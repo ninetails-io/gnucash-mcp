@@ -3,6 +3,8 @@
 import pytest
 import piecash
 from pathlib import Path
+from datetime import date
+from decimal import Decimal
 
 
 @pytest.fixture
@@ -26,84 +28,95 @@ def test_book(tmp_path: Path) -> Path:
         overwrite=True,
     )
 
-    # Get the root account
+    # Get the root account and currency
     root = book.root_account
+    usd = book.default_currency
 
-    # Create standard account hierarchy
+    # Create standard account hierarchy - must add to session
     assets = piecash.Account(
         name="Assets",
         type="ASSET",
         parent=root,
-        commodity=book.default_currency,
+        commodity=usd,
         placeholder=True,
     )
+    book.session.add(assets)
+
     checking = piecash.Account(
         name="Checking",
         type="BANK",
         parent=assets,
-        commodity=book.default_currency,
+        commodity=usd,
     )
+    book.session.add(checking)
 
     liabilities = piecash.Account(
         name="Liabilities",
         type="LIABILITY",
         parent=root,
-        commodity=book.default_currency,
+        commodity=usd,
         placeholder=True,
     )
+    book.session.add(liabilities)
 
     income = piecash.Account(
         name="Income",
         type="INCOME",
         parent=root,
-        commodity=book.default_currency,
+        commodity=usd,
         placeholder=True,
     )
+    book.session.add(income)
+
     salary = piecash.Account(
         name="Salary",
         type="INCOME",
         parent=income,
-        commodity=book.default_currency,
+        commodity=usd,
     )
+    book.session.add(salary)
 
     expenses = piecash.Account(
         name="Expenses",
         type="EXPENSE",
         parent=root,
-        commodity=book.default_currency,
+        commodity=usd,
         placeholder=True,
     )
+    book.session.add(expenses)
+
     groceries = piecash.Account(
         name="Groceries",
         type="EXPENSE",
         parent=expenses,
-        commodity=book.default_currency,
+        commodity=usd,
     )
+    book.session.add(groceries)
 
     equity = piecash.Account(
         name="Equity",
         type="EQUITY",
         parent=root,
-        commodity=book.default_currency,
+        commodity=usd,
         placeholder=True,
     )
+    book.session.add(equity)
+
     opening_balance = piecash.Account(
         name="Opening Balance",
         type="EQUITY",
         parent=equity,
-        commodity=book.default_currency,
+        commodity=usd,
     )
+    book.session.add(opening_balance)
 
-    # Save accounts
-    book.flush()
+    # Save accounts first
+    book.save()
 
     # Create sample transactions
-    from datetime import date
-    from decimal import Decimal
-
     # Opening balance: $1000 in checking
-    piecash.Transaction(
-        currency=book.default_currency,
+    t1 = piecash.Transaction(
+        currency=usd,
         description="Opening Balance",
         post_date=date(2024, 1, 1),
         splits=[
@@ -111,10 +124,11 @@ def test_book(tmp_path: Path) -> Path:
             piecash.Split(account=opening_balance, value=Decimal("-1000.00")),
         ],
     )
+    book.session.add(t1)
 
     # Salary deposit: $2000
-    piecash.Transaction(
-        currency=book.default_currency,
+    t2 = piecash.Transaction(
+        currency=usd,
         description="Salary Deposit",
         post_date=date(2024, 1, 15),
         splits=[
@@ -122,10 +136,11 @@ def test_book(tmp_path: Path) -> Path:
             piecash.Split(account=salary, value=Decimal("-2000.00")),
         ],
     )
+    book.session.add(t2)
 
     # Grocery expense: $150
-    piecash.Transaction(
-        currency=book.default_currency,
+    t3 = piecash.Transaction(
+        currency=usd,
         description="Weekly Groceries",
         post_date=date(2024, 1, 20),
         splits=[
@@ -133,8 +148,9 @@ def test_book(tmp_path: Path) -> Path:
             piecash.Split(account=checking, value=Decimal("-150.00")),
         ],
     )
+    book.session.add(t3)
 
-    book.flush()
+    book.save()
     book.close()
 
     return book_path
