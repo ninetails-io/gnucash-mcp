@@ -430,3 +430,111 @@ class GnuCashBook:
                 "fullname": new_account.fullname,
                 "status": "created",
             }
+
+    def delete_transaction(self, guid: str) -> dict:
+        """Delete a transaction by GUID.
+
+        Args:
+            guid: Transaction GUID (32-character hex string).
+
+        Returns:
+            Dict with guid, description, and status.
+
+        Raises:
+            ValueError: If transaction not found.
+        """
+        with self.open(readonly=False) as book:
+            # Find the transaction
+            transaction = None
+            for t in book.transactions:
+                if t.guid == guid:
+                    transaction = t
+                    break
+
+            if not transaction:
+                raise ValueError(f"Transaction not found: {guid}")
+
+            # Capture info before deletion
+            result = {
+                "guid": guid,
+                "description": transaction.description,
+                "status": "deleted",
+            }
+
+            # Delete the transaction
+            book.session.delete(transaction)
+            book.save()
+
+            return result
+
+    def update_transaction(
+        self,
+        guid: str,
+        description: str | None = None,
+        trans_date: date | None = None,
+        splits: list[dict] | None = None,
+    ) -> dict:
+        """Update an existing transaction.
+
+        Args:
+            guid: Transaction GUID to update.
+            description: New description (optional).
+            trans_date: New transaction date (optional).
+            splits: List of split updates with 'account' and 'amount' (optional).
+                    Must match existing splits by account name.
+
+        Returns:
+            Dict with updated transaction details.
+
+        Raises:
+            ValueError: If transaction not found, splits don't balance,
+                       or account not found in splits.
+        """
+        with self.open(readonly=False) as book:
+            # Find the transaction
+            transaction = None
+            for t in book.transactions:
+                if t.guid == guid:
+                    transaction = t
+                    break
+
+            if not transaction:
+                raise ValueError(f"Transaction not found: {guid}")
+
+            # Update description if provided
+            if description is not None:
+                transaction.description = description
+
+            # Update date if provided
+            if trans_date is not None:
+                transaction.post_date = trans_date
+
+            # Update splits if provided
+            if splits is not None:
+                # Validate splits balance to zero
+                total = Decimal("0")
+                for split in splits:
+                    total += Decimal(split["amount"])
+                if total != Decimal("0"):
+                    raise ValueError(f"Splits do not balance: total is {total}")
+
+                # Build a map of account -> new amount
+                split_updates = {s["account"]: Decimal(s["amount"]) for s in splits}
+
+                # Update existing splits
+                for split in transaction.splits:
+                    account_name = split.account.fullname
+                    if account_name in split_updates:
+                        new_value = split_updates[account_name]
+                        split.value = new_value
+                        split.quantity = new_value
+                        del split_updates[account_name]
+
+                # Check if all provided accounts were found
+                if split_updates:
+                    missing = list(split_updates.keys())[0]
+                    raise ValueError(f"Account not found in transaction: {missing}")
+
+            book.save()
+
+            return _transaction_to_dict(transaction) | {"status": "updated"}

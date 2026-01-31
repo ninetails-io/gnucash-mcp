@@ -185,6 +185,51 @@ def create_account(
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def delete_transaction(guid: str) -> str:
+    """Delete a transaction by GUID.
+
+    Args:
+        guid: Transaction GUID (32-character hex string)
+    """
+    book = get_book()
+    try:
+        result = book.delete_transaction(guid)
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def update_transaction(
+    guid: str,
+    description: str | None = None,
+    transaction_date: str | None = None,
+    splits: list[dict] | None = None,
+) -> str:
+    """Update an existing transaction.
+
+    Args:
+        guid: Transaction GUID to update
+        description: New transaction description (optional)
+        transaction_date: New date in ISO format YYYY-MM-DD (optional)
+        splits: List of split updates with 'account' and 'amount' (optional).
+                Must match existing splits by account name and balance to zero.
+    """
+    book = get_book()
+    try:
+        trans_date = date.fromisoformat(transaction_date) if transaction_date else None
+        result = book.update_transaction(
+            guid=guid,
+            description=description,
+            trans_date=trans_date,
+            splits=splits,
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
 # ============== Resources ==============
 
 
