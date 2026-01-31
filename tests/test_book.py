@@ -352,3 +352,109 @@ class TestSearchTransactions:
 
         with pytest.raises(ValueError, match="Invalid search field"):
             gc_book.search_transactions("test", field="invalid")
+
+
+class TestCreateAccount:
+    """Tests for create_account method."""
+
+    def test_create_account_success(self, test_book: Path):
+        """Should create a new account under existing parent."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_account(
+            name="Test Category",
+            account_type="EXPENSE",
+            parent="Expenses",
+            description="A test expense category",
+        )
+
+        assert result["status"] == "created"
+        assert result["fullname"] == "Expenses:Test Category"
+        assert len(result["guid"]) == 32
+
+        # Verify account exists
+        account = gc_book.get_account("Expenses:Test Category")
+        assert account is not None
+        assert account["description"] == "A test expense category"
+
+    def test_create_account_nested(self, test_book: Path):
+        """Should create account under nested parent."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # First create a parent
+        gc_book.create_account(
+            name="Online Services",
+            account_type="EXPENSE",
+            parent="Expenses",
+            placeholder=True,
+        )
+
+        # Then create child
+        result = gc_book.create_account(
+            name="AI Subscriptions",
+            account_type="EXPENSE",
+            parent="Expenses:Online Services",
+            description="Claude, ChatGPT, etc.",
+        )
+
+        assert result["fullname"] == "Expenses:Online Services:AI Subscriptions"
+
+    def test_create_account_placeholder(self, test_book: Path):
+        """Should create placeholder account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_account(
+            name="Placeholder Category",
+            account_type="EXPENSE",
+            parent="Expenses",
+            placeholder=True,
+        )
+
+        account = gc_book.get_account("Expenses:Placeholder Category")
+        assert account["placeholder"] is True
+
+    def test_create_account_parent_not_found(self, test_book: Path):
+        """Should raise ValueError if parent doesn't exist."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Parent account not found"):
+            gc_book.create_account(
+                name="Test",
+                account_type="EXPENSE",
+                parent="Nonexistent:Parent",
+            )
+
+    def test_create_account_duplicate(self, test_book: Path):
+        """Should raise ValueError if account with same name exists under parent."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Groceries already exists under Expenses
+        with pytest.raises(ValueError, match="already exists"):
+            gc_book.create_account(
+                name="Groceries",
+                account_type="EXPENSE",
+                parent="Expenses",
+            )
+
+    def test_create_account_invalid_type(self, test_book: Path):
+        """Should raise ValueError for invalid account type."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Invalid account type"):
+            gc_book.create_account(
+                name="Test",
+                account_type="INVALID",
+                parent="Expenses",
+            )
+
+    def test_create_account_type_case_insensitive(self, test_book: Path):
+        """Should accept lowercase account types."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_account(
+            name="Lowercase Type Test",
+            account_type="expense",
+            parent="Expenses",
+        )
+
+        assert result["status"] == "created"

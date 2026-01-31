@@ -169,6 +169,35 @@ class TestSearchTransactionsTool:
         assert len(data) == 2  # Opening Balance (1000) and Salary (2000)
 
 
+class TestCreateAccountTool:
+    """Tests for create_account tool."""
+
+    def test_create_account(self, setup_book_env):
+        """Should create account and return result."""
+        result = server_module.create_account(
+            name="Test Category",
+            account_type="EXPENSE",
+            parent="Expenses",
+            description="A test category",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert data["fullname"] == "Expenses:Test Category"
+
+    def test_create_account_invalid_parent(self, setup_book_env):
+        """Should return error for invalid parent."""
+        result = server_module.create_account(
+            name="Test",
+            account_type="EXPENSE",
+            parent="Nonexistent:Parent",
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+
 class TestResources:
     """Tests for MCP resources."""
 
