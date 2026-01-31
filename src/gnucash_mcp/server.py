@@ -154,6 +154,37 @@ def search_transactions(query: str, field: str = "description") -> str:
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+def create_account(
+    name: str,
+    account_type: str,
+    parent: str,
+    description: str = "",
+    placeholder: bool = False,
+) -> str:
+    """Create a new account in the chart of accounts.
+
+    Args:
+        name: Account name (e.g., "AI Subscriptions")
+        account_type: GnuCash account type (ASSET, BANK, CASH, CREDIT, EQUITY, EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK)
+        parent: Full path of parent account (e.g., "Expenses:Online Services")
+        description: Optional description
+        placeholder: If true, account is container-only. Default: false
+    """
+    book = get_book()
+    try:
+        result = book.create_account(
+            name=name,
+            account_type=account_type,
+            parent=parent,
+            description=description,
+            placeholder=placeholder,
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
 # ============== Resources ==============
 
 

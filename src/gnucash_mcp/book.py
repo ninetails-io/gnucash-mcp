@@ -18,7 +18,7 @@ def _account_to_dict(account: piecash.Account) -> dict:
         "type": account.type,
         "commodity": account.commodity.mnemonic if account.commodity else None,
         "description": account.description or "",
-        "placeholder": account.placeholder,
+        "placeholder": bool(account.placeholder),
     }
 
 
@@ -355,3 +355,78 @@ class GnuCashBook:
         # Exact match
         target = Decimal(query)
         return any(amt == target for amt in amounts)
+
+    # Valid GnuCash account types
+    VALID_ACCOUNT_TYPES = {
+        "ASSET",
+        "BANK",
+        "CASH",
+        "CREDIT",
+        "EQUITY",
+        "EXPENSE",
+        "INCOME",
+        "LIABILITY",
+        "MUTUAL",
+        "STOCK",
+    }
+
+    def create_account(
+        self,
+        name: str,
+        account_type: str,
+        parent: str,
+        description: str = "",
+        placeholder: bool = False,
+    ) -> dict:
+        """Create a new account in the chart of accounts.
+
+        Args:
+            name: Account name (e.g., "AI Subscriptions").
+            account_type: GnuCash account type (ASSET, EXPENSE, etc.).
+            parent: Full path of parent account (e.g., "Expenses:Online Services").
+            description: Optional description.
+            placeholder: If True, account is container-only. Default False.
+
+        Returns:
+            Dict with guid, fullname, and status.
+
+        Raises:
+            ValueError: If parent not found, invalid type, or duplicate name.
+        """
+        # Validate account type
+        if account_type.upper() not in self.VALID_ACCOUNT_TYPES:
+            raise ValueError(
+                f"Invalid account type: {account_type}. "
+                f"Valid types: {', '.join(sorted(self.VALID_ACCOUNT_TYPES))}"
+            )
+
+        with self.open(readonly=False) as book:
+            # Find parent account
+            parent_account = self._find_account(book, parent)
+            if not parent_account:
+                raise ValueError(f"Parent account not found: {parent}")
+
+            # Check for duplicate - same name under same parent
+            for child in parent_account.children:
+                if child.name == name:
+                    raise ValueError(
+                        f"Account '{name}' already exists under '{parent}'"
+                    )
+
+            # Create the account
+            new_account = piecash.Account(
+                name=name,
+                type=account_type.upper(),
+                parent=parent_account,
+                commodity=book.default_currency,
+                description=description,
+                placeholder=placeholder,
+            )
+
+            book.save()
+
+            return {
+                "guid": new_account.guid,
+                "fullname": new_account.fullname,
+                "status": "created",
+            }
