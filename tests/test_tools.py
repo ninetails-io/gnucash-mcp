@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -317,3 +318,82 @@ class TestResources:
         assert isinstance(data, list)
         fullnames = {a["fullname"] for a in data}
         assert "Assets:Checking" in fullnames
+
+
+class TestErrorHandling:
+    """Tests for error handling and the safe_tool decorator."""
+
+    def test_missing_env_variable(self, monkeypatch):
+        """Should return error when GNUCASH_BOOK_PATH is not set."""
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        server_module._book = None
+
+        result = server_module.list_accounts()
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "error_type" in data
+        assert data["error_type"] == "validation_error"
+        assert "GNUCASH_BOOK_PATH" in data["error"]
+
+    def test_file_not_found(self, monkeypatch):
+        """Should return error when book file doesn't exist."""
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", "/nonexistent/path/book.gnucash")
+        server_module._book = None
+
+        result = server_module.list_accounts()
+
+        data = json.loads(result)
+        assert "error" in data
+        assert data["error_type"] == "file_not_found"
+        assert "suggestion" in data
+
+    def test_invalid_date_format(self, setup_book_env):
+        """Should return error for invalid date format."""
+        result = server_module.get_balance("Assets:Checking", "not-a-date")
+
+        data = json.loads(result)
+        assert "error" in data
+        # ValueError from date parsing should be caught
+        assert "error_type" in data
+
+    def test_invalid_amount_query(self, setup_book_env):
+        """Should return error for invalid amount query."""
+        result = server_module.search_transactions(">abc", field="amount")
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid amount query" in data["error"]
+
+    def test_lock_error_handling(self, setup_book_env):
+        """Should handle lock errors gracefully."""
+        from gnucash_mcp.book import GnuCashLockError
+
+        # Mock the book's list_accounts to raise GnuCashLockError
+        with patch.object(
+            server_module.get_book(),
+            "list_accounts",
+            side_effect=GnuCashLockError("Book is locked by another process"),
+        ):
+            result = server_module.list_accounts()
+
+        data = json.loads(result)
+        assert "error" in data
+        assert data["error_type"] == "lock_error"
+        assert "suggestion" in data
+        assert "Close GnuCash" in data["suggestion"]
+
+    def test_unexpected_error_handling(self, setup_book_env):
+        """Should handle unexpected errors gracefully."""
+        # Patch to raise an unexpected error
+        with patch.object(
+            server_module,
+            "get_book",
+            side_effect=RuntimeError("Unexpected error"),
+        ):
+            result = server_module.list_accounts()
+
+        data = json.loads(result)
+        assert "error" in data
+        assert data["error_type"] == "unexpected_error"
+        assert "RuntimeError" in data["error"]
