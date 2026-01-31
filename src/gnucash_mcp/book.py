@@ -1,12 +1,20 @@
 """GnuCash book wrapper using piecash."""
 
+import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator
 
 import piecash
+
+
+class GnuCashLockError(Exception):
+    """Raised when the GnuCash book is locked by another process."""
+
+    pass
 
 
 def _account_to_dict(account: piecash.Account) -> dict:
@@ -63,20 +71,48 @@ class GnuCashBook:
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
 
     @contextmanager
-    def open(self, readonly: bool = True) -> Generator[piecash.Book, None, None]:
-        """Context manager for book access.
+    def open(
+        self, readonly: bool = True, max_retries: int = 3, retry_delay: float = 0.5
+    ) -> Generator[piecash.Book, None, None]:
+        """Context manager for book access with retry logic for locked files.
 
         Args:
             readonly: If True, open in read-only mode. Default True for safety.
+            max_retries: Number of retry attempts if file is locked. Default 3.
+            retry_delay: Seconds to wait between retries. Default 0.5.
 
         Yields:
             piecash.Book instance.
+
+        Raises:
+            GnuCashLockError: If the book is locked after all retries.
+            FileNotFoundError: If the book file doesn't exist.
         """
-        book = piecash.open_book(str(self.book_path), readonly=readonly)
-        try:
-            yield book
-        finally:
-            book.close()
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                book = piecash.open_book(str(self.book_path), readonly=readonly)
+                try:
+                    yield book
+                    return
+                finally:
+                    book.close()
+            except sqlite3.OperationalError as e:
+                last_error = e
+                error_msg = str(e).lower()
+                if "locked" in error_msg or "busy" in error_msg:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                        continue
+                    raise GnuCashLockError(
+                        f"GnuCash book is locked (possibly by GnuCash or another process). "
+                        f"Close GnuCash and try again. Details: {e}"
+                    ) from e
+                raise  # Re-raise non-lock errors immediately
+
+        # Should not reach here, but just in case
+        if last_error:
+            raise last_error
 
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
         """Find an account by its full name path.
@@ -327,6 +363,9 @@ class GnuCashBook:
 
         Returns:
             True if any split matches.
+
+        Raises:
+            ValueError: If the amount query is malformed.
         """
         # Get absolute values of all splits
         amounts = [abs(split.value) for split in transaction.splits]
@@ -334,27 +373,31 @@ class GnuCashBook:
         # Parse query
         query = query.strip()
 
-        # Greater than: >100
-        if query.startswith(">"):
-            threshold = Decimal(query[1:])
-            return any(amt > threshold for amt in amounts)
+        try:
+            # Greater than: >100
+            if query.startswith(">"):
+                threshold = Decimal(query[1:])
+                return any(amt > threshold for amt in amounts)
 
-        # Less than: <100
-        if query.startswith("<"):
-            threshold = Decimal(query[1:])
-            return any(amt < threshold for amt in amounts)
+            # Less than: <100
+            if query.startswith("<"):
+                threshold = Decimal(query[1:])
+                return any(amt < threshold for amt in amounts)
 
-        # Range: 100-200
-        if "-" in query and not query.startswith("-"):
-            parts = query.split("-")
-            if len(parts) == 2:
-                low = Decimal(parts[0])
-                high = Decimal(parts[1])
-                return any(low <= amt <= high for amt in amounts)
+            # Range: 100-200
+            if "-" in query and not query.startswith("-"):
+                parts = query.split("-")
+                if len(parts) == 2:
+                    low = Decimal(parts[0])
+                    high = Decimal(parts[1])
+                    return any(low <= amt <= high for amt in amounts)
 
-        # Exact match
-        target = Decimal(query)
-        return any(amt == target for amt in amounts)
+            # Exact match
+            target = Decimal(query)
+            return any(amt == target for amt in amounts)
+
+        except InvalidOperation as e:
+            raise ValueError(f"Invalid amount query '{query}': {e}") from e
 
     # Valid GnuCash account types
     VALID_ACCOUNT_TYPES = {

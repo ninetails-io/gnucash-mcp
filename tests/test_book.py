@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gnucash_mcp.book import GnuCashBook
+from gnucash_mcp.book import GnuCashBook, GnuCashLockError
 
 
 class TestGnuCashBookInit:
@@ -352,6 +352,13 @@ class TestSearchTransactions:
 
         with pytest.raises(ValueError, match="Invalid search field"):
             gc_book.search_transactions("test", field="invalid")
+
+    def test_search_by_amount_invalid_query(self, test_book: Path):
+        """Should raise ValueError for malformed amount query."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Invalid amount query"):
+            gc_book.search_transactions(">notanumber", field="amount")
 
 
 class TestCreateAccount:
