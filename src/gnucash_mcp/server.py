@@ -1,18 +1,15 @@
 """MCP server definition for GnuCash."""
 
-import asyncio
 import json
 import os
 from datetime import date
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Resource, TextContent, Tool
+from mcp.server.fastmcp import FastMCP
 
 from gnucash_mcp.book import GnuCashBook
-from gnucash_mcp.tools import TOOLS
 
-server = Server("gnucash-mcp")
+# Create FastMCP server
+mcp = FastMCP("gnucash-mcp")
 
 # Global book instance - initialized on first use
 _book: GnuCashBook | None = None
@@ -29,129 +26,151 @@ def get_book() -> GnuCashBook:
     return _book
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    """Return available tools."""
-    return TOOLS
+# ============== Tools ==============
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Handle tool calls by routing to GnuCashBook methods."""
+@mcp.tool()
+def list_accounts() -> str:
+    """List all accounts in the GnuCash chart of accounts."""
     book = get_book()
+    result = book.list_accounts()
+    return json.dumps(result, indent=2)
 
+
+@mcp.tool()
+def get_account(name: str) -> str:
+    """Get details for a specific account by name.
+
+    Args:
+        name: Full account name (e.g., 'Assets:Bank:Checking')
+    """
+    book = get_book()
+    result = book.get_account(name)
+    if result is None:
+        return json.dumps({"error": f"Account not found: {name}"})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_balance(account_name: str, as_of_date: str | None = None) -> str:
+    """Get the balance of an account, optionally as of a specific date.
+
+    Args:
+        account_name: Full account name (e.g., 'Assets:Bank:Checking')
+        as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to current date.
+    """
+    book = get_book()
     try:
-        if name == "list_accounts":
-            result = book.list_accounts()
-
-        elif name == "get_account":
-            result = book.get_account(arguments["name"])
-            if result is None:
-                result = {"error": f"Account not found: {arguments['name']}"}
-
-        elif name == "get_balance":
-            as_of_date = None
-            if "as_of_date" in arguments and arguments["as_of_date"]:
-                as_of_date = date.fromisoformat(arguments["as_of_date"])
-            balance = book.get_balance(arguments["account_name"], as_of_date)
-            result = {
-                "account": arguments["account_name"],
-                "balance": str(balance),
-                "as_of_date": as_of_date.isoformat() if as_of_date else "current",
-            }
-
-        elif name == "list_transactions":
-            start = None
-            end = None
-            if "start_date" in arguments and arguments["start_date"]:
-                start = date.fromisoformat(arguments["start_date"])
-            if "end_date" in arguments and arguments["end_date"]:
-                end = date.fromisoformat(arguments["end_date"])
-            limit = arguments.get("limit", 50)
-            account = arguments.get("account")
-            result = book.list_transactions(account, start, end, limit)
-
-        elif name == "get_transaction":
-            result = book.get_transaction(arguments["guid"])
-            if result is None:
-                result = {"error": f"Transaction not found: {arguments['guid']}"}
-
-        elif name == "create_transaction":
-            trans_date = None
-            if "date" in arguments and arguments["date"]:
-                trans_date = date.fromisoformat(arguments["date"])
-            guid = book.create_transaction(
-                description=arguments["description"],
-                splits=arguments["splits"],
-                trans_date=trans_date,
-            )
-            result = {"guid": guid, "status": "created"}
-
-        elif name == "search_transactions":
-            field = arguments.get("field", "description")
-            result = book.search_transactions(arguments["query"], field)
-
-        else:
-            result = {"error": f"Unknown tool: {name}"}
-
+        date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+        balance = book.get_balance(account_name, date_obj)
+        result = {
+            "account": account_name,
+            "balance": str(balance),
+            "as_of_date": as_of_date if as_of_date else "current",
+        }
+        return json.dumps(result, indent=2)
     except ValueError as e:
-        result = {"error": str(e)}
-    except FileNotFoundError as e:
-        result = {"error": str(e)}
-
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return json.dumps({"error": str(e)})
 
 
-@server.list_resources()
-async def list_resources() -> list[Resource]:
-    """Return available resources."""
-    return [
-        Resource(
-            uri="gnucash://accounts",
-            name="Chart of Accounts",
-            description="Full chart of accounts from the GnuCash book",
-            mimeType="application/json",
-        ),
-    ]
+@mcp.tool()
+def list_transactions(
+    account: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List transactions with optional filters.
 
-
-@server.read_resource()
-async def read_resource(uri: str) -> str:
-    """Handle resource reads."""
+    Args:
+        account: Filter by account name
+        start_date: Start date in ISO format (YYYY-MM-DD)
+        end_date: End date in ISO format (YYYY-MM-DD)
+        limit: Maximum number of transactions to return (default 50)
+    """
     book = get_book()
+    try:
+        start = date.fromisoformat(start_date) if start_date else None
+        end = date.fromisoformat(end_date) if end_date else None
+        result = book.list_transactions(account, start, end, limit)
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
-    if uri == "gnucash://accounts":
-        accounts = book.list_accounts()
-        return json.dumps(accounts, indent=2)
 
-    # Handle balance resources: gnucash://balance/{account_name}
-    if uri.startswith("gnucash://balance/"):
-        account_name = uri.replace("gnucash://balance/", "")
-        # URL decode the account name (replace %3A with :)
-        account_name = account_name.replace("%3A", ":")
-        try:
-            balance = book.get_balance(account_name)
-            return json.dumps(
-                {"account": account_name, "balance": str(balance)}, indent=2
-            )
-        except ValueError as e:
-            return json.dumps({"error": str(e)})
+@mcp.tool()
+def get_transaction(guid: str) -> str:
+    """Get details for a specific transaction by GUID.
 
-    return json.dumps({"error": f"Unknown resource: {uri}"})
+    Args:
+        guid: Transaction GUID (32-character hex string)
+    """
+    book = get_book()
+    result = book.get_transaction(guid)
+    if result is None:
+        return json.dumps({"error": f"Transaction not found: {guid}"})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_transaction(
+    description: str,
+    splits: list[dict],
+    transaction_date: str | None = None,
+) -> str:
+    """Create a new transaction with splits. Splits must balance to zero.
+
+    Args:
+        description: Transaction description
+        splits: List of splits. Each split has 'account' (name) and 'amount' (string)
+        transaction_date: Transaction date in ISO format (YYYY-MM-DD). Defaults to today.
+    """
+    book = get_book()
+    try:
+        trans_date = date.fromisoformat(transaction_date) if transaction_date else None
+        guid = book.create_transaction(
+            description=description,
+            splits=splits,
+            trans_date=trans_date,
+        )
+        return json.dumps({"guid": guid, "status": "created"}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def search_transactions(query: str, field: str = "description") -> str:
+    """Search transactions by description, memo, or amount.
+
+    Args:
+        query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
+        field: Field to search: 'description', 'memo', or 'amount'
+    """
+    book = get_book()
+    try:
+        result = book.search_transactions(query, field)
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# ============== Resources ==============
+
+
+@mcp.resource("gnucash://accounts")
+def accounts_resource() -> str:
+    """Full chart of accounts from the GnuCash book."""
+    book = get_book()
+    accounts = book.list_accounts()
+    return json.dumps(accounts, indent=2)
+
+
+# ============== Main ==============
 
 
 def main() -> None:
     """Run the MCP server."""
-
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
-
-    asyncio.run(run())
+    mcp.run()
 
 
 if __name__ == "__main__":
