@@ -458,3 +458,152 @@ class TestCreateAccount:
         )
 
         assert result["status"] == "created"
+
+
+class TestDeleteTransaction:
+    """Tests for delete_transaction method."""
+
+    def test_delete_transaction_success(self, test_book: Path):
+        """Should delete an existing transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a transaction to delete
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+        description = transactions[0]["description"]
+
+        result = gc_book.delete_transaction(guid)
+
+        assert result["status"] == "deleted"
+        assert result["guid"] == guid
+        assert result["description"] == description
+
+        # Verify transaction is gone
+        assert gc_book.get_transaction(guid) is None
+
+    def test_delete_transaction_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Transaction not found"):
+            gc_book.delete_transaction("nonexistent_guid_12345")
+
+
+class TestUpdateTransaction:
+    """Tests for update_transaction method."""
+
+    def test_update_description_only(self, test_book: Path):
+        """Should update only the description."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            description="Updated Description",
+        )
+
+        assert result["status"] == "updated"
+        assert result["description"] == "Updated Description"
+
+    def test_update_date_only(self, test_book: Path):
+        """Should update only the date."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            trans_date=date(2024, 6, 15),
+        )
+
+        assert result["status"] == "updated"
+        assert result["date"] == "2024-06-15"
+
+    def test_update_splits(self, test_book: Path):
+        """Should update split amounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get the groceries transaction (150.00)
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "175.00"},
+                {"account": "Assets:Checking", "amount": "-175.00"},
+            ],
+        )
+
+        assert result["status"] == "updated"
+        # Verify new amounts
+        updated = gc_book.get_transaction(guid)
+        for split in updated["splits"]:
+            if split["account"] == "Expenses:Groceries":
+                assert split["value"] == "175"
+
+    def test_update_everything(self, test_book: Path):
+        """Should update description, date, and splits together."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            description="Safeway Groceries",
+            trans_date=date(2024, 1, 21),
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "160.00"},
+                {"account": "Assets:Checking", "amount": "-160.00"},
+            ],
+        )
+
+        assert result["status"] == "updated"
+        assert result["description"] == "Safeway Groceries"
+        assert result["date"] == "2024-01-21"
+
+    def test_update_transaction_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Transaction not found"):
+            gc_book.update_transaction(
+                guid="nonexistent_guid",
+                description="Test",
+            )
+
+    def test_update_splits_unbalanced(self, test_book: Path):
+        """Should raise ValueError for unbalanced splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="do not balance"):
+            gc_book.update_transaction(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "100.00"},
+                    {"account": "Assets:Checking", "amount": "-90.00"},
+                ],
+            )
+
+    def test_update_splits_account_not_found(self, test_book: Path):
+        """Should raise ValueError if split account not in transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="Account not found in transaction"):
+            gc_book.update_transaction(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Nonexistent", "amount": "100.00"},
+                    {"account": "Assets:Checking", "amount": "-100.00"},
+                ],
+            )

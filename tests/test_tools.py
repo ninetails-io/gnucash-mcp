@@ -198,6 +198,114 @@ class TestCreateAccountTool:
         assert "not found" in data["error"].lower()
 
 
+class TestDeleteTransactionTool:
+    """Tests for delete_transaction tool."""
+
+    def test_delete_transaction(self, setup_book_env):
+        """Should delete a transaction and return result."""
+        # First get a transaction to delete
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.delete_transaction(guid)
+
+        data = json.loads(result)
+        assert data["status"] == "deleted"
+        assert data["guid"] == guid
+
+        # Verify it's gone
+        get_result = server_module.get_transaction(guid)
+        assert "error" in json.loads(get_result)
+
+    def test_delete_nonexistent_transaction(self, setup_book_env):
+        """Should return error for missing transaction."""
+        result = server_module.delete_transaction("nonexistent_guid_12345")
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+
+class TestUpdateTransactionTool:
+    """Tests for update_transaction tool."""
+
+    def test_update_description(self, setup_book_env):
+        """Should update transaction description."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.update_transaction(
+            guid=guid,
+            description="Updated Description",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
+        assert data["description"] == "Updated Description"
+
+    def test_update_date(self, setup_book_env):
+        """Should update transaction date."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.update_transaction(
+            guid=guid,
+            transaction_date="2024-06-15",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
+        assert data["date"] == "2024-06-15"
+
+    def test_update_splits(self, setup_book_env):
+        """Should update transaction split amounts."""
+        # Find the groceries transaction which has known accounts
+        transactions = json.loads(server_module.list_transactions())
+        groceries_trans = next(
+            t for t in transactions if t["description"] == "Weekly Groceries"
+        )
+        guid = groceries_trans["guid"]
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
+
+    def test_update_nonexistent_transaction(self, setup_book_env):
+        """Should return error for missing transaction."""
+        result = server_module.update_transaction(
+            guid="nonexistent_guid_12345",
+            description="New Description",
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+    def test_update_unbalanced_splits(self, setup_book_env):
+        """Should return error for unbalanced splits."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100.00"},
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "balance" in data["error"].lower()
+
+
 class TestResources:
     """Tests for MCP resources."""
 
