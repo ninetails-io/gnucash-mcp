@@ -1058,3 +1058,362 @@ class GnuCashBook:
             book.save()
 
             return _transaction_to_dict(transaction) | {"status": "unvoided"}
+
+    # ============== Reporting Methods ==============
+
+    def _get_account_depth(self, account: piecash.Account) -> int:
+        """Get the depth of an account in the hierarchy (root = 0)."""
+        depth = 0
+        current = account
+        while current.parent and current.parent.type != "ROOT":
+            depth += 1
+            current = current.parent
+        return depth
+
+    def _get_account_at_depth(
+        self, account: piecash.Account, target_depth: int
+    ) -> piecash.Account:
+        """Get the ancestor of an account at a specific depth."""
+        # First get to root and build path
+        path = [account]
+        current = account
+        while current.parent and current.parent.type != "ROOT":
+            current = current.parent
+            path.append(current)
+        path.reverse()  # Now path[0] is top-level, path[-1] is the account
+
+        # Return account at target depth (0-indexed from top)
+        if target_depth >= len(path):
+            return account
+        return path[target_depth]
+
+    def spending_by_category(
+        self,
+        start_date: date,
+        end_date: date,
+        depth: int = 1,
+    ) -> dict:
+        """Get spending breakdown by expense category.
+
+        Args:
+            start_date: Start of period (inclusive).
+            end_date: End of period (inclusive).
+            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+
+        Returns:
+            Dict with period, total, and category breakdown.
+        """
+        with self.open(readonly=True) as book:
+            totals: dict[str, Decimal] = {}
+
+            for transaction in book.transactions:
+                if not (start_date <= transaction.post_date <= end_date):
+                    continue
+
+                for split in transaction.splits:
+                    if split.account.type != "EXPENSE":
+                        continue
+
+                    # Get the account at the requested depth
+                    group_account = self._get_account_at_depth(
+                        split.account, depth - 1
+                    )
+                    account_name = group_account.fullname
+
+                    # Expense splits are positive when money is spent
+                    amount = split.value
+                    if amount > 0:
+                        totals[account_name] = totals.get(
+                            account_name, Decimal("0")
+                        ) + amount
+
+            # Calculate total and percentages
+            total = sum(totals.values())
+            categories = []
+            for account_name, amount in sorted(
+                totals.items(), key=lambda x: x[1], reverse=True
+            ):
+                percent = (
+                    (amount / total * 100) if total > 0 else Decimal("0")
+                )
+                categories.append({
+                    "account": account_name,
+                    "amount": str(amount),
+                    "percent": str(percent.quantize(Decimal("0.1"))),
+                })
+
+            return {
+                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
+                "total": str(total),
+                "categories": categories,
+            }
+
+    def income_by_source(
+        self,
+        start_date: date,
+        end_date: date,
+        depth: int = 1,
+    ) -> dict:
+        """Get income breakdown by source.
+
+        Args:
+            start_date: Start of period (inclusive).
+            end_date: End of period (inclusive).
+            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+
+        Returns:
+            Dict with period, total, and source breakdown.
+        """
+        with self.open(readonly=True) as book:
+            totals: dict[str, Decimal] = {}
+
+            for transaction in book.transactions:
+                if not (start_date <= transaction.post_date <= end_date):
+                    continue
+
+                for split in transaction.splits:
+                    if split.account.type != "INCOME":
+                        continue
+
+                    # Get the account at the requested depth
+                    group_account = self._get_account_at_depth(
+                        split.account, depth - 1
+                    )
+                    account_name = group_account.fullname
+
+                    # Income splits are negative (money coming in)
+                    amount = -split.value
+                    if amount > 0:
+                        totals[account_name] = totals.get(
+                            account_name, Decimal("0")
+                        ) + amount
+
+            # Calculate total and percentages
+            total = sum(totals.values())
+            sources = []
+            for account_name, amount in sorted(
+                totals.items(), key=lambda x: x[1], reverse=True
+            ):
+                percent = (
+                    (amount / total * 100) if total > 0 else Decimal("0")
+                )
+                sources.append({
+                    "account": account_name,
+                    "amount": str(amount),
+                    "percent": str(percent.quantize(Decimal("0.1"))),
+                })
+
+            return {
+                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
+                "total": str(total),
+                "sources": sources,
+            }
+
+    def balance_sheet(self, as_of_date: date) -> dict:
+        """Generate a balance sheet as of a specific date.
+
+        Args:
+            as_of_date: Date to calculate balances as of.
+
+        Returns:
+            Dict with assets, liabilities, equity sections and totals.
+        """
+        with self.open(readonly=True) as book:
+            assets: dict[str, Decimal] = {}
+            liabilities: dict[str, Decimal] = {}
+            equity: dict[str, Decimal] = {}
+
+            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
+            liability_types = {"LIABILITY", "CREDIT"}
+            equity_types = {"EQUITY"}
+
+            for account in book.accounts:
+                if account.type == "ROOT":
+                    continue
+
+                # Calculate balance as of date
+                balance = Decimal("0")
+                for split in account.splits:
+                    if split.transaction.post_date <= as_of_date:
+                        balance += split.value
+
+                # Skip zero balances
+                if balance == 0:
+                    continue
+
+                if account.type in asset_types:
+                    assets[account.fullname] = balance
+                elif account.type in liability_types:
+                    # Liabilities are stored as negative, show as positive
+                    liabilities[account.fullname] = -balance
+                elif account.type in equity_types:
+                    equity[account.fullname] = -balance
+
+            # Also include net income (Income - Expenses) in equity
+            net_income = Decimal("0")
+            for account in book.accounts:
+                if account.type in ("INCOME", "EXPENSE"):
+                    for split in account.splits:
+                        if split.transaction.post_date <= as_of_date:
+                            net_income -= split.value  # Income negative, expense positive
+
+            assets_total = sum(assets.values())
+            liabilities_total = sum(liabilities.values())
+            equity_total = sum(equity.values()) + net_income
+
+            def format_accounts(accounts_dict: dict[str, Decimal]) -> list[dict]:
+                return [
+                    {"account": name, "balance": str(bal)}
+                    for name, bal in sorted(accounts_dict.items())
+                ]
+
+            return {
+                "as_of_date": as_of_date.isoformat(),
+                "assets": {
+                    "total": str(assets_total),
+                    "accounts": format_accounts(assets),
+                },
+                "liabilities": {
+                    "total": str(liabilities_total),
+                    "accounts": format_accounts(liabilities),
+                },
+                "equity": {
+                    "total": str(equity_total),
+                    "accounts": format_accounts(equity) + (
+                        [{"account": "Retained Earnings", "balance": str(net_income)}]
+                        if net_income != 0 else []
+                    ),
+                },
+                "balanced": assets_total == liabilities_total + equity_total,
+            }
+
+    def net_worth(
+        self,
+        end_date: date,
+        start_date: date | None = None,
+        interval: str | None = None,
+    ) -> dict:
+        """Calculate net worth (assets minus liabilities).
+
+        Args:
+            end_date: Calculate net worth as of this date.
+            start_date: If provided with interval, calculate series over time.
+            interval: 'month', 'quarter', or 'year' for time series.
+
+        Returns:
+            Dict with net worth value or time series.
+        """
+        from dateutil.relativedelta import relativedelta
+
+        def calc_net_worth_at(book: piecash.Book, at_date: date) -> Decimal:
+            """Calculate net worth at a specific date."""
+            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
+            liability_types = {"LIABILITY", "CREDIT"}
+
+            total = Decimal("0")
+            for account in book.accounts:
+                if account.type in asset_types:
+                    for split in account.splits:
+                        if split.transaction.post_date <= at_date:
+                            total += split.value
+                elif account.type in liability_types:
+                    for split in account.splits:
+                        if split.transaction.post_date <= at_date:
+                            total += split.value  # Already negative
+
+            return total
+
+        with self.open(readonly=True) as book:
+            # Point-in-time calculation
+            if not start_date or not interval:
+                nw = calc_net_worth_at(book, end_date)
+                return {
+                    "as_of_date": end_date.isoformat(),
+                    "net_worth": str(nw),
+                }
+
+            # Time series calculation
+            if interval not in ("month", "quarter", "year"):
+                raise ValueError(f"Invalid interval: {interval}. Use 'month', 'quarter', or 'year'")
+
+            delta = {
+                "month": relativedelta(months=1),
+                "quarter": relativedelta(months=3),
+                "year": relativedelta(years=1),
+            }[interval]
+
+            series = []
+            current = start_date
+            while current <= end_date:
+                nw = calc_net_worth_at(book, current)
+                series.append({
+                    "date": current.isoformat(),
+                    "net_worth": str(nw),
+                })
+                current += delta
+
+            # Always include end_date if not already included
+            if series and series[-1]["date"] != end_date.isoformat():
+                nw = calc_net_worth_at(book, end_date)
+                series.append({
+                    "date": end_date.isoformat(),
+                    "net_worth": str(nw),
+                })
+
+            return {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "interval": interval,
+                "series": series,
+            }
+
+    def cash_flow(
+        self,
+        start_date: date,
+        end_date: date,
+        account: str | None = None,
+    ) -> dict:
+        """Calculate cash flow (inflows and outflows) for a period.
+
+        Args:
+            start_date: Start of period (inclusive).
+            end_date: End of period (inclusive).
+            account: Optional account to filter (e.g., specific bank account).
+
+        Returns:
+            Dict with inflows, outflows, and net cash flow.
+        """
+        with self.open(readonly=True) as book:
+            # If account specified, only look at that account
+            if account:
+                target_account = self._find_account(book, account)
+                if not target_account:
+                    raise ValueError(f"Account not found: {account}")
+                accounts_to_check = [target_account]
+            else:
+                # Default to cash/bank accounts
+                cash_types = {"BANK", "CASH"}
+                accounts_to_check = [
+                    a for a in book.accounts if a.type in cash_types
+                ]
+
+            inflows = Decimal("0")
+            outflows = Decimal("0")
+
+            for acc in accounts_to_check:
+                for split in acc.splits:
+                    if not (start_date <= split.transaction.post_date <= end_date):
+                        continue
+
+                    if split.value > 0:
+                        inflows += split.value
+                    else:
+                        outflows += -split.value
+
+            return {
+                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
+                "account": account if account else "All cash/bank accounts",
+                "inflows": str(inflows),
+                "outflows": str(outflows),
+                "net": str(inflows - outflows),
+            }
