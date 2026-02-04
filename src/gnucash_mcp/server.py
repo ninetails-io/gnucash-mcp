@@ -273,6 +273,121 @@ def update_transaction(
     return json.dumps(result, indent=2)
 
 
+# ============== Reconciliation Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+def set_reconcile_state(
+    split_guid: str,
+    state: str,
+    reconcile_date: str | None = None,
+) -> str:
+    """Set the reconciliation state for a split.
+
+    Args:
+        split_guid: GUID of the split to update
+        state: New reconcile state: 'n' (new), 'c' (cleared), 'y' (reconciled)
+        reconcile_date: Date in ISO format (YYYY-MM-DD). Required for 'y', defaults to today.
+    """
+    book = get_book()
+    rec_date = date.fromisoformat(reconcile_date) if reconcile_date else None
+    result = book.set_reconcile_state(
+        split_guid=split_guid,
+        state=state,
+        reconcile_date=rec_date,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def get_unreconciled_splits(
+    account: str,
+    as_of_date: str | None = None,
+) -> str:
+    """Get all unreconciled splits for an account.
+
+    Args:
+        account: Full account name (e.g., 'Assets:Bank:Checking')
+        as_of_date: Only include splits on or before this date (YYYY-MM-DD)
+    """
+    book = get_book()
+    date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+    result = book.get_unreconciled_splits(
+        account_name=account,
+        as_of_date=date_obj,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def reconcile_account(
+    account: str,
+    statement_date: str,
+    statement_balance: str,
+    split_guids: list[str],
+) -> str:
+    """Reconcile multiple splits against a statement balance.
+
+    Marks all specified splits as reconciled if the resulting balance matches
+    the statement balance. This is an atomic operation - either all splits are
+    reconciled or none are.
+
+    Args:
+        account: Full account name (e.g., 'Assets:Bank:Checking')
+        statement_date: Statement ending date (YYYY-MM-DD)
+        statement_balance: Expected balance from statement (as string, e.g., '1234.56')
+        split_guids: List of split GUIDs to mark as reconciled
+    """
+    book = get_book()
+    stmt_date = date.fromisoformat(statement_date)
+    result = book.reconcile_account(
+        account_name=account,
+        statement_date=stmt_date,
+        statement_balance=statement_balance,
+        split_guids=split_guids,
+    )
+    return json.dumps(result, indent=2)
+
+
+# ============== Void Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+def void_transaction(guid: str, reason: str) -> str:
+    """Void a transaction (proper accounting void, not delete).
+
+    Voiding preserves the transaction for audit purposes but zeroes out
+    all split values. Use this instead of delete when you need to maintain
+    an audit trail.
+
+    Args:
+        guid: Transaction GUID to void
+        reason: Reason for voiding (required for audit trail)
+    """
+    book = get_book()
+    result = book.void_transaction(guid=guid, reason=reason)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def unvoid_transaction(guid: str) -> str:
+    """Restore a voided transaction.
+
+    Restores original split values and removes void markers.
+
+    Args:
+        guid: Transaction GUID to unvoid
+    """
+    book = get_book()
+    result = book.unvoid_transaction(guid=guid)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 

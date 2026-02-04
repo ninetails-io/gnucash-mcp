@@ -307,6 +307,153 @@ class TestUpdateTransactionTool:
         assert "balance" in data["error"].lower()
 
 
+class TestSetReconcileStateTool:
+    """Tests for set_reconcile_state tool."""
+
+    def test_set_reconcile_state(self, setup_book_env):
+        """Should set reconcile state on a split."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        result = server_module.set_reconcile_state(split_guid, "c")
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
+        assert data["reconcile_state"] == "c"
+
+    def test_set_reconcile_state_invalid(self, setup_book_env):
+        """Should return error for invalid state."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        result = server_module.set_reconcile_state(split_guid, "x")
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestGetUnreconciledSplitsTool:
+    """Tests for get_unreconciled_splits tool."""
+
+    def test_get_unreconciled_splits(self, setup_book_env):
+        """Should return unreconciled splits for account."""
+        result = server_module.get_unreconciled_splits("Assets:Checking")
+
+        data = json.loads(result)
+        assert "splits" in data
+        assert data["account"] == "Assets:Checking"
+        assert data["count"] > 0
+
+    def test_get_unreconciled_splits_not_found(self, setup_book_env):
+        """Should return error for non-existent account."""
+        result = server_module.get_unreconciled_splits("Nonexistent:Account")
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestReconcileAccountTool:
+    """Tests for reconcile_account tool."""
+
+    def test_reconcile_account(self, setup_book_env):
+        """Should reconcile account when balance matches."""
+        from decimal import Decimal
+
+        # Get unreconciled splits
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking")
+        )
+
+        # Calculate expected balance
+        total = Decimal("0")
+        guids = []
+        for split in unreconciled["splits"]:
+            total += Decimal(split["value"])
+            guids.append(split["guid"])
+
+        result = server_module.reconcile_account(
+            account="Assets:Checking",
+            statement_date="2024-01-31",
+            statement_balance=str(total),
+            split_guids=guids,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "reconciled"
+
+    def test_reconcile_account_balance_mismatch(self, setup_book_env):
+        """Should return error when balance doesn't match."""
+        unreconciled = json.loads(
+            server_module.get_unreconciled_splits("Assets:Checking")
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        result = server_module.reconcile_account(
+            account="Assets:Checking",
+            statement_date="2024-01-31",
+            statement_balance="9999999.99",
+            split_guids=guids,
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "mismatch" in data["error"].lower()
+
+
+class TestVoidTransactionTool:
+    """Tests for void_transaction tool."""
+
+    def test_void_transaction(self, setup_book_env):
+        """Should void a transaction."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.void_transaction(guid, "Test void reason")
+
+        data = json.loads(result)
+        assert data["status"] == "voided"
+        assert data["void_reason"] == "Test void reason"
+
+    def test_void_transaction_no_reason(self, setup_book_env):
+        """Should return error if no reason provided."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.void_transaction(guid, "")
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestUnvoidTransactionTool:
+    """Tests for unvoid_transaction tool."""
+
+    def test_unvoid_transaction(self, setup_book_env):
+        """Should restore a voided transaction."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        # Void first
+        server_module.void_transaction(guid, "Test void")
+
+        # Then unvoid
+        result = server_module.unvoid_transaction(guid)
+
+        data = json.loads(result)
+        assert data["status"] == "unvoided"
+
+    def test_unvoid_not_voided(self, setup_book_env):
+        """Should return error if transaction not voided."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.unvoid_transaction(guid)
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "not voided" in data["error"].lower()
+
+
 class TestResources:
     """Tests for MCP resources."""
 
