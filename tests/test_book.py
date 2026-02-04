@@ -614,3 +614,268 @@ class TestUpdateTransaction:
                     {"account": "Assets:Checking", "amount": "-100.00"},
                 ],
             )
+
+
+class TestSetReconcileState:
+    """Tests for set_reconcile_state method."""
+
+    def test_set_reconcile_cleared(self, test_book: Path):
+        """Should set split to cleared state."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a split guid
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        result = gc_book.set_reconcile_state(split_guid, "c")
+
+        assert result["status"] == "updated"
+        assert result["reconcile_state"] == "c"
+
+    def test_set_reconcile_reconciled(self, test_book: Path):
+        """Should set split to reconciled state with date."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        result = gc_book.set_reconcile_state(
+            split_guid, "y", reconcile_date=date(2024, 1, 31)
+        )
+
+        assert result["status"] == "updated"
+        assert result["reconcile_state"] == "y"
+        assert result["reconcile_date"] is not None
+
+    def test_set_reconcile_new(self, test_book: Path):
+        """Should reset split to new state."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        # First set to cleared
+        gc_book.set_reconcile_state(split_guid, "c")
+
+        # Then reset to new
+        result = gc_book.set_reconcile_state(split_guid, "n")
+
+        assert result["reconcile_state"] == "n"
+        assert result["reconcile_date"] is None
+
+    def test_set_reconcile_invalid_state(self, test_book: Path):
+        """Should raise ValueError for invalid state."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+
+        with pytest.raises(ValueError, match="Invalid reconcile state"):
+            gc_book.set_reconcile_state(split_guid, "x")
+
+    def test_set_reconcile_split_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent split."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Split not found"):
+            gc_book.set_reconcile_state("nonexistent_guid", "c")
+
+
+class TestGetUnreconciledSplits:
+    """Tests for get_unreconciled_splits method."""
+
+    def test_get_unreconciled_splits(self, test_book: Path):
+        """Should return unreconciled splits for account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.get_unreconciled_splits("Assets:Checking")
+
+        assert "splits" in result
+        assert "cleared_total" in result
+        assert "uncleared_total" in result
+        assert result["account"] == "Assets:Checking"
+        # All splits should be unreconciled initially
+        assert result["count"] > 0
+
+    def test_get_unreconciled_splits_with_date(self, test_book: Path):
+        """Should filter splits by date."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get splits before a specific date
+        result = gc_book.get_unreconciled_splits(
+            "Assets:Checking", as_of_date=date(2024, 1, 10)
+        )
+
+        # All returned splits should be on or before the date
+        for split in result["splits"]:
+            assert split["date"] <= "2024-01-10"
+
+    def test_get_unreconciled_splits_account_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.get_unreconciled_splits("Nonexistent:Account")
+
+
+class TestReconcileAccount:
+    """Tests for reconcile_account method."""
+
+    def test_reconcile_account_success(self, test_book: Path):
+        """Should reconcile splits when balance matches."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get unreconciled splits
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+
+        # Calculate what the balance should be
+        total = Decimal("0")
+        guids = []
+        for split in unreconciled["splits"]:
+            total += Decimal(split["value"])
+            guids.append(split["guid"])
+
+        # Reconcile all splits
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            split_guids=guids,
+        )
+
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == len(guids)
+
+    def test_reconcile_account_balance_mismatch(self, test_book: Path):
+        """Should raise ValueError when balance doesn't match."""
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        with pytest.raises(ValueError, match="Balance mismatch"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="9999999.99",  # Wrong balance
+                split_guids=guids,
+            )
+
+    def test_reconcile_account_split_wrong_account(self, test_book: Path):
+        """Should raise ValueError if split belongs to different account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a split from a different account
+        transactions = gc_book.list_transactions()
+        expense_split = None
+        for split in transactions[0]["splits"]:
+            if "Expenses" in split["account"]:
+                expense_split = split["guid"]
+                break
+
+        if expense_split:
+            with pytest.raises(ValueError, match="belongs to account"):
+                gc_book.reconcile_account(
+                    account_name="Assets:Checking",
+                    statement_date=date(2024, 1, 31),
+                    statement_balance="0",
+                    split_guids=[expense_split],
+                )
+
+
+class TestVoidTransaction:
+    """Tests for void_transaction method."""
+
+    def test_void_transaction_success(self, test_book: Path):
+        """Should void a transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a transaction to void
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        result = gc_book.void_transaction(guid, reason="Entered in error")
+
+        assert result["status"] == "voided"
+        assert result["void_reason"] == "Entered in error"
+
+        # Verify the transaction is voided (splits have 0 value and 'v' state)
+        voided = gc_book.get_transaction(guid)
+        for split in voided["splits"]:
+            assert split["value"] == "0"
+            assert split["reconcile_state"] == "v"
+
+    def test_void_transaction_no_reason(self, test_book: Path):
+        """Should raise ValueError if no reason provided."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="reason is required"):
+            gc_book.void_transaction(guid, reason="")
+
+    def test_void_transaction_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Transaction not found"):
+            gc_book.void_transaction("nonexistent_guid", reason="Test")
+
+    def test_void_transaction_already_voided(self, test_book: Path):
+        """Should raise ValueError if already voided."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        # Void once
+        gc_book.void_transaction(guid, reason="First void")
+
+        # Try to void again
+        with pytest.raises(ValueError, match="already voided"):
+            gc_book.void_transaction(guid, reason="Second void")
+
+
+class TestUnvoidTransaction:
+    """Tests for unvoid_transaction method."""
+
+    def test_unvoid_transaction_success(self, test_book: Path):
+        """Should restore a voided transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get original transaction values
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+        original = gc_book.get_transaction(guid)
+        original_values = {s["account"]: s["value"] for s in original["splits"]}
+
+        # Void it
+        gc_book.void_transaction(guid, reason="Test void")
+
+        # Unvoid it
+        result = gc_book.unvoid_transaction(guid)
+
+        assert result["status"] == "unvoided"
+
+        # Verify values are restored
+        for split in result["splits"]:
+            assert split["value"] == original_values[split["account"]]
+            assert split["reconcile_state"] == "n"
+
+    def test_unvoid_transaction_not_voided(self, test_book: Path):
+        """Should raise ValueError if transaction is not voided."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="not voided"):
+            gc_book.unvoid_transaction(guid)
+
+    def test_unvoid_transaction_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Transaction not found"):
+            gc_book.unvoid_transaction("nonexistent_guid")
