@@ -1076,3 +1076,148 @@ class TestUnvoidTransaction:
 
         with pytest.raises(ValueError, match="Transaction not found"):
             gc_book.unvoid_transaction("nonexistent_guid")
+
+
+class TestSpendingByCategory:
+    """Tests for spending_by_category method."""
+
+    def test_spending_by_category(self, test_book: Path):
+        """Should return spending breakdown."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.spending_by_category(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+
+        assert "period" in result
+        assert "total" in result
+        assert "categories" in result
+        assert Decimal(result["total"]) > 0
+
+    def test_spending_by_category_empty_period(self, test_book: Path):
+        """Should return zero for period with no transactions."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.spending_by_category(
+            start_date=date(2020, 1, 1),
+            end_date=date(2020, 1, 31),
+        )
+
+        assert result["total"] == "0"
+        assert result["categories"] == []
+
+
+class TestIncomeBySource:
+    """Tests for income_by_source method."""
+
+    def test_income_by_source(self, test_book: Path):
+        """Should return income breakdown."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.income_by_source(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+
+        assert "period" in result
+        assert "total" in result
+        assert "sources" in result
+        assert Decimal(result["total"]) > 0
+
+
+class TestBalanceSheet:
+    """Tests for balance_sheet method."""
+
+    def test_balance_sheet(self, test_book: Path):
+        """Should return balance sheet with assets, liabilities, equity."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+
+        assert "as_of_date" in result
+        assert "assets" in result
+        assert "liabilities" in result
+        assert "equity" in result
+        assert "total" in result["assets"]
+        assert "accounts" in result["assets"]
+
+
+class TestNetWorth:
+    """Tests for net_worth method."""
+
+    def test_net_worth_point_in_time(self, test_book: Path):
+        """Should calculate net worth at a point in time."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.net_worth(end_date=date(2024, 12, 31))
+
+        assert "as_of_date" in result
+        assert "net_worth" in result
+
+    def test_net_worth_time_series(self, test_book: Path):
+        """Should calculate net worth time series."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.net_worth(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            interval="month",
+        )
+
+        assert "series" in result
+        assert len(result["series"]) > 0
+        assert "date" in result["series"][0]
+        assert "net_worth" in result["series"][0]
+
+    def test_net_worth_invalid_interval(self, test_book: Path):
+        """Should raise ValueError for invalid interval."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Invalid interval"):
+            gc_book.net_worth(
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 12, 31),
+                interval="invalid",
+            )
+
+
+class TestCashFlow:
+    """Tests for cash_flow method."""
+
+    def test_cash_flow(self, test_book: Path):
+        """Should calculate cash flow."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+
+        assert "period" in result
+        assert "inflows" in result
+        assert "outflows" in result
+        assert "net" in result
+
+    def test_cash_flow_specific_account(self, test_book: Path):
+        """Should calculate cash flow for specific account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account="Assets:Checking",
+        )
+
+        assert result["account"] == "Assets:Checking"
+
+    def test_cash_flow_invalid_account(self, test_book: Path):
+        """Should raise ValueError for invalid account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.cash_flow(
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 12, 31),
+                account="Nonexistent:Account",
+            )

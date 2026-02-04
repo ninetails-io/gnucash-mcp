@@ -628,3 +628,84 @@ class TestErrorHandling:
         assert "error" in data
         assert data["error_type"] == "unexpected_error"
         assert "RuntimeError" in data["error"]
+
+
+class TestSpendingByCategoryTool:
+    """Tests for spending_by_category tool."""
+
+    def test_spending_by_category(self, setup_book_env):
+        """Should return spending breakdown."""
+        result = server_module.spending_by_category(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+        )
+
+        data = json.loads(result)
+        assert "total" in data
+        assert "categories" in data
+
+
+class TestIncomeBySourcTool:
+    """Tests for income_by_source tool."""
+
+    def test_income_by_source(self, setup_book_env):
+        """Should return income breakdown."""
+        result = server_module.income_by_source(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+        )
+
+        data = json.loads(result)
+        assert "total" in data
+        assert "sources" in data
+
+
+class TestBalanceSheetTool:
+    """Tests for balance_sheet tool."""
+
+    def test_balance_sheet(self, setup_book_env):
+        """Should return balance sheet."""
+        result = server_module.balance_sheet(as_of_date="2024-12-31")
+
+        data = json.loads(result)
+        assert "assets" in data
+        assert "liabilities" in data
+        assert "equity" in data
+
+
+class TestNetWorthTool:
+    """Tests for net_worth tool."""
+
+    def test_net_worth_point_in_time(self, setup_book_env):
+        """Should calculate net worth at a point in time."""
+        result = server_module.net_worth(end_date="2024-12-31")
+
+        data = json.loads(result)
+        assert "net_worth" in data
+
+    def test_net_worth_time_series(self, setup_book_env):
+        """Should calculate net worth time series."""
+        result = server_module.net_worth(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            interval="month",
+        )
+
+        data = json.loads(result)
+        assert "series" in data
+
+
+class TestCashFlowTool:
+    """Tests for cash_flow tool."""
+
+    def test_cash_flow(self, setup_book_env):
+        """Should calculate cash flow."""
+        result = server_module.cash_flow(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+        )
+
+        data = json.loads(result)
+        assert "inflows" in data
+        assert "outflows" in data
+        assert "net" in data

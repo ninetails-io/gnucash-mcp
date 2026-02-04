@@ -13,7 +13,7 @@ A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to rea
 | Account Management | ✅ Complete |
 | Reconciliation | ✅ Complete |
 | Void/Unvoid | ✅ Complete |
-| Reporting | 🔲 Backlog |
+| Reporting | ✅ Complete |
 | Import/Export | 🔲 Backlog |
 
 ## Overview
@@ -47,6 +47,13 @@ This MCP server provides tools for interacting with GnuCash books stored in SQLi
 - `set_reconcile_state` - Set split state (new/cleared/reconciled)
 - `get_unreconciled_splits` - List unreconciled splits for an account
 - `reconcile_account` - Batch reconcile with statement balance validation
+
+**Reporting:**
+- `spending_by_category` - Expense breakdown by category for a period
+- `income_by_source` - Income breakdown by source for a period
+- `balance_sheet` - Assets, liabilities, equity at a point in time
+- `net_worth` - Calculate net worth (point-in-time or time series)
+- `cash_flow` - Inflows and outflows for a period
 
 ### Resources
 
@@ -138,18 +145,12 @@ gnucash-mcp/
 - [x] Reconciliation tools (set state, get unreconciled, batch reconcile)
 - [x] Void/unvoid transactions
 - [x] Account management (update, move, delete with safeguards)
+- [x] Reporting (spending, income, balance sheet, net worth, cash flow)
 
 ### 🔲 Backlog
 
 **Transaction Operations:**
 - [ ] Duplicate transaction
-
-**Reporting:**
-- [ ] Spending by category
-- [ ] Income by source
-- [ ] Balance sheet
-- [ ] Net worth over time
-- [ ] Cash flow report
 
 **Import/Export:**
 - [ ] Export transactions to CSV

@@ -443,6 +443,118 @@ def unvoid_transaction(guid: str) -> str:
     return json.dumps(result, indent=2)
 
 
+# ============== Reporting Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+def spending_by_category(
+    start_date: str,
+    end_date: str,
+    depth: int = 1,
+) -> str:
+    """Get spending breakdown by expense category for a period.
+
+    Args:
+        start_date: Start of period (YYYY-MM-DD)
+        end_date: End of period (YYYY-MM-DD)
+        depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+    """
+    book = get_book()
+    result = book.spending_by_category(
+        start_date=date.fromisoformat(start_date),
+        end_date=date.fromisoformat(end_date),
+        depth=depth,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def income_by_source(
+    start_date: str,
+    end_date: str,
+    depth: int = 1,
+) -> str:
+    """Get income breakdown by source for a period.
+
+    Args:
+        start_date: Start of period (YYYY-MM-DD)
+        end_date: End of period (YYYY-MM-DD)
+        depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+    """
+    book = get_book()
+    result = book.income_by_source(
+        start_date=date.fromisoformat(start_date),
+        end_date=date.fromisoformat(end_date),
+        depth=depth,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def balance_sheet(as_of_date: str) -> str:
+    """Generate a balance sheet as of a specific date.
+
+    Shows assets, liabilities, and equity with account breakdowns.
+
+    Args:
+        as_of_date: Date to calculate balances as of (YYYY-MM-DD)
+    """
+    book = get_book()
+    result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def net_worth(
+    end_date: str,
+    start_date: str | None = None,
+    interval: str | None = None,
+) -> str:
+    """Calculate net worth (assets minus liabilities).
+
+    Can calculate a single point-in-time value or a time series.
+
+    Args:
+        end_date: Calculate net worth as of this date (YYYY-MM-DD)
+        start_date: Optional start date for time series (YYYY-MM-DD)
+        interval: Optional interval for time series: 'month', 'quarter', or 'year'
+    """
+    book = get_book()
+    result = book.net_worth(
+        end_date=date.fromisoformat(end_date),
+        start_date=date.fromisoformat(start_date) if start_date else None,
+        interval=interval,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def cash_flow(
+    start_date: str,
+    end_date: str,
+    account: str | None = None,
+) -> str:
+    """Calculate cash flow (inflows and outflows) for a period.
+
+    Args:
+        start_date: Start of period (YYYY-MM-DD)
+        end_date: End of period (YYYY-MM-DD)
+        account: Optional specific account to analyze (defaults to all cash/bank accounts)
+    """
+    book = get_book()
+    result = book.cash_flow(
+        start_date=date.fromisoformat(start_date),
+        end_date=date.fromisoformat(end_date),
+        account=account,
+    )
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 
