@@ -199,6 +199,90 @@ class TestCreateAccountTool:
         assert "not found" in data["error"].lower()
 
 
+class TestUpdateAccountTool:
+    """Tests for update_account tool."""
+
+    def test_update_account_rename(self, setup_book_env):
+        """Should rename an account."""
+        result = server_module.update_account(
+            name="Expenses:Groceries",
+            new_name="Food",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
+        assert data["name"] == "Food"
+
+    def test_update_account_not_found(self, setup_book_env):
+        """Should return error for non-existent account."""
+        result = server_module.update_account(
+            name="Nonexistent:Account",
+            description="test",
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestMoveAccountTool:
+    """Tests for move_account tool."""
+
+    def test_move_account(self, setup_book_env):
+        """Should move an account."""
+        # First create a destination
+        server_module.create_account(
+            name="Daily",
+            account_type="EXPENSE",
+            parent="Expenses",
+            placeholder=True,
+        )
+
+        result = server_module.move_account(
+            name="Expenses:Groceries",
+            new_parent="Expenses:Daily",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "moved"
+        assert "Daily:Groceries" in data["fullname"]
+
+    def test_move_account_not_found(self, setup_book_env):
+        """Should return error for non-existent account."""
+        result = server_module.move_account(
+            name="Nonexistent:Account",
+            new_parent="Expenses",
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestDeleteAccountTool:
+    """Tests for delete_account tool."""
+
+    def test_delete_account(self, setup_book_env):
+        """Should delete an empty account."""
+        # Create an account to delete
+        server_module.create_account(
+            name="ToDelete",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        result = server_module.delete_account("Expenses:ToDelete")
+
+        data = json.loads(result)
+        assert data["status"] == "deleted"
+
+    def test_delete_account_with_children(self, setup_book_env):
+        """Should return error if account has children."""
+        result = server_module.delete_account("Expenses")
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "children" in data["error"].lower()
+
+
 class TestDeleteTransactionTool:
     """Tests for delete_transaction tool."""
 

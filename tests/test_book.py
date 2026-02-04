@@ -467,6 +467,203 @@ class TestCreateAccount:
         assert result["status"] == "created"
 
 
+class TestUpdateAccount:
+    """Tests for update_account method."""
+
+    def test_update_account_rename(self, test_book: Path):
+        """Should rename an account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.update_account(
+            name="Expenses:Groceries",
+            new_name="Food & Groceries",
+        )
+
+        assert result["status"] == "updated"
+        assert result["name"] == "Food & Groceries"
+
+        # Verify old name doesn't exist
+        assert gc_book.get_account("Expenses:Groceries") is None
+        # Verify new name exists
+        assert gc_book.get_account("Expenses:Food & Groceries") is not None
+
+    def test_update_account_description(self, test_book: Path):
+        """Should update account description."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.update_account(
+            name="Expenses:Groceries",
+            description="Weekly grocery shopping",
+        )
+
+        assert result["status"] == "updated"
+        assert result["description"] == "Weekly grocery shopping"
+
+    def test_update_account_placeholder(self, test_book: Path):
+        """Should update placeholder status."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.update_account(
+            name="Expenses",
+            placeholder=True,
+        )
+
+        assert result["status"] == "updated"
+        assert result["placeholder"] is True
+
+    def test_update_account_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.update_account(
+                name="Nonexistent:Account",
+                description="test",
+            )
+
+    def test_update_account_name_conflict(self, test_book: Path):
+        """Should raise ValueError if new name conflicts with sibling."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create another expense account
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Try to rename Groceries to Dining
+        with pytest.raises(ValueError, match="already exists"):
+            gc_book.update_account(
+                name="Expenses:Groceries",
+                new_name="Dining",
+            )
+
+
+class TestMoveAccount:
+    """Tests for move_account method."""
+
+    def test_move_account_success(self, test_book: Path):
+        """Should move an account to new parent."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a new parent category
+        gc_book.create_account(
+            name="Daily Expenses",
+            account_type="EXPENSE",
+            parent="Expenses",
+            placeholder=True,
+        )
+
+        # Move Groceries under Daily Expenses
+        result = gc_book.move_account(
+            name="Expenses:Groceries",
+            new_parent="Expenses:Daily Expenses",
+        )
+
+        assert result["status"] == "moved"
+        assert result["fullname"] == "Expenses:Daily Expenses:Groceries"
+
+    def test_move_account_not_found(self, test_book: Path):
+        """Should raise ValueError if account not found."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.move_account(
+                name="Nonexistent:Account",
+                new_parent="Expenses",
+            )
+
+    def test_move_account_parent_not_found(self, test_book: Path):
+        """Should raise ValueError if new parent not found."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Parent account not found"):
+            gc_book.move_account(
+                name="Expenses:Groceries",
+                new_parent="Nonexistent:Parent",
+            )
+
+    def test_move_account_circular_reference(self, test_book: Path):
+        """Should raise ValueError if move would create circular reference."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a child under Groceries
+        gc_book.create_account(
+            name="Organic",
+            account_type="EXPENSE",
+            parent="Expenses:Groceries",
+        )
+
+        # Try to move Groceries under its own child
+        with pytest.raises(ValueError, match="Cannot move account under itself"):
+            gc_book.move_account(
+                name="Expenses:Groceries",
+                new_parent="Expenses:Groceries:Organic",
+            )
+
+    def test_move_account_name_conflict(self, test_book: Path):
+        """Should raise ValueError if name conflicts in new location."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create an account under Assets with same name as one under Expenses
+        gc_book.create_account(
+            name="Groceries",
+            account_type="ASSET",
+            parent="Assets",
+        )
+
+        # Try to move Expenses:Groceries to Assets (conflict with Assets:Groceries)
+        with pytest.raises(ValueError, match="already exists"):
+            gc_book.move_account(
+                name="Expenses:Groceries",
+                new_parent="Assets",
+            )
+
+
+class TestDeleteAccount:
+    """Tests for delete_account method."""
+
+    def test_delete_account_success(self, test_book: Path):
+        """Should delete an empty account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a new account to delete
+        gc_book.create_account(
+            name="To Delete",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        result = gc_book.delete_account("Expenses:To Delete")
+
+        assert result["status"] == "deleted"
+        assert gc_book.get_account("Expenses:To Delete") is None
+
+    def test_delete_account_not_found(self, test_book: Path):
+        """Should raise ValueError if account not found."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.delete_account("Nonexistent:Account")
+
+    def test_delete_account_with_children(self, test_book: Path):
+        """Should raise ValueError if account has children."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Expenses has Groceries as a child
+        with pytest.raises(ValueError, match="Cannot delete account with children"):
+            gc_book.delete_account("Expenses")
+
+    def test_delete_account_with_transactions(self, test_book: Path):
+        """Should raise ValueError if account has transactions."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Groceries has transactions
+        with pytest.raises(ValueError, match="Cannot delete account with"):
+            gc_book.delete_account("Expenses:Groceries")
+
+
 class TestDeleteTransaction:
     """Tests for delete_transaction method."""
 
