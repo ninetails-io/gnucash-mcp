@@ -11,7 +11,8 @@ A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to rea
 | Core Read Tools | ✅ Complete |
 | Core Write Tools | ✅ Complete |
 | Account Management | ✅ Basic (create), 🔲 Extended (update/move/delete) |
-| Reconciliation | 🔲 Backlog |
+| Reconciliation | ✅ Complete |
+| Void/Unvoid | ✅ Complete |
 | Reporting | 🔲 Backlog |
 | Import/Export | 🔲 Backlog |
 
@@ -36,6 +37,13 @@ This MCP server provides tools for interacting with GnuCash books stored in SQLi
 - `update_transaction` - Update description, date, or splits of existing transaction
 - `delete_transaction` - Delete a transaction by GUID
 - `search_transactions` - Search transactions by description, memo, or amount
+- `void_transaction` - Void a transaction (preserves audit trail)
+- `unvoid_transaction` - Restore a voided transaction
+
+**Reconciliation:**
+- `set_reconcile_state` - Set split state (new/cleared/reconciled)
+- `get_unreconciled_splits` - List unreconciled splits for an account
+- `reconcile_account` - Batch reconcile with statement balance validation
 
 ### Resources
 
@@ -124,6 +132,8 @@ gnucash-mcp/
 - [x] Search by description, memo, or amount
 - [x] Account creation
 - [x] Hardened error handling throughout
+- [x] Reconciliation tools (set state, get unreconciled, batch reconcile)
+- [x] Void/unvoid transactions
 
 ### 🔲 Backlog
 
@@ -132,14 +142,7 @@ gnucash-mcp/
 - [ ] Move account (change parent)
 - [ ] Delete account (with safeguards)
 
-**Reconciliation:**
-- [ ] Set reconcile state on splits (new/cleared/reconciled)
-- [ ] Get unreconciled splits for account
-- [ ] Statement reconciliation workflow
-
 **Transaction Operations:**
-- [ ] Void transaction (proper accounting, not delete)
-- [ ] Unvoid transaction
 - [ ] Duplicate transaction
 
 **Reporting:**
