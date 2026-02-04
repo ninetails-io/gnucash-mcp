@@ -234,6 +234,61 @@ def create_account(
 
 @mcp.tool()
 @safe_tool
+def update_account(
+    name: str,
+    new_name: str | None = None,
+    description: str | None = None,
+    placeholder: bool | None = None,
+) -> str:
+    """Update an existing account's properties.
+
+    Args:
+        name: Full account path to update (e.g., "Expenses:Groceries")
+        new_name: New name for the account (just the leaf name, not full path)
+        description: New description
+        placeholder: New placeholder status (true = container only)
+    """
+    book = get_book()
+    result = book.update_account(
+        name=name,
+        new_name=new_name,
+        description=description,
+        placeholder=placeholder,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def move_account(name: str, new_parent: str) -> str:
+    """Move an account to a new parent in the hierarchy.
+
+    Args:
+        name: Full account path to move (e.g., "Expenses:Old:Account")
+        new_parent: Full path of the new parent account (e.g., "Expenses:New")
+    """
+    book = get_book()
+    result = book.move_account(name=name, new_parent=new_parent)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+def delete_account(name: str) -> str:
+    """Delete an account from the chart of accounts.
+
+    Safeguards prevent deletion if the account has children or transactions.
+
+    Args:
+        name: Full account path to delete (e.g., "Expenses:Old Category")
+    """
+    book = get_book()
+    result = book.delete_account(name=name)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
 def delete_transaction(guid: str) -> str:
     """Delete a transaction by GUID.
 

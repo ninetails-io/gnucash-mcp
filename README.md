@@ -10,7 +10,7 @@ A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to rea
 |----------|--------|
 | Core Read Tools | ✅ Complete |
 | Core Write Tools | ✅ Complete |
-| Account Management | ✅ Basic (create), 🔲 Extended (update/move/delete) |
+| Account Management | ✅ Complete |
 | Reconciliation | ✅ Complete |
 | Void/Unvoid | ✅ Complete |
 | Reporting | 🔲 Backlog |
@@ -29,6 +29,9 @@ This MCP server provides tools for interacting with GnuCash books stored in SQLi
 - `get_account` - Get details for a specific account
 - `get_balance` - Get current or historical balance for an account
 - `create_account` - Create a new account in the chart of accounts
+- `update_account` - Rename account, update description or placeholder status
+- `move_account` - Move account to a new parent in the hierarchy
+- `delete_account` - Delete account (with safeguards for children/transactions)
 
 **Transaction Operations:**
 - `list_transactions` - List transactions with optional filters (account, date range, limit)
@@ -134,13 +137,9 @@ gnucash-mcp/
 - [x] Hardened error handling throughout
 - [x] Reconciliation tools (set state, get unreconciled, batch reconcile)
 - [x] Void/unvoid transactions
+- [x] Account management (update, move, delete with safeguards)
 
 ### 🔲 Backlog
-
-**Account Management:**
-- [ ] Update/rename account
-- [ ] Move account (change parent)
-- [ ] Delete account (with safeguards)
 
 **Transaction Operations:**
 - [ ] Duplicate transaction

@@ -475,6 +475,140 @@ class GnuCashBook:
                 "status": "created",
             }
 
+    def update_account(
+        self,
+        name: str,
+        new_name: str | None = None,
+        description: str | None = None,
+        placeholder: bool | None = None,
+    ) -> dict:
+        """Update an existing account's properties.
+
+        Args:
+            name: Full account path to update (e.g., "Expenses:Groceries").
+            new_name: New name for the account (just the name, not full path).
+            description: New description.
+            placeholder: New placeholder status.
+
+        Returns:
+            Dict with updated account details.
+
+        Raises:
+            ValueError: If account not found or new name conflicts.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, name)
+            if not account:
+                raise ValueError(f"Account not found: {name}")
+
+            # Check for name conflict if renaming
+            if new_name and new_name != account.name:
+                if account.parent:
+                    for sibling in account.parent.children:
+                        if sibling.name == new_name and sibling.guid != account.guid:
+                            raise ValueError(
+                                f"Account '{new_name}' already exists under "
+                                f"'{account.parent.fullname}'"
+                            )
+                account.name = new_name
+
+            if description is not None:
+                account.description = description
+
+            if placeholder is not None:
+                account.placeholder = placeholder
+
+            book.save()
+
+            return _account_to_dict(account) | {"status": "updated"}
+
+    def move_account(self, name: str, new_parent: str) -> dict:
+        """Move an account to a new parent in the hierarchy.
+
+        Args:
+            name: Full account path to move (e.g., "Expenses:Old:Account").
+            new_parent: Full path of the new parent account.
+
+        Returns:
+            Dict with updated account details including new fullname.
+
+        Raises:
+            ValueError: If account or parent not found, or would create cycle.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, name)
+            if not account:
+                raise ValueError(f"Account not found: {name}")
+
+            new_parent_account = self._find_account(book, new_parent)
+            if not new_parent_account:
+                raise ValueError(f"Parent account not found: {new_parent}")
+
+            # Check for circular reference (can't move to self or descendant)
+            check = new_parent_account
+            while check:
+                if check.guid == account.guid:
+                    raise ValueError(
+                        f"Cannot move account under itself or its descendants"
+                    )
+                check = check.parent
+
+            # Check for name conflict in new location
+            for sibling in new_parent_account.children:
+                if sibling.name == account.name:
+                    raise ValueError(
+                        f"Account '{account.name}' already exists under '{new_parent}'"
+                    )
+
+            account.parent = new_parent_account
+
+            book.save()
+
+            return _account_to_dict(account) | {"status": "moved"}
+
+    def delete_account(self, name: str) -> dict:
+        """Delete an account from the chart of accounts.
+
+        Args:
+            name: Full account path to delete.
+
+        Returns:
+            Dict with deleted account info and status.
+
+        Raises:
+            ValueError: If account not found, has children, or has transactions.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, name)
+            if not account:
+                raise ValueError(f"Account not found: {name}")
+
+            # Safeguard: Check for children
+            if account.children:
+                child_names = [c.name for c in account.children]
+                raise ValueError(
+                    f"Cannot delete account with children: {', '.join(child_names)}"
+                )
+
+            # Safeguard: Check for transactions (splits)
+            if account.splits:
+                raise ValueError(
+                    f"Cannot delete account with {len(account.splits)} transaction(s). "
+                    f"Move or delete transactions first."
+                )
+
+            # Capture info before deletion
+            result = {
+                "guid": account.guid,
+                "fullname": account.fullname,
+                "status": "deleted",
+            }
+
+            book.session.delete(account)
+            book.save()
+
+            return result
+
     def delete_transaction(self, guid: str) -> dict:
         """Delete a transaction by GUID.
 
