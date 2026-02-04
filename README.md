@@ -2,26 +2,44 @@
 
 A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to read and write accounting data.
 
+## Project Status
+
+**Current Phase:** Core functionality complete, extending capabilities
+
+| Category | Status |
+|----------|--------|
+| Core Read Tools | ✅ Complete |
+| Core Write Tools | ✅ Complete |
+| Account Management | ✅ Basic (create), 🔲 Extended (update/move/delete) |
+| Reconciliation | 🔲 Backlog |
+| Reporting | 🔲 Backlog |
+| Import/Export | 🔲 Backlog |
+
 ## Overview
 
 This MCP server provides tools for interacting with GnuCash books stored in SQLite format. It uses [piecash](https://github.com/sdementen/piecash) for GnuCash file access and the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) for the protocol implementation.
 
 ## Features
 
-### Tools
+### Implemented Tools
 
+**Account Operations:**
 - `list_accounts` - List all accounts in the chart of accounts
 - `get_account` - Get details for a specific account
 - `get_balance` - Get current or historical balance for an account
+- `create_account` - Create a new account in the chart of accounts
+
+**Transaction Operations:**
 - `list_transactions` - List transactions with optional filters (account, date range, limit)
-- `get_transaction` - Get details for a specific transaction
+- `get_transaction` - Get details for a specific transaction by GUID
 - `create_transaction` - Create a new transaction with splits
-- `search_transactions` - Search transactions by description, payee, or amount
+- `update_transaction` - Update description, date, or splits of existing transaction
+- `delete_transaction` - Delete a transaction by GUID
+- `search_transactions` - Search transactions by description, memo, or amount
 
 ### Resources
 
-- `gnucash://accounts` - Chart of accounts
-- `gnucash://balance/{account_name}` - Account balance
+- `gnucash://accounts` - Chart of accounts as JSON
 
 ## Requirements
 
@@ -98,13 +116,48 @@ gnucash-mcp/
 
 ## Roadmap
 
-- [ ] Core tools (list, get, create transactions)
-- [ ] Balance queries
-- [ ] Search functionality
-- [ ] Reporting tools (spending by category, income by source)
-- [ ] Duplicate detection
-- [ ] Reconciliation support
-- [ ] Import from CSV/OFX
+### ✅ Completed
+
+- [x] Core read tools (list/get accounts, transactions, balances)
+- [x] Transaction creation with split validation
+- [x] Transaction update and delete
+- [x] Search by description, memo, or amount
+- [x] Account creation
+- [x] Hardened error handling throughout
+
+### 🔲 Backlog
+
+**Account Management:**
+- [ ] Update/rename account
+- [ ] Move account (change parent)
+- [ ] Delete account (with safeguards)
+
+**Reconciliation:**
+- [ ] Set reconcile state on splits (new/cleared/reconciled)
+- [ ] Get unreconciled splits for account
+- [ ] Statement reconciliation workflow
+
+**Transaction Operations:**
+- [ ] Void transaction (proper accounting, not delete)
+- [ ] Unvoid transaction
+- [ ] Duplicate transaction
+
+**Reporting:**
+- [ ] Spending by category
+- [ ] Income by source
+- [ ] Balance sheet
+- [ ] Net worth over time
+- [ ] Cash flow report
+
+**Import/Export:**
+- [ ] Export transactions to CSV
+- [ ] Export account register to CSV
+- [ ] Import from CSV (with field mapping)
+- [ ] Import from OFX/QFX
+
+**Advanced:**
+- [ ] Duplicate transaction detection
+- [ ] Scheduled transactions (if piecash supports full CRUD)
 
 ## License
 
