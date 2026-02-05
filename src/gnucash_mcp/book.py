@@ -97,7 +97,7 @@ class GnuCashBook:
         for attempt in range(max_retries):
             try:
                 start_time = time.time()
-                book = piecash.open_book(str(self.book_path), readonly=readonly)
+                book = piecash.open_book(str(self.book_path), readonly=readonly, do_backup=False)
                 open_elapsed = (time.time() - start_time) * 1000
                 debug_logger.debug(
                     f"Book opened (readonly={readonly}) in {open_elapsed:.0f}ms"
