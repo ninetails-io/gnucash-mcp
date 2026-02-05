@@ -14,6 +14,7 @@ A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to rea
 | Reconciliation | ✅ Complete |
 | Void/Unvoid | ✅ Complete |
 | Reporting | ✅ Complete |
+| Audit Logging | ✅ Complete |
 | Import/Export | 🔲 Backlog |
 
 ## Overview
@@ -54,6 +55,9 @@ This MCP server provides tools for interacting with GnuCash books stored in SQLi
 - `balance_sheet` - Assets, liabilities, equity at a point in time
 - `net_worth` - Calculate net worth (point-in-time or time series)
 - `cash_flow` - Inflows and outflows for a period
+
+**Audit Logging:**
+- `get_audit_log` - Read audit log entries with optional filters
 
 ### Resources
 
@@ -132,6 +136,33 @@ gnucash-mcp/
 - piecash automatically creates backups before modifications
 - Consider using a copy of your book for testing
 
+## Audit Logging
+
+All write operations (mutations) are logged to an audit trail stored alongside your book:
+
+```
+/path/to/book.gnucash.mcp/
+  audit/YYYY-MM-DD.txt    # Human-readable audit log (default)
+  debug/YYYY-MM-DD.log    # Debug log (when enabled)
+```
+
+**Formats:**
+- `text` (default): Human-readable format, logs only write operations
+- `json`: JSONL format, logs all operations including reads
+
+**CLI Options:**
+```bash
+gnucash-mcp --help                    # Show all options
+gnucash-mcp --audit-format=json       # Use JSON format
+gnucash-mcp --noaudit                 # Disable audit logging
+gnucash-mcp --debug                   # Enable debug logging
+```
+
+**Environment Variables:**
+- `GNUCASH_MCP_AUDIT_FORMAT=text|json`
+- `GNUCASH_MCP_NOAUDIT=1`
+- `GNUCASH_MCP_DEBUG=1`
+
 ## Roadmap
 
 ### ✅ Completed
@@ -146,6 +177,7 @@ gnucash-mcp/
 - [x] Void/unvoid transactions
 - [x] Account management (update, move, delete with safeguards)
 - [x] Reporting (spending, income, balance sheet, net worth, cash flow)
+- [x] Audit logging (text and JSON formats, debug logging)
 
 ### 🔲 Backlog
 

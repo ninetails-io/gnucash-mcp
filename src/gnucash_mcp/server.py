@@ -3,14 +3,17 @@
 import json
 import logging
 import os
+import sys
 import traceback
 from datetime import date
 from functools import wraps
+from pathlib import Path
 from typing import Callable
 
 from mcp.server.fastmcp import FastMCP
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
+from gnucash_mcp.logging_config import audit_log, debug_log, get_log_dir, setup_logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -31,6 +34,27 @@ def get_book() -> GnuCashBook:
             raise ValueError("GNUCASH_BOOK_PATH environment variable not set")
         _book = GnuCashBook(path)
     return _book
+
+
+# Initialize logging at module import time
+# Use GNUCASH_MCP_DEBUG=1 env var to enable debug logging
+# Use GNUCASH_MCP_NOAUDIT=1 env var to disable audit logging
+# Use GNUCASH_MCP_AUDIT_FORMAT=json|text env var to set audit format (default: text)
+# Logs are stored alongside the book file: {book_path}.mcp/audit/ and {book_path}.mcp/debug/
+_debug_mode = os.environ.get("GNUCASH_MCP_DEBUG") == "1"
+_audit_mode = os.environ.get("GNUCASH_MCP_NOAUDIT") != "1"
+_audit_format = os.environ.get("GNUCASH_MCP_AUDIT_FORMAT", "text")
+_book_path = os.environ.get("GNUCASH_BOOK_PATH")
+if _book_path and (_audit_mode or _debug_mode):
+    setup_logging(
+        book_path=_book_path,
+        debug=_debug_mode,
+        audit=_audit_mode,
+        audit_format=_audit_format,
+        get_book=get_book,
+    )
+    if _debug_mode:
+        debug_log(f"Server module loaded. Book path: {_book_path}")
 
 
 def safe_tool(func: Callable) -> Callable:
@@ -85,6 +109,7 @@ def safe_tool(func: Callable) -> Callable:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def list_accounts() -> str:
     """List all accounts in the GnuCash chart of accounts."""
     book = get_book()
@@ -94,6 +119,7 @@ def list_accounts() -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def get_account(name: str) -> str:
     """Get details for a specific account by name.
 
@@ -109,6 +135,7 @@ def get_account(name: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def get_balance(account_name: str, as_of_date: str | None = None) -> str:
     """Get the balance of an account, optionally as of a specific date.
 
@@ -129,6 +156,7 @@ def get_balance(account_name: str, as_of_date: str | None = None) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def list_transactions(
     account: str | None = None,
     start_date: str | None = None,
@@ -152,6 +180,7 @@ def list_transactions(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def get_transaction(guid: str) -> str:
     """Get details for a specific transaction by GUID.
 
@@ -167,6 +196,7 @@ def get_transaction(guid: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction(
     description: str,
     splits: list[dict],
@@ -191,6 +221,7 @@ def create_transaction(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def search_transactions(query: str, field: str = "description") -> str:
     """Search transactions by description, memo, or amount.
 
@@ -205,6 +236,7 @@ def search_transactions(query: str, field: str = "description") -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="create", entity_type="account")
 def create_account(
     name: str,
     account_type: str,
@@ -234,6 +266,7 @@ def create_account(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="update", entity_type="account")
 def update_account(
     name: str,
     new_name: str | None = None,
@@ -260,6 +293,7 @@ def update_account(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="update", entity_type="account")
 def move_account(name: str, new_parent: str) -> str:
     """Move an account to a new parent in the hierarchy.
 
@@ -274,6 +308,7 @@ def move_account(name: str, new_parent: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="delete", entity_type="account")
 def delete_account(name: str) -> str:
     """Delete an account from the chart of accounts.
 
@@ -289,6 +324,7 @@ def delete_account(name: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="delete", entity_type="transaction")
 def delete_transaction(guid: str) -> str:
     """Delete a transaction by GUID.
 
@@ -302,6 +338,7 @@ def delete_transaction(guid: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="update", entity_type="transaction")
 def update_transaction(
     guid: str,
     description: str | None = None,
@@ -333,6 +370,7 @@ def update_transaction(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="set_state", entity_type="split")
 def set_reconcile_state(
     split_guid: str,
     state: str,
@@ -357,6 +395,7 @@ def set_reconcile_state(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def get_unreconciled_splits(
     account: str,
     as_of_date: str | None = None,
@@ -378,6 +417,7 @@ def get_unreconciled_splits(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="reconcile", entity_type="split")
 def reconcile_account(
     account: str,
     statement_date: str,
@@ -412,6 +452,7 @@ def reconcile_account(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="void", entity_type="transaction")
 def void_transaction(guid: str, reason: str) -> str:
     """Void a transaction (proper accounting void, not delete).
 
@@ -430,6 +471,7 @@ def void_transaction(guid: str, reason: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="unvoid", entity_type="transaction")
 def unvoid_transaction(guid: str) -> str:
     """Restore a voided transaction.
 
@@ -448,6 +490,7 @@ def unvoid_transaction(guid: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def spending_by_category(
     start_date: str,
     end_date: str,
@@ -471,6 +514,7 @@ def spending_by_category(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def income_by_source(
     start_date: str,
     end_date: str,
@@ -494,6 +538,7 @@ def income_by_source(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def balance_sheet(as_of_date: str) -> str:
     """Generate a balance sheet as of a specific date.
 
@@ -509,6 +554,7 @@ def balance_sheet(as_of_date: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def net_worth(
     end_date: str,
     start_date: str | None = None,
@@ -534,6 +580,7 @@ def net_worth(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="read")
 def cash_flow(
     start_date: str,
     end_date: str,
@@ -566,11 +613,118 @@ def accounts_resource() -> str:
     return json.dumps(accounts, indent=2)
 
 
+# ============== Audit Log Tool ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_audit_log(
+    log_date: str | None = None,
+    tool_filter: str | None = None,
+    classification: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Read audit log entries.
+
+    Args:
+        log_date: Date to read (YYYY-MM-DD). Defaults to today.
+        tool_filter: Filter by tool name.
+        classification: Filter by "read" or "write".
+        limit: Maximum entries to return (default 50).
+    """
+    from datetime import datetime, timezone
+
+    log_dir = get_log_dir()
+    if not log_dir:
+        return json.dumps({"error": "Logging not initialized (no book path configured)"})
+
+    audit_dir = log_dir / "audit"
+    target_date = log_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log_file = audit_dir / f"{target_date}.jsonl"
+
+    if not log_file.exists():
+        return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
+
+    entries = []
+    for line in log_file.read_text().strip().split("\n"):
+        if not line:
+            continue
+        entry = json.loads(line)
+        if tool_filter and entry.get("tool") != tool_filter:
+            continue
+        if classification and entry.get("classification") != classification:
+            continue
+        entries.append(entry)
+
+    # Return most recent entries up to limit
+    return json.dumps(
+        {"entries": entries[-limit:], "total_count": len(entries)}, indent=2
+    )
+
+
 # ============== Main ==============
 
 
 def main() -> None:
     """Run the MCP server."""
+    # Handle --help
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("""GnuCash MCP Server
+
+Usage: gnucash-mcp [OPTIONS]
+
+Options:
+  --debug                Enable debug logging (MCP protocol traffic, timing)
+  --noaudit              Disable audit logging
+  --audit-format=FORMAT  Audit log format: "text" (default) or "json"
+  -h, --help             Show this help message
+
+Environment variables:
+  GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required)
+  GNUCASH_MCP_DEBUG=1        Enable debug logging
+  GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_MCP_AUDIT_FORMAT   Audit format: "text" or "json"
+
+Logs are stored alongside the book file:
+  {book_path}.mcp/audit/YYYY-MM-DD.txt   (or .jsonl for JSON format)
+  {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
+""")
+        sys.exit(0)
+
+    book_path = os.environ.get("GNUCASH_BOOK_PATH")
+
+    # Parse CLI flags
+    debug_flag = "--debug" in sys.argv
+    noaudit_flag = "--noaudit" in sys.argv
+    audit_format = "text"  # default
+
+    # Parse --audit-format=json or --audit-format=text
+    for arg in sys.argv[:]:
+        if arg.startswith("--audit-format="):
+            audit_format = arg.split("=", 1)[1]
+            sys.argv.remove(arg)
+
+    if "--debug" in sys.argv:
+        sys.argv.remove("--debug")
+    if "--noaudit" in sys.argv:
+        sys.argv.remove("--noaudit")
+
+    # Re-init logging if CLI flags override env vars
+    if debug_flag or noaudit_flag or audit_format != "text":
+        audit_enabled = not noaudit_flag
+        if book_path and (audit_enabled or debug_flag):
+            setup_logging(
+                book_path=book_path,
+                debug=debug_flag,
+                audit=audit_enabled,
+                audit_format=audit_format,
+                get_book=get_book,
+            )
+            if debug_flag:
+                debug_log(f"Server starting via CLI. Book: {book_path}")
+                debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}, format={audit_format}")
+
     mcp.run()
 
 

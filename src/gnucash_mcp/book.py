@@ -1,5 +1,6 @@
 """GnuCash book wrapper using piecash."""
 
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -9,6 +10,9 @@ from pathlib import Path
 from typing import Generator
 
 import piecash
+
+# Debug logger - configured by logging_config.setup_logging()
+debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
 class GnuCashLockError(Exception):
@@ -92,12 +96,20 @@ class GnuCashBook:
         last_error = None
         for attempt in range(max_retries):
             try:
+                start_time = time.time()
                 book = piecash.open_book(str(self.book_path), readonly=readonly)
+                open_elapsed = (time.time() - start_time) * 1000
+                debug_logger.debug(
+                    f"Book opened (readonly={readonly}) in {open_elapsed:.0f}ms"
+                )
                 try:
                     yield book
                     return
                 finally:
+                    close_start = time.time()
                     book.close()
+                    close_elapsed = (time.time() - close_start) * 1000
+                    debug_logger.debug(f"Book closed in {close_elapsed:.0f}ms")
             except sqlite3.OperationalError as e:
                 last_error = e
                 error_msg = str(e).lower()
