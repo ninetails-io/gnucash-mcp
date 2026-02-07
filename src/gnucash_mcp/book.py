@@ -49,13 +49,16 @@ def _split_to_dict(split: piecash.Split) -> dict:
 
 def _transaction_to_dict(transaction: piecash.Transaction) -> dict:
     """Convert a piecash Transaction to a serializable dict."""
-    return {
+    result = {
         "guid": transaction.guid,
         "date": transaction.post_date.isoformat(),
         "description": transaction.description,
         "currency": transaction.currency.mnemonic,
         "splits": [_split_to_dict(s) for s in transaction.splits],
     }
+    if transaction.notes:
+        result["notes"] = transaction.notes
+    return result
 
 
 class GnuCashBook:
@@ -355,6 +358,7 @@ class GnuCashBook:
         splits: list[dict],
         trans_date: date | None = None,
         currency: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Create a new transaction with splits.
 
@@ -369,6 +373,8 @@ class GnuCashBook:
             trans_date: Transaction date. Defaults to today.
             currency: ISO currency code for the transaction (e.g., "USD", "EUR").
                       Defaults to book's default currency.
+            notes: Transaction notes (optional). Free-text annotation
+                   stored separately from the description.
 
         Returns:
             GUID of the created transaction.
@@ -443,6 +449,7 @@ class GnuCashBook:
             transaction = piecash.Transaction(
                 currency=trans_currency,
                 description=description,
+                notes=notes,
                 post_date=trans_date,
                 splits=piecash_splits,
             )
@@ -459,7 +466,8 @@ class GnuCashBook:
                    - Greater than: ">100"
                    - Less than: "<100"
                    - Range: "100-200"
-            field: Field to search: 'description', 'memo', or 'amount'.
+            field: Field to search: 'description', 'memo', 'notes',
+                   or 'amount'.
 
         Returns:
             List of matching transactions.
@@ -467,7 +475,7 @@ class GnuCashBook:
         Raises:
             ValueError: If field is not valid.
         """
-        if field not in ("description", "memo", "amount"):
+        if field not in ("description", "memo", "notes", "amount"):
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
@@ -476,6 +484,10 @@ class GnuCashBook:
             for transaction in book.transactions:
                 if field == "description":
                     if query.lower() in transaction.description.lower():
+                        results.append(_transaction_to_dict(transaction))
+
+                elif field == "notes":
+                    if transaction.notes and query.lower() in transaction.notes.lower():
                         results.append(_transaction_to_dict(transaction))
 
                 elif field == "memo":
@@ -803,6 +815,7 @@ class GnuCashBook:
         description: str | None = None,
         trans_date: date | None = None,
         splits: list[dict] | None = None,
+        notes: str | None = None,
     ) -> dict:
         """Update an existing transaction.
 
@@ -815,6 +828,8 @@ class GnuCashBook:
                     splits by account name. For cross-currency splits,
                     'quantity' is required when the account commodity differs
                     from the transaction currency.
+            notes: New transaction notes (optional). Pass empty string
+                   to clear existing notes.
 
         Returns:
             Dict with updated transaction details.
@@ -832,6 +847,10 @@ class GnuCashBook:
             # Update description if provided
             if description is not None:
                 transaction.description = description
+
+            # Update notes if provided
+            if notes is not None:
+                transaction.notes = notes if notes else None
 
             # Update date if provided
             if trans_date is not None:
