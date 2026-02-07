@@ -215,6 +215,7 @@ def create_transaction(
     splits: list[dict],
     transaction_date: str | None = None,
     currency: str | None = None,
+    notes: str | None = None,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -229,6 +230,8 @@ def create_transaction(
         transaction_date: Transaction date in ISO format (YYYY-MM-DD). Defaults to today.
         currency: ISO currency code for transaction (e.g., "USD", "EUR").
                   Defaults to book's default currency.
+        notes: Transaction notes (optional). Free-text annotation stored
+               separately from description.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -237,6 +240,7 @@ def create_transaction(
         splits=splits,
         trans_date=trans_date,
         currency=currency,
+        notes=notes,
     )
     return json.dumps({"guid": guid, "status": "created"}, indent=2)
 
@@ -245,11 +249,11 @@ def create_transaction(
 @safe_tool
 @audit_log(classification="read")
 def search_transactions(query: str, field: str = "description") -> str:
-    """Search transactions by description, memo, or amount.
+    """Search transactions by description, memo, notes, or amount.
 
     Args:
         query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
-        field: Field to search: 'description', 'memo', or 'amount'
+        field: Field to search: 'description', 'memo', 'notes', or 'amount'
     """
     book = get_book()
     result = book.search_transactions(query, field)
@@ -369,6 +373,7 @@ def update_transaction(
     description: str | None = None,
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
+    notes: str | None = None,
 ) -> str:
     """Update an existing transaction.
 
@@ -379,6 +384,7 @@ def update_transaction(
         splits: List of split updates with 'account' and 'amount' (optional).
                 Must match existing splits by account name and balance to zero.
                 For cross-currency splits, include 'quantity' (amount in account's commodity).
+        notes: New transaction notes (optional). Pass empty string to clear.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -387,6 +393,7 @@ def update_transaction(
         description=description,
         trans_date=trans_date,
         splits=splits,
+        notes=notes,
     )
     return json.dumps(result, indent=2)
 

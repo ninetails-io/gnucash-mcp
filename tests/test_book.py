@@ -295,6 +295,41 @@ class TestCreateTransaction:
                 ],
             )
 
+    def test_create_transaction_with_notes(self, test_book: Path):
+        """Should create transaction with notes field."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="Safeway",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "75.00", "memo": "Meats"},
+                {"account": "Assets:Checking", "amount": "-75.00"},
+            ],
+            notes="P2W1 groceries",
+        )
+
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["description"] == "Safeway"
+        assert transaction["notes"] == "P2W1 groceries"
+        # Verify memo is separate from notes
+        memos = {s["memo"] for s in transaction["splits"]}
+        assert "Meats" in memos
+
+    def test_create_transaction_without_notes(self, test_book: Path):
+        """Transaction without notes should not include notes key."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="No Notes",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+
+        transaction = gc_book.get_transaction(guid)
+        assert "notes" not in transaction
+
 
 class TestSearchTransactions:
     """Tests for search_transactions method."""
@@ -345,6 +380,32 @@ class TestSearchTransactions:
         results = gc_book.search_transactions("100-500", field="amount")
         assert len(results) == 1
         assert results[0]["description"] == "Weekly Groceries"
+
+    def test_search_by_notes(self, test_book: Path):
+        """Should find transactions by notes field."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a transaction with notes
+        gc_book.create_transaction(
+            description="Safeway",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30.00"},
+                {"account": "Assets:Checking", "amount": "-30.00"},
+            ],
+            notes="P2W1 groceries",
+        )
+
+        results = gc_book.search_transactions("P2W1", field="notes")
+        assert len(results) == 1
+        assert results[0]["description"] == "Safeway"
+        assert results[0]["notes"] == "P2W1 groceries"
+
+    def test_search_by_notes_no_match(self, test_book: Path):
+        """Should return empty list when no notes match."""
+        gc_book = GnuCashBook(str(test_book))
+
+        results = gc_book.search_transactions("nonexistent", field="notes")
+        assert len(results) == 0
 
     def test_search_invalid_field(self, test_book: Path):
         """Should raise ValueError for invalid field."""
@@ -811,6 +872,47 @@ class TestUpdateTransaction:
                     {"account": "Assets:Checking", "amount": "-100.00"},
                 ],
             )
+
+    def test_update_notes(self, test_book: Path):
+        """Should add notes to an existing transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            notes="P2W1 groceries",
+        )
+
+        assert result["status"] == "updated"
+        assert result["notes"] == "P2W1 groceries"
+
+        # Verify persistence
+        updated = gc_book.get_transaction(guid)
+        assert updated["notes"] == "P2W1 groceries"
+
+    def test_clear_notes(self, test_book: Path):
+        """Should clear notes when empty string is passed."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create transaction with notes
+        guid = gc_book.create_transaction(
+            description="With Notes",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "20.00"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+            notes="Some notes",
+        )
+
+        # Clear notes
+        result = gc_book.update_transaction(guid=guid, notes="")
+        assert "notes" not in result
+
+        # Verify persistence
+        updated = gc_book.get_transaction(guid)
+        assert "notes" not in updated
 
 
 class TestSetReconcileState:
