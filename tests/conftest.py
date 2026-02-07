@@ -302,3 +302,215 @@ def multi_currency_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+@pytest.fixture
+def budget_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book with data suitable for budget testing.
+
+    Creates a USD-default book with:
+    - Accounts: Assets:Checking, Income:Salary, Expenses:Groceries,
+      Expenses:Dining, Expenses:Entertainment, Equity:Opening Balance
+    - Jan 2026: Salary $5000, Groceries $120+$180+$200=$500,
+      Dining $85+$65=$150
+    - Feb 2026: Salary $5000, Groceries $150, Dining $95
+
+    Returns:
+        Path to the temporary GnuCash SQLite file.
+    """
+    book_path = tmp_path / "budget_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    # Accounts
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    salary = piecash.Account(
+        name="Salary", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(salary)
+
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(expenses)
+
+    groceries = piecash.Account(
+        name="Groceries", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(groceries)
+
+    dining = piecash.Account(
+        name="Dining", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(dining)
+
+    entertainment = piecash.Account(
+        name="Entertainment", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(entertainment)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity, commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    # Opening balance: $20000 in checking
+    t0 = piecash.Transaction(
+        currency=usd,
+        description="Opening Balance",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("20000")),
+            piecash.Split(account=opening, value=Decimal("-20000")),
+        ],
+    )
+    book.session.add(t0)
+
+    # === January 2026 ===
+
+    # Salary $5000
+    t1 = piecash.Transaction(
+        currency=usd,
+        description="January Salary",
+        post_date=date(2026, 1, 15),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("5000")),
+            piecash.Split(account=salary, value=Decimal("-5000")),
+        ],
+    )
+    book.session.add(t1)
+
+    # Groceries: $120
+    t2 = piecash.Transaction(
+        currency=usd,
+        description="Grocery Store A",
+        post_date=date(2026, 1, 5),
+        splits=[
+            piecash.Split(account=groceries, value=Decimal("120")),
+            piecash.Split(account=checking, value=Decimal("-120")),
+        ],
+    )
+    book.session.add(t2)
+
+    # Groceries: $180
+    t3 = piecash.Transaction(
+        currency=usd,
+        description="Grocery Store B",
+        post_date=date(2026, 1, 12),
+        splits=[
+            piecash.Split(account=groceries, value=Decimal("180")),
+            piecash.Split(account=checking, value=Decimal("-180")),
+        ],
+    )
+    book.session.add(t3)
+
+    # Groceries: $200
+    t4b = piecash.Transaction(
+        currency=usd,
+        description="Grocery Store C",
+        post_date=date(2026, 1, 20),
+        splits=[
+            piecash.Split(account=groceries, value=Decimal("200")),
+            piecash.Split(account=checking, value=Decimal("-200")),
+        ],
+    )
+    book.session.add(t4b)
+
+    # Dining: $85
+    t5 = piecash.Transaction(
+        currency=usd,
+        description="Restaurant A",
+        post_date=date(2026, 1, 8),
+        splits=[
+            piecash.Split(account=dining, value=Decimal("85")),
+            piecash.Split(account=checking, value=Decimal("-85")),
+        ],
+    )
+    book.session.add(t5)
+
+    # Dining: $65
+    t6 = piecash.Transaction(
+        currency=usd,
+        description="Restaurant B",
+        post_date=date(2026, 1, 22),
+        splits=[
+            piecash.Split(account=dining, value=Decimal("65")),
+            piecash.Split(account=checking, value=Decimal("-65")),
+        ],
+    )
+    book.session.add(t6)
+
+    # === February 2026 ===
+
+    # Salary $5000
+    t7 = piecash.Transaction(
+        currency=usd,
+        description="February Salary",
+        post_date=date(2026, 2, 15),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("5000")),
+            piecash.Split(account=salary, value=Decimal("-5000")),
+        ],
+    )
+    book.session.add(t7)
+
+    # Groceries: $150
+    t8 = piecash.Transaction(
+        currency=usd,
+        description="Grocery Store D",
+        post_date=date(2026, 2, 10),
+        splits=[
+            piecash.Split(account=groceries, value=Decimal("150")),
+            piecash.Split(account=checking, value=Decimal("-150")),
+        ],
+    )
+    book.session.add(t8)
+
+    # Dining: $95
+    t9 = piecash.Transaction(
+        currency=usd,
+        description="Restaurant C",
+        post_date=date(2026, 2, 18),
+        splits=[
+            piecash.Split(account=dining, value=Decimal("95")),
+            piecash.Split(account=checking, value=Decimal("-95")),
+        ],
+    )
+    book.session.add(t9)
+
+    book.save()
+    book.close()
+
+    return book_path
