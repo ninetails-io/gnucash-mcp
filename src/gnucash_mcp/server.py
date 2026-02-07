@@ -13,7 +13,7 @@ from typing import Callable
 from mcp.server.fastmcp import FastMCP
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
-from gnucash_mcp.logging_config import audit_log, debug_log, get_log_dir, setup_logging
+from gnucash_mcp.logging_config import audit_log, debug_log, get_audit_format, get_log_dir, setup_logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -1276,11 +1276,29 @@ def get_audit_log(
 
     audit_dir = log_dir / "audit"
     target_date = log_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    log_file = audit_dir / f"{target_date}.jsonl"
+
+    # Try the configured format first, then fall back to the other
+    fmt = get_audit_format()
+    primary_ext = "txt" if fmt == "text" else "jsonl"
+    fallback_ext = "jsonl" if fmt == "text" else "txt"
+
+    log_file = audit_dir / f"{target_date}.{primary_ext}"
+    if not log_file.exists():
+        log_file = audit_dir / f"{target_date}.{fallback_ext}"
 
     if not log_file.exists():
         return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
 
+    # Text format: return raw text content (filters not applicable)
+    if log_file.suffix == ".txt":
+        content = log_file.read_text()
+        lines = content.strip().split("\n")
+        # Return the last `limit` lines (approximation for text)
+        if len(lines) > limit:
+            lines = lines[-limit:]
+        return "\n".join(lines)
+
+    # JSON format: parse and filter entries
     entries = []
     for line in log_file.read_text().strip().split("\n"):
         if not line:

@@ -35,6 +35,11 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
+def get_audit_format() -> str:
+    """Get the configured audit log format ('text' or 'json')."""
+    return _audit_format
+
+
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,

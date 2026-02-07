@@ -4,14 +4,18 @@ A Model Context Protocol (MCP) server for GnuCash, enabling AI assistants to rea
 
 ## Features
 
-**25 tools** across six categories:
+**47 tools** across ten categories:
 
 | Category | Tools | Description |
 |----------|-------|-------------|
-| Accounts | `list_accounts`, `list_commodities`, `get_account`, `get_balance`, `create_account`, `update_account`, `move_account`, `delete_account` | Full chart-of-accounts management with multi-currency support |
+| Accounts | `list_accounts`, `get_account`, `get_balance`, `create_account`, `update_account`, `move_account`, `delete_account` | Full chart-of-accounts management |
+| Commodities & Prices | `list_commodities`, `create_commodity`, `create_price`, `get_prices`, `get_latest_price` | Multi-currency and investment price tracking |
 | Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` | CRUD, search, cross-currency transactions, and proper accounting voids |
 | Reconciliation | `set_reconcile_state`, `get_unreconciled_splits`, `reconcile_account` | Bank statement reconciliation workflow |
 | Reporting | `spending_by_category`, `income_by_source`, `balance_sheet`, `net_worth`, `cash_flow` | Computed financial reports |
+| Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` | Budget creation, targets, and variance reporting |
+| Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` | Recurring transaction templates and instantiation |
+| Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` | Investment cost basis tracking and capital gain calculation |
 | Audit | `get_audit_log` | Read the server's own audit trail |
 
 **Resources:**
@@ -139,7 +143,9 @@ gnucash-mcp/
 │   ├── conftest.py          # Test fixtures (temp book creation)
 │   ├── test_book.py         # Book wrapper tests
 │   ├── test_tools.py        # MCP tool integration tests
-│   └── test_logging.py      # Audit logging tests
+│   ├── test_logging.py      # Audit logging tests
+│   ├── test_scheduled.py    # Scheduled transaction tests
+│   └── test_lots.py         # Lot (cost basis) tests
 ├── pyproject.toml
 ├── LICENSE
 └── README.md
@@ -155,9 +161,15 @@ uv run pytest -x -v      # Run tests (stop on first failure, verbose)
 
 ## Roadmap
 
-Implemented features cover accounts, transactions, reconciliation, reporting, and audit logging. Remaining backlog:
-
-- [x] Multiple currency support
+- [x] Accounts (CRUD, move, hierarchy)
+- [x] Transactions (CRUD, search, void/unvoid)
+- [x] Reconciliation (split states, batch reconcile)
+- [x] Reporting (spending, income, balance sheet, net worth, cash flow)
+- [x] Multi-currency support (cross-currency transactions, commodities, prices)
+- [x] Audit logging (text and JSON formats)
+- [x] Budgets (create, set targets, variance reporting)
+- [x] Scheduled transactions (recurring templates, instantiation)
+- [x] Lots (cost basis tracking, capital gain calculation)
 - [ ] Export transactions to CSV
 - [ ] Import from CSV (with field mapping)
 - [ ] Import from OFX/QFX
