@@ -943,6 +943,155 @@ def delete_budget(name: str) -> str:
     return json.dumps(result, indent=2)
 
 
+# ============== Scheduled Transaction Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="scheduled_transaction")
+def create_scheduled_transaction(
+    name: str,
+    description: str,
+    splits: list[dict],
+    start_date: str,
+    frequency: str,
+    end_date: str | None = None,
+    enabled: bool = True,
+) -> str:
+    """Create a recurring transaction template.
+
+    Args:
+        name: Name for the scheduled transaction (e.g., "Monthly Rent").
+        description: Transaction description when created.
+        splits: List of splits, same format as create_transaction:
+            [{"account": "Expenses:Rent", "amount": "1850.00"}, ...]
+        start_date: First occurrence date (YYYY-MM-DD).
+        frequency: How often it recurs:
+            - "weekly"
+            - "biweekly" (every 2 weeks)
+            - "monthly"
+            - "quarterly" (every 3 months)
+            - "yearly"
+        end_date: Optional last occurrence date (YYYY-MM-DD).
+        enabled: Whether the schedule is active. Default True.
+    """
+    book = get_book()
+    result = book.create_scheduled_transaction(
+        name=name,
+        description=description,
+        splits=splits,
+        start_date=start_date,
+        frequency=frequency,
+        end_date=end_date,
+        enabled=enabled,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_scheduled_transactions(
+    enabled_only: bool = True,
+) -> str:
+    """List all scheduled transactions.
+
+    Args:
+        enabled_only: If True, only show enabled schedules. Default True.
+
+    Returns:
+        JSON list with guid, name, frequency, next_occurrence, enabled.
+    """
+    book = get_book()
+    result = book.list_scheduled_transactions(
+        enabled_only=enabled_only,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_upcoming_transactions(
+    days: int = 14,
+) -> str:
+    """Get scheduled transactions due within a time window.
+
+    This is the "what bills are coming up?" query.
+
+    Args:
+        days: Look ahead window in days. Default 14.
+
+    Returns:
+        JSON list of upcoming occurrences:
+        [{"name": "...", "occurrence_date": "...", "amount": "...", "days_until": N}]
+    """
+    book = get_book()
+    result = book.get_upcoming_transactions(days=days)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="transaction")
+def create_transaction_from_scheduled(
+    guid: str,
+    transaction_date: str | None = None,
+) -> str:
+    """Create an actual transaction from a scheduled template.
+
+    Args:
+        guid: Scheduled transaction GUID.
+        transaction_date: Date for the transaction. Defaults to next occurrence.
+    """
+    book = get_book()
+    result = book.create_transaction_from_scheduled(
+        guid=guid,
+        transaction_date=transaction_date,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="scheduled_transaction")
+def update_scheduled_transaction(
+    guid: str,
+    enabled: bool | None = None,
+    end_date: str | None = None,
+) -> str:
+    """Update a scheduled transaction.
+
+    Args:
+        guid: Scheduled transaction GUID.
+        enabled: Enable or disable.
+        end_date: Set end date (empty string to clear).
+    """
+    book = get_book()
+    result = book.update_scheduled_transaction(
+        guid=guid,
+        enabled=enabled,
+        end_date=end_date,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="scheduled_transaction")
+def delete_scheduled_transaction(guid: str) -> str:
+    """Delete a scheduled transaction.
+
+    Does not affect transactions already created from this schedule.
+
+    Args:
+        guid: Scheduled transaction GUID.
+    """
+    book = get_book()
+    result = book.delete_scheduled_transaction(guid=guid)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 
