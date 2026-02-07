@@ -514,3 +514,98 @@ def budget_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+@pytest.fixture
+def scheduled_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book for scheduled transaction testing.
+
+    Creates a USD-default book with:
+    - Accounts: Assets:Checking, Expenses:Rent, Expenses:Utilities,
+      Income:Salary, Equity:Opening Balance
+    - Opening balance: $10000 in checking
+
+    No pre-existing scheduled transactions — tests create their own.
+
+    Returns:
+        Path to the temporary GnuCash SQLite file.
+    """
+    book_path = tmp_path / "scheduled_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    # Accounts
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    salary = piecash.Account(
+        name="Salary", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(salary)
+
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(expenses)
+
+    rent = piecash.Account(
+        name="Rent", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(rent)
+
+    utilities = piecash.Account(
+        name="Utilities", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(utilities)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity, commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    # Opening balance: $10000 in checking
+    t0 = piecash.Transaction(
+        currency=usd,
+        description="Opening Balance",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("10000")),
+            piecash.Split(account=opening, value=Decimal("-10000")),
+        ],
+    )
+    book.session.add(t0)
+
+    book.save()
+    book.close()
+
+    return book_path
