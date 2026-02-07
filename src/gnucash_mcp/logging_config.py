@@ -232,7 +232,7 @@ def _get_split_states_batch(book, split_guids: list[str]) -> dict[str, dict | No
                     results[split.guid] = {
                         "guid": split.guid,
                         "account": split.account.fullname,
-                        "amount": str(split.value),
+                        "amount": str(split.quantity),
                         "reconcile_state": split.reconcile_state,
                         "reconcile_date": (
                             split.reconcile_date.isoformat()
@@ -291,7 +291,7 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
         # Use short account name (last component)
         account = split.get("account", "Unknown")
         short_name = account.split(":")[-1]
-        amount = _format_amount(split.get("value") or split.get("amount"))
+        amount = _format_amount(split.get("amount") or split.get("value"))
         lines.append(f"{indent}{short_name:<{max_name_len}}  {amount:>12}")
 
     return "\n".join(lines)
