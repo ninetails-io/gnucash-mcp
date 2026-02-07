@@ -142,6 +142,76 @@ class GnuCashBook:
                 return account
         return None
 
+    def _find_commodity(
+        self, book: piecash.Book, mnemonic: str, namespace: str = "CURRENCY"
+    ) -> piecash.Commodity | None:
+        """Find a commodity by mnemonic and namespace.
+
+        Args:
+            book: Open piecash book.
+            mnemonic: ISO currency code (e.g., "USD", "EUR") or stock symbol.
+            namespace: Commodity namespace. Default "CURRENCY" for currencies.
+
+        Returns:
+            Commodity if found, None otherwise.
+        """
+        try:
+            return book.commodities.get(mnemonic=mnemonic, namespace=namespace)
+        except KeyError:
+            return None
+
+    def _get_or_create_currency(
+        self, book: piecash.Book, mnemonic: str
+    ) -> piecash.Commodity:
+        """Get an existing currency or create it from ISO code.
+
+        Uses book.currencies which has a built-in fallback that auto-creates
+        currencies from the ISO 4217 table if they don't already exist.
+
+        Args:
+            book: Open piecash book.
+            mnemonic: ISO 4217 currency code (e.g., "USD", "EUR", "GBP").
+
+        Returns:
+            Commodity for the currency.
+
+        Raises:
+            ValueError: If mnemonic is not a valid ISO 4217 currency code.
+        """
+        try:
+            return book.currencies(mnemonic=mnemonic)
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"Invalid currency code '{mnemonic}': {e}") from e
+
+    def list_commodities(self) -> dict:
+        """List all commodities in the book.
+
+        Returns:
+            Dict with commodities grouped by namespace, plus the default currency.
+        """
+        with self.open(readonly=True) as book:
+            by_namespace: dict[str, list[dict]] = {}
+
+            for commodity in book.commodities:
+                ns = commodity.namespace
+                if ns not in by_namespace:
+                    by_namespace[ns] = []
+
+                by_namespace[ns].append({
+                    "mnemonic": commodity.mnemonic,
+                    "fullname": commodity.fullname,
+                    "fraction": commodity.fraction,
+                })
+
+            # Sort each namespace's commodities
+            for ns in by_namespace:
+                by_namespace[ns].sort(key=lambda c: c["mnemonic"])
+
+            return {
+                "default_currency": book.default_currency.mnemonic,
+                "commodities": by_namespace,
+            }
+
     def list_accounts(self) -> list[dict]:
         """List all accounts in the chart of accounts.
 
@@ -195,7 +265,7 @@ class GnuCashBook:
             balance = Decimal("0")
             for split in account.splits:
                 if as_of_date is None or split.transaction.post_date <= as_of_date:
-                    balance += split.value
+                    balance += split.quantity
 
             return balance
 
@@ -268,27 +338,35 @@ class GnuCashBook:
         splits: list[dict],
         trans_date: date | None = None,
         memo: str | None = None,
+        currency: str | None = None,
     ) -> str:
         """Create a new transaction with splits.
 
         Args:
             description: Transaction description.
-            splits: List of splits, each with 'account' and 'amount' keys,
-                    and optional 'memo' key.
+            splits: List of splits, each with:
+                - 'account' (required): Full account path.
+                - 'amount' (required): Value in transaction currency.
+                - 'quantity' (optional): Amount in account's commodity.
+                  Required if account commodity differs from transaction currency.
+                - 'memo' (optional): Split memo.
             trans_date: Transaction date. Defaults to today.
             memo: Optional memo (currently unused, per-split memos preferred).
+            currency: ISO currency code for the transaction (e.g., "USD", "EUR").
+                      Defaults to book's default currency.
 
         Returns:
             GUID of the created transaction.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
-                       or accounts don't exist.
+                       accounts don't exist, or cross-currency splits
+                       are missing quantity.
         """
         if len(splits) < 2:
             raise ValueError("Transaction must have at least 2 splits")
 
-        # Validate splits balance to zero
+        # Validate splits balance to zero (using "amount" as value)
         total = Decimal("0")
         for split in splits:
             total += Decimal(split["amount"])
@@ -299,6 +377,12 @@ class GnuCashBook:
             trans_date = date.today()
 
         with self.open(readonly=False) as book:
+            # Determine transaction currency
+            if currency is None:
+                trans_currency = book.default_currency
+            else:
+                trans_currency = self._get_or_create_currency(book, currency)
+
             # Validate all accounts exist and build split list
             piecash_splits = []
             for split in splits:
@@ -306,17 +390,43 @@ class GnuCashBook:
                 if not account:
                     raise ValueError(f"Account not found: {split['account']}")
 
+                value = Decimal(split["amount"])
+
+                # Determine quantity
+                if account.commodity == trans_currency:
+                    # Same currency: quantity equals value
+                    quantity = value
+                elif "quantity" in split:
+                    # Cross-currency: use provided quantity
+                    quantity = Decimal(split["quantity"])
+                    # Validate same sign (or zero)
+                    if quantity * value < 0:
+                        raise ValueError(
+                            f"Split for '{split['account']}': quantity and value "
+                            f"must have same sign "
+                            f"(got value={value}, quantity={quantity})"
+                        )
+                else:
+                    # Cross-currency but no quantity provided
+                    raise ValueError(
+                        f"Split for '{split['account']}' requires 'quantity' "
+                        f"because account commodity "
+                        f"({account.commodity.mnemonic}) differs from "
+                        f"transaction currency ({trans_currency.mnemonic})"
+                    )
+
                 piecash_splits.append(
                     piecash.Split(
                         account=account,
-                        value=Decimal(split["amount"]),
+                        value=value,
+                        quantity=quantity,
                         memo=split.get("memo", ""),
                     )
                 )
 
             # Create transaction
             transaction = piecash.Transaction(
-                currency=book.default_currency,
+                currency=trans_currency,
                 description=description,
                 post_date=trans_date,
                 splits=piecash_splits,
@@ -433,6 +543,8 @@ class GnuCashBook:
         parent: str,
         description: str = "",
         placeholder: bool = False,
+        commodity: str | None = None,
+        commodity_namespace: str = "CURRENCY",
     ) -> dict:
         """Create a new account in the chart of accounts.
 
@@ -442,12 +554,17 @@ class GnuCashBook:
             parent: Full path of parent account (e.g., "Expenses:Online Services").
             description: Optional description.
             placeholder: If True, account is container-only. Default False.
+            commodity: ISO currency code (e.g., "USD", "EUR") or commodity mnemonic.
+                       Defaults to book's default currency.
+            commodity_namespace: Commodity namespace for non-currency commodities.
+                                Default "CURRENCY".
 
         Returns:
             Dict with guid, fullname, and status.
 
         Raises:
-            ValueError: If parent not found, invalid type, or duplicate name.
+            ValueError: If parent not found, invalid type, duplicate name,
+                       or invalid commodity.
         """
         # Validate account type
         if account_type.upper() not in self.VALID_ACCOUNT_TYPES:
@@ -469,12 +586,26 @@ class GnuCashBook:
                         f"Account '{name}' already exists under '{parent}'"
                     )
 
+            # Determine commodity
+            if commodity is None:
+                account_commodity = book.default_currency
+            elif commodity_namespace == "CURRENCY":
+                account_commodity = self._get_or_create_currency(book, commodity)
+            else:
+                account_commodity = self._find_commodity(
+                    book, commodity, commodity_namespace
+                )
+                if not account_commodity:
+                    raise ValueError(
+                        f"Commodity not found: {commodity_namespace}:{commodity}"
+                    )
+
             # Create the account
             new_account = piecash.Account(
                 name=name,
                 type=account_type.upper(),
                 parent=parent_account,
-                commodity=book.default_currency,
+                commodity=account_commodity,
                 description=description,
                 placeholder=placeholder,
             )
@@ -850,16 +981,16 @@ class GnuCashBook:
                         "guid": split.guid,
                         "date": split.transaction.post_date.isoformat(),
                         "description": split.transaction.description,
-                        "value": str(split.value),
+                        "value": str(split.quantity),
                         "reconcile_state": split.reconcile_state,
                         "memo": split.memo or "",
                     }
                     unreconciled.append(split_dict)
 
                     if split.reconcile_state == "c":
-                        cleared_total += split.value
+                        cleared_total += split.quantity
                     else:
-                        uncleared_total += split.value
+                        uncleared_total += split.quantity
 
             return {
                 "account": account_name,
@@ -904,7 +1035,7 @@ class GnuCashBook:
             reconciled_balance = Decimal("0")
             for split in account.splits:
                 if split.reconcile_state == "y":
-                    reconciled_balance += split.value
+                    reconciled_balance += split.quantity
 
             # Find and validate all splits to reconcile
             splits_to_reconcile = []
@@ -923,7 +1054,7 @@ class GnuCashBook:
                     raise ValueError(f"Split {guid} is already reconciled")
 
                 splits_to_reconcile.append(split)
-                reconciling_total += split.value
+                reconciling_total += split.quantity
 
             # Check if balance will match
             new_balance = reconciled_balance + reconciling_total
@@ -1133,7 +1264,7 @@ class GnuCashBook:
                     account_name = group_account.fullname
 
                     # Expense splits are positive when money is spent
-                    amount = split.value
+                    amount = split.quantity
                     if amount > 0:
                         totals[account_name] = totals.get(
                             account_name, Decimal("0")
@@ -1194,7 +1325,7 @@ class GnuCashBook:
                     account_name = group_account.fullname
 
                     # Income splits are negative (money coming in)
-                    amount = -split.value
+                    amount = -split.quantity
                     if amount > 0:
                         totals[account_name] = totals.get(
                             account_name, Decimal("0")
@@ -1247,7 +1378,7 @@ class GnuCashBook:
                 balance = Decimal("0")
                 for split in account.splits:
                     if split.transaction.post_date <= as_of_date:
-                        balance += split.value
+                        balance += split.quantity
 
                 # Skip zero balances
                 if balance == 0:
@@ -1267,7 +1398,7 @@ class GnuCashBook:
                 if account.type in ("INCOME", "EXPENSE"):
                     for split in account.splits:
                         if split.transaction.post_date <= as_of_date:
-                            net_income -= split.value  # Income negative, expense positive
+                            net_income -= split.quantity  # Income negative, expense positive
 
             assets_total = sum(assets.values())
             liabilities_total = sum(liabilities.values())
@@ -1327,11 +1458,11 @@ class GnuCashBook:
                 if account.type in asset_types:
                     for split in account.splits:
                         if split.transaction.post_date <= at_date:
-                            total += split.value
+                            total += split.quantity
                 elif account.type in liability_types:
                     for split in account.splits:
                         if split.transaction.post_date <= at_date:
-                            total += split.value  # Already negative
+                            total += split.quantity  # Already negative
 
             return total
 
@@ -1417,10 +1548,10 @@ class GnuCashBook:
                     if not (start_date <= split.transaction.post_date <= end_date):
                         continue
 
-                    if split.value > 0:
-                        inflows += split.value
+                    if split.quantity > 0:
+                        inflows += split.quantity
                     else:
-                        outflows += -split.value
+                        outflows += -split.quantity
 
             return {
                 "period": f"{start_date.isoformat()} to {end_date.isoformat()}",

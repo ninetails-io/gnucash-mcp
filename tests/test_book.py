@@ -1221,3 +1221,327 @@ class TestCashFlow:
                 end_date=date(2024, 12, 31),
                 account="Nonexistent:Account",
             )
+
+
+class TestListCommodities:
+    """Tests for list_commodities method."""
+
+    def test_list_commodities(self, test_book: Path):
+        """Should return commodities grouped by namespace."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_commodities()
+
+        assert "default_currency" in result
+        assert result["default_currency"] == "USD"
+        assert "commodities" in result
+        assert "CURRENCY" in result["commodities"]
+
+        # Should include USD at minimum
+        mnemonics = [c["mnemonic"] for c in result["commodities"]["CURRENCY"]]
+        assert "USD" in mnemonics
+
+    def test_list_commodities_structure(self, test_book: Path):
+        """Should return proper structure for each commodity."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_commodities()
+
+        currencies = result["commodities"]["CURRENCY"]
+        for commodity in currencies:
+            assert "mnemonic" in commodity
+            assert "fullname" in commodity
+            assert "fraction" in commodity
+
+
+class TestCreateAccountWithCurrency:
+    """Tests for create_account with commodity parameter."""
+
+    def test_create_account_with_currency(self, test_book: Path):
+        """Should create account with specified currency."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_account(
+            name="EUR Savings",
+            account_type="BANK",
+            parent="Assets",
+            commodity="EUR",
+            description="Euro savings account",
+        )
+
+        assert result["status"] == "created"
+        assert result["fullname"] == "Assets:EUR Savings"
+
+        # Verify the account commodity is EUR
+        account = gc_book.get_account("Assets:EUR Savings")
+        assert account is not None
+        assert account["commodity"] == "EUR"
+
+    def test_create_account_default_currency(self, test_book: Path):
+        """Should use default currency when commodity is None."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_account(
+            name="Default Currency Account",
+            account_type="BANK",
+            parent="Assets",
+        )
+
+        assert result["status"] == "created"
+
+        account = gc_book.get_account("Assets:Default Currency Account")
+        assert account["commodity"] == "USD"  # Book default
+
+    def test_create_account_invalid_currency(self, test_book: Path):
+        """Should raise ValueError for invalid currency code."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Invalid currency code"):
+            gc_book.create_account(
+                name="Bad Currency",
+                account_type="BANK",
+                parent="Assets",
+                commodity="INVALID",
+            )
+
+    def test_create_account_creates_currency_commodity(self, test_book: Path):
+        """Should auto-create currency commodity if it doesn't exist in book."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # GBP shouldn't exist in the book initially (only USD)
+        result = gc_book.create_account(
+            name="GBP Account",
+            account_type="BANK",
+            parent="Assets",
+            commodity="GBP",
+        )
+
+        assert result["status"] == "created"
+
+        # Verify GBP is now in the commodities list
+        commodities = gc_book.list_commodities()
+        mnemonics = [c["mnemonic"] for c in commodities["commodities"]["CURRENCY"]]
+        assert "GBP" in mnemonics
+
+
+class TestCreateTransactionMultiCurrency:
+    """Tests for create_transaction with multi-currency support."""
+
+    def test_create_transaction_with_explicit_currency(self, test_book: Path):
+        """Should create transaction with specified currency."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="Explicit USD Transaction",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=date(2024, 2, 1),
+            currency="USD",
+        )
+
+        assert guid is not None
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["currency"] == "USD"
+
+    def test_create_transaction_default_currency(self, test_book: Path):
+        """Should use default currency when none specified."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="Default Currency Transaction",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30.00"},
+                {"account": "Assets:Checking", "amount": "-30.00"},
+            ],
+        )
+
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["currency"] == "USD"
+
+    def test_create_cross_currency_transaction(self, test_book: Path):
+        """Should create cross-currency transaction with quantity."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # First create a EUR account
+        gc_book.create_account(
+            name="EUR Card",
+            account_type="CREDIT",
+            parent="Liabilities",
+            commodity="EUR",
+        )
+
+        # Create a cross-currency transaction: USD transaction with EUR split
+        guid = gc_book.create_transaction(
+            description="Dinner in Paris",
+            currency="USD",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+                {
+                    "account": "Liabilities:EUR Card",
+                    "amount": "-55.00",
+                    "quantity": "-50.00",
+                },
+            ],
+            trans_date=date(2024, 3, 1),
+        )
+
+        assert guid is not None
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["currency"] == "USD"
+
+        # Verify the EUR split has different value and quantity
+        for split in transaction["splits"]:
+            if split["account"] == "Liabilities:EUR Card":
+                assert split["value"] == "-55"
+                assert split["quantity"] == "-50"
+
+    def test_create_cross_currency_missing_quantity(self, test_book: Path):
+        """Should raise ValueError when quantity is required but missing."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a EUR account
+        gc_book.create_account(
+            name="EUR Checking",
+            account_type="BANK",
+            parent="Assets",
+            commodity="EUR",
+        )
+
+        with pytest.raises(ValueError, match="requires 'quantity'"):
+            gc_book.create_transaction(
+                description="Missing quantity",
+                currency="USD",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {"account": "Assets:EUR Checking", "amount": "-50.00"},
+                ],
+            )
+
+    def test_create_cross_currency_sign_mismatch(self, test_book: Path):
+        """Should raise ValueError when quantity and value have different signs."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a EUR account
+        gc_book.create_account(
+            name="EUR Savings",
+            account_type="BANK",
+            parent="Assets",
+            commodity="EUR",
+        )
+
+        with pytest.raises(ValueError, match="same sign"):
+            gc_book.create_transaction(
+                description="Sign mismatch",
+                currency="USD",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {
+                        "account": "Assets:EUR Savings",
+                        "amount": "-50.00",
+                        "quantity": "45.00",  # Wrong sign!
+                    },
+                ],
+            )
+
+    def test_create_transaction_backward_compatible(self, test_book: Path):
+        """Existing single-currency workflow should work unchanged."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # No currency, no quantity - original API
+        guid = gc_book.create_transaction(
+            description="Backward Compatible",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "85.00"},
+                {"account": "Assets:Checking", "amount": "-85.00"},
+            ],
+        )
+
+        assert guid is not None
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["description"] == "Backward Compatible"
+
+        # Value and quantity should be equal for same-currency
+        for split in transaction["splits"]:
+            assert split["value"] == split["quantity"]
+
+
+class TestMultiCurrencyBalances:
+    """Tests that balances and reports use split.quantity (account commodity)
+    rather than split.value (transaction currency)."""
+
+    def test_get_balance_uses_quantity(self, multi_currency_book: Path):
+        """EUR account balance should be in EUR (quantity), not USD (value)."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        balance = gc_book.get_balance("Assets:Euro Savings")
+        # The EUR savings account received 1000 EUR (quantity),
+        # NOT 1100 USD (value)
+        assert balance == Decimal("1000")
+
+    def test_get_balance_usd_account_unaffected(self, multi_currency_book: Path):
+        """USD account balance should still be correct."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        balance = gc_book.get_balance("Assets:Checking")
+        # 5000 (opening) + 3000 (salary) - 1100 (transfer) - 200 (groceries)
+        assert balance == Decimal("6700")
+
+    def test_balance_sheet_uses_quantity(self, multi_currency_book: Path):
+        """Balance sheet should report account balances in their own commodity."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+
+        asset_accounts = {
+            a["account"]: Decimal(a["balance"])
+            for a in result["assets"]["accounts"]
+        }
+        assert asset_accounts["Assets:Checking"] == Decimal("6700")
+        # EUR savings should show 1000 (EUR quantity), not 1100 (USD value)
+        assert asset_accounts["Assets:Euro Savings"] == Decimal("1000")
+
+    def test_net_worth_uses_quantity(self, multi_currency_book: Path):
+        """Net worth should use quantity for each account."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.net_worth(end_date=date(2024, 12, 31))
+        net = Decimal(result["net_worth"])
+        # Assets: Checking 6700 + Euro Savings 1000 = 7700
+        # (Note: mixing currencies, but that's the current behavior —
+        # the important thing is we use quantity, not value)
+        assert net == Decimal("7700")
+
+    def test_cash_flow_uses_quantity(self, multi_currency_book: Path):
+        """Cash flow should use quantity for account splits."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+        inflows = Decimal(result["inflows"])
+        outflows = Decimal(result["outflows"])
+        # Checking inflows: 5000 + 3000 = 8000
+        # Checking outflows: 1100 + 200 = 1300
+        # EUR Savings inflows: 1000 (quantity, not 1100 value)
+        assert inflows == Decimal("9000")
+        assert outflows == Decimal("1300")
+
+    def test_spending_by_category_uses_quantity(self, multi_currency_book: Path):
+        """Expense reporting should use quantity."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.spending_by_category(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert result["total"] == "200"
+        assert len(result["categories"]) == 1
+        assert result["categories"][0]["account"] == "Expenses:Groceries"
+
+    def test_income_by_source_uses_quantity(self, multi_currency_book: Path):
+        """Income reporting should use quantity."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.income_by_source(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert result["total"] == "3000"
+        assert len(result["sources"]) == 1
+        assert result["sources"][0]["account"] == "Income:Salary"

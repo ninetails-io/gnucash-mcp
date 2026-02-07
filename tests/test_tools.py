@@ -709,3 +709,153 @@ class TestCashFlowTool:
         assert "inflows" in data
         assert "outflows" in data
         assert "net" in data
+
+
+class TestListCommoditiesTool:
+    """Tests for list_commodities tool."""
+
+    def test_list_commodities(self, setup_book_env):
+        """Should return commodities grouped by namespace."""
+        result = server_module.list_commodities()
+
+        data = json.loads(result)
+        assert "default_currency" in data
+        assert data["default_currency"] == "USD"
+        assert "commodities" in data
+        assert "CURRENCY" in data["commodities"]
+
+    def test_list_commodities_includes_usd(self, setup_book_env):
+        """Should include USD in currency commodities."""
+        result = server_module.list_commodities()
+
+        data = json.loads(result)
+        mnemonics = [c["mnemonic"] for c in data["commodities"]["CURRENCY"]]
+        assert "USD" in mnemonics
+
+
+class TestCreateAccountWithCommodityTool:
+    """Tests for create_account tool with commodity parameter."""
+
+    def test_create_account_with_eur(self, setup_book_env):
+        """Should create account with EUR commodity."""
+        result = server_module.create_account(
+            name="Euro Account",
+            account_type="BANK",
+            parent="Assets",
+            commodity="EUR",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+
+        # Verify account has EUR commodity
+        account = json.loads(server_module.get_account("Assets:Euro Account"))
+        assert account["commodity"] == "EUR"
+
+    def test_create_account_default_commodity(self, setup_book_env):
+        """Should default to book's currency when no commodity specified."""
+        result = server_module.create_account(
+            name="Default Account",
+            account_type="BANK",
+            parent="Assets",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+
+        account = json.loads(server_module.get_account("Assets:Default Account"))
+        assert account["commodity"] == "USD"
+
+    def test_create_account_invalid_commodity(self, setup_book_env):
+        """Should return error for invalid commodity."""
+        result = server_module.create_account(
+            name="Bad",
+            account_type="BANK",
+            parent="Assets",
+            commodity="INVALID",
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+class TestCreateTransactionMultiCurrencyTool:
+    """Tests for create_transaction tool with multi-currency support."""
+
+    def test_create_transaction_with_currency(self, setup_book_env):
+        """Should create transaction with explicit currency."""
+        result = server_module.create_transaction(
+            description="USD Transaction",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "25.00"},
+                {"account": "Assets:Checking", "amount": "-25.00"},
+            ],
+            currency="USD",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+
+    def test_create_cross_currency_transaction(self, setup_book_env):
+        """Should create cross-currency transaction via tool."""
+        # Create EUR account first
+        server_module.create_account(
+            name="EUR Card",
+            account_type="CREDIT",
+            parent="Liabilities",
+            commodity="EUR",
+        )
+
+        result = server_module.create_transaction(
+            description="Paris Dinner",
+            currency="USD",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+                {
+                    "account": "Liabilities:EUR Card",
+                    "amount": "-55.00",
+                    "quantity": "-50.00",
+                },
+            ],
+            transaction_date="2024-03-01",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert "guid" in data
+
+    def test_create_cross_currency_missing_quantity(self, setup_book_env):
+        """Should return error when quantity missing for cross-currency."""
+        # Create EUR account
+        server_module.create_account(
+            name="EUR Checking",
+            account_type="BANK",
+            parent="Assets",
+            commodity="EUR",
+        )
+
+        result = server_module.create_transaction(
+            description="Missing Quantity",
+            currency="USD",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:EUR Checking", "amount": "-50.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "quantity" in data["error"].lower()
+
+    def test_create_transaction_backward_compatible(self, setup_book_env):
+        """Should work without currency or quantity (backward compatible)."""
+        result = server_module.create_transaction(
+            description="Old Style",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "40.00"},
+                {"account": "Assets:Checking", "amount": "-40.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"

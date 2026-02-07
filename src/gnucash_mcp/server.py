@@ -120,6 +120,19 @@ def list_accounts() -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
+def list_commodities() -> str:
+    """List all commodities (currencies, stocks, etc.) in the book.
+
+    Returns commodities grouped by namespace with their mnemonic, fullname, and fraction.
+    """
+    book = get_book()
+    result = book.list_commodities()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
 def get_account(name: str) -> str:
     """Get details for a specific account by name.
 
@@ -201,13 +214,21 @@ def create_transaction(
     description: str,
     splits: list[dict],
     transaction_date: str | None = None,
+    currency: str | None = None,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
     Args:
         description: Transaction description
-        splits: List of splits. Each split has 'account' (name) and 'amount' (string)
+        splits: List of splits. Each split has:
+            - 'account' (required): Full account path
+            - 'amount' (required): Value in transaction currency
+            - 'quantity' (optional): Amount in account's commodity. Required if
+              account commodity differs from transaction currency.
+            - 'memo' (optional): Split memo
         transaction_date: Transaction date in ISO format (YYYY-MM-DD). Defaults to today.
+        currency: ISO currency code for transaction (e.g., "USD", "EUR").
+                  Defaults to book's default currency.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -215,6 +236,7 @@ def create_transaction(
         description=description,
         splits=splits,
         trans_date=trans_date,
+        currency=currency,
     )
     return json.dumps({"guid": guid, "status": "created"}, indent=2)
 
@@ -243,6 +265,7 @@ def create_account(
     parent: str,
     description: str = "",
     placeholder: bool = False,
+    commodity: str | None = None,
 ) -> str:
     """Create a new account in the chart of accounts.
 
@@ -252,6 +275,7 @@ def create_account(
         parent: Full path of parent account (e.g., "Expenses:Online Services")
         description: Optional description
         placeholder: If true, account is container-only. Default: false
+        commodity: ISO currency code (e.g., "USD", "EUR"). Defaults to book's default currency.
     """
     book = get_book()
     result = book.create_account(
@@ -260,6 +284,7 @@ def create_account(
         parent=parent,
         description=description,
         placeholder=placeholder,
+        commodity=commodity,
     )
     return json.dumps(result, indent=2)
 
