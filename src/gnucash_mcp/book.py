@@ -15,6 +15,17 @@ import piecash
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
+def _to_date(dt: date | datetime) -> date:
+    """Convert a datetime or date to a date object.
+
+    piecash may return either datetime or date for price dates depending
+    on how the price was created. This normalizes to date.
+    """
+    if isinstance(dt, datetime):
+        return dt.date()
+    return dt
+
+
 class GnuCashLockError(Exception):
     """Raised when the GnuCash book is locked by another process."""
 
@@ -204,24 +215,45 @@ class GnuCashBook:
             raise ValueError(f"Invalid currency code '{mnemonic}': {e}") from e
 
     def list_commodities(self) -> dict:
-        """List all commodities in the book.
+        """List all commodities in the book with latest prices.
 
         Returns:
             Dict with commodities grouped by namespace, plus the default currency.
+            Non-currency commodities include their latest price when available.
         """
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
+
+            # Build a map of latest prices by commodity
+            latest_prices: dict[str, tuple] = {}  # commodity_key -> (date, price)
+            for p in book.prices:
+                key = f"{p.commodity.namespace}:{p.commodity.mnemonic}"
+                p_date = _to_date(p.date)
+                if key not in latest_prices or p_date > latest_prices[key][0]:
+                    latest_prices[key] = (p_date, p)
 
             for commodity in book.commodities:
                 ns = commodity.namespace
                 if ns not in by_namespace:
                     by_namespace[ns] = []
 
-                by_namespace[ns].append({
+                entry: dict = {
                     "mnemonic": commodity.mnemonic,
                     "fullname": commodity.fullname,
                     "fraction": commodity.fraction,
-                })
+                }
+
+                # Add latest price for non-currency commodities
+                key = f"{ns}:{commodity.mnemonic}"
+                if key in latest_prices:
+                    _, price = latest_prices[key]
+                    entry["latest_price"] = {
+                        "value": str(price.value),
+                        "currency": price.currency.mnemonic,
+                        "date": _to_date(price.date).isoformat(),
+                    }
+
+                by_namespace[ns].append(entry)
 
             # Sort each namespace's commodities
             for ns in by_namespace:
@@ -230,6 +262,245 @@ class GnuCashBook:
             return {
                 "default_currency": book.default_currency.mnemonic,
                 "commodities": by_namespace,
+            }
+
+    def create_commodity(
+        self,
+        mnemonic: str,
+        fullname: str,
+        namespace: str = "FUND",
+        fraction: int = 10000,
+        cusip: str | None = None,
+    ) -> dict:
+        """Create a new commodity (stock, mutual fund, etc.) in the book.
+
+        Args:
+            mnemonic: Symbol (e.g., "VTSAX", "AAPL"). Must be unique within namespace.
+            fullname: Full name (e.g., "Vanguard Total Stock Market Index Fund").
+            namespace: Grouping category. Common values: "FUND", "NASDAQ",
+                       "NYSE", "AMEX", or any custom string. Default "FUND".
+            fraction: Smallest fractional unit. Use 10000 for 4 decimal places
+                      (standard for shares), 100 for 2, 1000000 for 6 (crypto).
+                      Default 10000.
+            cusip: Optional CUSIP/ISIN identifier for the security.
+
+        Returns:
+            Dict with mnemonic, namespace, fullname, fraction, and status.
+
+        Raises:
+            ValueError: If commodity already exists in that namespace.
+        """
+        with self.open(readonly=False) as book:
+            # Check for duplicate
+            existing = self._find_commodity(book, mnemonic, namespace)
+            if existing:
+                raise ValueError(
+                    f"Commodity {namespace}:{mnemonic} already exists"
+                )
+
+            commodity = piecash.Commodity(
+                namespace=namespace,
+                mnemonic=mnemonic,
+                fullname=fullname,
+                fraction=fraction,
+                cusip=cusip or "",
+                book=book,
+            )
+
+            book.save()
+
+            return {
+                "mnemonic": commodity.mnemonic,
+                "namespace": commodity.namespace,
+                "fullname": commodity.fullname,
+                "fraction": commodity.fraction,
+                "status": "created",
+            }
+
+    def create_price(
+        self,
+        commodity: str,
+        namespace: str,
+        value: str,
+        currency: str = "USD",
+        price_date: date | None = None,
+        price_type: str = "nav",
+        source: str = "user:price",
+    ) -> dict:
+        """Record a price for a commodity (stock price, NAV, exchange rate).
+
+        Args:
+            commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
+            namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
+            value: Price per unit as decimal string (e.g., "250.45").
+            currency: Currency the price is denominated in. Default "USD".
+            price_date: Price date. Defaults to today.
+            price_type: Type of price: "nav", "last", "bid", "ask", "unknown".
+                        Default "nav".
+            source: Source identifier. Default "user:price".
+
+        Returns:
+            Dict with commodity, date, value, type, and status.
+
+        Raises:
+            ValueError: If commodity not found or invalid currency.
+        """
+        if price_date is None:
+            price_date = date.today()
+
+        with self.open(readonly=False) as book:
+            # Find the commodity
+            comm = self._find_commodity(book, commodity, namespace)
+            if not comm:
+                raise ValueError(
+                    f"Commodity not found: {namespace}:{commodity}"
+                )
+
+            # Find the currency
+            curr = self._get_or_create_currency(book, currency)
+
+            # Check for existing price (same commodity/currency/date/source)
+            existing = None
+            for p in book.prices:
+                if (
+                    p.commodity == comm
+                    and p.currency == curr
+                    and _to_date(p.date) == price_date
+                    and p.source == source
+                ):
+                    existing = p
+                    break
+
+            if existing:
+                # Update existing price
+                existing.value = Decimal(value)
+                existing.type = price_type
+            else:
+                # Create new price
+                # piecash expects datetime.date, not datetime.datetime
+                piecash.Price(
+                    commodity=comm,
+                    currency=curr,
+                    date=price_date,
+                    value=Decimal(value),
+                    type=price_type,
+                    source=source,
+                )
+
+            book.save()
+
+            return {
+                "commodity": commodity,
+                "namespace": namespace,
+                "currency": currency,
+                "date": price_date.isoformat(),
+                "value": value,
+                "type": price_type,
+                "status": "updated" if existing else "created",
+            }
+
+    def get_prices(
+        self,
+        commodity: str,
+        namespace: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        currency: str | None = None,
+    ) -> list[dict]:
+        """Get price history for a commodity.
+
+        Args:
+            commodity: Symbol of the commodity (e.g., "VTSAX").
+            namespace: Namespace of the commodity (e.g., "FUND").
+            start_date: Optional start date filter.
+            end_date: Optional end date filter.
+            currency: Optional currency filter (e.g., "USD").
+
+        Returns:
+            List of price dicts sorted by date descending (most recent first).
+
+        Raises:
+            ValueError: If commodity not found.
+        """
+        with self.open(readonly=True) as book:
+            comm = self._find_commodity(book, commodity, namespace)
+            if not comm:
+                raise ValueError(
+                    f"Commodity not found: {namespace}:{commodity}"
+                )
+
+            prices = []
+            for p in book.prices:
+                if p.commodity != comm:
+                    continue
+                if currency and p.currency.mnemonic != currency:
+                    continue
+                p_date = _to_date(p.date)
+                if start_date and p_date < start_date:
+                    continue
+                if end_date and p_date > end_date:
+                    continue
+
+                prices.append({
+                    "date": p_date.isoformat(),
+                    "value": str(p.value),
+                    "currency": p.currency.mnemonic,
+                    "type": p.type,
+                    "source": p.source,
+                })
+
+            # Sort by date descending
+            prices.sort(key=lambda x: x["date"], reverse=True)
+
+            return prices
+
+    def get_latest_price(
+        self,
+        commodity: str,
+        namespace: str,
+        currency: str = "USD",
+    ) -> dict | None:
+        """Get the most recent price for a commodity.
+
+        Args:
+            commodity: Symbol of the commodity (e.g., "VTSAX").
+            namespace: Namespace of the commodity (e.g., "FUND").
+            currency: Currency for the price. Default "USD".
+
+        Returns:
+            Price dict with date, value, type, and source, or None if no price exists.
+
+        Raises:
+            ValueError: If commodity not found.
+        """
+        with self.open(readonly=True) as book:
+            comm = self._find_commodity(book, commodity, namespace)
+            if not comm:
+                raise ValueError(
+                    f"Commodity not found: {namespace}:{commodity}"
+                )
+
+            latest = None
+            latest_date = None
+            for p in book.prices:
+                if p.commodity != comm:
+                    continue
+                if p.currency.mnemonic != currency:
+                    continue
+                p_date = _to_date(p.date)
+                if latest_date is None or p_date > latest_date:
+                    latest_date = p_date
+                    latest = p
+
+            if latest is None:
+                return None
+
+            return {
+                "date": latest_date.isoformat(),
+                "value": str(latest.value),
+                "currency": latest.currency.mnemonic,
+                "type": latest.type,
+                "source": latest.source,
             }
 
     def list_accounts(self) -> list[dict]:

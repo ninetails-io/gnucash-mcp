@@ -132,6 +132,159 @@ def list_commodities() -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="create", entity_type="commodity")
+def create_commodity(
+    mnemonic: str,
+    fullname: str,
+    namespace: str = "FUND",
+    fraction: int = 10000,
+    cusip: str | None = None,
+) -> str:
+    """Create a new commodity (stock, mutual fund, etc.) in the book.
+
+    Args:
+        mnemonic: Symbol (e.g., "VTSAX", "AAPL"). Must be unique within namespace.
+        fullname: Full name (e.g., "Vanguard Total Stock Market Index Fund").
+        namespace: Grouping category. Common values:
+            - "FUND" for mutual funds (default)
+            - "NASDAQ", "NYSE", "AMEX" for stocks
+            - Any custom string for other assets
+        fraction: Smallest fractional unit. Use:
+            - 1 for whole units only
+            - 100 for 2 decimal places
+            - 10000 for 4 decimal places (default, standard for shares)
+            - 1000000 for 6 decimal places (crypto)
+        cusip: Optional CUSIP/ISIN identifier for the security.
+    """
+    book = get_book()
+    result = book.create_commodity(
+        mnemonic=mnemonic,
+        fullname=fullname,
+        namespace=namespace,
+        fraction=fraction,
+        cusip=cusip,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="price")
+def create_price(
+    commodity: str,
+    namespace: str,
+    value: str,
+    currency: str = "USD",
+    date: str | None = None,
+    price_type: str = "nav",
+    source: str = "user:price",
+) -> str:
+    """Record a price for a commodity (stock price, NAV, exchange rate).
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
+        namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
+        value: Price per unit as decimal string (e.g., "250.45").
+        currency: Currency the price is denominated in. Default "USD".
+        date: Price date in ISO format (YYYY-MM-DD). Defaults to today.
+        price_type: Type of price:
+            - "nav" for mutual fund net asset value (default)
+            - "last" for last trade price
+            - "bid" / "ask" for bid/ask prices
+            - "unknown" for unspecified
+        source: Source identifier. Default "user:price".
+
+    Note:
+        If a price already exists for the same commodity/currency/date/source,
+        it will be updated rather than creating a duplicate.
+    """
+    book = get_book()
+    price_date = None
+    if date:
+        from datetime import date as date_type
+
+        price_date = date_type.fromisoformat(date)
+
+    result = book.create_price(
+        commodity=commodity,
+        namespace=namespace,
+        value=value,
+        currency=currency,
+        price_date=price_date,
+        price_type=price_type,
+        source=source,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_prices(
+    commodity: str,
+    namespace: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    currency: str | None = None,
+) -> str:
+    """Get price history for a commodity.
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX").
+        namespace: Namespace of the commodity (e.g., "FUND").
+        start_date: Optional start date filter (YYYY-MM-DD).
+        end_date: Optional end date filter (YYYY-MM-DD).
+        currency: Optional currency filter (e.g., "USD").
+
+    Returns:
+        JSON with list of prices sorted by date descending (most recent first).
+    """
+    book = get_book()
+    from datetime import date as date_type
+
+    start = date_type.fromisoformat(start_date) if start_date else None
+    end = date_type.fromisoformat(end_date) if end_date else None
+
+    result = book.get_prices(
+        commodity=commodity,
+        namespace=namespace,
+        start_date=start,
+        end_date=end,
+        currency=currency,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_latest_price(
+    commodity: str,
+    namespace: str,
+    currency: str = "USD",
+) -> str:
+    """Get the most recent price for a commodity.
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX").
+        namespace: Namespace of the commodity (e.g., "FUND").
+        currency: Currency for the price. Default "USD".
+
+    Returns:
+        JSON with date, value, type, and source of most recent price.
+        Returns null if no price exists.
+    """
+    book = get_book()
+    result = book.get_latest_price(
+        commodity=commodity,
+        namespace=namespace,
+        currency=currency,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
 @audit_log(classification="read")
 def get_account(name: str) -> str:
     """Get details for a specific account by name.
@@ -270,6 +423,7 @@ def create_account(
     description: str = "",
     placeholder: bool = False,
     commodity: str | None = None,
+    commodity_namespace: str = "CURRENCY",
 ) -> str:
     """Create a new account in the chart of accounts.
 
@@ -279,7 +433,15 @@ def create_account(
         parent: Full path of parent account (e.g., "Expenses:Online Services")
         description: Optional description
         placeholder: If true, account is container-only. Default: false
-        commodity: ISO currency code (e.g., "USD", "EUR"). Defaults to book's default currency.
+        commodity: Symbol for the account's commodity:
+            - For currencies: ISO code (e.g., "USD", "EUR")
+            - For investments: Fund/stock symbol (e.g., "VTSAX", "AAPL")
+            Defaults to book's default currency.
+        commodity_namespace: Namespace of the commodity:
+            - "CURRENCY" (default) for currencies
+            - "FUND" for mutual funds
+            - "NASDAQ", "NYSE", etc. for stocks
+            Required when commodity is not a currency.
     """
     book = get_book()
     result = book.create_account(
@@ -289,6 +451,7 @@ def create_account(
         description=description,
         placeholder=placeholder,
         commodity=commodity,
+        commodity_namespace=commodity_namespace,
     )
     return json.dumps(result, indent=2)
 
