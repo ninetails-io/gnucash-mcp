@@ -1092,6 +1092,151 @@ def delete_scheduled_transaction(guid: str) -> str:
     return json.dumps(result, indent=2)
 
 
+# ============== Lot (Cost Basis) Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="lot")
+def create_lot(
+    account: str,
+    title: str,
+    notes: str = "",
+) -> str:
+    """Create a new lot for cost basis tracking.
+
+    Lots group investment purchases for tracking cost basis and
+    calculating capital gains when selling.
+
+    Args:
+        account: Full path of investment account (e.g., "Assets:Investments:VTSAX").
+        title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
+        notes: Optional notes.
+    """
+    book = get_book()
+    result = book.create_lot(account=account, title=title, notes=notes)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_lots(
+    account: str,
+    include_closed: bool = False,
+) -> str:
+    """List all lots for an investment account.
+
+    Args:
+        account: Full path of investment account.
+        include_closed: If True, include fully-sold lots. Default False.
+
+    Returns:
+        JSON list of lots with:
+        - guid, title, notes, is_closed
+        - quantity (shares remaining)
+        - cost_basis (original cost of remaining shares)
+        - cost_per_share
+    """
+    book = get_book()
+    result = book.list_lots(account=account, include_closed=include_closed)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_lot(guid: str) -> str:
+    """Get detailed information about a lot.
+
+    Args:
+        guid: Lot GUID.
+
+    Returns:
+        JSON with lot details including all splits:
+        - title, notes, is_closed
+        - splits: list of all splits with date, quantity, value
+        - summary: total quantity, cost basis, cost per share
+    """
+    book = get_book()
+    result = book.get_lot(guid=guid)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="lot")
+def assign_split_to_lot(
+    split_guid: str,
+    lot_guid: str,
+) -> str:
+    """Assign a transaction split to a lot.
+
+    Use after creating a buy/sell transaction to link the investment
+    account split to its lot for cost basis tracking.
+
+    Args:
+        split_guid: GUID of the split (from transaction's investment account).
+        lot_guid: GUID of the lot.
+
+    Workflow:
+        1. create_lot("Assets:VTSAX", "VTSAX Jan 2026")
+        2. create_transaction(...buy 10 shares...)
+        3. assign_split_to_lot(investment_split_guid, lot_guid)
+    """
+    book = get_book()
+    result = book.assign_split_to_lot(split_guid=split_guid, lot_guid=lot_guid)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def calculate_lot_gain(
+    lot_guid: str,
+    shares: str | None = None,
+    sale_price: str | None = None,
+) -> str:
+    """Calculate potential or actual capital gain for a lot.
+
+    If shares and sale_price provided, calculates hypothetical gain.
+    Otherwise uses lot's current state and latest price.
+
+    Args:
+        lot_guid: Lot GUID.
+        shares: Optional number of shares to calculate for.
+                Defaults to all remaining shares.
+        sale_price: Optional sale price per share.
+                    Defaults to latest price for the commodity.
+    """
+    book = get_book()
+    result = book.calculate_lot_gain(
+        lot_guid=lot_guid, shares=shares, sale_price=sale_price,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="lot")
+def close_lot(guid: str) -> str:
+    """Mark a lot as closed.
+
+    Use when a lot is fully sold but wasn't automatically marked closed,
+    or to manually close a lot with zero shares.
+
+    Args:
+        guid: Lot GUID.
+
+    Note:
+        Lots are automatically marked closed when their quantity reaches zero
+        through assigned splits. This tool is for manual cleanup.
+    """
+    book = get_book()
+    result = book.close_lot(guid=guid)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 

@@ -55,6 +55,7 @@ def _split_to_dict(split: piecash.Split) -> dict:
         "memo": split.memo or "",
         "reconcile_state": split.reconcile_state,
         "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date else None,
+        "lot_guid": split.lot.guid if split.lot else None,
     }
 
 
@@ -3036,3 +3037,350 @@ class GnuCashBook:
             book.save()
 
             return result
+
+    # ── Lot (Cost Basis Tracking) Methods ─────────────────────────
+
+    def _find_lot(self, book: piecash.Book, guid: str):
+        """Find a lot by GUID.
+
+        Args:
+            book: Open piecash book.
+            guid: Lot GUID.
+
+        Returns:
+            Lot if found, None otherwise.
+        """
+        from piecash.core.transaction import Lot
+
+        return book.session.query(Lot).filter_by(guid=guid).first()
+
+    def _lot_summary(self, lot) -> dict:
+        """Compute current state of a lot from its splits.
+
+        Returns:
+            Dict with quantity, cost_basis, cost_per_share as strings.
+        """
+        purchase_quantity = Decimal(0)
+        purchase_value = Decimal(0)
+        sale_quantity = Decimal(0)
+
+        for split in lot.splits:
+            if split.quantity > 0:
+                purchase_quantity += Decimal(str(split.quantity))
+                purchase_value += Decimal(str(split.value))
+            else:
+                sale_quantity += abs(Decimal(str(split.quantity)))
+
+        remaining = purchase_quantity - sale_quantity
+
+        if purchase_quantity > 0:
+            cost_per_share = purchase_value / purchase_quantity
+            remaining_cost_basis = cost_per_share * remaining
+        else:
+            cost_per_share = Decimal(0)
+            remaining_cost_basis = Decimal(0)
+
+        return {
+            "quantity": str(remaining),
+            "cost_basis": str(remaining_cost_basis),
+            "cost_per_share": str(cost_per_share),
+            "is_closed": bool(lot.is_closed),
+        }
+
+    def create_lot(
+        self,
+        account: str,
+        title: str,
+        notes: str = "",
+    ) -> dict:
+        """Create a new lot for cost basis tracking.
+
+        Lots group investment purchases for tracking cost basis and
+        calculating capital gains when selling.
+
+        Args:
+            account: Full path of investment account (e.g., "Assets:Investments:VTSAX").
+            title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
+            notes: Optional notes.
+
+        Returns:
+            Dict with guid, title, account, and status.
+
+        Raises:
+            ValueError: If account not found.
+        """
+        from piecash.core.transaction import Lot
+
+        with self.open(readonly=False) as book:
+            acct = self._find_account(book, account)
+            if not acct:
+                raise ValueError(f"Account not found: {account}")
+
+            lot = Lot(
+                title=title,
+                account=acct,
+                notes=notes,
+                is_closed=0,
+            )
+            book.session.add(lot)
+            book.save()
+
+            return {
+                "guid": lot.guid,
+                "title": title,
+                "account": account,
+                "notes": notes,
+                "status": "created",
+            }
+
+    def list_lots(
+        self,
+        account: str,
+        include_closed: bool = False,
+    ) -> list[dict]:
+        """List all lots for an investment account.
+
+        Args:
+            account: Full path of investment account.
+            include_closed: If True, include fully-sold lots. Default False.
+
+        Returns:
+            List of lot dicts with guid, title, notes, is_closed,
+            quantity, cost_basis, cost_per_share.
+
+        Raises:
+            ValueError: If account not found.
+        """
+        with self.open(readonly=True) as book:
+            acct = self._find_account(book, account)
+            if not acct:
+                raise ValueError(f"Account not found: {account}")
+
+            results = []
+            for lot in acct.lots:
+                if not include_closed and lot.is_closed:
+                    continue
+                summary = self._lot_summary(lot)
+                results.append({
+                    "guid": lot.guid,
+                    "title": lot.title,
+                    "notes": lot.notes or "",
+                    **summary,
+                })
+
+            return results
+
+    def get_lot(self, guid: str) -> dict:
+        """Get detailed information about a lot.
+
+        Args:
+            guid: Lot GUID.
+
+        Returns:
+            Dict with lot details including all splits and summary.
+
+        Raises:
+            ValueError: If lot not found.
+        """
+        with self.open(readonly=True) as book:
+            lot = self._find_lot(book, guid)
+            if not lot:
+                raise ValueError(f"Lot not found: {guid}")
+
+            splits = []
+            for split in lot.splits:
+                splits.append({
+                    "guid": split.guid,
+                    "date": split.transaction.post_date.isoformat(),
+                    "description": split.transaction.description,
+                    "quantity": str(split.quantity),
+                    "value": str(split.value),
+                })
+
+            summary = self._lot_summary(lot)
+
+            return {
+                "guid": lot.guid,
+                "title": lot.title,
+                "account": lot.account.fullname,
+                "notes": lot.notes or "",
+                "is_closed": bool(lot.is_closed),
+                "splits": splits,
+                "summary": summary,
+            }
+
+    def assign_split_to_lot(
+        self,
+        split_guid: str,
+        lot_guid: str,
+    ) -> dict:
+        """Assign a transaction split to a lot.
+
+        Use after creating a buy/sell transaction to link the investment
+        account split to its lot for cost basis tracking.
+
+        Args:
+            split_guid: GUID of the split (from transaction's investment account).
+            lot_guid: GUID of the lot.
+
+        Returns:
+            Dict with status and updated lot summary.
+
+        Raises:
+            ValueError: If split or lot not found, split is in wrong account,
+                       split already assigned to a lot, or lot is closed.
+        """
+        with self.open(readonly=False) as book:
+            split = self._find_split(book, split_guid)
+            if not split:
+                raise ValueError(f"Split not found: {split_guid}")
+
+            lot = self._find_lot(book, lot_guid)
+            if not lot:
+                raise ValueError(f"Lot not found: {lot_guid}")
+
+            if lot.is_closed:
+                raise ValueError("Cannot assign split to a closed lot")
+
+            if split.account != lot.account:
+                raise ValueError(
+                    f"Split account ({split.account.fullname}) does not match "
+                    f"lot account ({lot.account.fullname})"
+                )
+
+            if split.lot is not None:
+                raise ValueError(
+                    f"Split is already assigned to lot: {split.lot.guid}"
+                )
+
+            split.lot = lot
+            book.save()
+
+            summary = self._lot_summary(lot)
+
+            # Auto-close if quantity reaches zero
+            if Decimal(summary["quantity"]) == 0 and len(lot.splits) > 0:
+                lot.is_closed = 1
+                book.save()
+                summary["is_closed"] = True
+
+            return {
+                "status": "assigned",
+                "split_guid": split_guid,
+                "lot_guid": lot_guid,
+                **summary,
+            }
+
+    def calculate_lot_gain(
+        self,
+        lot_guid: str,
+        shares: str | None = None,
+        sale_price: str | None = None,
+    ) -> dict:
+        """Calculate potential or actual capital gain for a lot.
+
+        If shares and sale_price provided, calculates hypothetical gain.
+        Otherwise uses lot's current state and latest price.
+
+        Args:
+            lot_guid: Lot GUID.
+            shares: Optional number of shares to calculate for.
+                    Defaults to all remaining shares.
+            sale_price: Optional sale price per share.
+                        Defaults to latest price for the commodity.
+
+        Returns:
+            Dict with shares, cost_basis, sale_proceeds, capital_gain, gain_percent.
+
+        Raises:
+            ValueError: If lot not found, no shares remaining, or no price available.
+        """
+        with self.open(readonly=True) as book:
+            lot = self._find_lot(book, lot_guid)
+            if not lot:
+                raise ValueError(f"Lot not found: {lot_guid}")
+
+            summary = self._lot_summary(lot)
+            remaining = Decimal(summary["quantity"])
+
+            if remaining <= 0:
+                raise ValueError("Lot has no remaining shares")
+
+            # Determine shares to sell
+            if shares is not None:
+                shares_to_sell = Decimal(shares)
+                if shares_to_sell > remaining:
+                    raise ValueError(
+                        f"Cannot sell {shares_to_sell}; lot has {remaining} shares"
+                    )
+            else:
+                shares_to_sell = remaining
+
+            # Determine sale price
+            if sale_price is not None:
+                price = Decimal(sale_price)
+            else:
+                # Look up latest price for the commodity (inline, since
+                # we're already inside an open session)
+                commodity = lot.account.commodity
+                latest_price = None
+                latest_date = None
+                for p in book.prices:
+                    if p.commodity != commodity:
+                        continue
+                    p_date = _to_date(p.date)
+                    if latest_date is None or p_date > latest_date:
+                        latest_date = p_date
+                        latest_price = p
+                if latest_price is None:
+                    raise ValueError(
+                        f"No price found for {commodity.mnemonic}. "
+                        "Provide sale_price explicitly."
+                    )
+                price = Decimal(str(latest_price.value))
+
+            cost_per_share = Decimal(summary["cost_per_share"])
+            cost_basis = cost_per_share * shares_to_sell
+            proceeds = price * shares_to_sell
+            gain = proceeds - cost_basis
+            gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
+
+            return {
+                "shares": str(shares_to_sell),
+                "cost_basis": str(cost_basis),
+                "sale_proceeds": str(proceeds),
+                "capital_gain": str(gain),
+                "gain_percent": str(gain_pct),
+            }
+
+    def close_lot(self, guid: str) -> dict:
+        """Mark a lot as closed.
+
+        Use when a lot is fully sold but wasn't automatically marked closed,
+        or to manually close a lot with zero shares.
+
+        Args:
+            guid: Lot GUID.
+
+        Returns:
+            Dict with status.
+
+        Raises:
+            ValueError: If lot not found or already closed.
+        """
+        with self.open(readonly=False) as book:
+            lot = self._find_lot(book, guid)
+            if not lot:
+                raise ValueError(f"Lot not found: {guid}")
+
+            if lot.is_closed:
+                raise ValueError("Lot is already closed")
+
+            lot.is_closed = 1
+            book.save()
+
+            return {
+                "guid": guid,
+                "title": lot.title,
+                "status": "closed",
+            }

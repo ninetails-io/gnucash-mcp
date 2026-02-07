@@ -609,3 +609,121 @@ def scheduled_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+@pytest.fixture
+def investment_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book with investment accounts for lot testing.
+
+    Creates a USD-default book with:
+    - Assets:Checking (BANK, USD)
+    - Assets:Investments (ASSET, USD, placeholder)
+    - Assets:Investments:VTSAX (MUTUAL, commodity=VTSAX)
+    - Income:Capital Gains (INCOME, USD)
+    - Equity:Opening Balance (EQUITY, USD)
+    - VTSAX commodity (FUND namespace, fraction=10000)
+    - VTSAX price: $125.00 on 2026-01-15
+    - Opening balance: $10000 in checking
+
+    No pre-existing lots or investment transactions.
+
+    Returns:
+        Path to the temporary GnuCash SQLite file.
+    """
+    book_path = tmp_path / "investment_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    # Create VTSAX commodity
+    vtsax = piecash.Commodity(
+        namespace="FUND",
+        mnemonic="VTSAX",
+        fullname="Vanguard Total Stock Market",
+        fraction=10000,
+    )
+    book.session.add(vtsax)
+
+    # Accounts
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    investments = piecash.Account(
+        name="Investments", type="ASSET", parent=assets,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(investments)
+
+    vtsax_acct = piecash.Account(
+        name="VTSAX", type="MUTUAL", parent=investments,
+        commodity=vtsax,
+    )
+    book.session.add(vtsax_acct)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    cap_gains = piecash.Account(
+        name="Capital Gains", type="INCOME", parent=income,
+        commodity=usd,
+    )
+    book.session.add(cap_gains)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity,
+        commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    # Record VTSAX price
+    p = piecash.Price(
+        commodity=vtsax,
+        currency=usd,
+        date=date(2026, 1, 15),
+        value=Decimal("125"),
+        type="nav",
+        source="user:price",
+    )
+    book.session.add(p)
+
+    # Opening balance: $10000 in checking
+    t0 = piecash.Transaction(
+        currency=usd,
+        description="Opening Balance",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("10000")),
+            piecash.Split(account=opening, value=Decimal("-10000")),
+        ],
+    )
+    book.session.add(t0)
+
+    book.save()
+    book.close()
+
+    return book_path
