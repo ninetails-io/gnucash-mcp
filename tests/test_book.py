@@ -929,7 +929,7 @@ class TestReconcileAccount:
         total = Decimal("0")
         guids = []
         for split in unreconciled["splits"]:
-            total += Decimal(split["value"])
+            total += Decimal(split["amount"])
             guids.append(split["guid"])
 
         # Reconcile all splits

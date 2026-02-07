@@ -378,6 +378,7 @@ def update_transaction(
         transaction_date: New date in ISO format YYYY-MM-DD (optional)
         splits: List of split updates with 'account' and 'amount' (optional).
                 Must match existing splits by account name and balance to zero.
+                For cross-currency splits, include 'quantity' (amount in account's commodity).
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None

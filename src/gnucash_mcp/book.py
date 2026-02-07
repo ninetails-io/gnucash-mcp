@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator
@@ -140,6 +140,23 @@ class GnuCashBook:
         for account in book.accounts:
             if account.fullname == fullname:
                 return account
+        return None
+
+    def _find_transaction(
+        self, book: piecash.Book, guid: str
+    ) -> piecash.Transaction | None:
+        """Find a transaction by GUID.
+
+        Args:
+            book: Open piecash book.
+            guid: Transaction GUID (32-character hex string).
+
+        Returns:
+            Transaction if found, None otherwise.
+        """
+        for transaction in book.transactions:
+            if transaction.guid == guid:
+                return transaction
         return None
 
     def _find_commodity(
@@ -327,9 +344,9 @@ class GnuCashBook:
             Transaction dict if found, None otherwise.
         """
         with self.open(readonly=True) as book:
-            for transaction in book.transactions:
-                if transaction.guid == guid:
-                    return _transaction_to_dict(transaction)
+            transaction = self._find_transaction(book, guid)
+            if transaction:
+                return _transaction_to_dict(transaction)
             return None
 
     def create_transaction(
@@ -337,7 +354,6 @@ class GnuCashBook:
         description: str,
         splits: list[dict],
         trans_date: date | None = None,
-        memo: str | None = None,
         currency: str | None = None,
     ) -> str:
         """Create a new transaction with splits.
@@ -351,7 +367,6 @@ class GnuCashBook:
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo.
             trans_date: Transaction date. Defaults to today.
-            memo: Optional memo (currently unused, per-split memos preferred).
             currency: ISO currency code for the transaction (e.g., "USD", "EUR").
                       Defaults to book's default currency.
 
@@ -765,13 +780,7 @@ class GnuCashBook:
             ValueError: If transaction not found.
         """
         with self.open(readonly=False) as book:
-            # Find the transaction
-            transaction = None
-            for t in book.transactions:
-                if t.guid == guid:
-                    transaction = t
-                    break
-
+            transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
@@ -801,24 +810,22 @@ class GnuCashBook:
             guid: Transaction GUID to update.
             description: New description (optional).
             trans_date: New transaction date (optional).
-            splits: List of split updates with 'account' and 'amount' (optional).
-                    Must match existing splits by account name.
+            splits: List of split updates with 'account', 'amount', and
+                    optionally 'quantity' (optional). Must match existing
+                    splits by account name. For cross-currency splits,
+                    'quantity' is required when the account commodity differs
+                    from the transaction currency.
 
         Returns:
             Dict with updated transaction details.
 
         Raises:
             ValueError: If transaction not found, splits don't balance,
-                       or account not found in splits.
+                       account not found in splits, or cross-currency split
+                       missing quantity.
         """
         with self.open(readonly=False) as book:
-            # Find the transaction
-            transaction = None
-            for t in book.transactions:
-                if t.guid == guid:
-                    transaction = t
-                    break
-
+            transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
@@ -839,16 +846,39 @@ class GnuCashBook:
                 if total != Decimal("0"):
                     raise ValueError(f"Splits do not balance: total is {total}")
 
-                # Build a map of account -> new amount
-                split_updates = {s["account"]: Decimal(s["amount"]) for s in splits}
+                # Build a map of account -> split data
+                split_updates = {s["account"]: s for s in splits}
+
+                trans_currency = transaction.currency
 
                 # Update existing splits
                 for split in transaction.splits:
                     account_name = split.account.fullname
                     if account_name in split_updates:
-                        new_value = split_updates[account_name]
+                        update = split_updates[account_name]
+                        new_value = Decimal(update["amount"])
                         split.value = new_value
-                        split.quantity = new_value
+
+                        # Determine quantity
+                        if split.account.commodity == trans_currency:
+                            split.quantity = new_value
+                        elif "quantity" in update:
+                            new_quantity = Decimal(update["quantity"])
+                            if new_quantity * new_value < 0:
+                                raise ValueError(
+                                    f"Split for '{account_name}': quantity and value "
+                                    f"must have same sign "
+                                    f"(got value={new_value}, quantity={new_quantity})"
+                                )
+                            split.quantity = new_quantity
+                        else:
+                            raise ValueError(
+                                f"Split for '{account_name}' requires 'quantity' "
+                                f"because account commodity "
+                                f"({split.account.commodity.mnemonic}) differs from "
+                                f"transaction currency ({trans_currency.mnemonic})"
+                            )
+
                         del split_updates[account_name]
 
                 # Check if all provided accounts were found
@@ -916,7 +946,6 @@ class GnuCashBook:
 
             # Handle reconcile date
             if state == "y":
-                from datetime import datetime
                 if reconcile_date:
                     split.reconcile_date = datetime.combine(
                         reconcile_date, datetime.min.time()
@@ -932,7 +961,7 @@ class GnuCashBook:
             return {
                 "split_guid": split_guid,
                 "account": split.account.fullname,
-                "value": str(split.value),
+                "amount": str(split.quantity),
                 "reconcile_state": state,
                 "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date else None,
                 "status": "updated",
@@ -981,7 +1010,7 @@ class GnuCashBook:
                         "guid": split.guid,
                         "date": split.transaction.post_date.isoformat(),
                         "description": split.transaction.description,
-                        "value": str(split.quantity),
+                        "amount": str(split.quantity),
                         "reconcile_state": split.reconcile_state,
                         "memo": split.memo or "",
                     }
@@ -1028,8 +1057,6 @@ class GnuCashBook:
             account = self._find_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
-
-            from datetime import datetime
 
             # Calculate current reconciled balance
             reconciled_balance = Decimal("0")
@@ -1103,21 +1130,13 @@ class GnuCashBook:
             raise ValueError("Void reason is required")
 
         with self.open(readonly=False) as book:
-            # Find the transaction
-            transaction = None
-            for t in book.transactions:
-                if t.guid == guid:
-                    transaction = t
-                    break
-
+            transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
             # Check if already voided (any split has 'v' state)
             if any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is already voided")
-
-            from datetime import datetime
 
             # Store void metadata in transaction slots
             # GnuCash uses these slot keys for void info
@@ -1161,13 +1180,7 @@ class GnuCashBook:
             ValueError: If transaction not found or not voided.
         """
         with self.open(readonly=False) as book:
-            # Find the transaction
-            transaction = None
-            for t in book.transactions:
-                if t.guid == guid:
-                    transaction = t
-                    break
-
+            transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
