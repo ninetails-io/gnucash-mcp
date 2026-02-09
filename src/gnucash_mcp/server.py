@@ -1279,26 +1279,44 @@ def get_audit_log(
 
     # Try the configured format first, then fall back to the other
     fmt = get_audit_format()
-    primary_ext = "txt" if fmt == "text" else "jsonl"
-    fallback_ext = "jsonl" if fmt == "text" else "txt"
+    primary_ext = "jsonl" if fmt == "json" else "txt"
+    fallback_ext = "txt" if fmt == "json" else "jsonl"
 
     log_file = audit_dir / f"{target_date}.{primary_ext}"
+    used_fallback = False
     if not log_file.exists():
         log_file = audit_dir / f"{target_date}.{fallback_ext}"
+        used_fallback = True
 
     if not log_file.exists():
-        return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
+        if fmt == "json":
+            return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
+        else:
+            return f"No audit log for {target_date}"
 
-    # Text format: return raw text content (filters not applicable)
+    # Reading a .txt file
     if log_file.suffix == ".txt":
         content = log_file.read_text()
         lines = content.strip().split("\n")
-        # Return the last `limit` lines (approximation for text)
         if len(lines) > limit:
             lines = lines[-limit:]
-        return "\n".join(lines)
+        text_content = "\n".join(lines)
 
-    # JSON format: parse and filter entries
+        # If user configured json but we fell back to txt, wrap in JSON with note
+        if fmt == "json":
+            return json.dumps({
+                "content": text_content,
+                "format": "text",
+                "note": (
+                    "No .jsonl file found for this date. Returning .txt fallback. "
+                    "Ensure GNUCASH_MCP_AUDIT_FORMAT=json is set when starting the server."
+                ),
+            }, indent=2)
+        else:
+            # User wants text, return raw text
+            return text_content
+
+    # Reading a .jsonl file
     entries = []
     for line in log_file.read_text().strip().split("\n"):
         if not line:
@@ -1310,9 +1328,21 @@ def get_audit_log(
             continue
         entries.append(entry)
 
-    # Return most recent entries up to limit
+    # If user configured text but we fell back to jsonl, format as text
+    if fmt == "text":
+        # Convert JSON entries to simple text representation
+        lines = []
+        for entry in entries[-limit:]:
+            ts = entry.get("timestamp", "")[:19]  # Trim to datetime
+            tool = entry.get("tool", "unknown")
+            result = entry.get("result", "")
+            lines.append(f"{ts}  {tool}  {result}")
+        return "\n".join(lines) if lines else "No entries"
+
+    # User wants JSON, return JSON
     return json.dumps(
-        {"entries": entries[-limit:], "total_count": len(entries)}, indent=2
+        {"entries": entries[-limit:], "total_count": len(entries)},
+        indent=2,
     )
 
 
