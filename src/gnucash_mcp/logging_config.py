@@ -98,7 +98,9 @@ def setup_logging(
     log_dir = book_path_obj.parent / f"{book_path_obj.name}.mcp"
     _log_dir = log_dir
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_local = datetime.now().astimezone()
+    today = now_local.strftime("%Y-%m-%d")
+    tz_name = now_local.strftime("%Z") or now_local.strftime("%z")
 
     # Audit log - unless --noaudit
     audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
@@ -125,7 +127,7 @@ def setup_logging(
 
         # Write text header if needed
         if write_header:
-            header = _format_text_header(today, book_path)
+            header = _format_text_header(today, book_path, tz_name)
             audit_logger.info(header)
             _flush_logger(audit_logger)
     else:
@@ -257,12 +259,13 @@ def _get_split_states_batch(book, split_guids: list[str]) -> dict[str, dict | No
     return results
 
 
-def _format_text_header(date_str: str, book_path: str) -> str:
+def _format_text_header(date_str: str, book_path: str, tz_name: str = "") -> str:
     """Format the header for a text audit log file."""
     line = "═" * 64
+    tz_line = f"\nTimezone: {tz_name}" if tz_name else ""
     return f"""{line}
 GNUCASH MCP AUDIT LOG — {date_str}
-Book: {book_path}
+Book: {book_path}{tz_line}
 {line}"""
 
 
@@ -536,7 +539,7 @@ def audit_log(
         def wrapper(*args, **kwargs) -> str:
             logger = logging.getLogger(AUDIT_LOGGER_NAME)
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
-            timestamp = datetime.now(timezone.utc).isoformat()
+            timestamp = datetime.now().astimezone().isoformat()
 
             entry = {
                 "timestamp": timestamp,
