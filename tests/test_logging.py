@@ -90,7 +90,7 @@ class TestAuditLogDecorator:
         result = test_read_tool(account_name="Assets:Checking")
 
         # Read the log file
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = temp_log_dir / "audit" / f"{today}.jsonl"
         assert log_file.exists()
 
@@ -115,7 +115,7 @@ class TestAuditLogDecorator:
 
         result = test_create_tool(description="Test transaction")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = temp_log_dir / "audit" / f"{today}.jsonl"
         entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
 
@@ -138,7 +138,7 @@ class TestAuditLogDecorator:
         with pytest.raises(ValueError):
             test_failing_tool(name="Nonexistent")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = temp_log_dir / "audit" / f"{today}.jsonl"
         entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
 
@@ -157,7 +157,7 @@ class TestAuditLogDecorator:
 
         result = test_error_response(name="Bad")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = temp_log_dir / "audit" / f"{today}.jsonl"
         entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
 
@@ -196,7 +196,7 @@ class TestDebugLogging:
 
         test_timed_tool()
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         debug_file = temp_log_dir / "debug" / f"{today}.log"
         assert debug_file.exists()
 
@@ -213,7 +213,7 @@ class TestTextFormat:
         """Verify text format creates .txt file, not .jsonl."""
         setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
         jsonl_file = temp_log_dir / "audit" / f"{today}.jsonl"
 
@@ -224,7 +224,7 @@ class TestTextFormat:
         """Verify text format file has proper header."""
         setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
         content = txt_file.read_text()
 
@@ -241,7 +241,7 @@ class TestTextFormat:
 
         test_create(description="Test Transaction")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
         content = txt_file.read_text()
 
@@ -258,7 +258,7 @@ class TestTextFormat:
 
         test_read(name="Test")
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
         content = txt_file.read_text()
 
@@ -291,7 +291,7 @@ class TestAuditLogIntegration:
             ],
         )
 
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         log_file = temp_log_dir / "audit" / f"{today}.jsonl"
         entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
 

@@ -1275,7 +1275,7 @@ def get_audit_log(
         return json.dumps({"error": "Logging not initialized (no book path configured)"})
 
     audit_dir = log_dir / "audit"
-    target_date = log_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
 
     # Try the configured format first, then fall back to the other
     fmt = get_audit_format()
