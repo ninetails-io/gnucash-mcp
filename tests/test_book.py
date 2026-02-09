@@ -295,6 +295,41 @@ class TestCreateTransaction:
                 ],
             )
 
+    def test_create_transaction_with_notes(self, test_book: Path):
+        """Should create transaction with notes field."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="Safeway",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "75.00", "memo": "Meats"},
+                {"account": "Assets:Checking", "amount": "-75.00"},
+            ],
+            notes="P2W1 groceries",
+        )
+
+        transaction = gc_book.get_transaction(guid)
+        assert transaction["description"] == "Safeway"
+        assert transaction["notes"] == "P2W1 groceries"
+        # Verify memo is separate from notes
+        memos = {s["memo"] for s in transaction["splits"]}
+        assert "Meats" in memos
+
+    def test_create_transaction_without_notes(self, test_book: Path):
+        """Transaction without notes should not include notes key."""
+        gc_book = GnuCashBook(str(test_book))
+
+        guid = gc_book.create_transaction(
+            description="No Notes",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+
+        transaction = gc_book.get_transaction(guid)
+        assert "notes" not in transaction
+
 
 class TestSearchTransactions:
     """Tests for search_transactions method."""
@@ -345,6 +380,32 @@ class TestSearchTransactions:
         results = gc_book.search_transactions("100-500", field="amount")
         assert len(results) == 1
         assert results[0]["description"] == "Weekly Groceries"
+
+    def test_search_by_notes(self, test_book: Path):
+        """Should find transactions by notes field."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create a transaction with notes
+        gc_book.create_transaction(
+            description="Safeway",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "30.00"},
+                {"account": "Assets:Checking", "amount": "-30.00"},
+            ],
+            notes="P2W1 groceries",
+        )
+
+        results = gc_book.search_transactions("P2W1", field="notes")
+        assert len(results) == 1
+        assert results[0]["description"] == "Safeway"
+        assert results[0]["notes"] == "P2W1 groceries"
+
+    def test_search_by_notes_no_match(self, test_book: Path):
+        """Should return empty list when no notes match."""
+        gc_book = GnuCashBook(str(test_book))
+
+        results = gc_book.search_transactions("nonexistent", field="notes")
+        assert len(results) == 0
 
     def test_search_invalid_field(self, test_book: Path):
         """Should raise ValueError for invalid field."""
@@ -812,6 +873,47 @@ class TestUpdateTransaction:
                 ],
             )
 
+    def test_update_notes(self, test_book: Path):
+        """Should add notes to an existing transaction."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            notes="P2W1 groceries",
+        )
+
+        assert result["status"] == "updated"
+        assert result["notes"] == "P2W1 groceries"
+
+        # Verify persistence
+        updated = gc_book.get_transaction(guid)
+        assert updated["notes"] == "P2W1 groceries"
+
+    def test_clear_notes(self, test_book: Path):
+        """Should clear notes when empty string is passed."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create transaction with notes
+        guid = gc_book.create_transaction(
+            description="With Notes",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "20.00"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+            notes="Some notes",
+        )
+
+        # Clear notes
+        result = gc_book.update_transaction(guid=guid, notes="")
+        assert "notes" not in result
+
+        # Verify persistence
+        updated = gc_book.get_transaction(guid)
+        assert "notes" not in updated
+
 
 class TestSetReconcileState:
     """Tests for set_reconcile_state method."""
@@ -929,7 +1031,7 @@ class TestReconcileAccount:
         total = Decimal("0")
         guids = []
         for split in unreconciled["splits"]:
-            total += Decimal(split["value"])
+            total += Decimal(split["amount"])
             guids.append(split["guid"])
 
         # Reconcile all splits
@@ -1545,3 +1647,489 @@ class TestMultiCurrencyBalances:
         assert result["total"] == "3000"
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
+
+
+class TestCreateCommodity:
+    """Tests for create_commodity method."""
+
+    def test_create_commodity(self, test_book: Path):
+        """Should create a new commodity and return it in list_commodities."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result = gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market Index Fund Admiral",
+            namespace="FUND",
+            fraction=10000,
+            cusip="922908728",
+        )
+
+        assert result["status"] == "created"
+        assert result["mnemonic"] == "VTSAX"
+        assert result["namespace"] == "FUND"
+        assert result["fullname"] == "Vanguard Total Stock Market Index Fund Admiral"
+        assert result["fraction"] == 10000
+
+        # Verify it appears in list_commodities
+        commodities = gc_book.list_commodities()
+        assert "FUND" in commodities["commodities"]
+        mnemonics = [c["mnemonic"] for c in commodities["commodities"]["FUND"]]
+        assert "VTSAX" in mnemonics
+
+    def test_create_commodity_duplicate(self, test_book: Path):
+        """Should raise ValueError when commodity already exists in namespace."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        with pytest.raises(ValueError, match="already exists"):
+            gc_book.create_commodity(
+                mnemonic="VTSAX",
+                fullname="Duplicate",
+                namespace="FUND",
+            )
+
+    def test_create_commodity_different_namespace(self, test_book: Path):
+        """Should allow same mnemonic in different namespaces."""
+        gc_book = GnuCashBook(str(test_book))
+
+        result1 = gc_book.create_commodity(
+            mnemonic="TEST",
+            fullname="Test Fund",
+            namespace="FUND",
+        )
+        result2 = gc_book.create_commodity(
+            mnemonic="TEST",
+            fullname="Test Stock",
+            namespace="NASDAQ",
+        )
+
+        assert result1["status"] == "created"
+        assert result2["status"] == "created"
+
+        commodities = gc_book.list_commodities()
+        assert "FUND" in commodities["commodities"]
+        assert "NASDAQ" in commodities["commodities"]
+
+
+class TestCreateAccountWithCommodity:
+    """Tests for create_account with non-currency commodities."""
+
+    def test_create_account_with_fund_commodity(self, test_book: Path):
+        """Should create MUTUAL account with FUND commodity."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # First create the commodity
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        # Create a parent for investments
+        gc_book.create_account(
+            name="Investments",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+
+        # Create the fund account
+        result = gc_book.create_account(
+            name="VTSAX",
+            account_type="MUTUAL",
+            parent="Assets:Investments",
+            commodity="VTSAX",
+            commodity_namespace="FUND",
+        )
+
+        assert result["status"] == "created"
+        assert result["fullname"] == "Assets:Investments:VTSAX"
+
+        # Verify the account commodity
+        account = gc_book.get_account("Assets:Investments:VTSAX")
+        assert account is not None
+        assert account["commodity"] == "VTSAX"
+
+    def test_create_account_missing_commodity(self, test_book: Path):
+        """Should raise ValueError when commodity doesn't exist."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Commodity not found"):
+            gc_book.create_account(
+                name="Missing Fund",
+                account_type="MUTUAL",
+                parent="Assets",
+                commodity="NONEXISTENT",
+                commodity_namespace="FUND",
+            )
+
+
+class TestPrices:
+    """Tests for price management methods."""
+
+    def test_create_price(self, test_book: Path):
+        """Should record a price and retrieve it."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        result = gc_book.create_price(
+            commodity="VTSAX",
+            namespace="FUND",
+            value="127.50",
+            currency="USD",
+            price_date=date(2026, 2, 7),
+            price_type="nav",
+        )
+
+        assert result["status"] == "created"
+        assert result["value"] == "127.50"
+        assert result["date"] == "2026-02-07"
+
+        # Verify via get_prices
+        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        assert len(prices) == 1
+        assert Decimal(prices[0]["value"]) == Decimal("127.50")
+        assert prices[0]["type"] == "nav"
+
+    def test_create_price_update(self, test_book: Path):
+        """Should update existing price with same date/source."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        # Create initial price
+        gc_book.create_price(
+            commodity="VTSAX",
+            namespace="FUND",
+            value="127.50",
+            price_date=date(2026, 2, 7),
+        )
+
+        # Update with new value (same date and source)
+        result = gc_book.create_price(
+            commodity="VTSAX",
+            namespace="FUND",
+            value="128.75",
+            price_date=date(2026, 2, 7),
+        )
+
+        assert result["status"] == "updated"
+        assert result["value"] == "128.75"
+
+        # Should still be only 1 price, not 2
+        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        assert len(prices) == 1
+        assert prices[0]["value"] == "128.75"
+
+    def test_get_prices_filtered(self, test_book: Path):
+        """Should filter prices by date range."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        # Create prices on multiple dates
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="125.00", price_date=date(2026, 2, 1),
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="126.50", price_date=date(2026, 2, 5),
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="128.75", price_date=date(2026, 2, 10),
+        )
+
+        # Filter to middle date
+        prices = gc_book.get_prices(
+            commodity="VTSAX",
+            namespace="FUND",
+            start_date=date(2026, 2, 3),
+            end_date=date(2026, 2, 8),
+        )
+        assert len(prices) == 1
+        assert Decimal(prices[0]["value"]) == Decimal("126.50")
+
+        # All prices, should be descending
+        all_prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        assert len(all_prices) == 3
+        assert all_prices[0]["date"] == "2026-02-10"  # Most recent first
+        assert all_prices[2]["date"] == "2026-02-01"  # Oldest last
+
+    def test_get_latest_price(self, test_book: Path):
+        """Should return the most recent price."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="125.00", price_date=date(2026, 2, 1),
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="128.75", price_date=date(2026, 2, 10),
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="126.50", price_date=date(2026, 2, 5),
+        )
+
+        result = gc_book.get_latest_price(
+            commodity="VTSAX", namespace="FUND", currency="USD",
+        )
+        assert result is not None
+        assert result["value"] == "128.75"
+        assert result["date"] == "2026-02-10"
+
+    def test_get_latest_price_no_prices(self, test_book: Path):
+        """Should return None when no prices exist."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        result = gc_book.get_latest_price(
+            commodity="VTSAX", namespace="FUND", currency="USD",
+        )
+        assert result is None
+
+    def test_create_price_commodity_not_found(self, test_book: Path):
+        """Should raise ValueError for non-existent commodity."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Commodity not found"):
+            gc_book.create_price(
+                commodity="NONEXISTENT",
+                namespace="FUND",
+                value="100.00",
+            )
+
+
+class TestInvestmentWorkflow:
+    """Integration tests for the full investment workflow."""
+
+    def test_full_investment_workflow(self, test_book: Path):
+        """Full workflow: create fund, account, price, buy shares, check balance."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # 1. Create commodity
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+            fraction=10000,
+        )
+
+        # 2. Create account hierarchy
+        gc_book.create_account(
+            name="Investments",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc_book.create_account(
+            name="401k",
+            account_type="ASSET",
+            parent="Assets:Investments",
+            placeholder=True,
+        )
+        gc_book.create_account(
+            name="VTSAX",
+            account_type="MUTUAL",
+            parent="Assets:Investments:401k",
+            commodity="VTSAX",
+            commodity_namespace="FUND",
+        )
+
+        # 3. Record price
+        gc_book.create_price(
+            commodity="VTSAX",
+            namespace="FUND",
+            value="127.50",
+            price_date=date(2026, 2, 7),
+        )
+
+        # 4. Buy shares: $500 at $127.50/share = 3.9216 shares
+        guid = gc_book.create_transaction(
+            description="VTSAX purchase",
+            splits=[
+                {
+                    "account": "Assets:Investments:401k:VTSAX",
+                    "amount": "500.00",
+                    "quantity": "3.9216",
+                },
+                {
+                    "account": "Assets:Checking",
+                    "amount": "-500.00",
+                },
+            ],
+            trans_date=date(2026, 2, 7),
+            currency="USD",
+        )
+        assert guid is not None
+
+        # 5. Check balance — should show share count
+        balance = gc_book.get_balance("Assets:Investments:401k:VTSAX")
+        assert balance == Decimal("3.9216")
+
+        # 6. Get latest price
+        price = gc_book.get_latest_price(
+            commodity="VTSAX", namespace="FUND", currency="USD",
+        )
+        assert Decimal(price["value"]) == Decimal("127.50")
+
+    def test_sell_shares(self, test_book: Path):
+        """Should handle selling shares (negative quantity)."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Setup: create fund, account, buy shares
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+        gc_book.create_account(
+            name="Investments", account_type="ASSET",
+            parent="Assets", placeholder=True,
+        )
+        gc_book.create_account(
+            name="VTSAX", account_type="MUTUAL",
+            parent="Assets:Investments",
+            commodity="VTSAX", commodity_namespace="FUND",
+        )
+
+        # Buy 10 shares at $100
+        gc_book.create_transaction(
+            description="Buy VTSAX",
+            splits=[
+                {"account": "Assets:Investments:VTSAX", "amount": "1000.00", "quantity": "10"},
+                {"account": "Assets:Checking", "amount": "-1000.00"},
+            ],
+            trans_date=date(2026, 1, 15),
+            currency="USD",
+        )
+
+        # Sell 3 shares at $110
+        gc_book.create_transaction(
+            description="Sell VTSAX",
+            splits=[
+                {"account": "Assets:Investments:VTSAX", "amount": "-330.00", "quantity": "-3"},
+                {"account": "Assets:Checking", "amount": "330.00"},
+            ],
+            trans_date=date(2026, 2, 7),
+            currency="USD",
+        )
+
+        # Balance should be 7 shares
+        balance = gc_book.get_balance("Assets:Investments:VTSAX")
+        assert balance == Decimal("7")
+
+    def test_multiple_funds(self, test_book: Path):
+        """Should handle multiple funds in same account hierarchy."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Create two funds
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+        gc_book.create_commodity(
+            mnemonic="VTIAX", fullname="Vanguard Total International",
+            namespace="FUND",
+        )
+
+        # Create accounts
+        gc_book.create_account(
+            name="Investments", account_type="ASSET",
+            parent="Assets", placeholder=True,
+        )
+        gc_book.create_account(
+            name="VTSAX", account_type="MUTUAL",
+            parent="Assets:Investments",
+            commodity="VTSAX", commodity_namespace="FUND",
+        )
+        gc_book.create_account(
+            name="VTIAX", account_type="MUTUAL",
+            parent="Assets:Investments",
+            commodity="VTIAX", commodity_namespace="FUND",
+        )
+
+        # Buy both
+        gc_book.create_transaction(
+            description="Buy VTSAX",
+            splits=[
+                {"account": "Assets:Investments:VTSAX", "amount": "500.00", "quantity": "4"},
+                {"account": "Assets:Checking", "amount": "-500.00"},
+            ],
+            trans_date=date(2026, 2, 7),
+            currency="USD",
+        )
+        gc_book.create_transaction(
+            description="Buy VTIAX",
+            splits=[
+                {"account": "Assets:Investments:VTIAX", "amount": "300.00", "quantity": "10"},
+                {"account": "Assets:Checking", "amount": "-300.00"},
+            ],
+            trans_date=date(2026, 2, 7),
+            currency="USD",
+        )
+
+        # Check balances
+        vtsax_bal = gc_book.get_balance("Assets:Investments:VTSAX")
+        vtiax_bal = gc_book.get_balance("Assets:Investments:VTIAX")
+        assert vtsax_bal == Decimal("4")
+        assert vtiax_bal == Decimal("10")
+
+    def test_list_commodities_with_prices(self, test_book: Path):
+        """Enhanced list_commodities should show latest prices."""
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+
+        # Add prices
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="125.00", price_date=date(2026, 2, 1),
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="128.75", price_date=date(2026, 2, 7),
+        )
+
+        commodities = gc_book.list_commodities()
+        fund_entries = commodities["commodities"]["FUND"]
+        vtsax = next(c for c in fund_entries if c["mnemonic"] == "VTSAX")
+
+        assert "latest_price" in vtsax
+        assert vtsax["latest_price"]["value"] == "128.75"
+        assert vtsax["latest_price"]["date"] == "2026-02-07"
+        assert vtsax["latest_price"]["currency"] == "USD"

@@ -13,7 +13,7 @@ from typing import Callable
 from mcp.server.fastmcp import FastMCP
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
-from gnucash_mcp.logging_config import audit_log, debug_log, get_log_dir, setup_logging
+from gnucash_mcp.logging_config import audit_log, debug_log, get_audit_format, get_log_dir, setup_logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -132,6 +132,159 @@ def list_commodities() -> str:
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="create", entity_type="commodity")
+def create_commodity(
+    mnemonic: str,
+    fullname: str,
+    namespace: str = "FUND",
+    fraction: int = 10000,
+    cusip: str | None = None,
+) -> str:
+    """Create a new commodity (stock, mutual fund, etc.) in the book.
+
+    Args:
+        mnemonic: Symbol (e.g., "VTSAX", "AAPL"). Must be unique within namespace.
+        fullname: Full name (e.g., "Vanguard Total Stock Market Index Fund").
+        namespace: Grouping category. Common values:
+            - "FUND" for mutual funds (default)
+            - "NASDAQ", "NYSE", "AMEX" for stocks
+            - Any custom string for other assets
+        fraction: Smallest fractional unit. Use:
+            - 1 for whole units only
+            - 100 for 2 decimal places
+            - 10000 for 4 decimal places (default, standard for shares)
+            - 1000000 for 6 decimal places (crypto)
+        cusip: Optional CUSIP/ISIN identifier for the security.
+    """
+    book = get_book()
+    result = book.create_commodity(
+        mnemonic=mnemonic,
+        fullname=fullname,
+        namespace=namespace,
+        fraction=fraction,
+        cusip=cusip,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="price")
+def create_price(
+    commodity: str,
+    namespace: str,
+    value: str,
+    currency: str = "USD",
+    date: str | None = None,
+    price_type: str = "nav",
+    source: str = "user:price",
+) -> str:
+    """Record a price for a commodity (stock price, NAV, exchange rate).
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
+        namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
+        value: Price per unit as decimal string (e.g., "250.45").
+        currency: Currency the price is denominated in. Default "USD".
+        date: Price date in ISO format (YYYY-MM-DD). Defaults to today.
+        price_type: Type of price:
+            - "nav" for mutual fund net asset value (default)
+            - "last" for last trade price
+            - "bid" / "ask" for bid/ask prices
+            - "unknown" for unspecified
+        source: Source identifier. Default "user:price".
+
+    Note:
+        If a price already exists for the same commodity/currency/date/source,
+        it will be updated rather than creating a duplicate.
+    """
+    book = get_book()
+    price_date = None
+    if date:
+        from datetime import date as date_type
+
+        price_date = date_type.fromisoformat(date)
+
+    result = book.create_price(
+        commodity=commodity,
+        namespace=namespace,
+        value=value,
+        currency=currency,
+        price_date=price_date,
+        price_type=price_type,
+        source=source,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_prices(
+    commodity: str,
+    namespace: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    currency: str | None = None,
+) -> str:
+    """Get price history for a commodity.
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX").
+        namespace: Namespace of the commodity (e.g., "FUND").
+        start_date: Optional start date filter (YYYY-MM-DD).
+        end_date: Optional end date filter (YYYY-MM-DD).
+        currency: Optional currency filter (e.g., "USD").
+
+    Returns:
+        JSON with list of prices sorted by date descending (most recent first).
+    """
+    book = get_book()
+    from datetime import date as date_type
+
+    start = date_type.fromisoformat(start_date) if start_date else None
+    end = date_type.fromisoformat(end_date) if end_date else None
+
+    result = book.get_prices(
+        commodity=commodity,
+        namespace=namespace,
+        start_date=start,
+        end_date=end,
+        currency=currency,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_latest_price(
+    commodity: str,
+    namespace: str,
+    currency: str = "USD",
+) -> str:
+    """Get the most recent price for a commodity.
+
+    Args:
+        commodity: Symbol of the commodity (e.g., "VTSAX").
+        namespace: Namespace of the commodity (e.g., "FUND").
+        currency: Currency for the price. Default "USD".
+
+    Returns:
+        JSON with date, value, type, and source of most recent price.
+        Returns null if no price exists.
+    """
+    book = get_book()
+    result = book.get_latest_price(
+        commodity=commodity,
+        namespace=namespace,
+        currency=currency,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
 @audit_log(classification="read")
 def get_account(name: str) -> str:
     """Get details for a specific account by name.
@@ -215,6 +368,7 @@ def create_transaction(
     splits: list[dict],
     transaction_date: str | None = None,
     currency: str | None = None,
+    notes: str | None = None,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -229,6 +383,8 @@ def create_transaction(
         transaction_date: Transaction date in ISO format (YYYY-MM-DD). Defaults to today.
         currency: ISO currency code for transaction (e.g., "USD", "EUR").
                   Defaults to book's default currency.
+        notes: Transaction notes (optional). Free-text annotation stored
+               separately from description.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -237,6 +393,7 @@ def create_transaction(
         splits=splits,
         trans_date=trans_date,
         currency=currency,
+        notes=notes,
     )
     return json.dumps({"guid": guid, "status": "created"}, indent=2)
 
@@ -245,11 +402,11 @@ def create_transaction(
 @safe_tool
 @audit_log(classification="read")
 def search_transactions(query: str, field: str = "description") -> str:
-    """Search transactions by description, memo, or amount.
+    """Search transactions by description, memo, notes, or amount.
 
     Args:
         query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
-        field: Field to search: 'description', 'memo', or 'amount'
+        field: Field to search: 'description', 'memo', 'notes', or 'amount'
     """
     book = get_book()
     result = book.search_transactions(query, field)
@@ -266,6 +423,7 @@ def create_account(
     description: str = "",
     placeholder: bool = False,
     commodity: str | None = None,
+    commodity_namespace: str = "CURRENCY",
 ) -> str:
     """Create a new account in the chart of accounts.
 
@@ -275,7 +433,15 @@ def create_account(
         parent: Full path of parent account (e.g., "Expenses:Online Services")
         description: Optional description
         placeholder: If true, account is container-only. Default: false
-        commodity: ISO currency code (e.g., "USD", "EUR"). Defaults to book's default currency.
+        commodity: Symbol for the account's commodity:
+            - For currencies: ISO code (e.g., "USD", "EUR")
+            - For investments: Fund/stock symbol (e.g., "VTSAX", "AAPL")
+            Defaults to book's default currency.
+        commodity_namespace: Namespace of the commodity:
+            - "CURRENCY" (default) for currencies
+            - "FUND" for mutual funds
+            - "NASDAQ", "NYSE", etc. for stocks
+            Required when commodity is not a currency.
     """
     book = get_book()
     result = book.create_account(
@@ -285,6 +451,7 @@ def create_account(
         description=description,
         placeholder=placeholder,
         commodity=commodity,
+        commodity_namespace=commodity_namespace,
     )
     return json.dumps(result, indent=2)
 
@@ -369,6 +536,7 @@ def update_transaction(
     description: str | None = None,
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
+    notes: str | None = None,
 ) -> str:
     """Update an existing transaction.
 
@@ -378,6 +546,8 @@ def update_transaction(
         transaction_date: New date in ISO format YYYY-MM-DD (optional)
         splits: List of split updates with 'account' and 'amount' (optional).
                 Must match existing splits by account name and balance to zero.
+                For cross-currency splits, include 'quantity' (amount in account's commodity).
+        notes: New transaction notes (optional). Pass empty string to clear.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -386,6 +556,7 @@ def update_transaction(
         description=description,
         trans_date=trans_date,
         splits=splits,
+        notes=notes,
     )
     return json.dumps(result, indent=2)
 
@@ -627,6 +798,445 @@ def cash_flow(
     return json.dumps(result, indent=2)
 
 
+# ============== Budget Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_budgets() -> str:
+    """List all budgets in the book.
+
+    Returns:
+        JSON list of budgets with guid, name, description,
+        num_periods, and period_type.
+    """
+    book = get_book()
+    result = book.list_budgets()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_budget(name: str) -> str:
+    """Get full details of a budget including all budget amounts.
+
+    Args:
+        name: Budget name.
+
+    Returns:
+        JSON with budget info and all account/period amounts.
+    """
+    book = get_book()
+    result = book.get_budget(name)
+    if result is None:
+        return json.dumps({"error": f"Budget not found: {name}"})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="budget")
+def create_budget(
+    name: str,
+    year: int | None = None,
+    num_periods: int = 12,
+    period_type: str = "monthly",
+    description: str = "",
+) -> str:
+    """Create a new budget.
+
+    Args:
+        name: Budget name (e.g., "2026 Budget").
+        year: Budget year. Defaults to current year. Used to set start date.
+        num_periods: Number of periods. Default 12 (monthly for a year).
+        period_type: Period length:
+            - "monthly" (default)
+            - "quarterly"
+            - "weekly"
+        description: Optional description.
+    """
+    book = get_book()
+    result = book.create_budget(
+        name=name,
+        year=year,
+        num_periods=num_periods,
+        period_type=period_type,
+        description=description,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="budget")
+def set_budget_amount(
+    budget_name: str,
+    account: str,
+    amount: str,
+    period: int | str | None = None,
+) -> str:
+    """Set a budget target for an account.
+
+    Args:
+        budget_name: Name of the budget.
+        account: Full account path (e.g., "Expenses:Groceries").
+        amount: Monthly budget amount as string (e.g., "500.00").
+        period: Which period(s) to set:
+            - None or "all": Set same amount for all periods (default)
+            - Integer 0-11: Set specific period (0 = January for yearly budget)
+            - "q1", "q2", "q3", "q4": Set all periods in quarter
+    """
+    book = get_book()
+    result = book.set_budget_amount(
+        budget_name=budget_name,
+        account=account,
+        amount=amount,
+        period=period,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_budget_report(
+    budget_name: str,
+    period: int | str | None = None,
+    account: str | None = None,
+    include_children: bool = True,
+) -> str:
+    """Compare actual spending against budget.
+
+    Args:
+        budget_name: Name of the budget.
+        period: Which period to report:
+            - None: Current period based on today's date (default)
+            - Integer 0-11: Specific period
+            - "ytd": Year to date (all periods up to current)
+            - "all": All periods
+        account: Optional filter to specific account or parent account.
+        include_children: If True and account specified, include child accounts.
+    """
+    book = get_book()
+    result = book.get_budget_report(
+        budget_name=budget_name,
+        period=period,
+        account=account,
+        include_children=include_children,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="budget")
+def delete_budget(name: str) -> str:
+    """Delete a budget.
+
+    Args:
+        name: Budget name.
+    """
+    book = get_book()
+    result = book.delete_budget(name=name)
+    return json.dumps(result, indent=2)
+
+
+# ============== Scheduled Transaction Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="scheduled_transaction")
+def create_scheduled_transaction(
+    name: str,
+    description: str,
+    splits: list[dict],
+    start_date: str,
+    frequency: str,
+    end_date: str | None = None,
+    enabled: bool = True,
+) -> str:
+    """Create a recurring transaction template.
+
+    Args:
+        name: Name for the scheduled transaction (e.g., "Monthly Rent").
+        description: Transaction description when created.
+        splits: List of splits, same format as create_transaction:
+            [{"account": "Expenses:Rent", "amount": "1850.00"}, ...]
+        start_date: First occurrence date (YYYY-MM-DD).
+        frequency: How often it recurs:
+            - "weekly"
+            - "biweekly" (every 2 weeks)
+            - "monthly"
+            - "quarterly" (every 3 months)
+            - "yearly"
+        end_date: Optional last occurrence date (YYYY-MM-DD).
+        enabled: Whether the schedule is active. Default True.
+    """
+    book = get_book()
+    result = book.create_scheduled_transaction(
+        name=name,
+        description=description,
+        splits=splits,
+        start_date=start_date,
+        frequency=frequency,
+        end_date=end_date,
+        enabled=enabled,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_scheduled_transactions(
+    enabled_only: bool = True,
+) -> str:
+    """List all scheduled transactions.
+
+    Args:
+        enabled_only: If True, only show enabled schedules. Default True.
+
+    Returns:
+        JSON list with guid, name, frequency, next_occurrence, enabled.
+    """
+    book = get_book()
+    result = book.list_scheduled_transactions(
+        enabled_only=enabled_only,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_upcoming_transactions(
+    days: int = 14,
+) -> str:
+    """Get scheduled transactions due within a time window.
+
+    This is the "what bills are coming up?" query.
+
+    Args:
+        days: Look ahead window in days. Default 14.
+
+    Returns:
+        JSON list of upcoming occurrences:
+        [{"name": "...", "occurrence_date": "...", "amount": "...", "days_until": N}]
+    """
+    book = get_book()
+    result = book.get_upcoming_transactions(days=days)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="transaction")
+def create_transaction_from_scheduled(
+    guid: str,
+    transaction_date: str | None = None,
+) -> str:
+    """Create an actual transaction from a scheduled template.
+
+    Args:
+        guid: Scheduled transaction GUID.
+        transaction_date: Date for the transaction. Defaults to next occurrence.
+    """
+    book = get_book()
+    result = book.create_transaction_from_scheduled(
+        guid=guid,
+        transaction_date=transaction_date,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="scheduled_transaction")
+def update_scheduled_transaction(
+    guid: str,
+    enabled: bool | None = None,
+    end_date: str | None = None,
+) -> str:
+    """Update a scheduled transaction.
+
+    Args:
+        guid: Scheduled transaction GUID.
+        enabled: Enable or disable.
+        end_date: Set end date (empty string to clear).
+    """
+    book = get_book()
+    result = book.update_scheduled_transaction(
+        guid=guid,
+        enabled=enabled,
+        end_date=end_date,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="scheduled_transaction")
+def delete_scheduled_transaction(guid: str) -> str:
+    """Delete a scheduled transaction.
+
+    Does not affect transactions already created from this schedule.
+
+    Args:
+        guid: Scheduled transaction GUID.
+    """
+    book = get_book()
+    result = book.delete_scheduled_transaction(guid=guid)
+    return json.dumps(result, indent=2)
+
+
+# ============== Lot (Cost Basis) Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="lot")
+def create_lot(
+    account: str,
+    title: str,
+    notes: str = "",
+) -> str:
+    """Create a new lot for cost basis tracking.
+
+    Lots group investment purchases for tracking cost basis and
+    calculating capital gains when selling.
+
+    Args:
+        account: Full path of investment account (e.g., "Assets:Investments:VTSAX").
+        title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
+        notes: Optional notes.
+    """
+    book = get_book()
+    result = book.create_lot(account=account, title=title, notes=notes)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_lots(
+    account: str,
+    include_closed: bool = False,
+) -> str:
+    """List all lots for an investment account.
+
+    Args:
+        account: Full path of investment account.
+        include_closed: If True, include fully-sold lots. Default False.
+
+    Returns:
+        JSON list of lots with:
+        - guid, title, notes, is_closed
+        - quantity (shares remaining)
+        - cost_basis (original cost of remaining shares)
+        - cost_per_share
+    """
+    book = get_book()
+    result = book.list_lots(account=account, include_closed=include_closed)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_lot(guid: str) -> str:
+    """Get detailed information about a lot.
+
+    Args:
+        guid: Lot GUID.
+
+    Returns:
+        JSON with lot details including all splits:
+        - title, notes, is_closed
+        - splits: list of all splits with date, quantity, value
+        - summary: total quantity, cost basis, cost per share
+    """
+    book = get_book()
+    result = book.get_lot(guid=guid)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="lot")
+def assign_split_to_lot(
+    split_guid: str,
+    lot_guid: str,
+) -> str:
+    """Assign a transaction split to a lot.
+
+    Use after creating a buy/sell transaction to link the investment
+    account split to its lot for cost basis tracking.
+
+    Args:
+        split_guid: GUID of the split (from transaction's investment account).
+        lot_guid: GUID of the lot.
+
+    Workflow:
+        1. create_lot("Assets:VTSAX", "VTSAX Jan 2026")
+        2. create_transaction(...buy 10 shares...)
+        3. assign_split_to_lot(investment_split_guid, lot_guid)
+    """
+    book = get_book()
+    result = book.assign_split_to_lot(split_guid=split_guid, lot_guid=lot_guid)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def calculate_lot_gain(
+    lot_guid: str,
+    shares: str | None = None,
+    sale_price: str | None = None,
+) -> str:
+    """Calculate potential or actual capital gain for a lot.
+
+    If shares and sale_price provided, calculates hypothetical gain.
+    Otherwise uses lot's current state and latest price.
+
+    Args:
+        lot_guid: Lot GUID.
+        shares: Optional number of shares to calculate for.
+                Defaults to all remaining shares.
+        sale_price: Optional sale price per share.
+                    Defaults to latest price for the commodity.
+    """
+    book = get_book()
+    result = book.calculate_lot_gain(
+        lot_guid=lot_guid, shares=shares, sale_price=sale_price,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="update", entity_type="lot")
+def close_lot(guid: str) -> str:
+    """Mark a lot as closed.
+
+    Use when a lot is fully sold but wasn't automatically marked closed,
+    or to manually close a lot with zero shares.
+
+    Args:
+        guid: Lot GUID.
+
+    Note:
+        Lots are automatically marked closed when their quantity reaches zero
+        through assigned splits. This tool is for manual cleanup.
+    """
+    book = get_book()
+    result = book.close_lot(guid=guid)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 
@@ -666,11 +1276,29 @@ def get_audit_log(
 
     audit_dir = log_dir / "audit"
     target_date = log_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    log_file = audit_dir / f"{target_date}.jsonl"
+
+    # Try the configured format first, then fall back to the other
+    fmt = get_audit_format()
+    primary_ext = "txt" if fmt == "text" else "jsonl"
+    fallback_ext = "jsonl" if fmt == "text" else "txt"
+
+    log_file = audit_dir / f"{target_date}.{primary_ext}"
+    if not log_file.exists():
+        log_file = audit_dir / f"{target_date}.{fallback_ext}"
 
     if not log_file.exists():
         return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
 
+    # Text format: return raw text content (filters not applicable)
+    if log_file.suffix == ".txt":
+        content = log_file.read_text()
+        lines = content.strip().split("\n")
+        # Return the last `limit` lines (approximation for text)
+        if len(lines) > limit:
+            lines = lines[-limit:]
+        return "\n".join(lines)
+
+    # JSON format: parse and filter entries
     entries = []
     for line in log_file.read_text().strip().split("\n"):
         if not line:
