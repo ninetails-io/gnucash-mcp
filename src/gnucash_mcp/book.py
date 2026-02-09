@@ -1469,6 +1469,10 @@ class GnuCashBook:
                                 f"transaction currency ({trans_currency.mnemonic})"
                             )
 
+                        # Update memo if provided
+                        if "memo" in update:
+                            split.memo = update["memo"]
+
                         del split_updates[account_name]
 
                 # Check if all provided accounts were found
