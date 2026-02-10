@@ -71,7 +71,14 @@ Add this (replace the paths with your actual paths):
   "mcpServers": {
     "gnucash": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/gnucash-mcp", "gnucash-mcp"],
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/gnucash-mcp",
+        "python",
+        "-m",
+        "gnucash_mcp"
+      ],
       "env": {
         "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash"
       }
@@ -93,6 +100,8 @@ If you used pip instead of uv:
   }
 }
 ```
+
+Optional flags: `"--debug"` enables debug logging, `"--audit-format=text"` or `"--audit-format=json"` sets the audit log format. Add these after `"gnucash_mcp"` in the args array.
 
 ### Step 4: Restart Claude Desktop
 
@@ -169,16 +178,16 @@ Claude: January 2026 Summary:
         • Spouse Salary: $1,749
         • VA Benefits: $200
         
-        Expenses: $9,614
+        Expenses: $9,014
         • Rent: $1,850
         • Groceries: $692
         • Dining: $351
-        • Credit Card Interest: $847
+        • Credit Card Interest: $247
         ...
         
-        Net: -$2,465 (spent more than earned)
+        Net: -$1,865 (spent more than earned)
         
-        Credit card debt: $64,345
+        Credit card debt: $14,345
 ```
 
 ---
@@ -234,21 +243,14 @@ This server **writes to your GnuCash book**. Before first use:
 
 ### Claude Code
 
-Add to your project's `.mcp.json`:
+Run this command to add the server (use `--scope user` for all projects, or `--scope project` for the current project only):
 
-```json
-{
-  "mcpServers": {
-    "gnucash": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/gnucash-mcp", "gnucash-mcp"],
-      "env": {
-        "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash"
-      }
-    }
-  }
-}
+```bash
+claude mcp add-json gnucash \
+  '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
 ```
+
+Replace both paths with your actual paths. Add `"--debug"` or `"--audit-format=text"` to the args array as needed.
 
 ### Other MCP Clients
 
@@ -357,4 +359,4 @@ gnucash-mcp/
 ## Acknowledgments
 
 - [piecash](https://github.com/sdementen/piecash) — Python interface to GnuCash
-- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — Model Context Protocol implementation
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — Model Context Protocol 
