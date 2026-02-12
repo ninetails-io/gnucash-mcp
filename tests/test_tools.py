@@ -164,6 +164,37 @@ class TestCreateTransactionTool:
         assert "error" in data
         assert "placeholder" in data["error"].lower()
 
+    def test_create_transaction_duplicate_rejected(self, setup_book_env):
+        """Should reject HIGH confidence duplicates via server layer."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            transaction_date="2024-01-20",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "rejected"
+        assert data["reason"] == "duplicate_detected"
+
+    def test_create_transaction_duplicate_force(self, setup_book_env):
+        """Should create with force_create despite HIGH duplicate."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            transaction_date="2024-01-20",
+            force_create=True,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert "guid" in data
+
 
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""

@@ -979,6 +979,86 @@ class GnuCashBook:
 
         return warnings
 
+    def _find_duplicates(
+        self,
+        description: str,
+        splits: list[dict],
+        trans_date: date,
+        window_days: int = 30,
+    ) -> list[dict]:
+        """Find potential duplicate transactions.
+
+        Uses three signals: description match (case-insensitive substring),
+        amount match (any split ±$1.00), and date match (±2 days).
+
+        Args:
+            description: Proposed transaction description.
+            splits: Proposed split dicts with 'amount' keys.
+            trans_date: Proposed transaction date.
+            window_days: Days before/after trans_date to search.
+
+        Returns:
+            List of duplicate candidates sorted by confidence (HIGH first).
+        """
+        proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
+        date_start = trans_date - timedelta(days=window_days)
+        date_end = trans_date + timedelta(days=window_days)
+        desc_lower = description.lower()
+
+        candidates = []
+
+        with self.open(readonly=True) as book:
+            for txn in book.transactions:
+                if txn.post_date < date_start or txn.post_date > date_end:
+                    continue
+
+                # Signal 1: Description match (substring both directions)
+                txn_desc_lower = txn.description.lower()
+                desc_match = (
+                    desc_lower in txn_desc_lower
+                    or txn_desc_lower in desc_lower
+                )
+
+                # Signal 2: Amount match (any split ±$1.00)
+                amount_match = False
+                txn_amounts = [abs(s.value) for s in txn.splits]
+                for proposed_amt in proposed_amounts:
+                    for txn_amt in txn_amounts:
+                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
+                            amount_match = True
+                            break
+                    if amount_match:
+                        break
+
+                # Signal 3: Date match (±2 days)
+                date_match = abs((txn.post_date - trans_date).days) <= 2
+
+                signals = sum([desc_match, amount_match, date_match])
+                if signals == 0:
+                    continue
+
+                if signals == 3:
+                    confidence = "HIGH"
+                elif signals == 2:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+
+                candidates.append({
+                    "confidence": confidence,
+                    "existing_transaction": _transaction_to_dict(txn),
+                    "match_signals": {
+                        "description": desc_match,
+                        "amount": amount_match,
+                        "date": date_match,
+                    },
+                })
+
+        # Sort: HIGH first, then MEDIUM, then LOW
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        candidates.sort(key=lambda c: order[c["confidence"]])
+        return candidates
+
     def create_transaction(
         self,
         description: str,
@@ -986,6 +1066,8 @@ class GnuCashBook:
         trans_date: date | None = None,
         currency: str | None = None,
         notes: str | None = None,
+        check_duplicates: bool = True,
+        force_create: bool = False,
     ) -> dict:
         """Create a new transaction with splits.
 
@@ -1002,9 +1084,13 @@ class GnuCashBook:
                       Defaults to book's default currency.
             notes: Transaction notes (optional). Free-text annotation
                    stored separately from the description.
+            check_duplicates: Run duplicate detection. Default True.
+            force_create: Create even if HIGH confidence duplicates found.
 
         Returns:
-            Dict with 'guid' and 'status' keys.
+            Dict with 'guid' and 'status' keys. May include 'warnings'
+            and 'duplicates'. If a HIGH duplicate is found and force_create
+            is False, returns 'status': 'rejected' instead.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
@@ -1023,6 +1109,20 @@ class GnuCashBook:
 
         if trans_date is None:
             trans_date = date.today()
+
+        # Stage 2: Duplicate check (readonly scan)
+        duplicates = []
+        if check_duplicates:
+            duplicates = self._find_duplicates(
+                description, splits, trans_date
+            )
+            has_high = any(d["confidence"] == "HIGH" for d in duplicates)
+            if has_high and not force_create:
+                return {
+                    "status": "rejected",
+                    "reason": "duplicate_detected",
+                    "duplicates": duplicates,
+                }
 
         with self.open(readonly=False) as book:
             # Determine transaction currency
@@ -1101,6 +1201,8 @@ class GnuCashBook:
             )
             if warnings:
                 result["warnings"] = warnings
+            if duplicates:
+                result["duplicates"] = duplicates
             return result
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:

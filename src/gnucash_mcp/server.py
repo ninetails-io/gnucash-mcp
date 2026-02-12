@@ -369,6 +369,8 @@ def create_transaction(
     transaction_date: str | None = None,
     currency: str | None = None,
     notes: str | None = None,
+    check_duplicates: bool = True,
+    force_create: bool = False,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -385,6 +387,8 @@ def create_transaction(
                   Defaults to book's default currency.
         notes: Transaction notes (optional). Free-text annotation stored
                separately from description.
+        check_duplicates: Run duplicate detection against existing transactions.
+        force_create: Create even if HIGH confidence duplicates are found.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -394,6 +398,8 @@ def create_transaction(
         trans_date=trans_date,
         currency=currency,
         notes=notes,
+        check_duplicates=check_duplicates,
+        force_create=force_create,
     )
     return json.dumps(result, indent=2)
 

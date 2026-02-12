@@ -453,6 +453,156 @@ class TestCreateTransactionWarnings:
         assert "negative_expense" in warning_types
 
 
+class TestDuplicateDetection:
+    """Tests for duplicate transaction detection."""
+
+    def test_high_duplicate_rejected(self, test_book: Path):
+        """Should reject when all 3 signals match (description, amount, date)."""
+        gc_book = GnuCashBook(str(test_book))
+        # Existing: "Weekly Groceries", $150, 2024-01-20
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        assert result["reason"] == "duplicate_detected"
+        assert len(result["duplicates"]) > 0
+        assert result["duplicates"][0]["confidence"] == "HIGH"
+
+    def test_high_duplicate_force_create(self, test_book: Path):
+        """Should create when force_create overrides HIGH duplicate."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            force_create=True,
+        )
+        assert result["status"] == "created"
+        assert "guid" in result
+        assert len(result["duplicates"]) > 0
+
+    def test_medium_duplicate_allowed(self, test_book: Path):
+        """Should allow creation with MEDIUM confidence (2/3 signals)."""
+        gc_book = GnuCashBook(str(test_book))
+        # Same description and date, different amount
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "created"
+        assert any(
+            d["confidence"] == "MEDIUM" for d in result.get("duplicates", [])
+        )
+
+    def test_low_duplicate_included(self, test_book: Path):
+        """LOW confidence duplicates should be included for reference."""
+        gc_book = GnuCashBook(str(test_book))
+        # Only amount matches (~$150), different description, different date
+        result = gc_book.create_transaction(
+            description="Totally Different Store",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.50"},
+                {"account": "Assets:Checking", "amount": "-150.50"},
+            ],
+            trans_date=date(2024, 1, 25),
+        )
+        assert result["status"] == "created"
+        # Should have LOW confidence match (amount only)
+        if result.get("duplicates"):
+            assert any(
+                d["confidence"] == "LOW" for d in result["duplicates"]
+            )
+
+    def test_check_duplicates_false_skips(self, test_book: Path):
+        """Should skip duplicate check entirely when check_duplicates=False."""
+        gc_book = GnuCashBook(str(test_book))
+        # Exact duplicate but check disabled
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "duplicates" not in result
+
+    def test_substring_description_match(self, test_book: Path):
+        """Substring matching should work in both directions."""
+        gc_book = GnuCashBook(str(test_book))
+        # "Groceries" is substring of "Weekly Groceries"
+        result = gc_book.create_transaction(
+            description="Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        high = [d for d in result["duplicates"] if d["confidence"] == "HIGH"]
+        assert len(high) > 0
+        assert high[0]["match_signals"]["description"] is True
+
+    def test_amount_tolerance(self, test_book: Path):
+        """Amount match should use ±$1.00 tolerance."""
+        gc_book = GnuCashBook(str(test_book))
+        # $150.99 is within $1.00 of $150.00
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.99"},
+                {"account": "Assets:Checking", "amount": "-150.99"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        assert result["duplicates"][0]["match_signals"]["amount"] is True
+
+    def test_date_window(self, test_book: Path):
+        """Date match should use ±2 day window."""
+        gc_book = GnuCashBook(str(test_book))
+        # 2 days after existing (2024-01-20), should still match
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 22),
+        )
+        assert result["status"] == "rejected"
+        assert result["duplicates"][0]["match_signals"]["date"] is True
+
+    def test_no_duplicates_distant_date(self, test_book: Path):
+        """Should find no duplicates when date is far from existing."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2025, 6, 15),
+        )
+        assert result["status"] == "created"
+        assert "duplicates" not in result
+
+
 class TestSearchTransactions:
     """Tests for search_transactions method."""
 
