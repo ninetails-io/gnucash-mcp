@@ -1237,6 +1237,71 @@ def close_lot(guid: str) -> str:
     return json.dumps(result, indent=2)
 
 
+# ============== Account Slot Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_account_slots(
+    account: str,
+    key: str | None = None,
+) -> str:
+    """Read slots (custom metadata) from an account.
+
+    Slots are key-value pairs stored on accounts for metadata like APR,
+    credit limit, reward rates, or any custom data.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Specific slot key to retrieve. If omitted, returns all slots.
+    """
+    book = get_book()
+    result = book.get_account_slots(account_name=account, key=key)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="set_slot", entity_type="account_slot")
+def set_account_slot(
+    account: str,
+    key: str,
+    value: str,
+) -> str:
+    """Set a custom metadata slot on an account.
+
+    Stores a key-value pair on the account. Values are stored as strings.
+    Use for APR, credit limits, reward rates, or any per-account metadata.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Slot key (e.g., "apr", "credit_limit").
+        value: Slot value (always stored as string).
+    """
+    book = get_book()
+    result = book.set_account_slot(account_name=account, key=key, value=value)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete_slot", entity_type="account_slot")
+def delete_account_slot(
+    account: str,
+    key: str,
+) -> str:
+    """Remove a custom metadata slot from an account.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Slot key to remove.
+    """
+    book = get_book()
+    result = book.delete_account_slot(account_name=account, key=key)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 

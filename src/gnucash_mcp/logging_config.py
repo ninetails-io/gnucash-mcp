@@ -474,6 +474,22 @@ def _format_audit_entry_text(entry: dict) -> str:
             old_state = before.get("reconcile_state", "n") if before else "n"
             lines.append(f"{indent}State: {old_state} → {state}")
 
+    elif entity_type == "account_slot":
+        account = params.get("account", "")
+        key = params.get("key", "")
+
+        if operation == "SET_SLOT":
+            value = params.get("value", "")
+            status = ""
+            if after:
+                status = after.get("status", "")
+            lines.append(f"{time_part}  SET ACCOUNT SLOT  account:{account}")
+            lines.append(f'{indent}key: "{key}"  value: "{value}"  ({status})')
+
+        elif operation == "DELETE_SLOT":
+            lines.append(f"{time_part}  DELETE ACCOUNT SLOT  account:{account}")
+            lines.append(f'{indent}key: "{key}"')
+
     # Handle move_account specially (it's logged as "update" but is conceptually a move)
     if entity_type == "account" and "new_parent" in params:
         # This is actually a MOVE operation
