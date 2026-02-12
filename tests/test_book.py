@@ -296,6 +296,34 @@ class TestCreateTransaction:
                 ],
             )
 
+    def test_create_transaction_placeholder_rejected(self, test_book: Path):
+        """Should reject transaction targeting a placeholder account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="placeholder") as exc_info:
+            gc_book.create_transaction(
+                description="Bad Transaction",
+                splits=[
+                    {"account": "Expenses", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+            )
+        # Error should suggest child accounts
+        assert "Expenses:Groceries" in str(exc_info.value)
+
+    def test_create_transaction_placeholder_suggests_children(self, test_book: Path):
+        """Error message should list the placeholder's child accounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Use one of:"):
+            gc_book.create_transaction(
+                description="Bad Transaction",
+                splits=[
+                    {"account": "Assets", "amount": "-50.00"},
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                ],
+            )
+
     def test_create_transaction_with_notes(self, test_book: Path):
         """Should create transaction with notes field."""
         gc_book = GnuCashBook(str(test_book))

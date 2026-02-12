@@ -982,6 +982,16 @@ class GnuCashBook:
                 if not account:
                     raise ValueError(f"Account not found: {split['account']}")
 
+                if account.placeholder:
+                    children_hint = ", ".join(
+                        c.fullname for c in account.children
+                    )
+                    raise ValueError(
+                        f"Account '{account.fullname}' is a placeholder and "
+                        f"cannot receive transactions. "
+                        f"Use one of: {children_hint}"
+                    )
+
                 value = Decimal(split["amount"])
 
                 # Determine quantity

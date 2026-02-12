@@ -150,6 +150,20 @@ class TestCreateTransactionTool:
         assert "error" in data
         assert "balance" in data["error"].lower()
 
+    def test_create_transaction_placeholder_rejected(self, setup_book_env):
+        """Should reject transaction targeting placeholder account."""
+        result = server_module.create_transaction(
+            description="Bad Transaction",
+            splits=[
+                {"account": "Expenses", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "placeholder" in data["error"].lower()
+
 
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""
