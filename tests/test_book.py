@@ -810,6 +810,343 @@ class TestAutoFillTransaction:
                 assert s["value"] == "200"
 
 
+class TestSplitConsistency:
+    """Tests for split consistency warnings."""
+
+    def _create_dining_account(self, gc_book):
+        """Helper to add Expenses:Dining account."""
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+    def _seed_groceries(self, gc_book, count=2):
+        """Create recent grocery transactions for consistency baseline."""
+        today = date.today()
+        for i in range(count):
+            gc_book.create_transaction(
+                description="Weekly Groceries",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+                trans_date=today - timedelta(days=7 * (i + 1)),
+                check_duplicates=False,
+            )
+
+    def test_no_history(self, test_book: Path):
+        """First transaction with a new description produces no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        result = gc_book.create_transaction(
+            description="Brand New Vendor XYZ",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "25.00"},
+                {"account": "Assets:Checking", "amount": "-25.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_matching_pattern(self, test_book: Path):
+        """Same expense account as recent history produces no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "175.00"},
+                {"account": "Assets:Checking", "amount": "-175.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_different_pattern(self, test_book: Path):
+        """Different expense account triggers split_consistency warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 1
+        assert "Expenses:Groceries" in consistency[0]["message"]
+        assert "Expenses:Dining" in consistency[0]["message"]
+
+    def test_ignores_funding_account(self, test_book: Path):
+        """Changing funding account (Checking→Credit Card) with same
+        expense should NOT trigger warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_groceries(gc_book)
+        # Add a credit card account
+        gc_book.create_account(
+            name="Credit Card",
+            account_type="CREDIT",
+            parent="Liabilities",
+        )
+        # Pay groceries from credit card instead of checking
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Liabilities:Credit Card", "amount": "-150.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_transfer_pattern(self, test_book: Path):
+        """Bank-to-bank transfer detects changed target account."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Savings",
+            account_type="BANK",
+            parent="Assets",
+        )
+        gc_book.create_account(
+            name="Emergency Fund",
+            account_type="BANK",
+            parent="Assets",
+        )
+        today = date.today()
+        # Seed: transfer Checking → Savings
+        gc_book.create_transaction(
+            description="Monthly Transfer",
+            splits=[
+                {"account": "Assets:Savings", "amount": "500.00"},
+                {"account": "Assets:Checking", "amount": "-500.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # New: transfer Checking → Emergency Fund (different target)
+        result = gc_book.create_transaction(
+            description="Monthly Transfer",
+            splits=[
+                {"account": "Assets:Emergency Fund", "amount": "500.00"},
+                {"account": "Assets:Checking", "amount": "-500.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        # Transfer between funding accounts → fallback uses all accounts
+        assert len(consistency) == 1
+
+    def test_with_dry_run(self, test_book: Path):
+        """Split consistency warning appears in dry-run result."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        consistency = [
+            w for w in result["warnings"]
+            if w["type"] == "split_consistency"
+        ]
+        assert len(consistency) == 1
+        assert "Expenses:Groceries" in consistency[0]["message"]
+
+
+class TestAutoFillStability:
+    """Tests for auto-fill stability warnings."""
+
+    def _seed_consistent(self, gc_book, count=3):
+        """Create consistent grocery transactions."""
+        today = date.today()
+        for i in range(count):
+            gc_book.create_transaction(
+                description="Weekly Groceries",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+                trans_date=today - timedelta(days=7 * (i + 1)),
+                check_duplicates=False,
+            )
+
+    def _create_dining_account(self, gc_book):
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+    def test_stable_pattern(self, test_book: Path):
+        """All recent matches consistent, no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_consistent(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" in result
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 0
+
+    def test_unstable_pattern(self, test_book: Path):
+        """Recent matches differ, auto_fill_unstable warning fires."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        # Older: groceries account
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        # More recent: dining account (different pattern)
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # Auto-fill should trigger instability warning
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" in result
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 1
+        assert "different account patterns" in stability[0]["message"]
+
+    def test_single_match(self, test_book: Path):
+        """Only one prior transaction, no instability warning."""
+        gc_book = GnuCashBook(str(test_book))
+        today = date.today()
+        gc_book.create_transaction(
+            description="One-Time Vendor",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        result = gc_book.create_transaction(
+            description="One-Time Vendor",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 0
+
+    def test_stability_with_dry_run(self, test_book: Path):
+        """Instability warning appears in dry-run result."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        stability = [
+            w for w in result["warnings"]
+            if w["type"] == "auto_fill_unstable"
+        ]
+        assert len(stability) == 1
+
+    def test_unstable_no_consistency_conflict(self, test_book: Path):
+        """Stability warning fires but NOT consistency warning when
+        proposed splits match most recent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        # Older: groceries
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        # More recent: dining
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # Auto-fill grabs most recent (dining) — matches recent so no
+        # consistency warning, but stability warning should fire
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(stability) == 1
+        assert len(consistency) == 0
+
+
 class TestSearchTransactions:
     """Tests for search_transactions method."""
 

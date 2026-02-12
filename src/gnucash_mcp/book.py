@@ -923,6 +923,71 @@ class GnuCashBook:
                 return _transaction_to_dict(transaction)
             return None
 
+    _FUNDING_ACCOUNT_TYPES = {
+        "BANK", "CASH", "ASSET", "CREDIT", "LIABILITY", "EQUITY",
+    }
+
+    @staticmethod
+    def _extract_account_pattern(accounts) -> frozenset[str]:
+        """Extract categorization (non-funding) account names.
+
+        Filters out funding account types (BANK, CASH, ASSET, CREDIT,
+        LIABILITY, EQUITY) to isolate expense/income categorization.
+        Falls back to all accounts if filtering leaves nothing
+        (e.g., bank-to-bank transfers).
+
+        Args:
+            accounts: Iterable of piecash Account objects.
+
+        Returns:
+            frozenset of account fullnames representing the pattern.
+        """
+        all_names = frozenset(a.fullname for a in accounts)
+        categorization = frozenset(
+            a.fullname for a in accounts
+            if a.type not in GnuCashBook._FUNDING_ACCOUNT_TYPES
+        )
+        return categorization if categorization else all_names
+
+    def _find_recent_description_matches(
+        self,
+        book,
+        description: str,
+        limit: int = 5,
+        days: int = 90,
+    ) -> list:
+        """Find recent transactions with matching descriptions.
+
+        Uses bidirectional case-insensitive substring matching
+        (same logic as _auto_fill_splits and _find_duplicates).
+
+        Args:
+            book: Open piecash book (readonly).
+            description: Description to match.
+            limit: Maximum matches to return.
+            days: How far back to search.
+
+        Returns:
+            List of piecash Transaction objects, most recent first.
+        """
+        desc_lower = description.lower()
+        cutoff = date.today() - timedelta(days=days)
+        matches = []
+
+        sorted_txns = sorted(
+            book.transactions, key=lambda t: t.post_date, reverse=True
+        )
+        for txn in sorted_txns:
+            if txn.post_date < cutoff:
+                break
+            txn_desc_lower = txn.description.lower()
+            if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
+                matches.append(txn)
+                if len(matches) >= limit:
+                    break
+
+        return matches
+
     @staticmethod
     def _generate_warnings(
         trans_date: date,
@@ -1027,6 +1092,108 @@ class GnuCashBook:
                     return filled_splits, source_info
 
         return None
+
+    def _check_split_consistency(
+        self,
+        description: str,
+        splits: list[dict],
+        resolved_accounts: list,
+        days: int = 30,
+    ) -> list[dict]:
+        """Check if proposed splits' account pattern matches recent history.
+
+        Compares categorization accounts in the proposed transaction
+        against recent transactions with the same description. Warns
+        if the account pattern differs.
+
+        Args:
+            description: Transaction description.
+            splits: Proposed split dicts with 'account' keys.
+            resolved_accounts: Resolved piecash Account objects,
+                same order as splits.
+            days: How far back to search for comparison.
+
+        Returns:
+            List of warning dicts (possibly empty).
+        """
+        proposed_pattern = self._extract_account_pattern(resolved_accounts)
+
+        with self.open(readonly=True) as book:
+            matches = self._find_recent_description_matches(
+                book, description, limit=5, days=days
+            )
+
+            if not matches:
+                return []
+
+            # Capture data inside session to avoid DetachedInstanceError
+            recent_accounts = [s.account for s in matches[0].splits]
+            recent_pattern = self._extract_account_pattern(recent_accounts)
+            recent_desc = matches[0].description
+
+        if proposed_pattern == recent_pattern:
+            return []
+
+        return [{
+            "type": "split_consistency",
+            "message": (
+                f"Recent '{recent_desc}' transactions used "
+                f"{', '.join(sorted(recent_pattern))}, but this transaction "
+                f"uses {', '.join(sorted(proposed_pattern))}."
+            ),
+        }]
+
+    def _check_auto_fill_stability(
+        self,
+        description: str,
+        limit: int = 5,
+        days: int = 90,
+    ) -> list[dict]:
+        """Check if recent matching transactions have consistent patterns.
+
+        Examines recent transactions with the same description and warns
+        if they use different categorization account patterns — meaning
+        auto-fill is drawing from an inconsistent history.
+
+        Args:
+            description: Transaction description to match.
+            limit: Number of recent matches to examine.
+            days: How far back to search.
+
+        Returns:
+            List of warning dicts (possibly empty).
+        """
+        with self.open(readonly=True) as book:
+            matches = self._find_recent_description_matches(
+                book, description, limit=limit, days=days
+            )
+
+            if len(matches) < 2:
+                return []
+
+            # Capture all data inside session to avoid DetachedInstanceError
+            patterns = []
+            for txn in matches:
+                accounts = [s.account for s in txn.splits]
+                patterns.append(self._extract_account_pattern(accounts))
+
+            most_recent_date = matches[0].post_date.isoformat()
+
+        first_pattern = patterns[0]
+        if all(p == first_pattern for p in patterns):
+            return []
+
+        different_count = sum(1 for p in patterns[1:] if p != first_pattern)
+
+        return [{
+            "type": "auto_fill_unstable",
+            "message": (
+                f"Recent '{description}' transactions use different account "
+                f"patterns. Auto-filled from most recent ({most_recent_date}), "
+                f"but {different_count} of {len(matches)} recent matches used "
+                f"different categorization."
+            ),
+        }]
 
     def _find_duplicates(
         self,
@@ -1163,6 +1330,11 @@ class GnuCashBook:
                 )
             splits, auto_filled_from = auto_result
 
+        # Stage 0b: Auto-fill stability check
+        auto_fill_warnings = []
+        if auto_filled_from:
+            auto_fill_warnings = self._check_auto_fill_stability(description)
+
         if len(splits) < 2:
             raise ValueError("Transaction must have at least 2 splits")
 
@@ -1194,7 +1366,7 @@ class GnuCashBook:
         if dry_run:
             return self._dry_run_transaction(
                 description, splits, trans_date, currency, notes,
-                duplicates, auto_filled_from,
+                duplicates, auto_filled_from, auto_fill_warnings,
             )
 
         # Stage 4: Write
@@ -1273,6 +1445,31 @@ class GnuCashBook:
             warnings = self._generate_warnings(
                 trans_date, splits, resolved_accounts
             )
+
+            # Split consistency check (uses already-open book)
+            proposed_pattern = self._extract_account_pattern(
+                resolved_accounts
+            )
+            recent = self._find_recent_description_matches(
+                book, description, limit=5, days=30
+            )
+            # Exclude the transaction we just created
+            recent = [t for t in recent if t.guid != transaction.guid]
+            if recent:
+                recent_accts = [s.account for s in recent[0].splits]
+                recent_pattern = self._extract_account_pattern(recent_accts)
+                if proposed_pattern != recent_pattern:
+                    warnings.append({
+                        "type": "split_consistency",
+                        "message": (
+                            f"Recent '{recent[0].description}' transactions "
+                            f"used {', '.join(sorted(recent_pattern))}, but "
+                            f"this transaction uses "
+                            f"{', '.join(sorted(proposed_pattern))}."
+                        ),
+                    })
+
+            warnings.extend(auto_fill_warnings)
             if warnings:
                 result["warnings"] = warnings
             if duplicates:
@@ -1290,6 +1487,7 @@ class GnuCashBook:
         notes: str | None,
         duplicates: list[dict],
         auto_filled_from: dict | None = None,
+        auto_fill_warnings: list[dict] | None = None,
     ) -> dict:
         """Validate a proposed transaction without writing.
 
@@ -1354,6 +1552,30 @@ class GnuCashBook:
             warnings = self._generate_warnings(
                 trans_date, splits, resolved_accounts
             )
+
+            # Split consistency check (uses already-open book)
+            proposed_pattern = self._extract_account_pattern(
+                resolved_accounts
+            )
+            recent = self._find_recent_description_matches(
+                book, description, limit=5, days=30
+            )
+            if recent:
+                recent_accts = [s.account for s in recent[0].splits]
+                recent_pattern = self._extract_account_pattern(recent_accts)
+                if proposed_pattern != recent_pattern:
+                    warnings.append({
+                        "type": "split_consistency",
+                        "message": (
+                            f"Recent '{recent[0].description}' transactions "
+                            f"used {', '.join(sorted(recent_pattern))}, but "
+                            f"this transaction uses "
+                            f"{', '.join(sorted(proposed_pattern))}."
+                        ),
+                    })
+
+            if auto_fill_warnings:
+                warnings.extend(auto_fill_warnings)
 
         result = {
             "dry_run": True,
