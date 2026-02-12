@@ -711,6 +711,105 @@ class TestDryRun:
             )
 
 
+class TestAutoFillTransaction:
+    """Tests for auto-fill splits from previous transactions."""
+
+    def test_auto_fill_from_description(self, test_book: Path):
+        """Should auto-fill splits from most recent matching transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        # "Weekly Groceries" exists in fixture: $150 groceries / -$150 checking
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        # Verify the transaction was created with auto-filled splits
+        txn = gc_book.get_transaction(result["guid"])
+        accounts = {s["account"] for s in txn["splits"]}
+        assert "Expenses:Groceries" in accounts
+        assert "Assets:Checking" in accounts
+
+    def test_auto_fill_result_includes_source(self, test_book: Path):
+        """Should include auto_filled_from with source transaction info."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert "auto_filled_from" in result
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
+        assert "guid" in result["auto_filled_from"]
+        assert "date" in result["auto_filled_from"]
+
+    def test_auto_fill_no_match(self, test_book: Path):
+        """Should raise ValueError when no matching transaction found."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(
+                description="Never Seen Before XYZ123",
+            )
+
+    def test_auto_fill_with_dry_run(self, test_book: Path):
+        """Should auto-fill and return proposal in dry run mode."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        assert "auto_filled_from" in result
+        # Proposed splits should come from the auto-fill
+        proposed_splits = result["proposed_transaction"]["splits"]
+        accounts = {s["account"] for s in proposed_splits}
+        assert "Expenses:Groceries" in accounts
+
+    def test_auto_fill_preserves_memo(self, test_book: Path):
+        """Auto-fill should preserve memo from source transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        # First create a transaction with a memo
+        gc_book.create_transaction(
+            description="Coffee Shop",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "5.00", "memo": "Latte"},
+                {"account": "Assets:Checking", "amount": "-5.00"},
+            ],
+            trans_date=date(2024, 2, 1),
+            check_duplicates=False,
+        )
+        # Auto-fill from it
+        result = gc_book.create_transaction(
+            description="Coffee Shop",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        txn = gc_book.get_transaction(result["guid"])
+        memos = {s["memo"] for s in txn["splits"]}
+        assert "Latte" in memos
+
+    def test_explicit_splits_no_auto_fill(self, test_book: Path):
+        """Providing explicit splits should bypass auto-fill."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" not in result
+        # Verify the explicit amount was used, not auto-filled
+        txn = gc_book.get_transaction(result["guid"])
+        for s in txn["splits"]:
+            if s["account"] == "Expenses:Groceries":
+                assert s["value"] == "200"
+
+
 class TestSearchTransactions:
     """Tests for search_transactions method."""
 

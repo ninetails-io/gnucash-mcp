@@ -979,6 +979,55 @@ class GnuCashBook:
 
         return warnings
 
+    def _auto_fill_splits(
+        self, description: str
+    ) -> tuple[list[dict], dict] | None:
+        """Find the most recent matching transaction and extract its splits.
+
+        Uses bidirectional case-insensitive substring matching on
+        description (same logic as _find_duplicates).
+
+        Args:
+            description: Transaction description to match against.
+
+        Returns:
+            Tuple of (splits_list, source_info) if match found, None otherwise.
+            splits_list is in create_transaction input format.
+            source_info has guid, description, and date of the source.
+        """
+        desc_lower = description.lower()
+
+        with self.open(readonly=True) as book:
+            # Sort by date descending to find most recent match
+            sorted_txns = sorted(
+                book.transactions, key=lambda t: t.post_date, reverse=True
+            )
+
+            for txn in sorted_txns:
+                txn_desc_lower = txn.description.lower()
+                if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
+                    # Extract splits into input format
+                    filled_splits = []
+                    for s in txn.splits:
+                        split_dict = {
+                            "account": s.account.fullname,
+                            "amount": str(s.value),
+                        }
+                        if s.quantity != s.value:
+                            split_dict["quantity"] = str(s.quantity)
+                        if s.memo:
+                            split_dict["memo"] = s.memo
+                        filled_splits.append(split_dict)
+
+                    source_info = {
+                        "guid": txn.guid,
+                        "description": txn.description,
+                        "date": txn.post_date.isoformat(),
+                    }
+                    return filled_splits, source_info
+
+        return None
+
     def _find_duplicates(
         self,
         description: str,
@@ -1062,7 +1111,7 @@ class GnuCashBook:
     def create_transaction(
         self,
         description: str,
-        splits: list[dict],
+        splits: list[dict] | None = None,
         trans_date: date | None = None,
         currency: str | None = None,
         notes: str | None = None,
@@ -1080,6 +1129,8 @@ class GnuCashBook:
                 - 'quantity' (optional): Amount in account's commodity.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo.
+                If omitted or empty, auto-fills from the most recent
+                transaction with a matching description.
             trans_date: Transaction date. Defaults to today.
             currency: ISO currency code for the transaction (e.g., "USD", "EUR").
                       Defaults to book's default currency.
@@ -1090,16 +1141,28 @@ class GnuCashBook:
             dry_run: Validate and return proposal without writing.
 
         Returns:
-            Dict with 'guid' and 'status' keys. May include 'warnings'
-            and 'duplicates'. If a HIGH duplicate is found and force_create
-            is False, returns 'status': 'rejected' instead. In dry_run
-            mode, returns 'dry_run': True with proposed transaction.
+            Dict with 'guid' and 'status' keys. May include 'warnings',
+            'duplicates', and 'auto_filled_from'. If a HIGH duplicate is
+            found and force_create is False, returns 'status': 'rejected'
+            instead. In dry_run mode, returns 'dry_run': True with
+            proposed transaction.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
-                       accounts don't exist, or cross-currency splits
-                       are missing quantity.
+                       accounts don't exist, cross-currency splits
+                       missing quantity, or no match found for auto-fill.
         """
+        # Stage 0: Auto-fill splits from previous matching transaction
+        auto_filled_from = None
+        if not splits:
+            auto_result = self._auto_fill_splits(description)
+            if auto_result is None:
+                raise ValueError(
+                    "No matching transaction found for auto-fill. "
+                    "Provide explicit splits."
+                )
+            splits, auto_filled_from = auto_result
+
         if len(splits) < 2:
             raise ValueError("Transaction must have at least 2 splits")
 
@@ -1131,7 +1194,7 @@ class GnuCashBook:
         if dry_run:
             return self._dry_run_transaction(
                 description, splits, trans_date, currency, notes,
-                duplicates,
+                duplicates, auto_filled_from,
             )
 
         # Stage 4: Write
@@ -1214,6 +1277,8 @@ class GnuCashBook:
                 result["warnings"] = warnings
             if duplicates:
                 result["duplicates"] = duplicates
+            if auto_filled_from:
+                result["auto_filled_from"] = auto_filled_from
             return result
 
     def _dry_run_transaction(
@@ -1224,6 +1289,7 @@ class GnuCashBook:
         currency: str | None,
         notes: str | None,
         duplicates: list[dict],
+        auto_filled_from: dict | None = None,
     ) -> dict:
         """Validate a proposed transaction without writing.
 
@@ -1302,6 +1368,8 @@ class GnuCashBook:
         }
         if notes:
             result["proposed_transaction"]["notes"] = notes
+        if auto_filled_from:
+            result["auto_filled_from"] = auto_filled_from
         return result
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:

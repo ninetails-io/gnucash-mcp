@@ -365,7 +365,7 @@ def get_transaction(guid: str) -> str:
 @audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction(
     description: str,
-    splits: list[dict],
+    splits: list[dict] | None = None,
     transaction_date: str | None = None,
     currency: str | None = None,
     notes: str | None = None,

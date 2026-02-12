@@ -212,6 +212,19 @@ class TestCreateTransactionTool:
         assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
         assert "guid" not in data
 
+    def test_create_transaction_auto_fill(self, setup_book_env):
+        """Should auto-fill splits from matching transaction."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            transaction_date="2024-03-01",
+            check_duplicates=False,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert "auto_filled_from" in data
+        assert data["auto_filled_from"]["description"] == "Weekly Groceries"
+
 
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""
