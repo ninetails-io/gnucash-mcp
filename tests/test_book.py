@@ -603,6 +603,114 @@ class TestDuplicateDetection:
         assert "duplicates" not in result
 
 
+class TestDryRun:
+    """Tests for dry run mode on create_transaction."""
+
+    def test_dry_run_returns_proposal(self, test_book: Path):
+        """Should return proposed transaction without writing."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Dry Run Test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=date(2024, 3, 1),
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert result["proposed_transaction"]["description"] == "Dry Run Test"
+        assert result["proposed_transaction"]["date"] == "2024-03-01"
+        assert result["proposed_transaction"]["currency"] == "USD"
+        assert len(result["proposed_transaction"]["splits"]) == 2
+
+    def test_dry_run_no_write(self, test_book: Path):
+        """Dry run should not create a transaction in the book."""
+        gc_book = GnuCashBook(str(test_book))
+        before = gc_book.list_transactions()
+        gc_book.create_transaction(
+            description="Ghost Transaction",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "99.99"},
+                {"account": "Assets:Checking", "amount": "-99.99"},
+            ],
+            dry_run=True,
+        )
+        after = gc_book.list_transactions()
+        assert len(after) == len(before)
+
+    def test_dry_run_includes_warnings(self, test_book: Path):
+        """Dry run should include warnings."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Future Dry Run",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=future,
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert any(w["type"] == "future_date" for w in result["warnings"])
+
+    def test_dry_run_includes_duplicates(self, test_book: Path):
+        """Dry run should include duplicate candidates."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert len(result["duplicates"]) > 0
+
+    def test_dry_run_validation_errors_raised(self, test_book: Path):
+        """Dry run should still raise validation errors."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="do not balance"):
+            gc_book.create_transaction(
+                description="Unbalanced Dry Run",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-40.00"},
+                ],
+                dry_run=True,
+            )
+
+    def test_dry_run_placeholder_rejected(self, test_book: Path):
+        """Dry run should reject placeholder accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="placeholder"):
+            gc_book.create_transaction(
+                description="Placeholder Dry Run",
+                splits=[
+                    {"account": "Expenses", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+                dry_run=True,
+            )
+
+    def test_dry_run_unknown_currency(self, test_book: Path):
+        """Dry run should raise error for unknown currency."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="not found"):
+            gc_book.create_transaction(
+                description="Bad Currency Dry Run",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+                currency="XYZ",
+                dry_run=True,
+            )
+
+
 class TestSearchTransactions:
     """Tests for search_transactions method."""
 

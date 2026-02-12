@@ -195,6 +195,23 @@ class TestCreateTransactionTool:
         assert data["status"] == "created"
         assert "guid" in data
 
+    def test_create_transaction_dry_run(self, setup_book_env):
+        """Should return proposal without writing in dry run mode."""
+        result = server_module.create_transaction(
+            description="Dry Run Server Test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "75.00"},
+                {"account": "Assets:Checking", "amount": "-75.00"},
+            ],
+            transaction_date="2024-03-01",
+            dry_run=True,
+        )
+
+        data = json.loads(result)
+        assert data["dry_run"] is True
+        assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
+        assert "guid" not in data
+
 
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""

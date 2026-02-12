@@ -371,6 +371,7 @@ def create_transaction(
     notes: str | None = None,
     check_duplicates: bool = True,
     force_create: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -389,6 +390,7 @@ def create_transaction(
                separately from description.
         check_duplicates: Run duplicate detection against existing transactions.
         force_create: Create even if HIGH confidence duplicates are found.
+        dry_run: Run validation and dupe check, return proposal without writing.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -400,6 +402,7 @@ def create_transaction(
         notes=notes,
         check_duplicates=check_duplicates,
         force_create=force_create,
+        dry_run=dry_run,
     )
     return json.dumps(result, indent=2)
 

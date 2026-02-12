@@ -1068,6 +1068,7 @@ class GnuCashBook:
         notes: str | None = None,
         check_duplicates: bool = True,
         force_create: bool = False,
+        dry_run: bool = False,
     ) -> dict:
         """Create a new transaction with splits.
 
@@ -1086,11 +1087,13 @@ class GnuCashBook:
                    stored separately from the description.
             check_duplicates: Run duplicate detection. Default True.
             force_create: Create even if HIGH confidence duplicates found.
+            dry_run: Validate and return proposal without writing.
 
         Returns:
             Dict with 'guid' and 'status' keys. May include 'warnings'
             and 'duplicates'. If a HIGH duplicate is found and force_create
-            is False, returns 'status': 'rejected' instead.
+            is False, returns 'status': 'rejected' instead. In dry_run
+            mode, returns 'dry_run': True with proposed transaction.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
@@ -1117,13 +1120,21 @@ class GnuCashBook:
                 description, splits, trans_date
             )
             has_high = any(d["confidence"] == "HIGH" for d in duplicates)
-            if has_high and not force_create:
+            if has_high and not force_create and not dry_run:
                 return {
                     "status": "rejected",
                     "reason": "duplicate_detected",
                     "duplicates": duplicates,
                 }
 
+        # Stage 3: Dry run — validate readonly, return proposal
+        if dry_run:
+            return self._dry_run_transaction(
+                description, splits, trans_date, currency, notes,
+                duplicates,
+            )
+
+        # Stage 4: Write
         with self.open(readonly=False) as book:
             # Determine transaction currency
             if currency is None:
@@ -1204,6 +1215,94 @@ class GnuCashBook:
             if duplicates:
                 result["duplicates"] = duplicates
             return result
+
+    def _dry_run_transaction(
+        self,
+        description: str,
+        splits: list[dict],
+        trans_date: date,
+        currency: str | None,
+        notes: str | None,
+        duplicates: list[dict],
+    ) -> dict:
+        """Validate a proposed transaction without writing.
+
+        Opens the book readonly to validate accounts, placeholders,
+        and cross-currency requirements.
+
+        Returns:
+            Dict with dry_run=True, proposed_transaction, warnings,
+            and duplicates.
+        """
+        with self.open(readonly=True) as book:
+            # Determine transaction currency (readonly — no creation)
+            if currency is None:
+                trans_currency = book.default_currency
+                currency_mnemonic = trans_currency.mnemonic
+            else:
+                trans_currency = self._find_commodity(book, currency)
+                if not trans_currency:
+                    raise ValueError(
+                        f"Currency '{currency}' not found in book. "
+                        f"Dry run cannot create new currencies."
+                    )
+                currency_mnemonic = trans_currency.mnemonic
+
+            # Validate all accounts
+            resolved_accounts = []
+            for split in splits:
+                account = self._find_account(book, split["account"])
+                if not account:
+                    raise ValueError(f"Account not found: {split['account']}")
+
+                if account.placeholder:
+                    children_hint = ", ".join(
+                        c.fullname for c in account.children
+                    )
+                    raise ValueError(
+                        f"Account '{account.fullname}' is a placeholder and "
+                        f"cannot receive transactions. "
+                        f"Use one of: {children_hint}"
+                    )
+
+                resolved_accounts.append(account)
+
+                # Cross-currency validation
+                if account.commodity != trans_currency:
+                    if "quantity" not in split:
+                        raise ValueError(
+                            f"Split for '{split['account']}' requires "
+                            f"'quantity' because account commodity "
+                            f"({account.commodity.mnemonic}) differs from "
+                            f"transaction currency ({currency_mnemonic})"
+                        )
+                    value = Decimal(split["amount"])
+                    quantity = Decimal(split["quantity"])
+                    if quantity * value < 0:
+                        raise ValueError(
+                            f"Split for '{split['account']}': quantity and "
+                            f"value must have same sign "
+                            f"(got value={value}, quantity={quantity})"
+                        )
+
+            warnings = self._generate_warnings(
+                trans_date, splits, resolved_accounts
+            )
+
+        result = {
+            "dry_run": True,
+            "proposed_transaction": {
+                "description": description,
+                "date": trans_date.isoformat(),
+                "currency": currency_mnemonic,
+                "splits": splits,
+            },
+            "warnings": warnings,
+            "duplicates": duplicates,
+        }
+        if notes:
+            result["proposed_transaction"]["notes"] = notes
+        return result
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:
         """Search transactions by field.
