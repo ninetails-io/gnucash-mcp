@@ -3388,3 +3388,112 @@ class GnuCashBook:
                 "title": lot.title,
                 "status": "closed",
             }
+
+    # ============== Account Slot Operations ==============
+
+    def get_account_slots(
+        self, account_name: str, key: str | None = None
+    ) -> dict:
+        """Read all slots (or a specific slot) from an account.
+
+        Args:
+            account_name: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+            key: Specific slot key to retrieve. If None, return all slots.
+
+        Returns:
+            Dict with account name and slots dict.
+
+        Raises:
+            ValueError: If account not found.
+        """
+        with self.open(readonly=True) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            if key is not None:
+                try:
+                    value = account[key]
+                    slots = {key: str(value.value) if hasattr(value, 'value') else str(value)}
+                except KeyError:
+                    slots = {}
+            else:
+                slots = {}
+                for k, v in account.iteritems():
+                    slots[k] = str(v.value)
+
+            return {
+                "account": account_name,
+                "slots": slots,
+            }
+
+    def set_account_slot(
+        self, account_name: str, key: str, value: str
+    ) -> dict:
+        """Set a single key-value pair on an account.
+
+        Args:
+            account_name: Full account path.
+            key: Slot key (e.g., "apr", "credit_limit").
+            value: Slot value. Stored as string.
+
+        Returns:
+            Dict with account, key, value, and status ("created" or "updated").
+
+        Raises:
+            ValueError: If account not found.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            # Check if key exists to determine created vs updated
+            existing = False
+            try:
+                account[key]
+                existing = True
+            except KeyError:
+                pass
+
+            account[key] = value
+            book.save()
+
+            return {
+                "account": account_name,
+                "key": key,
+                "value": value,
+                "status": "updated" if existing else "created",
+            }
+
+    def delete_account_slot(self, account_name: str, key: str) -> dict:
+        """Remove a slot from an account.
+
+        Args:
+            account_name: Full account path.
+            key: Slot key to remove.
+
+        Returns:
+            Dict with account, key, and status.
+
+        Raises:
+            ValueError: If account not found or key not found.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            try:
+                account[key]
+            except KeyError:
+                raise ValueError(f"Slot key not found: {key}")
+
+            del account[key]
+            book.save()
+
+            return {
+                "account": account_name,
+                "key": key,
+                "status": "deleted",
+            }
