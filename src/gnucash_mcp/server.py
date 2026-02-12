@@ -110,11 +110,24 @@ def safe_tool(func: Callable) -> Callable:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def list_accounts() -> str:
-    """List all accounts in the GnuCash chart of accounts."""
+def list_accounts(
+    root: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """List all accounts in the GnuCash chart of accounts.
+
+    Returns a compact one-line-per-account format by default.
+    Use verbose=true for full JSON with guid, type, commodity, etc.
+
+    Args:
+        root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
+        verbose: If true, return full JSON details for each account.
+    """
     book = get_book()
-    result = book.list_accounts()
-    return json.dumps(result, indent=2)
+    result = book.list_accounts(root=root, compact=not verbose)
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -1325,7 +1338,7 @@ def delete_account_slot(
 def accounts_resource() -> str:
     """Full chart of accounts from the GnuCash book."""
     book = get_book()
-    accounts = book.list_accounts()
+    accounts = book.list_accounts(compact=False)
     return json.dumps(accounts, indent=2)
 
 

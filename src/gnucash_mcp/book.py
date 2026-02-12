@@ -45,6 +45,44 @@ def _account_to_dict(account: piecash.Account) -> dict:
     }
 
 
+# Mapping of top-level parent to "obvious" account types that need no annotation
+_DEFAULT_TYPES = {
+    "Assets": {"ASSET"},
+    "Liabilities": {"LIABILITY"},
+    "Income": {"INCOME"},
+    "Expenses": {"EXPENSE"},
+    "Equity": {"EQUITY"},
+}
+
+
+def _account_to_compact_line(account: piecash.Account) -> str:
+    """Convert a piecash Account to a compact one-line string.
+
+    Format: "fullname [ANNOTATION]" where annotation is shown only when
+    the account type is non-obvious or the account is a placeholder.
+
+    Examples:
+        "Assets:Checking [BANK]"
+        "Expenses:Groceries [PLACEHOLDER]"
+        "Expenses:Groceries:Bakery"
+        "Assets:Investments [ASSET, PLACEHOLDER]"
+    """
+    fullname = account.fullname
+    annotations = []
+
+    top_level = fullname.split(":")[0]
+    default_types = _DEFAULT_TYPES.get(top_level, set())
+
+    if account.type not in default_types:
+        annotations.append(account.type)
+    if account.placeholder:
+        annotations.append("PLACEHOLDER")
+
+    if annotations:
+        return f"{fullname} [{', '.join(annotations)}]"
+    return fullname
+
+
 def _split_to_dict(split: piecash.Split) -> dict:
     """Convert a piecash Split to a serializable dict."""
     return {
@@ -803,20 +841,42 @@ class GnuCashBook:
                 "source": latest.source,
             }
 
-    def list_accounts(self) -> list[dict]:
+    def list_accounts(
+        self,
+        root: str | None = None,
+        compact: bool = True,
+    ) -> list[dict] | str:
         """List all accounts in the chart of accounts.
 
+        Args:
+            root: Optional root account path to filter to a subtree.
+                  E.g., "Expenses" returns only Expenses and descendants.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per account. If False, return
+                     the full list of account dicts.
+
         Returns:
-            Flat list of account dicts with full paths.
+            If compact: newline-separated string of account lines.
+            If not compact: flat list of account dicts with full paths.
         """
         with self.open(readonly=True) as book:
-            accounts = []
+            filtered = []
             for account in book.accounts:
-                # Skip the root template account
                 if account.type == "ROOT":
                     continue
-                accounts.append(_account_to_dict(account))
-            return sorted(accounts, key=lambda a: a["fullname"])
+                if root is not None:
+                    fn = account.fullname
+                    if fn != root and not fn.startswith(root + ":"):
+                        continue
+                filtered.append(account)
+
+            filtered.sort(key=lambda a: a.fullname)
+
+            if compact:
+                lines = [_account_to_compact_line(a) for a in filtered]
+                return "\n".join(lines)
+            else:
+                return [_account_to_dict(a) for a in filtered]
 
     def get_account(self, name: str) -> dict | None:
         """Get details for a specific account by full name.
