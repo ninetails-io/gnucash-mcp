@@ -23,17 +23,40 @@ def setup_book_env(test_book: Path, monkeypatch):
 class TestListAccountsTool:
     """Tests for list_accounts tool."""
 
-    def test_list_accounts(self, setup_book_env):
-        """Should return all accounts."""
+    def test_list_accounts_compact_default(self, setup_book_env):
+        """Default should return compact one-line-per-account format."""
         result = server_module.list_accounts()
+
+        # Compact mode returns plain string, not JSON array
+        assert not result.startswith("[")
+        assert "Assets:Checking" in result
+        assert "\n" in result
+
+    def test_list_accounts_verbose(self, setup_book_env):
+        """verbose=True should return full JSON."""
+        result = server_module.list_accounts(verbose=True)
 
         data = json.loads(result)
         assert isinstance(data, list)
         assert len(data) > 0
-
         fullnames = {a["fullname"] for a in data}
         assert "Assets" in fullnames
         assert "Assets:Checking" in fullnames
+
+    def test_list_accounts_root_filter(self, setup_book_env):
+        """root parameter should filter accounts."""
+        result = server_module.list_accounts(root="Expenses")
+        lines = result.strip().split("\n")
+        for line in lines:
+            assert line.startswith("Expenses")
+
+    def test_list_accounts_root_with_verbose(self, setup_book_env):
+        """root + verbose should return filtered JSON."""
+        result = server_module.list_accounts(root="Assets", verbose=True)
+        data = json.loads(result)
+        assert isinstance(data, list)
+        for a in data:
+            assert a["fullname"].startswith("Assets")
 
 
 class TestGetAccountTool:

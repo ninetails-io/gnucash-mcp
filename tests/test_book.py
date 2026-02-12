@@ -44,30 +44,31 @@ class TestListAccounts:
     """Tests for list_accounts method."""
 
     def test_list_accounts_returns_all(self, test_book: Path):
-        """Should return all non-root accounts."""
+        """Default should return compact string with all accounts."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        result = gc_book.list_accounts()
 
-        # Should have our test accounts
-        fullnames = {a["fullname"] for a in accounts}
-        assert "Assets" in fullnames
-        assert "Assets:Checking" in fullnames
-        assert "Expenses:Groceries" in fullnames
-        assert "Income:Salary" in fullnames
+        assert isinstance(result, str)
+        assert "Assets:Checking" in result
+        assert "Expenses:Groceries" in result
+        assert "Income:Salary" in result
 
     def test_list_accounts_sorted(self, test_book: Path):
-        """Should return accounts sorted by fullname."""
+        """Compact output lines should be sorted by account name."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        result = gc_book.list_accounts()
 
-        fullnames = [a["fullname"] for a in accounts]
-        assert fullnames == sorted(fullnames)
+        lines = result.strip().split("\n")
+        # Extract fullname (before any annotation bracket)
+        names = [line.split(" [")[0] for line in lines]
+        assert names == sorted(names)
 
-    def test_list_accounts_structure(self, test_book: Path):
-        """Should return proper account dict structure."""
+    def test_list_accounts_structure_verbose(self, test_book: Path):
+        """compact=False should return proper account dict structure."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        accounts = gc_book.list_accounts(compact=False)
 
+        assert isinstance(accounts, list)
         account = accounts[0]
         assert "guid" in account
         assert "name" in account
@@ -76,6 +77,88 @@ class TestListAccounts:
         assert "commodity" in account
         assert "description" in account
         assert "placeholder" in account
+
+    def test_compact_annotations(self, test_book: Path):
+        """Non-obvious types should be annotated, obvious ones not."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        lines = result.strip().split("\n")
+
+        # Assets:Checking is BANK (not default ASSET) → annotated
+        checking = [l for l in lines if l.startswith("Assets:Checking")][0]
+        assert "[BANK]" in checking
+
+        # Expenses:Groceries is EXPENSE (default under Expenses) → no annotation
+        groceries = [l for l in lines if l.startswith("Expenses:Groceries")][0]
+        assert "[" not in groceries
+
+        # Income:Salary is INCOME (default under Income) → no annotation
+        salary = [l for l in lines if l.startswith("Income:Salary")][0]
+        assert "[" not in salary
+
+    def test_compact_placeholder(self, test_book: Path):
+        """Placeholder accounts should be annotated."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        lines = result.strip().split("\n")
+
+        # "Assets" is ASSET (default) + placeholder → [PLACEHOLDER]
+        assets_line = [l for l in lines if l == "Assets [PLACEHOLDER]"]
+        assert len(assets_line) == 1
+
+        # "Expenses" is EXPENSE (default) + placeholder → [PLACEHOLDER]
+        expenses_line = [l for l in lines if l == "Expenses [PLACEHOLDER]"]
+        assert len(expenses_line) == 1
+
+    def test_verbose_mode(self, test_book: Path):
+        """compact=False should return list of dicts (old behavior)."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(compact=False)
+
+        assert isinstance(result, list)
+        assert all(isinstance(a, dict) for a in result)
+        fullnames = {a["fullname"] for a in result}
+        assert "Assets" in fullnames
+        assert "Assets:Checking" in fullnames
+
+    def test_root_filter(self, test_book: Path):
+        """root parameter should filter to a subtree."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Expenses")
+        lines = result.strip().split("\n")
+
+        for line in lines:
+            assert line.startswith("Expenses")
+        assert any("Expenses:Groceries" in l for l in lines)
+
+    def test_root_filter_verbose(self, test_book: Path):
+        """root + compact=False should return filtered dicts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Assets", compact=False)
+
+        assert isinstance(result, list)
+        for a in result:
+            assert a["fullname"].startswith("Assets")
+
+    def test_root_no_partial_match(self, test_book: Path):
+        """root filter should not partially match account names."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Exp")
+        assert result == ""
+
+    def test_root_nonexistent(self, test_book: Path):
+        """root filter for nonexistent account returns empty."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Nonexistent")
+        assert result == ""
+
+    def test_root_includes_self(self, test_book: Path):
+        """root account itself should be included in results."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Expenses")
+        lines = result.strip().split("\n")
+        assert any(l.startswith("Expenses") and ":" not in l.split(" [")[0]
+                   for l in lines)
 
 
 class TestGetAccount:
