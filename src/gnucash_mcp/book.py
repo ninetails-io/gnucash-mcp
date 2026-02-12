@@ -923,6 +923,62 @@ class GnuCashBook:
                 return _transaction_to_dict(transaction)
             return None
 
+    @staticmethod
+    def _generate_warnings(
+        trans_date: date,
+        splits: list[dict],
+        accounts: list,
+    ) -> list[dict]:
+        """Generate warnings for unusual but valid transaction attributes.
+
+        Args:
+            trans_date: Transaction date.
+            splits: Original split dicts with 'amount' keys.
+            accounts: Resolved piecash account objects, same order as splits.
+
+        Returns:
+            List of warning dicts with 'type' and 'message' keys.
+        """
+        warnings = []
+        today = date.today()
+
+        if trans_date > today:
+            warnings.append({
+                "type": "future_date",
+                "message": f"Transaction date {trans_date.isoformat()} is in the future",
+            })
+
+        days_old = (today - trans_date).days
+        if days_old > 365:
+            warnings.append({
+                "type": "old_date",
+                "message": (
+                    f"Transaction date {trans_date.isoformat()} "
+                    f"is {days_old} days in the past"
+                ),
+            })
+
+        for split_data, account in zip(splits, accounts):
+            amount = Decimal(split_data["amount"])
+            if account.type == "EXPENSE" and amount < 0:
+                warnings.append({
+                    "type": "negative_expense",
+                    "message": (
+                        f"Negative amount ({amount}) to expense account "
+                        f"'{account.fullname}'"
+                    ),
+                })
+            elif account.type == "INCOME" and amount > 0:
+                warnings.append({
+                    "type": "positive_income",
+                    "message": (
+                        f"Positive amount ({amount}) to income account "
+                        f"'{account.fullname}'"
+                    ),
+                })
+
+        return warnings
+
     def create_transaction(
         self,
         description: str,
@@ -977,6 +1033,7 @@ class GnuCashBook:
 
             # Validate all accounts exist and build split list
             piecash_splits = []
+            resolved_accounts = []
             for split in splits:
                 account = self._find_account(book, split["account"])
                 if not account:
@@ -992,6 +1049,7 @@ class GnuCashBook:
                         f"Use one of: {children_hint}"
                     )
 
+                resolved_accounts.append(account)
                 value = Decimal(split["amount"])
 
                 # Determine quantity
@@ -1036,7 +1094,14 @@ class GnuCashBook:
             )
 
             book.save()
-            return {"guid": transaction.guid, "status": "created"}
+
+            result = {"guid": transaction.guid, "status": "created"}
+            warnings = self._generate_warnings(
+                trans_date, splits, resolved_accounts
+            )
+            if warnings:
+                result["warnings"] = warnings
+            return result
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:
         """Search transactions by field.

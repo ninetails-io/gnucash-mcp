@@ -1,6 +1,6 @@
 """Tests for GnuCashBook wrapper."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -358,6 +358,99 @@ class TestCreateTransaction:
 
         transaction = gc_book.get_transaction(result["guid"])
         assert "notes" not in transaction
+
+
+class TestCreateTransactionWarnings:
+    """Tests for transaction creation warnings."""
+
+    def test_future_date_warning(self, test_book: Path):
+        """Should warn about future-dated transactions but still create them."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Future Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=future,
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "future_date" for w in result["warnings"])
+
+    def test_old_date_warning(self, test_book: Path):
+        """Should warn about dates more than 365 days in the past."""
+        gc_book = GnuCashBook(str(test_book))
+        old = date.today() - timedelta(days=400)
+        result = gc_book.create_transaction(
+            description="Old Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=old,
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "old_date" for w in result["warnings"])
+
+    def test_normal_date_no_warning(self, test_book: Path):
+        """Should not warn about normal dates."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Normal Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=date.today(),
+        )
+        assert result["status"] == "created"
+        assert "warnings" not in result
+
+    def test_negative_expense_warning(self, test_book: Path):
+        """Should warn about negative amounts to expense accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Expense Reversal",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-25.00"},
+                {"account": "Assets:Checking", "amount": "25.00"},
+            ],
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "negative_expense" for w in result["warnings"])
+
+    def test_positive_income_warning(self, test_book: Path):
+        """Should warn about positive amounts to income accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Income Reversal",
+            splits=[
+                {"account": "Income:Salary", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "positive_income" for w in result["warnings"])
+
+    def test_warnings_dont_block_creation(self, test_book: Path):
+        """Warnings should not prevent transaction creation."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Warned but Created",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-10.00"},
+                {"account": "Assets:Checking", "amount": "10.00"},
+            ],
+            trans_date=future,
+        )
+        assert result["status"] == "created"
+        assert result["guid"]
+        # Should have both future_date and negative_expense warnings
+        warning_types = {w["type"] for w in result["warnings"]}
+        assert "future_date" in warning_types
+        assert "negative_expense" in warning_types
 
 
 class TestSearchTransactions:
