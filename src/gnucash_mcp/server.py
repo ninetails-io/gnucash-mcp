@@ -365,10 +365,13 @@ def get_transaction(guid: str) -> str:
 @audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction(
     description: str,
-    splits: list[dict],
+    splits: list[dict] | None = None,
     transaction_date: str | None = None,
     currency: str | None = None,
     notes: str | None = None,
+    check_duplicates: bool = True,
+    force_create: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -385,17 +388,23 @@ def create_transaction(
                   Defaults to book's default currency.
         notes: Transaction notes (optional). Free-text annotation stored
                separately from description.
+        check_duplicates: Run duplicate detection against existing transactions.
+        force_create: Create even if HIGH confidence duplicates are found.
+        dry_run: Run validation and dupe check, return proposal without writing.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
-    guid = book.create_transaction(
+    result = book.create_transaction(
         description=description,
         splits=splits,
         trans_date=trans_date,
         currency=currency,
         notes=notes,
+        check_duplicates=check_duplicates,
+        force_create=force_create,
+        dry_run=dry_run,
     )
-    return json.dumps({"guid": guid, "status": "created"}, indent=2)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -517,14 +526,18 @@ def delete_account(name: str) -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="transaction")
-def delete_transaction(guid: str) -> str:
+def delete_transaction(guid: str, force: bool = False) -> str:
     """Delete a transaction by GUID.
+
+    Safeguards prevent deletion if the transaction has reconciled splits.
+    Use force=true to override.
 
     Args:
         guid: Transaction GUID (32-character hex string)
+        force: Allow deleting transactions with reconciled splits
     """
     book = get_book()
-    result = book.delete_transaction(guid)
+    result = book.delete_transaction(guid, force=force)
     return json.dumps(result, indent=2)
 
 
@@ -537,6 +550,7 @@ def update_transaction(
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
     notes: str | None = None,
+    force: bool = False,
 ) -> str:
     """Update an existing transaction.
 
@@ -548,6 +562,7 @@ def update_transaction(
                 Must match existing splits by account name and balance to zero.
                 For cross-currency splits, include 'quantity' (amount in account's commodity).
         notes: New transaction notes (optional). Pass empty string to clear.
+        force: Allow modifying transactions with reconciled splits
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -557,6 +572,7 @@ def update_transaction(
         trans_date=trans_date,
         splits=splits,
         notes=notes,
+        force=force,
     )
     return json.dumps(result, indent=2)
 

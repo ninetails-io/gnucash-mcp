@@ -150,6 +150,81 @@ class TestCreateTransactionTool:
         assert "error" in data
         assert "balance" in data["error"].lower()
 
+    def test_create_transaction_placeholder_rejected(self, setup_book_env):
+        """Should reject transaction targeting placeholder account."""
+        result = server_module.create_transaction(
+            description="Bad Transaction",
+            splits=[
+                {"account": "Expenses", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "placeholder" in data["error"].lower()
+
+    def test_create_transaction_duplicate_rejected(self, setup_book_env):
+        """Should reject HIGH confidence duplicates via server layer."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            transaction_date="2024-01-20",
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "rejected"
+        assert data["reason"] == "duplicate_detected"
+
+    def test_create_transaction_duplicate_force(self, setup_book_env):
+        """Should create with force_create despite HIGH duplicate."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            transaction_date="2024-01-20",
+            force_create=True,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert "guid" in data
+
+    def test_create_transaction_dry_run(self, setup_book_env):
+        """Should return proposal without writing in dry run mode."""
+        result = server_module.create_transaction(
+            description="Dry Run Server Test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "75.00"},
+                {"account": "Assets:Checking", "amount": "-75.00"},
+            ],
+            transaction_date="2024-03-01",
+            dry_run=True,
+        )
+
+        data = json.loads(result)
+        assert data["dry_run"] is True
+        assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
+        assert "guid" not in data
+
+    def test_create_transaction_auto_fill(self, setup_book_env):
+        """Should auto-fill splits from matching transaction."""
+        result = server_module.create_transaction(
+            description="Weekly Groceries",
+            transaction_date="2024-03-01",
+            check_duplicates=False,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "created"
+        assert "auto_filled_from" in data
+        assert data["auto_filled_from"]["description"] == "Weekly Groceries"
+
 
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""
@@ -302,6 +377,32 @@ class TestDeleteTransactionTool:
         get_result = server_module.get_transaction(guid)
         assert "error" in json.loads(get_result)
 
+    def test_delete_reconciled_rejected(self, setup_book_env):
+        """Should reject deleting a transaction with reconciled splits."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+        guid = transactions[0]["guid"]
+
+        result = server_module.delete_transaction(guid)
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "reconciled" in data["error"].lower()
+
+    def test_delete_reconciled_force(self, setup_book_env):
+        """Should allow deleting reconciled transaction with force=True."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+        guid = transactions[0]["guid"]
+
+        result = server_module.delete_transaction(guid, force=True)
+
+        data = json.loads(result)
+        assert data["status"] == "deleted"
+        assert data["reconciled_splits_affected"] == 1
+
     def test_delete_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
         result = server_module.delete_transaction("nonexistent_guid_12345")
@@ -389,6 +490,50 @@ class TestUpdateTransactionTool:
         data = json.loads(result)
         assert "error" in data
         assert "balance" in data["error"].lower()
+
+    def test_update_reconciled_splits_rejected(self, setup_book_env):
+        """Should reject updating splits on a reconciled transaction."""
+        transactions = json.loads(server_module.list_transactions())
+        groceries_trans = next(
+            t for t in transactions if t["description"] == "Weekly Groceries"
+        )
+        guid = groceries_trans["guid"]
+        split_guid = groceries_trans["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "reconciled" in data["error"].lower()
+
+    def test_update_reconciled_force(self, setup_book_env):
+        """Should allow updating reconciled splits with force=True."""
+        transactions = json.loads(server_module.list_transactions())
+        groceries_trans = next(
+            t for t in transactions if t["description"] == "Weekly Groceries"
+        )
+        guid = groceries_trans["guid"]
+        split_guid = groceries_trans["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+            ],
+            force=True,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
 
 
 class TestSetReconcileStateTool:
