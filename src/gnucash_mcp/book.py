@@ -1350,22 +1350,35 @@ class GnuCashBook:
 
             return result
 
-    def delete_transaction(self, guid: str) -> dict:
+    def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
         Args:
             guid: Transaction GUID (32-character hex string).
+            force: If True, allow deleting transactions with reconciled splits.
 
         Returns:
             Dict with guid, description, and status.
 
         Raises:
-            ValueError: If transaction not found.
+            ValueError: If transaction not found, or has reconciled splits
+                       and force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
+
+            # Check for reconciled splits
+            reconciled = [
+                s for s in transaction.splits if s.reconcile_state == "y"
+            ]
+            if reconciled and not force:
+                acct_names = ", ".join(s.account.fullname for s in reconciled)
+                raise ValueError(
+                    f"Transaction has reconciled splits in: {acct_names}. "
+                    f"Deleting will break reconciliation. Use force=true to override."
+                )
 
             # Capture info before deletion
             result = {
@@ -1373,6 +1386,8 @@ class GnuCashBook:
                 "description": transaction.description,
                 "status": "deleted",
             }
+            if reconciled:
+                result["reconciled_splits_affected"] = len(reconciled)
 
             # Delete the transaction
             book.session.delete(transaction)
@@ -1387,6 +1402,7 @@ class GnuCashBook:
         trans_date: date | None = None,
         splits: list[dict] | None = None,
         notes: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Update an existing transaction.
 
@@ -1401,19 +1417,37 @@ class GnuCashBook:
                     from the transaction currency.
             notes: New transaction notes (optional). Pass empty string
                    to clear existing notes.
+            force: If True, allow modifying transactions with reconciled
+                   splits. Only checked when splits are being updated.
 
         Returns:
             Dict with updated transaction details.
 
         Raises:
             ValueError: If transaction not found, splits don't balance,
-                       account not found in splits, or cross-currency split
-                       missing quantity.
+                       account not found in splits, cross-currency split
+                       missing quantity, or has reconciled splits and
+                       force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
+
+            # Check for reconciled splits when modifying splits
+            if splits is not None:
+                reconciled = [
+                    s for s in transaction.splits if s.reconcile_state == "y"
+                ]
+                if reconciled and not force:
+                    acct_names = ", ".join(
+                        s.account.fullname for s in reconciled
+                    )
+                    raise ValueError(
+                        f"Transaction has reconciled splits in: {acct_names}. "
+                        f"Modifying will break reconciliation. "
+                        f"Use force=true to override."
+                    )
 
             # Update description if provided
             if description is not None:

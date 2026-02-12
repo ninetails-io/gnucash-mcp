@@ -517,14 +517,18 @@ def delete_account(name: str) -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="transaction")
-def delete_transaction(guid: str) -> str:
+def delete_transaction(guid: str, force: bool = False) -> str:
     """Delete a transaction by GUID.
+
+    Safeguards prevent deletion if the transaction has reconciled splits.
+    Use force=true to override.
 
     Args:
         guid: Transaction GUID (32-character hex string)
+        force: Allow deleting transactions with reconciled splits
     """
     book = get_book()
-    result = book.delete_transaction(guid)
+    result = book.delete_transaction(guid, force=force)
     return json.dumps(result, indent=2)
 
 
@@ -537,6 +541,7 @@ def update_transaction(
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
     notes: str | None = None,
+    force: bool = False,
 ) -> str:
     """Update an existing transaction.
 
@@ -548,6 +553,7 @@ def update_transaction(
                 Must match existing splits by account name and balance to zero.
                 For cross-currency splits, include 'quantity' (amount in account's commodity).
         notes: New transaction notes (optional). Pass empty string to clear.
+        force: Allow modifying transactions with reconciled splits
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -557,6 +563,7 @@ def update_transaction(
         trans_date=trans_date,
         splits=splits,
         notes=notes,
+        force=force,
     )
     return json.dumps(result, indent=2)
 

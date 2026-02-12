@@ -302,6 +302,32 @@ class TestDeleteTransactionTool:
         get_result = server_module.get_transaction(guid)
         assert "error" in json.loads(get_result)
 
+    def test_delete_reconciled_rejected(self, setup_book_env):
+        """Should reject deleting a transaction with reconciled splits."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+        guid = transactions[0]["guid"]
+
+        result = server_module.delete_transaction(guid)
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "reconciled" in data["error"].lower()
+
+    def test_delete_reconciled_force(self, setup_book_env):
+        """Should allow deleting reconciled transaction with force=True."""
+        transactions = json.loads(server_module.list_transactions())
+        split_guid = transactions[0]["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+        guid = transactions[0]["guid"]
+
+        result = server_module.delete_transaction(guid, force=True)
+
+        data = json.loads(result)
+        assert data["status"] == "deleted"
+        assert data["reconciled_splits_affected"] == 1
+
     def test_delete_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
         result = server_module.delete_transaction("nonexistent_guid_12345")
@@ -389,6 +415,50 @@ class TestUpdateTransactionTool:
         data = json.loads(result)
         assert "error" in data
         assert "balance" in data["error"].lower()
+
+    def test_update_reconciled_splits_rejected(self, setup_book_env):
+        """Should reject updating splits on a reconciled transaction."""
+        transactions = json.loads(server_module.list_transactions())
+        groceries_trans = next(
+            t for t in transactions if t["description"] == "Weekly Groceries"
+        )
+        guid = groceries_trans["guid"]
+        split_guid = groceries_trans["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "reconciled" in data["error"].lower()
+
+    def test_update_reconciled_force(self, setup_book_env):
+        """Should allow updating reconciled splits with force=True."""
+        transactions = json.loads(server_module.list_transactions())
+        groceries_trans = next(
+            t for t in transactions if t["description"] == "Weekly Groceries"
+        )
+        guid = groceries_trans["guid"]
+        split_guid = groceries_trans["splits"][0]["guid"]
+        server_module.set_reconcile_state(split_guid, "y")
+
+        result = server_module.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-200.00"},
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+            ],
+            force=True,
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "updated"
 
 
 class TestSetReconcileStateTool:

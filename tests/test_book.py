@@ -753,6 +753,33 @@ class TestDeleteTransaction:
         with pytest.raises(ValueError, match="Transaction not found"):
             gc_book.delete_transaction("nonexistent_guid_12345")
 
+    def test_delete_reconciled_transaction_rejected(self, test_book: Path):
+        """Should reject deletion of transaction with reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        guid = transactions[0]["guid"]
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.delete_transaction(guid)
+
+    def test_delete_reconciled_transaction_force(self, test_book: Path):
+        """Should allow deletion with force=True despite reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        guid = transactions[0]["guid"]
+        result = gc_book.delete_transaction(guid, force=True)
+
+        assert result["status"] == "deleted"
+        assert result["reconciled_splits_affected"] == 1
+        assert gc_book.get_transaction(guid) is None
+
 
 class TestUpdateTransaction:
     """Tests for update_transaction method."""
@@ -913,6 +940,60 @@ class TestUpdateTransaction:
         # Verify persistence
         updated = gc_book.get_transaction(guid)
         assert "notes" not in updated
+
+    def test_update_reconciled_splits_rejected(self, test_book: Path):
+        """Should reject split updates on transactions with reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get the groceries transaction and reconcile a split
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.update_transaction(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "175.00"},
+                    {"account": "Assets:Checking", "amount": "-175.00"},
+                ],
+            )
+
+    def test_update_reconciled_splits_force(self, test_book: Path):
+        """Should allow split updates with force=True despite reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "175.00"},
+                {"account": "Assets:Checking", "amount": "-175.00"},
+            ],
+            force=True,
+        )
+        assert result["status"] == "updated"
+
+    def test_update_description_on_reconciled_ok(self, test_book: Path):
+        """Should allow description/date/notes changes without force on reconciled."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        # Description change should work without force
+        result = gc_book.update_transaction(
+            guid=guid, description="Updated Groceries"
+        )
+        assert result["status"] == "updated"
+        assert result["description"] == "Updated Groceries"
 
 
 class TestSetReconcileState:
