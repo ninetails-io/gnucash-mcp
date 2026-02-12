@@ -930,7 +930,7 @@ class GnuCashBook:
         trans_date: date | None = None,
         currency: str | None = None,
         notes: str | None = None,
-    ) -> str:
+    ) -> dict:
         """Create a new transaction with splits.
 
         Args:
@@ -948,7 +948,7 @@ class GnuCashBook:
                    stored separately from the description.
 
         Returns:
-            GUID of the created transaction.
+            Dict with 'guid' and 'status' keys.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
@@ -1026,7 +1026,7 @@ class GnuCashBook:
             )
 
             book.save()
-            return transaction.guid
+            return {"guid": transaction.guid, "status": "created"}
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:
         """Search transactions by field.
@@ -2965,14 +2965,14 @@ class GnuCashBook:
             book.save()
 
         # Create the actual transaction (separate session)
-        txn_guid = self.create_transaction(
+        txn_result = self.create_transaction(
             description=sx_name,
             splits=splits,
             trans_date=txn_date,
         )
 
         return {
-            "transaction_guid": txn_guid,
+            "transaction_guid": txn_result["guid"],
             "scheduled_transaction": sx_name,
             "transaction_date": txn_date.isoformat(),
             "instance_count": instance_count,

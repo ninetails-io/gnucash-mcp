@@ -222,7 +222,7 @@ class TestCreateTransaction:
         """Should create a simple two-split transaction."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Test Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
@@ -231,7 +231,8 @@ class TestCreateTransaction:
             trans_date=date(2024, 2, 1),
         )
 
-        assert guid is not None
+        assert result["status"] == "created"
+        guid = result["guid"]
         assert len(guid) == 32  # GnuCash GUID format
 
         # Verify transaction was created
@@ -244,7 +245,7 @@ class TestCreateTransaction:
         """Should create transaction with split memos."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Transaction with Memo",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "25.00", "memo": "Weekly shop"},
@@ -252,7 +253,7 @@ class TestCreateTransaction:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         memos = {s["memo"] for s in transaction["splits"]}
         assert "Weekly shop" in memos
         assert "Debit" in memos
@@ -299,7 +300,7 @@ class TestCreateTransaction:
         """Should create transaction with notes field."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Safeway",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "75.00", "memo": "Meats"},
@@ -308,7 +309,7 @@ class TestCreateTransaction:
             notes="P2W1 groceries",
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert transaction["description"] == "Safeway"
         assert transaction["notes"] == "P2W1 groceries"
         # Verify memo is separate from notes
@@ -319,7 +320,7 @@ class TestCreateTransaction:
         """Transaction without notes should not include notes key."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="No Notes",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "10.00"},
@@ -327,7 +328,7 @@ class TestCreateTransaction:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert "notes" not in transaction
 
 
@@ -924,7 +925,7 @@ class TestUpdateTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Create transaction with notes
-        guid = gc_book.create_transaction(
+        create_result = gc_book.create_transaction(
             description="With Notes",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "20.00"},
@@ -932,6 +933,7 @@ class TestUpdateTransaction:
             ],
             notes="Some notes",
         )
+        guid = create_result["guid"]
 
         # Clear notes
         result = gc_book.update_transaction(guid=guid, notes="")
@@ -1512,7 +1514,7 @@ class TestCreateTransactionMultiCurrency:
         """Should create transaction with specified currency."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Explicit USD Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
@@ -1522,7 +1524,7 @@ class TestCreateTransactionMultiCurrency:
             currency="USD",
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["currency"] == "USD"
 
@@ -1530,7 +1532,7 @@ class TestCreateTransactionMultiCurrency:
         """Should use default currency when none specified."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Default Currency Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "30.00"},
@@ -1538,7 +1540,7 @@ class TestCreateTransactionMultiCurrency:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert transaction["currency"] == "USD"
 
     def test_create_cross_currency_transaction(self, test_book: Path):
@@ -1554,7 +1556,7 @@ class TestCreateTransactionMultiCurrency:
         )
 
         # Create a cross-currency transaction: USD transaction with EUR split
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Dinner in Paris",
             currency="USD",
             splits=[
@@ -1568,7 +1570,7 @@ class TestCreateTransactionMultiCurrency:
             trans_date=date(2024, 3, 1),
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["currency"] == "USD"
 
@@ -1631,7 +1633,7 @@ class TestCreateTransactionMultiCurrency:
         gc_book = GnuCashBook(str(test_book))
 
         # No currency, no quantity - original API
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Backward Compatible",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "85.00"},
@@ -1639,7 +1641,7 @@ class TestCreateTransactionMultiCurrency:
             ],
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["description"] == "Backward Compatible"
 
@@ -2058,7 +2060,7 @@ class TestInvestmentWorkflow:
         )
 
         # 4. Buy shares: $500 at $127.50/share = 3.9216 shares
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="VTSAX purchase",
             splits=[
                 {
@@ -2074,7 +2076,7 @@ class TestInvestmentWorkflow:
             trans_date=date(2026, 2, 7),
             currency="USD",
         )
-        assert guid is not None
+        assert result["status"] == "created"
 
         # 5. Check balance — should show share count
         balance = gc_book.get_balance("Assets:Investments:401k:VTSAX")

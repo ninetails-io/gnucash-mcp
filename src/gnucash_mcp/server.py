@@ -388,14 +388,14 @@ def create_transaction(
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
-    guid = book.create_transaction(
+    result = book.create_transaction(
         description=description,
         splits=splits,
         trans_date=trans_date,
         currency=currency,
         notes=notes,
     )
-    return json.dumps({"guid": guid, "status": "created"}, indent=2)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
