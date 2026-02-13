@@ -18,7 +18,7 @@ def _buy_shares(book: GnuCashBook, shares: int, price: Decimal, txn_date: date) 
     Accounting: cash decreases (checking -total), investment increases (VTSAX +total in USD, +shares in quantity).
     """
     total = price * shares
-    guid = book.create_transaction(
+    result = book.create_transaction(
         description=f"Buy {shares} VTSAX @ {price}",
         splits=[
             {"account": "Assets:Investments:VTSAX", "amount": str(total), "quantity": str(shares)},
@@ -26,7 +26,7 @@ def _buy_shares(book: GnuCashBook, shares: int, price: Decimal, txn_date: date) 
         ],
         trans_date=txn_date,
     )
-    txn = book.get_transaction(guid)
+    txn = book.get_transaction(result["guid"])
     for s in txn["splits"]:
         if s["account"] == "Assets:Investments:VTSAX":
             return s["guid"]
@@ -39,7 +39,7 @@ def _sell_shares(book: GnuCashBook, shares: int, price: Decimal, txn_date: date)
     Accounting: cash increases (checking +proceeds), investment decreases (VTSAX -proceeds in USD, -shares in quantity).
     """
     proceeds = price * shares
-    guid = book.create_transaction(
+    result = book.create_transaction(
         description=f"Sell {shares} VTSAX @ {price}",
         splits=[
             {"account": "Assets:Investments:VTSAX", "amount": str(-proceeds), "quantity": str(-shares)},
@@ -47,7 +47,7 @@ def _sell_shares(book: GnuCashBook, shares: int, price: Decimal, txn_date: date)
         ],
         trans_date=txn_date,
     )
-    txn = book.get_transaction(guid)
+    txn = book.get_transaction(result["guid"])
     for s in txn["splits"]:
         if s["account"] == "Assets:Investments:VTSAX":
             return s["guid"]
@@ -202,7 +202,7 @@ class TestAssignSplitToLot:
         lot = book.create_lot(account="Assets:Investments:VTSAX", title="Test")
 
         # Get the checking split from a buy transaction
-        txn_guid = book.create_transaction(
+        txn_result = book.create_transaction(
             description="Buy VTSAX",
             splits=[
                 {"account": "Assets:Investments:VTSAX", "amount": "1250", "quantity": "10"},
@@ -210,7 +210,7 @@ class TestAssignSplitToLot:
             ],
             trans_date=date(2026, 1, 15),
         )
-        txn = book.get_transaction(txn_guid)
+        txn = book.get_transaction(txn_result["guid"])
         checking_split_guid = None
         for s in txn["splits"]:
             if s["account"] == "Assets:Checking":
@@ -345,7 +345,7 @@ class TestSplitToDictLotGuid:
     def test_split_has_lot_guid_none(self, investment_book: Path):
         """Splits without lots should have lot_guid=None."""
         book = GnuCashBook(str(investment_book))
-        txn_guid = book.create_transaction(
+        txn_result = book.create_transaction(
             description="No lot test",
             splits=[
                 {"account": "Assets:Checking", "amount": "-100"},
@@ -353,7 +353,7 @@ class TestSplitToDictLotGuid:
             ],
             trans_date=date(2026, 1, 20),
         )
-        txn = book.get_transaction(txn_guid)
+        txn = book.get_transaction(txn_result["guid"])
         for s in txn["splits"]:
             assert "lot_guid" in s
             assert s["lot_guid"] is None

@@ -1,6 +1,6 @@
 """Tests for GnuCashBook wrapper."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -44,30 +44,31 @@ class TestListAccounts:
     """Tests for list_accounts method."""
 
     def test_list_accounts_returns_all(self, test_book: Path):
-        """Should return all non-root accounts."""
+        """Default should return compact string with all accounts."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        result = gc_book.list_accounts()
 
-        # Should have our test accounts
-        fullnames = {a["fullname"] for a in accounts}
-        assert "Assets" in fullnames
-        assert "Assets:Checking" in fullnames
-        assert "Expenses:Groceries" in fullnames
-        assert "Income:Salary" in fullnames
+        assert isinstance(result, str)
+        assert "Assets:Checking" in result
+        assert "Expenses:Groceries" in result
+        assert "Income:Salary" in result
 
     def test_list_accounts_sorted(self, test_book: Path):
-        """Should return accounts sorted by fullname."""
+        """Compact output lines should be sorted by account name."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        result = gc_book.list_accounts()
 
-        fullnames = [a["fullname"] for a in accounts]
-        assert fullnames == sorted(fullnames)
+        lines = result.strip().split("\n")
+        # Extract fullname (before any annotation bracket)
+        names = [line.split(" [")[0] for line in lines]
+        assert names == sorted(names)
 
-    def test_list_accounts_structure(self, test_book: Path):
-        """Should return proper account dict structure."""
+    def test_list_accounts_structure_verbose(self, test_book: Path):
+        """compact=False should return proper account dict structure."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts()
+        accounts = gc_book.list_accounts(compact=False)
 
+        assert isinstance(accounts, list)
         account = accounts[0]
         assert "guid" in account
         assert "name" in account
@@ -76,6 +77,88 @@ class TestListAccounts:
         assert "commodity" in account
         assert "description" in account
         assert "placeholder" in account
+
+    def test_compact_annotations(self, test_book: Path):
+        """Non-obvious types should be annotated, obvious ones not."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        lines = result.strip().split("\n")
+
+        # Assets:Checking is BANK (not default ASSET) → annotated
+        checking = [l for l in lines if l.startswith("Assets:Checking")][0]
+        assert "[BANK]" in checking
+
+        # Expenses:Groceries is EXPENSE (default under Expenses) → no annotation
+        groceries = [l for l in lines if l.startswith("Expenses:Groceries")][0]
+        assert "[" not in groceries
+
+        # Income:Salary is INCOME (default under Income) → no annotation
+        salary = [l for l in lines if l.startswith("Income:Salary")][0]
+        assert "[" not in salary
+
+    def test_compact_placeholder(self, test_book: Path):
+        """Placeholder accounts should be annotated."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        lines = result.strip().split("\n")
+
+        # "Assets" is ASSET (default) + placeholder → [PLACEHOLDER]
+        assets_line = [l for l in lines if l == "Assets [PLACEHOLDER]"]
+        assert len(assets_line) == 1
+
+        # "Expenses" is EXPENSE (default) + placeholder → [PLACEHOLDER]
+        expenses_line = [l for l in lines if l == "Expenses [PLACEHOLDER]"]
+        assert len(expenses_line) == 1
+
+    def test_verbose_mode(self, test_book: Path):
+        """compact=False should return list of dicts (old behavior)."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(compact=False)
+
+        assert isinstance(result, list)
+        assert all(isinstance(a, dict) for a in result)
+        fullnames = {a["fullname"] for a in result}
+        assert "Assets" in fullnames
+        assert "Assets:Checking" in fullnames
+
+    def test_root_filter(self, test_book: Path):
+        """root parameter should filter to a subtree."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Expenses")
+        lines = result.strip().split("\n")
+
+        for line in lines:
+            assert line.startswith("Expenses")
+        assert any("Expenses:Groceries" in l for l in lines)
+
+    def test_root_filter_verbose(self, test_book: Path):
+        """root + compact=False should return filtered dicts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Assets", compact=False)
+
+        assert isinstance(result, list)
+        for a in result:
+            assert a["fullname"].startswith("Assets")
+
+    def test_root_no_partial_match(self, test_book: Path):
+        """root filter should not partially match account names."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Exp")
+        assert result == ""
+
+    def test_root_nonexistent(self, test_book: Path):
+        """root filter for nonexistent account returns empty."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Nonexistent")
+        assert result == ""
+
+    def test_root_includes_self(self, test_book: Path):
+        """root account itself should be included in results."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(root="Expenses")
+        lines = result.strip().split("\n")
+        assert any(l.startswith("Expenses") and ":" not in l.split(" [")[0]
+                   for l in lines)
 
 
 class TestGetAccount:
@@ -222,7 +305,7 @@ class TestCreateTransaction:
         """Should create a simple two-split transaction."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Test Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
@@ -231,7 +314,8 @@ class TestCreateTransaction:
             trans_date=date(2024, 2, 1),
         )
 
-        assert guid is not None
+        assert result["status"] == "created"
+        guid = result["guid"]
         assert len(guid) == 32  # GnuCash GUID format
 
         # Verify transaction was created
@@ -244,7 +328,7 @@ class TestCreateTransaction:
         """Should create transaction with split memos."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Transaction with Memo",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "25.00", "memo": "Weekly shop"},
@@ -252,7 +336,7 @@ class TestCreateTransaction:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         memos = {s["memo"] for s in transaction["splits"]}
         assert "Weekly shop" in memos
         assert "Debit" in memos
@@ -295,11 +379,39 @@ class TestCreateTransaction:
                 ],
             )
 
+    def test_create_transaction_placeholder_rejected(self, test_book: Path):
+        """Should reject transaction targeting a placeholder account."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="placeholder") as exc_info:
+            gc_book.create_transaction(
+                description="Bad Transaction",
+                splits=[
+                    {"account": "Expenses", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+            )
+        # Error should suggest child accounts
+        assert "Expenses:Groceries" in str(exc_info.value)
+
+    def test_create_transaction_placeholder_suggests_children(self, test_book: Path):
+        """Error message should list the placeholder's child accounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Use one of:"):
+            gc_book.create_transaction(
+                description="Bad Transaction",
+                splits=[
+                    {"account": "Assets", "amount": "-50.00"},
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                ],
+            )
+
     def test_create_transaction_with_notes(self, test_book: Path):
         """Should create transaction with notes field."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Safeway",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "75.00", "memo": "Meats"},
@@ -308,7 +420,7 @@ class TestCreateTransaction:
             notes="P2W1 groceries",
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert transaction["description"] == "Safeway"
         assert transaction["notes"] == "P2W1 groceries"
         # Verify memo is separate from notes
@@ -319,7 +431,7 @@ class TestCreateTransaction:
         """Transaction without notes should not include notes key."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="No Notes",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "10.00"},
@@ -327,8 +439,795 @@ class TestCreateTransaction:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert "notes" not in transaction
+
+
+class TestCreateTransactionWarnings:
+    """Tests for transaction creation warnings."""
+
+    def test_future_date_warning(self, test_book: Path):
+        """Should warn about future-dated transactions but still create them."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Future Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=future,
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "future_date" for w in result["warnings"])
+
+    def test_old_date_warning(self, test_book: Path):
+        """Should warn about dates more than 365 days in the past."""
+        gc_book = GnuCashBook(str(test_book))
+        old = date.today() - timedelta(days=400)
+        result = gc_book.create_transaction(
+            description="Old Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=old,
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "old_date" for w in result["warnings"])
+
+    def test_normal_date_no_warning(self, test_book: Path):
+        """Should not warn about normal dates."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Normal Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=date.today(),
+        )
+        assert result["status"] == "created"
+        assert "warnings" not in result
+
+    def test_negative_expense_warning(self, test_book: Path):
+        """Should warn about negative amounts to expense accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Expense Reversal",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-25.00"},
+                {"account": "Assets:Checking", "amount": "25.00"},
+            ],
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "negative_expense" for w in result["warnings"])
+
+    def test_positive_income_warning(self, test_book: Path):
+        """Should warn about positive amounts to income accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Income Reversal",
+            splits=[
+                {"account": "Income:Salary", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+        )
+        assert result["status"] == "created"
+        assert any(w["type"] == "positive_income" for w in result["warnings"])
+
+    def test_warnings_dont_block_creation(self, test_book: Path):
+        """Warnings should not prevent transaction creation."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Warned but Created",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-10.00"},
+                {"account": "Assets:Checking", "amount": "10.00"},
+            ],
+            trans_date=future,
+        )
+        assert result["status"] == "created"
+        assert result["guid"]
+        # Should have both future_date and negative_expense warnings
+        warning_types = {w["type"] for w in result["warnings"]}
+        assert "future_date" in warning_types
+        assert "negative_expense" in warning_types
+
+
+class TestDuplicateDetection:
+    """Tests for duplicate transaction detection."""
+
+    def test_high_duplicate_rejected(self, test_book: Path):
+        """Should reject when all 3 signals match (description, amount, date)."""
+        gc_book = GnuCashBook(str(test_book))
+        # Existing: "Weekly Groceries", $150, 2024-01-20
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        assert result["reason"] == "duplicate_detected"
+        assert len(result["duplicates"]) > 0
+        assert result["duplicates"][0]["confidence"] == "HIGH"
+
+    def test_high_duplicate_force_create(self, test_book: Path):
+        """Should create when force_create overrides HIGH duplicate."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            force_create=True,
+        )
+        assert result["status"] == "created"
+        assert "guid" in result
+        assert len(result["duplicates"]) > 0
+
+    def test_medium_duplicate_allowed(self, test_book: Path):
+        """Should allow creation with MEDIUM confidence (2/3 signals)."""
+        gc_book = GnuCashBook(str(test_book))
+        # Same description and date, different amount
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "created"
+        assert any(
+            d["confidence"] == "MEDIUM" for d in result.get("duplicates", [])
+        )
+
+    def test_low_duplicate_included(self, test_book: Path):
+        """LOW confidence duplicates should be included for reference."""
+        gc_book = GnuCashBook(str(test_book))
+        # Only amount matches (~$150), different description, different date
+        result = gc_book.create_transaction(
+            description="Totally Different Store",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.50"},
+                {"account": "Assets:Checking", "amount": "-150.50"},
+            ],
+            trans_date=date(2024, 1, 25),
+        )
+        assert result["status"] == "created"
+        # Should have LOW confidence match (amount only)
+        if result.get("duplicates"):
+            assert any(
+                d["confidence"] == "LOW" for d in result["duplicates"]
+            )
+
+    def test_check_duplicates_false_skips(self, test_book: Path):
+        """Should skip duplicate check entirely when check_duplicates=False."""
+        gc_book = GnuCashBook(str(test_book))
+        # Exact duplicate but check disabled
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "duplicates" not in result
+
+    def test_substring_description_match(self, test_book: Path):
+        """Substring matching should work in both directions."""
+        gc_book = GnuCashBook(str(test_book))
+        # "Groceries" is substring of "Weekly Groceries"
+        result = gc_book.create_transaction(
+            description="Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        high = [d for d in result["duplicates"] if d["confidence"] == "HIGH"]
+        assert len(high) > 0
+        assert high[0]["match_signals"]["description"] is True
+
+    def test_amount_tolerance(self, test_book: Path):
+        """Amount match should use ±$1.00 tolerance."""
+        gc_book = GnuCashBook(str(test_book))
+        # $150.99 is within $1.00 of $150.00
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.99"},
+                {"account": "Assets:Checking", "amount": "-150.99"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        assert result["duplicates"][0]["match_signals"]["amount"] is True
+
+    def test_date_window(self, test_book: Path):
+        """Date match should use ±2 day window."""
+        gc_book = GnuCashBook(str(test_book))
+        # 2 days after existing (2024-01-20), should still match
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 22),
+        )
+        assert result["status"] == "rejected"
+        assert result["duplicates"][0]["match_signals"]["date"] is True
+
+    def test_no_duplicates_distant_date(self, test_book: Path):
+        """Should find no duplicates when date is far from existing."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2025, 6, 15),
+        )
+        assert result["status"] == "created"
+        assert "duplicates" not in result
+
+
+class TestDryRun:
+    """Tests for dry run mode on create_transaction."""
+
+    def test_dry_run_returns_proposal(self, test_book: Path):
+        """Should return proposed transaction without writing."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Dry Run Test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=date(2024, 3, 1),
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert result["proposed_transaction"]["description"] == "Dry Run Test"
+        assert result["proposed_transaction"]["date"] == "2024-03-01"
+        assert result["proposed_transaction"]["currency"] == "USD"
+        assert len(result["proposed_transaction"]["splits"]) == 2
+
+    def test_dry_run_no_write(self, test_book: Path):
+        """Dry run should not create a transaction in the book."""
+        gc_book = GnuCashBook(str(test_book))
+        before = gc_book.list_transactions()
+        gc_book.create_transaction(
+            description="Ghost Transaction",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "99.99"},
+                {"account": "Assets:Checking", "amount": "-99.99"},
+            ],
+            dry_run=True,
+        )
+        after = gc_book.list_transactions()
+        assert len(after) == len(before)
+
+    def test_dry_run_includes_warnings(self, test_book: Path):
+        """Dry run should include warnings."""
+        gc_book = GnuCashBook(str(test_book))
+        future = date.today() + timedelta(days=30)
+        result = gc_book.create_transaction(
+            description="Future Dry Run",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=future,
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert any(w["type"] == "future_date" for w in result["warnings"])
+
+    def test_dry_run_includes_duplicates(self, test_book: Path):
+        """Dry run should include duplicate candidates."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert len(result["duplicates"]) > 0
+
+    def test_dry_run_validation_errors_raised(self, test_book: Path):
+        """Dry run should still raise validation errors."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="do not balance"):
+            gc_book.create_transaction(
+                description="Unbalanced Dry Run",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-40.00"},
+                ],
+                dry_run=True,
+            )
+
+    def test_dry_run_placeholder_rejected(self, test_book: Path):
+        """Dry run should reject placeholder accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="placeholder"):
+            gc_book.create_transaction(
+                description="Placeholder Dry Run",
+                splits=[
+                    {"account": "Expenses", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+                dry_run=True,
+            )
+
+    def test_dry_run_unknown_currency(self, test_book: Path):
+        """Dry run should raise error for unknown currency."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="not found"):
+            gc_book.create_transaction(
+                description="Bad Currency Dry Run",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+                currency="XYZ",
+                dry_run=True,
+            )
+
+
+class TestAutoFillTransaction:
+    """Tests for auto-fill splits from previous transactions."""
+
+    def test_auto_fill_from_description(self, test_book: Path):
+        """Should auto-fill splits from most recent matching transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        # "Weekly Groceries" exists in fixture: $150 groceries / -$150 checking
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        # Verify the transaction was created with auto-filled splits
+        txn = gc_book.get_transaction(result["guid"])
+        accounts = {s["account"] for s in txn["splits"]}
+        assert "Expenses:Groceries" in accounts
+        assert "Assets:Checking" in accounts
+
+    def test_auto_fill_result_includes_source(self, test_book: Path):
+        """Should include auto_filled_from with source transaction info."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert "auto_filled_from" in result
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
+        assert "guid" in result["auto_filled_from"]
+        assert "date" in result["auto_filled_from"]
+
+    def test_auto_fill_no_match(self, test_book: Path):
+        """Should raise ValueError when no matching transaction found."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(
+                description="Never Seen Before XYZ123",
+            )
+
+    def test_auto_fill_with_dry_run(self, test_book: Path):
+        """Should auto-fill and return proposal in dry run mode."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        assert "auto_filled_from" in result
+        # Proposed splits should come from the auto-fill
+        proposed_splits = result["proposed_transaction"]["splits"]
+        accounts = {s["account"] for s in proposed_splits}
+        assert "Expenses:Groceries" in accounts
+
+    def test_auto_fill_preserves_memo(self, test_book: Path):
+        """Auto-fill should preserve memo from source transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        # First create a transaction with a memo
+        gc_book.create_transaction(
+            description="Coffee Shop",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "5.00", "memo": "Latte"},
+                {"account": "Assets:Checking", "amount": "-5.00"},
+            ],
+            trans_date=date(2024, 2, 1),
+            check_duplicates=False,
+        )
+        # Auto-fill from it
+        result = gc_book.create_transaction(
+            description="Coffee Shop",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        txn = gc_book.get_transaction(result["guid"])
+        memos = {s["memo"] for s in txn["splits"]}
+        assert "Latte" in memos
+
+    def test_explicit_splits_no_auto_fill(self, test_book: Path):
+        """Providing explicit splits should bypass auto-fill."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" not in result
+        # Verify the explicit amount was used, not auto-filled
+        txn = gc_book.get_transaction(result["guid"])
+        for s in txn["splits"]:
+            if s["account"] == "Expenses:Groceries":
+                assert s["value"] == "200"
+
+
+class TestSplitConsistency:
+    """Tests for split consistency warnings."""
+
+    def _create_dining_account(self, gc_book):
+        """Helper to add Expenses:Dining account."""
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+    def _seed_groceries(self, gc_book, count=2):
+        """Create recent grocery transactions for consistency baseline."""
+        today = date.today()
+        for i in range(count):
+            gc_book.create_transaction(
+                description="Weekly Groceries",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+                trans_date=today - timedelta(days=7 * (i + 1)),
+                check_duplicates=False,
+            )
+
+    def test_no_history(self, test_book: Path):
+        """First transaction with a new description produces no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        result = gc_book.create_transaction(
+            description="Brand New Vendor XYZ",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "25.00"},
+                {"account": "Assets:Checking", "amount": "-25.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_matching_pattern(self, test_book: Path):
+        """Same expense account as recent history produces no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "175.00"},
+                {"account": "Assets:Checking", "amount": "-175.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_different_pattern(self, test_book: Path):
+        """Different expense account triggers split_consistency warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 1
+        assert "Expenses:Groceries" in consistency[0]["message"]
+        assert "Expenses:Dining" in consistency[0]["message"]
+
+    def test_ignores_funding_account(self, test_book: Path):
+        """Changing funding account (Checking→Credit Card) with same
+        expense should NOT trigger warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_groceries(gc_book)
+        # Add a credit card account
+        gc_book.create_account(
+            name="Credit Card",
+            account_type="CREDIT",
+            parent="Liabilities",
+        )
+        # Pay groceries from credit card instead of checking
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Liabilities:Credit Card", "amount": "-150.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(consistency) == 0
+
+    def test_transfer_pattern(self, test_book: Path):
+        """Bank-to-bank transfer detects changed target account."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Savings",
+            account_type="BANK",
+            parent="Assets",
+        )
+        gc_book.create_account(
+            name="Emergency Fund",
+            account_type="BANK",
+            parent="Assets",
+        )
+        today = date.today()
+        # Seed: transfer Checking → Savings
+        gc_book.create_transaction(
+            description="Monthly Transfer",
+            splits=[
+                {"account": "Assets:Savings", "amount": "500.00"},
+                {"account": "Assets:Checking", "amount": "-500.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # New: transfer Checking → Emergency Fund (different target)
+        result = gc_book.create_transaction(
+            description="Monthly Transfer",
+            splits=[
+                {"account": "Assets:Emergency Fund", "amount": "500.00"},
+                {"account": "Assets:Checking", "amount": "-500.00"},
+            ],
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        # Transfer between funding accounts → fallback uses all accounts
+        assert len(consistency) == 1
+
+    def test_with_dry_run(self, test_book: Path):
+        """Split consistency warning appears in dry-run result."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        self._seed_groceries(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        consistency = [
+            w for w in result["warnings"]
+            if w["type"] == "split_consistency"
+        ]
+        assert len(consistency) == 1
+        assert "Expenses:Groceries" in consistency[0]["message"]
+
+
+class TestAutoFillStability:
+    """Tests for auto-fill stability warnings."""
+
+    def _seed_consistent(self, gc_book, count=3):
+        """Create consistent grocery transactions."""
+        today = date.today()
+        for i in range(count):
+            gc_book.create_transaction(
+                description="Weekly Groceries",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+                trans_date=today - timedelta(days=7 * (i + 1)),
+                check_duplicates=False,
+            )
+
+    def _create_dining_account(self, gc_book):
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+    def test_stable_pattern(self, test_book: Path):
+        """All recent matches consistent, no warning."""
+        gc_book = GnuCashBook(str(test_book))
+        self._seed_consistent(gc_book)
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" in result
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 0
+
+    def test_unstable_pattern(self, test_book: Path):
+        """Recent matches differ, auto_fill_unstable warning fires."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        # Older: groceries account
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        # More recent: dining account (different pattern)
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # Auto-fill should trigger instability warning
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        assert "auto_filled_from" in result
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 1
+        assert "different account patterns" in stability[0]["message"]
+
+    def test_single_match(self, test_book: Path):
+        """Only one prior transaction, no instability warning."""
+        gc_book = GnuCashBook(str(test_book))
+        today = date.today()
+        gc_book.create_transaction(
+            description="One-Time Vendor",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        result = gc_book.create_transaction(
+            description="One-Time Vendor",
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        assert len(stability) == 0
+
+    def test_stability_with_dry_run(self, test_book: Path):
+        """Instability warning appears in dry-run result."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            dry_run=True,
+            check_duplicates=False,
+        )
+        assert result["dry_run"] is True
+        stability = [
+            w for w in result["warnings"]
+            if w["type"] == "auto_fill_unstable"
+        ]
+        assert len(stability) == 1
+
+    def test_unstable_no_consistency_conflict(self, test_book: Path):
+        """Stability warning fires but NOT consistency warning when
+        proposed splits match most recent transaction."""
+        gc_book = GnuCashBook(str(test_book))
+        self._create_dining_account(gc_book)
+        today = date.today()
+        # Older: groceries
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=14),
+            check_duplicates=False,
+        )
+        # More recent: dining
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=today - timedelta(days=7),
+            check_duplicates=False,
+        )
+        # Auto-fill grabs most recent (dining) — matches recent so no
+        # consistency warning, but stability warning should fire
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            check_duplicates=False,
+        )
+        warnings = result.get("warnings", [])
+        stability = [w for w in warnings if w["type"] == "auto_fill_unstable"]
+        consistency = [w for w in warnings if w["type"] == "split_consistency"]
+        assert len(stability) == 1
+        assert len(consistency) == 0
 
 
 class TestSearchTransactions:
@@ -753,6 +1652,33 @@ class TestDeleteTransaction:
         with pytest.raises(ValueError, match="Transaction not found"):
             gc_book.delete_transaction("nonexistent_guid_12345")
 
+    def test_delete_reconciled_transaction_rejected(self, test_book: Path):
+        """Should reject deletion of transaction with reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        guid = transactions[0]["guid"]
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.delete_transaction(guid)
+
+    def test_delete_reconciled_transaction_force(self, test_book: Path):
+        """Should allow deletion with force=True despite reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions()
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        guid = transactions[0]["guid"]
+        result = gc_book.delete_transaction(guid, force=True)
+
+        assert result["status"] == "deleted"
+        assert result["reconciled_splits_affected"] == 1
+        assert gc_book.get_transaction(guid) is None
+
 
 class TestUpdateTransaction:
     """Tests for update_transaction method."""
@@ -897,7 +1823,7 @@ class TestUpdateTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Create transaction with notes
-        guid = gc_book.create_transaction(
+        create_result = gc_book.create_transaction(
             description="With Notes",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "20.00"},
@@ -905,6 +1831,7 @@ class TestUpdateTransaction:
             ],
             notes="Some notes",
         )
+        guid = create_result["guid"]
 
         # Clear notes
         result = gc_book.update_transaction(guid=guid, notes="")
@@ -913,6 +1840,60 @@ class TestUpdateTransaction:
         # Verify persistence
         updated = gc_book.get_transaction(guid)
         assert "notes" not in updated
+
+    def test_update_reconciled_splits_rejected(self, test_book: Path):
+        """Should reject split updates on transactions with reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get the groceries transaction and reconcile a split
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.update_transaction(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "175.00"},
+                    {"account": "Assets:Checking", "amount": "-175.00"},
+                ],
+            )
+
+    def test_update_reconciled_splits_force(self, test_book: Path):
+        """Should allow split updates with force=True despite reconciled splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "175.00"},
+                {"account": "Assets:Checking", "amount": "-175.00"},
+            ],
+            force=True,
+        )
+        assert result["status"] == "updated"
+
+    def test_update_description_on_reconciled_ok(self, test_book: Path):
+        """Should allow description/date/notes changes without force on reconciled."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        # Description change should work without force
+        result = gc_book.update_transaction(
+            guid=guid, description="Updated Groceries"
+        )
+        assert result["status"] == "updated"
+        assert result["description"] == "Updated Groceries"
 
 
 class TestSetReconcileState:
@@ -1431,7 +2412,7 @@ class TestCreateTransactionMultiCurrency:
         """Should create transaction with specified currency."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Explicit USD Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
@@ -1441,7 +2422,7 @@ class TestCreateTransactionMultiCurrency:
             currency="USD",
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["currency"] == "USD"
 
@@ -1449,7 +2430,7 @@ class TestCreateTransactionMultiCurrency:
         """Should use default currency when none specified."""
         gc_book = GnuCashBook(str(test_book))
 
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Default Currency Transaction",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "30.00"},
@@ -1457,7 +2438,7 @@ class TestCreateTransactionMultiCurrency:
             ],
         )
 
-        transaction = gc_book.get_transaction(guid)
+        transaction = gc_book.get_transaction(result["guid"])
         assert transaction["currency"] == "USD"
 
     def test_create_cross_currency_transaction(self, test_book: Path):
@@ -1473,7 +2454,7 @@ class TestCreateTransactionMultiCurrency:
         )
 
         # Create a cross-currency transaction: USD transaction with EUR split
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Dinner in Paris",
             currency="USD",
             splits=[
@@ -1487,7 +2468,7 @@ class TestCreateTransactionMultiCurrency:
             trans_date=date(2024, 3, 1),
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["currency"] == "USD"
 
@@ -1550,7 +2531,7 @@ class TestCreateTransactionMultiCurrency:
         gc_book = GnuCashBook(str(test_book))
 
         # No currency, no quantity - original API
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="Backward Compatible",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "85.00"},
@@ -1558,7 +2539,7 @@ class TestCreateTransactionMultiCurrency:
             ],
         )
 
-        assert guid is not None
+        guid = result["guid"]
         transaction = gc_book.get_transaction(guid)
         assert transaction["description"] == "Backward Compatible"
 
@@ -1977,7 +2958,7 @@ class TestInvestmentWorkflow:
         )
 
         # 4. Buy shares: $500 at $127.50/share = 3.9216 shares
-        guid = gc_book.create_transaction(
+        result = gc_book.create_transaction(
             description="VTSAX purchase",
             splits=[
                 {
@@ -1993,7 +2974,7 @@ class TestInvestmentWorkflow:
             trans_date=date(2026, 2, 7),
             currency="USD",
         )
-        assert guid is not None
+        assert result["status"] == "created"
 
         # 5. Check balance — should show share count
         balance = gc_book.get_balance("Assets:Investments:401k:VTSAX")

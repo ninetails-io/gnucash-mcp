@@ -110,11 +110,24 @@ def safe_tool(func: Callable) -> Callable:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def list_accounts() -> str:
-    """List all accounts in the GnuCash chart of accounts."""
+def list_accounts(
+    root: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """List all accounts in the GnuCash chart of accounts.
+
+    Returns a compact one-line-per-account format by default.
+    Use verbose=true for full JSON with guid, type, commodity, etc.
+
+    Args:
+        root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
+        verbose: If true, return full JSON details for each account.
+    """
     book = get_book()
-    result = book.list_accounts()
-    return json.dumps(result, indent=2)
+    result = book.list_accounts(root=root, compact=not verbose)
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
 
 
 @mcp.tool()
@@ -365,10 +378,13 @@ def get_transaction(guid: str) -> str:
 @audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction(
     description: str,
-    splits: list[dict],
+    splits: list[dict] | None = None,
     transaction_date: str | None = None,
     currency: str | None = None,
     notes: str | None = None,
+    check_duplicates: bool = True,
+    force_create: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """Create a new transaction with splits. Splits must balance to zero.
 
@@ -385,17 +401,23 @@ def create_transaction(
                   Defaults to book's default currency.
         notes: Transaction notes (optional). Free-text annotation stored
                separately from description.
+        check_duplicates: Run duplicate detection against existing transactions.
+        force_create: Create even if HIGH confidence duplicates are found.
+        dry_run: Run validation and dupe check, return proposal without writing.
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
-    guid = book.create_transaction(
+    result = book.create_transaction(
         description=description,
         splits=splits,
         trans_date=trans_date,
         currency=currency,
         notes=notes,
+        check_duplicates=check_duplicates,
+        force_create=force_create,
+        dry_run=dry_run,
     )
-    return json.dumps({"guid": guid, "status": "created"}, indent=2)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -517,14 +539,18 @@ def delete_account(name: str) -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="transaction")
-def delete_transaction(guid: str) -> str:
+def delete_transaction(guid: str, force: bool = False) -> str:
     """Delete a transaction by GUID.
+
+    Safeguards prevent deletion if the transaction has reconciled splits.
+    Use force=true to override.
 
     Args:
         guid: Transaction GUID (32-character hex string)
+        force: Allow deleting transactions with reconciled splits
     """
     book = get_book()
-    result = book.delete_transaction(guid)
+    result = book.delete_transaction(guid, force=force)
     return json.dumps(result, indent=2)
 
 
@@ -537,6 +563,7 @@ def update_transaction(
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
     notes: str | None = None,
+    force: bool = False,
 ) -> str:
     """Update an existing transaction.
 
@@ -548,6 +575,7 @@ def update_transaction(
                 Must match existing splits by account name and balance to zero.
                 For cross-currency splits, include 'quantity' (amount in account's commodity).
         notes: New transaction notes (optional). Pass empty string to clear.
+        force: Allow modifying transactions with reconciled splits
     """
     book = get_book()
     trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -557,6 +585,7 @@ def update_transaction(
         trans_date=trans_date,
         splits=splits,
         notes=notes,
+        force=force,
     )
     return json.dumps(result, indent=2)
 
@@ -1237,6 +1266,71 @@ def close_lot(guid: str) -> str:
     return json.dumps(result, indent=2)
 
 
+# ============== Account Slot Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_account_slots(
+    account: str,
+    key: str | None = None,
+) -> str:
+    """Read slots (custom metadata) from an account.
+
+    Slots are key-value pairs stored on accounts for metadata like APR,
+    credit limit, reward rates, or any custom data.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Specific slot key to retrieve. If omitted, returns all slots.
+    """
+    book = get_book()
+    result = book.get_account_slots(account_name=account, key=key)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="set_slot", entity_type="account_slot")
+def set_account_slot(
+    account: str,
+    key: str,
+    value: str,
+) -> str:
+    """Set a custom metadata slot on an account.
+
+    Stores a key-value pair on the account. Values are stored as strings.
+    Use for APR, credit limits, reward rates, or any per-account metadata.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Slot key (e.g., "apr", "credit_limit").
+        value: Slot value (always stored as string).
+    """
+    book = get_book()
+    result = book.set_account_slot(account_name=account, key=key, value=value)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete_slot", entity_type="account_slot")
+def delete_account_slot(
+    account: str,
+    key: str,
+) -> str:
+    """Remove a custom metadata slot from an account.
+
+    Args:
+        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+        key: Slot key to remove.
+    """
+    book = get_book()
+    result = book.delete_account_slot(account_name=account, key=key)
+    return json.dumps(result, indent=2)
+
+
 # ============== Resources ==============
 
 
@@ -1244,7 +1338,7 @@ def close_lot(guid: str) -> str:
 def accounts_resource() -> str:
     """Full chart of accounts from the GnuCash book."""
     book = get_book()
-    accounts = book.list_accounts()
+    accounts = book.list_accounts(compact=False)
     return json.dumps(accounts, indent=2)
 
 

@@ -45,6 +45,44 @@ def _account_to_dict(account: piecash.Account) -> dict:
     }
 
 
+# Mapping of top-level parent to "obvious" account types that need no annotation
+_DEFAULT_TYPES = {
+    "Assets": {"ASSET"},
+    "Liabilities": {"LIABILITY"},
+    "Income": {"INCOME"},
+    "Expenses": {"EXPENSE"},
+    "Equity": {"EQUITY"},
+}
+
+
+def _account_to_compact_line(account: piecash.Account) -> str:
+    """Convert a piecash Account to a compact one-line string.
+
+    Format: "fullname [ANNOTATION]" where annotation is shown only when
+    the account type is non-obvious or the account is a placeholder.
+
+    Examples:
+        "Assets:Checking [BANK]"
+        "Expenses:Groceries [PLACEHOLDER]"
+        "Expenses:Groceries:Bakery"
+        "Assets:Investments [ASSET, PLACEHOLDER]"
+    """
+    fullname = account.fullname
+    annotations = []
+
+    top_level = fullname.split(":")[0]
+    default_types = _DEFAULT_TYPES.get(top_level, set())
+
+    if account.type not in default_types:
+        annotations.append(account.type)
+    if account.placeholder:
+        annotations.append("PLACEHOLDER")
+
+    if annotations:
+        return f"{fullname} [{', '.join(annotations)}]"
+    return fullname
+
+
 def _split_to_dict(split: piecash.Split) -> dict:
     """Convert a piecash Split to a serializable dict."""
     return {
@@ -803,20 +841,42 @@ class GnuCashBook:
                 "source": latest.source,
             }
 
-    def list_accounts(self) -> list[dict]:
+    def list_accounts(
+        self,
+        root: str | None = None,
+        compact: bool = True,
+    ) -> list[dict] | str:
         """List all accounts in the chart of accounts.
 
+        Args:
+            root: Optional root account path to filter to a subtree.
+                  E.g., "Expenses" returns only Expenses and descendants.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per account. If False, return
+                     the full list of account dicts.
+
         Returns:
-            Flat list of account dicts with full paths.
+            If compact: newline-separated string of account lines.
+            If not compact: flat list of account dicts with full paths.
         """
         with self.open(readonly=True) as book:
-            accounts = []
+            filtered = []
             for account in book.accounts:
-                # Skip the root template account
                 if account.type == "ROOT":
                     continue
-                accounts.append(_account_to_dict(account))
-            return sorted(accounts, key=lambda a: a["fullname"])
+                if root is not None:
+                    fn = account.fullname
+                    if fn != root and not fn.startswith(root + ":"):
+                        continue
+                filtered.append(account)
+
+            filtered.sort(key=lambda a: a.fullname)
+
+            if compact:
+                lines = [_account_to_compact_line(a) for a in filtered]
+                return "\n".join(lines)
+            else:
+                return [_account_to_dict(a) for a in filtered]
 
     def get_account(self, name: str) -> dict | None:
         """Get details for a specific account by full name.
@@ -923,14 +983,369 @@ class GnuCashBook:
                 return _transaction_to_dict(transaction)
             return None
 
-    def create_transaction(
+    _FUNDING_ACCOUNT_TYPES = {
+        "BANK", "CASH", "ASSET", "CREDIT", "LIABILITY", "EQUITY",
+    }
+
+    @staticmethod
+    def _extract_account_pattern(accounts) -> frozenset[str]:
+        """Extract categorization (non-funding) account names.
+
+        Filters out funding account types (BANK, CASH, ASSET, CREDIT,
+        LIABILITY, EQUITY) to isolate expense/income categorization.
+        Falls back to all accounts if filtering leaves nothing
+        (e.g., bank-to-bank transfers).
+
+        Args:
+            accounts: Iterable of piecash Account objects.
+
+        Returns:
+            frozenset of account fullnames representing the pattern.
+        """
+        all_names = frozenset(a.fullname for a in accounts)
+        categorization = frozenset(
+            a.fullname for a in accounts
+            if a.type not in GnuCashBook._FUNDING_ACCOUNT_TYPES
+        )
+        return categorization if categorization else all_names
+
+    def _find_recent_description_matches(
+        self,
+        book,
+        description: str,
+        limit: int = 5,
+        days: int = 90,
+    ) -> list:
+        """Find recent transactions with matching descriptions.
+
+        Uses bidirectional case-insensitive substring matching
+        (same logic as _auto_fill_splits and _find_duplicates).
+
+        Args:
+            book: Open piecash book (readonly).
+            description: Description to match.
+            limit: Maximum matches to return.
+            days: How far back to search.
+
+        Returns:
+            List of piecash Transaction objects, most recent first.
+        """
+        desc_lower = description.lower()
+        cutoff = date.today() - timedelta(days=days)
+        matches = []
+
+        sorted_txns = sorted(
+            book.transactions, key=lambda t: t.post_date, reverse=True
+        )
+        for txn in sorted_txns:
+            if txn.post_date < cutoff:
+                break
+            txn_desc_lower = txn.description.lower()
+            if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
+                matches.append(txn)
+                if len(matches) >= limit:
+                    break
+
+        return matches
+
+    @staticmethod
+    def _generate_warnings(
+        trans_date: date,
+        splits: list[dict],
+        accounts: list,
+    ) -> list[dict]:
+        """Generate warnings for unusual but valid transaction attributes.
+
+        Args:
+            trans_date: Transaction date.
+            splits: Original split dicts with 'amount' keys.
+            accounts: Resolved piecash account objects, same order as splits.
+
+        Returns:
+            List of warning dicts with 'type' and 'message' keys.
+        """
+        warnings = []
+        today = date.today()
+
+        if trans_date > today:
+            warnings.append({
+                "type": "future_date",
+                "message": f"Transaction date {trans_date.isoformat()} is in the future",
+            })
+
+        days_old = (today - trans_date).days
+        if days_old > 365:
+            warnings.append({
+                "type": "old_date",
+                "message": (
+                    f"Transaction date {trans_date.isoformat()} "
+                    f"is {days_old} days in the past"
+                ),
+            })
+
+        for split_data, account in zip(splits, accounts):
+            amount = Decimal(split_data["amount"])
+            if account.type == "EXPENSE" and amount < 0:
+                warnings.append({
+                    "type": "negative_expense",
+                    "message": (
+                        f"Negative amount ({amount}) to expense account "
+                        f"'{account.fullname}'"
+                    ),
+                })
+            elif account.type == "INCOME" and amount > 0:
+                warnings.append({
+                    "type": "positive_income",
+                    "message": (
+                        f"Positive amount ({amount}) to income account "
+                        f"'{account.fullname}'"
+                    ),
+                })
+
+        return warnings
+
+    def _auto_fill_splits(
+        self, description: str
+    ) -> tuple[list[dict], dict] | None:
+        """Find the most recent matching transaction and extract its splits.
+
+        Uses bidirectional case-insensitive substring matching on
+        description (same logic as _find_duplicates).
+
+        Args:
+            description: Transaction description to match against.
+
+        Returns:
+            Tuple of (splits_list, source_info) if match found, None otherwise.
+            splits_list is in create_transaction input format.
+            source_info has guid, description, and date of the source.
+        """
+        desc_lower = description.lower()
+
+        with self.open(readonly=True) as book:
+            # Sort by date descending to find most recent match
+            sorted_txns = sorted(
+                book.transactions, key=lambda t: t.post_date, reverse=True
+            )
+
+            for txn in sorted_txns:
+                txn_desc_lower = txn.description.lower()
+                if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
+                    # Extract splits into input format
+                    filled_splits = []
+                    for s in txn.splits:
+                        split_dict = {
+                            "account": s.account.fullname,
+                            "amount": str(s.value),
+                        }
+                        if s.quantity != s.value:
+                            split_dict["quantity"] = str(s.quantity)
+                        if s.memo:
+                            split_dict["memo"] = s.memo
+                        filled_splits.append(split_dict)
+
+                    source_info = {
+                        "guid": txn.guid,
+                        "description": txn.description,
+                        "date": txn.post_date.isoformat(),
+                    }
+                    return filled_splits, source_info
+
+        return None
+
+    def _check_split_consistency(
         self,
         description: str,
         splits: list[dict],
+        resolved_accounts: list,
+        days: int = 30,
+    ) -> list[dict]:
+        """Check if proposed splits' account pattern matches recent history.
+
+        Compares categorization accounts in the proposed transaction
+        against recent transactions with the same description. Warns
+        if the account pattern differs.
+
+        Args:
+            description: Transaction description.
+            splits: Proposed split dicts with 'account' keys.
+            resolved_accounts: Resolved piecash Account objects,
+                same order as splits.
+            days: How far back to search for comparison.
+
+        Returns:
+            List of warning dicts (possibly empty).
+        """
+        proposed_pattern = self._extract_account_pattern(resolved_accounts)
+
+        with self.open(readonly=True) as book:
+            matches = self._find_recent_description_matches(
+                book, description, limit=5, days=days
+            )
+
+            if not matches:
+                return []
+
+            # Capture data inside session to avoid DetachedInstanceError
+            recent_accounts = [s.account for s in matches[0].splits]
+            recent_pattern = self._extract_account_pattern(recent_accounts)
+            recent_desc = matches[0].description
+
+        if proposed_pattern == recent_pattern:
+            return []
+
+        return [{
+            "type": "split_consistency",
+            "message": (
+                f"Recent '{recent_desc}' transactions used "
+                f"{', '.join(sorted(recent_pattern))}, but this transaction "
+                f"uses {', '.join(sorted(proposed_pattern))}."
+            ),
+        }]
+
+    def _check_auto_fill_stability(
+        self,
+        description: str,
+        limit: int = 5,
+        days: int = 90,
+    ) -> list[dict]:
+        """Check if recent matching transactions have consistent patterns.
+
+        Examines recent transactions with the same description and warns
+        if they use different categorization account patterns — meaning
+        auto-fill is drawing from an inconsistent history.
+
+        Args:
+            description: Transaction description to match.
+            limit: Number of recent matches to examine.
+            days: How far back to search.
+
+        Returns:
+            List of warning dicts (possibly empty).
+        """
+        with self.open(readonly=True) as book:
+            matches = self._find_recent_description_matches(
+                book, description, limit=limit, days=days
+            )
+
+            if len(matches) < 2:
+                return []
+
+            # Capture all data inside session to avoid DetachedInstanceError
+            patterns = []
+            for txn in matches:
+                accounts = [s.account for s in txn.splits]
+                patterns.append(self._extract_account_pattern(accounts))
+
+            most_recent_date = matches[0].post_date.isoformat()
+
+        first_pattern = patterns[0]
+        if all(p == first_pattern for p in patterns):
+            return []
+
+        different_count = sum(1 for p in patterns[1:] if p != first_pattern)
+
+        return [{
+            "type": "auto_fill_unstable",
+            "message": (
+                f"Recent '{description}' transactions use different account "
+                f"patterns. Auto-filled from most recent ({most_recent_date}), "
+                f"but {different_count} of {len(matches)} recent matches used "
+                f"different categorization."
+            ),
+        }]
+
+    def _find_duplicates(
+        self,
+        description: str,
+        splits: list[dict],
+        trans_date: date,
+        window_days: int = 30,
+    ) -> list[dict]:
+        """Find potential duplicate transactions.
+
+        Uses three signals: description match (case-insensitive substring),
+        amount match (any split ±$1.00), and date match (±2 days).
+
+        Args:
+            description: Proposed transaction description.
+            splits: Proposed split dicts with 'amount' keys.
+            trans_date: Proposed transaction date.
+            window_days: Days before/after trans_date to search.
+
+        Returns:
+            List of duplicate candidates sorted by confidence (HIGH first).
+        """
+        proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
+        date_start = trans_date - timedelta(days=window_days)
+        date_end = trans_date + timedelta(days=window_days)
+        desc_lower = description.lower()
+
+        candidates = []
+
+        with self.open(readonly=True) as book:
+            for txn in book.transactions:
+                if txn.post_date < date_start or txn.post_date > date_end:
+                    continue
+
+                # Signal 1: Description match (substring both directions)
+                txn_desc_lower = txn.description.lower()
+                desc_match = (
+                    desc_lower in txn_desc_lower
+                    or txn_desc_lower in desc_lower
+                )
+
+                # Signal 2: Amount match (any split ±$1.00)
+                amount_match = False
+                txn_amounts = [abs(s.value) for s in txn.splits]
+                for proposed_amt in proposed_amounts:
+                    for txn_amt in txn_amounts:
+                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
+                            amount_match = True
+                            break
+                    if amount_match:
+                        break
+
+                # Signal 3: Date match (±2 days)
+                date_match = abs((txn.post_date - trans_date).days) <= 2
+
+                signals = sum([desc_match, amount_match, date_match])
+                if signals == 0:
+                    continue
+
+                if signals == 3:
+                    confidence = "HIGH"
+                elif signals == 2:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+
+                candidates.append({
+                    "confidence": confidence,
+                    "existing_transaction": _transaction_to_dict(txn),
+                    "match_signals": {
+                        "description": desc_match,
+                        "amount": amount_match,
+                        "date": date_match,
+                    },
+                })
+
+        # Sort: HIGH first, then MEDIUM, then LOW
+        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        candidates.sort(key=lambda c: order[c["confidence"]])
+        return candidates
+
+    def create_transaction(
+        self,
+        description: str,
+        splits: list[dict] | None = None,
         trans_date: date | None = None,
         currency: str | None = None,
         notes: str | None = None,
-    ) -> str:
+        check_duplicates: bool = True,
+        force_create: bool = False,
+        dry_run: bool = False,
+    ) -> dict:
         """Create a new transaction with splits.
 
         Args:
@@ -941,20 +1356,45 @@ class GnuCashBook:
                 - 'quantity' (optional): Amount in account's commodity.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo.
+                If omitted or empty, auto-fills from the most recent
+                transaction with a matching description.
             trans_date: Transaction date. Defaults to today.
             currency: ISO currency code for the transaction (e.g., "USD", "EUR").
                       Defaults to book's default currency.
             notes: Transaction notes (optional). Free-text annotation
                    stored separately from the description.
+            check_duplicates: Run duplicate detection. Default True.
+            force_create: Create even if HIGH confidence duplicates found.
+            dry_run: Validate and return proposal without writing.
 
         Returns:
-            GUID of the created transaction.
+            Dict with 'guid' and 'status' keys. May include 'warnings',
+            'duplicates', and 'auto_filled_from'. If a HIGH duplicate is
+            found and force_create is False, returns 'status': 'rejected'
+            instead. In dry_run mode, returns 'dry_run': True with
+            proposed transaction.
 
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
-                       accounts don't exist, or cross-currency splits
-                       are missing quantity.
+                       accounts don't exist, cross-currency splits
+                       missing quantity, or no match found for auto-fill.
         """
+        # Stage 0: Auto-fill splits from previous matching transaction
+        auto_filled_from = None
+        if not splits:
+            auto_result = self._auto_fill_splits(description)
+            if auto_result is None:
+                raise ValueError(
+                    "No matching transaction found for auto-fill. "
+                    "Provide explicit splits."
+                )
+            splits, auto_filled_from = auto_result
+
+        # Stage 0b: Auto-fill stability check
+        auto_fill_warnings = []
+        if auto_filled_from:
+            auto_fill_warnings = self._check_auto_fill_stability(description)
+
         if len(splits) < 2:
             raise ValueError("Transaction must have at least 2 splits")
 
@@ -968,6 +1408,28 @@ class GnuCashBook:
         if trans_date is None:
             trans_date = date.today()
 
+        # Stage 2: Duplicate check (readonly scan)
+        duplicates = []
+        if check_duplicates:
+            duplicates = self._find_duplicates(
+                description, splits, trans_date
+            )
+            has_high = any(d["confidence"] == "HIGH" for d in duplicates)
+            if has_high and not force_create and not dry_run:
+                return {
+                    "status": "rejected",
+                    "reason": "duplicate_detected",
+                    "duplicates": duplicates,
+                }
+
+        # Stage 3: Dry run — validate readonly, return proposal
+        if dry_run:
+            return self._dry_run_transaction(
+                description, splits, trans_date, currency, notes,
+                duplicates, auto_filled_from, auto_fill_warnings,
+            )
+
+        # Stage 4: Write
         with self.open(readonly=False) as book:
             # Determine transaction currency
             if currency is None:
@@ -977,11 +1439,23 @@ class GnuCashBook:
 
             # Validate all accounts exist and build split list
             piecash_splits = []
+            resolved_accounts = []
             for split in splits:
                 account = self._find_account(book, split["account"])
                 if not account:
                     raise ValueError(f"Account not found: {split['account']}")
 
+                if account.placeholder:
+                    children_hint = ", ".join(
+                        c.fullname for c in account.children
+                    )
+                    raise ValueError(
+                        f"Account '{account.fullname}' is a placeholder and "
+                        f"cannot receive transactions. "
+                        f"Use one of: {children_hint}"
+                    )
+
+                resolved_accounts.append(account)
                 value = Decimal(split["amount"])
 
                 # Determine quantity
@@ -1026,7 +1500,159 @@ class GnuCashBook:
             )
 
             book.save()
-            return transaction.guid
+
+            result = {"guid": transaction.guid, "status": "created"}
+            warnings = self._generate_warnings(
+                trans_date, splits, resolved_accounts
+            )
+
+            # Split consistency check (uses already-open book)
+            proposed_pattern = self._extract_account_pattern(
+                resolved_accounts
+            )
+            recent = self._find_recent_description_matches(
+                book, description, limit=5, days=30
+            )
+            # Exclude the transaction we just created
+            recent = [t for t in recent if t.guid != transaction.guid]
+            if recent:
+                recent_accts = [s.account for s in recent[0].splits]
+                recent_pattern = self._extract_account_pattern(recent_accts)
+                if proposed_pattern != recent_pattern:
+                    warnings.append({
+                        "type": "split_consistency",
+                        "message": (
+                            f"Recent '{recent[0].description}' transactions "
+                            f"used {', '.join(sorted(recent_pattern))}, but "
+                            f"this transaction uses "
+                            f"{', '.join(sorted(proposed_pattern))}."
+                        ),
+                    })
+
+            warnings.extend(auto_fill_warnings)
+            if warnings:
+                result["warnings"] = warnings
+            if duplicates:
+                result["duplicates"] = duplicates
+            if auto_filled_from:
+                result["auto_filled_from"] = auto_filled_from
+            return result
+
+    def _dry_run_transaction(
+        self,
+        description: str,
+        splits: list[dict],
+        trans_date: date,
+        currency: str | None,
+        notes: str | None,
+        duplicates: list[dict],
+        auto_filled_from: dict | None = None,
+        auto_fill_warnings: list[dict] | None = None,
+    ) -> dict:
+        """Validate a proposed transaction without writing.
+
+        Opens the book readonly to validate accounts, placeholders,
+        and cross-currency requirements.
+
+        Returns:
+            Dict with dry_run=True, proposed_transaction, warnings,
+            and duplicates.
+        """
+        with self.open(readonly=True) as book:
+            # Determine transaction currency (readonly — no creation)
+            if currency is None:
+                trans_currency = book.default_currency
+                currency_mnemonic = trans_currency.mnemonic
+            else:
+                trans_currency = self._find_commodity(book, currency)
+                if not trans_currency:
+                    raise ValueError(
+                        f"Currency '{currency}' not found in book. "
+                        f"Dry run cannot create new currencies."
+                    )
+                currency_mnemonic = trans_currency.mnemonic
+
+            # Validate all accounts
+            resolved_accounts = []
+            for split in splits:
+                account = self._find_account(book, split["account"])
+                if not account:
+                    raise ValueError(f"Account not found: {split['account']}")
+
+                if account.placeholder:
+                    children_hint = ", ".join(
+                        c.fullname for c in account.children
+                    )
+                    raise ValueError(
+                        f"Account '{account.fullname}' is a placeholder and "
+                        f"cannot receive transactions. "
+                        f"Use one of: {children_hint}"
+                    )
+
+                resolved_accounts.append(account)
+
+                # Cross-currency validation
+                if account.commodity != trans_currency:
+                    if "quantity" not in split:
+                        raise ValueError(
+                            f"Split for '{split['account']}' requires "
+                            f"'quantity' because account commodity "
+                            f"({account.commodity.mnemonic}) differs from "
+                            f"transaction currency ({currency_mnemonic})"
+                        )
+                    value = Decimal(split["amount"])
+                    quantity = Decimal(split["quantity"])
+                    if quantity * value < 0:
+                        raise ValueError(
+                            f"Split for '{split['account']}': quantity and "
+                            f"value must have same sign "
+                            f"(got value={value}, quantity={quantity})"
+                        )
+
+            warnings = self._generate_warnings(
+                trans_date, splits, resolved_accounts
+            )
+
+            # Split consistency check (uses already-open book)
+            proposed_pattern = self._extract_account_pattern(
+                resolved_accounts
+            )
+            recent = self._find_recent_description_matches(
+                book, description, limit=5, days=30
+            )
+            if recent:
+                recent_accts = [s.account for s in recent[0].splits]
+                recent_pattern = self._extract_account_pattern(recent_accts)
+                if proposed_pattern != recent_pattern:
+                    warnings.append({
+                        "type": "split_consistency",
+                        "message": (
+                            f"Recent '{recent[0].description}' transactions "
+                            f"used {', '.join(sorted(recent_pattern))}, but "
+                            f"this transaction uses "
+                            f"{', '.join(sorted(proposed_pattern))}."
+                        ),
+                    })
+
+            if auto_fill_warnings:
+                warnings.extend(auto_fill_warnings)
+
+        result = {
+            "dry_run": True,
+            "proposed_transaction": {
+                "description": description,
+                "date": trans_date.isoformat(),
+                "currency": currency_mnemonic,
+                "splits": splits,
+            },
+            "warnings": warnings,
+            "duplicates": duplicates,
+        }
+        if notes:
+            result["proposed_transaction"]["notes"] = notes
+        if auto_filled_from:
+            result["auto_filled_from"] = auto_filled_from
+        return result
 
     def search_transactions(self, query: str, field: str = "description") -> list[dict]:
         """Search transactions by field.
@@ -1350,22 +1976,35 @@ class GnuCashBook:
 
             return result
 
-    def delete_transaction(self, guid: str) -> dict:
+    def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
         Args:
             guid: Transaction GUID (32-character hex string).
+            force: If True, allow deleting transactions with reconciled splits.
 
         Returns:
             Dict with guid, description, and status.
 
         Raises:
-            ValueError: If transaction not found.
+            ValueError: If transaction not found, or has reconciled splits
+                       and force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
+
+            # Check for reconciled splits
+            reconciled = [
+                s for s in transaction.splits if s.reconcile_state == "y"
+            ]
+            if reconciled and not force:
+                acct_names = ", ".join(s.account.fullname for s in reconciled)
+                raise ValueError(
+                    f"Transaction has reconciled splits in: {acct_names}. "
+                    f"Deleting will break reconciliation. Use force=true to override."
+                )
 
             # Capture info before deletion
             result = {
@@ -1373,6 +2012,8 @@ class GnuCashBook:
                 "description": transaction.description,
                 "status": "deleted",
             }
+            if reconciled:
+                result["reconciled_splits_affected"] = len(reconciled)
 
             # Delete the transaction
             book.session.delete(transaction)
@@ -1387,6 +2028,7 @@ class GnuCashBook:
         trans_date: date | None = None,
         splits: list[dict] | None = None,
         notes: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Update an existing transaction.
 
@@ -1401,19 +2043,37 @@ class GnuCashBook:
                     from the transaction currency.
             notes: New transaction notes (optional). Pass empty string
                    to clear existing notes.
+            force: If True, allow modifying transactions with reconciled
+                   splits. Only checked when splits are being updated.
 
         Returns:
             Dict with updated transaction details.
 
         Raises:
             ValueError: If transaction not found, splits don't balance,
-                       account not found in splits, or cross-currency split
-                       missing quantity.
+                       account not found in splits, cross-currency split
+                       missing quantity, or has reconciled splits and
+                       force is False.
         """
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
+
+            # Check for reconciled splits when modifying splits
+            if splits is not None:
+                reconciled = [
+                    s for s in transaction.splits if s.reconcile_state == "y"
+                ]
+                if reconciled and not force:
+                    acct_names = ", ".join(
+                        s.account.fullname for s in reconciled
+                    )
+                    raise ValueError(
+                        f"Transaction has reconciled splits in: {acct_names}. "
+                        f"Modifying will break reconciliation. "
+                        f"Use force=true to override."
+                    )
 
             # Update description if provided
             if description is not None:
@@ -2931,14 +3591,14 @@ class GnuCashBook:
             book.save()
 
         # Create the actual transaction (separate session)
-        txn_guid = self.create_transaction(
+        txn_result = self.create_transaction(
             description=sx_name,
             splits=splits,
             trans_date=txn_date,
         )
 
         return {
-            "transaction_guid": txn_guid,
+            "transaction_guid": txn_result["guid"],
             "scheduled_transaction": sx_name,
             "transaction_date": txn_date.isoformat(),
             "instance_count": instance_count,
@@ -3387,4 +4047,113 @@ class GnuCashBook:
                 "guid": guid,
                 "title": lot.title,
                 "status": "closed",
+            }
+
+    # ============== Account Slot Operations ==============
+
+    def get_account_slots(
+        self, account_name: str, key: str | None = None
+    ) -> dict:
+        """Read all slots (or a specific slot) from an account.
+
+        Args:
+            account_name: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+            key: Specific slot key to retrieve. If None, return all slots.
+
+        Returns:
+            Dict with account name and slots dict.
+
+        Raises:
+            ValueError: If account not found.
+        """
+        with self.open(readonly=True) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            if key is not None:
+                try:
+                    value = account[key]
+                    slots = {key: str(value.value) if hasattr(value, 'value') else str(value)}
+                except KeyError:
+                    slots = {}
+            else:
+                slots = {}
+                for k, v in account.iteritems():
+                    slots[k] = str(v.value)
+
+            return {
+                "account": account_name,
+                "slots": slots,
+            }
+
+    def set_account_slot(
+        self, account_name: str, key: str, value: str
+    ) -> dict:
+        """Set a single key-value pair on an account.
+
+        Args:
+            account_name: Full account path.
+            key: Slot key (e.g., "apr", "credit_limit").
+            value: Slot value. Stored as string.
+
+        Returns:
+            Dict with account, key, value, and status ("created" or "updated").
+
+        Raises:
+            ValueError: If account not found.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            # Check if key exists to determine created vs updated
+            existing = False
+            try:
+                account[key]
+                existing = True
+            except KeyError:
+                pass
+
+            account[key] = value
+            book.save()
+
+            return {
+                "account": account_name,
+                "key": key,
+                "value": value,
+                "status": "updated" if existing else "created",
+            }
+
+    def delete_account_slot(self, account_name: str, key: str) -> dict:
+        """Remove a slot from an account.
+
+        Args:
+            account_name: Full account path.
+            key: Slot key to remove.
+
+        Returns:
+            Dict with account, key, and status.
+
+        Raises:
+            ValueError: If account not found or key not found.
+        """
+        with self.open(readonly=False) as book:
+            account = self._find_account(book, account_name)
+            if not account:
+                raise ValueError(f"Account not found: {account_name}")
+
+            try:
+                account[key]
+            except KeyError:
+                raise ValueError(f"Slot key not found: {key}")
+
+            del account[key]
+            book.save()
+
+            return {
+                "account": account_name,
+                "key": key,
+                "status": "deleted",
             }
