@@ -1896,6 +1896,479 @@ class TestUpdateTransaction:
         assert result["description"] == "Updated Groceries"
 
 
+class TestReplaceSplits:
+    """Tests for replace_splits method."""
+
+    def test_basic_replace_splits(self, test_book: Path):
+        """Should replace splits with new accounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        original_splits = transactions[0]["splits"]
+
+        # Get original accounts for verification
+        original_accounts = {s["account"] for s in original_splits}
+        assert "Expenses:Groceries" in original_accounts
+
+        # Create a Dining account to replace splits with
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Recategorize: Groceries -> Dining
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        assert result["status"] == "splits_replaced"
+        new_accounts = {s["account"] for s in result["splits"]}
+        assert "Expenses:Dining" in new_accounts
+        assert "Expenses:Groceries" not in new_accounts
+
+    def test_preserves_transaction_identity(self, test_book: Path):
+        """Should preserve transaction GUID, description, date, notes."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        original_date = transactions[0]["date"]
+        original_description = transactions[0]["description"]
+
+        # Create a Dining account
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Recategorize
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        # Identity preserved
+        assert result["guid"] == guid
+        assert result["date"] == original_date
+        assert result["description"] == original_description
+
+    def test_returns_previous_splits(self, test_book: Path):
+        """Should include previous_splits in response for audit trail."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        original_splits = transactions[0]["splits"]
+
+        # Create a Dining account
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Recategorize
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        assert "previous_splits" in result
+        assert len(result["previous_splits"]) == len(original_splits)
+        previous_accounts = {s["account"] for s in result["previous_splits"]}
+        assert "Expenses:Groceries" in previous_accounts
+
+    def test_requires_balanced_splits(self, test_book: Path):
+        """Should reject splits that don't balance to zero."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="do not balance"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-140.00"},  # Wrong
+                ],
+            )
+
+    def test_requires_two_splits(self, test_book: Path):
+        """Should reject fewer than 2 splits."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="At least 2 splits"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "0.00"},
+                ],
+            )
+
+    def test_account_not_found(self, test_book: Path):
+        """Should reject splits with non-existent accounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="Account not found"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:NonExistent", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+            )
+
+    def test_placeholder_rejected(self, test_book: Path):
+        """Should reject splits to placeholder accounts."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+
+        # Expenses is a placeholder in test_book
+        with pytest.raises(ValueError, match="placeholder account"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+            )
+
+    def test_transaction_not_found(self, test_book: Path):
+        """Should reject non-existent transaction GUID."""
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Transaction not found"):
+            gc_book.replace_splits(
+                guid="00000000000000000000000000000000",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+            )
+
+    def test_reconciled_requires_force(self, test_book: Path):
+        """Should reject recategorizing reconciled splits without force."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a transaction and reconcile one of its splits
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "150.00"},
+                    {"account": "Assets:Checking", "amount": "-150.00"},
+                ],
+            )
+
+    def test_reconciled_with_force(self, test_book: Path):
+        """Should allow recategorizing reconciled splits with force."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Get a transaction and reconcile one of its splits
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        split_guid = transactions[0]["splits"][0]["guid"]
+        gc_book.set_reconcile_state(split_guid, "y")
+
+        # Create a Dining account
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            force=True,
+        )
+
+        assert result["status"] == "splits_replaced"
+        assert "warnings" in result
+        assert any("reconciled" in w.lower() for w in result["warnings"])
+
+    def test_lot_requires_force(self, investment_book: Path):
+        """Should reject recategorizing splits in lots without force."""
+        gc_book = GnuCashBook(str(investment_book))
+
+        # Create an investment purchase with a lot
+        lot_result = gc_book.create_lot(
+            account="Assets:Investments:VTSAX",
+            title="Test Lot",
+        )
+        lot_guid = lot_result["guid"]
+
+        # Create a buy transaction
+        result = gc_book.create_transaction(
+            description="Buy VTSAX",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "1250.00",
+                    "quantity": "10",
+                },
+                {"account": "Assets:Checking", "amount": "-1250.00"},
+            ],
+        )
+        txn_guid = result["guid"]
+
+        # Get the investment split and assign to lot
+        txn = gc_book.get_transaction(txn_guid)
+        inv_split = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Investments:VTSAX"
+        )
+        gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
+
+        # Try to replace splits without force
+        with pytest.raises(ValueError, match="splits in lots"):
+            gc_book.replace_splits(
+                guid=txn_guid,
+                splits=[
+                    {
+                        "account": "Assets:Investments:VTSAX",
+                        "amount": "1250.00",
+                        "quantity": "10",
+                    },
+                    {"account": "Assets:Checking", "amount": "-1250.00"},
+                ],
+            )
+
+    def test_lot_with_force(self, investment_book: Path):
+        """Should allow recategorizing splits in lots with force and warning."""
+        gc_book = GnuCashBook(str(investment_book))
+
+        # Create an investment purchase with a lot
+        lot_result = gc_book.create_lot(
+            account="Assets:Investments:VTSAX",
+            title="Test Lot For Force",
+        )
+        lot_guid = lot_result["guid"]
+
+        # Create a buy transaction
+        result = gc_book.create_transaction(
+            description="Buy VTSAX for force test",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "1250.00",
+                    "quantity": "10",
+                },
+                {"account": "Assets:Checking", "amount": "-1250.00"},
+            ],
+        )
+        txn_guid = result["guid"]
+
+        # Get the investment split and assign to lot
+        txn = gc_book.get_transaction(txn_guid)
+        inv_split = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Investments:VTSAX"
+        )
+        gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
+
+        # Recategorize with force
+        result = gc_book.replace_splits(
+            guid=txn_guid,
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "1250.00",
+                    "quantity": "10",
+                },
+                {"account": "Assets:Checking", "amount": "-1250.00"},
+            ],
+            force=True,
+        )
+
+        assert result["status"] == "splits_replaced"
+        assert "warnings" in result
+        assert any("lot" in w.lower() for w in result["warnings"])
+
+    def test_three_way_split(self, test_book: Path):
+        """Should allow recategorizing to more splits than original."""
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction (2 splits)
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+        assert len(transactions[0]["splits"]) == 2
+
+        # Create additional accounts
+        gc_book.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Recategorize to 3 splits
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "100.00"},
+                {"account": "Expenses:Dining", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        assert result["status"] == "splits_replaced"
+        assert len(result["splits"]) == 3
+
+    def test_reduce_to_two_splits(self, budget_book: Path):
+        """Should allow recategorizing to fewer splits than original."""
+        gc_book = GnuCashBook(str(budget_book))
+
+        # Create a 3-way split transaction
+        result = gc_book.create_transaction(
+            description="Multi-category purchase",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "50.00"},
+                {"account": "Expenses:Dining", "amount": "30.00"},
+                {"account": "Assets:Checking", "amount": "-80.00"},
+            ],
+        )
+        guid = result["guid"]
+
+        # Get the transaction to verify 3 splits
+        txn = gc_book.get_transaction(guid)
+        assert len(txn["splits"]) == 3
+
+        # Recategorize to 2 splits
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "80.00"},
+                {"account": "Assets:Checking", "amount": "-80.00"},
+            ],
+        )
+
+        assert result["status"] == "splits_replaced"
+        assert len(result["splits"]) == 2
+
+    def test_preserves_memo(self, test_book: Path):
+        """Should preserve memo on new splits when provided."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions("Weekly Groceries")
+        guid = transactions[0]["guid"]
+
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {
+                    "account": "Expenses:Groceries",
+                    "amount": "150.00",
+                    "memo": "Updated memo",
+                },
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        assert result["status"] == "splits_replaced"
+        groceries_split = next(
+            s for s in result["splits"] if s["account"] == "Expenses:Groceries"
+        )
+        assert groceries_split["memo"] == "Updated memo"
+
+    def test_cross_currency_requires_quantity(self, multi_currency_book: Path):
+        """Should require quantity for cross-currency splits."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Find a USD transaction
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        # Try to replace splits to EUR account without quantity
+        with pytest.raises(ValueError, match="requires 'quantity'"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Assets:Euro Savings", "amount": "200.00"},
+                    {"account": "Assets:Checking", "amount": "-200.00"},
+                ],
+            )
+
+    def test_cross_currency_with_quantity(self, multi_currency_book: Path):
+        """Should allow cross-currency splits when quantity provided."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Find a USD transaction
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        # Recategorize with proper quantity
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {
+                    "account": "Assets:Euro Savings",
+                    "amount": "200.00",
+                    "quantity": "182.00",  # EUR equivalent
+                },
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+        )
+
+        assert result["status"] == "splits_replaced"
+        eur_split = next(
+            s for s in result["splits"] if s["account"] == "Assets:Euro Savings"
+        )
+        assert Decimal(eur_split["quantity"]) == Decimal("182.00")
+
+    def test_quantity_sign_mismatch(self, multi_currency_book: Path):
+        """Should reject quantity with opposite sign from amount."""
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        transactions = gc_book.search_transactions("Groceries")
+        guid = transactions[0]["guid"]
+
+        with pytest.raises(ValueError, match="same sign"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {
+                        "account": "Assets:Euro Savings",
+                        "amount": "200.00",
+                        "quantity": "-182.00",  # Wrong sign
+                    },
+                    {"account": "Assets:Checking", "amount": "-200.00"},
+                ],
+            )
+
+
 class TestSetReconcileState:
     """Tests for set_reconcile_state method."""
 
