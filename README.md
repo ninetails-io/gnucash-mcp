@@ -118,7 +118,7 @@ Ask Claude:
 
 ## What can it do?
 
-**47 tools** across ten categories:
+**51 tools** across eleven categories:
 
 | Category | What you can ask |
 |----------|------------------|
@@ -130,6 +130,7 @@ Ask Claude:
 | **Reports** | "Spending by category last month", "What's my net worth?", "Show cash flow this year" |
 | **Multi-currency** | "Record a €50 purchase", "What's my EUR account balance?" |
 | **Reconciliation** | "Show unreconciled transactions", "Mark these as cleared" |
+| **Account Metadata** | "Set my credit card APR", "What metadata is on this account?" |
 
 ---
 
@@ -291,7 +292,7 @@ Example audit entry:
 
 ---
 
-## All 47 Tools
+## All 51 Tools
 
 <details>
 <summary>Click to expand full tool list</summary>
@@ -300,12 +301,13 @@ Example audit entry:
 |----------|-------|
 | Accounts | `list_accounts`, `get_account`, `get_balance`, `create_account`, `update_account`, `move_account`, `delete_account` |
 | Commodities & Prices | `list_commodities`, `create_commodity`, `create_price`, `get_prices`, `get_latest_price` |
-| Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` |
+| Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `replace_splits`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` |
 | Reconciliation | `set_reconcile_state`, `get_unreconciled_splits`, `reconcile_account` |
 | Reporting | `spending_by_category`, `income_by_source`, `balance_sheet`, `net_worth`, `cash_flow` |
 | Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` |
 | Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` |
 | Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` |
+| Account Metadata | `get_account_slots`, `set_account_slot`, `delete_account_slot` |
 | Audit | `get_audit_log` |
 
 </details>
@@ -346,6 +348,7 @@ gnucash-mcp/
 - [x] Budgets with variance reporting
 - [x] Scheduled transactions
 - [x] Audit logging
+- [x] Split recategorization (`replace_splits`)
 - [ ] CSV export
 - [ ] CSV/OFX import
 - [ ] Duplicate detection
