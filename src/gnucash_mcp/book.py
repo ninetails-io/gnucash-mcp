@@ -2144,6 +2144,151 @@ class GnuCashBook:
 
             return _transaction_to_dict(transaction) | {"status": "updated"}
 
+    def recategorize_transaction(
+        self,
+        guid: str,
+        splits: list[dict],
+        force: bool = False,
+    ) -> dict:
+        """Replace all splits in a transaction with a new set.
+
+        Use this to change which accounts a transaction affects (recategorize).
+        The transaction's currency, description, date, and notes are preserved.
+        New splits must balance to zero.
+
+        Args:
+            guid: Transaction GUID.
+            splits: Complete new set of splits. Each split needs:
+                - 'account' (required): Full account path
+                - 'amount' (required): Value in transaction currency
+                - 'quantity' (optional): Amount in account's commodity.
+                  Required if account commodity differs from transaction currency.
+                - 'memo' (optional): Split memo
+            force: Required if existing splits are reconciled ('y') or
+                   assigned to lots.
+
+        Returns:
+            Dict with updated transaction details, previous splits for audit
+            trail, status, and any warnings.
+
+        Raises:
+            ValueError: If transaction not found, splits don't balance,
+                       account not found, placeholder account used,
+                       cross-currency split missing quantity, or has
+                       reconciled/lot splits without force.
+        """
+        # Validate split count upfront
+        if len(splits) < 2:
+            raise ValueError("At least 2 splits required")
+
+        # Validate balance upfront
+        total = sum(Decimal(s["amount"]) for s in splits)
+        if total != Decimal("0"):
+            raise ValueError(f"Splits do not balance: total is {total}")
+
+        with self.open(readonly=False) as book:
+            warnings = []
+
+            # 1. Find transaction
+            transaction = self._find_transaction(book, guid)
+            if not transaction:
+                raise ValueError(f"Transaction not found: {guid}")
+
+            # 2. Capture previous splits for audit trail (before deletion)
+            previous_splits = [_split_to_dict(s) for s in transaction.splits]
+
+            # 3. Resolve and validate all accounts upfront
+            resolved_accounts = []
+            for split_data in splits:
+                account_name = split_data["account"]
+                account = self._find_account(book, account_name)
+                if not account:
+                    raise ValueError(f"Account not found: {account_name}")
+                if account.placeholder:
+                    raise ValueError(
+                        f"Cannot use placeholder account: {account_name}"
+                    )
+                resolved_accounts.append((account, split_data))
+
+            # 4. Check reconciled splits
+            reconciled = [
+                s for s in transaction.splits if s.reconcile_state == "y"
+            ]
+            if reconciled and not force:
+                names = ", ".join(s.account.fullname for s in reconciled)
+                raise ValueError(
+                    f"Transaction has reconciled splits in: {names}. "
+                    f"Use force=true to override."
+                )
+            if reconciled:
+                names = ", ".join(s.account.fullname for s in reconciled)
+                warnings.append(f"Replaced reconciled splits in: {names}")
+
+            # 5. Check lot assignments
+            in_lots = [s for s in transaction.splits if s.lot is not None]
+            if in_lots and not force:
+                names = ", ".join(s.account.fullname for s in in_lots)
+                raise ValueError(
+                    f"Transaction has splits in lots: {names}. "
+                    f"Use force=true to override."
+                )
+            if in_lots:
+                lot_info = ", ".join(
+                    f"{s.lot.title} ({s.account.fullname})" for s in in_lots
+                )
+                warnings.append(
+                    f"Removed splits from lots: {lot_info}. "
+                    f"Cost basis tracking affected."
+                )
+
+            # 6. Delete existing splits
+            for split in list(transaction.splits):
+                book.delete(split)
+
+            # 7. Create new splits
+            trans_currency = transaction.currency
+            for account, split_data in resolved_accounts:
+                amount = Decimal(split_data["amount"])
+
+                # Determine quantity
+                if account.commodity == trans_currency:
+                    quantity = amount
+                elif "quantity" in split_data:
+                    quantity = Decimal(split_data["quantity"])
+                    if quantity * amount < 0:
+                        raise ValueError(
+                            f"Split for '{account.fullname}': quantity and "
+                            f"value must have same sign "
+                            f"(got value={amount}, quantity={quantity})"
+                        )
+                else:
+                    raise ValueError(
+                        f"Split for '{account.fullname}' requires 'quantity' "
+                        f"because account commodity "
+                        f"({account.commodity.mnemonic}) differs from "
+                        f"transaction currency ({trans_currency.mnemonic})"
+                    )
+
+                piecash.Split(
+                    account=account,
+                    value=amount,
+                    quantity=quantity,
+                    memo=split_data.get("memo", ""),
+                    transaction=transaction,
+                )
+
+            # 8. Save
+            book.save()
+
+            # 9. Build response
+            result = _transaction_to_dict(transaction)
+            result["previous_splits"] = previous_splits
+            result["status"] = "recategorized"
+            if warnings:
+                result["warnings"] = warnings
+
+            return result
+
     def _find_split(self, book: piecash.Book, guid: str) -> piecash.Split | None:
         """Find a split by GUID.
 
