@@ -403,8 +403,8 @@ def _format_audit_entry_text(entry: dict) -> str:
                 if before.get("splits"):
                     lines.append(_format_splits_text(before["splits"], indent + "  "))
 
-        elif operation == "RECATEGORIZE":
-            lines.append(f"{time_part}  RECATEGORIZE TRANSACTION  guid:{guid_short}")
+        elif operation == "REPLACE_SPLITS":
+            lines.append(f"{time_part}  REPLACE SPLITS  guid:{guid_short}")
             if after:
                 desc = after.get("description", "")
                 date_str = after.get("date", "")

@@ -1896,10 +1896,10 @@ class TestUpdateTransaction:
         assert result["description"] == "Updated Groceries"
 
 
-class TestRecategorizeTransaction:
-    """Tests for recategorize_transaction method."""
+class TestReplaceSplits:
+    """Tests for replace_splits method."""
 
-    def test_basic_recategorize(self, test_book: Path):
+    def test_basic_replace_splits(self, test_book: Path):
         """Should replace splits with new accounts."""
         gc_book = GnuCashBook(str(test_book))
 
@@ -1912,7 +1912,7 @@ class TestRecategorizeTransaction:
         original_accounts = {s["account"] for s in original_splits}
         assert "Expenses:Groceries" in original_accounts
 
-        # Create a Dining account to recategorize to
+        # Create a Dining account to replace splits with
         gc_book.create_account(
             name="Dining",
             account_type="EXPENSE",
@@ -1920,7 +1920,7 @@ class TestRecategorizeTransaction:
         )
 
         # Recategorize: Groceries -> Dining
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Dining", "amount": "150.00"},
@@ -1928,7 +1928,7 @@ class TestRecategorizeTransaction:
             ],
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         new_accounts = {s["account"] for s in result["splits"]}
         assert "Expenses:Dining" in new_accounts
         assert "Expenses:Groceries" not in new_accounts
@@ -1951,7 +1951,7 @@ class TestRecategorizeTransaction:
         )
 
         # Recategorize
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Dining", "amount": "150.00"},
@@ -1981,7 +1981,7 @@ class TestRecategorizeTransaction:
         )
 
         # Recategorize
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Dining", "amount": "150.00"},
@@ -2002,7 +2002,7 @@ class TestRecategorizeTransaction:
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="do not balance"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Expenses:Groceries", "amount": "150.00"},
@@ -2018,7 +2018,7 @@ class TestRecategorizeTransaction:
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="At least 2 splits"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Expenses:Groceries", "amount": "0.00"},
@@ -2033,7 +2033,7 @@ class TestRecategorizeTransaction:
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="Account not found"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Expenses:NonExistent", "amount": "150.00"},
@@ -2050,7 +2050,7 @@ class TestRecategorizeTransaction:
 
         # Expenses is a placeholder in test_book
         with pytest.raises(ValueError, match="placeholder account"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Expenses", "amount": "150.00"},
@@ -2063,7 +2063,7 @@ class TestRecategorizeTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="Transaction not found"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid="00000000000000000000000000000000",
                 splits=[
                     {"account": "Expenses:Groceries", "amount": "150.00"},
@@ -2082,7 +2082,7 @@ class TestRecategorizeTransaction:
         gc_book.set_reconcile_state(split_guid, "y")
 
         with pytest.raises(ValueError, match="reconciled splits"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Expenses:Groceries", "amount": "150.00"},
@@ -2107,7 +2107,7 @@ class TestRecategorizeTransaction:
             parent="Expenses",
         )
 
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Dining", "amount": "150.00"},
@@ -2116,7 +2116,7 @@ class TestRecategorizeTransaction:
             force=True,
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         assert "warnings" in result
         assert any("reconciled" in w.lower() for w in result["warnings"])
 
@@ -2153,9 +2153,9 @@ class TestRecategorizeTransaction:
         )
         gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
 
-        # Try to recategorize without force
+        # Try to replace splits without force
         with pytest.raises(ValueError, match="splits in lots"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=txn_guid,
                 splits=[
                     {
@@ -2201,7 +2201,7 @@ class TestRecategorizeTransaction:
         gc_book.assign_split_to_lot(inv_split["guid"], lot_guid)
 
         # Recategorize with force
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=txn_guid,
             splits=[
                 {
@@ -2214,7 +2214,7 @@ class TestRecategorizeTransaction:
             force=True,
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         assert "warnings" in result
         assert any("lot" in w.lower() for w in result["warnings"])
 
@@ -2235,7 +2235,7 @@ class TestRecategorizeTransaction:
         )
 
         # Recategorize to 3 splits
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Groceries", "amount": "100.00"},
@@ -2244,7 +2244,7 @@ class TestRecategorizeTransaction:
             ],
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         assert len(result["splits"]) == 3
 
     def test_reduce_to_two_splits(self, budget_book: Path):
@@ -2267,7 +2267,7 @@ class TestRecategorizeTransaction:
         assert len(txn["splits"]) == 3
 
         # Recategorize to 2 splits
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Groceries", "amount": "80.00"},
@@ -2275,7 +2275,7 @@ class TestRecategorizeTransaction:
             ],
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         assert len(result["splits"]) == 2
 
     def test_preserves_memo(self, test_book: Path):
@@ -2285,7 +2285,7 @@ class TestRecategorizeTransaction:
         transactions = gc_book.search_transactions("Weekly Groceries")
         guid = transactions[0]["guid"]
 
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {
@@ -2297,7 +2297,7 @@ class TestRecategorizeTransaction:
             ],
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         groceries_split = next(
             s for s in result["splits"] if s["account"] == "Expenses:Groceries"
         )
@@ -2311,9 +2311,9 @@ class TestRecategorizeTransaction:
         transactions = gc_book.search_transactions("Groceries")
         guid = transactions[0]["guid"]
 
-        # Try to recategorize to EUR account without quantity
+        # Try to replace splits to EUR account without quantity
         with pytest.raises(ValueError, match="requires 'quantity'"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {"account": "Assets:Euro Savings", "amount": "200.00"},
@@ -2330,7 +2330,7 @@ class TestRecategorizeTransaction:
         guid = transactions[0]["guid"]
 
         # Recategorize with proper quantity
-        result = gc_book.recategorize_transaction(
+        result = gc_book.replace_splits(
             guid=guid,
             splits=[
                 {
@@ -2342,7 +2342,7 @@ class TestRecategorizeTransaction:
             ],
         )
 
-        assert result["status"] == "recategorized"
+        assert result["status"] == "splits_replaced"
         eur_split = next(
             s for s in result["splits"] if s["account"] == "Assets:Euro Savings"
         )
@@ -2356,7 +2356,7 @@ class TestRecategorizeTransaction:
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="same sign"):
-            gc_book.recategorize_transaction(
+            gc_book.replace_splits(
                 guid=guid,
                 splits=[
                     {
