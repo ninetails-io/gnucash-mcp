@@ -128,6 +128,58 @@ class GnuCashBook:
         if not self.book_path.exists():
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
 
+    # Tables that support GUID resolution
+    _GUID_TABLES = frozenset({
+        "transactions", "splits", "accounts", "lots",
+        "schedxactions", "commodities", "budgets",
+    })
+
+    def _resolve_guid(self, table: str, partial: str) -> str:
+        """Resolve a partial GUID prefix to a full 32-character GUID.
+
+        Uses raw SQLite in read-only mode — no piecash session needed.
+
+        Args:
+            table: Database table name (e.g., "transactions", "splits").
+            partial: Full or partial GUID prefix (minimum 8 characters).
+
+        Returns:
+            Full 32-character GUID.
+
+        Raises:
+            ValueError: If table is not in the allowed set.
+            ValueError: If partial is too short (< 8 chars).
+            ValueError: If no match found.
+            ValueError: If multiple matches found (ambiguous).
+        """
+        if table not in self._GUID_TABLES:
+            raise ValueError(f"Invalid table: {table}")
+        if len(partial) < 8:
+            raise ValueError(f"GUID prefix too short (minimum 8 chars): {partial}")
+
+        # Fast path: already a full GUID
+        if len(partial) == 32:
+            return partial
+
+        conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                f"SELECT guid FROM {table} WHERE guid LIKE ?",
+                (partial + "%",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if len(rows) == 0:
+            raise ValueError(f"No {table[:-1]} found matching GUID prefix: {partial}")
+        if len(rows) > 1:
+            matches = [r[0] for r in rows]
+            raise ValueError(
+                f"Ambiguous GUID prefix '{partial}' matches {len(rows)} {table}: "
+                f"{', '.join(m[:12] + '...' for m in matches)}"
+            )
+        return rows[0][0]
+
     @contextmanager
     def open(
         self, readonly: bool = True, max_retries: int = 3, retry_delay: float = 0.5
