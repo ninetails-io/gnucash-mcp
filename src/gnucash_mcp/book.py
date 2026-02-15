@@ -2144,7 +2144,7 @@ class GnuCashBook:
 
             return _transaction_to_dict(transaction) | {"status": "updated"}
 
-    def recategorize_transaction(
+    def replace_splits(
         self,
         guid: str,
         splits: list[dict],
@@ -2152,7 +2152,7 @@ class GnuCashBook:
     ) -> dict:
         """Replace all splits in a transaction with a new set.
 
-        Use this to change which accounts a transaction affects (recategorize).
+        Replace all splits in a transaction with a completely new set.
         The transaction's currency, description, date, and notes are preserved.
         New splits must balance to zero.
 
@@ -2283,7 +2283,7 @@ class GnuCashBook:
             # 9. Build response
             result = _transaction_to_dict(transaction)
             result["previous_splits"] = previous_splits
-            result["status"] = "recategorized"
+            result["status"] = "splits_replaced"
             if warnings:
                 result["warnings"] = warnings
 

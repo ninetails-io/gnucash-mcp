@@ -592,15 +592,15 @@ def update_transaction(
 
 @mcp.tool()
 @safe_tool
-@audit_log(classification="write", operation="recategorize", entity_type="transaction")
-def recategorize_transaction(
+@audit_log(classification="write", operation="replace_splits", entity_type="transaction")
+def replace_splits(
     guid: str,
     splits: list[dict],
     force: bool = False,
 ) -> str:
     """Replace all splits in a transaction with a new set.
 
-    Use this to change which accounts a transaction affects (recategorize).
+    Replace all splits in a transaction with a completely new set.
     The transaction's currency, description, date, and notes are preserved.
     New splits must balance to zero.
 
@@ -615,7 +615,7 @@ def recategorize_transaction(
         force: Allow replacing reconciled splits or splits in lots
     """
     book = get_book()
-    result = book.recategorize_transaction(
+    result = book.replace_splits(
         guid=guid,
         splits=splits,
         force=force,

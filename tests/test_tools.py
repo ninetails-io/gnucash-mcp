@@ -559,11 +559,11 @@ class TestUpdateTransactionTool:
         assert data["status"] == "updated"
 
 
-class TestRecategorizeTransactionTool:
-    """Tests for recategorize_transaction tool."""
+class TestReplaceSplitsTool:
+    """Tests for replace_splits tool."""
 
-    def test_recategorize_basic(self, setup_book_env):
-        """Should recategorize a transaction to different accounts."""
+    def test_replace_splits_basic(self, setup_book_env):
+        """Should replace splits on a transaction with different accounts."""
         # Create a Dining account first
         server_module.create_account(
             name="Dining",
@@ -571,15 +571,15 @@ class TestRecategorizeTransactionTool:
             parent="Expenses",
         )
 
-        # Find a transaction to recategorize
+        # Find a transaction to replace splits on
         transactions = json.loads(server_module.list_transactions())
         grocery_txn = next(
             t for t in transactions if "Groceries" in t["description"]
         )
         guid = grocery_txn["guid"]
 
-        # Recategorize
-        result = server_module.recategorize_transaction(
+        # Replace splits
+        result = server_module.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Dining", "amount": "150.00"},
@@ -588,12 +588,12 @@ class TestRecategorizeTransactionTool:
         )
 
         data = json.loads(result)
-        assert data["status"] == "recategorized"
+        assert data["status"] == "splits_replaced"
         accounts = {s["account"] for s in data["splits"]}
         assert "Expenses:Dining" in accounts
         assert "Expenses:Groceries" not in accounts
 
-    def test_recategorize_returns_previous_splits(self, setup_book_env):
+    def test_replace_splits_returns_previous_splits(self, setup_book_env):
         """Should include previous_splits for audit trail."""
         transactions = json.loads(server_module.list_transactions())
         grocery_txn = next(
@@ -601,7 +601,7 @@ class TestRecategorizeTransactionTool:
         )
         guid = grocery_txn["guid"]
 
-        result = server_module.recategorize_transaction(
+        result = server_module.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Groceries", "amount": "150.00"},
@@ -613,12 +613,12 @@ class TestRecategorizeTransactionTool:
         assert "previous_splits" in data
         assert len(data["previous_splits"]) == 2
 
-    def test_recategorize_unbalanced_error(self, setup_book_env):
+    def test_replace_splits_unbalanced_error(self, setup_book_env):
         """Should return error for unbalanced splits."""
         transactions = json.loads(server_module.list_transactions())
         guid = transactions[0]["guid"]
 
-        result = server_module.recategorize_transaction(
+        result = server_module.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses:Groceries", "amount": "150.00"},
@@ -630,12 +630,12 @@ class TestRecategorizeTransactionTool:
         assert "error" in data
         assert "balance" in data["error"].lower()
 
-    def test_recategorize_placeholder_error(self, setup_book_env):
+    def test_replace_splits_placeholder_error(self, setup_book_env):
         """Should return error for placeholder account."""
         transactions = json.loads(server_module.list_transactions())
         guid = transactions[0]["guid"]
 
-        result = server_module.recategorize_transaction(
+        result = server_module.replace_splits(
             guid=guid,
             splits=[
                 {"account": "Expenses", "amount": "150.00"},
