@@ -559,6 +559,95 @@ class TestUpdateTransactionTool:
         assert data["status"] == "updated"
 
 
+class TestRecategorizeTransactionTool:
+    """Tests for recategorize_transaction tool."""
+
+    def test_recategorize_basic(self, setup_book_env):
+        """Should recategorize a transaction to different accounts."""
+        # Create a Dining account first
+        server_module.create_account(
+            name="Dining",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+
+        # Find a transaction to recategorize
+        transactions = json.loads(server_module.list_transactions())
+        grocery_txn = next(
+            t for t in transactions if "Groceries" in t["description"]
+        )
+        guid = grocery_txn["guid"]
+
+        # Recategorize
+        result = server_module.recategorize_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Dining", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert data["status"] == "recategorized"
+        accounts = {s["account"] for s in data["splits"]}
+        assert "Expenses:Dining" in accounts
+        assert "Expenses:Groceries" not in accounts
+
+    def test_recategorize_returns_previous_splits(self, setup_book_env):
+        """Should include previous_splits for audit trail."""
+        transactions = json.loads(server_module.list_transactions())
+        grocery_txn = next(
+            t for t in transactions if "Groceries" in t["description"]
+        )
+        guid = grocery_txn["guid"]
+
+        result = server_module.recategorize_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "previous_splits" in data
+        assert len(data["previous_splits"]) == 2
+
+    def test_recategorize_unbalanced_error(self, setup_book_env):
+        """Should return error for unbalanced splits."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.recategorize_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "balance" in data["error"].lower()
+
+    def test_recategorize_placeholder_error(self, setup_book_env):
+        """Should return error for placeholder account."""
+        transactions = json.loads(server_module.list_transactions())
+        guid = transactions[0]["guid"]
+
+        result = server_module.recategorize_transaction(
+            guid=guid,
+            splits=[
+                {"account": "Expenses", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+        )
+
+        data = json.loads(result)
+        assert "error" in data
+        assert "placeholder" in data["error"].lower()
+
+
 class TestSetReconcileStateTool:
     """Tests for set_reconcile_state tool."""
 

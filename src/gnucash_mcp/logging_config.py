@@ -403,6 +403,28 @@ def _format_audit_entry_text(entry: dict) -> str:
                 if before.get("splits"):
                     lines.append(_format_splits_text(before["splits"], indent + "  "))
 
+        elif operation == "RECATEGORIZE":
+            lines.append(f"{time_part}  RECATEGORIZE TRANSACTION  guid:{guid_short}")
+            if after:
+                desc = after.get("description", "")
+                date_str = after.get("date", "")
+                lines.append(f'{indent}"{desc}" ({date_str})')
+                # Show before splits (from previous_splits in the response)
+                prev_splits = after.get("previous_splits", [])
+                if prev_splits:
+                    lines.append(f"{indent}Splits (before):")
+                    lines.append(_format_splits_text(prev_splits, indent + "  "))
+                # Show after splits
+                new_splits = after.get("splits", [])
+                if new_splits:
+                    lines.append(f"{indent}Splits (after):")
+                    lines.append(_format_splits_text(new_splits, indent + "  "))
+                # Show warnings if any
+                warnings = after.get("warnings", [])
+                if warnings:
+                    for w in warnings:
+                        lines.append(f"{indent}Warning: {w}")
+
     elif entity_type == "account":
         if operation == "CREATE":
             lines.append(f"{time_part}  CREATE ACCOUNT")

@@ -266,6 +266,45 @@ class TestTextFormat:
         assert "test_read" not in content
         assert "balance" not in content
 
+    def test_text_format_logs_recategorize_with_splits(self, temp_book_path, temp_log_dir):
+        """Verify text format logs recategorize with before and after splits."""
+        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+
+        @audit_log(classification="write", operation="recategorize", entity_type="transaction")
+        def test_recategorize(guid: str, splits: list) -> str:
+            return json.dumps({
+                "guid": guid,
+                "description": "Test Transaction",
+                "date": "2026-02-14",
+                "splits": [
+                    {"account": "Expenses:Dining", "value": "50.00"},
+                    {"account": "Assets:Checking", "value": "-50.00"},
+                ],
+                "previous_splits": [
+                    {"account": "Expenses:Groceries", "value": "50.00"},
+                    {"account": "Assets:Checking", "value": "-50.00"},
+                ],
+                "status": "recategorized",
+            })
+
+        test_recategorize(
+            guid="abc12345",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        )
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        assert "RECATEGORIZE TRANSACTION" in content
+        assert "Splits (before):" in content
+        assert "Splits (after):" in content
+        assert "Groceries" in content  # Old split (formatted as leaf name)
+        assert "Dining" in content  # New split (formatted as leaf name)
+
 
 class TestAuditLogIntegration:
     """Integration tests for the complete audit trail."""
