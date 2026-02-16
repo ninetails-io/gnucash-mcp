@@ -118,10 +118,11 @@ Ask Claude:
 
 ## What can it do?
 
-**51 tools** across eleven categories:
+**52 tools** across twelve categories:
 
 | Category | What you can ask |
 |----------|------------------|
+| **Overview** | "Summarize the book", "What's the financial picture?", "Orient me" |
 | **Accounts** | "List my accounts", "What's my checking balance?", "Create a new expense category for subscriptions" |
 | **Transactions** | "Show recent transactions", "Record a $50 grocery purchase", "Find all Amazon transactions" |
 | **Budgets** | "Create a monthly budget", "Set grocery budget to $500", "How am I doing on my budget?" |
@@ -292,13 +293,14 @@ Example audit entry:
 
 ---
 
-## All 51 Tools
+## All 52 Tools
 
 <details>
 <summary>Click to expand full tool list</summary>
 
 | Category | Tools |
 |----------|-------|
+| Overview | `get_book_summary` |
 | Accounts | `list_accounts`, `get_account`, `get_balance`, `create_account`, `update_account`, `move_account`, `delete_account` |
 | Commodities & Prices | `list_commodities`, `create_commodity`, `create_price`, `get_prices`, `get_latest_price` |
 | Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `replace_splits`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` |

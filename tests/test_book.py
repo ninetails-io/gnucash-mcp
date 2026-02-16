@@ -40,6 +40,45 @@ class TestGnuCashBookOpen:
             assert book is not None
 
 
+class TestGetBookSummary:
+    """Tests for get_book_summary method."""
+
+    def test_get_book_summary_returns_string(self, test_book: Path):
+        """Should return a formatted text string."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_get_book_summary_contains_sections(self, test_book: Path):
+        """Should contain all expected sections."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+
+        assert "Book:" in result
+        assert "Currency:" in result
+        assert "Accounts:" in result
+        assert "Assets:" in result
+        assert "Liabilities:" in result
+        assert "Income:" in result
+        assert "Expenses:" in result
+        assert "Transactions:" in result
+        assert "Commodities:" in result
+        assert "Net worth:" in result
+
+    def test_get_book_summary_currency(self, test_book: Path):
+        """Should show USD as default currency."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert "Currency: USD" in result
+
+    def test_get_book_summary_book_path(self, test_book: Path):
+        """Should include the book file path."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert f"Book: {test_book}" in result
+
+
 class TestListAccounts:
     """Tests for list_accounts method."""
 

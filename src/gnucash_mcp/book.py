@@ -1062,6 +1062,171 @@ class GnuCashBook:
                 "source": latest.source,
             }
 
+    def get_book_summary(self) -> str:
+        """Return a compact text summary of the entire book.
+
+        Provides instant orientation: account structure, transaction volume,
+        key balances, commodities, and scheduled transactions — all in one call.
+
+        Returns:
+            Pre-formatted text summary string.
+        """
+        from piecash.core.transaction import ScheduledTransaction
+
+        with self.open(readonly=True) as book:
+            currency = book.default_currency.mnemonic
+
+            # --- Identify template accounts (scheduled transaction placeholders) ---
+            template_guids = set()
+            rt = book.root_template
+            if rt:
+                template_guids.add(rt.guid)
+                for child in rt.children:
+                    template_guids.add(child.guid)
+
+            # --- Collect parent GUIDs (placeholder containers) ---
+            parent_guids = set()
+            for account in book.accounts:
+                if account.parent and account.parent.type != "ROOT":
+                    parent_guids.add(account.parent.guid)
+
+            # --- Account stats ---
+            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
+
+            # Assets: (leaf_name, balance) for non-placeholder leaf accounts
+            asset_leaves: list[tuple[str, Decimal]] = []
+            # Liabilities: (leaf_name, positive_balance) grouped by category
+            credit_cards: list[tuple[str, Decimal]] = []
+            loan_accts: list[tuple[str, Decimal]] = []
+            other_liab_accts: list[tuple[str, Decimal]] = []
+
+            income_active = 0
+            income_total = 0
+            expense_active = 0
+            expense_total = 0
+            total_accounts = 0
+
+            for account in book.accounts:
+                if account.type == "ROOT":
+                    continue
+                if account.guid in template_guids:
+                    continue
+                total_accounts += 1
+
+                has_activity = len(account.splits) > 0
+                is_leaf = account.guid not in parent_guids
+
+                # Calculate balance
+                balance = Decimal("0")
+                for split in account.splits:
+                    balance += split.quantity
+
+                leaf = account.fullname.split(":")[-1]
+
+                if account.type in asset_types:
+                    if is_leaf and balance != 0:
+                        asset_leaves.append((leaf, balance))
+                elif account.type == "CREDIT":
+                    if is_leaf:
+                        credit_cards.append((leaf, -balance))
+                elif account.type == "LIABILITY":
+                    if is_leaf:
+                        neg_balance = -balance
+                        if "loan" in account.fullname.lower():
+                            loan_accts.append((leaf, neg_balance))
+                        else:
+                            other_liab_accts.append((leaf, neg_balance))
+                elif account.type == "INCOME":
+                    income_total += 1
+                    if has_activity:
+                        income_active += 1
+                elif account.type == "EXPENSE":
+                    expense_total += 1
+                    if has_activity:
+                        expense_active += 1
+
+            # Compute totals from leaf accounts
+            def _r2(v: Decimal) -> Decimal:
+                return v.quantize(Decimal("0.01"))
+
+            assets_total = _r2(sum(b for _, b in asset_leaves) if asset_leaves else Decimal(0))
+            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
+            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
+            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
+            liabilities_total = _r2(credit_total + loan_total + other_liab_total)
+            net_worth = _r2(assets_total - liabilities_total)
+
+            # All liability leaves sorted by balance descending for top-N
+            all_liab_leaves = credit_cards + loan_accts + other_liab_accts
+            all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
+
+            # --- Transaction stats ---
+            transactions = list(book.transactions)
+            total_txns = len(transactions)
+            unreconciled_txns = 0
+            first_date = None
+            last_date = None
+
+            for txn in transactions:
+                d = txn.post_date
+                if first_date is None or d < first_date:
+                    first_date = d
+                if last_date is None or d > last_date:
+                    last_date = d
+                if any(s.reconcile_state != "y" for s in txn.splits):
+                    unreconciled_txns += 1
+
+            # --- Scheduled transactions ---
+            all_sx = book.session.query(ScheduledTransaction).all()
+            enabled_sx = sum(1 for sx in all_sx if sx.enabled)
+
+            # --- Commodities ---
+            commodity_mnemonics = sorted(set(
+                c.mnemonic for c in book.commodities
+            ))
+
+            # --- Build output ---
+            lines = []
+            lines.append(f"Book: {self.book_path}")
+            lines.append(f"Currency: {currency}")
+
+            if first_date and last_date:
+                lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
+
+            lines.append(f"Accounts: {total_accounts} total")
+
+            # Assets section — leaf accounts with balances
+            lines.append(f"Assets: {len(asset_leaves)} accounts, {currency} {assets_total}")
+            for name, bal in sorted(asset_leaves, key=lambda x: x[1], reverse=True):
+                lines.append(f"  {name}: {currency} {_r2(bal)}")
+
+            # Liabilities section — grouped subtotals + top 3
+            liab_count = len(credit_cards) + len(loan_accts) + len(other_liab_accts)
+            lines.append(f"Liabilities: {liab_count} accounts, {currency} {liabilities_total}")
+            if credit_cards:
+                lines.append(f"  Credit cards ({len(credit_cards)}): {currency} {credit_total}")
+            if loan_accts:
+                lines.append(f"  Loans ({len(loan_accts)}): {currency} {loan_total}")
+            if other_liab_accts:
+                lines.append(f"  Other ({len(other_liab_accts)}): {currency} {other_liab_total}")
+            if len(all_liab_leaves) > 1:
+                top_n = all_liab_leaves[:3]
+                top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
+                lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
+
+            lines.append(f"Income: {income_active} active ({income_total} total)")
+            lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
+
+            lines.append(f"Transactions: {total_txns} ({unreconciled_txns} unreconciled)")
+
+            if enabled_sx > 0:
+                lines.append(f"Scheduled: {enabled_sx} recurring")
+
+            lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
+            lines.append(f"Net worth: {currency} {net_worth}")
+
+            return "\n".join(lines)
+
     def list_accounts(
         self,
         root: str | None = None,

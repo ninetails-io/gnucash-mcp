@@ -127,6 +127,20 @@ def safe_tool(func: Callable) -> Callable:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
+def get_book_summary() -> str:
+    """Get a compact overview of the entire GnuCash book.
+
+    Returns book path, currency, account structure, transaction counts,
+    key balances, net worth, commodities, and scheduled transactions
+    in a single text response. Use this first to orient yourself.
+    """
+    book = get_book()
+    return book.get_book_summary()
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
 def list_accounts(
     root: str | None = None,
     verbose: bool = False,

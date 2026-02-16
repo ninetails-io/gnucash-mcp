@@ -20,6 +20,19 @@ def setup_book_env(test_book: Path, monkeypatch):
     server_module._book = None
 
 
+class TestGetBookSummaryTool:
+    """Tests for get_book_summary tool."""
+
+    def test_get_book_summary(self, setup_book_env):
+        """Should return a text summary string."""
+        result = server_module.get_book_summary()
+        assert isinstance(result, str)
+        assert "Book:" in result
+        assert "Currency: USD" in result
+        assert "Accounts:" in result
+        assert "Net worth:" in result
+
+
 class TestListAccountsTool:
     """Tests for list_accounts tool."""
 
