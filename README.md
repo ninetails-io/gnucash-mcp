@@ -349,6 +349,8 @@ gnucash-mcp/
 - [x] Scheduled transactions
 - [x] Audit logging
 - [x] Split recategorization (`replace_splits`)
+- [x] Compact output for reduced token usage
+- [x] Partial GUID support (8+ character prefixes)
 - [ ] CSV export
 - [ ] CSV/OFX import
 - [ ] Duplicate detection
