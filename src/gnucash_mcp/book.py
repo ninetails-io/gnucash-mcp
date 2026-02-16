@@ -128,6 +128,58 @@ class GnuCashBook:
         if not self.book_path.exists():
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
 
+    # Tables that support GUID resolution
+    _GUID_TABLES = frozenset({
+        "transactions", "splits", "accounts", "lots",
+        "schedxactions", "commodities", "budgets",
+    })
+
+    def _resolve_guid(self, table: str, partial: str) -> str:
+        """Resolve a partial GUID prefix to a full 32-character GUID.
+
+        Uses raw SQLite in read-only mode — no piecash session needed.
+
+        Args:
+            table: Database table name (e.g., "transactions", "splits").
+            partial: Full or partial GUID prefix (minimum 8 characters).
+
+        Returns:
+            Full 32-character GUID.
+
+        Raises:
+            ValueError: If table is not in the allowed set.
+            ValueError: If partial is too short (< 8 chars).
+            ValueError: If no match found.
+            ValueError: If multiple matches found (ambiguous).
+        """
+        if table not in self._GUID_TABLES:
+            raise ValueError(f"Invalid table: {table}")
+        if len(partial) < 8:
+            raise ValueError(f"GUID prefix too short (minimum 8 chars): {partial}")
+
+        # Fast path: already a full GUID
+        if len(partial) == 32:
+            return partial
+
+        conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                f"SELECT guid FROM {table} WHERE guid LIKE ?",
+                (partial + "%",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if len(rows) == 0:
+            raise ValueError(f"No {table[:-1]} found matching GUID prefix: {partial}")
+        if len(rows) > 1:
+            matches = [r[0] for r in rows]
+            raise ValueError(
+                f"Ambiguous GUID prefix '{partial}' matches {len(rows)} {table}: "
+                f"{', '.join(m[:12] + '...' for m in matches)}"
+            )
+        return rows[0][0]
+
     @contextmanager
     def open(
         self, readonly: bool = True, max_retries: int = 3, retry_delay: float = 0.5
@@ -198,17 +250,26 @@ class GnuCashBook:
     def _find_transaction(
         self, book: piecash.Book, guid: str
     ) -> piecash.Transaction | None:
-        """Find a transaction by GUID.
+        """Find a transaction by GUID or partial GUID prefix.
 
         Args:
             book: Open piecash book.
-            guid: Transaction GUID (32-character hex string).
+            guid: Transaction GUID (full 32-char or 8+ char prefix).
 
         Returns:
             Transaction if found, None otherwise.
+
+        Raises:
+            ValueError: If partial GUID is ambiguous (matches multiple).
         """
+        try:
+            full_guid = self._resolve_guid("transactions", guid)
+        except ValueError as e:
+            if "No transaction" in str(e):
+                return None
+            raise
         for transaction in book.transactions:
-            if transaction.guid == guid:
+            if transaction.guid == full_guid:
                 return transaction
         return None
 
@@ -2290,18 +2351,27 @@ class GnuCashBook:
             return result
 
     def _find_split(self, book: piecash.Book, guid: str) -> piecash.Split | None:
-        """Find a split by GUID.
+        """Find a split by GUID or partial GUID prefix.
 
         Args:
             book: Open piecash book.
-            guid: Split GUID.
+            guid: Split GUID (full 32-char or 8+ char prefix).
 
         Returns:
             Split if found, None otherwise.
+
+        Raises:
+            ValueError: If partial GUID is ambiguous (matches multiple).
         """
+        try:
+            full_guid = self._resolve_guid("splits", guid)
+        except ValueError as e:
+            if "No split" in str(e):
+                return None
+            raise
         for transaction in book.transactions:
             for split in transaction.splits:
-                if split.guid == guid:
+                if split.guid == full_guid:
                     return split
         return None
 
