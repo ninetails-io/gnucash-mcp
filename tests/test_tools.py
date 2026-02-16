@@ -20,6 +20,19 @@ def setup_book_env(test_book: Path, monkeypatch):
     server_module._book = None
 
 
+class TestGetBookSummaryTool:
+    """Tests for get_book_summary tool."""
+
+    def test_get_book_summary(self, setup_book_env):
+        """Should return a text summary string."""
+        result = server_module.get_book_summary()
+        assert isinstance(result, str)
+        assert "Book:" in result
+        assert "Currency: USD" in result
+        assert "Accounts:" in result
+        assert "Net worth:" in result
+
+
 class TestListAccountsTool:
     """Tests for list_accounts tool."""
 
@@ -104,7 +117,7 @@ class TestListTransactionsTool:
 
     def test_list_all_transactions(self, setup_book_env):
         """Should return all transactions."""
-        result = server_module.list_transactions()
+        result = server_module.list_transactions(verbose=True)
 
         data = json.loads(result)
         assert isinstance(data, list)
@@ -112,7 +125,7 @@ class TestListTransactionsTool:
 
     def test_list_transactions_by_account(self, setup_book_env):
         """Should filter by account."""
-        result = server_module.list_transactions(account="Expenses:Groceries")
+        result = server_module.list_transactions(account="Expenses:Groceries", verbose=True)
 
         data = json.loads(result)
         assert len(data) == 1
@@ -121,7 +134,7 @@ class TestListTransactionsTool:
     def test_list_transactions_date_range(self, setup_book_env):
         """Should filter by date range."""
         result = server_module.list_transactions(
-            start_date="2024-01-10", end_date="2024-01-18"
+            start_date="2024-01-10", end_date="2024-01-18", verbose=True
         )
 
         data = json.loads(result)
@@ -254,7 +267,7 @@ class TestSearchTransactionsTool:
 
     def test_search_by_description(self, setup_book_env):
         """Should find transactions by description."""
-        result = server_module.search_transactions("Salary")
+        result = server_module.search_transactions("Salary", verbose=True)
 
         data = json.loads(result)
         assert len(data) == 1
@@ -262,7 +275,7 @@ class TestSearchTransactionsTool:
 
     def test_search_by_amount(self, setup_book_env):
         """Should find transactions by amount range."""
-        result = server_module.search_transactions(">500", field="amount")
+        result = server_module.search_transactions(">500", field="amount", verbose=True)
 
         data = json.loads(result)
         assert len(data) == 2  # Opening Balance (1000) and Salary (2000)
@@ -387,7 +400,7 @@ class TestDeleteTransactionTool:
     def test_delete_transaction(self, setup_book_env):
         """Should delete a transaction and return result."""
         # First get a transaction to delete
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.delete_transaction(guid)
@@ -402,7 +415,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_reconciled_rejected(self, setup_book_env):
         """Should reject deleting a transaction with reconciled splits."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         split_guid = transactions[0]["splits"][0]["guid"]
         server_module.set_reconcile_state(split_guid, "y")
         guid = transactions[0]["guid"]
@@ -415,7 +428,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_reconciled_force(self, setup_book_env):
         """Should allow deleting reconciled transaction with force=True."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         split_guid = transactions[0]["splits"][0]["guid"]
         server_module.set_reconcile_state(split_guid, "y")
         guid = transactions[0]["guid"]
@@ -440,7 +453,7 @@ class TestUpdateTransactionTool:
 
     def test_update_description(self, setup_book_env):
         """Should update transaction description."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -454,7 +467,7 @@ class TestUpdateTransactionTool:
 
     def test_update_date(self, setup_book_env):
         """Should update transaction date."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -469,7 +482,7 @@ class TestUpdateTransactionTool:
     def test_update_splits(self, setup_book_env):
         """Should update transaction split amounts."""
         # Find the groceries transaction which has known accounts
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -499,7 +512,7 @@ class TestUpdateTransactionTool:
 
     def test_update_unbalanced_splits(self, setup_book_env):
         """Should return error for unbalanced splits."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -516,7 +529,7 @@ class TestUpdateTransactionTool:
 
     def test_update_reconciled_splits_rejected(self, setup_book_env):
         """Should reject updating splits on a reconciled transaction."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -538,7 +551,7 @@ class TestUpdateTransactionTool:
 
     def test_update_reconciled_force(self, setup_book_env):
         """Should allow updating reconciled splits with force=True."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -572,7 +585,7 @@ class TestReplaceSplitsTool:
         )
 
         # Find a transaction to replace splits on
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         grocery_txn = next(
             t for t in transactions if "Groceries" in t["description"]
         )
@@ -595,7 +608,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_returns_previous_splits(self, setup_book_env):
         """Should include previous_splits for audit trail."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         grocery_txn = next(
             t for t in transactions if "Groceries" in t["description"]
         )
@@ -615,7 +628,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_unbalanced_error(self, setup_book_env):
         """Should return error for unbalanced splits."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.replace_splits(
@@ -632,7 +645,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_placeholder_error(self, setup_book_env):
         """Should return error for placeholder account."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.replace_splits(
@@ -653,7 +666,7 @@ class TestSetReconcileStateTool:
 
     def test_set_reconcile_state(self, setup_book_env):
         """Should set reconcile state on a split."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = server_module.set_reconcile_state(split_guid, "c")
@@ -664,7 +677,7 @@ class TestSetReconcileStateTool:
 
     def test_set_reconcile_state_invalid(self, setup_book_env):
         """Should return error for invalid state."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = server_module.set_reconcile_state(split_guid, "x")
@@ -678,7 +691,7 @@ class TestGetUnreconciledSplitsTool:
 
     def test_get_unreconciled_splits(self, setup_book_env):
         """Should return unreconciled splits for account."""
-        result = server_module.get_unreconciled_splits("Assets:Checking")
+        result = server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
 
         data = json.loads(result)
         assert "splits" in data
@@ -702,7 +715,7 @@ class TestReconcileAccountTool:
 
         # Get unreconciled splits
         unreconciled = json.loads(
-            server_module.get_unreconciled_splits("Assets:Checking")
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
         )
 
         # Calculate expected balance
@@ -725,7 +738,7 @@ class TestReconcileAccountTool:
     def test_reconcile_account_balance_mismatch(self, setup_book_env):
         """Should return error when balance doesn't match."""
         unreconciled = json.loads(
-            server_module.get_unreconciled_splits("Assets:Checking")
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
         )
         guids = [s["guid"] for s in unreconciled["splits"]]
 
@@ -746,7 +759,7 @@ class TestVoidTransactionTool:
 
     def test_void_transaction(self, setup_book_env):
         """Should void a transaction."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.void_transaction(guid, "Test void reason")
@@ -757,7 +770,7 @@ class TestVoidTransactionTool:
 
     def test_void_transaction_no_reason(self, setup_book_env):
         """Should return error if no reason provided."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.void_transaction(guid, "")
@@ -771,7 +784,7 @@ class TestUnvoidTransactionTool:
 
     def test_unvoid_transaction(self, setup_book_env):
         """Should restore a voided transaction."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         # Void first
@@ -785,7 +798,7 @@ class TestUnvoidTransactionTool:
 
     def test_unvoid_not_voided(self, setup_book_env):
         """Should return error if transaction not voided."""
-        transactions = json.loads(server_module.list_transactions())
+        transactions = json.loads(server_module.list_transactions(verbose=True))
         guid = transactions[0]["guid"]
 
         result = server_module.unvoid_transaction(guid)
@@ -973,7 +986,7 @@ class TestListCommoditiesTool:
 
     def test_list_commodities(self, setup_book_env):
         """Should return commodities grouped by namespace."""
-        result = server_module.list_commodities()
+        result = server_module.list_commodities(verbose=True)
 
         data = json.loads(result)
         assert "default_currency" in data
@@ -983,7 +996,7 @@ class TestListCommoditiesTool:
 
     def test_list_commodities_includes_usd(self, setup_book_env):
         """Should include USD in currency commodities."""
-        result = server_module.list_commodities()
+        result = server_module.list_commodities(verbose=True)
 
         data = json.loads(result)
         mnemonics = [c["mnemonic"] for c in data["commodities"]["CURRENCY"]]

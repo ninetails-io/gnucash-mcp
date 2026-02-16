@@ -90,14 +90,14 @@ class TestCreateLot:
 class TestListLots:
     def test_list_lots_empty(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
-        result = book.list_lots(account="Assets:Investments:VTSAX")
+        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
         assert result == []
 
     def test_list_lots_with_lots(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
         book.create_lot(account="Assets:Investments:VTSAX", title="Lot A")
         book.create_lot(account="Assets:Investments:VTSAX", title="Lot B")
-        result = book.list_lots(account="Assets:Investments:VTSAX")
+        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
         assert len(result) == 2
         titles = {r["title"] for r in result}
         assert titles == {"Lot A", "Lot B"}
@@ -109,12 +109,12 @@ class TestListLots:
         book.close_lot(guid=lot_b["guid"])
 
         # Default: exclude closed
-        result = book.list_lots(account="Assets:Investments:VTSAX")
+        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
         assert len(result) == 1
         assert result[0]["title"] == "Open Lot"
 
         # Include closed
-        result = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True)
+        result = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True, compact=False)
         assert len(result) == 2
 
 
@@ -330,11 +330,11 @@ class TestFullLotWorkflow:
         assert len(lot_detail["splits"]) == 2
 
         # Verify excluded from default list
-        lots = book.list_lots(account="Assets:Investments:VTSAX")
+        lots = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
         assert len(lots) == 0
 
         # Verify included when include_closed=True
-        lots = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True)
+        lots = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True, compact=False)
         assert len(lots) == 1
         assert lots[0]["is_closed"] is True
 
@@ -373,7 +373,7 @@ class TestSplitToDictLotGuid:
         txn_desc = lot_detail["splits"][0]["description"]
 
         # Search for the transaction
-        txns = book.search_transactions(query=txn_desc, field="description")
+        txns = book.search_transactions(query=txn_desc, field="description", compact=False)
         assert len(txns) > 0
         txn = book.get_transaction(txns[0]["guid"])
 

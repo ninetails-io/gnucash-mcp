@@ -85,6 +85,11 @@ def _account_to_compact_line(account: piecash.Account) -> str:
 
 def _split_to_dict(split: piecash.Split) -> dict:
     """Convert a piecash Split to a serializable dict."""
+    # Treat epoch zero (1970-01-01) as null — GnuCash stores this
+    # as the default for unreconciled splits instead of NULL
+    rec_date = split.reconcile_date
+    if rec_date and rec_date.year <= 1970:
+        rec_date = None
     return {
         "guid": split.guid,
         "account": split.account.fullname,
@@ -92,7 +97,7 @@ def _split_to_dict(split: piecash.Split) -> dict:
         "quantity": str(split.quantity),
         "memo": split.memo or "",
         "reconcile_state": split.reconcile_state,
-        "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date else None,
+        "reconcile_date": rec_date.isoformat() if rec_date else None,
         "lot_guid": split.lot.guid if split.lot else None,
     }
 
@@ -109,6 +114,148 @@ def _transaction_to_dict(transaction: piecash.Transaction) -> dict:
     if transaction.notes:
         result["notes"] = transaction.notes
     return result
+
+
+def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
+    """Convert a commodity dict to a compact one-line tab-separated string.
+
+    Format: "NAMESPACE:MNEMONIC\\tfullname\\tprice_info"
+
+    Examples:
+        "CURRENCY:USD\\tUS Dollar"
+        "FUND:VTSAX\\tVanguard Total Stock Market\\t128.75 USD (2026-02-07)"
+    """
+    prefix = f"{namespace}:{entry['mnemonic']}"
+    name = entry.get("fullname", "")
+    parts = [prefix, name]
+    lp = entry.get("latest_price")
+    if lp:
+        parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
+    return "\t".join(parts)
+
+
+def _unreconciled_split_to_compact_line(split_dict: dict) -> str:
+    """Convert an unreconciled split dict to a compact one-line tab-separated string.
+
+    Format: "short_guid\\tYYYY-MM-DD\\tdescription\\tamount\\tstate"
+
+    The account name is omitted — the caller already knows which account
+    was queried. State is 'n' (new) or 'c' (cleared).
+
+    Examples:
+        "a1b2c3d4\\t2026-01-15\\tSafeway\\t-47.50\\tn"
+        "e5f6a7b8\\t2026-01-20\\tPayroll\\t3200.00\\tc"
+    """
+    short_guid = split_dict["guid"][:8]
+    d = split_dict["date"]
+    desc = split_dict["description"]
+    amount = split_dict["amount"]
+    state = split_dict["reconcile_state"]
+    return f"{short_guid}\t{d}\t{desc}\t{amount}\t{state}"
+
+
+def _transaction_to_compact_line(
+    transaction: piecash.Transaction, exclude_account: str | None = None,
+) -> str:
+    """Convert a piecash Transaction to a compact one-line tab-separated string.
+
+    Format: "YYYY-MM-DD\\tabcd1234\\tDescription\\tAccount amount, Account amount"
+
+    Fields are tab-separated so descriptions can be any length without
+    truncation — important for matching. Tabs are single-token for LLMs
+    and never appear in transaction descriptions.
+
+    Args:
+        transaction: piecash Transaction object.
+        exclude_account: If set, omit the split for this account (used when
+                        listing transactions filtered by account — the AI
+                        already knows the filtered account).
+
+    Examples:
+        "2026-02-15\\ta1b2c3d4\\tSafeway\\tExpenses:Groceries 47.50, Liabilities:Visa -47.50"
+        "2026-02-14\\te5f6a7b8\\tMonthly Rent\\tExpenses:Rent 1850.00, Assets:Checking -1850.00"
+    """
+    date_str = transaction.post_date.isoformat()
+    short_guid = transaction.guid[:8]
+    desc = transaction.description
+
+    parts = []
+    for split in transaction.splits:
+        account_name = split.account.fullname
+        if exclude_account and account_name == exclude_account:
+            continue
+        amount = split.quantity
+        # For multi-currency, show both quantity and value
+        if split.quantity != split.value:
+            currency = transaction.currency.mnemonic
+            commodity = split.account.commodity.mnemonic
+            parts.append(f"{account_name} {amount} {commodity} (={split.value} {currency})")
+        else:
+            parts.append(f"{account_name} {amount}")
+
+    splits_str = ", ".join(parts)
+    line = f"{date_str}\t{short_guid}\t{desc}\t{splits_str}"
+    if transaction.notes:
+        line += f"\t{transaction.notes}"
+    return line
+
+
+def _lot_to_compact_line(lot_dict: dict) -> str:
+    """Convert a lot dict to a compact one-line tab-separated string.
+
+    Format: "short_guid\\ttitle\\tquantity shares\\tcost_basis basis\\tclosed"
+
+    Examples:
+        "a1b2c3d4\\tVTSAX 2026-01-15 purchase\\t10.0000 shares\\t2504.50 basis"
+        "e5f6a7b8\\tAAPL 2025-06-01 purchase\\t0 shares\\t0 basis\\tCLOSED"
+    """
+    short_guid = lot_dict["guid"][:8]
+    title = lot_dict["title"]
+    qty = lot_dict["quantity"]
+    basis = lot_dict["cost_basis"]
+    parts = [short_guid, title, f"{qty} shares", f"{basis} basis"]
+    if lot_dict.get("is_closed"):
+        parts.append("CLOSED")
+    return "\t".join(parts)
+
+
+def _sx_to_compact_line(sx_dict: dict) -> str:
+    """Convert a scheduled transaction dict to a compact one-line tab-separated string.
+
+    Format: "short_guid\\tname\\tfrequency\\tnext:YYYY-MM-DD"
+
+    Examples:
+        "a1b2c3d4\\tMonthly Rent\\tmonthly\\tnext:2026-03-01"
+        "e5f6a7b8\\tWeekly Groceries\\tweekly\\tnext:2026-02-22"
+        "c9d0e1f2\\tOld Subscription\\tmonthly\\tdisabled"
+    """
+    short_guid = sx_dict["guid"][:8]
+    name = sx_dict["name"]
+    freq = sx_dict["frequency"]
+    if not sx_dict.get("enabled"):
+        status = "disabled"
+    elif sx_dict.get("next_occurrence"):
+        status = f"next:{sx_dict['next_occurrence']}"
+    else:
+        status = "no upcoming"
+    return f"{short_guid}\t{name}\t{freq}\t{status}"
+
+
+def _upcoming_to_compact_line(entry: dict) -> str:
+    """Convert an upcoming transaction dict to a compact one-line tab-separated string.
+
+    Format: "short_guid\\tname\\tYYYY-MM-DD\\tN days\\tamount"
+
+    Examples:
+        "a390ebb7\\tComcast Xfinity\\t2026-02-27\\t12 days\\t149.26"
+        "b1c2d3e4\\tMonthly Rent\\t2026-03-01\\t14 days\\t1850.00"
+    """
+    short_guid = entry["guid"][:8]
+    name = entry["name"]
+    occ_date = entry["occurrence_date"]
+    days = entry["days_until"]
+    amount = entry["amount"]
+    return f"{short_guid}\t{name}\t{occ_date}\t{days} days\t{amount}"
 
 
 class GnuCashBook:
@@ -613,12 +760,16 @@ class GnuCashBook:
             return json.loads(row[0])
         return []
 
-    def list_commodities(self) -> dict:
+    def list_commodities(self, compact: bool = True) -> dict | str:
         """List all commodities in the book with latest prices.
 
+        Args:
+            compact: If True (default), return compact one-line-per-commodity
+                     string. If False, return full dict grouped by namespace.
+
         Returns:
-            Dict with commodities grouped by namespace, plus the default currency.
-            Non-currency commodities include their latest price when available.
+            If compact: newline-separated string of commodity lines.
+            If not compact: dict with commodities grouped by namespace.
         """
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
@@ -658,10 +809,19 @@ class GnuCashBook:
             for ns in by_namespace:
                 by_namespace[ns].sort(key=lambda c: c["mnemonic"])
 
-            return {
+            result = {
                 "default_currency": book.default_currency.mnemonic,
                 "commodities": by_namespace,
             }
+
+            if compact:
+                lines = []
+                for ns, entries in sorted(by_namespace.items()):
+                    for entry in entries:
+                        lines.append(_commodity_to_compact_line(ns, entry))
+                return "\n".join(lines)
+            else:
+                return result
 
     def create_commodity(
         self,
@@ -902,6 +1062,171 @@ class GnuCashBook:
                 "source": latest.source,
             }
 
+    def get_book_summary(self) -> str:
+        """Return a compact text summary of the entire book.
+
+        Provides instant orientation: account structure, transaction volume,
+        key balances, commodities, and scheduled transactions — all in one call.
+
+        Returns:
+            Pre-formatted text summary string.
+        """
+        from piecash.core.transaction import ScheduledTransaction
+
+        with self.open(readonly=True) as book:
+            currency = book.default_currency.mnemonic
+
+            # --- Identify template accounts (scheduled transaction placeholders) ---
+            template_guids = set()
+            rt = book.root_template
+            if rt:
+                template_guids.add(rt.guid)
+                for child in rt.children:
+                    template_guids.add(child.guid)
+
+            # --- Collect parent GUIDs (placeholder containers) ---
+            parent_guids = set()
+            for account in book.accounts:
+                if account.parent and account.parent.type != "ROOT":
+                    parent_guids.add(account.parent.guid)
+
+            # --- Account stats ---
+            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
+
+            # Assets: (leaf_name, balance) for non-placeholder leaf accounts
+            asset_leaves: list[tuple[str, Decimal]] = []
+            # Liabilities: (leaf_name, positive_balance) grouped by category
+            credit_cards: list[tuple[str, Decimal]] = []
+            loan_accts: list[tuple[str, Decimal]] = []
+            other_liab_accts: list[tuple[str, Decimal]] = []
+
+            income_active = 0
+            income_total = 0
+            expense_active = 0
+            expense_total = 0
+            total_accounts = 0
+
+            for account in book.accounts:
+                if account.type == "ROOT":
+                    continue
+                if account.guid in template_guids:
+                    continue
+                total_accounts += 1
+
+                has_activity = len(account.splits) > 0
+                is_leaf = account.guid not in parent_guids
+
+                # Calculate balance
+                balance = Decimal("0")
+                for split in account.splits:
+                    balance += split.quantity
+
+                leaf = account.fullname.split(":")[-1]
+
+                if account.type in asset_types:
+                    if is_leaf and balance != 0:
+                        asset_leaves.append((leaf, balance))
+                elif account.type == "CREDIT":
+                    if is_leaf:
+                        credit_cards.append((leaf, -balance))
+                elif account.type == "LIABILITY":
+                    if is_leaf:
+                        neg_balance = -balance
+                        if "loan" in account.fullname.lower():
+                            loan_accts.append((leaf, neg_balance))
+                        else:
+                            other_liab_accts.append((leaf, neg_balance))
+                elif account.type == "INCOME":
+                    income_total += 1
+                    if has_activity:
+                        income_active += 1
+                elif account.type == "EXPENSE":
+                    expense_total += 1
+                    if has_activity:
+                        expense_active += 1
+
+            # Compute totals from leaf accounts
+            def _r2(v: Decimal) -> Decimal:
+                return v.quantize(Decimal("0.01"))
+
+            assets_total = _r2(sum(b for _, b in asset_leaves) if asset_leaves else Decimal(0))
+            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
+            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
+            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
+            liabilities_total = _r2(credit_total + loan_total + other_liab_total)
+            net_worth = _r2(assets_total - liabilities_total)
+
+            # All liability leaves sorted by balance descending for top-N
+            all_liab_leaves = credit_cards + loan_accts + other_liab_accts
+            all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
+
+            # --- Transaction stats ---
+            transactions = list(book.transactions)
+            total_txns = len(transactions)
+            unreconciled_txns = 0
+            first_date = None
+            last_date = None
+
+            for txn in transactions:
+                d = txn.post_date
+                if first_date is None or d < first_date:
+                    first_date = d
+                if last_date is None or d > last_date:
+                    last_date = d
+                if any(s.reconcile_state != "y" for s in txn.splits):
+                    unreconciled_txns += 1
+
+            # --- Scheduled transactions ---
+            all_sx = book.session.query(ScheduledTransaction).all()
+            enabled_sx = sum(1 for sx in all_sx if sx.enabled)
+
+            # --- Commodities ---
+            commodity_mnemonics = sorted(set(
+                c.mnemonic for c in book.commodities
+            ))
+
+            # --- Build output ---
+            lines = []
+            lines.append(f"Book: {self.book_path}")
+            lines.append(f"Currency: {currency}")
+
+            if first_date and last_date:
+                lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
+
+            lines.append(f"Accounts: {total_accounts} total")
+
+            # Assets section — leaf accounts with balances
+            lines.append(f"Assets: {len(asset_leaves)} accounts, {currency} {assets_total}")
+            for name, bal in sorted(asset_leaves, key=lambda x: x[1], reverse=True):
+                lines.append(f"  {name}: {currency} {_r2(bal)}")
+
+            # Liabilities section — grouped subtotals + top 3
+            liab_count = len(credit_cards) + len(loan_accts) + len(other_liab_accts)
+            lines.append(f"Liabilities: {liab_count} accounts, {currency} {liabilities_total}")
+            if credit_cards:
+                lines.append(f"  Credit cards ({len(credit_cards)}): {currency} {credit_total}")
+            if loan_accts:
+                lines.append(f"  Loans ({len(loan_accts)}): {currency} {loan_total}")
+            if other_liab_accts:
+                lines.append(f"  Other ({len(other_liab_accts)}): {currency} {other_liab_total}")
+            if len(all_liab_leaves) > 1:
+                top_n = all_liab_leaves[:3]
+                top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
+                lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
+
+            lines.append(f"Income: {income_active} active ({income_total} total)")
+            lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
+
+            lines.append(f"Transactions: {total_txns} ({unreconciled_txns} unreconciled)")
+
+            if enabled_sx > 0:
+                lines.append(f"Scheduled: {enabled_sx} recurring")
+
+            lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
+            lines.append(f"Net worth: {currency} {net_worth}")
+
+            return "\n".join(lines)
+
     def list_accounts(
         self,
         root: str | None = None,
@@ -987,7 +1312,8 @@ class GnuCashBook:
         start_date: date | None = None,
         end_date: date | None = None,
         limit: int = 50,
-    ) -> list[dict]:
+        compact: bool = True,
+    ) -> list[dict] | str:
         """List transactions with optional filters.
 
         Args:
@@ -995,9 +1321,13 @@ class GnuCashBook:
             start_date: Filter transactions on or after this date.
             end_date: Filter transactions on or before this date.
             limit: Maximum number of transactions to return.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per transaction. If False, return
+                     the full list of transaction dicts.
 
         Returns:
-            List of transaction dicts, most recent first.
+            If compact: newline-separated string of transaction lines.
+            If not compact: list of transaction dicts, most recent first.
 
         Raises:
             ValueError: If specified account not found.
@@ -1027,7 +1357,12 @@ class GnuCashBook:
             # Apply limit
             filtered = filtered[:limit]
 
-            return [_transaction_to_dict(t) for t in filtered]
+            if compact:
+                lines = [_transaction_to_compact_line(t, exclude_account=account)
+                         for t in filtered]
+                return "\n".join(lines)
+            else:
+                return [_transaction_to_dict(t) for t in filtered]
 
     def get_transaction(self, guid: str) -> dict | None:
         """Get details for a specific transaction by GUID.
@@ -1715,7 +2050,9 @@ class GnuCashBook:
             result["auto_filled_from"] = auto_filled_from
         return result
 
-    def search_transactions(self, query: str, field: str = "description") -> list[dict]:
+    def search_transactions(
+        self, query: str, field: str = "description", compact: bool = True,
+    ) -> list[dict] | str:
         """Search transactions by field.
 
         Args:
@@ -1726,9 +2063,13 @@ class GnuCashBook:
                    - Range: "100-200"
             field: Field to search: 'description', 'memo', 'notes',
                    or 'amount'.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per transaction. If False, return
+                     the full list of transaction dicts.
 
         Returns:
-            List of matching transactions.
+            If compact: newline-separated string of transaction lines.
+            If not compact: list of matching transaction dicts.
 
         Raises:
             ValueError: If field is not valid.
@@ -1737,30 +2078,35 @@ class GnuCashBook:
             raise ValueError(f"Invalid search field: {field}")
 
         with self.open(readonly=True) as book:
-            results = []
+            matched = []
 
             for transaction in book.transactions:
                 if field == "description":
                     if query.lower() in transaction.description.lower():
-                        results.append(_transaction_to_dict(transaction))
+                        matched.append(transaction)
 
                 elif field == "notes":
                     if transaction.notes and query.lower() in transaction.notes.lower():
-                        results.append(_transaction_to_dict(transaction))
+                        matched.append(transaction)
 
                 elif field == "memo":
-                    # Search across all split memos
                     for split in transaction.splits:
                         if split.memo and query.lower() in split.memo.lower():
-                            results.append(_transaction_to_dict(transaction))
+                            matched.append(transaction)
                             break
 
                 elif field == "amount":
-                    # Parse amount query for ranges/comparisons
                     if self._match_amount(transaction, query):
-                        results.append(_transaction_to_dict(transaction))
+                        matched.append(transaction)
 
-            return results
+            # Sort by date descending
+            matched.sort(key=lambda t: t.post_date, reverse=True)
+
+            if compact:
+                lines = [_transaction_to_compact_line(t) for t in matched]
+                return "\n".join(lines)
+            else:
+                return [_transaction_to_dict(t) for t in matched]
 
     def _match_amount(self, transaction: piecash.Transaction, query: str) -> bool:
         """Check if any split amount matches the query.
@@ -2069,7 +2415,7 @@ class GnuCashBook:
 
             # Capture info before deletion
             result = {
-                "guid": guid,
+                "guid": transaction.guid,
                 "description": transaction.description,
                 "status": "deleted",
             }
@@ -2428,11 +2774,11 @@ class GnuCashBook:
             book.save()
 
             return {
-                "split_guid": split_guid,
+                "split_guid": split.guid,
                 "account": split.account.fullname,
                 "amount": str(split.quantity),
                 "reconcile_state": state,
-                "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date else None,
+                "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date and split.reconcile_date.year > 1970 else None,
                 "status": "updated",
             }
 
@@ -2440,15 +2786,20 @@ class GnuCashBook:
         self,
         account_name: str,
         as_of_date: date | None = None,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get all unreconciled splits for an account.
 
         Args:
             account_name: Full account path.
             as_of_date: Only include splits on or before this date.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per split plus a summary footer.
+                     If False, return the full dict with splits list.
 
         Returns:
-            Dict with account info, splits list, and running totals.
+            If compact: newline-separated string of split lines with summary.
+            If not compact: dict with account info, splits list, and totals.
 
         Raises:
             ValueError: If account not found.
@@ -2490,7 +2841,7 @@ class GnuCashBook:
                     else:
                         uncleared_total += split.quantity
 
-            return {
+            result = {
                 "account": account_name,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
                 "splits": unreconciled,
@@ -2498,6 +2849,14 @@ class GnuCashBook:
                 "uncleared_total": str(uncleared_total),
                 "count": len(unreconciled),
             }
+
+            if compact:
+                lines = [_unreconciled_split_to_compact_line(s) for s in unreconciled]
+                footer = f"{len(unreconciled)} splits\tcleared:{cleared_total}\tuncleared:{uncleared_total}"
+                lines.append(footer)
+                return "\n".join(lines)
+            else:
+                return result
 
     def reconcile_account(
         self,
@@ -2628,7 +2987,7 @@ class GnuCashBook:
             book.save()
 
             return {
-                "guid": guid,
+                "guid": transaction.guid,
                 "description": transaction.description,
                 "void_reason": reason,
                 "status": "voided",
@@ -3459,6 +3818,26 @@ class GnuCashBook:
 
     # ============== Scheduled Transaction Methods ==============
 
+    def _find_scheduled_transaction(self, book, guid: str):
+        """Find a scheduled transaction by GUID (supports partial GUIDs, 8+ chars).
+
+        Args:
+            book: Open piecash book.
+            guid: Scheduled transaction GUID or prefix (minimum 8 characters).
+
+        Returns:
+            ScheduledTransaction if found, None otherwise.
+        """
+        from piecash.core.transaction import ScheduledTransaction
+
+        try:
+            full_guid = self._resolve_guid("schedxactions", guid)
+        except ValueError as e:
+            if "No schedxaction" in str(e):
+                return None
+            raise
+        return book.session.query(ScheduledTransaction).filter_by(guid=full_guid).first()
+
     def create_scheduled_transaction(
         self,
         name: str,
@@ -3621,15 +4000,20 @@ class GnuCashBook:
     def list_scheduled_transactions(
         self,
         enabled_only: bool = True,
-    ) -> list[dict]:
+        compact: bool = True,
+    ) -> list[dict] | str:
         """List all scheduled transactions.
 
         Args:
             enabled_only: If True, only show enabled schedules.
                          Default True.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per scheduled transaction. If
+                     False, return the full list of dicts.
 
         Returns:
-            List of scheduled transaction dicts.
+            If compact: newline-separated string of scheduled transaction lines.
+            If not compact: list of scheduled transaction dicts.
         """
         from piecash.core.transaction import ScheduledTransaction
 
@@ -3643,22 +4027,32 @@ class GnuCashBook:
                 if enabled_only and not sx.enabled:
                     continue
                 d = self._sx_to_dict(sx)
-                d["splits"] = self._get_sx_splits(book, sx)
+                if not compact:
+                    d["splits"] = self._get_sx_splits(book, sx)
                 results.append(d)
 
-            return results
+            if compact:
+                lines = [_sx_to_compact_line(d) for d in results]
+                return "\n".join(lines)
+            else:
+                return results
 
     def get_upcoming_transactions(
         self,
         days: int = 14,
-    ) -> list[dict]:
+        compact: bool = True,
+    ) -> list[dict] | str:
         """Get scheduled transactions due within a time window.
 
         Args:
             days: Look ahead window in days. Default 14.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per upcoming transaction. If
+                     False, return the full list of dicts with splits.
 
         Returns:
-            List of upcoming occurrences sorted by date.
+            If compact: newline-separated string of upcoming transaction lines.
+            If not compact: list of upcoming occurrence dicts sorted by date.
         """
         from piecash.core.transaction import ScheduledTransaction
 
@@ -3710,18 +4104,25 @@ class GnuCashBook:
                         if amt > 0:
                             total += amt
 
-                    upcoming.append({
+                    entry = {
                         "guid": sx.guid,
                         "name": sx.name,
                         "occurrence_date": next_occ.isoformat(),
                         "days_until": (next_occ - today).days,
                         "amount": str(total),
-                        "splits": splits,
-                    })
+                    }
+                    if not compact:
+                        entry["splits"] = splits
+                    upcoming.append(entry)
 
             # Sort by occurrence date
             upcoming.sort(key=lambda x: x["occurrence_date"])
-            return upcoming
+
+            if compact:
+                lines = [_upcoming_to_compact_line(e) for e in upcoming]
+                return "\n".join(lines)
+            else:
+                return upcoming
 
     def create_transaction_from_scheduled(
         self,
@@ -3741,12 +4142,8 @@ class GnuCashBook:
         Raises:
             ValueError: If scheduled transaction not found or disabled.
         """
-        from piecash.core.transaction import ScheduledTransaction
-
         with self.open(readonly=False) as book:
-            sx = book.session.query(
-                ScheduledTransaction
-            ).filter_by(guid=guid).first()
+            sx = self._find_scheduled_transaction(book, guid)
             if not sx:
                 raise ValueError(
                     f"Scheduled transaction not found: {guid}"
@@ -3840,12 +4237,8 @@ class GnuCashBook:
         Raises:
             ValueError: If not found.
         """
-        from piecash.core.transaction import ScheduledTransaction
-
         with self.open(readonly=False) as book:
-            sx = book.session.query(
-                ScheduledTransaction
-            ).filter_by(guid=guid).first()
+            sx = self._find_scheduled_transaction(book, guid)
             if not sx:
                 raise ValueError(
                     f"Scheduled transaction not found: {guid}"
@@ -3881,12 +4274,8 @@ class GnuCashBook:
         """
         from sqlalchemy import text
 
-        from piecash.core.transaction import ScheduledTransaction
-
         with self.open(readonly=False) as book:
-            sx = book.session.query(
-                ScheduledTransaction
-            ).filter_by(guid=guid).first()
+            sx = self._find_scheduled_transaction(book, guid)
             if not sx:
                 raise ValueError(
                     f"Scheduled transaction not found: {guid}"
@@ -3920,18 +4309,24 @@ class GnuCashBook:
     # ── Lot (Cost Basis Tracking) Methods ─────────────────────────
 
     def _find_lot(self, book: piecash.Book, guid: str):
-        """Find a lot by GUID.
+        """Find a lot by GUID (supports partial GUIDs, 8+ chars).
 
         Args:
             book: Open piecash book.
-            guid: Lot GUID.
+            guid: Lot GUID or prefix (minimum 8 characters).
 
         Returns:
             Lot if found, None otherwise.
         """
         from piecash.core.transaction import Lot
 
-        return book.session.query(Lot).filter_by(guid=guid).first()
+        try:
+            full_guid = self._resolve_guid("lots", guid)
+        except ValueError as e:
+            if "No lot" in str(e):
+                return None
+            raise
+        return book.session.query(Lot).filter_by(guid=full_guid).first()
 
     def _lot_summary(self, lot) -> dict:
         """Compute current state of a lot from its splits.
@@ -4016,16 +4411,21 @@ class GnuCashBook:
         self,
         account: str,
         include_closed: bool = False,
-    ) -> list[dict]:
+        compact: bool = True,
+    ) -> list[dict] | str:
         """List all lots for an investment account.
 
         Args:
             account: Full path of investment account.
             include_closed: If True, include fully-sold lots. Default False.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per lot. If False, return
+                     the full list of lot dicts.
 
         Returns:
-            List of lot dicts with guid, title, notes, is_closed,
-            quantity, cost_basis, cost_per_share.
+            If compact: newline-separated string of lot lines.
+            If not compact: list of lot dicts with guid, title, notes,
+            is_closed, quantity, cost_basis, cost_per_share.
 
         Raises:
             ValueError: If account not found.
@@ -4047,7 +4447,11 @@ class GnuCashBook:
                     **summary,
                 })
 
-            return results
+            if compact:
+                lines = [_lot_to_compact_line(d) for d in results]
+                return "\n".join(lines)
+            else:
+                return results
 
     def get_lot(self, guid: str) -> dict:
         """Get detailed information about a lot.
@@ -4145,8 +4549,8 @@ class GnuCashBook:
 
             return {
                 "status": "assigned",
-                "split_guid": split_guid,
-                "lot_guid": lot_guid,
+                "split_guid": split.guid,
+                "lot_guid": lot.guid,
                 **summary,
             }
 
@@ -4259,7 +4663,7 @@ class GnuCashBook:
             book.save()
 
             return {
-                "guid": guid,
+                "guid": lot.guid,
                 "title": lot.title,
                 "status": "closed",
             }

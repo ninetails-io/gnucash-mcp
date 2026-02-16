@@ -40,6 +40,45 @@ class TestGnuCashBookOpen:
             assert book is not None
 
 
+class TestGetBookSummary:
+    """Tests for get_book_summary method."""
+
+    def test_get_book_summary_returns_string(self, test_book: Path):
+        """Should return a formatted text string."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_get_book_summary_contains_sections(self, test_book: Path):
+        """Should contain all expected sections."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+
+        assert "Book:" in result
+        assert "Currency:" in result
+        assert "Accounts:" in result
+        assert "Assets:" in result
+        assert "Liabilities:" in result
+        assert "Income:" in result
+        assert "Expenses:" in result
+        assert "Transactions:" in result
+        assert "Commodities:" in result
+        assert "Net worth:" in result
+
+    def test_get_book_summary_currency(self, test_book: Path):
+        """Should show USD as default currency."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert "Currency: USD" in result
+
+    def test_get_book_summary_book_path(self, test_book: Path):
+        """Should include the book file path."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.get_book_summary()
+        assert f"Book: {test_book}" in result
+
+
 class TestListAccounts:
     """Tests for list_accounts method."""
 
@@ -219,7 +258,7 @@ class TestListTransactions:
     def test_list_all_transactions(self, test_book: Path):
         """Should return all transactions."""
         gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
 
         assert len(transactions) == 3
         descriptions = {t["description"] for t in transactions}
@@ -232,7 +271,7 @@ class TestListTransactions:
         gc_book = GnuCashBook(str(test_book))
 
         # Groceries account only has one transaction
-        transactions = gc_book.list_transactions(account="Expenses:Groceries")
+        transactions = gc_book.list_transactions(account="Expenses:Groceries", compact=False)
         assert len(transactions) == 1
         assert transactions[0]["description"] == "Weekly Groceries"
 
@@ -244,6 +283,7 @@ class TestListTransactions:
         transactions = gc_book.list_transactions(
             start_date=date(2024, 1, 10),
             end_date=date(2024, 1, 18),
+            compact=False,
         )
         assert len(transactions) == 1
         assert transactions[0]["description"] == "Salary Deposit"
@@ -251,14 +291,14 @@ class TestListTransactions:
     def test_list_transactions_limit(self, test_book: Path):
         """Should respect limit parameter."""
         gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions(limit=2)
+        transactions = gc_book.list_transactions(limit=2, compact=False)
 
         assert len(transactions) == 2
 
     def test_list_transactions_sorted_descending(self, test_book: Path):
         """Should return transactions sorted by date descending."""
         gc_book = GnuCashBook(str(test_book))
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
 
         dates = [t["date"] for t in transactions]
         assert dates == sorted(dates, reverse=True)
@@ -279,7 +319,7 @@ class TestGetTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # First get a valid GUID
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         # Then fetch by GUID
@@ -710,7 +750,7 @@ class TestDryRun:
     def test_dry_run_no_write(self, test_book: Path):
         """Dry run should not create a transaction in the book."""
         gc_book = GnuCashBook(str(test_book))
-        before = gc_book.list_transactions()
+        before = gc_book.list_transactions(compact=False)
         gc_book.create_transaction(
             description="Ghost Transaction",
             splits=[
@@ -719,7 +759,7 @@ class TestDryRun:
             ],
             dry_run=True,
         )
-        after = gc_book.list_transactions()
+        after = gc_book.list_transactions(compact=False)
         assert len(after) == len(before)
 
     def test_dry_run_includes_warnings(self, test_book: Path):
@@ -1237,7 +1277,7 @@ class TestSearchTransactions:
         """Should find transactions by description."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("Salary", field="description")
+        results = gc_book.search_transactions("Salary", field="description", compact=False)
         assert len(results) == 1
         assert results[0]["description"] == "Salary Deposit"
 
@@ -1245,14 +1285,14 @@ class TestSearchTransactions:
         """Should search case-insensitively."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("salary", field="description")
+        results = gc_book.search_transactions("salary", field="description", compact=False)
         assert len(results) == 1
 
     def test_search_by_amount_exact(self, test_book: Path):
         """Should find transactions by exact amount."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("150", field="amount")
+        results = gc_book.search_transactions("150", field="amount", compact=False)
         assert len(results) == 1
         assert results[0]["description"] == "Weekly Groceries"
 
@@ -1260,7 +1300,7 @@ class TestSearchTransactions:
         """Should find transactions with amount greater than threshold."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions(">500", field="amount")
+        results = gc_book.search_transactions(">500", field="amount", compact=False)
         # Opening (1000) and Salary (2000) transactions
         assert len(results) == 2
 
@@ -1268,7 +1308,7 @@ class TestSearchTransactions:
         """Should find transactions with amount less than threshold."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("<200", field="amount")
+        results = gc_book.search_transactions("<200", field="amount", compact=False)
         assert len(results) == 1
         assert results[0]["description"] == "Weekly Groceries"
 
@@ -1276,7 +1316,7 @@ class TestSearchTransactions:
         """Should find transactions with amount in range."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("100-500", field="amount")
+        results = gc_book.search_transactions("100-500", field="amount", compact=False)
         assert len(results) == 1
         assert results[0]["description"] == "Weekly Groceries"
 
@@ -1294,7 +1334,7 @@ class TestSearchTransactions:
             notes="P2W1 groceries",
         )
 
-        results = gc_book.search_transactions("P2W1", field="notes")
+        results = gc_book.search_transactions("P2W1", field="notes", compact=False)
         assert len(results) == 1
         assert results[0]["description"] == "Safeway"
         assert results[0]["notes"] == "P2W1 groceries"
@@ -1303,7 +1343,7 @@ class TestSearchTransactions:
         """Should return empty list when no notes match."""
         gc_book = GnuCashBook(str(test_book))
 
-        results = gc_book.search_transactions("nonexistent", field="notes")
+        results = gc_book.search_transactions("nonexistent", field="notes", compact=False)
         assert len(results) == 0
 
     def test_search_invalid_field(self, test_book: Path):
@@ -1632,7 +1672,7 @@ class TestDeleteTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction to delete
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
         description = transactions[0]["description"]
 
@@ -1656,7 +1696,7 @@ class TestDeleteTransaction:
         """Should reject deletion of transaction with reconciled splits."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
 
@@ -1668,7 +1708,7 @@ class TestDeleteTransaction:
         """Should allow deletion with force=True despite reconciled splits."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
 
@@ -1687,7 +1727,7 @@ class TestUpdateTransaction:
         """Should update only the description."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.update_transaction(
@@ -1702,7 +1742,7 @@ class TestUpdateTransaction:
         """Should update only the date."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.update_transaction(
@@ -1718,7 +1758,7 @@ class TestUpdateTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Get the groceries transaction (150.00)
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.update_transaction(
@@ -1740,7 +1780,7 @@ class TestUpdateTransaction:
         """Should update description, date, and splits together."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.update_transaction(
@@ -1771,7 +1811,7 @@ class TestUpdateTransaction:
         """Should raise ValueError for unbalanced splits."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="do not balance"):
@@ -1787,7 +1827,7 @@ class TestUpdateTransaction:
         """Should raise ValueError if split account not in transaction."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="Account not found in transaction"):
@@ -1803,7 +1843,7 @@ class TestUpdateTransaction:
         """Should add notes to an existing transaction."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.update_transaction(
@@ -1846,7 +1886,7 @@ class TestUpdateTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Get the groceries transaction and reconcile a split
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
@@ -1864,7 +1904,7 @@ class TestUpdateTransaction:
         """Should allow split updates with force=True despite reconciled splits."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
@@ -1883,7 +1923,7 @@ class TestUpdateTransaction:
         """Should allow description/date/notes changes without force on reconciled."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
@@ -1904,7 +1944,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Find the grocery transaction
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         original_splits = transactions[0]["splits"]
 
@@ -1938,7 +1978,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Find the grocery transaction
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         original_date = transactions[0]["date"]
         original_description = transactions[0]["description"]
@@ -1969,7 +2009,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Find the grocery transaction
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         original_splits = transactions[0]["splits"]
 
@@ -1998,7 +2038,7 @@ class TestReplaceSplits:
         """Should reject splits that don't balance to zero."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="do not balance"):
@@ -2014,7 +2054,7 @@ class TestReplaceSplits:
         """Should reject fewer than 2 splits."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="At least 2 splits"):
@@ -2029,7 +2069,7 @@ class TestReplaceSplits:
         """Should reject splits with non-existent accounts."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="Account not found"):
@@ -2045,7 +2085,7 @@ class TestReplaceSplits:
         """Should reject splits to placeholder accounts."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         # Expenses is a placeholder in test_book
@@ -2076,7 +2116,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction and reconcile one of its splits
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
@@ -2095,7 +2135,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction and reconcile one of its splits
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         split_guid = transactions[0]["splits"][0]["guid"]
         gc_book.set_reconcile_state(split_guid, "y")
@@ -2223,7 +2263,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(test_book))
 
         # Find the grocery transaction (2 splits)
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
         assert len(transactions[0]["splits"]) == 2
 
@@ -2282,7 +2322,7 @@ class TestReplaceSplits:
         """Should preserve memo on new splits when provided."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.search_transactions("Weekly Groceries")
+        transactions = gc_book.search_transactions("Weekly Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.replace_splits(
@@ -2308,7 +2348,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(multi_currency_book))
 
         # Find a USD transaction
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         # Try to replace splits to EUR account without quantity
@@ -2326,7 +2366,7 @@ class TestReplaceSplits:
         gc_book = GnuCashBook(str(multi_currency_book))
 
         # Find a USD transaction
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         # Recategorize with proper quantity
@@ -2352,7 +2392,7 @@ class TestReplaceSplits:
         """Should reject quantity with opposite sign from amount."""
         gc_book = GnuCashBook(str(multi_currency_book))
 
-        transactions = gc_book.search_transactions("Groceries")
+        transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="same sign"):
@@ -2377,7 +2417,7 @@ class TestSetReconcileState:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a split guid
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = gc_book.set_reconcile_state(split_guid, "c")
@@ -2389,7 +2429,7 @@ class TestSetReconcileState:
         """Should set split to reconciled state with date."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = gc_book.set_reconcile_state(
@@ -2404,7 +2444,7 @@ class TestSetReconcileState:
         """Should reset split to new state."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
 
         # First set to cleared
@@ -2420,7 +2460,7 @@ class TestSetReconcileState:
         """Should raise ValueError for invalid state."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         split_guid = transactions[0]["splits"][0]["guid"]
 
         with pytest.raises(ValueError, match="Invalid reconcile state"):
@@ -2441,7 +2481,7 @@ class TestGetUnreconciledSplits:
         """Should return unreconciled splits for account."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.get_unreconciled_splits("Assets:Checking")
+        result = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
 
         assert "splits" in result
         assert "cleared_total" in result
@@ -2456,7 +2496,7 @@ class TestGetUnreconciledSplits:
 
         # Get splits before a specific date
         result = gc_book.get_unreconciled_splits(
-            "Assets:Checking", as_of_date=date(2024, 1, 10)
+            "Assets:Checking", as_of_date=date(2024, 1, 10), compact=False,
         )
 
         # All returned splits should be on or before the date
@@ -2479,7 +2519,7 @@ class TestReconcileAccount:
         gc_book = GnuCashBook(str(test_book))
 
         # Get unreconciled splits
-        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
 
         # Calculate what the balance should be
         total = Decimal("0")
@@ -2503,7 +2543,7 @@ class TestReconcileAccount:
         """Should raise ValueError when balance doesn't match."""
         gc_book = GnuCashBook(str(test_book))
 
-        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
         guids = [s["guid"] for s in unreconciled["splits"]]
 
         with pytest.raises(ValueError, match="Balance mismatch"):
@@ -2519,7 +2559,7 @@ class TestReconcileAccount:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a split from a different account
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         expense_split = None
         for split in transactions[0]["splits"]:
             if "Expenses" in split["account"]:
@@ -2544,7 +2584,7 @@ class TestVoidTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction to void
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         result = gc_book.void_transaction(guid, reason="Entered in error")
@@ -2562,7 +2602,7 @@ class TestVoidTransaction:
         """Should raise ValueError if no reason provided."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="reason is required"):
@@ -2579,7 +2619,7 @@ class TestVoidTransaction:
         """Should raise ValueError if already voided."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         # Void once
@@ -2598,7 +2638,7 @@ class TestUnvoidTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         # Get original transaction values
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
         original = gc_book.get_transaction(guid)
         original_values = {s["account"]: s["value"] for s in original["splits"]}
@@ -2620,7 +2660,7 @@ class TestUnvoidTransaction:
         """Should raise ValueError if transaction is not voided."""
         gc_book = GnuCashBook(str(test_book))
 
-        transactions = gc_book.list_transactions()
+        transactions = gc_book.list_transactions(compact=False)
         guid = transactions[0]["guid"]
 
         with pytest.raises(ValueError, match="not voided"):
@@ -2785,7 +2825,7 @@ class TestListCommodities:
     def test_list_commodities(self, test_book: Path):
         """Should return commodities grouped by namespace."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_commodities()
+        result = gc_book.list_commodities(compact=False)
 
         assert "default_currency" in result
         assert result["default_currency"] == "USD"
@@ -2799,7 +2839,7 @@ class TestListCommodities:
     def test_list_commodities_structure(self, test_book: Path):
         """Should return proper structure for each commodity."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_commodities()
+        result = gc_book.list_commodities(compact=False)
 
         currencies = result["commodities"]["CURRENCY"]
         for commodity in currencies:
@@ -2873,7 +2913,7 @@ class TestCreateAccountWithCurrency:
         assert result["status"] == "created"
 
         # Verify GBP is now in the commodities list
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         mnemonics = [c["mnemonic"] for c in commodities["commodities"]["CURRENCY"]]
         assert "GBP" in mnemonics
 
@@ -3125,7 +3165,7 @@ class TestCreateCommodity:
         assert result["fraction"] == 10000
 
         # Verify it appears in list_commodities
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         assert "FUND" in commodities["commodities"]
         mnemonics = [c["mnemonic"] for c in commodities["commodities"]["FUND"]]
         assert "VTSAX" in mnemonics
@@ -3165,7 +3205,7 @@ class TestCreateCommodity:
         assert result1["status"] == "created"
         assert result2["status"] == "created"
 
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         assert "FUND" in commodities["commodities"]
         assert "NASDAQ" in commodities["commodities"]
 
@@ -3579,7 +3619,7 @@ class TestInvestmentWorkflow:
             value="128.75", price_date=date(2026, 2, 7),
         )
 
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         fund_entries = commodities["commodities"]["FUND"]
         vtsax = next(c for c in fund_entries if c["mnemonic"] == "VTSAX")
 

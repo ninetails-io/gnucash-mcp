@@ -8,12 +8,29 @@ import traceback
 from datetime import date
 from functools import wraps
 from pathlib import Path
-from typing import Callable
+from typing import Annotated, Callable
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
 from gnucash_mcp.logging_config import audit_log, debug_log, get_audit_format, get_log_dir, setup_logging
+
+
+def _json(obj) -> str:
+    """Serialize to minified JSON, stripping noise values."""
+    return json.dumps(_strip_noise(obj), separators=(",", ":"))
+
+
+def _strip_noise(obj):
+    """Recursively remove keys with None or empty-string values from dicts."""
+    if isinstance(obj, dict):
+        return {k: _strip_noise(v) for k, v in obj.items()
+                if v is not None and v != ""}
+    if isinstance(obj, list):
+        return [_strip_noise(item) for item in obj]
+    return obj
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -70,7 +87,7 @@ def safe_tool(func: Callable) -> Callable:
             return func(*args, **kwargs)
         except GnuCashLockError as e:
             logger.warning(f"Lock error in {func.__name__}: {e}")
-            return json.dumps(
+            return _json(
                 {
                     "error": str(e),
                     "error_type": "lock_error",
@@ -79,7 +96,7 @@ def safe_tool(func: Callable) -> Callable:
             )
         except FileNotFoundError as e:
             logger.error(f"File not found in {func.__name__}: {e}")
-            return json.dumps(
+            return _json(
                 {
                     "error": str(e),
                     "error_type": "file_not_found",
@@ -88,13 +105,13 @@ def safe_tool(func: Callable) -> Callable:
             )
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
-            return json.dumps({"error": str(e), "error_type": "validation_error"})
+            return _json({"error": str(e), "error_type": "validation_error"})
         except Exception as e:
             # Catch-all for unexpected errors
             logger.error(
                 f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
             )
-            return json.dumps(
+            return _json(
                 {
                     "error": f"Unexpected error: {type(e).__name__}: {e}",
                     "error_type": "unexpected_error",
@@ -105,6 +122,20 @@ def safe_tool(func: Callable) -> Callable:
 
 
 # ============== Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_book_summary() -> str:
+    """Get a compact overview of the entire GnuCash book.
+
+    Returns book path, currency, account structure, transaction counts,
+    key balances, net worth, commodities, and scheduled transactions
+    in a single text response. Use this first to orient yourself.
+    """
+    book = get_book()
+    return book.get_book_summary()
 
 
 @mcp.tool()
@@ -126,21 +157,27 @@ def list_accounts(
     book = get_book()
     result = book.list_accounts(root=root, compact=not verbose)
     if verbose:
-        return json.dumps(result, indent=2)
+        return _json(result)
     return result
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def list_commodities() -> str:
+def list_commodities(verbose: bool = False) -> str:
     """List all commodities (currencies, stocks, etc.) in the book.
 
-    Returns commodities grouped by namespace with their mnemonic, fullname, and fraction.
+    Returns a compact one-line-per-commodity format by default.
+    Use verbose=true for full JSON with fraction, latest prices, etc.
+
+    Args:
+        verbose: If true, return full JSON details for each commodity.
     """
     book = get_book()
-    result = book.list_commodities()
-    return json.dumps(result, indent=2)
+    result = book.list_commodities(compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -177,7 +214,7 @@ def create_commodity(
         fraction=fraction,
         cusip=cusip,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -227,7 +264,7 @@ def create_price(
         price_type=price_type,
         source=source,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -265,7 +302,7 @@ def get_prices(
         end_date=end,
         currency=currency,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -293,7 +330,7 @@ def get_latest_price(
         namespace=namespace,
         currency=currency,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -308,8 +345,8 @@ def get_account(name: str) -> str:
     book = get_book()
     result = book.get_account(name)
     if result is None:
-        return json.dumps({"error": f"Account not found: {name}"})
-    return json.dumps(result, indent=2)
+        return _json({"error": f"Account not found: {name}"})
+    return _json(result)
 
 
 @mcp.tool()
@@ -330,7 +367,7 @@ def get_balance(account_name: str, as_of_date: str | None = None) -> str:
         "balance": str(balance),
         "as_of_date": as_of_date if as_of_date else "current",
     }
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -341,36 +378,45 @@ def list_transactions(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 50,
+    verbose: bool = False,
 ) -> str:
     """List transactions with optional filters.
+
+    Returns a compact one-line-per-transaction format by default.
+    Use verbose=true for full JSON with GUIDs, splits, reconcile state, etc.
 
     Args:
         account: Filter by account name
         start_date: Start date in ISO format (YYYY-MM-DD)
         end_date: End date in ISO format (YYYY-MM-DD)
         limit: Maximum number of transactions to return (default 50)
+        verbose: If true, return full JSON details for each transaction.
     """
     book = get_book()
     start = date.fromisoformat(start_date) if start_date else None
     end = date.fromisoformat(end_date) if end_date else None
-    result = book.list_transactions(account, start, end, limit)
-    return json.dumps(result, indent=2)
+    result = book.list_transactions(account, start, end, limit, compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def get_transaction(guid: str) -> str:
+def get_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+) -> str:
     """Get details for a specific transaction by GUID.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
     """
     book = get_book()
     result = book.get_transaction(guid)
     if result is None:
-        return json.dumps({"error": f"Transaction not found: {guid}"})
-    return json.dumps(result, indent=2)
+        return _json({"error": f"Transaction not found: {guid}"})
+    return _json(result)
 
 
 @mcp.tool()
@@ -417,22 +463,28 @@ def create_transaction(
         force_create=force_create,
         dry_run=dry_run,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def search_transactions(query: str, field: str = "description") -> str:
+def search_transactions(query: str, field: str = "description", verbose: bool = False) -> str:
     """Search transactions by description, memo, notes, or amount.
+
+    Returns a compact one-line-per-transaction format by default.
+    Use verbose=true for full JSON with GUIDs, splits, reconcile state, etc.
 
     Args:
         query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
         field: Field to search: 'description', 'memo', 'notes', or 'amount'
+        verbose: If true, return full JSON details for each transaction.
     """
     book = get_book()
-    result = book.search_transactions(query, field)
-    return json.dumps(result, indent=2)
+    result = book.search_transactions(query, field, compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -475,7 +527,7 @@ def create_account(
         commodity=commodity,
         commodity_namespace=commodity_namespace,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -502,7 +554,7 @@ def update_account(
         description=description,
         placeholder=placeholder,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -517,7 +569,7 @@ def move_account(name: str, new_parent: str) -> str:
     """
     book = get_book()
     result = book.move_account(name=name, new_parent=new_parent)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -533,32 +585,35 @@ def delete_account(name: str) -> str:
     """
     book = get_book()
     result = book.delete_account(name=name)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="transaction")
-def delete_transaction(guid: str, force: bool = False) -> str:
+def delete_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+    force: bool = False,
+) -> str:
     """Delete a transaction by GUID.
 
     Safeguards prevent deletion if the transaction has reconciled splits.
     Use force=true to override.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
         force: Allow deleting transactions with reconciled splits
     """
     book = get_book()
     result = book.delete_transaction(guid, force=force)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="transaction")
 def update_transaction(
-    guid: str,
+    guid: Annotated[str, Field(description="Transaction GUID to update (32-character hex string, or 8+ char prefix)")],
     description: str | None = None,
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
@@ -568,7 +623,7 @@ def update_transaction(
     """Update an existing transaction.
 
     Args:
-        guid: Transaction GUID to update
+        guid: Transaction GUID to update (32-character hex string, or 8+ char prefix)
         description: New transaction description (optional)
         transaction_date: New date in ISO format YYYY-MM-DD (optional)
         splits: List of split updates with 'account' and 'amount' (optional).
@@ -587,14 +642,14 @@ def update_transaction(
         notes=notes,
         force=force,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
 def replace_splits(
-    guid: str,
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
     splits: list[dict],
     force: bool = False,
 ) -> str:
@@ -605,7 +660,7 @@ def replace_splits(
     New splits must balance to zero.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
         splits: Complete new set of splits. Each split needs:
             - 'account' (required): Full account path
             - 'amount' (required): Value in transaction currency
@@ -620,7 +675,7 @@ def replace_splits(
         splits=splits,
         force=force,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Reconciliation Tools ==============
@@ -630,14 +685,14 @@ def replace_splits(
 @safe_tool
 @audit_log(classification="write", operation="set_state", entity_type="split")
 def set_reconcile_state(
-    split_guid: str,
+    split_guid: Annotated[str, Field(description="GUID of the split to update (32-character hex string, or 8+ char prefix)")],
     state: str,
     reconcile_date: str | None = None,
 ) -> str:
     """Set the reconciliation state for a split.
 
     Args:
-        split_guid: GUID of the split to update
+        split_guid: GUID of the split to update (32-character hex string, or 8+ char prefix)
         state: New reconcile state: 'n' (new), 'c' (cleared), 'y' (reconciled)
         reconcile_date: Date in ISO format (YYYY-MM-DD). Required for 'y', defaults to today.
     """
@@ -648,7 +703,7 @@ def set_reconcile_state(
         state=state,
         reconcile_date=rec_date,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -657,20 +712,28 @@ def set_reconcile_state(
 def get_unreconciled_splits(
     account: str,
     as_of_date: str | None = None,
+    verbose: bool = False,
 ) -> str:
     """Get all unreconciled splits for an account.
+
+    Returns a compact one-line-per-split format by default with a summary footer.
+    Use verbose=true for full JSON with split GUIDs, amounts, and totals.
 
     Args:
         account: Full account name (e.g., 'Assets:Bank:Checking')
         as_of_date: Only include splits on or before this date (YYYY-MM-DD)
+        verbose: If true, return full JSON details. Default compact one-line format.
     """
     book = get_book()
     date_obj = date.fromisoformat(as_of_date) if as_of_date else None
     result = book.get_unreconciled_splits(
         account_name=account,
         as_of_date=date_obj,
+        compact=not verbose,
     )
-    return json.dumps(result, indent=2)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -680,7 +743,7 @@ def reconcile_account(
     account: str,
     statement_date: str,
     statement_balance: str,
-    split_guids: list[str],
+    split_guids: Annotated[list[str], Field(description="List of split GUIDs to mark as reconciled (8+ char prefixes accepted)")],
 ) -> str:
     """Reconcile multiple splits against a statement balance.
 
@@ -692,7 +755,7 @@ def reconcile_account(
         account: Full account name (e.g., 'Assets:Bank:Checking')
         statement_date: Statement ending date (YYYY-MM-DD)
         statement_balance: Expected balance from statement (as string, e.g., '1234.56')
-        split_guids: List of split GUIDs to mark as reconciled
+        split_guids: List of split GUIDs to mark as reconciled (8+ char prefixes accepted)
     """
     book = get_book()
     stmt_date = date.fromisoformat(statement_date)
@@ -702,7 +765,7 @@ def reconcile_account(
         statement_balance=statement_balance,
         split_guids=split_guids,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Void Tools ==============
@@ -711,7 +774,10 @@ def reconcile_account(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="void", entity_type="transaction")
-def void_transaction(guid: str, reason: str) -> str:
+def void_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID to void (32-character hex string, or 8+ char prefix)")],
+    reason: str,
+) -> str:
     """Void a transaction (proper accounting void, not delete).
 
     Voiding preserves the transaction for audit purposes but zeroes out
@@ -719,28 +785,30 @@ def void_transaction(guid: str, reason: str) -> str:
     an audit trail.
 
     Args:
-        guid: Transaction GUID to void
+        guid: Transaction GUID to void (32-character hex string, or 8+ char prefix)
         reason: Reason for voiding (required for audit trail)
     """
     book = get_book()
     result = book.void_transaction(guid=guid, reason=reason)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="unvoid", entity_type="transaction")
-def unvoid_transaction(guid: str) -> str:
+def unvoid_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)")],
+) -> str:
     """Restore a voided transaction.
 
     Restores original split values and removes void markers.
 
     Args:
-        guid: Transaction GUID to unvoid
+        guid: Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)
     """
     book = get_book()
     result = book.unvoid_transaction(guid=guid)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Reporting Tools ==============
@@ -767,7 +835,7 @@ def spending_by_category(
         end_date=date.fromisoformat(end_date),
         depth=depth,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -791,7 +859,7 @@ def income_by_source(
         end_date=date.fromisoformat(end_date),
         depth=depth,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -807,7 +875,7 @@ def balance_sheet(as_of_date: str) -> str:
     """
     book = get_book()
     result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -833,7 +901,7 @@ def net_worth(
         start_date=date.fromisoformat(start_date) if start_date else None,
         interval=interval,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -857,7 +925,7 @@ def cash_flow(
         end_date=date.fromisoformat(end_date),
         account=account,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Budget Tools ==============
@@ -875,7 +943,7 @@ def list_budgets() -> str:
     """
     book = get_book()
     result = book.list_budgets()
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -893,8 +961,8 @@ def get_budget(name: str) -> str:
     book = get_book()
     result = book.get_budget(name)
     if result is None:
-        return json.dumps({"error": f"Budget not found: {name}"})
-    return json.dumps(result, indent=2)
+        return _json({"error": f"Budget not found: {name}"})
+    return _json(result)
 
 
 @mcp.tool()
@@ -927,7 +995,7 @@ def create_budget(
         period_type=period_type,
         description=description,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -957,7 +1025,7 @@ def set_budget_amount(
         amount=amount,
         period=period,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -988,7 +1056,7 @@ def get_budget_report(
         account=account,
         include_children=include_children,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -1002,7 +1070,7 @@ def delete_budget(name: str) -> str:
     """
     book = get_book()
     result = book.delete_budget(name=name)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Scheduled Transaction Tools ==============
@@ -1047,7 +1115,7 @@ def create_scheduled_transaction(
         end_date=end_date,
         enabled=enabled,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -1055,20 +1123,25 @@ def create_scheduled_transaction(
 @audit_log(classification="read")
 def list_scheduled_transactions(
     enabled_only: bool = True,
+    verbose: bool = False,
 ) -> str:
     """List all scheduled transactions.
 
+    Returns a compact one-line-per-schedule format by default.
+    Use verbose=true for full JSON with GUIDs, splits, dates, etc.
+
     Args:
         enabled_only: If True, only show enabled schedules. Default True.
-
-    Returns:
-        JSON list with guid, name, frequency, next_occurrence, enabled.
+        verbose: If true, return full JSON details for each scheduled transaction.
     """
     book = get_book()
     result = book.list_scheduled_transactions(
         enabled_only=enabled_only,
+        compact=not verbose,
     )
-    return json.dumps(result, indent=2)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -1076,6 +1149,7 @@ def list_scheduled_transactions(
 @audit_log(classification="read")
 def get_upcoming_transactions(
     days: int = 14,
+    verbose: bool = False,
 ) -> str:
     """Get scheduled transactions due within a time window.
 
@@ -1083,27 +1157,26 @@ def get_upcoming_transactions(
 
     Args:
         days: Look ahead window in days. Default 14.
-
-    Returns:
-        JSON list of upcoming occurrences:
-        [{"name": "...", "occurrence_date": "...", "amount": "...", "days_until": N}]
+        verbose: If true, return full JSON with splits. Default compact one-line format.
     """
     book = get_book()
-    result = book.get_upcoming_transactions(days=days)
-    return json.dumps(result, indent=2)
+    result = book.get_upcoming_transactions(days=days, compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction_from_scheduled(
-    guid: str,
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
     transaction_date: str | None = None,
 ) -> str:
     """Create an actual transaction from a scheduled template.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
         transaction_date: Date for the transaction. Defaults to next occurrence.
     """
     book = get_book()
@@ -1111,21 +1184,21 @@ def create_transaction_from_scheduled(
         guid=guid,
         transaction_date=transaction_date,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="scheduled_transaction")
 def update_scheduled_transaction(
-    guid: str,
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
     enabled: bool | None = None,
     end_date: str | None = None,
 ) -> str:
     """Update a scheduled transaction.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
         enabled: Enable or disable.
         end_date: Set end date (empty string to clear).
     """
@@ -1135,23 +1208,25 @@ def update_scheduled_transaction(
         enabled=enabled,
         end_date=end_date,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="scheduled_transaction")
-def delete_scheduled_transaction(guid: str) -> str:
+def delete_scheduled_transaction(
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
+) -> str:
     """Delete a scheduled transaction.
 
     Does not affect transactions already created from this schedule.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
     """
     book = get_book()
     result = book.delete_scheduled_transaction(guid=guid)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Lot (Cost Basis) Tools ==============
@@ -1177,7 +1252,7 @@ def create_lot(
     """
     book = get_book()
     result = book.create_lot(account=account, title=title, notes=notes)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -1186,33 +1261,35 @@ def create_lot(
 def list_lots(
     account: str,
     include_closed: bool = False,
+    verbose: bool = False,
 ) -> str:
     """List all lots for an investment account.
+
+    Returns a compact one-line-per-lot format by default.
+    Use verbose=true for full JSON with guid, title, notes, etc.
 
     Args:
         account: Full path of investment account.
         include_closed: If True, include fully-sold lots. Default False.
-
-    Returns:
-        JSON list of lots with:
-        - guid, title, notes, is_closed
-        - quantity (shares remaining)
-        - cost_basis (original cost of remaining shares)
-        - cost_per_share
+        verbose: If true, return full JSON details for each lot.
     """
     book = get_book()
-    result = book.list_lots(account=account, include_closed=include_closed)
-    return json.dumps(result, indent=2)
+    result = book.list_lots(account=account, include_closed=include_closed, compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def get_lot(guid: str) -> str:
+def get_lot(
+    guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+) -> str:
     """Get detailed information about a lot.
 
     Args:
-        guid: Lot GUID.
+        guid: Lot GUID (or 8+ char prefix).
 
     Returns:
         JSON with lot details including all splits:
@@ -1222,15 +1299,15 @@ def get_lot(guid: str) -> str:
     """
     book = get_book()
     result = book.get_lot(guid=guid)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="lot")
 def assign_split_to_lot(
-    split_guid: str,
-    lot_guid: str,
+    split_guid: Annotated[str, Field(description="GUID of the split (from transaction's investment account). 8+ char prefix accepted.")],
+    lot_guid: Annotated[str, Field(description="GUID of the lot (or 8+ char prefix)")],
 ) -> str:
     """Assign a transaction split to a lot.
 
@@ -1238,8 +1315,8 @@ def assign_split_to_lot(
     account split to its lot for cost basis tracking.
 
     Args:
-        split_guid: GUID of the split (from transaction's investment account).
-        lot_guid: GUID of the lot.
+        split_guid: GUID of the split (from transaction's investment account). 8+ char prefix accepted.
+        lot_guid: GUID of the lot (or 8+ char prefix).
 
     Workflow:
         1. create_lot("Assets:VTSAX", "VTSAX Jan 2026")
@@ -1248,14 +1325,14 @@ def assign_split_to_lot(
     """
     book = get_book()
     result = book.assign_split_to_lot(split_guid=split_guid, lot_guid=lot_guid)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
 def calculate_lot_gain(
-    lot_guid: str,
+    lot_guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
     shares: str | None = None,
     sale_price: str | None = None,
 ) -> str:
@@ -1265,7 +1342,7 @@ def calculate_lot_gain(
     Otherwise uses lot's current state and latest price.
 
     Args:
-        lot_guid: Lot GUID.
+        lot_guid: Lot GUID (or 8+ char prefix).
         shares: Optional number of shares to calculate for.
                 Defaults to all remaining shares.
         sale_price: Optional sale price per share.
@@ -1275,20 +1352,22 @@ def calculate_lot_gain(
     result = book.calculate_lot_gain(
         lot_guid=lot_guid, shares=shares, sale_price=sale_price,
     )
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="lot")
-def close_lot(guid: str) -> str:
+def close_lot(
+    guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+) -> str:
     """Mark a lot as closed.
 
     Use when a lot is fully sold but wasn't automatically marked closed,
     or to manually close a lot with zero shares.
 
     Args:
-        guid: Lot GUID.
+        guid: Lot GUID (or 8+ char prefix).
 
     Note:
         Lots are automatically marked closed when their quantity reaches zero
@@ -1296,7 +1375,7 @@ def close_lot(guid: str) -> str:
     """
     book = get_book()
     result = book.close_lot(guid=guid)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Account Slot Tools ==============
@@ -1320,7 +1399,7 @@ def get_account_slots(
     """
     book = get_book()
     result = book.get_account_slots(account_name=account, key=key)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -1343,7 +1422,7 @@ def set_account_slot(
     """
     book = get_book()
     result = book.set_account_slot(account_name=account, key=key, value=value)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 @mcp.tool()
@@ -1361,7 +1440,7 @@ def delete_account_slot(
     """
     book = get_book()
     result = book.delete_account_slot(account_name=account, key=key)
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 # ============== Resources ==============
@@ -1372,7 +1451,7 @@ def accounts_resource() -> str:
     """Full chart of accounts from the GnuCash book."""
     book = get_book()
     accounts = book.list_accounts(compact=False)
-    return json.dumps(accounts, indent=2)
+    return _json(accounts)
 
 
 # ============== Audit Log Tool ==============
@@ -1399,7 +1478,7 @@ def get_audit_log(
 
     log_dir = get_log_dir()
     if not log_dir:
-        return json.dumps({"error": "Logging not initialized (no book path configured)"})
+        return _json({"error": "Logging not initialized (no book path configured)"})
 
     audit_dir = log_dir / "audit"
     target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -1417,7 +1496,7 @@ def get_audit_log(
 
     if not log_file.exists():
         if fmt == "json":
-            return json.dumps({"entries": [], "message": f"No audit log for {target_date}"})
+            return _json({"entries": [], "message": f"No audit log for {target_date}"})
         else:
             return f"No audit log for {target_date}"
 
@@ -1431,14 +1510,14 @@ def get_audit_log(
 
         # If user configured json but we fell back to txt, wrap in JSON with note
         if fmt == "json":
-            return json.dumps({
+            return _json({
                 "content": text_content,
                 "format": "text",
                 "note": (
                     "No .jsonl file found for this date. Returning .txt fallback. "
                     "Ensure GNUCASH_MCP_AUDIT_FORMAT=json is set when starting the server."
                 ),
-            }, indent=2)
+            })
         else:
             # User wants text, return raw text
             return text_content
@@ -1467,10 +1546,7 @@ def get_audit_log(
         return "\n".join(lines) if lines else "No entries"
 
     # User wants JSON, return JSON
-    return json.dumps(
-        {"entries": entries[-limit:], "total_count": len(entries)},
-        indent=2,
-    )
+    return _json({"entries": entries[-limit:], "total_count": len(entries)})
 
 
 # ============== Main ==============
