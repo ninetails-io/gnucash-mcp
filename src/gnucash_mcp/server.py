@@ -8,7 +8,9 @@ import traceback
 from datetime import date
 from functools import wraps
 from pathlib import Path
-from typing import Callable
+from typing import Annotated, Callable
+
+from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
@@ -148,14 +150,20 @@ def list_accounts(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def list_commodities() -> str:
+def list_commodities(verbose: bool = False) -> str:
     """List all commodities (currencies, stocks, etc.) in the book.
 
-    Returns commodities grouped by namespace with their mnemonic, fullname, and fraction.
+    Returns a compact one-line-per-commodity format by default.
+    Use verbose=true for full JSON with fraction, latest prices, etc.
+
+    Args:
+        verbose: If true, return full JSON details for each commodity.
     """
     book = get_book()
-    result = book.list_commodities()
-    return _json(result)
+    result = book.list_commodities(compact=not verbose)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -382,11 +390,13 @@ def list_transactions(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def get_transaction(guid: str) -> str:
+def get_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+) -> str:
     """Get details for a specific transaction by GUID.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
     """
     book = get_book()
     result = book.get_transaction(guid)
@@ -567,14 +577,17 @@ def delete_account(name: str) -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="transaction")
-def delete_transaction(guid: str, force: bool = False) -> str:
+def delete_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+    force: bool = False,
+) -> str:
     """Delete a transaction by GUID.
 
     Safeguards prevent deletion if the transaction has reconciled splits.
     Use force=true to override.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
         force: Allow deleting transactions with reconciled splits
     """
     book = get_book()
@@ -586,7 +599,7 @@ def delete_transaction(guid: str, force: bool = False) -> str:
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="transaction")
 def update_transaction(
-    guid: str,
+    guid: Annotated[str, Field(description="Transaction GUID to update (32-character hex string, or 8+ char prefix)")],
     description: str | None = None,
     transaction_date: str | None = None,
     splits: list[dict] | None = None,
@@ -596,7 +609,7 @@ def update_transaction(
     """Update an existing transaction.
 
     Args:
-        guid: Transaction GUID to update
+        guid: Transaction GUID to update (32-character hex string, or 8+ char prefix)
         description: New transaction description (optional)
         transaction_date: New date in ISO format YYYY-MM-DD (optional)
         splits: List of split updates with 'account' and 'amount' (optional).
@@ -622,7 +635,7 @@ def update_transaction(
 @safe_tool
 @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
 def replace_splits(
-    guid: str,
+    guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
     splits: list[dict],
     force: bool = False,
 ) -> str:
@@ -633,7 +646,7 @@ def replace_splits(
     New splits must balance to zero.
 
     Args:
-        guid: Transaction GUID (32-character hex string)
+        guid: Transaction GUID (32-character hex string, or 8+ char prefix)
         splits: Complete new set of splits. Each split needs:
             - 'account' (required): Full account path
             - 'amount' (required): Value in transaction currency
@@ -658,14 +671,14 @@ def replace_splits(
 @safe_tool
 @audit_log(classification="write", operation="set_state", entity_type="split")
 def set_reconcile_state(
-    split_guid: str,
+    split_guid: Annotated[str, Field(description="GUID of the split to update (32-character hex string, or 8+ char prefix)")],
     state: str,
     reconcile_date: str | None = None,
 ) -> str:
     """Set the reconciliation state for a split.
 
     Args:
-        split_guid: GUID of the split to update
+        split_guid: GUID of the split to update (32-character hex string, or 8+ char prefix)
         state: New reconcile state: 'n' (new), 'c' (cleared), 'y' (reconciled)
         reconcile_date: Date in ISO format (YYYY-MM-DD). Required for 'y', defaults to today.
     """
@@ -685,20 +698,28 @@ def set_reconcile_state(
 def get_unreconciled_splits(
     account: str,
     as_of_date: str | None = None,
+    verbose: bool = False,
 ) -> str:
     """Get all unreconciled splits for an account.
+
+    Returns a compact one-line-per-split format by default with a summary footer.
+    Use verbose=true for full JSON with split GUIDs, amounts, and totals.
 
     Args:
         account: Full account name (e.g., 'Assets:Bank:Checking')
         as_of_date: Only include splits on or before this date (YYYY-MM-DD)
+        verbose: If true, return full JSON details. Default compact one-line format.
     """
     book = get_book()
     date_obj = date.fromisoformat(as_of_date) if as_of_date else None
     result = book.get_unreconciled_splits(
         account_name=account,
         as_of_date=date_obj,
+        compact=not verbose,
     )
-    return _json(result)
+    if verbose:
+        return _json(result)
+    return result
 
 
 @mcp.tool()
@@ -708,7 +729,7 @@ def reconcile_account(
     account: str,
     statement_date: str,
     statement_balance: str,
-    split_guids: list[str],
+    split_guids: Annotated[list[str], Field(description="List of split GUIDs to mark as reconciled (8+ char prefixes accepted)")],
 ) -> str:
     """Reconcile multiple splits against a statement balance.
 
@@ -720,7 +741,7 @@ def reconcile_account(
         account: Full account name (e.g., 'Assets:Bank:Checking')
         statement_date: Statement ending date (YYYY-MM-DD)
         statement_balance: Expected balance from statement (as string, e.g., '1234.56')
-        split_guids: List of split GUIDs to mark as reconciled
+        split_guids: List of split GUIDs to mark as reconciled (8+ char prefixes accepted)
     """
     book = get_book()
     stmt_date = date.fromisoformat(statement_date)
@@ -739,7 +760,10 @@ def reconcile_account(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="void", entity_type="transaction")
-def void_transaction(guid: str, reason: str) -> str:
+def void_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID to void (32-character hex string, or 8+ char prefix)")],
+    reason: str,
+) -> str:
     """Void a transaction (proper accounting void, not delete).
 
     Voiding preserves the transaction for audit purposes but zeroes out
@@ -747,7 +771,7 @@ def void_transaction(guid: str, reason: str) -> str:
     an audit trail.
 
     Args:
-        guid: Transaction GUID to void
+        guid: Transaction GUID to void (32-character hex string, or 8+ char prefix)
         reason: Reason for voiding (required for audit trail)
     """
     book = get_book()
@@ -758,13 +782,15 @@ def void_transaction(guid: str, reason: str) -> str:
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="unvoid", entity_type="transaction")
-def unvoid_transaction(guid: str) -> str:
+def unvoid_transaction(
+    guid: Annotated[str, Field(description="Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)")],
+) -> str:
     """Restore a voided transaction.
 
     Restores original split values and removes void markers.
 
     Args:
-        guid: Transaction GUID to unvoid
+        guid: Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)
     """
     book = get_book()
     result = book.unvoid_transaction(guid=guid)
@@ -1130,13 +1156,13 @@ def get_upcoming_transactions(
 @safe_tool
 @audit_log(classification="write", operation="create", entity_type="transaction")
 def create_transaction_from_scheduled(
-    guid: str,
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
     transaction_date: str | None = None,
 ) -> str:
     """Create an actual transaction from a scheduled template.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
         transaction_date: Date for the transaction. Defaults to next occurrence.
     """
     book = get_book()
@@ -1151,14 +1177,14 @@ def create_transaction_from_scheduled(
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="scheduled_transaction")
 def update_scheduled_transaction(
-    guid: str,
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
     enabled: bool | None = None,
     end_date: str | None = None,
 ) -> str:
     """Update a scheduled transaction.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
         enabled: Enable or disable.
         end_date: Set end date (empty string to clear).
     """
@@ -1174,13 +1200,15 @@ def update_scheduled_transaction(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="delete", entity_type="scheduled_transaction")
-def delete_scheduled_transaction(guid: str) -> str:
+def delete_scheduled_transaction(
+    guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
+) -> str:
     """Delete a scheduled transaction.
 
     Does not affect transactions already created from this schedule.
 
     Args:
-        guid: Scheduled transaction GUID.
+        guid: Scheduled transaction GUID (or 8+ char prefix).
     """
     book = get_book()
     result = book.delete_scheduled_transaction(guid=guid)
@@ -1241,11 +1269,13 @@ def list_lots(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="read")
-def get_lot(guid: str) -> str:
+def get_lot(
+    guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+) -> str:
     """Get detailed information about a lot.
 
     Args:
-        guid: Lot GUID.
+        guid: Lot GUID (or 8+ char prefix).
 
     Returns:
         JSON with lot details including all splits:
@@ -1262,8 +1292,8 @@ def get_lot(guid: str) -> str:
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="lot")
 def assign_split_to_lot(
-    split_guid: str,
-    lot_guid: str,
+    split_guid: Annotated[str, Field(description="GUID of the split (from transaction's investment account). 8+ char prefix accepted.")],
+    lot_guid: Annotated[str, Field(description="GUID of the lot (or 8+ char prefix)")],
 ) -> str:
     """Assign a transaction split to a lot.
 
@@ -1271,8 +1301,8 @@ def assign_split_to_lot(
     account split to its lot for cost basis tracking.
 
     Args:
-        split_guid: GUID of the split (from transaction's investment account).
-        lot_guid: GUID of the lot.
+        split_guid: GUID of the split (from transaction's investment account). 8+ char prefix accepted.
+        lot_guid: GUID of the lot (or 8+ char prefix).
 
     Workflow:
         1. create_lot("Assets:VTSAX", "VTSAX Jan 2026")
@@ -1288,7 +1318,7 @@ def assign_split_to_lot(
 @safe_tool
 @audit_log(classification="read")
 def calculate_lot_gain(
-    lot_guid: str,
+    lot_guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
     shares: str | None = None,
     sale_price: str | None = None,
 ) -> str:
@@ -1298,7 +1328,7 @@ def calculate_lot_gain(
     Otherwise uses lot's current state and latest price.
 
     Args:
-        lot_guid: Lot GUID.
+        lot_guid: Lot GUID (or 8+ char prefix).
         shares: Optional number of shares to calculate for.
                 Defaults to all remaining shares.
         sale_price: Optional sale price per share.
@@ -1314,14 +1344,16 @@ def calculate_lot_gain(
 @mcp.tool()
 @safe_tool
 @audit_log(classification="write", operation="update", entity_type="lot")
-def close_lot(guid: str) -> str:
+def close_lot(
+    guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+) -> str:
     """Mark a lot as closed.
 
     Use when a lot is fully sold but wasn't automatically marked closed,
     or to manually close a lot with zero shares.
 
     Args:
-        guid: Lot GUID.
+        guid: Lot GUID (or 8+ char prefix).
 
     Note:
         Lots are automatically marked closed when their quantity reaches zero

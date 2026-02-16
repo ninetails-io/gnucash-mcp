@@ -116,6 +116,44 @@ def _transaction_to_dict(transaction: piecash.Transaction) -> dict:
     return result
 
 
+def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
+    """Convert a commodity dict to a compact one-line tab-separated string.
+
+    Format: "NAMESPACE:MNEMONIC\\tfullname\\tprice_info"
+
+    Examples:
+        "CURRENCY:USD\\tUS Dollar"
+        "FUND:VTSAX\\tVanguard Total Stock Market\\t128.75 USD (2026-02-07)"
+    """
+    prefix = f"{namespace}:{entry['mnemonic']}"
+    name = entry.get("fullname", "")
+    parts = [prefix, name]
+    lp = entry.get("latest_price")
+    if lp:
+        parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
+    return "\t".join(parts)
+
+
+def _unreconciled_split_to_compact_line(split_dict: dict) -> str:
+    """Convert an unreconciled split dict to a compact one-line tab-separated string.
+
+    Format: "short_guid\\tYYYY-MM-DD\\tdescription\\tamount\\tstate"
+
+    The account name is omitted — the caller already knows which account
+    was queried. State is 'n' (new) or 'c' (cleared).
+
+    Examples:
+        "a1b2c3d4\\t2026-01-15\\tSafeway\\t-47.50\\tn"
+        "e5f6a7b8\\t2026-01-20\\tPayroll\\t3200.00\\tc"
+    """
+    short_guid = split_dict["guid"][:8]
+    d = split_dict["date"]
+    desc = split_dict["description"]
+    amount = split_dict["amount"]
+    state = split_dict["reconcile_state"]
+    return f"{short_guid}\t{d}\t{desc}\t{amount}\t{state}"
+
+
 def _transaction_to_compact_line(
     transaction: piecash.Transaction, exclude_account: str | None = None,
 ) -> str:
@@ -722,12 +760,16 @@ class GnuCashBook:
             return json.loads(row[0])
         return []
 
-    def list_commodities(self) -> dict:
+    def list_commodities(self, compact: bool = True) -> dict | str:
         """List all commodities in the book with latest prices.
 
+        Args:
+            compact: If True (default), return compact one-line-per-commodity
+                     string. If False, return full dict grouped by namespace.
+
         Returns:
-            Dict with commodities grouped by namespace, plus the default currency.
-            Non-currency commodities include their latest price when available.
+            If compact: newline-separated string of commodity lines.
+            If not compact: dict with commodities grouped by namespace.
         """
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
@@ -767,10 +809,19 @@ class GnuCashBook:
             for ns in by_namespace:
                 by_namespace[ns].sort(key=lambda c: c["mnemonic"])
 
-            return {
+            result = {
                 "default_currency": book.default_currency.mnemonic,
                 "commodities": by_namespace,
             }
+
+            if compact:
+                lines = []
+                for ns, entries in sorted(by_namespace.items()):
+                    for entry in entries:
+                        lines.append(_commodity_to_compact_line(ns, entry))
+                return "\n".join(lines)
+            else:
+                return result
 
     def create_commodity(
         self,
@@ -2570,15 +2621,20 @@ class GnuCashBook:
         self,
         account_name: str,
         as_of_date: date | None = None,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get all unreconciled splits for an account.
 
         Args:
             account_name: Full account path.
             as_of_date: Only include splits on or before this date.
+            compact: If True (default), return a compact newline-separated
+                     string with one line per split plus a summary footer.
+                     If False, return the full dict with splits list.
 
         Returns:
-            Dict with account info, splits list, and running totals.
+            If compact: newline-separated string of split lines with summary.
+            If not compact: dict with account info, splits list, and totals.
 
         Raises:
             ValueError: If account not found.
@@ -2620,7 +2676,7 @@ class GnuCashBook:
                     else:
                         uncleared_total += split.quantity
 
-            return {
+            result = {
                 "account": account_name,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
                 "splits": unreconciled,
@@ -2628,6 +2684,14 @@ class GnuCashBook:
                 "uncleared_total": str(uncleared_total),
                 "count": len(unreconciled),
             }
+
+            if compact:
+                lines = [_unreconciled_split_to_compact_line(s) for s in unreconciled]
+                footer = f"{len(unreconciled)} splits\tcleared:{cleared_total}\tuncleared:{uncleared_total}"
+                lines.append(footer)
+                return "\n".join(lines)
+            else:
+                return result
 
     def reconcile_account(
         self,

@@ -2442,7 +2442,7 @@ class TestGetUnreconciledSplits:
         """Should return unreconciled splits for account."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.get_unreconciled_splits("Assets:Checking")
+        result = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
 
         assert "splits" in result
         assert "cleared_total" in result
@@ -2457,7 +2457,7 @@ class TestGetUnreconciledSplits:
 
         # Get splits before a specific date
         result = gc_book.get_unreconciled_splits(
-            "Assets:Checking", as_of_date=date(2024, 1, 10)
+            "Assets:Checking", as_of_date=date(2024, 1, 10), compact=False,
         )
 
         # All returned splits should be on or before the date
@@ -2480,7 +2480,7 @@ class TestReconcileAccount:
         gc_book = GnuCashBook(str(test_book))
 
         # Get unreconciled splits
-        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
 
         # Calculate what the balance should be
         total = Decimal("0")
@@ -2504,7 +2504,7 @@ class TestReconcileAccount:
         """Should raise ValueError when balance doesn't match."""
         gc_book = GnuCashBook(str(test_book))
 
-        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking")
+        unreconciled = gc_book.get_unreconciled_splits("Assets:Checking", compact=False)
         guids = [s["guid"] for s in unreconciled["splits"]]
 
         with pytest.raises(ValueError, match="Balance mismatch"):
@@ -2786,7 +2786,7 @@ class TestListCommodities:
     def test_list_commodities(self, test_book: Path):
         """Should return commodities grouped by namespace."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_commodities()
+        result = gc_book.list_commodities(compact=False)
 
         assert "default_currency" in result
         assert result["default_currency"] == "USD"
@@ -2800,7 +2800,7 @@ class TestListCommodities:
     def test_list_commodities_structure(self, test_book: Path):
         """Should return proper structure for each commodity."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_commodities()
+        result = gc_book.list_commodities(compact=False)
 
         currencies = result["commodities"]["CURRENCY"]
         for commodity in currencies:
@@ -2874,7 +2874,7 @@ class TestCreateAccountWithCurrency:
         assert result["status"] == "created"
 
         # Verify GBP is now in the commodities list
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         mnemonics = [c["mnemonic"] for c in commodities["commodities"]["CURRENCY"]]
         assert "GBP" in mnemonics
 
@@ -3126,7 +3126,7 @@ class TestCreateCommodity:
         assert result["fraction"] == 10000
 
         # Verify it appears in list_commodities
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         assert "FUND" in commodities["commodities"]
         mnemonics = [c["mnemonic"] for c in commodities["commodities"]["FUND"]]
         assert "VTSAX" in mnemonics
@@ -3166,7 +3166,7 @@ class TestCreateCommodity:
         assert result1["status"] == "created"
         assert result2["status"] == "created"
 
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         assert "FUND" in commodities["commodities"]
         assert "NASDAQ" in commodities["commodities"]
 
@@ -3580,7 +3580,7 @@ class TestInvestmentWorkflow:
             value="128.75", price_date=date(2026, 2, 7),
         )
 
-        commodities = gc_book.list_commodities()
+        commodities = gc_book.list_commodities(compact=False)
         fund_entries = commodities["commodities"]["FUND"]
         vtsax = next(c for c in fund_entries if c["mnemonic"] == "VTSAX")
 

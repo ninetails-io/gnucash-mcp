@@ -678,7 +678,7 @@ class TestGetUnreconciledSplitsTool:
 
     def test_get_unreconciled_splits(self, setup_book_env):
         """Should return unreconciled splits for account."""
-        result = server_module.get_unreconciled_splits("Assets:Checking")
+        result = server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
 
         data = json.loads(result)
         assert "splits" in data
@@ -702,7 +702,7 @@ class TestReconcileAccountTool:
 
         # Get unreconciled splits
         unreconciled = json.loads(
-            server_module.get_unreconciled_splits("Assets:Checking")
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
         )
 
         # Calculate expected balance
@@ -725,7 +725,7 @@ class TestReconcileAccountTool:
     def test_reconcile_account_balance_mismatch(self, setup_book_env):
         """Should return error when balance doesn't match."""
         unreconciled = json.loads(
-            server_module.get_unreconciled_splits("Assets:Checking")
+            server_module.get_unreconciled_splits("Assets:Checking", verbose=True)
         )
         guids = [s["guid"] for s in unreconciled["splits"]]
 
@@ -973,7 +973,7 @@ class TestListCommoditiesTool:
 
     def test_list_commodities(self, setup_book_env):
         """Should return commodities grouped by namespace."""
-        result = server_module.list_commodities()
+        result = server_module.list_commodities(verbose=True)
 
         data = json.loads(result)
         assert "default_currency" in data
@@ -983,7 +983,7 @@ class TestListCommoditiesTool:
 
     def test_list_commodities_includes_usd(self, setup_book_env):
         """Should include USD in currency commodities."""
-        result = server_module.list_commodities()
+        result = server_module.list_commodities(verbose=True)
 
         data = json.loads(result)
         mnemonics = [c["mnemonic"] for c in data["commodities"]["CURRENCY"]]

@@ -353,7 +353,7 @@ gnucash-mcp/
 - [x] Partial GUID support (8+ character prefixes)
 - [ ] CSV export
 - [ ] CSV/OFX import
-- [ ] Duplicate detection
+- [x] Duplicate detection (built into `create_transaction`)
 
 ---
 
