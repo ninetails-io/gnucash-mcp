@@ -250,17 +250,26 @@ class GnuCashBook:
     def _find_transaction(
         self, book: piecash.Book, guid: str
     ) -> piecash.Transaction | None:
-        """Find a transaction by GUID.
+        """Find a transaction by GUID or partial GUID prefix.
 
         Args:
             book: Open piecash book.
-            guid: Transaction GUID (32-character hex string).
+            guid: Transaction GUID (full 32-char or 8+ char prefix).
 
         Returns:
             Transaction if found, None otherwise.
+
+        Raises:
+            ValueError: If partial GUID is ambiguous (matches multiple).
         """
+        try:
+            full_guid = self._resolve_guid("transactions", guid)
+        except ValueError as e:
+            if "No transaction" in str(e):
+                return None
+            raise
         for transaction in book.transactions:
-            if transaction.guid == guid:
+            if transaction.guid == full_guid:
                 return transaction
         return None
 
@@ -2342,18 +2351,27 @@ class GnuCashBook:
             return result
 
     def _find_split(self, book: piecash.Book, guid: str) -> piecash.Split | None:
-        """Find a split by GUID.
+        """Find a split by GUID or partial GUID prefix.
 
         Args:
             book: Open piecash book.
-            guid: Split GUID.
+            guid: Split GUID (full 32-char or 8+ char prefix).
 
         Returns:
             Split if found, None otherwise.
+
+        Raises:
+            ValueError: If partial GUID is ambiguous (matches multiple).
         """
+        try:
+            full_guid = self._resolve_guid("splits", guid)
+        except ValueError as e:
+            if "No split" in str(e):
+                return None
+            raise
         for transaction in book.transactions:
             for split in transaction.splits:
-                if split.guid == guid:
+                if split.guid == full_guid:
                     return split
         return None
 
