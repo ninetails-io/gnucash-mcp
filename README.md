@@ -239,9 +239,35 @@ This server **writes to your GnuCash book**. Before first use:
 | Variable | Description |
 |----------|-------------|
 | `GNUCASH_BOOK_PATH` | Path to your GnuCash SQLite book (required) |
+| `GNUCASH_MCP_MODULES` | Tool modules to load (e.g., `core,reporting`). Default: `core` |
 | `GNUCASH_MCP_DEBUG` | Set to `1` for debug logging |
 | `GNUCASH_MCP_NOAUDIT` | Set to `1` to disable audit logging |
 | `GNUCASH_MCP_AUDIT_FORMAT` | `text` (default) or `json` |
+
+### Tool Modules
+
+By default, only the **core** module (15 tools) is loaded to minimize context usage. Load additional modules as needed:
+
+```bash
+# Default: core only (15 tools — accounts, transactions, book summary)
+gnucash-mcp
+
+# All 52 tools
+gnucash-mcp --modules=all
+
+# Mix and match
+gnucash-mcp --modules=core,reporting,reconciliation
+```
+
+| Module | Tools | Description |
+|--------|-------|-------------|
+| `core` | 15 | Accounts, transactions, book summary (always loaded) |
+| `reconciliation` | 5 | Unreconciled splits, reconcile, void/unvoid |
+| `reporting` | 5 | Spending, income, balance sheet, net worth, cash flow |
+| `budgets` | 6 | Budget CRUD and variance reports |
+| `scheduling` | 6 | Recurring transactions and upcoming bills |
+| `investments` | 11 | Commodities, prices, lots, cost basis |
+| `admin` | 4 | Account metadata slots, audit log |
 
 ### Claude Code
 
@@ -252,7 +278,7 @@ claude mcp add-json gnucash \
   '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
 ```
 
-Replace both paths with your actual paths. Add `"--debug"` or `"--audit-format=text"` to the args array as needed.
+Replace both paths with your actual paths. Add `"--modules=all"`, `"--debug"`, or `"--audit-format=text"` to the args array as needed.
 
 ### Other MCP Clients
 
