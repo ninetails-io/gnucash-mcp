@@ -1,8 +1,15 @@
-"""Tests for tool module filtering."""
+"""Tests for tool module filtering and server configuration."""
 
 import pytest
 
-from gnucash_mcp.server import TOOL_MODULES, _apply_module_filter, _validate_tool_modules, mcp
+from gnucash_mcp.server import (
+    TOOL_MODULES,
+    _apply_module_filter,
+    _get_server_config_impl,
+    _server_state,
+    _validate_tool_modules,
+    mcp,
+)
 
 
 class TestToolModulesMapping:
@@ -136,3 +143,82 @@ class TestApplyModuleFilter:
         registered = set(dict(mcp._tool_manager._tools).keys())
         # All remaining tools should be valid registered tools
         assert remaining == registered
+
+    def test_returns_loaded_modules_sorted(self):
+        """Return value should be sorted list of actually loaded modules."""
+        result = _apply_module_filter("reporting,budgets")
+        # core is always added, result should be sorted
+        assert result == ["budgets", "core", "reporting"]
+
+    def test_returns_all_modules_for_all(self):
+        """'all' should return all module names sorted."""
+        result = _apply_module_filter("all")
+        assert result == sorted(TOOL_MODULES.keys())
+
+    def test_returns_core_for_none(self):
+        """None should return just core."""
+        result = _apply_module_filter(None)
+        assert result == ["core"]
+
+    def test_returns_excludes_unknown_modules(self):
+        """Unknown module names should not appear in return value."""
+        result = _apply_module_filter("reporting,nonexistent")
+        assert "nonexistent" not in result
+        assert "core" in result
+        assert "reporting" in result
+
+
+class TestGetServerConfig:
+    """Tests for the debug-only get_server_config tool."""
+
+    @pytest.fixture(autouse=True)
+    def save_and_restore_state(self):
+        """Save server state before test, restore after."""
+        original = dict(_server_state)
+        yield
+        _server_state.clear()
+        _server_state.update(original)
+
+    def test_impl_returns_all_fields(self):
+        """Output should contain all five diagnostic fields."""
+        _server_state.update({
+            "modules": "core,reporting",
+            "tool_count": 20,
+            "book_path": "/tmp/test.gnucash",
+            "debug": True,
+        })
+        output = _get_server_config_impl()
+        assert "Modules loaded: core,reporting" in output
+        assert "Tools available: 20" in output
+        assert "Book path: /tmp/test.gnucash" in output
+        assert "Debug mode: true" in output
+        assert "Version:" in output
+
+    def test_impl_defaults_when_state_empty(self):
+        """Output should handle missing state gracefully."""
+        _server_state.clear()
+        output = _get_server_config_impl()
+        assert "Modules loaded: unknown" in output
+        assert "Tools available: unknown" in output
+        assert "Book path: not set" in output
+        assert "Debug mode: false" in output
+
+    def test_impl_output_is_plain_text(self):
+        """Output should be plain text, not JSON."""
+        _server_state.update({
+            "modules": "all",
+            "tool_count": 53,
+            "book_path": "/tmp/test.gnucash",
+            "debug": True,
+        })
+        output = _get_server_config_impl()
+        assert not output.startswith("{")
+        lines = output.strip().split("\n")
+        assert len(lines) == 5
+
+    def test_not_registered_by_default(self):
+        """get_server_config should not be in TOOL_MODULES or registered at import time."""
+        all_module_tools = set()
+        for tools in TOOL_MODULES.values():
+            all_module_tools.update(tools)
+        assert "get_server_config" not in all_module_tools

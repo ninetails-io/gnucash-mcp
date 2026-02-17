@@ -136,18 +136,21 @@ def _validate_tool_modules() -> None:
         )
 
 
-def _apply_module_filter(modules_str: str | None) -> None:
+def _apply_module_filter(modules_str: str | None) -> list[str]:
     """Remove tools not in the selected modules from the FastMCP registry.
 
     Args:
         modules_str: Comma-separated module names, "all", or None (core only).
+
+    Returns:
+        Sorted list of module names that were actually loaded.
     """
     if modules_str is None:
         enabled_modules = {"core"}
     else:
         enabled_modules = {m.strip() for m in modules_str.split(",")}
         if "all" in enabled_modules:
-            return  # Keep everything
+            return sorted(TOOL_MODULES.keys())
         # Validate module names
         unknown = enabled_modules - set(TOOL_MODULES.keys())
         if unknown:
@@ -161,9 +164,11 @@ def _apply_module_filter(modules_str: str | None) -> None:
 
     # Build the set of tool names to keep
     keep: set[str] = set()
-    for mod_name in enabled_modules:
+    valid_modules: list[str] = []
+    for mod_name in sorted(enabled_modules):
         if mod_name in TOOL_MODULES:
             keep.update(TOOL_MODULES[mod_name])
+            valid_modules.append(mod_name)
 
     # Remove tools not in the keep set
     all_registered = list(mcp._tool_manager._tools.keys())
@@ -171,6 +176,11 @@ def _apply_module_filter(modules_str: str | None) -> None:
         if tool_name not in keep:
             mcp.remove_tool(tool_name)
 
+    return valid_modules
+
+
+# Runtime server state — populated by main(), read by get_server_config tool
+_server_state: dict = {}
 
 # Global book instance - initialized on first use
 _book: GnuCashBook | None = None
@@ -1683,6 +1693,27 @@ def get_audit_log(
     return _json({"entries": entries[-limit:], "total_count": len(entries)})
 
 
+# ============== Debug Tool (conditionally registered) ==============
+
+
+def _get_server_config_impl() -> str:
+    """Return current server configuration and runtime state.
+
+    Only available when the server is started with --debug.
+    Reports loaded modules, tool count, book path, and version
+    so the client can verify its own tool inventory.
+    """
+    from gnucash_mcp import __version__
+    lines = [
+        f"Modules loaded: {_server_state.get('modules', 'unknown')}",
+        f"Tools available: {_server_state.get('tool_count', 'unknown')}",
+        f"Book path: {_server_state.get('book_path', 'not set')}",
+        f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
+        f"Version: {__version__}",
+    ]
+    return "\n".join(lines)
+
+
 # ============== Main ==============
 
 
@@ -1760,11 +1791,39 @@ Logs are stored alongside the book file:
 
     # Validate and apply module filter
     _validate_tool_modules()
-    _apply_module_filter(modules_value)
+    loaded_modules = _apply_module_filter(modules_value)
+
+    # Populate runtime state and conditionally register debug tool
+    tool_count = len(mcp._tool_manager._tools)
+    modules_display = ", ".join(loaded_modules)
+    _server_state.update({
+        "modules": modules_display,
+        "tool_count": tool_count,
+        "book_path": book_path or "not set",
+        "debug": debug_flag,
+    })
 
     if debug_flag:
-        debug_log(f"Modules: {modules_value or 'core (default)'}")
-        debug_log(f"Tools loaded: {len(mcp._tool_manager._tools)}")
+        # Register the debug-only diagnostic tool
+        @mcp.tool()
+        @safe_tool
+        def get_server_config() -> str:
+            """Get the server's loaded configuration.
+
+            Returns loaded modules, tool count, book path, debug mode,
+            and version. Only available when server is started with --debug.
+            Use this to verify which tools are available in this session.
+            """
+            return _get_server_config_impl()
+
+        # Update tool count to include the newly registered tool
+        _server_state["tool_count"] = len(mcp._tool_manager._tools)
+        debug_log(f"Modules: {modules_display}")
+        debug_log(f"Tools loaded: {_server_state['tool_count']}")
+    else:
+        if _debug_mode:
+            debug_log(f"Modules: {modules_display}")
+            debug_log(f"Tools loaded: {tool_count}")
 
     mcp.run()
 
