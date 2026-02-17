@@ -38,6 +38,150 @@ logger = logging.getLogger(__name__)
 # Create FastMCP server
 mcp = FastMCP("gnucash-mcp")
 
+# ---------------------------------------------------------------------------
+# Tool module definitions — controls which tools are advertised via --modules
+# ---------------------------------------------------------------------------
+TOOL_MODULES: dict[str, list[str]] = {
+    "core": [
+        "get_book_summary",
+        "list_accounts",
+        "get_account",
+        "get_balance",
+        "create_account",
+        "update_account",
+        "move_account",
+        "delete_account",
+        "list_transactions",
+        "get_transaction",
+        "create_transaction",
+        "update_transaction",
+        "delete_transaction",
+        "replace_splits",
+        "search_transactions",
+    ],
+    "reconciliation": [
+        "get_unreconciled_splits",
+        "set_reconcile_state",
+        "reconcile_account",
+        "void_transaction",
+        "unvoid_transaction",
+    ],
+    "reporting": [
+        "spending_by_category",
+        "income_by_source",
+        "balance_sheet",
+        "net_worth",
+        "cash_flow",
+    ],
+    "budgets": [
+        "list_budgets",
+        "get_budget",
+        "create_budget",
+        "set_budget_amount",
+        "get_budget_report",
+        "delete_budget",
+    ],
+    "scheduling": [
+        "create_scheduled_transaction",
+        "list_scheduled_transactions",
+        "get_upcoming_transactions",
+        "create_transaction_from_scheduled",
+        "update_scheduled_transaction",
+        "delete_scheduled_transaction",
+    ],
+    "investments": [
+        "list_commodities",
+        "create_commodity",
+        "create_price",
+        "get_prices",
+        "get_latest_price",
+        "create_lot",
+        "list_lots",
+        "get_lot",
+        "assign_split_to_lot",
+        "calculate_lot_gain",
+        "close_lot",
+    ],
+    "admin": [
+        "get_account_slots",
+        "set_account_slot",
+        "delete_account_slot",
+        "get_audit_log",
+    ],
+}
+
+
+def _validate_tool_modules() -> None:
+    """Verify every registered tool belongs to exactly one module.
+
+    Developer guard — catches the case where a tool is added but not
+    placed in TOOL_MODULES, or a module lists a tool that doesn't exist.
+    """
+    all_mapped: set[str] = set()
+    for tools in TOOL_MODULES.values():
+        all_mapped.update(tools)
+
+    registered = set(mcp._tool_manager._tools.keys())
+    unmapped = registered - all_mapped
+    if unmapped:
+        raise RuntimeError(
+            f"Tools registered but not in TOOL_MODULES: {sorted(unmapped)}. "
+            f"Add them to the appropriate module."
+        )
+    phantom = all_mapped - registered
+    if phantom:
+        raise RuntimeError(
+            f"Tools in TOOL_MODULES but not registered: {sorted(phantom)}. "
+            f"Remove them from TOOL_MODULES or register the tools."
+        )
+
+
+def _apply_module_filter(modules_str: str | None) -> list[str]:
+    """Remove tools not in the selected modules from the FastMCP registry.
+
+    Args:
+        modules_str: Comma-separated module names, "all", or None (core only).
+
+    Returns:
+        Sorted list of module names that were actually loaded.
+    """
+    if modules_str is None:
+        enabled_modules = {"core"}
+    else:
+        enabled_modules = {m.strip() for m in modules_str.split(",")}
+        if "all" in enabled_modules:
+            return sorted(TOOL_MODULES.keys())
+        # Validate module names
+        unknown = enabled_modules - set(TOOL_MODULES.keys())
+        if unknown:
+            print(
+                f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
+                f"Available: {', '.join(sorted(TOOL_MODULES.keys()))}, all",
+                file=sys.stderr,
+            )
+        # core is always included
+        enabled_modules.add("core")
+
+    # Build the set of tool names to keep
+    keep: set[str] = set()
+    valid_modules: list[str] = []
+    for mod_name in sorted(enabled_modules):
+        if mod_name in TOOL_MODULES:
+            keep.update(TOOL_MODULES[mod_name])
+            valid_modules.append(mod_name)
+
+    # Remove tools not in the keep set
+    all_registered = list(mcp._tool_manager._tools.keys())
+    for tool_name in all_registered:
+        if tool_name not in keep:
+            mcp.remove_tool(tool_name)
+
+    return valid_modules
+
+
+# Runtime server state — populated by main(), read by get_server_config tool
+_server_state: dict = {}
+
 # Global book instance - initialized on first use
 _book: GnuCashBook | None = None
 
@@ -1549,6 +1693,27 @@ def get_audit_log(
     return _json({"entries": entries[-limit:], "total_count": len(entries)})
 
 
+# ============== Debug Tool (conditionally registered) ==============
+
+
+def _get_server_config_impl() -> str:
+    """Return current server configuration and runtime state.
+
+    Only available when the server is started with --debug.
+    Reports loaded modules, tool count, book path, and version
+    so the client can verify its own tool inventory.
+    """
+    from gnucash_mcp import __version__
+    lines = [
+        f"Modules loaded: {_server_state.get('modules', 'unknown')}",
+        f"Tools available: {_server_state.get('tool_count', 'unknown')}",
+        f"Book path: {_server_state.get('book_path', 'not set')}",
+        f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
+        f"Version: {__version__}",
+    ]
+    return "\n".join(lines)
+
+
 # ============== Main ==============
 
 
@@ -1561,13 +1726,18 @@ def main() -> None:
 Usage: gnucash-mcp [OPTIONS]
 
 Options:
-  --debug                Enable debug logging (MCP protocol traffic, timing)
-  --noaudit              Disable audit logging
+  --modules=MODULES    Tool modules to load (comma-separated).
+                       Default: core (15 tools). Use "all" for all 52 tools.
+                       Available: core, reconciliation, reporting, budgets,
+                       scheduling, investments, admin
+  --debug              Enable debug logging (MCP protocol traffic, timing)
+  --noaudit            Disable audit logging
   --audit-format=FORMAT  Audit log format: "text" (default) or "json"
-  -h, --help             Show this help message
+  -h, --help           Show this help message
 
 Environment variables:
   GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required)
+  GNUCASH_MCP_MODULES        Tool modules to load (e.g., "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
   GNUCASH_MCP_AUDIT_FORMAT   Audit format: "text" or "json"
@@ -1584,17 +1754,25 @@ Logs are stored alongside the book file:
     debug_flag = "--debug" in sys.argv
     noaudit_flag = "--noaudit" in sys.argv
     audit_format = "text"  # default
+    modules_value = None
 
-    # Parse --audit-format=json or --audit-format=text
+    # Parse --key=value flags
     for arg in sys.argv[:]:
         if arg.startswith("--audit-format="):
             audit_format = arg.split("=", 1)[1]
+            sys.argv.remove(arg)
+        elif arg.startswith("--modules="):
+            modules_value = arg.split("=", 1)[1]
             sys.argv.remove(arg)
 
     if "--debug" in sys.argv:
         sys.argv.remove("--debug")
     if "--noaudit" in sys.argv:
         sys.argv.remove("--noaudit")
+
+    # Env var fallback for modules (CLI flag takes precedence)
+    if modules_value is None:
+        modules_value = os.environ.get("GNUCASH_MCP_MODULES")
 
     # Re-init logging if CLI flags override env vars
     if debug_flag or noaudit_flag or audit_format != "text":
@@ -1610,6 +1788,42 @@ Logs are stored alongside the book file:
             if debug_flag:
                 debug_log(f"Server starting via CLI. Book: {book_path}")
                 debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}, format={audit_format}")
+
+    # Validate and apply module filter
+    _validate_tool_modules()
+    loaded_modules = _apply_module_filter(modules_value)
+
+    # Populate runtime state and conditionally register debug tool
+    tool_count = len(mcp._tool_manager._tools)
+    modules_display = ", ".join(loaded_modules)
+    _server_state.update({
+        "modules": modules_display,
+        "tool_count": tool_count,
+        "book_path": book_path or "not set",
+        "debug": debug_flag,
+    })
+
+    if debug_flag:
+        # Register the debug-only diagnostic tool
+        @mcp.tool()
+        @safe_tool
+        def get_server_config() -> str:
+            """Get the server's loaded configuration.
+
+            Returns loaded modules, tool count, book path, debug mode,
+            and version. Only available when server is started with --debug.
+            Use this to verify which tools are available in this session.
+            """
+            return _get_server_config_impl()
+
+        # Update tool count to include the newly registered tool
+        _server_state["tool_count"] = len(mcp._tool_manager._tools)
+        debug_log(f"Modules: {modules_display}")
+        debug_log(f"Tools loaded: {_server_state['tool_count']}")
+    else:
+        if _debug_mode:
+            debug_log(f"Modules: {modules_display}")
+            debug_log(f"Tools loaded: {tool_count}")
 
     mcp.run()
 

@@ -239,9 +239,37 @@ This server **writes to your GnuCash book**. Before first use:
 | Variable | Description |
 |----------|-------------|
 | `GNUCASH_BOOK_PATH` | Path to your GnuCash SQLite book (required) |
+| `GNUCASH_MCP_MODULES` | Tool modules to load (e.g., `core,reporting`). Default: `core` |
 | `GNUCASH_MCP_DEBUG` | Set to `1` for debug logging |
 | `GNUCASH_MCP_NOAUDIT` | Set to `1` to disable audit logging |
 | `GNUCASH_MCP_AUDIT_FORMAT` | `text` (default) or `json` |
+
+### Tool Modules
+
+By default, only the **core** module (15 tools) is loaded to minimize context usage. Load additional modules as needed:
+
+```bash
+# Default: core only (15 tools — accounts, transactions, book summary)
+gnucash-mcp
+
+# All 52 tools
+gnucash-mcp --modules=all
+
+# Mix and match
+gnucash-mcp --modules=core,reporting,reconciliation
+```
+
+| Module | Tools | Description |
+|--------|-------|-------------|
+| `core` | 15 | Accounts, transactions, book summary (always loaded) |
+| `reconciliation` | 5 | Unreconciled splits, reconcile, void/unvoid |
+| `reporting` | 5 | Spending, income, balance sheet, net worth, cash flow |
+| `budgets` | 6 | Budget CRUD and variance reports |
+| `scheduling` | 6 | Recurring transactions and upcoming bills |
+| `investments` | 11 | Commodities, prices, lots, cost basis |
+| `admin` | 4 | Account metadata slots, audit log |
+
+When `--debug` is set, an additional `get_server_config` diagnostic tool is registered. It reports loaded modules, tool count, book path, debug mode, and version — useful for verifying what the server actually loaded.
 
 ### Claude Code
 
@@ -252,7 +280,7 @@ claude mcp add-json gnucash \
   '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
 ```
 
-Replace both paths with your actual paths. Add `"--debug"` or `"--audit-format=text"` to the args array as needed.
+Replace both paths with your actual paths. Add `"--modules=all"`, `"--debug"`, or `"--audit-format=text"` to the args array as needed.
 
 ### Other MCP Clients
 
@@ -341,6 +369,59 @@ gnucash-mcp/
 
 ---
 
+## Changelog
+
+### v1.1.0 — Modular Tool Loading
+
+The context-efficiency release. Previous versions advertised all tools to every client, consuming system prompt tokens whether you needed investments or not.
+
+- **Tool modules** (`--modules=`): Load only the tool categories you need. Seven modules (core, reconciliation, reporting, budgets, scheduling, investments, admin) let you go from 52 tools down to as few as 15. Core is always loaded; `all` loads everything.
+- **`get_server_config` debug tool**: When `--debug` is set, a diagnostic tool reports loaded modules, tool count, book path, and version. Clients can verify their own inventory instead of guessing.
+- **`GNUCASH_MCP_MODULES` env var**: Configure modules without CLI flags — useful for Claude Desktop configs.
+- **Version**: 1.1.0 (424 tests)
+
+### v1.0.2 — Compact Output
+
+Reduced token usage on the *response* side. Every read tool that returned verbose JSON by default now returns compact one-line-per-item text instead.
+
+- **Compact default output** for list_transactions, list_commodities, list_scheduled_transactions, get_unreconciled_splits, list_lots — verbose JSON available via `verbose=true`
+- **`get_book_summary`**: Single-call financial snapshot — book path, account structure, key balances, net worth, commodities, and scheduled transactions in one text response
+- **Minified JSON**: Stripped null/empty values and whitespace from all JSON responses
+- **Partial GUID support**: 8+ character prefixes accepted for transactions, splits, lots, and scheduled transactions
+- **Version**: 1.0.2 (399 tests)
+
+### v1.0.0 — Stable Release
+
+Feature-complete with write safety and audit trail.
+
+- **`replace_splits`**: Wholesale split replacement on existing transactions (recategorization without void/recreate)
+- **Transaction pipeline**: Duplicate detection, dry run mode, auto-fill from prior transactions, date sanity checks, placeholder account warnings
+- **`list_accounts` compact mode**: One-line-per-account default with `root` filter
+- **Account metadata slots**: Custom key-value pairs on accounts (APR, credit limits, reward rates)
+- **Audit log text format**: Human-readable audit trail alongside JSON option
+- **Version**: 1.0.0 (394 tests)
+
+### v0.9.0 — Feature Build-out
+
+From basic CRUD to a full accounting toolkit.
+
+- **Investments**: Commodities, prices, lot-based cost basis tracking, capital gain calculation
+- **Scheduled transactions**: Recurring templates, upcoming bills, one-click instantiation
+- **Budgets**: Create budgets, set targets by period/quarter, variance reporting
+- **Multi-currency**: Cross-currency transactions with quantity/value split handling
+- **Reporting**: Spending by category, income by source, balance sheet, net worth, cash flow
+- **Reconciliation**: Statement reconciliation, void/unvoid with audit trail
+- **Audit logging**: Automatic write-operation logging alongside the book file
+- **Version**: 0.9.0 (187 tests)
+
+### v0.1.0 — Initial Release
+
+- Account listing, balances, transaction CRUD, search
+- MCP server with FastMCP, Claude Desktop integration
+- piecash SQLite interface with error handling
+
+---
+
 ## Roadmap
 
 - [x] Full account management
@@ -353,9 +434,10 @@ gnucash-mcp/
 - [x] Split recategorization (`replace_splits`)
 - [x] Compact output for reduced token usage
 - [x] Partial GUID support (8+ character prefixes)
+- [x] Duplicate detection (built into `create_transaction`)
+- [x] Modular tool loading (`--modules=`)
 - [ ] CSV export
 - [ ] CSV/OFX import
-- [x] Duplicate detection (built into `create_transaction`)
 
 ---
 
