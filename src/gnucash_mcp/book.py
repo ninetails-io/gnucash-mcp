@@ -5777,3 +5777,665 @@ class GnuCashBook:
             if v.guid == guid:
                 return v
         return None
+
+    @staticmethod
+    def _calculate_lot_balance(lot) -> Decimal:
+        """Sum of split values in a lot.
+
+        For A/R lots: positive = outstanding receivable.
+        For A/P lots: negative = outstanding payable.
+        """
+        total = Decimal(0)
+        for split in lot.splits:
+            total += Decimal(str(split.value))
+        return total
+
+    def _get_invoice_entries_and_total(self, book, inv):
+        """Query entries for an invoice/bill and compute total.
+
+        Returns:
+            Tuple of (entries_list, per_account_totals_dict, grand_total).
+            per_account_totals maps account_guid -> Decimal total.
+        """
+        from sqlalchemy import text
+
+        is_bill = inv.owner_type == 4
+        if is_bill:
+            rows = book.session.execute(
+                text("SELECT * FROM entries WHERE bill = :guid"),
+                {"guid": inv.guid},
+            ).fetchall()
+        else:
+            rows = book.session.execute(
+                text("SELECT * FROM entries WHERE invoice = :guid"),
+                {"guid": inv.guid},
+            ).fetchall()
+
+        if not rows:
+            raise ValueError(
+                f"Cannot post: invoice {inv.id} has no entries"
+            )
+
+        # Aggregate totals per account
+        acct_totals: dict[str, Decimal] = {}
+        grand_total = Decimal(0)
+        for row in rows:
+            q_num = row.quantity_num or 0
+            q_denom = row.quantity_denom or 1
+            quantity = Decimal(q_num) / Decimal(q_denom)
+
+            if is_bill:
+                p_num = row.b_price_num or 0
+                p_denom = row.b_price_denom or 1
+                acct_guid = row.b_acct
+            else:
+                p_num = row.i_price_num or 0
+                p_denom = row.i_price_denom or 1
+                acct_guid = row.i_acct
+
+            price = Decimal(p_num) / Decimal(p_denom)
+            entry_total = quantity * price
+            grand_total += entry_total
+            acct_totals[acct_guid] = acct_totals.get(
+                acct_guid, Decimal(0)
+            ) + entry_total
+
+        return rows, acct_totals, grand_total
+
+    def post_invoice(
+        self,
+        invoice_id: str,
+        post_account: str,
+        post_date: str | None = None,
+        due_date: str | None = None,
+        description: str | None = None,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Post a customer invoice or vendor bill.
+
+        Posting creates a transaction in the A/R or A/P account, creates
+        a lot for payment tracking, and marks the invoice as posted.
+
+        Args:
+            invoice_id: Human-readable ID (e.g., '000001').
+            post_account: A/R or A/P account path.
+            post_date: ISO date (YYYY-MM-DD). Defaults to today.
+            due_date: Payment due date (YYYY-MM-DD). Optional.
+            description: Description for the posting transaction.
+            owner_type: 'customer' or 'vendor' for disambiguation.
+
+        Returns:
+            Dict with invoice details, total, transaction_guid, lot_guid.
+
+        Raises:
+            ValueError: If invoice not found, already posted, no entries,
+                        or invalid account type.
+        """
+        from piecash.business.invoice import Invoice
+        from piecash.core.transaction import Lot
+
+        ot = None
+        if owner_type == "customer":
+            ot = 2
+        elif owner_type == "vendor":
+            ot = 4
+
+        parsed_date = (
+            date.fromisoformat(post_date) if post_date
+            else date.today()
+        )
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(
+                    f"Invoice/bill not found: {invoice_id}"
+                )
+
+            if inv.date_posted is not None:
+                raise ValueError(
+                    f"Invoice {invoice_id} is already posted"
+                )
+
+            is_bill = inv.owner_type == 4
+
+            # Validate post account type
+            post_acct = self._find_account(book, post_account)
+            if not post_acct:
+                raise ValueError(
+                    f"Account not found: {post_account}"
+                )
+            expected_type = "PAYABLE" if is_bill else "RECEIVABLE"
+            if post_acct.type != expected_type:
+                raise ValueError(
+                    f"Post account must be {expected_type}, "
+                    f"got {post_acct.type}"
+                )
+
+            # Get entries and totals
+            _, acct_totals, grand_total = (
+                self._get_invoice_entries_and_total(book, inv)
+            )
+
+            # Create lot for payment tracking
+            lot = Lot(
+                title=f"Invoice {inv.id}",
+                account=post_acct,
+                is_closed=0,
+            )
+            book.session.add(lot)
+
+            # Build transaction splits
+            # For customer invoice: A/R debit (positive), income credit (negative)
+            # For vendor bill: A/P credit (negative), expense debit (positive)
+            piecash_splits = []
+
+            if is_bill:
+                # A/P split: negative (credit)
+                ar_ap_split = piecash.Split(
+                    account=post_acct,
+                    value=-grand_total,
+                    quantity=-grand_total,
+                    memo="",
+                )
+            else:
+                # A/R split: positive (debit)
+                ar_ap_split = piecash.Split(
+                    account=post_acct,
+                    value=grand_total,
+                    quantity=grand_total,
+                    memo="",
+                )
+            piecash_splits.append(ar_ap_split)
+
+            # One split per distinct entry account
+            for acct_guid, acct_total in acct_totals.items():
+                entry_acct = None
+                for a in book.accounts:
+                    if a.guid == acct_guid:
+                        entry_acct = a
+                        break
+                if not entry_acct:
+                    raise ValueError(
+                        f"Entry account not found: {acct_guid}"
+                    )
+
+                if is_bill:
+                    # Expense: positive (debit)
+                    split_value = acct_total
+                else:
+                    # Income: negative (credit)
+                    split_value = -acct_total
+
+                piecash_splits.append(
+                    piecash.Split(
+                        account=entry_acct,
+                        value=split_value,
+                        quantity=split_value,
+                        memo="",
+                    )
+                )
+
+            # Create posting transaction
+            txn_desc = description or f"Invoice {inv.id}"
+            txn = piecash.Transaction(
+                currency=inv.currency,
+                description=txn_desc,
+                post_date=parsed_date,
+                splits=piecash_splits,
+            )
+
+            # Assign A/R or A/P split to the lot
+            ar_ap_split.lot = lot
+
+            # Update invoice record with posting info via ORM
+            inv.date_posted = datetime.combine(
+                parsed_date, datetime.min.time()
+            )
+            inv.post_txn = txn
+            inv.post_lot = lot
+            inv.post_account = post_acct
+
+            book.save()
+
+            # Capture return values before session closes
+            result = {
+                "id": inv.id,
+                "type": "bill" if is_bill else "invoice",
+                "status": "posted",
+                "total": str(grand_total),
+                "post_date": str(parsed_date),
+                "transaction_guid": txn.guid,
+                "lot_guid": lot.guid,
+                "post_account": post_acct.fullname,
+            }
+
+        return result
+
+    def pay_invoice(
+        self,
+        invoice_id: str,
+        payment_account: str,
+        amount: str,
+        payment_date: str | None = None,
+        description: str | None = None,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Record a payment against a posted invoice or bill.
+
+        Creates a payment transaction and assigns the A/R or A/P split
+        to the invoice's lot for balance tracking. Partial payments
+        are supported.
+
+        Args:
+            invoice_id: Human-readable ID (e.g., '000001').
+            payment_account: Bank or cash account path.
+            amount: Payment amount as decimal string (e.g., '500.00').
+            payment_date: ISO date (YYYY-MM-DD). Defaults to today.
+            description: Description for the payment transaction.
+            owner_type: 'customer' or 'vendor' for disambiguation.
+
+        Returns:
+            Dict with payment details and remaining balance.
+
+        Raises:
+            ValueError: If invoice not found, not posted, or invalid account.
+        """
+        ot = None
+        if owner_type == "customer":
+            ot = 2
+        elif owner_type == "vendor":
+            ot = 4
+
+        payment_amount = Decimal(amount)
+        if payment_amount <= 0:
+            raise ValueError("Payment amount must be positive")
+
+        parsed_date = (
+            date.fromisoformat(payment_date) if payment_date
+            else date.today()
+        )
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(
+                    f"Invoice/bill not found: {invoice_id}"
+                )
+
+            if inv.date_posted is None:
+                raise ValueError(
+                    f"Invoice {invoice_id} is not posted — "
+                    f"post it before recording payment"
+                )
+
+            is_bill = inv.owner_type == 4
+
+            # Find payment account
+            pay_acct = self._find_account(book, payment_account)
+            if not pay_acct:
+                raise ValueError(
+                    f"Account not found: {payment_account}"
+                )
+
+            # Find the post account (A/R or A/P) from invoice
+            post_acct = None
+            post_acc_guid = inv.post_acc_guid
+            for a in book.accounts:
+                if a.guid == post_acc_guid:
+                    post_acct = a
+                    break
+            if not post_acct:
+                raise ValueError(
+                    f"Post account not found for invoice {invoice_id}"
+                )
+
+            # Find the lot
+            lot_guid = inv.post_lot_guid
+            lot_obj = None
+            for lot in post_acct.lots:
+                if lot.guid == lot_guid:
+                    lot_obj = lot
+                    break
+            if not lot_obj:
+                raise ValueError(
+                    f"Lot not found for invoice {invoice_id}"
+                )
+
+            # Build payment splits
+            if is_bill:
+                # Pay vendor bill: debit A/P (positive), credit bank (negative)
+                ar_ap_split = piecash.Split(
+                    account=post_acct,
+                    value=payment_amount,
+                    quantity=payment_amount,
+                    memo="",
+                )
+                bank_split = piecash.Split(
+                    account=pay_acct,
+                    value=-payment_amount,
+                    quantity=-payment_amount,
+                    memo="",
+                )
+            else:
+                # Receive customer payment: credit A/R (negative), debit bank (positive)
+                ar_ap_split = piecash.Split(
+                    account=post_acct,
+                    value=-payment_amount,
+                    quantity=-payment_amount,
+                    memo="",
+                )
+                bank_split = piecash.Split(
+                    account=pay_acct,
+                    value=payment_amount,
+                    quantity=payment_amount,
+                    memo="",
+                )
+
+            # Create payment transaction
+            txn_desc = (
+                description
+                or f"Payment for {'Bill' if is_bill else 'Invoice'} {inv.id}"
+            )
+            txn = piecash.Transaction(
+                currency=inv.currency,
+                description=txn_desc,
+                post_date=parsed_date,
+                splits=[ar_ap_split, bank_split],
+            )
+
+            # Assign A/R or A/P split to the invoice's lot
+            ar_ap_split.lot = lot_obj
+
+            book.save()
+
+            # Calculate remaining balance
+            remaining = self._calculate_lot_balance(lot_obj)
+
+            result = {
+                "id": inv.id,
+                "type": "bill" if is_bill else "invoice",
+                "status": "paid",
+                "amount_paid": str(payment_amount),
+                "remaining_balance": str(abs(remaining)),
+                "transaction_guid": txn.guid,
+                "payment_account": pay_acct.fullname,
+                "payment_date": str(parsed_date),
+            }
+
+        return result
+
+    def get_outstanding_invoices(
+        self,
+        owner_type: str | None = None,
+        customer_id: str | None = None,
+        vendor_id: str | None = None,
+    ) -> list[dict]:
+        """Get all posted invoices/bills with outstanding balances.
+
+        Args:
+            owner_type: Filter by 'customer' or 'vendor'. Omit for all.
+            customer_id: Filter by specific customer ID.
+            vendor_id: Filter by specific vendor ID.
+
+        Returns:
+            List of dicts with invoice details and balance info.
+        """
+        from piecash.business.invoice import Invoice
+
+        with self.open() as book:
+            query = book.session.query(Invoice).filter(
+                Invoice.date_posted.isnot(None)
+            )
+
+            if owner_type == "customer":
+                query = query.filter(Invoice.owner_type == 2)
+            elif owner_type == "vendor":
+                query = query.filter(Invoice.owner_type == 4)
+
+            # Filter by specific customer or vendor
+            if customer_id:
+                customer = None
+                for c in book.customers:
+                    if c.id == customer_id:
+                        customer = c
+                        break
+                if not customer:
+                    raise ValueError(
+                        f"Customer not found: {customer_id}"
+                    )
+                query = query.filter(
+                    Invoice.owner_guid == customer.guid
+                )
+
+            if vendor_id:
+                vendor = None
+                for v in book.vendors:
+                    if v.id == vendor_id:
+                        vendor = v
+                        break
+                if not vendor:
+                    raise ValueError(
+                        f"Vendor not found: {vendor_id}"
+                    )
+                query = query.filter(
+                    Invoice.owner_guid == vendor.guid
+                )
+
+            invoices = query.order_by(
+                Invoice.date_posted.desc()
+            ).all()
+
+            results = []
+            for inv in invoices:
+                is_bill = inv.owner_type == 4
+
+                # Find lot and calculate balance
+                post_acc_guid = inv.post_acc_guid
+                post_acct = None
+                for a in book.accounts:
+                    if a.guid == post_acc_guid:
+                        post_acct = a
+                        break
+                if not post_acct:
+                    continue
+
+                lot_obj = None
+                for lot in post_acct.lots:
+                    if lot.guid == inv.post_lot_guid:
+                        lot_obj = lot
+                        break
+                if not lot_obj:
+                    continue
+
+                balance = self._calculate_lot_balance(lot_obj)
+                # Skip fully paid (balance is zero)
+                if balance == Decimal(0):
+                    continue
+
+                # Calculate original total from entries
+                try:
+                    _, _, grand_total = (
+                        self._get_invoice_entries_and_total(book, inv)
+                    )
+                except ValueError:
+                    grand_total = abs(balance)
+
+                amount_paid = grand_total - abs(balance)
+
+                # Owner name
+                owner_name = None
+                if is_bill:
+                    v = self._find_vendor_by_guid(
+                        book, inv.owner_guid
+                    )
+                    if v:
+                        owner_name = v.name
+                else:
+                    c = self._find_customer_by_guid(
+                        book, inv.owner_guid
+                    )
+                    if c:
+                        owner_name = c.name
+
+                results.append({
+                    "id": inv.id,
+                    "type": "bill" if is_bill else "invoice",
+                    "owner_name": owner_name,
+                    "date_posted": (
+                        str(inv.date_posted.date())
+                        if inv.date_posted else None
+                    ),
+                    "original_amount": str(grand_total),
+                    "amount_paid": str(amount_paid),
+                    "amount_due": str(abs(balance)),
+                })
+
+        return results
+
+    def vendor_spending_report(
+        self,
+        start_date: str,
+        end_date: str,
+        vendor_id: str | None = None,
+    ) -> dict:
+        """Get spending breakdown by vendor for a period.
+
+        Analyzes posted vendor bills to show total billed, paid,
+        and outstanding amounts per vendor.
+
+        Args:
+            start_date: Start of period (YYYY-MM-DD).
+            end_date: End of period (YYYY-MM-DD).
+            vendor_id: Optional filter to specific vendor.
+
+        Returns:
+            Dict with per-vendor breakdown and grand totals.
+        """
+        from piecash.business.invoice import Invoice
+
+        parsed_start = date.fromisoformat(start_date)
+        parsed_end = date.fromisoformat(end_date)
+
+        with self.open() as book:
+            query = book.session.query(Invoice).filter(
+                Invoice.owner_type == 4,
+                Invoice.date_posted.isnot(None),
+            )
+
+            if vendor_id:
+                vendor = None
+                for v in book.vendors:
+                    if v.id == vendor_id:
+                        vendor = v
+                        break
+                if not vendor:
+                    raise ValueError(
+                        f"Vendor not found: {vendor_id}"
+                    )
+                query = query.filter(
+                    Invoice.owner_guid == vendor.guid
+                )
+
+            bills = query.all()
+
+            # Filter by date range (date_posted is datetime)
+            bills = [
+                b for b in bills
+                if parsed_start <= b.date_posted.date() <= parsed_end
+            ]
+
+            # Aggregate by vendor
+            vendor_data: dict[str, dict] = {}
+            for bill in bills:
+                # Get vendor name
+                v = self._find_vendor_by_guid(
+                    book, bill.owner_guid
+                )
+                v_name = v.name if v else "Unknown"
+                v_id = v.id if v else ""
+
+                if v_name not in vendor_data:
+                    vendor_data[v_name] = {
+                        "vendor_id": v_id,
+                        "vendor_name": v_name,
+                        "total_billed": Decimal(0),
+                        "total_paid": Decimal(0),
+                        "outstanding": Decimal(0),
+                        "bill_count": 0,
+                    }
+
+                # Calculate bill total from entries
+                try:
+                    _, _, total = (
+                        self._get_invoice_entries_and_total(
+                            book, bill
+                        )
+                    )
+                except ValueError:
+                    total = Decimal(0)
+
+                # Calculate outstanding from lot
+                balance = Decimal(0)
+                post_acct = None
+                for a in book.accounts:
+                    if a.guid == bill.post_acc_guid:
+                        post_acct = a
+                        break
+                if post_acct:
+                    for lot in post_acct.lots:
+                        if lot.guid == bill.post_lot_guid:
+                            balance = self._calculate_lot_balance(
+                                lot
+                            )
+                            break
+
+                outstanding = abs(balance)
+                paid = total - outstanding
+
+                vendor_data[v_name]["total_billed"] += total
+                vendor_data[v_name]["total_paid"] += paid
+                vendor_data[v_name]["outstanding"] += outstanding
+                vendor_data[v_name]["bill_count"] += 1
+
+            # Convert Decimals to strings
+            vendors_list = []
+            grand_billed = Decimal(0)
+            grand_paid = Decimal(0)
+            grand_outstanding = Decimal(0)
+
+            for vd in vendor_data.values():
+                grand_billed += vd["total_billed"]
+                grand_paid += vd["total_paid"]
+                grand_outstanding += vd["outstanding"]
+                vendors_list.append({
+                    "vendor_id": vd["vendor_id"],
+                    "vendor_name": vd["vendor_name"],
+                    "total_billed": str(vd["total_billed"]),
+                    "total_paid": str(vd["total_paid"]),
+                    "outstanding": str(vd["outstanding"]),
+                    "bill_count": vd["bill_count"],
+                })
+
+            # Sort by total billed descending
+            vendors_list.sort(
+                key=lambda x: Decimal(x["total_billed"]),
+                reverse=True,
+            )
+
+        return {
+            "period": {
+                "start": start_date,
+                "end": end_date,
+            },
+            "vendors": vendors_list,
+            "totals": {
+                "total_billed": str(grand_billed),
+                "total_paid": str(grand_paid),
+                "outstanding": str(grand_outstanding),
+                "vendor_count": len(vendors_list),
+                "bill_count": sum(
+                    v["bill_count"] for v in vendors_list
+                ),
+            },
+        }

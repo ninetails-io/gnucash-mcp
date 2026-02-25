@@ -557,6 +557,26 @@ def _format_audit_entry_text(entry: dict) -> str:
                 customer_id = after.get("customer_id", customer_id)
             lines.append(f"{time_part}  CREATE INVOICE  id:{inv_id}")
             lines.append(f'{indent}customer: {customer_id}')
+        elif operation == "POST":
+            inv_id = params.get("id", "")
+            post_account = params.get("post_account", "")
+            lines.append(f"{time_part}  POST INVOICE  id:{inv_id}")
+            if after:
+                total = after.get("total", "")
+                post_date = after.get("post_date", "")
+                txn_guid = (after.get("transaction_guid") or "")[:8]
+                lines.append(f'{indent}total: {total}  date: {post_date}')
+                lines.append(f'{indent}account: {post_account}  txn:{txn_guid}')
+        elif operation == "PAY":
+            inv_id = params.get("id", "")
+            lines.append(f"{time_part}  PAY INVOICE  id:{inv_id}")
+            if after:
+                amount = after.get("amount_paid", "")
+                remaining = after.get("remaining_balance", "")
+                pay_acct = params.get("payment_account", "")
+                txn_guid = (after.get("transaction_guid") or "")[:8]
+                lines.append(f'{indent}paid: {amount}  remaining: {remaining}')
+                lines.append(f'{indent}from: {pay_acct}  txn:{txn_guid}')
 
     elif entity_type == "bill":
         if operation == "CREATE":

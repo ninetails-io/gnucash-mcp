@@ -123,6 +123,10 @@ TOOL_MODULES: dict[str, list[str]] = {
         "add_bill_entry",
         "list_invoices",
         "get_invoice",
+        "post_invoice",
+        "pay_invoice",
+        "get_outstanding_invoices",
+        "vendor_spending_report",
     ],
 }
 
@@ -1949,6 +1953,129 @@ def get_invoice(
     """
     book = get_book()
     result = book.get_invoice(invoice_id=id, owner_type=owner_type)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="post", entity_type="invoice")
+def post_invoice(
+    id: str,
+    post_account: str,
+    post_date: str | None = None,
+    due_date: str | None = None,
+    description: str | None = None,
+    owner_type: str | None = None,
+) -> str:
+    """Post a customer invoice or vendor bill.
+
+    Posting creates a transaction in the A/R or A/P account and makes
+    the invoice official. Once posted, entries cannot be added.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001").
+        post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
+        post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        due_date: Payment due date (YYYY-MM-DD). Optional.
+        description: Description for the posting transaction. Optional.
+        owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+    """
+    book = get_book()
+    result = book.post_invoice(
+        invoice_id=id,
+        post_account=post_account,
+        post_date=post_date,
+        due_date=due_date,
+        description=description,
+        owner_type=owner_type,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="pay", entity_type="invoice")
+def pay_invoice(
+    id: str,
+    payment_account: str,
+    amount: str,
+    payment_date: str | None = None,
+    description: str | None = None,
+    owner_type: str | None = None,
+) -> str:
+    """Record a payment against a posted invoice or bill.
+
+    Creates a payment transaction from the specified bank/cash account
+    to the invoice's A/R or A/P account. Partial payments are supported.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001").
+        payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
+        amount: Payment amount as decimal string (e.g., "500.00").
+        payment_date: Payment date (YYYY-MM-DD). Defaults to today.
+        description: Description for the payment transaction. Optional.
+        owner_type: "customer" or "vendor" for disambiguation.
+    """
+    book = get_book()
+    result = book.pay_invoice(
+        invoice_id=id,
+        payment_account=payment_account,
+        amount=amount,
+        payment_date=payment_date,
+        description=description,
+        owner_type=owner_type,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_outstanding_invoices(
+    owner_type: str | None = None,
+    customer_id: str | None = None,
+    vendor_id: str | None = None,
+) -> str:
+    """Get all posted invoices/bills with outstanding balances.
+
+    Args:
+        owner_type: Filter by "customer" or "vendor". Omit for all.
+        customer_id: Filter by specific customer ID.
+        vendor_id: Filter by specific vendor ID.
+    """
+    book = get_book()
+    result = book.get_outstanding_invoices(
+        owner_type=owner_type,
+        customer_id=customer_id,
+        vendor_id=vendor_id,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def vendor_spending_report(
+    start_date: str,
+    end_date: str,
+    vendor_id: str | None = None,
+) -> str:
+    """Get spending breakdown by vendor for a period.
+
+    Analyzes posted vendor bills to show total billed, total paid,
+    and outstanding amounts per vendor.
+
+    Args:
+        start_date: Start of period (YYYY-MM-DD).
+        end_date: End of period (YYYY-MM-DD).
+        vendor_id: Optional filter to a specific vendor.
+    """
+    book = get_book()
+    result = book.vendor_spending_report(
+        start_date=start_date,
+        end_date=end_date,
+        vendor_id=vendor_id,
+    )
     return _json(result)
 
 
