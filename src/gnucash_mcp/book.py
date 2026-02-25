@@ -4867,6 +4867,116 @@ class GnuCashBook:
             "discount": str(bt.discount) if bt.discount else "0",
         }
 
+    @staticmethod
+    def _decimal_to_num_denom(value: Decimal) -> tuple[int, int]:
+        """Convert a Decimal to numerator/denominator pair.
+
+        Uses the decimal's exponent to determine appropriate denominator.
+        E.g., Decimal("25.50") -> (2550, 100)
+        """
+        sign, digits, exp = value.as_tuple()
+        if exp < 0:
+            denom = 10 ** (-exp)
+            num = int(value * denom)
+        else:
+            num = int(value)
+            denom = 1
+        return num, denom
+
+    @staticmethod
+    def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
+        """Find an invoice/bill by human-readable ID.
+
+        Args:
+            book: piecash Book instance.
+            invoice_id: Human-readable ID (e.g., '000001').
+            owner_type: Filter by owner type (2=customer, 4=vendor).
+                        None returns first match of either type.
+        """
+        from piecash.business.invoice import Invoice
+        query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
+        if owner_type is not None:
+            query = query.filter(Invoice.owner_type == owner_type)
+        return query.first()
+
+    @staticmethod
+    def _invoice_to_dict(invoice, entries=None) -> dict:
+        """Convert a piecash Invoice to a serializable dict.
+
+        Args:
+            invoice: piecash Invoice object.
+            entries: Optional list of entry dicts. If None, entries are not included.
+        """
+        is_posted = invoice.date_posted is not None
+        result = {
+            "guid": invoice.guid,
+            "id": invoice.id,
+            "type": "bill" if invoice.owner_type == 4 else "invoice",
+            "owner_type": invoice.owner_type,
+            "owner_guid": invoice.owner_guid,
+            "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
+            "date_posted": str(invoice.date_posted.date()) if invoice.date_posted else None,
+            "notes": invoice.notes or "",
+            "active": bool(invoice.active),
+            "currency": invoice.currency.mnemonic if invoice.currency else None,
+            "is_posted": is_posted,
+        }
+        if entries is not None:
+            result["entries"] = entries
+        return result
+
+    @staticmethod
+    def _invoice_to_compact_line(invoice) -> str:
+        """One-line compact: 'id  type  owner_id  date_opened  status'."""
+        inv_type = "BILL" if invoice.owner_type == 4 else "INV"
+        date_str = str(invoice.date_opened.date()) if invoice.date_opened else "n/a"
+        status = "posted" if invoice.date_posted else "open"
+        return f"{invoice.id}\t{inv_type}\t{date_str}\t{status}"
+
+    @staticmethod
+    def _entry_to_dict(entry_row, is_bill: bool = False) -> dict:
+        """Convert an entry row (from raw SQL) to a serializable dict.
+
+        Args:
+            entry_row: SQLAlchemy row from entries table.
+            is_bill: If True, read b_* columns; otherwise read i_* columns.
+        """
+        # Quantity
+        q_num = entry_row.quantity_num or 0
+        q_denom = entry_row.quantity_denom or 1
+        quantity = Decimal(q_num) / Decimal(q_denom)
+
+        if is_bill:
+            p_num = entry_row.b_price_num or 0
+            p_denom = entry_row.b_price_denom or 1
+            acct_guid = entry_row.b_acct
+        else:
+            p_num = entry_row.i_price_num or 0
+            p_denom = entry_row.i_price_denom or 1
+            acct_guid = entry_row.i_acct
+
+        price = Decimal(p_num) / Decimal(p_denom)
+        total = quantity * price
+
+        # Raw SQL returns date as string; handle both str and datetime
+        raw_date = entry_row.date
+        if raw_date is None:
+            date_str = None
+        elif isinstance(raw_date, str):
+            date_str = raw_date[:10]  # "YYYY-MM-DD..."
+        else:
+            date_str = str(raw_date.date())
+
+        return {
+            "guid": entry_row.guid,
+            "date": date_str,
+            "description": entry_row.description or "",
+            "account_guid": acct_guid or "",
+            "quantity": str(quantity),
+            "price": str(price),
+            "total": str(total),
+        }
+
     def create_customer(
         self,
         name: str,
@@ -5162,3 +5272,508 @@ class GnuCashBook:
                 return "\n".join(lines)
             else:
                 return [self._billterm_to_dict(t) for t in terms]
+
+    def create_invoice(
+        self,
+        customer_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+    ) -> dict:
+        """Create a customer invoice.
+
+        Args:
+            customer_id: Customer ID (e.g., '000001').
+            date_opened: Date in ISO format. Defaults to today.
+            notes: Optional notes.
+            currency: ISO currency code. Defaults to book's default currency.
+            term: Billterm name (e.g., 'Net 30'). Optional.
+
+        Returns:
+            Dict with guid, id, customer_id, status.
+        """
+        import uuid
+        from piecash.business.invoice import Invoice, Billterm
+
+        open_date = (
+            datetime.strptime(date_opened, "%Y-%m-%d")
+            if date_opened
+            else datetime.now()
+        )
+
+        with self.open(readonly=False) as book:
+            customer = self._find_customer(book, customer_id)
+            if not customer:
+                raise ValueError(f"Customer not found: {customer_id}")
+
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+                currency_guid = currency_obj.guid
+            else:
+                currency_guid = book.default_currency.guid
+
+            term_guid = None
+            if term:
+                bt = book.session.query(Billterm).filter(
+                    Billterm.name == term, Billterm.invisible == 0
+                ).first()
+                if not bt:
+                    raise ValueError(f"Billterm not found: {term}")
+                term_guid = bt.guid
+
+            cnt = book.counter_invoice + 1
+            book.counter_invoice = cnt
+            invoice_id = f"{cnt:06d}"
+            inv_guid = uuid.uuid4().hex
+
+            book.session.execute(
+                Invoice.__table__.insert().values(
+                    guid=inv_guid,
+                    id=invoice_id,
+                    date_opened=open_date,
+                    date_posted=None,
+                    notes=notes,
+                    active=1,
+                    currency=currency_guid,
+                    owner_type=2,  # Customer
+                    owner_guid=customer.guid,
+                    terms=term_guid,
+                    billing_id="",
+                    post_txn=None,
+                    post_lot=None,
+                    post_acc=None,
+                    billto_type=0,
+                    billto_guid=None,
+                    charge_amt_num=0,
+                    charge_amt_denom=1,
+                )
+            )
+
+            book.save()
+
+            return {
+                "guid": inv_guid,
+                "id": invoice_id,
+                "customer_id": customer_id,
+                "date_opened": str(open_date.date()),
+                "status": "created",
+            }
+
+    def create_bill(
+        self,
+        vendor_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+    ) -> dict:
+        """Create a vendor bill.
+
+        Args:
+            vendor_id: Vendor ID (e.g., '000001').
+            date_opened: Date in ISO format. Defaults to today.
+            notes: Optional notes.
+            currency: ISO currency code. Defaults to book's default currency.
+            term: Billterm name (e.g., 'Net 30'). Optional.
+
+        Returns:
+            Dict with guid, id, vendor_id, status.
+        """
+        import uuid
+        from piecash.business.invoice import Invoice, Billterm
+
+        open_date = (
+            datetime.strptime(date_opened, "%Y-%m-%d")
+            if date_opened
+            else datetime.now()
+        )
+
+        with self.open(readonly=False) as book:
+            vendor = self._find_vendor(book, vendor_id)
+            if not vendor:
+                raise ValueError(f"Vendor not found: {vendor_id}")
+
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+                currency_guid = currency_obj.guid
+            else:
+                currency_guid = book.default_currency.guid
+
+            term_guid = None
+            if term:
+                bt = book.session.query(Billterm).filter(
+                    Billterm.name == term, Billterm.invisible == 0
+                ).first()
+                if not bt:
+                    raise ValueError(f"Billterm not found: {term}")
+                term_guid = bt.guid
+
+            cnt = book.counter_bill + 1
+            book.counter_bill = cnt
+            bill_id = f"{cnt:06d}"
+            inv_guid = uuid.uuid4().hex
+
+            book.session.execute(
+                Invoice.__table__.insert().values(
+                    guid=inv_guid,
+                    id=bill_id,
+                    date_opened=open_date,
+                    date_posted=None,
+                    notes=notes,
+                    active=1,
+                    currency=currency_guid,
+                    owner_type=4,  # Vendor
+                    owner_guid=vendor.guid,
+                    terms=term_guid,
+                    billing_id="",
+                    post_txn=None,
+                    post_lot=None,
+                    post_acc=None,
+                    billto_type=0,
+                    billto_guid=None,
+                    charge_amt_num=0,
+                    charge_amt_denom=1,
+                )
+            )
+
+            book.save()
+
+            return {
+                "guid": inv_guid,
+                "id": bill_id,
+                "vendor_id": vendor_id,
+                "date_opened": str(open_date.date()),
+                "status": "created",
+            }
+
+    def add_invoice_entry(
+        self,
+        invoice_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+    ) -> dict:
+        """Add a line item entry to a customer invoice.
+
+        Args:
+            invoice_id: Invoice ID (e.g., '000001').
+            account: Income account full path (e.g., 'Income:Sales').
+            description: Line item description.
+            quantity: Quantity as string (e.g., '1', '2.5').
+            price: Unit price as string (e.g., '100.00').
+
+        Returns:
+            Dict with guid, invoice_id, total, status.
+        """
+        import uuid
+        from piecash.business.invoice import Invoice, Entry
+
+        qty = Decimal(quantity)
+        unit_price = Decimal(price)
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, invoice_id, owner_type=2)
+            if not inv:
+                raise ValueError(f"Invoice not found: {invoice_id}")
+            if inv.owner_type != 2:
+                raise ValueError(
+                    f"'{invoice_id}' is a vendor bill, not a customer invoice. "
+                    f"Use add_bill_entry instead."
+                )
+            if inv.date_posted is not None:
+                raise ValueError(
+                    f"Invoice '{invoice_id}' is already posted. "
+                    f"Cannot add entries to posted invoices."
+                )
+
+            acct = self._find_account(book, account)
+            if not acct:
+                raise ValueError(f"Account not found: {account}")
+
+            q_num, q_denom = self._decimal_to_num_denom(qty)
+            p_num, p_denom = self._decimal_to_num_denom(unit_price)
+            entry_guid = uuid.uuid4().hex
+
+            book.session.execute(
+                Entry.__table__.insert().values(
+                    guid=entry_guid,
+                    date=datetime.now(),
+                    date_entered=datetime.now(),
+                    description=description,
+                    action="",
+                    notes="",
+                    quantity_num=q_num,
+                    quantity_denom=q_denom,
+                    i_acct=acct.guid,
+                    i_price_num=p_num,
+                    i_price_denom=p_denom,
+                    i_discount_num=0,
+                    i_discount_denom=1,
+                    invoice=inv.guid,
+                    i_disc_type="",
+                    i_disc_how="",
+                    i_taxable=0,
+                    i_taxincluded=0,
+                    i_taxtable=None,
+                    b_acct=None,
+                    b_price_num=0,
+                    b_price_denom=1,
+                    bill=None,
+                    b_taxable=0,
+                    b_taxincluded=0,
+                    b_taxtable=None,
+                    b_paytype=0,
+                    billable=0,
+                    billto_type=0,
+                    billto_guid=None,
+                    order_guid=None,
+                )
+            )
+
+            book.save()
+
+            total = qty * unit_price
+            return {
+                "guid": entry_guid,
+                "invoice_id": invoice_id,
+                "description": description,
+                "quantity": str(qty),
+                "price": str(unit_price),
+                "total": str(total),
+                "status": "created",
+            }
+
+    def add_bill_entry(
+        self,
+        bill_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+    ) -> dict:
+        """Add a line item entry to a vendor bill.
+
+        Args:
+            bill_id: Bill ID (e.g., '000001').
+            account: Expense account full path (e.g., 'Expenses:Office Supplies').
+            description: Line item description.
+            quantity: Quantity as string (e.g., '1', '2.5').
+            price: Unit price as string (e.g., '50.00').
+
+        Returns:
+            Dict with guid, bill_id, total, status.
+        """
+        import uuid
+        from piecash.business.invoice import Invoice, Entry
+
+        qty = Decimal(quantity)
+        unit_price = Decimal(price)
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, bill_id, owner_type=4)
+            if not inv:
+                raise ValueError(f"Bill not found: {bill_id}")
+            if inv.owner_type != 4:
+                raise ValueError(
+                    f"'{bill_id}' is a customer invoice, not a vendor bill. "
+                    f"Use add_invoice_entry instead."
+                )
+            if inv.date_posted is not None:
+                raise ValueError(
+                    f"Bill '{bill_id}' is already posted. "
+                    f"Cannot add entries to posted bills."
+                )
+
+            acct = self._find_account(book, account)
+            if not acct:
+                raise ValueError(f"Account not found: {account}")
+
+            q_num, q_denom = self._decimal_to_num_denom(qty)
+            p_num, p_denom = self._decimal_to_num_denom(unit_price)
+            entry_guid = uuid.uuid4().hex
+
+            book.session.execute(
+                Entry.__table__.insert().values(
+                    guid=entry_guid,
+                    date=datetime.now(),
+                    date_entered=datetime.now(),
+                    description=description,
+                    action="",
+                    notes="",
+                    quantity_num=q_num,
+                    quantity_denom=q_denom,
+                    i_acct=None,
+                    i_price_num=0,
+                    i_price_denom=1,
+                    i_discount_num=0,
+                    i_discount_denom=1,
+                    invoice=None,
+                    i_disc_type="",
+                    i_disc_how="",
+                    i_taxable=0,
+                    i_taxincluded=0,
+                    i_taxtable=None,
+                    b_acct=acct.guid,
+                    b_price_num=p_num,
+                    b_price_denom=p_denom,
+                    bill=inv.guid,
+                    b_taxable=0,
+                    b_taxincluded=0,
+                    b_taxtable=None,
+                    b_paytype=0,
+                    billable=0,
+                    billto_type=0,
+                    billto_guid=None,
+                    order_guid=None,
+                )
+            )
+
+            book.save()
+
+            total = qty * unit_price
+            return {
+                "guid": entry_guid,
+                "bill_id": bill_id,
+                "description": description,
+                "quantity": str(qty),
+                "price": str(unit_price),
+                "total": str(total),
+                "status": "created",
+            }
+
+    def list_invoices(
+        self,
+        owner_type: str | None = None,
+        status: str | None = None,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List invoices and/or bills.
+
+        Args:
+            owner_type: Filter by type: 'customer', 'vendor', or None for all.
+            status: Filter by status: 'posted', 'open', or None for all.
+            compact: If True, return compact one-line-per-invoice string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        from piecash.business.invoice import Invoice
+
+        with self.open() as book:
+            query = book.session.query(Invoice)
+
+            if owner_type == "customer":
+                query = query.filter(Invoice.owner_type == 2)
+            elif owner_type == "vendor":
+                query = query.filter(Invoice.owner_type == 4)
+
+            invoices = query.order_by(Invoice.date_opened.desc()).all()
+
+            if status == "posted":
+                invoices = [i for i in invoices if i.date_posted is not None]
+            elif status == "open":
+                invoices = [i for i in invoices if i.date_posted is None]
+
+            if compact:
+                lines = [self._invoice_to_compact_line(i) for i in invoices]
+                return "\n".join(lines)
+            else:
+                return [self._invoice_to_dict(i) for i in invoices]
+
+    def get_invoice(self, invoice_id: str, owner_type: str | None = None) -> dict:
+        """Get full details for an invoice or bill, including entries.
+
+        Args:
+            invoice_id: Human-readable invoice/bill ID (e.g., '000001').
+            owner_type: Filter by type: 'customer' or 'vendor'.
+                        Useful when invoice and bill share the same ID.
+
+        Returns:
+            Dict with full invoice details and entry list.
+
+        Raises:
+            ValueError: If invoice not found.
+        """
+        from piecash.business.invoice import Invoice, Entry
+        from sqlalchemy import text
+
+        ot = None
+        if owner_type == "customer":
+            ot = 2
+        elif owner_type == "vendor":
+            ot = 4
+
+        with self.open() as book:
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(f"Invoice/bill not found: {invoice_id}")
+
+            is_bill = inv.owner_type == 4
+
+            # Get entries via raw SQL since ORM relationship doesn't
+            # work for vendor bills (bill column is VARCHAR, not FK)
+            if is_bill:
+                rows = book.session.execute(
+                    text("SELECT * FROM entries WHERE bill = :guid"),
+                    {"guid": inv.guid},
+                ).fetchall()
+            else:
+                rows = book.session.execute(
+                    text("SELECT * FROM entries WHERE invoice = :guid"),
+                    {"guid": inv.guid},
+                ).fetchall()
+
+            entries = [self._entry_to_dict(r, is_bill=is_bill) for r in rows]
+
+            # Calculate total
+            total = sum(
+                Decimal(e["quantity"]) * Decimal(e["price"])
+                for e in entries
+            )
+
+            # Look up owner name
+            owner_name = None
+            if is_bill:
+                vendor = self._find_vendor_by_guid(book, inv.owner_guid)
+                if vendor:
+                    owner_name = vendor.name
+            else:
+                customer = self._find_customer_by_guid(book, inv.owner_guid)
+                if customer:
+                    owner_name = customer.name
+
+            result = self._invoice_to_dict(inv, entries=entries)
+            result["total"] = str(total)
+            if owner_name:
+                result["owner_name"] = owner_name
+            return result
+
+    @staticmethod
+    def _find_customer_by_guid(book, guid: str):
+        """Find a customer by GUID."""
+        for c in book.customers:
+            if c.guid == guid:
+                return c
+        return None
+
+    @staticmethod
+    def _find_vendor_by_guid(book, guid: str):
+        """Find a vendor by GUID."""
+        for v in book.vendors:
+            if v.guid == guid:
+                return v
+        return None

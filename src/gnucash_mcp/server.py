@@ -117,6 +117,12 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_vendor",
         "create_billterm",
         "list_billterms",
+        "create_invoice",
+        "create_bill",
+        "add_invoice_entry",
+        "add_bill_entry",
+        "list_invoices",
+        "get_invoice",
     ],
 }
 
@@ -1778,6 +1784,172 @@ def list_billterms(
     if verbose:
         return json.dumps(result, indent=2)
     return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="invoice")
+def create_invoice(
+    customer_id: str,
+    date_opened: str | None = None,
+    notes: str = "",
+    currency: str | None = None,
+    term: str | None = None,
+) -> str:
+    """Create a customer invoice.
+
+    Args:
+        customer_id: Customer ID (e.g., "000001").
+        date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        notes: Optional notes.
+        currency: ISO currency code. Defaults to book's default currency.
+        term: Billterm name (e.g., "Net 30"). Optional.
+    """
+    book = get_book()
+    result = book.create_invoice(
+        customer_id=customer_id, date_opened=date_opened,
+        notes=notes, currency=currency, term=term,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="bill")
+def create_bill(
+    vendor_id: str,
+    date_opened: str | None = None,
+    notes: str = "",
+    currency: str | None = None,
+    term: str | None = None,
+) -> str:
+    """Create a vendor bill.
+
+    Args:
+        vendor_id: Vendor ID (e.g., "000001").
+        date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        notes: Optional notes.
+        currency: ISO currency code. Defaults to book's default currency.
+        term: Billterm name (e.g., "Net 30"). Optional.
+    """
+    book = get_book()
+    result = book.create_bill(
+        vendor_id=vendor_id, date_opened=date_opened,
+        notes=notes, currency=currency, term=term,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="entry")
+def add_invoice_entry(
+    invoice_id: str,
+    account: str,
+    description: str,
+    quantity: str,
+    price: str,
+) -> str:
+    """Add a line item to a customer invoice.
+
+    The invoice must not be posted yet. Entries represent individual
+    goods or services being billed.
+
+    Args:
+        invoice_id: Invoice ID (e.g., "000001").
+        account: Income account path (e.g., "Income:Sales").
+        description: Line item description.
+        quantity: Quantity as decimal string (e.g., "1", "2.5").
+        price: Unit price as decimal string (e.g., "100.00").
+    """
+    book = get_book()
+    result = book.add_invoice_entry(
+        invoice_id=invoice_id, account=account,
+        description=description, quantity=quantity, price=price,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="entry")
+def add_bill_entry(
+    bill_id: str,
+    account: str,
+    description: str,
+    quantity: str,
+    price: str,
+) -> str:
+    """Add a line item to a vendor bill.
+
+    The bill must not be posted yet. Entries represent individual
+    goods or services being billed.
+
+    Args:
+        bill_id: Bill ID (e.g., "000001").
+        account: Expense account path (e.g., "Expenses:Office Supplies").
+        description: Line item description.
+        quantity: Quantity as decimal string (e.g., "1", "2.5").
+        price: Unit price as decimal string (e.g., "50.00").
+    """
+    book = get_book()
+    result = book.add_bill_entry(
+        bill_id=bill_id, account=account,
+        description=description, quantity=quantity, price=price,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_invoices(
+    owner_type: str | None = None,
+    status: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """List invoices and/or vendor bills.
+
+    Returns a compact one-line-per-invoice format by default.
+    Use verbose=true for full JSON with GUIDs, dates, notes, etc.
+
+    Args:
+        owner_type: Filter by type: "customer" for invoices,
+                    "vendor" for bills, or omit for all.
+        status: Filter by status: "posted" or "open", or omit for all.
+        verbose: If true, return full JSON details.
+    """
+    book = get_book()
+    result = book.list_invoices(
+        owner_type=owner_type, status=status, compact=not verbose,
+    )
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_invoice(
+    id: str,
+    owner_type: str | None = None,
+) -> str:
+    """Get full details for an invoice or bill, including line items.
+
+    Works for both customer invoices and vendor bills. Returns all
+    entries with quantities, prices, and totals.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001"). This is the
+            human-readable ID, not the internal GUID.
+        owner_type: Filter by type: "customer" for invoices,
+                    "vendor" for bills. Useful when an invoice and
+                    bill share the same ID (independent counters).
+    """
+    book = get_book()
+    result = book.get_invoice(invoice_id=id, owner_type=owner_type)
+    return _json(result)
 
 
 # ============== Resources ==============
