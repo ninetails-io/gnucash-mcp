@@ -36,15 +36,15 @@ class TestToolModulesMapping:
         assert len(TOOL_MODULES["core"]) == 15
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 52."""
+        """Total tools across all modules should be 60."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 52
+        assert total == 60
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
         expected = {
             "core", "reconciliation", "reporting", "budgets",
-            "scheduling", "investments", "admin",
+            "scheduling", "investments", "admin", "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
 
@@ -68,9 +68,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 52 tools."""
+        """--modules=all should keep all 60 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 52
+        assert len(self._tool_names()) == 60
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag should default to core only."""
@@ -97,12 +97,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 52
+        assert len(self._tool_names()) == 60
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 52 tools."""
+        """'all' mixed with other modules should keep all 60 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 52
+        assert len(self._tool_names()) == 60
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""

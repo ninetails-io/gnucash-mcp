@@ -512,6 +512,42 @@ def _format_audit_entry_text(entry: dict) -> str:
             lines.append(f"{time_part}  DELETE ACCOUNT SLOT  account:{account}")
             lines.append(f'{indent}key: "{key}"')
 
+    elif entity_type == "customer":
+        if operation == "CREATE":
+            cust_id = ""
+            cust_name = params.get("name", "")
+            if after:
+                cust_id = after.get("id", "")
+                cust_name = after.get("name", cust_name)
+            lines.append(f"{time_part}  CREATE CUSTOMER  id:{cust_id}")
+            currency = params.get("currency", "")
+            if after:
+                currency = after.get("currency", currency) or ""
+            lines.append(f'{indent}name: "{cust_name}"  currency: {currency}')
+
+    elif entity_type == "vendor":
+        if operation == "CREATE":
+            vend_id = ""
+            vend_name = params.get("name", "")
+            if after:
+                vend_id = after.get("id", "")
+                vend_name = after.get("name", vend_name)
+            lines.append(f"{time_part}  CREATE VENDOR  id:{vend_id}")
+            currency = params.get("currency", "")
+            if after:
+                currency = after.get("currency", currency) or ""
+            lines.append(f'{indent}name: "{vend_name}"  currency: {currency}')
+
+    elif entity_type == "billterm":
+        if operation == "CREATE":
+            bt_name = params.get("name", "")
+            due_days = params.get("due_days", "")
+            if after:
+                bt_name = after.get("name", bt_name)
+                due_days = after.get("due_days", due_days)
+            lines.append(f"{time_part}  CREATE BILLTERM")
+            lines.append(f'{indent}name: "{bt_name}"  due: {due_days} days')
+
     # Handle move_account specially (it's logged as "update" but is conceptually a move)
     if entity_type == "account" and "new_parent" in params:
         # This is actually a MOVE operation
