@@ -108,6 +108,16 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_account_slot",
         "get_audit_log",
     ],
+    "business": [
+        "create_customer",
+        "list_customers",
+        "get_customer",
+        "create_vendor",
+        "list_vendors",
+        "get_vendor",
+        "create_billterm",
+        "list_billterms",
+    ],
 }
 
 
@@ -647,7 +657,7 @@ def create_account(
 
     Args:
         name: Account name (e.g., "AI Subscriptions")
-        account_type: GnuCash account type (ASSET, BANK, CASH, CREDIT, EQUITY, EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK)
+        account_type: GnuCash account type (ASSET, BANK, CASH, CREDIT, EQUITY, EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE, PAYABLE)
         parent: Full path of parent account (e.g., "Expenses:Online Services")
         description: Optional description
         placeholder: If true, account is container-only. Default: false
@@ -1585,6 +1595,189 @@ def delete_account_slot(
     book = get_book()
     result = book.delete_account_slot(account_name=account, key=key)
     return _json(result)
+
+
+# ============== Business Tools ==============
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="customer")
+def create_customer(
+    name: str,
+    currency: str | None = None,
+    notes: str = "",
+    address: dict | None = None,
+) -> str:
+    """Create a new customer.
+
+    Args:
+        name: Customer name (e.g., "Acme Corp").
+        currency: ISO currency code (e.g., "USD", "EUR").
+                  Defaults to book's default currency.
+        notes: Optional notes.
+        address: Optional address with keys: name, addr1, addr2,
+                 addr3, addr4, phone, fax, email.
+    """
+    book = get_book()
+    result = book.create_customer(
+        name=name, currency=currency, notes=notes, address=address,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_customers(
+    active_only: bool = True,
+    verbose: bool = False,
+) -> str:
+    """List all customers.
+
+    Returns a compact one-line-per-customer format by default.
+    Use verbose=true for full JSON with guid, address, notes, etc.
+
+    Args:
+        active_only: If True, only show active customers. Default True.
+        verbose: If true, return full JSON details for each customer.
+    """
+    book = get_book()
+    result = book.list_customers(active_only=active_only, compact=not verbose)
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_customer(
+    id: str,
+) -> str:
+    """Get details for a specific customer by ID.
+
+    Args:
+        id: Customer ID (e.g., "000001"). This is the human-readable
+            ID shown in GnuCash, not the internal GUID.
+    """
+    book = get_book()
+    result = book.get_customer(customer_id=id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="vendor")
+def create_vendor(
+    name: str,
+    currency: str | None = None,
+    notes: str = "",
+    address: dict | None = None,
+) -> str:
+    """Create a new vendor.
+
+    Args:
+        name: Vendor name (e.g., "Office Depot").
+        currency: ISO currency code (e.g., "USD", "EUR").
+                  Defaults to book's default currency.
+        notes: Optional notes.
+        address: Optional address with keys: name, addr1, addr2,
+                 addr3, addr4, phone, fax, email.
+    """
+    book = get_book()
+    result = book.create_vendor(
+        name=name, currency=currency, notes=notes, address=address,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_vendors(
+    active_only: bool = True,
+    verbose: bool = False,
+) -> str:
+    """List all vendors.
+
+    Returns a compact one-line-per-vendor format by default.
+    Use verbose=true for full JSON with guid, address, notes, etc.
+
+    Args:
+        active_only: If True, only show active vendors. Default True.
+        verbose: If true, return full JSON details for each vendor.
+    """
+    book = get_book()
+    result = book.list_vendors(active_only=active_only, compact=not verbose)
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_vendor(
+    id: str,
+) -> str:
+    """Get details for a specific vendor by ID.
+
+    Args:
+        id: Vendor ID (e.g., "000001"). This is the human-readable
+            ID shown in GnuCash, not the internal GUID.
+    """
+    book = get_book()
+    result = book.get_vendor(vendor_id=id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="billterm")
+def create_billterm(
+    name: str,
+    due_days: int = 30,
+    description: str = "",
+    discount_days: int = 0,
+    discount_percent: str = "0",
+) -> str:
+    """Create a new billing term.
+
+    Args:
+        name: Billterm name (e.g., "Net 30").
+        due_days: Number of days until payment is due. Default 30.
+        description: Optional description.
+        discount_days: Days within which early discount applies.
+        discount_percent: Early payment discount percentage (e.g., "2" for 2%).
+    """
+    book = get_book()
+    result = book.create_billterm(
+        name=name, due_days=due_days, description=description,
+        discount_days=discount_days, discount_percent=discount_percent,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_billterms(
+    verbose: bool = False,
+) -> str:
+    """List all billing terms.
+
+    Returns a compact one-line-per-term format by default.
+    Use verbose=true for full JSON with guid, discount details, etc.
+
+    Args:
+        verbose: If true, return full JSON details for each billing term.
+    """
+    book = get_book()
+    result = book.list_billterms(compact=not verbose)
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
 
 
 # ============== Resources ==============

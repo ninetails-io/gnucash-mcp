@@ -279,6 +279,7 @@ class GnuCashBook:
     _GUID_TABLES = frozenset({
         "transactions", "splits", "accounts", "lots",
         "schedxactions", "commodities", "budgets",
+        "customers", "vendors", "invoices",
     })
 
     def _resolve_guid(self, table: str, partial: str) -> str:
@@ -2164,6 +2165,8 @@ class GnuCashBook:
         "INCOME",
         "LIABILITY",
         "MUTUAL",
+        "PAYABLE",
+        "RECEIVABLE",
         "STOCK",
     }
 
@@ -4776,3 +4779,386 @@ class GnuCashBook:
                 "key": key,
                 "status": "deleted",
             }
+
+    # ------------------------------------------------------------------
+    # Business: Customer / Vendor / Billterm
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_customer(book, customer_id: str):
+        """Find a customer by their human-readable ID (e.g., '000001')."""
+        for c in book.customers:
+            if c.id == customer_id:
+                return c
+        return None
+
+    @staticmethod
+    def _find_vendor(book, vendor_id: str):
+        """Find a vendor by their human-readable ID (e.g., '000001')."""
+        for v in book.vendors:
+            if v.id == vendor_id:
+                return v
+        return None
+
+    @staticmethod
+    def _customer_to_dict(customer) -> dict:
+        """Convert a piecash Customer to a serializable dict."""
+        return {
+            "guid": customer.guid,
+            "id": customer.id,
+            "name": customer.name,
+            "currency": customer.currency.mnemonic if customer.currency else None,
+            "notes": customer.notes or "",
+            "active": bool(customer.active),
+            "address": {
+                "name": customer.addr_name or "",
+                "addr1": customer.addr_addr1 or "",
+                "addr2": customer.addr_addr2 or "",
+                "addr3": customer.addr_addr3 or "",
+                "addr4": customer.addr_addr4 or "",
+                "phone": customer.addr_phone or "",
+                "fax": customer.addr_fax or "",
+                "email": customer.addr_email or "",
+            },
+        }
+
+    @staticmethod
+    def _vendor_to_dict(vendor) -> dict:
+        """Convert a piecash Vendor to a serializable dict."""
+        return {
+            "guid": vendor.guid,
+            "id": vendor.id,
+            "name": vendor.name,
+            "currency": vendor.currency.mnemonic if vendor.currency else None,
+            "notes": vendor.notes or "",
+            "active": bool(vendor.active),
+            "address": {
+                "name": vendor.addr_name or "",
+                "addr1": vendor.addr_addr1 or "",
+                "addr2": vendor.addr_addr2 or "",
+                "addr3": vendor.addr_addr3 or "",
+                "addr4": vendor.addr_addr4 or "",
+                "phone": vendor.addr_phone or "",
+                "fax": vendor.addr_fax or "",
+                "email": vendor.addr_email or "",
+            },
+        }
+
+    @staticmethod
+    def _customer_to_compact_line(customer) -> str:
+        """One-line compact: 'id  name  currency'."""
+        return f"{customer.id}\t{customer.name}\t{customer.currency.mnemonic}"
+
+    @staticmethod
+    def _vendor_to_compact_line(vendor) -> str:
+        """One-line compact: 'id  name  currency'."""
+        return f"{vendor.id}\t{vendor.name}\t{vendor.currency.mnemonic}"
+
+    @staticmethod
+    def _billterm_to_dict(bt) -> dict:
+        """Convert a Billterm to a serializable dict."""
+        return {
+            "guid": bt.guid,
+            "name": bt.name,
+            "description": bt.description or "",
+            "type": bt.type,
+            "due_days": bt.duedays,
+            "discount_days": bt.discountdays if bt.discountdays else 0,
+            "discount": str(bt.discount) if bt.discount else "0",
+        }
+
+    def create_customer(
+        self,
+        name: str,
+        currency: str | None = None,
+        notes: str = "",
+        address: dict | None = None,
+    ) -> dict:
+        """Create a new customer.
+
+        Args:
+            name: Customer name.
+            currency: ISO currency code. Defaults to book's default currency.
+            notes: Optional notes.
+            address: Optional address dict with keys: name, addr1, addr2,
+                     addr3, addr4, phone, fax, email.
+
+        Returns:
+            Dict with guid, id, name, status.
+        """
+        from piecash.business.person import Customer, Address
+
+        with self.open(readonly=False) as book:
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+            else:
+                currency_obj = book.default_currency
+
+            addr = None
+            if address:
+                addr = Address(
+                    name=address.get("name", name),
+                    addr1=address.get("addr1", ""),
+                    addr2=address.get("addr2", ""),
+                    addr3=address.get("addr3", ""),
+                    addr4=address.get("addr4", ""),
+                    phone=address.get("phone", ""),
+                    fax=address.get("fax", ""),
+                    email=address.get("email", ""),
+                )
+
+            customer = Customer(
+                name=name,
+                currency=currency_obj,
+                notes=notes,
+                address=addr,
+                book=book,
+            )
+            book.save()
+
+            return {
+                "guid": customer.guid,
+                "id": customer.id,
+                "name": customer.name,
+                "status": "created",
+            }
+
+    def list_customers(
+        self,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List all customers.
+
+        Args:
+            active_only: If True, only return active customers.
+            compact: If True, return compact one-line-per-customer string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        with self.open() as book:
+            customers = sorted(book.customers, key=lambda c: c.name)
+            if active_only:
+                customers = [c for c in customers if c.active]
+
+            if compact:
+                lines = [self._customer_to_compact_line(c) for c in customers]
+                return "\n".join(lines)
+            else:
+                return [self._customer_to_dict(c) for c in customers]
+
+    def get_customer(self, customer_id: str) -> dict:
+        """Get customer details by ID.
+
+        Args:
+            customer_id: Human-readable customer ID (e.g., '000001').
+
+        Returns:
+            Dict with full customer details.
+
+        Raises:
+            ValueError: If customer not found.
+        """
+        with self.open() as book:
+            customer = self._find_customer(book, customer_id)
+            if not customer:
+                raise ValueError(f"Customer not found: {customer_id}")
+            return self._customer_to_dict(customer)
+
+    def create_vendor(
+        self,
+        name: str,
+        currency: str | None = None,
+        notes: str = "",
+        address: dict | None = None,
+    ) -> dict:
+        """Create a new vendor.
+
+        Args:
+            name: Vendor name.
+            currency: ISO currency code. Defaults to book's default currency.
+            notes: Optional notes.
+            address: Optional address dict with keys: name, addr1, addr2,
+                     addr3, addr4, phone, fax, email.
+
+        Returns:
+            Dict with guid, id, name, status.
+        """
+        from piecash.business.person import Vendor, Address
+
+        with self.open(readonly=False) as book:
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+            else:
+                currency_obj = book.default_currency
+
+            addr = None
+            if address:
+                addr = Address(
+                    name=address.get("name", name),
+                    addr1=address.get("addr1", ""),
+                    addr2=address.get("addr2", ""),
+                    addr3=address.get("addr3", ""),
+                    addr4=address.get("addr4", ""),
+                    phone=address.get("phone", ""),
+                    fax=address.get("fax", ""),
+                    email=address.get("email", ""),
+                )
+
+            vendor = Vendor(
+                name=name,
+                currency=currency_obj,
+                notes=notes,
+                address=addr,
+                book=book,
+            )
+            book.save()
+
+            return {
+                "guid": vendor.guid,
+                "id": vendor.id,
+                "name": vendor.name,
+                "status": "created",
+            }
+
+    def list_vendors(
+        self,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List all vendors.
+
+        Args:
+            active_only: If True, only return active vendors.
+            compact: If True, return compact one-line-per-vendor string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        with self.open() as book:
+            vendors = sorted(book.vendors, key=lambda v: v.name)
+            if active_only:
+                vendors = [v for v in vendors if v.active]
+
+            if compact:
+                lines = [self._vendor_to_compact_line(v) for v in vendors]
+                return "\n".join(lines)
+            else:
+                return [self._vendor_to_dict(v) for v in vendors]
+
+    def get_vendor(self, vendor_id: str) -> dict:
+        """Get vendor details by ID.
+
+        Args:
+            vendor_id: Human-readable vendor ID (e.g., '000001').
+
+        Returns:
+            Dict with full vendor details.
+
+        Raises:
+            ValueError: If vendor not found.
+        """
+        with self.open() as book:
+            vendor = self._find_vendor(book, vendor_id)
+            if not vendor:
+                raise ValueError(f"Vendor not found: {vendor_id}")
+            return self._vendor_to_dict(vendor)
+
+    def create_billterm(
+        self,
+        name: str,
+        due_days: int = 30,
+        description: str = "",
+        discount_days: int = 0,
+        discount_percent: str = "0",
+    ) -> dict:
+        """Create a new billing term.
+
+        Args:
+            name: Billterm name (e.g., 'Net 30').
+            due_days: Number of days until payment is due.
+            description: Optional description.
+            discount_days: Days within which early discount applies.
+            discount_percent: Early payment discount percentage.
+
+        Returns:
+            Dict with guid, name, due_days, status.
+        """
+        import uuid
+        from piecash.business.invoice import Billterm
+
+        discount = Decimal(discount_percent)
+        # Convert discount to num/denom
+        disc_str = str(discount)
+        if "." in disc_str:
+            decimals = len(disc_str.split(".")[1])
+            disc_denom = 10 ** decimals
+            disc_num = int(discount * disc_denom)
+        else:
+            disc_num = int(discount)
+            disc_denom = 1
+
+        with self.open(readonly=False) as book:
+            bt_guid = uuid.uuid4().hex
+
+            book.session.execute(
+                Billterm.__table__.insert().values(
+                    guid=bt_guid,
+                    name=name,
+                    description=description,
+                    refcount=0,
+                    invisible=0,
+                    type="GNC_TERM_TYPE_DAYS",
+                    duedays=due_days,
+                    discountdays=discount_days,
+                    discount_num=disc_num,
+                    discount_denom=disc_denom,
+                    cutoff=0,
+                )
+            )
+
+            book.save()
+
+            return {
+                "guid": bt_guid,
+                "name": name,
+                "due_days": due_days,
+                "status": "created",
+            }
+
+    def list_billterms(self, compact: bool = True) -> list[dict] | str:
+        """List all billing terms.
+
+        Args:
+            compact: If True, return compact one-line-per-term string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        from piecash.business.invoice import Billterm
+
+        with self.open() as book:
+            terms = book.session.query(Billterm).filter(
+                Billterm.invisible == 0
+            ).order_by(Billterm.name).all()
+
+            if compact:
+                lines = []
+                for t in terms:
+                    lines.append(f"{t.name}\t{t.duedays} days")
+                return "\n".join(lines)
+            else:
+                return [self._billterm_to_dict(t) for t in terms]

@@ -727,3 +727,120 @@ def investment_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+@pytest.fixture
+def business_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book with business-ready accounts.
+
+    Creates a USD-default book with:
+    - Assets:Checking (BANK, USD)
+    - Assets:Accounts Receivable (RECEIVABLE, USD)
+    - Liabilities:Accounts Payable (PAYABLE, USD)
+    - Income:Sales, Income:Consulting (INCOME, USD)
+    - Expenses:Office Supplies, Expenses:Services (EXPENSE, USD)
+    - Equity:Opening Balance (EQUITY, USD)
+    - Opening balance: $10000 in checking
+
+    No pre-existing customers/vendors — tests create their own.
+    """
+    book_path = tmp_path / "business_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    ar = piecash.Account(
+        name="Accounts Receivable", type="RECEIVABLE", parent=assets,
+        commodity=usd,
+    )
+    book.session.add(ar)
+
+    liabilities = piecash.Account(
+        name="Liabilities", type="LIABILITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(liabilities)
+
+    ap = piecash.Account(
+        name="Accounts Payable", type="PAYABLE", parent=liabilities,
+        commodity=usd,
+    )
+    book.session.add(ap)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    sales = piecash.Account(
+        name="Sales", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(sales)
+
+    consulting = piecash.Account(
+        name="Consulting", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(consulting)
+
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(expenses)
+
+    office_supplies = piecash.Account(
+        name="Office Supplies", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(office_supplies)
+
+    services = piecash.Account(
+        name="Services", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(services)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity, commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    t0 = piecash.Transaction(
+        currency=usd,
+        description="Opening Balance",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("10000")),
+            piecash.Split(account=opening, value=Decimal("-10000")),
+        ],
+    )
+    book.session.add(t0)
+
+    book.save()
+    book.close()
+
+    return book_path
