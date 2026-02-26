@@ -834,6 +834,124 @@ class TestPostInvoice:
         )
         assert result["status"] == "posted"
 
+    def test_post_sets_transaction_metadata(self, business_book):
+        """Posting transaction has GnuCash-compatible metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            due_date="2026-04-01",
+        )
+        txn_guid = result["transaction_guid"]
+        lot_guid = result["lot_guid"]
+
+        # Read slots from the database directly
+        conn = sqlite3.connect(str(business_book))
+        try:
+            # Transaction num should be invoice ID
+            txn = conn.execute(
+                "SELECT num, description FROM transactions "
+                "WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "000001", "transaction.num should be invoice ID"
+            assert txn[1] == "Acme Corp", (
+                "description should be customer name"
+            )
+
+            # A/R split should have action='Invoice'
+            ar_split = conn.execute(
+                "SELECT action, reconcile_date FROM splits "
+                "WHERE tx_guid = ? AND action = 'Invoice'",
+                (txn_guid,),
+            ).fetchone()
+            assert ar_split is not None, "A/R split should have action=Invoice"
+
+            # Check transaction slots
+            slots = conn.execute(
+                "SELECT name, slot_type, string_val, guid_val, gdate_val "
+                "FROM slots WHERE obj_guid = ?",
+                (txn_guid,),
+            ).fetchall()
+            slot_dict = {s[0]: s for s in slots}
+
+            assert "trans-txn-type" in slot_dict, "missing trans-txn-type slot"
+            assert slot_dict["trans-txn-type"][2] == "I"
+
+            assert "trans-read-only" in slot_dict, "missing trans-read-only slot"
+            assert "invoice" in slot_dict["trans-read-only"][2].lower()
+
+            # gncInvoice frame slot on transaction
+            assert "gncInvoice" in slot_dict, (
+                "missing gncInvoice slot on transaction"
+            )
+            frame_guid = slot_dict["gncInvoice"][3]
+            assert frame_guid is not None
+
+            # Child GUID slot inside the frame
+            child = conn.execute(
+                "SELECT name, slot_type, guid_val FROM slots "
+                "WHERE obj_guid = ? AND name = 'invoice'",
+                (frame_guid,),
+            ).fetchone()
+            assert child is not None, "missing gncInvoice/invoice child slot"
+            assert child[1] == 5, "child slot should be GUID type (5)"
+
+            # Due date slot
+            assert "trans-date-due" in slot_dict, "missing trans-date-due slot"
+            assert slot_dict["trans-date-due"][1] == 10, (
+                "trans-date-due should be GDATE type (10)"
+            )
+
+            # gncInvoice frame slot on lot
+            lot_slots = conn.execute(
+                "SELECT name, slot_type, guid_val FROM slots "
+                "WHERE obj_guid = ?",
+                (lot_guid,),
+            ).fetchall()
+            lot_slot_dict = {s[0]: s for s in lot_slots}
+            assert "gncInvoice" in lot_slot_dict, (
+                "missing gncInvoice slot on lot"
+            )
+        finally:
+            conn.close()
+
+    def test_post_bill_sets_metadata(self, business_book):
+        """Vendor bill posting also sets correct metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._setup_bill(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        txn_guid = result["transaction_guid"]
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            txn = conn.execute(
+                "SELECT description FROM transactions WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "Office Depot", (
+                "bill description should be vendor name"
+            )
+
+            slots = conn.execute(
+                "SELECT name, string_val FROM slots "
+                "WHERE obj_guid = ? AND slot_type = 4",
+                (txn_guid,),
+            ).fetchall()
+            slot_dict = {s[0]: s[1] for s in slots}
+            assert slot_dict.get("trans-txn-type") == "I"
+        finally:
+            conn.close()
+
 
 # ============== Pay Invoice Tests ==============
 
@@ -982,6 +1100,102 @@ class TestPayInvoice:
             description="Wire transfer payment",
         )
         assert result["status"] == "paid"
+
+    def test_payment_sets_transaction_metadata(self, business_book):
+        """Payment transaction has GnuCash-compatible metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        txn_guid = result["transaction_guid"]
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            # Description should be customer name
+            txn = conn.execute(
+                "SELECT description FROM transactions WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "Acme Corp", (
+                "payment description should be customer name"
+            )
+
+            # A/R split should have action='Payment'
+            pay_split = conn.execute(
+                "SELECT action FROM splits "
+                "WHERE tx_guid = ? AND action = 'Payment'",
+                (txn_guid,),
+            ).fetchone()
+            assert pay_split is not None, (
+                "A/R split should have action=Payment"
+            )
+
+            # trans-txn-type slot should be 'P'
+            slot = conn.execute(
+                "SELECT string_val FROM slots "
+                "WHERE obj_guid = ? AND name = 'trans-txn-type'",
+                (txn_guid,),
+            ).fetchone()
+            assert slot is not None, "missing trans-txn-type slot on payment"
+            assert slot[0] == "P"
+        finally:
+            conn.close()
+
+    def test_full_payment_closes_lot(self, business_book):
+        """Full payment auto-closes the lot with GnuCash boolean -1."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        post_result = gb.get_invoice("000001")
+
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+
+        # Check lot is_closed = -1 in the database
+        conn = sqlite3.connect(str(business_book))
+        try:
+            lots = conn.execute(
+                "SELECT is_closed FROM lots WHERE account_guid IN "
+                "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
+            ).fetchall()
+            assert any(
+                row[0] == -1 for row in lots
+            ), "lot should be closed with is_closed=-1"
+        finally:
+            conn.close()
+
+    def test_partial_payment_does_not_close_lot(self, business_book):
+        """Partial payment leaves lot open."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            lots = conn.execute(
+                "SELECT is_closed FROM lots WHERE account_guid IN "
+                "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
+            ).fetchall()
+            assert all(
+                row[0] == 0 for row in lots
+            ), "lot should remain open after partial payment"
+        finally:
+            conn.close()
 
 
 # ============== Outstanding Invoices Tests ==============

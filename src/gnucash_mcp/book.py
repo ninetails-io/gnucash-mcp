@@ -4545,8 +4545,9 @@ class GnuCashBook:
             summary = self._lot_summary(lot)
 
             # Auto-close if quantity reaches zero
+            # GnuCash uses -1 for boolean true
             if Decimal(summary["quantity"]) == 0 and len(lot.splits) > 0:
-                lot.is_closed = 1
+                lot.is_closed = -1
                 book.save()
                 summary["is_closed"] = True
 
@@ -4662,7 +4663,8 @@ class GnuCashBook:
             if lot.is_closed:
                 raise ValueError("Lot is already closed")
 
-            lot.is_closed = 1
+            # GnuCash uses -1 for boolean true
+            lot.is_closed = -1
             book.save()
 
             return {
@@ -5779,6 +5781,58 @@ class GnuCashBook:
         return None
 
     @staticmethod
+    def _write_gncinvoice_slot(book, obj_guid: str, invoice_guid: str):
+        """Write a gncInvoice FRAME+GUID slot linking an object to an invoice.
+
+        GnuCash stores invoice linkage as a two-row structure:
+          Row 1: obj_guid=<parent>, name='gncInvoice', slot_type=9 (FRAME),
+                 guid_val=<frame_guid>
+          Row 2: obj_guid=<frame_guid>, name='invoice', slot_type=5 (GUID),
+                 guid_val=<invoice_guid>
+
+        This is used on both posting transactions and lots to enable
+        GnuCash UI navigation from transaction/lot back to the invoice.
+        """
+        import uuid
+        from piecash.kvp import Slot, KVP_Type
+
+        frame_guid = uuid.uuid4().hex
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=obj_guid,
+                name="gncInvoice",
+                slot_type=KVP_Type.KVP_TYPE_FRAME,
+                guid_val=frame_guid,
+            )
+        )
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=frame_guid,
+                name="invoice",
+                slot_type=KVP_Type.KVP_TYPE_GUID,
+                guid_val=invoice_guid,
+            )
+        )
+
+    @staticmethod
+    def _write_gdate_slot(book, obj_guid: str, name: str, date_val: date):
+        """Write a gdate-typed slot on an object.
+
+        Used for trans-date-due and date-posted slots on invoice
+        posting transactions.
+        """
+        from piecash.kvp import Slot, KVP_Type
+
+        book.session.execute(
+            Slot.__table__.insert().values(
+                obj_guid=obj_guid,
+                name=name,
+                slot_type=KVP_Type.KVP_TYPE_GDATE,
+                gdate_val=date_val,
+            )
+        )
+
+    @staticmethod
     def _calculate_lot_balance(lot) -> Decimal:
         """Sum of split values in a lot.
 
@@ -5925,6 +5979,22 @@ class GnuCashBook:
             )
             book.session.add(lot)
 
+            # Resolve owner name for transaction description
+            # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
+            if is_bill:
+                owner = self._find_vendor_by_guid(book, inv.owner_guid)
+            else:
+                owner = self._find_customer_by_guid(
+                    book, inv.owner_guid
+                )
+            owner_name = owner.name if owner else f"Invoice {inv.id}"
+            txn_desc = description or owner_name
+
+            # Parse due date if provided
+            parsed_due = (
+                date.fromisoformat(due_date) if due_date else None
+            )
+
             # Build transaction splits
             # For customer invoice: A/R debit (positive), income credit (negative)
             # For vendor bill: A/P credit (negative), expense debit (positive)
@@ -5937,6 +6007,8 @@ class GnuCashBook:
                     value=-grand_total,
                     quantity=-grand_total,
                     memo="",
+                    action="Invoice",
+                    reconcile_date=datetime(1970, 1, 1),
                 )
             else:
                 # A/R split: positive (debit)
@@ -5945,6 +6017,8 @@ class GnuCashBook:
                     value=grand_total,
                     quantity=grand_total,
                     memo="",
+                    action="Invoice",
+                    reconcile_date=datetime(1970, 1, 1),
                 )
             piecash_splits.append(ar_ap_split)
 
@@ -5977,11 +6051,12 @@ class GnuCashBook:
                 )
 
             # Create posting transaction
-            txn_desc = description or f"Invoice {inv.id}"
+            # num = invoice ID, matching GnuCash UI behavior
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
+                num=inv.id,
                 splits=piecash_splits,
             )
 
@@ -5995,6 +6070,28 @@ class GnuCashBook:
             inv.post_txn = txn
             inv.post_lot = lot
             inv.post_account = post_acct
+
+            # Flush to assign GUIDs before writing slots
+            book.flush()
+
+            # Write metadata slots matching GnuCash UI behavior.
+            # These enable GnuCash to identify invoice-generated
+            # transactions and navigate between invoices/lots/txns.
+            txn["trans-txn-type"] = "I"
+            txn["trans-read-only"] = (
+                "Generated from an invoice. "
+                "Try unposting the invoice."
+            )
+            self._write_gncinvoice_slot(
+                book, txn.guid, inv.guid
+            )
+            self._write_gncinvoice_slot(
+                book, lot.guid, inv.guid
+            )
+            if parsed_due:
+                self._write_gdate_slot(
+                    book, txn.guid, "trans-date-due", parsed_due
+                )
 
             book.save()
 
@@ -6102,6 +6199,19 @@ class GnuCashBook:
                     f"Lot not found for invoice {invoice_id}"
                 )
 
+            # Resolve owner name for transaction description
+            # GnuCash UI uses the customer/vendor name
+            if is_bill:
+                owner = self._find_vendor_by_guid(
+                    book, inv.owner_guid
+                )
+            else:
+                owner = self._find_customer_by_guid(
+                    book, inv.owner_guid
+                )
+            owner_name = owner.name if owner else ""
+            txn_desc = description or owner_name
+
             # Build payment splits
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
@@ -6110,6 +6220,7 @@ class GnuCashBook:
                     value=payment_amount,
                     quantity=payment_amount,
                     memo="",
+                    action="Payment",
                 )
                 bank_split = piecash.Split(
                     account=pay_acct,
@@ -6124,6 +6235,7 @@ class GnuCashBook:
                     value=-payment_amount,
                     quantity=-payment_amount,
                     memo="",
+                    action="Payment",
                 )
                 bank_split = piecash.Split(
                     account=pay_acct,
@@ -6133,24 +6245,29 @@ class GnuCashBook:
                 )
 
             # Create payment transaction
-            txn_desc = (
-                description
-                or f"Payment for {'Bill' if is_bill else 'Invoice'} {inv.id}"
-            )
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
+                num="",
                 splits=[ar_ap_split, bank_split],
             )
 
             # Assign A/R or A/P split to the invoice's lot
             ar_ap_split.lot = lot_obj
 
-            book.save()
+            # Flush to assign GUIDs before writing slots
+            book.flush()
 
-            # Calculate remaining balance
+            # Mark as payment transaction for GnuCash UI
+            txn["trans-txn-type"] = "P"
+
+            # Auto-close lot if fully paid
             remaining = self._calculate_lot_balance(lot_obj)
+            if remaining == Decimal(0):
+                lot_obj.is_closed = -1
+
+            book.save()
 
             result = {
                 "id": inv.id,
