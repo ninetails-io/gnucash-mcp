@@ -2219,9 +2219,9 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (15 tools). Use "all" for all 52 tools.
+                       Default: core (15 tools). Use "all" for all 70 tools.
                        Available: core, reconciliation, reporting, budgets,
-                       scheduling, investments, admin
+                       scheduling, investments, business, admin
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   --audit-format=FORMAT  Audit log format: "text" (default) or "json"

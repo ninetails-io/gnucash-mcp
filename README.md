@@ -101,7 +101,34 @@ If you used pip instead of uv:
 }
 ```
 
-Optional flags: `"--debug"` enables debug logging, `"--audit-format=text"` or `"--audit-format=json"` sets the audit log format. Add these after `"gnucash_mcp"` in the args array.
+#### Choosing modules (important)
+
+**Only load the modules you actually use.** The server has 70 tools across 8 modules, but every loaded tool gets described in the system prompt — eating tokens and context on every single message. Most users only need 2-3 modules.
+
+Add `--modules=` after `"gnucash_mcp"` in the args array with a comma-separated list:
+
+```json
+"args": [
+  "run", "--directory", "/path/to/gnucash-mcp",
+  "python", "-m", "gnucash_mcp",
+  "--modules=core,reporting,budgets"
+]
+```
+
+| Module | Tools | What it does |
+|--------|-------|--------------|
+| `core` | 15 | Accounts, transactions, book summary (always loaded) |
+| `reconciliation` | 5 | Bank reconciliation, void/unvoid |
+| `reporting` | 5 | Spending, income, balance sheet, net worth, cash flow |
+| `budgets` | 6 | Budget creation, targets, variance reports |
+| `scheduling` | 6 | Recurring transactions, upcoming bills |
+| `investments` | 11 | Commodities, prices, lots, cost basis tracking |
+| `business` | 18 | Customers, vendors, invoices, bills, payments |
+| `admin` | 4 | Account metadata slots, audit log |
+
+Use `--modules=all` to load everything (70 tools), but only if you need it. You can also set `GNUCASH_MCP_MODULES=core,reporting` as an environment variable instead of using the CLI flag.
+
+Other optional flags: `"--debug"` enables debug logging, `"--audit-format=text"` or `"--audit-format=json"` sets the audit log format.
 
 ### Step 4: Restart Claude Desktop
 
@@ -118,7 +145,7 @@ Ask Claude:
 
 ## What can it do?
 
-**52 tools** across twelve categories:
+**70 tools** across thirteen categories:
 
 | Category | What you can ask |
 |----------|------------------|
@@ -129,6 +156,7 @@ Ask Claude:
 | **Scheduled** | "Set up rent as a monthly bill", "What bills are coming up?", "Pay this month's electric bill" |
 | **Investments** | "Track my VTSAX shares", "What's my cost basis?", "Calculate my capital gains" |
 | **Reports** | "Spending by category last month", "What's my net worth?", "Show cash flow this year" |
+| **Business** | "Create a customer", "Invoice Acme Corp for consulting", "Record payment on invoice", "How much did we spend with each vendor?" |
 | **Multi-currency** | "Record a €50 purchase", "What's my EUR account balance?" |
 | **Reconciliation** | "Show unreconciled transactions", "Mark these as cleared" |
 | **Account Metadata** | "Set my credit card APR", "What metadata is on this account?" |
@@ -169,6 +197,29 @@ Claude: Recorded VTSAX purchase:
         I've created a lot to track this purchase for capital gains.
 ```
 
+### Invoicing a customer
+```
+You: Create a customer called "Acme Corp" and invoice them $1,500 for consulting.
+
+Claude: Created customer "Acme Corp" (ID: 000001)
+        Created invoice 000001:
+        • 1x Consulting at $1,500.00
+        • Total: $1,500.00
+
+        Ready to post when you want to make it official.
+```
+
+### Tracking vendor spending
+```
+You: How much did we spend with each vendor this year?
+
+Claude: Vendor spending (Jan–Feb 2026):
+        • Office Depot: $2,340 (4 bills, $0 outstanding)
+        • CloudHost Inc: $1,200 (2 bills, $600 outstanding)
+        • Legal Associates: $3,500 (1 bill, $3,500 outstanding)
+        Total billed: $7,040 | Paid: $2,940 | Outstanding: $4,100
+```
+
 ### Month-end review
 ```
 You: Give me a financial summary for January.
@@ -196,11 +247,13 @@ Claude: January 2026 Summary:
 
 ## Important: Back Up Your Data
 
-This server **writes to your GnuCash book**. Before first use:
+This server **reads and writes your GnuCash book directly**. Your GnuCash file may contain your entire financial history — treat it accordingly.
 
-1. Make a copy of your `.gnucash` file
-2. Consider using a test book first
-3. The server logs all changes to an audit file (see Audit Logging below)
+1. **Back up your `.gnucash` file before first use** and keep regular backups
+2. **Test with a copy first**, not your real book
+3. All write operations are logged to an audit file (see Audit Logging below)
+
+> **Disclaimer:** This software is provided "as is" under the [MIT License](LICENSE), without warranty of any kind. The authors are not liable for any data loss, corruption, or financial discrepancy arising from its use. You are solely responsible for maintaining backups and verifying the accuracy of your financial data.
 
 ---
 
@@ -246,28 +299,18 @@ This server **writes to your GnuCash book**. Before first use:
 
 ### Tool Modules
 
-By default, only the **core** module (15 tools) is loaded to minimize context usage. Load additional modules as needed:
+See [Choosing modules](#choosing-modules-important) in the Quick Start for the full module table. From the command line:
 
 ```bash
-# Default: core only (15 tools — accounts, transactions, book summary)
+# Default: core only (15 tools)
 gnucash-mcp
 
-# All 52 tools
+# Load specific modules
+gnucash-mcp --modules=core,reporting,business
+
+# Everything (70 tools — not recommended unless you need it all)
 gnucash-mcp --modules=all
-
-# Mix and match
-gnucash-mcp --modules=core,reporting,reconciliation
 ```
-
-| Module | Tools | Description |
-|--------|-------|-------------|
-| `core` | 15 | Accounts, transactions, book summary (always loaded) |
-| `reconciliation` | 5 | Unreconciled splits, reconcile, void/unvoid |
-| `reporting` | 5 | Spending, income, balance sheet, net worth, cash flow |
-| `budgets` | 6 | Budget CRUD and variance reports |
-| `scheduling` | 6 | Recurring transactions and upcoming bills |
-| `investments` | 11 | Commodities, prices, lots, cost basis |
-| `admin` | 4 | Account metadata slots, audit log |
 
 When `--debug` is set, an additional `get_server_config` diagnostic tool is registered. It reports loaded modules, tool count, book path, debug mode, and version — useful for verifying what the server actually loaded.
 
@@ -280,7 +323,7 @@ claude mcp add-json gnucash \
   '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
 ```
 
-Replace both paths with your actual paths. Add `"--modules=all"`, `"--debug"`, or `"--audit-format=text"` to the args array as needed.
+Replace both paths with your actual paths. Add `"--modules=core,reporting"` (or whichever modules you need), `"--debug"`, or `"--audit-format=text"` to the args array.
 
 ### Other MCP Clients
 
@@ -321,7 +364,7 @@ Example audit entry:
 
 ---
 
-## All 52 Tools
+## All 70 Tools
 
 <details>
 <summary>Click to expand full tool list</summary>
@@ -337,6 +380,7 @@ Example audit entry:
 | Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` |
 | Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` |
 | Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` |
+| Business | `create_customer`, `list_customers`, `get_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `get_outstanding_invoices`, `vendor_spending_report` |
 | Account Metadata | `get_account_slots`, `set_account_slot`, `delete_account_slot` |
 | Audit | `get_audit_log` |
 
@@ -370,6 +414,19 @@ gnucash-mcp/
 ---
 
 ## Changelog
+
+### v1.2.0 — Business Module
+
+Full accounts receivable and accounts payable workflow. Create customers and vendors, generate invoices and bills, post them to A/R or A/P, and record payments — all through natural language.
+
+- **Customers & vendors**: Create, list, and query customers and vendors with addresses
+- **Billing terms**: Define payment terms (e.g., Net 30 with early payment discounts)
+- **Invoices & bills**: Create invoices for customers and bills from vendors, add line items, post to A/R or A/P accounts, record full or partial payments
+- **Reporting**: List outstanding invoices/bills, vendor spending breakdown by period
+- **GnuCash UI compatibility**: Posted invoices include metadata slots (`gncInvoice`, `trans-date-due`, `date-posted`) so they display correctly in the native GnuCash interface
+- **Write verification**: All raw SQL operations (those bypassing the piecash ORM) are now verified with a read-back check before commit, with automatic rollback on failure
+- **`business` tool module**: 18 new tools, loaded via `--modules=business` or `--modules=all`
+- **Version**: 1.2.0 (540 tests)
 
 ### v1.1.0 — Modular Tool Loading
 
@@ -426,7 +483,7 @@ From basic CRUD to a full accounting toolkit.
 
 - [x] Full account management
 - [x] Transaction CRUD with search
-- [x] Multi-currency support  
+- [x] Multi-currency support
 - [x] Investment tracking with cost basis
 - [x] Budgets with variance reporting
 - [x] Scheduled transactions
@@ -436,6 +493,8 @@ From basic CRUD to a full accounting toolkit.
 - [x] Partial GUID support (8+ character prefixes)
 - [x] Duplicate detection (built into `create_transaction`)
 - [x] Modular tool loading (`--modules=`)
+- [x] Business: customers, vendors, invoices, bills, payments
+- [x] Write verification for raw SQL operations
 - [ ] CSV export
 - [ ] CSV/OFX import
 
