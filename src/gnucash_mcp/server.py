@@ -1264,6 +1264,7 @@ def create_scheduled_transaction(
             - "weekly"
             - "biweekly" (every 2 weeks)
             - "monthly"
+            - "bimonthly" (every 2 months)
             - "quarterly" (every 3 months)
             - "yearly"
         end_date: Optional last occurrence date (YYYY-MM-DD).
