@@ -26,6 +26,77 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+def _verify_write(session, table, guid: str, label: str) -> None:
+    """Verify a raw SQL INSERT persisted by reading back the primary key.
+
+    Must be called within the same session, before book.save().
+    Raises RuntimeError if the inserted row cannot be found.
+    """
+    from sqlalchemy import select, func
+
+    count = session.execute(
+        select(func.count()).select_from(table).where(table.c.guid == guid)
+    ).scalar()
+    if count != 1:
+        debug_logger.error(
+            f"Write verification FAILED: {label} guid={guid} count={count}"
+        )
+        raise RuntimeError(
+            f"Write verification failed: {label} with guid "
+            f"{guid} not found after INSERT (count={count})"
+        )
+
+
+def _verify_composite_write(
+    session, table, conditions: dict, label: str
+) -> None:
+    """Verify a raw SQL INSERT for a table with composite primary key.
+
+    Must be called within the same session, before book.save().
+    Raises RuntimeError if the inserted row cannot be found.
+    """
+    from sqlalchemy import select, func, and_
+
+    where_clause = and_(
+        *(table.c[col] == val for col, val in conditions.items())
+    )
+    count = session.execute(
+        select(func.count()).select_from(table).where(where_clause)
+    ).scalar()
+    if count != 1:
+        debug_logger.error(
+            f"Write verification FAILED: {label} conditions={conditions} "
+            f"count={count}"
+        )
+        raise RuntimeError(
+            f"Write verification failed: {label} not found "
+            f"after INSERT (count={count})"
+        )
+
+
+def _verify_delete(session, conditions: dict, label: str) -> None:
+    """Verify a raw SQL DELETE removed the expected row(s).
+
+    Must be called within the same session, before book.save().
+    Raises RuntimeError if matching rows still exist.
+    """
+    from sqlalchemy import text
+
+    where_parts = " AND ".join(f"{col} = :{col}" for col in conditions)
+    count = session.execute(
+        text(f"SELECT count(*) FROM slots WHERE {where_parts}"),
+        conditions,
+    ).scalar()
+    if count != 0:
+        debug_logger.error(
+            f"Delete verification FAILED: {label} still has {count} rows"
+        )
+        raise RuntimeError(
+            f"Delete verification failed: {label} still exists "
+            f"after DELETE ({count} rows remain)"
+        )
+
+
 class GnuCashLockError(Exception):
     """Raised when the GnuCash book is locked by another process."""
 
@@ -3521,6 +3592,10 @@ class GnuCashBook:
                     num_periods=num_periods,
                 )
             )
+            _verify_write(
+                book.session, Budget.__table__, budget_guid,
+                f"Budget '{name}'",
+            )
 
             book.session.execute(
                 Recurrence.__table__.insert().values(
@@ -3530,6 +3605,11 @@ class GnuCashBook:
                     recurrence_period_start=date(year, 1, 1),
                     recurrence_weekend_adjust="none",
                 )
+            )
+            _verify_composite_write(
+                book.session, Recurrence.__table__,
+                {"obj_guid": budget_guid},
+                f"Recurrence for budget '{name}'",
             )
 
             book.save()
@@ -3603,6 +3683,15 @@ class GnuCashBook:
                             amount_num=amount_num,
                             amount_denom=amount_denom,
                         )
+                    )
+                    _verify_composite_write(
+                        book.session, BudgetAmount.__table__,
+                        {
+                            "budget_guid": budget.guid,
+                            "account_guid": acct.guid,
+                            "period_num": p,
+                        },
+                        f"BudgetAmount period {p} for '{budget_name}'",
                     )
 
             book.save()
@@ -3952,6 +4041,10 @@ class GnuCashBook:
                     template_act_guid=template_acct.guid,
                 )
             )
+            _verify_write(
+                book.session, ScheduledTransaction.__table__, sx_guid,
+                f"ScheduledTransaction '{name}'",
+            )
 
             # Insert Recurrence
             book.session.execute(
@@ -3962,6 +4055,11 @@ class GnuCashBook:
                     recurrence_period_start=parsed_start,
                     recurrence_weekend_adjust="none",
                 )
+            )
+            _verify_composite_write(
+                book.session, Recurrence.__table__,
+                {"obj_guid": sx_guid},
+                f"Recurrence for scheduled transaction '{name}'",
             )
 
             # Store split templates as JSON in a slot
@@ -3980,6 +4078,11 @@ class GnuCashBook:
                     slot_type=KVP_Type.KVP_TYPE_STRING,
                     string_val=splits_json,
                 )
+            )
+            _verify_composite_write(
+                book.session, Slot.__table__,
+                {"obj_guid": sx_guid, "name": "splits-json"},
+                f"Splits slot for scheduled transaction '{name}'",
             )
 
             book.save()
@@ -4297,6 +4400,11 @@ class GnuCashBook:
                     "WHERE obj_guid = :guid AND name = :name"
                 ),
                 {"guid": sx.guid, "name": "splits-json"},
+            )
+            _verify_delete(
+                book.session,
+                {"obj_guid": sx.guid, "name": "splits-json"},
+                f"Splits slot for scheduled transaction '{result['name']}'",
             )
 
             # Delete the template account
@@ -5241,6 +5349,10 @@ class GnuCashBook:
                     cutoff=0,
                 )
             )
+            _verify_write(
+                book.session, Billterm.__table__, bt_guid,
+                f"Billterm '{name}'",
+            )
 
             book.save()
 
@@ -5357,6 +5469,10 @@ class GnuCashBook:
                     charge_amt_denom=1,
                 )
             )
+            _verify_write(
+                book.session, Invoice.__table__, inv_guid,
+                f"Invoice '{invoice_id}'",
+            )
 
             book.save()
 
@@ -5449,6 +5565,10 @@ class GnuCashBook:
                     charge_amt_num=0,
                     charge_amt_denom=1,
                 )
+            )
+            _verify_write(
+                book.session, Invoice.__table__, inv_guid,
+                f"Bill '{bill_id}'",
             )
 
             book.save()
@@ -5544,6 +5664,10 @@ class GnuCashBook:
                     billto_guid=None,
                     order_guid=None,
                 )
+            )
+            _verify_write(
+                book.session, Entry.__table__, entry_guid,
+                f"Invoice entry '{description}' on invoice {invoice_id}",
             )
 
             book.save()
@@ -5642,6 +5766,10 @@ class GnuCashBook:
                     billto_guid=None,
                     order_guid=None,
                 )
+            )
+            _verify_write(
+                book.session, Entry.__table__, entry_guid,
+                f"Bill entry '{description}' on bill {bill_id}",
             )
 
             book.save()
@@ -5805,6 +5933,11 @@ class GnuCashBook:
                 guid_val=frame_guid,
             )
         )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": obj_guid, "name": "gncInvoice"},
+            f"gncInvoice frame slot for {obj_guid[:8]}",
+        )
         book.session.execute(
             Slot.__table__.insert().values(
                 obj_guid=frame_guid,
@@ -5812,6 +5945,11 @@ class GnuCashBook:
                 slot_type=KVP_Type.KVP_TYPE_GUID,
                 guid_val=invoice_guid,
             )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": frame_guid, "name": "invoice"},
+            f"gncInvoice ref slot for frame {frame_guid[:8]}",
         )
 
     @staticmethod
@@ -5830,6 +5968,11 @@ class GnuCashBook:
                 slot_type=KVP_Type.KVP_TYPE_GDATE,
                 gdate_val=date_val,
             )
+        )
+        _verify_composite_write(
+            book.session, Slot.__table__,
+            {"obj_guid": obj_guid, "name": name},
+            f"Gdate slot '{name}' for {obj_guid[:8]}",
         )
 
     @staticmethod
