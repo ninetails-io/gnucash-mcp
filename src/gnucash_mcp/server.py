@@ -117,6 +117,16 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_vendor",
         "create_billterm",
         "list_billterms",
+        "create_invoice",
+        "create_bill",
+        "add_invoice_entry",
+        "add_bill_entry",
+        "list_invoices",
+        "get_invoice",
+        "post_invoice",
+        "pay_invoice",
+        "get_outstanding_invoices",
+        "vendor_spending_report",
     ],
 }
 
@@ -1778,6 +1788,295 @@ def list_billterms(
     if verbose:
         return json.dumps(result, indent=2)
     return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="invoice")
+def create_invoice(
+    customer_id: str,
+    date_opened: str | None = None,
+    notes: str = "",
+    currency: str | None = None,
+    term: str | None = None,
+) -> str:
+    """Create a customer invoice.
+
+    Args:
+        customer_id: Customer ID (e.g., "000001").
+        date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        notes: Optional notes.
+        currency: ISO currency code. Defaults to book's default currency.
+        term: Billterm name (e.g., "Net 30"). Optional.
+    """
+    book = get_book()
+    result = book.create_invoice(
+        customer_id=customer_id, date_opened=date_opened,
+        notes=notes, currency=currency, term=term,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="bill")
+def create_bill(
+    vendor_id: str,
+    date_opened: str | None = None,
+    notes: str = "",
+    currency: str | None = None,
+    term: str | None = None,
+) -> str:
+    """Create a vendor bill.
+
+    Args:
+        vendor_id: Vendor ID (e.g., "000001").
+        date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        notes: Optional notes.
+        currency: ISO currency code. Defaults to book's default currency.
+        term: Billterm name (e.g., "Net 30"). Optional.
+    """
+    book = get_book()
+    result = book.create_bill(
+        vendor_id=vendor_id, date_opened=date_opened,
+        notes=notes, currency=currency, term=term,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="entry")
+def add_invoice_entry(
+    invoice_id: str,
+    account: str,
+    description: str,
+    quantity: str,
+    price: str,
+) -> str:
+    """Add a line item to a customer invoice.
+
+    The invoice must not be posted yet. Entries represent individual
+    goods or services being billed.
+
+    Args:
+        invoice_id: Invoice ID (e.g., "000001").
+        account: Income account path (e.g., "Income:Sales").
+        description: Line item description.
+        quantity: Quantity as decimal string (e.g., "1", "2.5").
+        price: Unit price as decimal string (e.g., "100.00").
+    """
+    book = get_book()
+    result = book.add_invoice_entry(
+        invoice_id=invoice_id, account=account,
+        description=description, quantity=quantity, price=price,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="create", entity_type="entry")
+def add_bill_entry(
+    bill_id: str,
+    account: str,
+    description: str,
+    quantity: str,
+    price: str,
+) -> str:
+    """Add a line item to a vendor bill.
+
+    The bill must not be posted yet. Entries represent individual
+    goods or services being billed.
+
+    Args:
+        bill_id: Bill ID (e.g., "000001").
+        account: Expense account path (e.g., "Expenses:Office Supplies").
+        description: Line item description.
+        quantity: Quantity as decimal string (e.g., "1", "2.5").
+        price: Unit price as decimal string (e.g., "50.00").
+    """
+    book = get_book()
+    result = book.add_bill_entry(
+        bill_id=bill_id, account=account,
+        description=description, quantity=quantity, price=price,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def list_invoices(
+    owner_type: str | None = None,
+    status: str | None = None,
+    verbose: bool = False,
+) -> str:
+    """List invoices and/or vendor bills.
+
+    Returns a compact one-line-per-invoice format by default.
+    Use verbose=true for full JSON with GUIDs, dates, notes, etc.
+
+    Args:
+        owner_type: Filter by type: "customer" for invoices,
+                    "vendor" for bills, or omit for all.
+        status: Filter by status: "posted" or "open", or omit for all.
+        verbose: If true, return full JSON details.
+    """
+    book = get_book()
+    result = book.list_invoices(
+        owner_type=owner_type, status=status, compact=not verbose,
+    )
+    if verbose:
+        return json.dumps(result, indent=2)
+    return result
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_invoice(
+    id: str,
+    owner_type: str | None = None,
+) -> str:
+    """Get full details for an invoice or bill, including line items.
+
+    Works for both customer invoices and vendor bills. Returns all
+    entries with quantities, prices, and totals.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001"). This is the
+            human-readable ID, not the internal GUID.
+        owner_type: Filter by type: "customer" for invoices,
+                    "vendor" for bills. Useful when an invoice and
+                    bill share the same ID (independent counters).
+    """
+    book = get_book()
+    result = book.get_invoice(invoice_id=id, owner_type=owner_type)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="post", entity_type="invoice")
+def post_invoice(
+    id: str,
+    post_account: str,
+    post_date: str | None = None,
+    due_date: str | None = None,
+    description: str | None = None,
+    owner_type: str | None = None,
+) -> str:
+    """Post a customer invoice or vendor bill.
+
+    Posting creates a transaction in the A/R or A/P account and makes
+    the invoice official. Once posted, entries cannot be added.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001").
+        post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
+        post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
+        due_date: Payment due date (YYYY-MM-DD). Optional.
+        description: Description for the posting transaction. Optional.
+        owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+    """
+    book = get_book()
+    result = book.post_invoice(
+        invoice_id=id,
+        post_account=post_account,
+        post_date=post_date,
+        due_date=due_date,
+        description=description,
+        owner_type=owner_type,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="pay", entity_type="invoice")
+def pay_invoice(
+    id: str,
+    payment_account: str,
+    amount: str,
+    payment_date: str | None = None,
+    description: str | None = None,
+    owner_type: str | None = None,
+) -> str:
+    """Record a payment against a posted invoice or bill.
+
+    Creates a payment transaction from the specified bank/cash account
+    to the invoice's A/R or A/P account. Partial payments are supported.
+
+    Args:
+        id: Invoice or bill ID (e.g., "000001").
+        payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
+        amount: Payment amount as decimal string (e.g., "500.00").
+        payment_date: Payment date (YYYY-MM-DD). Defaults to today.
+        description: Description for the payment transaction. Optional.
+        owner_type: "customer" or "vendor" for disambiguation.
+    """
+    book = get_book()
+    result = book.pay_invoice(
+        invoice_id=id,
+        payment_account=payment_account,
+        amount=amount,
+        payment_date=payment_date,
+        description=description,
+        owner_type=owner_type,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def get_outstanding_invoices(
+    owner_type: str | None = None,
+    customer_id: str | None = None,
+    vendor_id: str | None = None,
+) -> str:
+    """Get all posted invoices/bills with outstanding balances.
+
+    Args:
+        owner_type: Filter by "customer" or "vendor". Omit for all.
+        customer_id: Filter by specific customer ID.
+        vendor_id: Filter by specific vendor ID.
+    """
+    book = get_book()
+    result = book.get_outstanding_invoices(
+        owner_type=owner_type,
+        customer_id=customer_id,
+        vendor_id=vendor_id,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def vendor_spending_report(
+    start_date: str,
+    end_date: str,
+    vendor_id: str | None = None,
+) -> str:
+    """Get spending breakdown by vendor for a period.
+
+    Analyzes posted vendor bills to show total billed, total paid,
+    and outstanding amounts per vendor.
+
+    Args:
+        start_date: Start of period (YYYY-MM-DD).
+        end_date: End of period (YYYY-MM-DD).
+        vendor_id: Optional filter to a specific vendor.
+    """
+    book = get_book()
+    result = book.vendor_spending_report(
+        start_date=start_date,
+        end_date=end_date,
+        vendor_id=vendor_id,
+    )
+    return _json(result)
 
 
 # ============== Resources ==============

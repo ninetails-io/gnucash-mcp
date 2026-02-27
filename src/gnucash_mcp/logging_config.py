@@ -548,6 +548,57 @@ def _format_audit_entry_text(entry: dict) -> str:
             lines.append(f"{time_part}  CREATE BILLTERM")
             lines.append(f'{indent}name: "{bt_name}"  due: {due_days} days')
 
+    elif entity_type == "invoice":
+        if operation == "CREATE":
+            inv_id = ""
+            customer_id = params.get("customer_id", "")
+            if after:
+                inv_id = after.get("id", "")
+                customer_id = after.get("customer_id", customer_id)
+            lines.append(f"{time_part}  CREATE INVOICE  id:{inv_id}")
+            lines.append(f'{indent}customer: {customer_id}')
+        elif operation == "POST":
+            inv_id = params.get("id", "")
+            post_account = params.get("post_account", "")
+            lines.append(f"{time_part}  POST INVOICE  id:{inv_id}")
+            if after:
+                total = after.get("total", "")
+                post_date = after.get("post_date", "")
+                txn_guid = (after.get("transaction_guid") or "")[:8]
+                lines.append(f'{indent}total: {total}  date: {post_date}')
+                lines.append(f'{indent}account: {post_account}  txn:{txn_guid}')
+        elif operation == "PAY":
+            inv_id = params.get("id", "")
+            lines.append(f"{time_part}  PAY INVOICE  id:{inv_id}")
+            if after:
+                amount = after.get("amount_paid", "")
+                remaining = after.get("remaining_balance", "")
+                pay_acct = params.get("payment_account", "")
+                txn_guid = (after.get("transaction_guid") or "")[:8]
+                lines.append(f'{indent}paid: {amount}  remaining: {remaining}')
+                lines.append(f'{indent}from: {pay_acct}  txn:{txn_guid}')
+
+    elif entity_type == "bill":
+        if operation == "CREATE":
+            bill_id = ""
+            vendor_id = params.get("vendor_id", "")
+            if after:
+                bill_id = after.get("id", "")
+                vendor_id = after.get("vendor_id", vendor_id)
+            lines.append(f"{time_part}  CREATE BILL  id:{bill_id}")
+            lines.append(f'{indent}vendor: {vendor_id}')
+
+    elif entity_type == "entry":
+        if operation == "CREATE":
+            desc = params.get("description", "")
+            total = ""
+            if after:
+                desc = after.get("description", desc)
+                total = after.get("total", "")
+            inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
+            lines.append(f"{time_part}  CREATE ENTRY")
+            lines.append(f'{indent}"{desc}"  total: {total}  on: {inv_id}')
+
     # Handle move_account specially (it's logged as "update" but is conceptually a move)
     if entity_type == "account" and "new_parent" in params:
         # This is actually a MOVE operation

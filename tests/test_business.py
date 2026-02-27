@@ -1,6 +1,7 @@
-"""Tests for business tools: customers, vendors, billterms."""
+"""Tests for business tools: customers, vendors, billterms, invoices, bills."""
 
 import json
+from decimal import Decimal
 import pytest
 from gnucash_mcp.book import GnuCashBook
 
@@ -285,3 +286,1275 @@ class TestReceivablePayableAccountTypes:
         assert result["status"] == "created"
         acct = gb.get_account("Liabilities:AP Other")
         assert acct["type"] == "PAYABLE"
+
+
+# ============== Invoice Tests ==============
+
+
+class TestCreateInvoice:
+    """Tests for create_invoice."""
+
+    def test_basic_creation(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.create_invoice(customer_id="000001")
+        assert result["status"] == "created"
+        assert result["id"] == "000001"
+        assert result["customer_id"] == "000001"
+        assert len(result["guid"]) == 32
+
+    def test_auto_id_increments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        r1 = gb.create_invoice(customer_id="000001")
+        r2 = gb.create_invoice(customer_id="000001")
+        assert r1["id"] == "000001"
+        assert r2["id"] == "000002"
+
+    def test_with_date(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.create_invoice(
+            customer_id="000001", date_opened="2026-01-15",
+        )
+        assert result["date_opened"] == "2026-01-15"
+
+    def test_with_notes(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.create_invoice(
+            customer_id="000001", notes="Q1 consulting",
+        )
+        assert result["status"] == "created"
+        # Verify notes via get_invoice
+        inv = gb.get_invoice(result["id"])
+        assert inv["notes"] == "Q1 consulting"
+
+    def test_with_billterm(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(name="Net 30", due_days=30)
+        result = gb.create_invoice(
+            customer_id="000001", term="Net 30",
+        )
+        assert result["status"] == "created"
+
+    def test_invalid_customer(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Customer not found"):
+            gb.create_invoice(customer_id="999999")
+
+    def test_invalid_billterm(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="Billterm not found"):
+            gb.create_invoice(customer_id="000001", term="Nonexistent")
+
+
+class TestCreateBill:
+    """Tests for create_bill."""
+
+    def test_basic_creation(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        result = gb.create_bill(vendor_id="000001")
+        assert result["status"] == "created"
+        assert result["id"] == "000001"
+        assert result["vendor_id"] == "000001"
+
+    def test_bill_counter_independent_from_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        inv = gb.create_invoice(customer_id="000001")
+        bill = gb.create_bill(vendor_id="000001")
+        # Both should be 000001 — independent counters
+        assert inv["id"] == "000001"
+        assert bill["id"] == "000001"
+
+    def test_invalid_vendor(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Vendor not found"):
+            gb.create_bill(vendor_id="999999")
+
+
+class TestAddInvoiceEntry:
+    """Tests for add_invoice_entry."""
+
+    def test_basic_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting services",
+            quantity="1",
+            price="500.00",
+        )
+        assert result["status"] == "created"
+        assert Decimal(result["total"]) == Decimal("500")
+        assert result["invoice_id"] == "000001"
+
+    def test_fractional_quantity(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Hours",
+            quantity="2.5",
+            price="100.00",
+        )
+        assert Decimal(result["total"]) == Decimal("250")
+
+    def test_multiple_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Item 1", quantity="1", price="100.00",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="Item 2", quantity="2", price="75.00",
+        )
+        inv = gb.get_invoice("000001")
+        assert len(inv["entries"]) == 2
+        assert Decimal(inv["total"]) == Decimal("250")
+
+    def test_invalid_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invoice not found"):
+            gb.add_invoice_entry(
+                invoice_id="999999", account="Income:Sales",
+                description="Test", quantity="1", price="10",
+            )
+
+    def test_wrong_type_rejects_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        with pytest.raises(ValueError, match="Invoice not found"):
+            gb.add_invoice_entry(
+                invoice_id="000001", account="Income:Sales",
+                description="Test", quantity="1", price="10",
+            )
+
+    def test_invalid_account(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="Account not found"):
+            gb.add_invoice_entry(
+                invoice_id="000001", account="Income:Nonexistent",
+                description="Test", quantity="1", price="10",
+            )
+
+
+class TestAddBillEntry:
+    """Tests for add_bill_entry."""
+
+    def test_basic_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        result = gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Printer paper",
+            quantity="10",
+            price="5.00",
+        )
+        assert result["status"] == "created"
+        assert Decimal(result["total"]) == Decimal("50")
+        assert result["bill_id"] == "000001"
+
+    def test_wrong_type_rejects_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="Bill not found"):
+            gb.add_bill_entry(
+                bill_id="000001", account="Expenses:Office Supplies",
+                description="Test", quantity="1", price="10",
+            )
+
+
+class TestListInvoices:
+    """Tests for list_invoices."""
+
+    def test_empty_list(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        result = gb.list_invoices()
+        assert result == ""
+
+    def test_compact_format(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001", date_opened="2026-01-15")
+        result = gb.list_invoices()
+        assert "000001" in result
+        assert "INV" in result
+        assert "open" in result
+
+    def test_verbose_format(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        result = gb.list_invoices(compact=False)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["type"] == "invoice"
+
+    def test_filter_by_customer_type(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        gb.create_bill(vendor_id="000001")
+        result = gb.list_invoices(owner_type="customer", compact=False)
+        assert len(result) == 1
+        assert result[0]["type"] == "invoice"
+
+    def test_filter_by_vendor_type(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        gb.create_bill(vendor_id="000001")
+        result = gb.list_invoices(owner_type="vendor", compact=False)
+        assert len(result) == 1
+        assert result[0]["type"] == "bill"
+
+    def test_filter_by_status(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        # All invoices are open (not posted)
+        result = gb.list_invoices(status="open", compact=False)
+        assert len(result) == 1
+        result = gb.list_invoices(status="posted", compact=False)
+        assert len(result) == 0
+
+
+class TestGetInvoice:
+    """Tests for get_invoice."""
+
+    def test_get_customer_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        result = gb.get_invoice("000001")
+        assert result["type"] == "invoice"
+        assert result["is_posted"] is False
+        assert len(result["entries"]) == 1
+        assert Decimal(result["total"]) == Decimal("500")
+        assert result["owner_name"] == "Acme Corp"
+
+    def test_get_vendor_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="10", price="5.00",
+        )
+        result = gb.get_invoice("000001")
+        assert result["type"] == "bill"
+        assert len(result["entries"]) == 1
+        assert Decimal(result["total"]) == Decimal("50")
+        assert result["owner_name"] == "Office Depot"
+
+    def test_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.get_invoice("999999")
+
+    def test_entries_have_correct_fields(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Widget", quantity="3", price="25.00",
+        )
+        result = gb.get_invoice("000001")
+        entry = result["entries"][0]
+        assert "guid" in entry
+        assert entry["description"] == "Widget"
+        assert Decimal(entry["quantity"]) == Decimal("3")
+        assert Decimal(entry["price"]) == Decimal("25")
+        assert Decimal(entry["total"]) == Decimal("75")
+
+
+class TestInvoiceBillIdCollision:
+    """Tests for ID collision between invoices and bills.
+
+    Invoice and bill IDs come from independent counters, so both
+    start at 000001. The lookup must filter by owner_type to avoid
+    returning the wrong record.
+    """
+
+    def test_add_invoice_entry_with_collision(self, business_book):
+        """add_invoice_entry targets the invoice, not the bill."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")  # ID 000001
+        gb.create_bill(vendor_id="000001")        # ID 000001
+        # Should target the customer invoice, not the vendor bill
+        result = gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="100",
+        )
+        assert result["status"] == "created"
+        inv = gb.get_invoice("000001")
+        assert inv["type"] == "invoice"
+        assert len(inv["entries"]) == 1
+
+    def test_add_bill_entry_with_collision(self, business_book):
+        """add_bill_entry targets the bill, not the invoice."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")  # ID 000001
+        gb.create_bill(vendor_id="000001")        # ID 000001
+        # Should target the vendor bill, not the customer invoice
+        result = gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="1", price="50",
+        )
+        assert result["status"] == "created"
+
+    def test_get_invoice_with_collision_defaults_to_first(self, business_book):
+        """get_invoice without owner_type returns first match."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        gb.create_bill(vendor_id="000001")
+        result = gb.get_invoice("000001")
+        # Returns whichever was created first (invoice)
+        assert result["type"] in ("invoice", "bill")
+
+    def test_get_invoice_with_owner_type_filter(self, business_book):
+        """get_invoice with owner_type disambiguates colliding IDs."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        gb.create_bill(vendor_id="000001")
+        inv = gb.get_invoice("000001", owner_type="customer")
+        assert inv["type"] == "invoice"
+        bill = gb.get_invoice("000001", owner_type="vendor")
+        assert bill["type"] == "bill"
+
+
+# ============== Post Invoice Tests ==============
+
+
+class TestPostInvoice:
+    """Tests for post_invoice."""
+
+    def _setup_invoice(self, gb, amount="500.00"):
+        """Create customer + invoice + entry, return invoice ID."""
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        return "000001"
+
+    def _setup_bill(self, gb, amount="50.00"):
+        """Create vendor + bill + entry, return bill ID."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price=amount,
+        )
+        return "000001"
+
+    def test_basic_post(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert result["status"] == "posted"
+        assert Decimal(result["total"]) == Decimal("500")
+        assert len(result["transaction_guid"]) == 32
+        assert len(result["lot_guid"]) == 32
+        assert result["post_account"] == "Assets:Accounts Receivable"
+
+    def test_post_marks_invoice_posted(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        inv = gb.get_invoice("000001")
+        assert inv["is_posted"] is True
+        assert inv["date_posted"] is not None
+
+    def test_post_with_multiple_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="2",
+            price="150.00",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="Advisory",
+            quantity="1",
+            price="200.00",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert Decimal(result["total"]) == Decimal("500")
+
+    def test_post_same_account_entries_aggregated(self, business_book):
+        """Entries to the same income account produce one split."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Item A",
+            quantity="1",
+            price="300.00",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Item B",
+            quantity="1",
+            price="200.00",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert Decimal(result["total"]) == Decimal("500")
+
+    def test_post_already_posted_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        with pytest.raises(ValueError, match="already posted"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+            )
+
+    def test_post_no_entries_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="no entries"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+            )
+
+    def test_post_not_found_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.post_invoice(
+                invoice_id="999999",
+                post_account="Assets:Accounts Receivable",
+            )
+
+    def test_post_wrong_account_type_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        with pytest.raises(ValueError, match="RECEIVABLE"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Checking",
+            )
+
+    def test_post_vendor_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_bill(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "bill"
+        assert Decimal(result["total"]) == Decimal("50")
+
+    def test_post_with_custom_date(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-15",
+        )
+        assert result["post_date"] == "2026-03-15"
+
+    def test_post_with_description(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            description="Q1 consulting services",
+        )
+        assert result["status"] == "posted"
+
+    def test_post_sets_transaction_metadata(self, business_book):
+        """Posting transaction has GnuCash-compatible metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            due_date="2026-04-01",
+        )
+        txn_guid = result["transaction_guid"]
+        lot_guid = result["lot_guid"]
+
+        # Read slots from the database directly
+        conn = sqlite3.connect(str(business_book))
+        try:
+            # Transaction num should be invoice ID
+            txn = conn.execute(
+                "SELECT num, description FROM transactions "
+                "WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "000001", "transaction.num should be invoice ID"
+            assert txn[1] == "Acme Corp", (
+                "description should be customer name"
+            )
+
+            # A/R split should have action='Invoice'
+            ar_split = conn.execute(
+                "SELECT action, reconcile_date FROM splits "
+                "WHERE tx_guid = ? AND action = 'Invoice'",
+                (txn_guid,),
+            ).fetchone()
+            assert ar_split is not None, "A/R split should have action=Invoice"
+
+            # Check transaction slots
+            slots = conn.execute(
+                "SELECT name, slot_type, string_val, guid_val, gdate_val "
+                "FROM slots WHERE obj_guid = ?",
+                (txn_guid,),
+            ).fetchall()
+            slot_dict = {s[0]: s for s in slots}
+
+            assert "trans-txn-type" in slot_dict, "missing trans-txn-type slot"
+            assert slot_dict["trans-txn-type"][2] == "I"
+
+            assert "trans-read-only" in slot_dict, "missing trans-read-only slot"
+            assert "invoice" in slot_dict["trans-read-only"][2].lower()
+
+            # gncInvoice frame slot on transaction
+            assert "gncInvoice" in slot_dict, (
+                "missing gncInvoice slot on transaction"
+            )
+            frame_guid = slot_dict["gncInvoice"][3]
+            assert frame_guid is not None
+
+            # Child GUID slot inside the frame
+            child = conn.execute(
+                "SELECT name, slot_type, guid_val FROM slots "
+                "WHERE obj_guid = ? AND name = 'invoice'",
+                (frame_guid,),
+            ).fetchone()
+            assert child is not None, "missing gncInvoice/invoice child slot"
+            assert child[1] == 5, "child slot should be GUID type (5)"
+
+            # Due date slot
+            assert "trans-date-due" in slot_dict, "missing trans-date-due slot"
+            assert slot_dict["trans-date-due"][1] == 10, (
+                "trans-date-due should be GDATE type (10)"
+            )
+
+            # gncInvoice frame slot on lot
+            lot_slots = conn.execute(
+                "SELECT name, slot_type, guid_val FROM slots "
+                "WHERE obj_guid = ?",
+                (lot_guid,),
+            ).fetchall()
+            lot_slot_dict = {s[0]: s for s in lot_slots}
+            assert "gncInvoice" in lot_slot_dict, (
+                "missing gncInvoice slot on lot"
+            )
+        finally:
+            conn.close()
+
+    def test_post_bill_sets_metadata(self, business_book):
+        """Vendor bill posting also sets correct metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._setup_bill(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        txn_guid = result["transaction_guid"]
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            txn = conn.execute(
+                "SELECT description FROM transactions WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "Office Depot", (
+                "bill description should be vendor name"
+            )
+
+            slots = conn.execute(
+                "SELECT name, string_val FROM slots "
+                "WHERE obj_guid = ? AND slot_type = 4",
+                (txn_guid,),
+            ).fetchall()
+            slot_dict = {s[0]: s[1] for s in slots}
+            assert slot_dict.get("trans-txn-type") == "I"
+        finally:
+            conn.close()
+
+
+# ============== Pay Invoice Tests ==============
+
+
+class TestPayInvoice:
+    """Tests for pay_invoice."""
+
+    def _post_invoice(self, gb, amount="500.00"):
+        """Create customer + invoice + entry + post, return invoice ID."""
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        return "000001"
+
+    def _post_bill(self, gb, amount="50.00"):
+        """Create vendor + bill + entry + post, return bill ID."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        return "000001"
+
+    def test_full_payment(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+
+    def test_partial_payment(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert Decimal(result["remaining_balance"]) == Decimal("300")
+
+    def test_multiple_payments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+
+    def test_pay_unposted_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100.00",
+        )
+        with pytest.raises(ValueError, match="not posted"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="100",
+            )
+
+    def test_pay_not_found_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.pay_invoice(
+                invoice_id="999999",
+                payment_account="Assets:Checking",
+                amount="100",
+            )
+
+    def test_pay_zero_amount_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        with pytest.raises(ValueError, match="must be positive"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="0",
+            )
+
+    def test_pay_vendor_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_bill(gb, "50.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="50",
+            owner_type="vendor",
+        )
+        assert result["type"] == "bill"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+
+    def test_pay_with_custom_date(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            payment_date="2026-04-01",
+        )
+        assert result["payment_date"] == "2026-04-01"
+
+    def test_pay_with_description(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            description="Wire transfer payment",
+        )
+        assert result["status"] == "paid"
+
+    def test_payment_sets_transaction_metadata(self, business_book):
+        """Payment transaction has GnuCash-compatible metadata."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        txn_guid = result["transaction_guid"]
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            # Description should be customer name
+            txn = conn.execute(
+                "SELECT description FROM transactions WHERE guid = ?",
+                (txn_guid,),
+            ).fetchone()
+            assert txn[0] == "Acme Corp", (
+                "payment description should be customer name"
+            )
+
+            # A/R split should have action='Payment'
+            pay_split = conn.execute(
+                "SELECT action FROM splits "
+                "WHERE tx_guid = ? AND action = 'Payment'",
+                (txn_guid,),
+            ).fetchone()
+            assert pay_split is not None, (
+                "A/R split should have action=Payment"
+            )
+
+            # trans-txn-type slot should be 'P'
+            slot = conn.execute(
+                "SELECT string_val FROM slots "
+                "WHERE obj_guid = ? AND name = 'trans-txn-type'",
+                (txn_guid,),
+            ).fetchone()
+            assert slot is not None, "missing trans-txn-type slot on payment"
+            assert slot[0] == "P"
+        finally:
+            conn.close()
+
+    def test_full_payment_closes_lot(self, business_book):
+        """Full payment auto-closes the lot with GnuCash boolean -1."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        post_result = gb.get_invoice("000001")
+
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+
+        # Check lot is_closed = -1 in the database
+        conn = sqlite3.connect(str(business_book))
+        try:
+            lots = conn.execute(
+                "SELECT is_closed FROM lots WHERE account_guid IN "
+                "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
+            ).fetchall()
+            assert any(
+                row[0] == -1 for row in lots
+            ), "lot should be closed with is_closed=-1"
+        finally:
+            conn.close()
+
+    def test_partial_payment_does_not_close_lot(self, business_book):
+        """Partial payment leaves lot open."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb)
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+
+        conn = sqlite3.connect(str(business_book))
+        try:
+            lots = conn.execute(
+                "SELECT is_closed FROM lots WHERE account_guid IN "
+                "(SELECT guid FROM accounts WHERE name = 'Accounts Receivable')"
+            ).fetchall()
+            assert all(
+                row[0] == 0 for row in lots
+            ), "lot should remain open after partial payment"
+        finally:
+            conn.close()
+
+
+# ============== Outstanding Invoices Tests ==============
+
+
+class TestGetOutstandingInvoices:
+    """Tests for get_outstanding_invoices."""
+
+    def test_empty_when_none_posted(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        result = gb.get_outstanding_invoices()
+        assert result == []
+
+    def test_shows_posted_unpaid(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        result = gb.get_outstanding_invoices()
+        assert len(result) == 1
+        assert result[0]["id"] == "000001"
+        assert Decimal(result[0]["amount_due"]) == Decimal("500")
+
+    def test_excludes_fully_paid(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        result = gb.get_outstanding_invoices()
+        assert len(result) == 0
+
+    def test_partially_paid_shows_correct_amounts(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        result = gb.get_outstanding_invoices()
+        assert len(result) == 1
+        assert Decimal(result[0]["amount_due"]) == Decimal("300")
+        assert Decimal(result[0]["amount_paid"]) == Decimal("200")
+
+    def test_filter_by_customer(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_customer(name="Beta Inc")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="For Acme",
+            quantity="1",
+            price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        gb.create_invoice(customer_id="000002")
+        gb.add_invoice_entry(
+            invoice_id="000002",
+            account="Income:Sales",
+            description="For Beta",
+            quantity="1",
+            price="200.00",
+        )
+        gb.post_invoice(
+            invoice_id="000002",
+            post_account="Assets:Accounts Receivable",
+        )
+        result = gb.get_outstanding_invoices(customer_id="000001")
+        assert len(result) == 1
+        assert result[0]["owner_name"] == "Acme Corp"
+
+    def test_filter_by_vendor(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        result = gb.get_outstanding_invoices(owner_type="vendor")
+        assert len(result) == 1
+        assert result[0]["type"] == "bill"
+
+
+# ============== Vendor Spending Report Tests ==============
+
+
+class TestVendorSpendingReport:
+    """Tests for vendor_spending_report."""
+
+    def test_basic_report(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-02-15",
+        )
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+        )
+        assert len(result["vendors"]) == 1
+        assert result["vendors"][0]["vendor_name"] == "Office Depot"
+        assert Decimal(result["vendors"][0]["total_billed"]) == Decimal("50")
+        assert result["totals"]["bill_count"] == 1
+
+    def test_multiple_vendors(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_vendor(name="Staples")
+        # Bill 1 for Office Depot
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-02-15",
+        )
+        # Bill 2 for Staples
+        gb.create_bill(vendor_id="000002")
+        gb.add_bill_entry(
+            bill_id="000002",
+            account="Expenses:Office Supplies",
+            description="Pens",
+            quantity="1",
+            price="30.00",
+        )
+        gb.post_invoice(
+            invoice_id="000002",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-02-20",
+        )
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+        )
+        assert result["totals"]["vendor_count"] == 2
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("80")
+
+    def test_date_filter(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-06-15",
+        )
+        # Query range that excludes the bill
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-03-31",
+        )
+        assert len(result["vendors"]) == 0
+
+    def test_filter_by_vendor_id(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_vendor(name="Staples")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-02-15",
+        )
+        gb.create_bill(vendor_id="000002")
+        gb.add_bill_entry(
+            bill_id="000002",
+            account="Expenses:Office Supplies",
+            description="Pens",
+            quantity="1",
+            price="30.00",
+        )
+        gb.post_invoice(
+            invoice_id="000002",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-02-20",
+        )
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            vendor_id="000001",
+        )
+        assert len(result["vendors"]) == 1
+        assert result["vendors"][0]["vendor_name"] == "Office Depot"
+
+
+# ============== End-to-End Lifecycle Tests ==============
+
+
+class TestInvoiceLifecycle:
+    """End-to-end invoice and bill lifecycle tests."""
+
+    def test_full_invoice_lifecycle(self, business_book):
+        """Customer invoice: create -> add entries -> post -> pay."""
+        gb = GnuCashBook(str(business_book))
+        # Create customer and invoice
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        assert inv["status"] == "created"
+
+        # Add entries
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="10",
+            price="100.00",
+        )
+
+        # Post
+        post_result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert post_result["status"] == "posted"
+        assert Decimal(post_result["total"]) == Decimal("1000")
+
+        # Verify outstanding
+        outstanding = gb.get_outstanding_invoices()
+        assert len(outstanding) == 1
+        assert Decimal(outstanding[0]["amount_due"]) == Decimal("1000")
+
+        # Pay in full
+        pay_result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="1000",
+        )
+        assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
+
+        # Verify no longer outstanding
+        outstanding = gb.get_outstanding_invoices()
+        assert len(outstanding) == 0
+
+    def test_full_bill_lifecycle(self, business_book):
+        """Vendor bill: create -> add entries -> post -> pay."""
+        gb = GnuCashBook(str(business_book))
+        # Create vendor and bill
+        gb.create_vendor(name="Office Depot")
+        bill = gb.create_bill(vendor_id="000001")
+        assert bill["status"] == "created"
+
+        # Add entry
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="5",
+            price="20.00",
+        )
+
+        # Post
+        post_result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert post_result["status"] == "posted"
+        assert Decimal(post_result["total"]) == Decimal("100")
+
+        # Verify outstanding
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor")
+        assert len(outstanding) == 1
+
+        # Pay
+        pay_result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="100",
+            owner_type="vendor",
+        )
+        assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
+
+        # Verify cleared
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor")
+        assert len(outstanding) == 0
