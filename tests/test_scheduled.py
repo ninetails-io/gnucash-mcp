@@ -47,6 +47,21 @@ class TestCreateScheduled:
         assert result["status"] == "created"
         assert result["frequency"] == "biweekly"
 
+    def test_bimonthly_electric(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        result = gb.create_scheduled_transaction(
+            name="Electric Bill",
+            description="Seattle City Light",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "400.00"},
+                {"account": "Assets:Checking", "amount": "-400.00"},
+            ],
+            start_date="2026-03-10",
+            frequency="bimonthly",
+        )
+        assert result["status"] == "created"
+        assert result["frequency"] == "bimonthly"
+
     def test_with_end_date(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
         result = gb.create_scheduled_transaction(

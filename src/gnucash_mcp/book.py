@@ -694,13 +694,14 @@ class GnuCashBook:
     # ============== Scheduled Transaction Helpers ==============
 
     VALID_FREQUENCIES = {
-        "weekly", "biweekly", "monthly", "quarterly", "yearly",
+        "weekly", "biweekly", "monthly", "bimonthly", "quarterly", "yearly",
     }
 
     FREQUENCY_TO_RECURRENCE = {
         "weekly": ("week", 1),
         "biweekly": ("week", 2),
         "monthly": ("month", 1),
+        "bimonthly": ("month", 2),
         "quarterly": ("month", 3),
         "yearly": ("year", 1),
     }
@@ -709,6 +710,7 @@ class GnuCashBook:
         ("week", 1): "weekly",
         ("week", 2): "biweekly",
         ("month", 1): "monthly",
+        ("month", 2): "bimonthly",
         ("month", 3): "quarterly",
         ("year", 1): "yearly",
     }
@@ -742,6 +744,7 @@ class GnuCashBook:
             "weekly": relativedelta(weeks=1),
             "biweekly": relativedelta(weeks=2),
             "monthly": relativedelta(months=1),
+            "bimonthly": relativedelta(months=2),
             "quarterly": relativedelta(months=3),
             "yearly": relativedelta(years=1),
         }
