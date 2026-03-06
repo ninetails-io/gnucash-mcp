@@ -1516,6 +1516,50 @@ class TestCreateAccount:
 
         assert result["status"] == "created"
 
+    def test_create_root_level_account(self, test_book: Path):
+        """Should create account at root level when parent is omitted."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_account(
+            name="Testing",
+            account_type="ASSET",
+        )
+        assert result["status"] == "created"
+        assert result["fullname"] == "Testing"
+        assert "warning" in result
+        assert "root level" in result["warning"]
+
+    def test_root_level_account_no_warning_with_parent(self, test_book: Path):
+        """Should not include warning when parent is provided."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_account(
+            name="Normal Child",
+            account_type="EXPENSE",
+            parent="Expenses",
+        )
+        assert result["status"] == "created"
+        assert "warning" not in result
+
+    def test_root_level_account_in_list(self, test_book: Path):
+        """Root-level account should appear in list_accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(name="TopLevel", account_type="ASSET")
+        result = gc_book.list_accounts()
+        assert "TopLevel" in result
+
+    def test_root_level_account_get_balance(self, test_book: Path):
+        """get_balance should work on a root-level account."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(name="TopLevel", account_type="ASSET")
+        balance = gc_book.get_balance("TopLevel")
+        assert balance == 0
+
+    def test_root_level_duplicate_blocked(self, test_book: Path):
+        """Should block duplicate root-level accounts."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(name="UniqueRoot", account_type="ASSET")
+        with pytest.raises(ValueError, match="already exists"):
+            gc_book.create_account(name="UniqueRoot", account_type="ASSET")
+
 
 class TestUpdateAccount:
     """Tests for update_account method."""
@@ -1588,6 +1632,88 @@ class TestUpdateAccount:
                 name="Expenses:Groceries",
                 new_name="Dining",
             )
+
+
+    def test_update_account_type_liability_to_credit(self, test_book: Path):
+        """Should allow changing LIABILITY to CREDIT (same polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="CareCredit", account_type="LIABILITY", parent="Liabilities",
+        )
+        result = gc_book.update_account(
+            name="Liabilities:CareCredit", account_type="CREDIT",
+        )
+        assert result["status"] == "updated"
+        assert result["type"] == "CREDIT"
+
+    def test_update_account_type_credit_to_liability(self, test_book: Path):
+        """Should allow changing CREDIT to LIABILITY (reverse, same polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Store Card", account_type="CREDIT", parent="Liabilities",
+        )
+        result = gc_book.update_account(
+            name="Liabilities:Store Card", account_type="LIABILITY",
+        )
+        assert result["status"] == "updated"
+        assert result["type"] == "LIABILITY"
+
+    def test_update_account_type_asset_to_bank(self, test_book: Path):
+        """Should allow changing ASSET to BANK (same polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Savings", account_type="ASSET", parent="Assets",
+        )
+        result = gc_book.update_account(
+            name="Assets:Savings", account_type="BANK",
+        )
+        assert result["status"] == "updated"
+        assert result["type"] == "BANK"
+
+    def test_update_account_type_stock_to_mutual(self, test_book: Path):
+        """Should allow changing STOCK to MUTUAL (same polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Index Fund", account_type="STOCK", parent="Assets",
+        )
+        result = gc_book.update_account(
+            name="Assets:Index Fund", account_type="MUTUAL",
+        )
+        assert result["status"] == "updated"
+        assert result["type"] == "MUTUAL"
+
+    def test_update_account_type_cross_polarity_blocked(self, test_book: Path):
+        """Should block ASSET to LIABILITY (cross-polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="flip the debit/credit polarity"):
+            gc_book.update_account(
+                name="Assets:Checking", account_type="LIABILITY",
+            )
+
+    def test_update_account_type_expense_to_income_blocked(self, test_book: Path):
+        """Should block EXPENSE to INCOME (cross-polarity)."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="flip the debit/credit polarity"):
+            gc_book.update_account(
+                name="Expenses:Groceries", account_type="INCOME",
+            )
+
+    def test_update_account_type_invalid_type(self, test_book: Path):
+        """Should reject invalid account types."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Invalid account type"):
+            gc_book.update_account(
+                name="Assets:Checking", account_type="NONSENSE",
+            )
+
+    def test_update_account_type_same_type_noop(self, test_book: Path):
+        """Changing to the same type should succeed without error."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.update_account(
+            name="Assets:Checking", account_type="BANK",
+        )
+        assert result["status"] == "updated"
+        assert result["type"] == "BANK"
 
 
 class TestMoveAccount:

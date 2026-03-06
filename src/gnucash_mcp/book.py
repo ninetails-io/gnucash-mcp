@@ -2271,7 +2271,7 @@ class GnuCashBook:
         self,
         name: str,
         account_type: str,
-        parent: str,
+        parent: str | None = None,
         description: str = "",
         placeholder: bool = False,
         commodity: str | None = None,
@@ -2283,6 +2283,7 @@ class GnuCashBook:
             name: Account name (e.g., "AI Subscriptions").
             account_type: GnuCash account type (ASSET, EXPENSE, etc.).
             parent: Full path of parent account (e.g., "Expenses:Online Services").
+                    If omitted, creates a top-level account at the book root.
             description: Optional description.
             placeholder: If True, account is container-only. Default False.
             commodity: ISO currency code (e.g., "USD", "EUR") or commodity mnemonic.
@@ -2291,7 +2292,8 @@ class GnuCashBook:
                                 Default "CURRENCY".
 
         Returns:
-            Dict with guid, fullname, and status.
+            Dict with guid, fullname, and status. Includes a warning if
+            created at root level.
 
         Raises:
             ValueError: If parent not found, invalid type, duplicate name,
@@ -2305,16 +2307,22 @@ class GnuCashBook:
             )
 
         with self.open(readonly=False) as book:
-            # Find parent account
-            parent_account = self._find_account(book, parent)
-            if not parent_account:
-                raise ValueError(f"Parent account not found: {parent}")
+            # Determine parent account
+            is_root_level = parent is None
+            if is_root_level:
+                parent_account = book.root_account
+                parent_label = "root"
+            else:
+                parent_account = self._find_account(book, parent)
+                if not parent_account:
+                    raise ValueError(f"Parent account not found: {parent}")
+                parent_label = parent
 
             # Check for duplicate - same name under same parent
             for child in parent_account.children:
                 if child.name == name:
                     raise ValueError(
-                        f"Account '{name}' already exists under '{parent}'"
+                        f"Account '{name}' already exists under '{parent_label}'"
                     )
 
             # Determine commodity
@@ -2343,11 +2351,36 @@ class GnuCashBook:
 
             book.save()
 
-            return {
+            result = {
                 "guid": new_account.guid,
                 "fullname": new_account.fullname,
                 "status": "created",
             }
+            if is_root_level:
+                result["warning"] = (
+                    "Account created at root level, outside the standard "
+                    "account hierarchy (Assets, Liabilities, Equity, Income, "
+                    "Expenses). This may affect reports and balance sheet "
+                    "calculations."
+                )
+            return result
+
+    # Polarity groups for account type change validation.
+    # Types within the same group can be freely converted.
+    _ACCOUNT_TYPE_POLARITY = {
+        "ASSET": "debit_asset",
+        "BANK": "debit_asset",
+        "CASH": "debit_asset",
+        "RECEIVABLE": "debit_asset",
+        "LIABILITY": "credit_liability",
+        "CREDIT": "credit_liability",
+        "PAYABLE": "credit_liability",
+        "INCOME": "credit_income",
+        "EXPENSE": "debit_expense",
+        "EQUITY": "credit_equity",
+        "STOCK": "debit_investment",
+        "MUTUAL": "debit_investment",
+    }
 
     def update_account(
         self,
@@ -2355,6 +2388,7 @@ class GnuCashBook:
         new_name: str | None = None,
         description: str | None = None,
         placeholder: bool | None = None,
+        account_type: str | None = None,
     ) -> dict:
         """Update an existing account's properties.
 
@@ -2363,12 +2397,16 @@ class GnuCashBook:
             new_name: New name for the account (just the name, not full path).
             description: New description.
             placeholder: New placeholder status.
+            account_type: New account type (e.g., "CREDIT", "BANK"). Only
+                changes within the same debit/credit polarity family are
+                allowed (e.g., LIABILITY to CREDIT, ASSET to BANK).
 
         Returns:
             Dict with updated account details.
 
         Raises:
-            ValueError: If account not found or new name conflicts.
+            ValueError: If account not found, new name conflicts, or type
+                change would flip debit/credit polarity.
         """
         with self.open(readonly=False) as book:
             account = self._find_account(book, name)
@@ -2391,6 +2429,29 @@ class GnuCashBook:
 
             if placeholder is not None:
                 account.placeholder = placeholder
+
+            if account_type is not None:
+                new_type = account_type.upper()
+                old_type = account.type
+
+                if new_type not in self.VALID_ACCOUNT_TYPES:
+                    raise ValueError(
+                        f"Invalid account type: {new_type}. "
+                        f"Valid types: {', '.join(sorted(self.VALID_ACCOUNT_TYPES))}"
+                    )
+
+                if new_type != old_type:
+                    old_polarity = self._ACCOUNT_TYPE_POLARITY.get(old_type)
+                    new_polarity = self._ACCOUNT_TYPE_POLARITY.get(new_type)
+
+                    if old_polarity != new_polarity:
+                        raise ValueError(
+                            f"Cannot change account type from {old_type} to "
+                            f"{new_type} — this would flip the debit/credit "
+                            f"polarity and corrupt existing transaction balances."
+                        )
+
+                    account.type = new_type
 
             book.save()
 

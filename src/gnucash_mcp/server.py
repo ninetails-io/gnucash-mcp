@@ -661,7 +661,7 @@ def search_transactions(query: str, field: str = "description", verbose: bool = 
 def create_account(
     name: str,
     account_type: str,
-    parent: str,
+    parent: str | None = None,
     description: str = "",
     placeholder: bool = False,
     commodity: str | None = None,
@@ -672,7 +672,8 @@ def create_account(
     Args:
         name: Account name (e.g., "AI Subscriptions")
         account_type: GnuCash account type (ASSET, BANK, CASH, CREDIT, EQUITY, EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE, PAYABLE)
-        parent: Full path of parent account (e.g., "Expenses:Online Services")
+        parent: Full path of parent account (e.g., "Expenses:Online Services").
+            If omitted, creates a top-level account at the book root.
         description: Optional description
         placeholder: If true, account is container-only. Default: false
         commodity: Symbol for the account's commodity:
@@ -706,6 +707,7 @@ def update_account(
     new_name: str | None = None,
     description: str | None = None,
     placeholder: bool | None = None,
+    account_type: str | None = None,
 ) -> str:
     """Update an existing account's properties.
 
@@ -714,6 +716,10 @@ def update_account(
         new_name: New name for the account (just the leaf name, not full path)
         description: New description
         placeholder: New placeholder status (true = container only)
+        account_type: New account type (e.g., "CREDIT", "BANK"). Only changes
+            within the same debit/credit polarity are allowed — e.g.,
+            LIABILITY to CREDIT, ASSET to BANK. Cross-polarity changes
+            (e.g., ASSET to LIABILITY) are blocked.
     """
     book = get_book()
     result = book.update_account(
@@ -721,6 +727,7 @@ def update_account(
         new_name=new_name,
         description=description,
         placeholder=placeholder,
+        account_type=account_type,
     )
     return _json(result)
 
