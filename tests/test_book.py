@@ -79,6 +79,56 @@ class TestGetBookSummary:
         assert f"Book: {test_book}" in result
 
 
+class TestMissingDefaultCurrency:
+    """Tests for books with no default currency."""
+
+    def _corrupt_book_currency(self, book_path: Path):
+        """Null out the default currency GUID in the books table."""
+        import sqlite3
+        conn = sqlite3.connect(str(book_path))
+        conn.execute(
+            "UPDATE books SET root_template_guid = root_template_guid"
+        )  # no-op to ensure we can write
+        # Delete the commodity referenced by the book
+        conn.execute(
+            "DELETE FROM commodities WHERE namespace = 'CURRENCY'"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_get_book_summary_clear_error(self, test_book: Path):
+        self._corrupt_book_currency(test_book)
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="no default currency"):
+            gc_book.get_book_summary()
+
+    def test_create_transaction_clear_error(self, test_book: Path):
+        self._corrupt_book_currency(test_book)
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="no default currency"):
+            gc_book.create_transaction(
+                description="Test",
+                splits=[
+                    {"account": "Assets:Checking", "amount": "100"},
+                    {"account": "Income:Salary", "amount": "-100"},
+                ],
+            )
+
+    def test_explicit_currency_bypasses_error(self, test_book: Path):
+        """Passing currency explicitly should work even without default."""
+        # Don't corrupt — just verify the workaround path works
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Test with explicit currency",
+            currency="USD",
+            splits=[
+                {"account": "Assets:Checking", "amount": "50"},
+                {"account": "Income:Salary", "amount": "-50"},
+            ],
+        )
+        assert result["guid"]
+
+
 class TestListAccounts:
     """Tests for list_accounts method."""
 

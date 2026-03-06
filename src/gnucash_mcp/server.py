@@ -125,6 +125,10 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_invoice",
         "post_invoice",
         "pay_invoice",
+        "delete_invoice",
+        "delete_bill",
+        "delete_customer",
+        "delete_vendor",
         "get_outstanding_invoices",
         "vendor_spending_report",
     ],
@@ -1800,6 +1804,7 @@ def create_invoice(
     notes: str = "",
     currency: str | None = None,
     term: str | None = None,
+    invoice_id: str | None = None,
 ) -> str:
     """Create a customer invoice.
 
@@ -1809,11 +1814,14 @@ def create_invoice(
         notes: Optional notes.
         currency: ISO currency code. Defaults to book's default currency.
         term: Billterm name (e.g., "Net 30"). Optional.
+        invoice_id: Custom invoice number (e.g., "INV-2026-001"). If omitted,
+            auto-generates from the book's invoice counter.
     """
     book = get_book()
     result = book.create_invoice(
         customer_id=customer_id, date_opened=date_opened,
         notes=notes, currency=currency, term=term,
+        invoice_id=invoice_id,
     )
     return _json(result)
 
@@ -1827,6 +1835,7 @@ def create_bill(
     notes: str = "",
     currency: str | None = None,
     term: str | None = None,
+    bill_id: str | None = None,
 ) -> str:
     """Create a vendor bill.
 
@@ -1836,11 +1845,14 @@ def create_bill(
         notes: Optional notes.
         currency: ISO currency code. Defaults to book's default currency.
         term: Billterm name (e.g., "Net 30"). Optional.
+        bill_id: Custom bill number (e.g., "BILL-2026-001"). If omitted,
+            auto-generates from the book's bill counter.
     """
     book = get_book()
     result = book.create_bill(
         vendor_id=vendor_id, date_opened=date_opened,
         notes=notes, currency=currency, term=term,
+        bill_id=bill_id,
     )
     return _json(result)
 
@@ -2031,6 +2043,74 @@ def pay_invoice(
 
 @mcp.tool()
 @safe_tool
+@audit_log(classification="write", operation="delete", entity_type="invoice")
+def delete_invoice(invoice_id: str) -> str:
+    """Delete an unposted customer invoice.
+
+    Automatically removes associated entries (line items). Posted invoices
+    cannot be deleted — void them or issue a credit note instead.
+
+    Args:
+        invoice_id: Invoice ID (e.g., "000001" or "INV-2026-001").
+    """
+    book = get_book()
+    result = book.delete_invoice(invoice_id=invoice_id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="bill")
+def delete_bill(bill_id: str) -> str:
+    """Delete an unposted vendor bill.
+
+    Automatically removes associated entries (line items). Posted bills
+    cannot be deleted — void them or issue a credit note instead.
+
+    Args:
+        bill_id: Bill ID (e.g., "000001" or "BILL-2026-001").
+    """
+    book = get_book()
+    result = book.delete_bill(bill_id=bill_id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="customer")
+def delete_customer(customer_id: str) -> str:
+    """Delete a customer with no invoices.
+
+    Customers with any invoices (posted or unposted) cannot be deleted.
+    Delete the invoices first, then delete the customer.
+
+    Args:
+        customer_id: Customer ID (e.g., "000001").
+    """
+    book = get_book()
+    result = book.delete_customer(customer_id=customer_id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="write", operation="delete", entity_type="vendor")
+def delete_vendor(vendor_id: str) -> str:
+    """Delete a vendor with no bills.
+
+    Vendors with any bills (posted or unposted) cannot be deleted.
+    Delete the bills first, then delete the vendor.
+
+    Args:
+        vendor_id: Vendor ID (e.g., "000001").
+    """
+    book = get_book()
+    result = book.delete_vendor(vendor_id=vendor_id)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
 @audit_log(classification="read")
 def get_outstanding_invoices(
     owner_type: str | None = None,
@@ -2204,6 +2284,9 @@ def _get_server_config_impl() -> str:
         f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
         f"Version: {__version__}",
     ]
+    dc_ok = _server_state.get("default_currency_ok")
+    if dc_ok is False:
+        lines.append("Warning: Book has no default currency set")
     return "\n".join(lines)
 
 
@@ -2286,6 +2369,27 @@ Logs are stored alongside the book file:
     _validate_tool_modules()
     loaded_modules = _apply_module_filter(modules_value)
 
+    # Check book health (non-fatal)
+    currency_ok = None
+    if book_path:
+        try:
+            b = get_book()
+            with b.open(readonly=True) as bk:
+                dc = bk.default_currency
+                if dc is None:
+                    currency_ok = False
+                    print(
+                        "Warning: Book has no default currency. "
+                        "Set one in GnuCash under Preferences > Accounts "
+                        "(Edit menu on Linux/Windows, GnuCash menu on macOS), "
+                        "or pass the currency parameter explicitly to each tool.",
+                        file=sys.stderr,
+                    )
+                else:
+                    currency_ok = True
+        except Exception:
+            pass  # Book may be locked — don't block startup
+
     # Populate runtime state and conditionally register debug tool
     tool_count = len(mcp._tool_manager._tools)
     modules_display = ", ".join(loaded_modules)
@@ -2294,6 +2398,7 @@ Logs are stored alongside the book file:
         "tool_count": tool_count,
         "book_path": book_path or "not set",
         "debug": debug_flag,
+        "default_currency_ok": currency_ok,
     })
 
     if debug_flag:

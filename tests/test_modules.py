@@ -38,7 +38,7 @@ class TestToolModulesMapping:
     def test_total_tool_count(self):
         """Total tools across all modules should be 66."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 70
+        assert total == 74
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
@@ -70,7 +70,7 @@ class TestApplyModuleFilter:
     def test_all_keeps_everything(self):
         """--modules=all should keep all 66 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 70
+        assert len(self._tool_names()) == 74
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag should default to core only."""
@@ -97,12 +97,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 70
+        assert len(self._tool_names()) == 74
 
     def test_all_in_list_keeps_everything(self):
         """'all' mixed with other modules should keep all 66 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 70
+        assert len(self._tool_names()) == 74
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""
