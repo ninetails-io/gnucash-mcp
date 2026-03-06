@@ -190,6 +190,85 @@ class TestGetVendor:
             gb.get_vendor("999999")
 
 
+class TestDeleteCustomer:
+    """Tests for delete_customer."""
+
+    def test_delete_customer_no_invoices(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Temp Customer")
+        result = gb.delete_customer(customer_id="000001")
+        assert result["status"] == "deleted"
+        assert result["name"] == "Temp Customer"
+        assert result["type"] == "customer"
+
+    def test_delete_customer_with_unposted_invoice_blocked(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="Delete the invoices first"):
+            gb.delete_customer(customer_id="000001")
+
+    def test_delete_customer_after_invoice_deleted(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.delete_invoice(invoice_id="000001")
+        result = gb.delete_customer(customer_id="000001")
+        assert result["status"] == "deleted"
+
+    def test_delete_customer_with_posted_invoice_blocked(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        with pytest.raises(ValueError, match="posted invoices"):
+            gb.delete_customer(customer_id="000001")
+
+    def test_delete_nonexistent_customer(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Customer not found"):
+            gb.delete_customer(customer_id="999999")
+
+
+class TestDeleteVendor:
+    """Tests for delete_vendor."""
+
+    def test_delete_vendor_no_bills(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Temp Vendor")
+        result = gb.delete_vendor(vendor_id="000001")
+        assert result["status"] == "deleted"
+        assert result["name"] == "Temp Vendor"
+        assert result["type"] == "vendor"
+
+    def test_delete_vendor_with_unposted_bill_blocked(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        with pytest.raises(ValueError, match="Delete the bills first"):
+            gb.delete_vendor(vendor_id="000001")
+
+    def test_delete_vendor_after_bill_deleted(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.delete_bill(bill_id="000001")
+        result = gb.delete_vendor(vendor_id="000001")
+        assert result["status"] == "deleted"
+
+    def test_delete_nonexistent_vendor(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Vendor not found"):
+            gb.delete_vendor(vendor_id="999999")
+
+
 class TestCreateBillterm:
     """Tests for create_billterm."""
 
@@ -339,6 +418,36 @@ class TestCreateInvoice:
         )
         assert result["status"] == "created"
 
+    def test_custom_invoice_id(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.create_invoice(
+            customer_id="000001", invoice_id="INV-2026-001",
+        )
+        assert result["id"] == "INV-2026-001"
+        assert result["status"] == "created"
+
+    def test_custom_id_does_not_increment_counter(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001", invoice_id="CUSTOM-1")
+        # Next auto-generated ID should still be 000001 (counter untouched)
+        r2 = gb.create_invoice(customer_id="000001")
+        assert r2["id"] == "000001"
+
+    def test_duplicate_invoice_id_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001", invoice_id="DUP-001")
+        with pytest.raises(ValueError, match="already exists"):
+            gb.create_invoice(customer_id="000001", invoice_id="DUP-001")
+
+    def test_blank_invoice_id_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="must not be blank"):
+            gb.create_invoice(customer_id="000001", invoice_id="  ")
+
     def test_invalid_customer(self, business_book):
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError, match="Customer not found"):
@@ -372,10 +481,137 @@ class TestCreateBill:
         assert inv["id"] == "000001"
         assert bill["id"] == "000001"
 
+    def test_custom_bill_id(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        result = gb.create_bill(
+            vendor_id="000001", bill_id="BILL-2026-001",
+        )
+        assert result["id"] == "BILL-2026-001"
+        assert result["status"] == "created"
+
+    def test_custom_id_does_not_increment_counter(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001", bill_id="CUSTOM-1")
+        # Next auto-generated ID should still be 000001 (counter untouched)
+        r2 = gb.create_bill(vendor_id="000001")
+        assert r2["id"] == "000001"
+
+    def test_duplicate_bill_id_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001", bill_id="DUP-001")
+        with pytest.raises(ValueError, match="already exists"):
+            gb.create_bill(vendor_id="000001", bill_id="DUP-001")
+
     def test_invalid_vendor(self, business_book):
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError, match="Vendor not found"):
             gb.create_bill(vendor_id="999999")
+
+
+class TestDeleteInvoice:
+    """Tests for delete_invoice."""
+
+    def test_delete_unposted_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        inv = gb.create_invoice(customer_id="000001")
+        result = gb.delete_invoice(invoice_id=inv["id"])
+        assert result["status"] == "deleted"
+        assert result["id"] == inv["id"]
+        assert result["type"] == "invoice"
+        # Verify it's gone
+        with pytest.raises(ValueError, match="not found"):
+            gb.get_invoice(inv["id"])
+
+    def test_delete_invoice_with_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        result = gb.delete_invoice(invoice_id="000001")
+        assert result["status"] == "deleted"
+        assert result["entries_deleted"] == 1
+
+    def test_delete_posted_invoice_blocked(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-15",
+        )
+        with pytest.raises(ValueError, match="Cannot delete posted"):
+            gb.delete_invoice(invoice_id="000001")
+
+    def test_delete_nonexistent_invoice(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.delete_invoice(invoice_id="NOPE")
+
+    def test_delete_with_custom_id(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001", invoice_id="INV-DEL-001")
+        result = gb.delete_invoice(invoice_id="INV-DEL-001")
+        assert result["status"] == "deleted"
+        assert result["id"] == "INV-DEL-001"
+
+
+class TestDeleteBill:
+    """Tests for delete_bill."""
+
+    def test_delete_unposted_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        bill = gb.create_bill(vendor_id="000001")
+        result = gb.delete_bill(bill_id=bill["id"])
+        assert result["status"] == "deleted"
+        assert result["id"] == bill["id"]
+        assert result["type"] == "bill"
+
+    def test_delete_bill_with_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="10", price="5.00",
+        )
+        result = gb.delete_bill(bill_id="000001")
+        assert result["status"] == "deleted"
+        assert result["entries_deleted"] == 1
+
+    def test_delete_posted_bill_blocked(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="10", price="5.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        with pytest.raises(ValueError, match="Cannot delete posted"):
+            gb.delete_bill(bill_id="000001")
+
+    def test_delete_nonexistent_bill(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.delete_bill(bill_id="NOPE")
 
 
 class TestAddInvoiceEntry:

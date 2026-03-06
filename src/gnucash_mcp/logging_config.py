@@ -524,6 +524,13 @@ def _format_audit_entry_text(entry: dict) -> str:
             if after:
                 currency = after.get("currency", currency) or ""
             lines.append(f'{indent}name: "{cust_name}"  currency: {currency}')
+        elif operation == "DELETE":
+            cust_id = params.get("customer_id", "")
+            lines.append(f"{time_part}  DELETE CUSTOMER  id:{cust_id}")
+            if after:
+                cust_name = after.get("name", "")
+                if cust_name:
+                    lines.append(f'{indent}name: "{cust_name}"')
 
     elif entity_type == "vendor":
         if operation == "CREATE":
@@ -537,6 +544,13 @@ def _format_audit_entry_text(entry: dict) -> str:
             if after:
                 currency = after.get("currency", currency) or ""
             lines.append(f'{indent}name: "{vend_name}"  currency: {currency}')
+        elif operation == "DELETE":
+            vend_id = params.get("vendor_id", "")
+            lines.append(f"{time_part}  DELETE VENDOR  id:{vend_id}")
+            if after:
+                vend_name = after.get("name", "")
+                if vend_name:
+                    lines.append(f'{indent}name: "{vend_name}"')
 
     elif entity_type == "billterm":
         if operation == "CREATE":
@@ -557,6 +571,13 @@ def _format_audit_entry_text(entry: dict) -> str:
                 customer_id = after.get("customer_id", customer_id)
             lines.append(f"{time_part}  CREATE INVOICE  id:{inv_id}")
             lines.append(f'{indent}customer: {customer_id}')
+        elif operation == "DELETE":
+            inv_id = params.get("invoice_id", "")
+            lines.append(f"{time_part}  DELETE INVOICE  id:{inv_id}")
+            if after:
+                entries = after.get("entries_deleted", 0)
+                if entries:
+                    lines.append(f"{indent}entries removed: {entries}")
         elif operation == "POST":
             inv_id = params.get("id", "")
             post_account = params.get("post_account", "")
@@ -587,6 +608,13 @@ def _format_audit_entry_text(entry: dict) -> str:
                 vendor_id = after.get("vendor_id", vendor_id)
             lines.append(f"{time_part}  CREATE BILL  id:{bill_id}")
             lines.append(f'{indent}vendor: {vendor_id}')
+        elif operation == "DELETE":
+            bill_id = params.get("bill_id", "")
+            lines.append(f"{time_part}  DELETE BILL  id:{bill_id}")
+            if after:
+                entries = after.get("entries_deleted", 0)
+                if entries:
+                    lines.append(f"{indent}entries removed: {entries}")
 
     elif entity_type == "entry":
         if operation == "CREATE":

@@ -492,6 +492,29 @@ class GnuCashBook:
                 return transaction
         return None
 
+    @staticmethod
+    def _require_default_currency(book: piecash.Book) -> piecash.Commodity:
+        """Get the book's default currency, raising a clear error if missing.
+
+        Args:
+            book: Open piecash book.
+
+        Returns:
+            The default currency Commodity.
+
+        Raises:
+            ValueError: If the book has no default currency set.
+        """
+        dc = book.default_currency
+        if dc is None:
+            raise ValueError(
+                "Book has no default currency set. In GnuCash desktop, "
+                "set the default currency under Preferences > Accounts "
+                "(Edit menu on Linux/Windows, GnuCash menu on macOS), "
+                "or pass the currency parameter explicitly."
+            )
+        return dc
+
     def _find_commodity(
         self, book: piecash.Book, mnemonic: str, namespace: str = "CURRENCY"
     ) -> piecash.Commodity | None:
@@ -885,7 +908,7 @@ class GnuCashBook:
                 by_namespace[ns].sort(key=lambda c: c["mnemonic"])
 
             result = {
-                "default_currency": book.default_currency.mnemonic,
+                "default_currency": self._require_default_currency(book).mnemonic,
                 "commodities": by_namespace,
             }
 
@@ -1149,7 +1172,7 @@ class GnuCashBook:
         from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
-            currency = book.default_currency.mnemonic
+            currency = self._require_default_currency(book).mnemonic
 
             # --- Identify template accounts (scheduled transaction placeholders) ---
             template_guids = set()
@@ -1904,7 +1927,7 @@ class GnuCashBook:
         with self.open(readonly=False) as book:
             # Determine transaction currency
             if currency is None:
-                trans_currency = book.default_currency
+                trans_currency = self._require_default_currency(book)
             else:
                 trans_currency = self._get_or_create_currency(book, currency)
 
@@ -2032,7 +2055,7 @@ class GnuCashBook:
         with self.open(readonly=True) as book:
             # Determine transaction currency (readonly — no creation)
             if currency is None:
-                trans_currency = book.default_currency
+                trans_currency = self._require_default_currency(book)
                 currency_mnemonic = trans_currency.mnemonic
             else:
                 trans_currency = self._find_commodity(book, currency)
@@ -2296,7 +2319,7 @@ class GnuCashBook:
 
             # Determine commodity
             if commodity is None:
-                account_commodity = book.default_currency
+                account_commodity = self._require_default_currency(book)
             elif commodity_namespace == "CURRENCY":
                 account_commodity = self._get_or_create_currency(book, commodity)
             else:
@@ -4020,7 +4043,7 @@ class GnuCashBook:
                 name=name,
                 type="BANK",
                 parent=book.root_template,
-                commodity=book.default_currency,
+                commodity=self._require_default_currency(book),
             )
             book.session.add(template_acct)
             book.session.flush()
@@ -5121,7 +5144,7 @@ class GnuCashBook:
                 if not currency_obj:
                     raise ValueError(f"Currency not found: {currency}")
             else:
-                currency_obj = book.default_currency
+                currency_obj = self._require_default_currency(book)
 
             addr = None
             if address:
@@ -5226,7 +5249,7 @@ class GnuCashBook:
                 if not currency_obj:
                     raise ValueError(f"Currency not found: {currency}")
             else:
-                currency_obj = book.default_currency
+                currency_obj = self._require_default_currency(book)
 
             addr = None
             if address:
@@ -5397,6 +5420,7 @@ class GnuCashBook:
         notes: str = "",
         currency: str | None = None,
         term: str | None = None,
+        invoice_id: str | None = None,
     ) -> dict:
         """Create a customer invoice.
 
@@ -5406,6 +5430,8 @@ class GnuCashBook:
             notes: Optional notes.
             currency: ISO currency code. Defaults to book's default currency.
             term: Billterm name (e.g., 'Net 30'). Optional.
+            invoice_id: Custom invoice number. If omitted, auto-generates
+                from the book's invoice counter.
 
         Returns:
             Dict with guid, id, customer_id, status.
@@ -5434,7 +5460,7 @@ class GnuCashBook:
                     raise ValueError(f"Currency not found: {currency}")
                 currency_guid = currency_obj.guid
             else:
-                currency_guid = book.default_currency.guid
+                currency_guid = self._require_default_currency(book).guid
 
             term_guid = None
             if term:
@@ -5445,9 +5471,18 @@ class GnuCashBook:
                     raise ValueError(f"Billterm not found: {term}")
                 term_guid = bt.guid
 
-            cnt = book.counter_invoice + 1
-            book.counter_invoice = cnt
-            invoice_id = f"{cnt:06d}"
+            if invoice_id is not None:
+                if not invoice_id.strip():
+                    raise ValueError("invoice_id must not be blank")
+                existing = self._find_invoice(book, invoice_id, owner_type=2)
+                if existing:
+                    raise ValueError(
+                        f"Invoice with ID '{invoice_id}' already exists"
+                    )
+            else:
+                cnt = book.counter_invoice + 1
+                book.counter_invoice = cnt
+                invoice_id = f"{cnt:06d}"
             inv_guid = uuid.uuid4().hex
 
             book.session.execute(
@@ -5494,6 +5529,7 @@ class GnuCashBook:
         notes: str = "",
         currency: str | None = None,
         term: str | None = None,
+        bill_id: str | None = None,
     ) -> dict:
         """Create a vendor bill.
 
@@ -5503,6 +5539,8 @@ class GnuCashBook:
             notes: Optional notes.
             currency: ISO currency code. Defaults to book's default currency.
             term: Billterm name (e.g., 'Net 30'). Optional.
+            bill_id: Custom bill number. If omitted, auto-generates
+                from the book's bill counter.
 
         Returns:
             Dict with guid, id, vendor_id, status.
@@ -5531,7 +5569,7 @@ class GnuCashBook:
                     raise ValueError(f"Currency not found: {currency}")
                 currency_guid = currency_obj.guid
             else:
-                currency_guid = book.default_currency.guid
+                currency_guid = self._require_default_currency(book).guid
 
             term_guid = None
             if term:
@@ -5542,9 +5580,18 @@ class GnuCashBook:
                     raise ValueError(f"Billterm not found: {term}")
                 term_guid = bt.guid
 
-            cnt = book.counter_bill + 1
-            book.counter_bill = cnt
-            bill_id = f"{cnt:06d}"
+            if bill_id is not None:
+                if not bill_id.strip():
+                    raise ValueError("bill_id must not be blank")
+                existing = self._find_invoice(book, bill_id, owner_type=4)
+                if existing:
+                    raise ValueError(
+                        f"Bill with ID '{bill_id}' already exists"
+                    )
+            else:
+                cnt = book.counter_bill + 1
+                book.counter_bill = cnt
+                bill_id = f"{cnt:06d}"
             inv_guid = uuid.uuid4().hex
 
             book.session.execute(
@@ -6427,6 +6474,191 @@ class GnuCashBook:
             }
 
         return result
+
+    def delete_invoice(self, invoice_id: str) -> dict:
+        """Delete an unposted customer invoice.
+
+        Automatically removes associated entries. Posted invoices cannot
+        be deleted — void them or issue a credit note instead.
+
+        Args:
+            invoice_id: Invoice ID (e.g., '000001' or 'INV-2026-001').
+
+        Returns:
+            Dict with id, guid, entries_deleted, status.
+
+        Raises:
+            ValueError: If invoice not found or is posted.
+        """
+        return self._delete_invoice_or_bill(invoice_id, owner_type=2)
+
+    def delete_bill(self, bill_id: str) -> dict:
+        """Delete an unposted vendor bill.
+
+        Automatically removes associated entries. Posted bills cannot
+        be deleted — void them or issue a credit note instead.
+
+        Args:
+            bill_id: Bill ID (e.g., '000001' or 'BILL-2026-001').
+
+        Returns:
+            Dict with id, guid, entries_deleted, status.
+
+        Raises:
+            ValueError: If bill not found or is posted.
+        """
+        return self._delete_invoice_or_bill(bill_id, owner_type=4)
+
+    def _delete_invoice_or_bill(self, doc_id: str, owner_type: int) -> dict:
+        """Shared implementation for delete_invoice and delete_bill."""
+        from sqlalchemy import text
+        from piecash.business.invoice import Invoice
+
+        type_label = "Bill" if owner_type == 4 else "Invoice"
+        entry_fk = "bill" if owner_type == 4 else "invoice"
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, doc_id, owner_type=owner_type)
+            if not inv:
+                raise ValueError(f"{type_label} not found: {doc_id}")
+
+            if inv.date_posted is not None:
+                raise ValueError(
+                    f"Cannot delete posted {type_label.lower()} '{doc_id}'. "
+                    f"Void it or issue a credit note instead."
+                )
+
+            inv_guid = inv.guid
+
+            # Delete entries
+            entry_count = book.session.execute(
+                text(f"SELECT count(*) FROM entries WHERE {entry_fk} = :guid"),
+                {"guid": inv_guid},
+            ).scalar()
+            if entry_count:
+                book.session.execute(
+                    text(f"DELETE FROM entries WHERE {entry_fk} = :guid"),
+                    {"guid": inv_guid},
+                )
+
+            # Delete the invoice row
+            book.session.execute(
+                text("DELETE FROM invoices WHERE guid = :guid"),
+                {"guid": inv_guid},
+            )
+
+            book.save()
+
+            return {
+                "id": doc_id,
+                "guid": inv_guid,
+                "type": type_label.lower(),
+                "entries_deleted": entry_count,
+                "status": "deleted",
+            }
+
+    def delete_customer(self, customer_id: str) -> dict:
+        """Delete a customer with no invoices.
+
+        Customers with any invoices (posted or unposted) cannot be deleted.
+        Delete the invoices first, or void posted ones.
+
+        Args:
+            customer_id: Customer ID (e.g., '000001').
+
+        Returns:
+            Dict with id, guid, name, status.
+
+        Raises:
+            ValueError: If customer not found or has invoices.
+        """
+        return self._delete_customer_or_vendor(customer_id, is_vendor=False)
+
+    def delete_vendor(self, vendor_id: str) -> dict:
+        """Delete a vendor with no bills.
+
+        Vendors with any bills (posted or unposted) cannot be deleted.
+        Delete the bills first, or void posted ones.
+
+        Args:
+            vendor_id: Vendor ID (e.g., '000001').
+
+        Returns:
+            Dict with id, guid, name, status.
+
+        Raises:
+            ValueError: If vendor not found or has bills.
+        """
+        return self._delete_customer_or_vendor(vendor_id, is_vendor=True)
+
+    def _delete_customer_or_vendor(self, entity_id: str, is_vendor: bool) -> dict:
+        """Shared implementation for delete_customer and delete_vendor."""
+        from sqlalchemy import text
+        from piecash.business.invoice import Invoice
+
+        if is_vendor:
+            type_label = "Vendor"
+            owner_type = 4
+            doc_label = "bills"
+        else:
+            type_label = "Customer"
+            owner_type = 2
+            doc_label = "invoices"
+
+        with self.open(readonly=False) as book:
+            if is_vendor:
+                entity = self._find_vendor(book, entity_id)
+            else:
+                entity = self._find_customer(book, entity_id)
+
+            if not entity:
+                raise ValueError(f"{type_label} not found: {entity_id}")
+
+            entity_guid = entity.guid
+            entity_name = entity.name
+
+            # Check for any invoices/bills
+            invoices = book.session.query(Invoice).filter(
+                Invoice.owner_guid == entity_guid,
+                Invoice.owner_type == owner_type,
+            ).all()
+
+            if invoices:
+                posted = [i for i in invoices if i.date_posted is not None]
+                unposted = [i for i in invoices if i.date_posted is None]
+
+                if posted:
+                    posted_ids = ", ".join(i.id for i in posted)
+                    raise ValueError(
+                        f"Cannot delete {type_label.lower()} with posted "
+                        f"{doc_label}: {posted_ids}. "
+                        f"Void them or issue credit notes first."
+                    )
+                else:
+                    unposted_ids = ", ".join(i.id for i in unposted)
+                    raise ValueError(
+                        f"Cannot delete {type_label.lower()} with "
+                        f"{doc_label}: {unposted_ids}. "
+                        f"Delete the {doc_label} first."
+                    )
+
+            # Delete slots for this entity
+            book.session.execute(
+                text("DELETE FROM slots WHERE obj_guid = :guid"),
+                {"guid": entity_guid},
+            )
+
+            # Delete the entity
+            book.session.delete(entity)
+            book.save()
+
+            return {
+                "id": entity_id,
+                "guid": entity_guid,
+                "name": entity_name,
+                "type": type_label.lower(),
+                "status": "deleted",
+            }
 
     def get_outstanding_invoices(
         self,
