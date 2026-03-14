@@ -103,7 +103,7 @@ If you used pip instead of uv:
 
 #### Choosing modules (important)
 
-**Only load the modules you actually use.** The server has 70 tools across 8 modules, but every loaded tool gets described in the system prompt — eating tokens and context on every single message. Most users only need 2-3 modules.
+**Only load the modules you actually use.** The server has 75 tools across 8 modules, but every loaded tool gets described in the system prompt — eating tokens and context on every single message. Most users only need 2-3 modules.
 
 Add `--modules=` after `"gnucash_mcp"` in the args array with a comma-separated list:
 
@@ -123,10 +123,11 @@ Add `--modules=` after `"gnucash_mcp"` in the args array with a comma-separated 
 | `budgets` | 6 | Budget creation, targets, variance reports |
 | `scheduling` | 6 | Recurring transactions, upcoming bills |
 | `investments` | 11 | Commodities, prices, lots, cost basis tracking |
-| `business` | 18 | Customers, vendors, invoices, bills, payments |
+| `business` | 22 | Customers, vendors, invoices, bills, payments |
 | `admin` | 4 | Account metadata slots, audit log |
+| `debug` | 1 | `get_server_config` — loaded when `--debug` is set |
 
-Use `--modules=all` to load everything (70 tools), but only if you need it. You can also set `GNUCASH_MCP_MODULES=core,reporting` as an environment variable instead of using the CLI flag.
+Use `--modules=all` to load everything (75 tools), but only if you need it. You can also set `GNUCASH_MCP_MODULES=core,reporting` as an environment variable instead of using the CLI flag.
 
 Other optional flags: `"--debug"` enables debug logging, `"--audit-format=text"` or `"--audit-format=json"` sets the audit log format.
 
@@ -145,7 +146,7 @@ Ask Claude:
 
 ## What can it do?
 
-**70 tools** across thirteen categories:
+**75 tools** across eleven categories:
 
 | Category | What you can ask |
 |----------|------------------|
@@ -308,7 +309,7 @@ gnucash-mcp
 # Load specific modules
 gnucash-mcp --modules=core,reporting,business
 
-# Everything (70 tools — not recommended unless you need it all)
+# Everything (75 tools — not recommended unless you need it all)
 gnucash-mcp --modules=all
 ```
 
@@ -364,7 +365,7 @@ Example audit entry:
 
 ---
 
-## All 70 Tools
+## All 75 Tools
 
 <details>
 <summary>Click to expand full tool list</summary>
@@ -380,9 +381,10 @@ Example audit entry:
 | Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` |
 | Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` |
 | Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` |
-| Business | `create_customer`, `list_customers`, `get_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `get_outstanding_invoices`, `vendor_spending_report` |
+| Business | `create_customer`, `list_customers`, `get_customer`, `delete_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `delete_vendor`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `delete_invoice`, `delete_bill`, `get_outstanding_invoices`, `vendor_spending_report` |
 | Account Metadata | `get_account_slots`, `set_account_slot`, `delete_account_slot` |
 | Audit | `get_audit_log` |
+| Debug | `get_server_config` (loaded when `--debug` is set) |
 
 </details>
 
@@ -425,7 +427,8 @@ Full accounts receivable and accounts payable workflow. Create customers and ven
 - **Reporting**: List outstanding invoices/bills, vendor spending breakdown by period
 - **GnuCash UI compatibility**: Posted invoices include metadata slots (`gncInvoice`, `trans-date-due`, `date-posted`) so they display correctly in the native GnuCash interface
 - **Write verification**: All raw SQL operations (those bypassing the piecash ORM) are now verified with a read-back check before commit, with automatic rollback on failure
-- **`business` tool module**: 18 new tools, loaded via `--modules=business` or `--modules=all`
+- **`business` tool module**: 22 tools, loaded via `--modules=business` or `--modules=all`
+- **Server-level MCP instructions**: The server now sends structured accounting guidance (double-entry basics, workflow conventions, safety rules) to clients at connection time via the MCP `instructions` field — helping non-Claude models use the tools correctly without bloating individual tool descriptions
 - **Version**: 1.2.0 (540 tests)
 
 ### v1.1.0 — Modular Tool Loading
@@ -495,8 +498,16 @@ From basic CRUD to a full accounting toolkit.
 - [x] Modular tool loading (`--modules=`)
 - [x] Business: customers, vendors, invoices, bills, payments
 - [x] Write verification for raw SQL operations
+- [x] Server-level MCP instructions for non-Claude clients
+- [ ] Business: employees
 - [ ] CSV export
 - [ ] CSV/OFX import
+
+---
+
+## Support the Project
+
+If gnucash-mcp is useful to you, consider [buying me a coffee](https://ko-fi.com/gomezfox). It helps keep development going.
 
 ---
 

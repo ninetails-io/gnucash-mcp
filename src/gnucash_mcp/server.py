@@ -36,7 +36,53 @@ def _strip_noise(obj):
 logger = logging.getLogger(__name__)
 
 # Create FastMCP server
-mcp = FastMCP("gnucash-mcp")
+mcp = FastMCP(
+    "gnucash-mcp",
+    instructions="""GnuCash MCP Server — Double-Entry Accounting Tools
+
+ORIENTATION:
+- Call get_book_summary first to understand the book's structure, currency, and account hierarchy.
+- Use list_accounts to find exact account paths before creating transactions.
+- Use search_transactions before creating to avoid duplicates.
+
+DOUBLE-ENTRY BASICS:
+- Every transaction has splits that MUST balance to zero.
+- Debits are positive for Asset/Expense accounts, negative for Liability/Income/Equity.
+- Credit card payment example: checking -200 (credit), credit card +200 (debit) — reduces both balances.
+- Income received: checking +3000 (debit), income -3000 (credit).
+
+ACCOUNT PATHS:
+- Always use full paths: "Expenses:Groceries" not "Groceries".
+- Paths are colon-delimited and case-sensitive.
+- When unsure of a path, use list_accounts or get_account to verify.
+
+GUID PREFIXES:
+- All tools accepting GUIDs also accept 8+ character prefixes.
+- Use the short prefix from list_transactions output — no need to look up full GUIDs.
+
+RECONCILIATION WORKFLOW:
+1. list_transactions for the account and date range
+2. Match each statement line to an existing transaction or create missing ones
+3. Verify balance matches statement with get_balance
+4. Use reconcile_account to mark splits as reconciled
+
+INVESTMENT WORKFLOW:
+1. create_lot for each purchase
+2. create_transaction with quantity (shares) and amount (cost)
+3. assign_split_to_lot to link the investment split
+4. create_price to record the share price
+5. calculate_lot_gain to check performance
+
+SLOTS (CUSTOM METADATA):
+- Use get_account_slots / set_account_slot to store per-account data like APR, credit limit, statement close day.
+- Values are stored as strings. Store numbers as strings: set_account_slot("...", "apr", "23.49").
+
+SAFETY:
+- Reconciled splits are protected. Use force=true only when intentionally modifying reconciled data.
+- void_transaction preserves audit trail. Prefer void over delete for posted transactions.
+- delete_account is blocked if account has children or transactions.
+""",
+)
 
 # ---------------------------------------------------------------------------
 # Tool module definitions — controls which tools are advertised via --modules
