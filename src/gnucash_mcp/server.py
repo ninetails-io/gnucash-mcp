@@ -118,6 +118,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "balance_sheet",
         "net_worth",
         "cash_flow",
+        "debt_payoff_plan",
     ],
     "budgets": [
         "list_budgets",
@@ -1145,6 +1146,34 @@ def cash_flow(
         start_date=date.fromisoformat(start_date),
         end_date=date.fromisoformat(end_date),
         account=account,
+    )
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@audit_log(classification="read")
+def debt_payoff_plan(
+    monthly_budget: str,
+    additional_purchase: str | None = None,
+) -> str:
+    """Calculate an avalanche-method debt payoff schedule with YETI multiplier.
+
+    Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
+    Set APRs via set_account_slot (e.g., set_account_slot("Liabilities:Visa", "apr", "23.49")).
+
+    YETI (Your Expense's True Impact) shows the true cost of a purchase when
+    carrying debt: "A $1.00 purchase will cost you $1.68 by the time your
+    debt is paid off."
+
+    Args:
+        monthly_budget: Total monthly amount available for all debt payments combined
+        additional_purchase: Dollar amount to calculate YETI for (default "1.00")
+    """
+    book = get_book()
+    result = book.debt_payoff_plan(
+        monthly_budget=monthly_budget,
+        additional_purchase=additional_purchase,
     )
     return _json(result)
 
