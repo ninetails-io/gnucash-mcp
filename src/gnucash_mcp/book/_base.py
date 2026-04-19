@@ -488,6 +488,19 @@ class BaseGnuCashBook:
             )
         return dc
 
+    def _find_commodity(
+        self, book: piecash.Book, mnemonic: str, namespace: str = "CURRENCY"
+    ) -> piecash.Commodity | None:
+        """Find a commodity by mnemonic and namespace.
+
+        Shared finder — used by create_account (core) and by the full
+        commodities/prices surface in InvestmentsMixin.
+        """
+        try:
+            return book.commodities.get(mnemonic=mnemonic, namespace=namespace)
+        except KeyError:
+            return None
+
     def _get_or_create_currency(
         self, book: piecash.Book, mnemonic: str
     ) -> piecash.Commodity:

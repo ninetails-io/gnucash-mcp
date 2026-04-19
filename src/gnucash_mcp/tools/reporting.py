@@ -1,0 +1,146 @@
+"""Reporting tools: spending, income, balance sheet, net worth, cash flow, debt payoff."""
+
+from datetime import date
+
+from gnucash_mcp.logging_config import audit_log
+from gnucash_mcp.tools._helpers import _json, safe_tool
+
+
+def register(mcp, get_book) -> None:
+    """Attach reporting tools to the FastMCP server."""
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def spending_by_category(
+        start_date: str,
+        end_date: str,
+        depth: int = 1,
+    ) -> str:
+        """Get spending breakdown by expense category for a period.
+
+        Args:
+            start_date: Start of period (YYYY-MM-DD)
+            end_date: End of period (YYYY-MM-DD)
+            depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+        """
+        book = get_book()
+        result = book.spending_by_category(
+            start_date=date.fromisoformat(start_date),
+            end_date=date.fromisoformat(end_date),
+            depth=depth,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def income_by_source(
+        start_date: str,
+        end_date: str,
+        depth: int = 1,
+    ) -> str:
+        """Get income breakdown by source for a period.
+
+        Args:
+            start_date: Start of period (YYYY-MM-DD)
+            end_date: End of period (YYYY-MM-DD)
+            depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+        """
+        book = get_book()
+        result = book.income_by_source(
+            start_date=date.fromisoformat(start_date),
+            end_date=date.fromisoformat(end_date),
+            depth=depth,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def balance_sheet(as_of_date: str) -> str:
+        """Generate a balance sheet as of a specific date.
+
+        Shows assets, liabilities, and equity with account breakdowns.
+
+        Args:
+            as_of_date: Date to calculate balances as of (YYYY-MM-DD)
+        """
+        book = get_book()
+        result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def net_worth(
+        end_date: str,
+        start_date: str | None = None,
+        interval: str | None = None,
+    ) -> str:
+        """Calculate net worth (assets minus liabilities).
+
+        Can calculate a single point-in-time value or a time series.
+
+        Args:
+            end_date: Calculate net worth as of this date (YYYY-MM-DD)
+            start_date: Optional start date for time series (YYYY-MM-DD)
+            interval: Optional interval for time series: 'month', 'quarter', or 'year'
+        """
+        book = get_book()
+        result = book.net_worth(
+            end_date=date.fromisoformat(end_date),
+            start_date=date.fromisoformat(start_date) if start_date else None,
+            interval=interval,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def cash_flow(
+        start_date: str,
+        end_date: str,
+        account: str | None = None,
+    ) -> str:
+        """Calculate cash flow (inflows and outflows) for a period.
+
+        Args:
+            start_date: Start of period (YYYY-MM-DD)
+            end_date: End of period (YYYY-MM-DD)
+            account: Optional specific account to analyze (defaults to all cash/bank accounts)
+        """
+        book = get_book()
+        result = book.cash_flow(
+            start_date=date.fromisoformat(start_date),
+            end_date=date.fromisoformat(end_date),
+            account=account,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def debt_payoff_plan(
+        monthly_budget: str,
+        additional_purchase: str | None = None,
+    ) -> str:
+        """Calculate an avalanche-method debt payoff schedule with YETI multiplier.
+
+        Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
+        Set APRs via set_account_slot (e.g., set_account_slot("Liabilities:Visa", "apr", "23.49")).
+
+        YETI (Your Expense's True Impact) shows the true cost of a purchase when
+        carrying debt: "A $1.00 purchase will cost you $1.68 by the time your
+        debt is paid off."
+
+        Args:
+            monthly_budget: Total monthly amount available for all debt payments combined
+            additional_purchase: Dollar amount to calculate YETI for (default "1.00")
+        """
+        book = get_book()
+        result = book.debt_payoff_plan(
+            monthly_budget=monthly_budget,
+            additional_purchase=additional_purchase,
+        )
+        return _json(result)

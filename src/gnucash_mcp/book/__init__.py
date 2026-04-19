@@ -28,7 +28,12 @@ from gnucash_mcp.book._legacy import LegacyMixin
 # As each module is peeled off the monolith, add an entry here.
 _MIXIN_MAP: dict[str, tuple[str, str]] = {
     "admin": (".admin", "AdminMixin"),
+    "budgets": (".budgets", "BudgetsMixin"),
     "business": (".business", "BusinessMixin"),
+    "investments": (".investments", "InvestmentsMixin"),
+    "reconciliation": (".reconciliation", "ReconciliationMixin"),
+    "reporting": (".reporting", "ReportingMixin"),
+    "scheduling": (".scheduling", "SchedulingMixin"),
 }
 
 
