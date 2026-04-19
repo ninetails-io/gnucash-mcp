@@ -32,6 +32,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
+    _guid_prefix_map,
     _split_to_dict,
     _transaction_to_compact_line,
     _transaction_to_dict,
@@ -337,8 +338,16 @@ class CoreMixin:
             filtered = filtered[:limit]
 
             if compact:
-                lines = [_transaction_to_compact_line(t, exclude_account=account)
-                         for t in filtered]
+                # Build collision-safe prefix map across ALL transactions in
+                # the book (not just the filtered batch) so emitted prefixes
+                # remain valid _resolve_guid lookup keys against the full table.
+                prefixes = _guid_prefix_map(t.guid for t in book.transactions)
+                lines = [
+                    _transaction_to_compact_line(
+                        t, exclude_account=account, prefixes=prefixes
+                    )
+                    for t in filtered
+                ]
                 return "\n".join(lines)
             else:
                 return [_transaction_to_dict(t) for t in filtered]
@@ -1082,7 +1091,12 @@ class CoreMixin:
             matched.sort(key=lambda t: t.post_date, reverse=True)
 
             if compact:
-                lines = [_transaction_to_compact_line(t) for t in matched]
+                # Collision-safe prefix map over the whole transactions table
+                prefixes = _guid_prefix_map(t.guid for t in book.transactions)
+                lines = [
+                    _transaction_to_compact_line(t, prefixes=prefixes)
+                    for t in matched
+                ]
                 return "\n".join(lines)
             else:
                 return [_transaction_to_dict(t) for t in matched]

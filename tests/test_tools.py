@@ -176,7 +176,7 @@ class TestGetTransactionTool:
 
     def test_get_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
-        result = server_module.get_transaction("nonexistent_guid")
+        result = server_module.get_transaction("deadbeef00000000")
 
         data = json.loads(result)
         assert "error" in data
@@ -470,7 +470,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
-        result = server_module.delete_transaction("nonexistent_guid_12345")
+        result = server_module.delete_transaction("deadbeef00000000")
 
         data = json.loads(result)
         assert "error" in data
@@ -531,7 +531,7 @@ class TestUpdateTransactionTool:
     def test_update_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
         result = server_module.update_transaction(
-            guid="nonexistent_guid_12345",
+            guid="deadbeef00000000",
             description="New Description",
         )
 
