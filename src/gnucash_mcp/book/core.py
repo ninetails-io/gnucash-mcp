@@ -1,16 +1,30 @@
-"""LegacyMixin — methods not yet extracted into per-module mixins.
+"""CoreMixin — the foundation layer: accounts, transactions, book summary.
 
-Temporary home for GnuCashBook methods that haven't been peeled off
-into their own module yet (core, reporting, budgets, scheduling,
-investments, business, reconciliation). As each module is extracted,
-methods move from here into their own file. When empty, this file
-can be deleted.
+Every other module (reconciliation, reporting, budgets, scheduling,
+investments, business, admin) presupposes the methods here. `--modules`
+always adds 'core' to the enabled set.
 
-Shared helpers (open, finders, serializers) live in _base.py.
+Holds:
+  - get_book_summary (one-shot orientation: accounts, balances, net
+    worth, txn count, commodities, scheduled)
+  - Account CRUD + list/get/balance
+  - Transaction CRUD + list/get/search/replace_splits
+  - The duplicate-detection / auto-fill / split-consistency pipeline
+    behind create_transaction
+
+Depends on shared helpers from BaseGnuCashBook (via MRO):
+  - self.open, self.book_path
+  - self._find_account, self._find_transaction, self._find_split
+  - self._find_commodity, self._require_default_currency,
+    self._get_or_create_currency, self._resolve_guid,
+    self._collect_descendants
+
+SchedulingMixin.create_transaction_from_scheduled calls
+self.create_transaction (defined here), resolved via MRO — that is
+the one extracted-to-core dependency in the whole tree.
 """
 
-import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 import piecash
@@ -18,39 +32,14 @@ import piecash
 from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
-    _commodity_to_compact_line,
-    _lot_to_compact_line,
     _split_to_dict,
-    _sx_to_compact_line,
-    _to_date,
     _transaction_to_compact_line,
     _transaction_to_dict,
-    _unreconciled_split_to_compact_line,
-    _upcoming_to_compact_line,
-    _verify_composite_write,
-    _verify_delete,
-    _verify_write,
 )
 
-# Debug logger - configured by logging_config.setup_logging()
-debug_logger = logging.getLogger("gnucash_mcp.debug")
 
-
-# Module-level helpers, serializers, and GnuCashLockError all moved to _base.py
-# (imported at top of this file).
-
-
-class LegacyMixin:
-    """Methods not yet extracted into per-module mixins.
-
-    Depends on shared helpers from BaseGnuCashBook (via MRO):
-      - self.open, self.book_path
-      - self._find_account, self._find_transaction, self._find_split
-      - self._resolve_guid, self._require_default_currency
-      - self._get_or_create_currency, self._collect_descendants
-    """
-
-    # Investments/budgets/scheduling helpers + commodities/prices methods moved to their mixins.
+class CoreMixin:
+    """Accounts, transactions, and the book-summary view. Always loaded."""
 
     def get_book_summary(self) -> str:
         """Return a compact text summary of the entire book.
@@ -391,7 +380,7 @@ class LegacyMixin:
         all_names = frozenset(a.fullname for a in accounts)
         categorization = frozenset(
             a.fullname for a in accounts
-            if a.type not in LegacyMixin._FUNDING_ACCOUNT_TYPES
+            if a.type not in CoreMixin._FUNDING_ACCOUNT_TYPES
         )
         return categorization if categorization else all_names
 

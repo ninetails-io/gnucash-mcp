@@ -22,14 +22,16 @@ from gnucash_mcp.book._base import (
     _verify_delete,
     _verify_write,
 )
-from gnucash_mcp.book._legacy import LegacyMixin
 
 # Map of module name → (relative import path, mixin class name).
-# As each module is peeled off the monolith, add an entry here.
+# Every module lives in its own file now; CoreMixin is always included
+# by _apply_module_filter (core is never truly "disabled"), but it goes
+# through the same registration path as every other module.
 _MIXIN_MAP: dict[str, tuple[str, str]] = {
     "admin": (".admin", "AdminMixin"),
     "budgets": (".budgets", "BudgetsMixin"),
     "business": (".business", "BusinessMixin"),
+    "core": (".core", "CoreMixin"),
     "investments": (".investments", "InvestmentsMixin"),
     "reconciliation": (".reconciliation", "ReconciliationMixin"),
     "reporting": (".reporting", "ReportingMixin"),
@@ -49,9 +51,10 @@ def _load_mixin(module_name: str):
 def extracted_modules() -> set[str]:
     """Return the set of modules that have their own mixin file.
 
-    Modules not in this set still live in LegacyMixin. Tool registration
-    logic uses this to decide which modules can be lazy-loaded from
-    gnucash_mcp.tools.<name> vs. filtered from server.py-registered tools.
+    Now every module is extracted, so this equals the full TOOL_MODULES
+    keyset. Retained for API stability — `_apply_module_filter` still
+    consults it to decide which modules are lazy-loadable via
+    gnucash_mcp.tools.<name>.register(mcp, get_book).
     """
     return set(_MIXIN_MAP.keys())
 
@@ -61,13 +64,13 @@ def build_book_class(modules: set[str] | None = None) -> type:
 
     Args:
         modules: Set of enabled module names (e.g., {"core", "admin"}).
-                 If None, include all extracted mixins (default class).
+                 If None, include every known mixin (default class).
 
     Returns:
-        Dynamically-created class inheriting from LegacyMixin, the
-        requested module mixins, and BaseGnuCashBook.
+        Dynamically-created class inheriting from the requested mixins
+        plus BaseGnuCashBook.
     """
-    mixins: list[type] = [LegacyMixin]
+    mixins: list[type] = []
 
     if modules is None:
         # Default / tests: include every extracted mixin

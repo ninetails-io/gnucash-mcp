@@ -914,11 +914,20 @@ class TestErrorHandling:
         assert "Close GnuCash" in data["suggestion"]
 
     def test_unexpected_error_handling(self, setup_book_env):
-        """Should handle unexpected errors gracefully."""
-        # Patch to raise an unexpected error
+        """Should handle unexpected errors gracefully.
+
+        Patches the underlying GnuCashBook.list_accounts method rather
+        than server_module.get_book — after the modularization refactor,
+        tool wrappers are closures in gnucash_mcp/tools/core.py and the
+        ``get_book`` they call was captured at register time, so
+        ``patch.object(server_module, "get_book", ...)`` no longer
+        intercepts it. Patching the book method achieves the same end:
+        the tool raises unexpectedly, safe_tool catches it.
+        """
+        book = server_module.get_book()
         with patch.object(
-            server_module,
-            "get_book",
+            type(book),
+            "list_accounts",
             side_effect=RuntimeError("Unexpected error"),
         ):
             result = server_module.list_accounts()

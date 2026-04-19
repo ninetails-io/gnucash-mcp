@@ -19,10 +19,10 @@ class TestToolModulesMapping:
     def test_registered_tools_are_a_subset_of_mapped(self):
         """Every tool registered at import must appear in TOOL_MODULES.
 
-        Extracted modules (e.g. 'admin') are lazy-loaded — their tools
-        aren't registered at import time. The reverse direction
-        (everything in TOOL_MODULES can be loaded) is covered by
-        test_extracted_modules_can_be_loaded.
+        Every module is now extracted and lazy-loaded, so no tools are
+        registered at import time. The reverse direction (every tool
+        in TOOL_MODULES can be loaded) is covered by
+        test_all_modules_load via _apply_module_filter("all").
         """
         all_mapped = set()
         for tools in TOOL_MODULES.values():
@@ -30,15 +30,14 @@ class TestToolModulesMapping:
         registered = set(mcp._tool_manager._tools.keys())
         assert registered.issubset(all_mapped)
 
-    def test_non_extracted_modules_are_fully_registered_at_import(self):
-        """Every tool in a non-extracted module must be registered at import."""
-        expected = set()
-        extracted = extracted_modules()
-        for mod_name, tools in TOOL_MODULES.items():
-            if mod_name not in extracted:
-                expected.update(tools)
-        registered = set(mcp._tool_manager._tools.keys())
-        assert expected.issubset(registered)
+    def test_every_module_is_extracted(self):
+        """Every TOOL_MODULES key has a corresponding mixin + tools file.
+
+        Before the final core extraction some tools shipped at module level
+        in server.py (non-extracted modules). That transition state is done —
+        every module is now lazy-loaded via gnucash_mcp/tools/<name>.py.
+        """
+        assert extracted_modules() == set(TOOL_MODULES.keys())
 
     def test_no_duplicate_tools_across_modules(self):
         """No tool should appear in more than one module."""
