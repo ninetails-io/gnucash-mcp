@@ -10,6 +10,35 @@ import pytest
 from gnucash_mcp import server as server_module
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _load_all_extracted_tool_modules():
+    """Force-load all extracted tool modules and bind their tools to the server module.
+
+    After the modularization refactor, most tool wrappers live inside
+    register() closures in gnucash_mcp/tools/<module>.py and only appear
+    in the FastMCP registry when --modules enables them. Tests in this
+    file call tools directly via ``server_module.<tool_name>(...)``, so
+    we force-load all modules and bind each registered tool's underlying
+    function back onto the server module namespace.
+
+    Teardown removes the tools we added from the FastMCP registry so
+    later test modules (notably test_modules.py) see a clean state where
+    extracted tools are absent at import — preserving the lazy-loading
+    assertions.
+    """
+    pre_tools = dict(server_module.mcp._tool_manager._tools)
+    server_module._apply_module_filter("all")
+    for name, tool in server_module.mcp._tool_manager._tools.items():
+        if not hasattr(server_module, name):
+            setattr(server_module, name, tool.fn)
+    yield
+    # Restore registry to the pre-fixture state (setattr bindings stay;
+    # they're harmless module attributes no other test inspects)
+    added = set(server_module.mcp._tool_manager._tools.keys()) - set(pre_tools.keys())
+    for name in added:
+        del server_module.mcp._tool_manager._tools[name]
+
+
 @pytest.fixture
 def setup_book_env(test_book: Path, monkeypatch):
     """Set up environment with test book path."""
@@ -885,11 +914,20 @@ class TestErrorHandling:
         assert "Close GnuCash" in data["suggestion"]
 
     def test_unexpected_error_handling(self, setup_book_env):
-        """Should handle unexpected errors gracefully."""
-        # Patch to raise an unexpected error
+        """Should handle unexpected errors gracefully.
+
+        Patches the underlying GnuCashBook.list_accounts method rather
+        than server_module.get_book — after the modularization refactor,
+        tool wrappers are closures in gnucash_mcp/tools/core.py and the
+        ``get_book`` they call was captured at register time, so
+        ``patch.object(server_module, "get_book", ...)`` no longer
+        intercepts it. Patching the book method achieves the same end:
+        the tool raises unexpectedly, safe_tool catches it.
+        """
+        book = server_module.get_book()
         with patch.object(
-            server_module,
-            "get_book",
+            type(book),
+            "list_accounts",
             side_effect=RuntimeError("Unexpected error"),
         ):
             result = server_module.list_accounts()
