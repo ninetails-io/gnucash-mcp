@@ -141,107 +141,6 @@ def setup_logging(
         debug_logger.setLevel(logging.CRITICAL + 1)
 
 
-def _capture_before_state(
-    entity_type: str | None, operation: str | None, params: dict
-) -> dict | None:
-    """Capture entity state before mutation.
-
-    Args:
-        entity_type: "transaction", "account", or "split"
-        operation: "create", "update", "delete", "void", "unvoid", "reconcile", "set_state"
-        params: Tool parameters
-
-    Returns:
-        State dict or None if not applicable.
-    """
-    if _get_book_func is None:
-        return None
-
-    # Creates don't have before state
-    if operation == "create":
-        return None
-
-    try:
-        book = _get_book_func()
-
-        if entity_type == "transaction":
-            guid = params.get("guid")
-            if guid:
-                return book.get_transaction(guid)
-
-        elif entity_type == "account":
-            name = params.get("name")
-            if name:
-                return book.get_account(name)
-
-        elif entity_type == "split":
-            # For set_reconcile_state
-            split_guid = params.get("split_guid")
-            if split_guid:
-                return _get_split_states_batch(book, [split_guid]).get(split_guid)
-
-            # For reconcile_account (multiple splits)
-            split_guids = params.get("split_guids")
-            if split_guids:
-                states = _get_split_states_batch(book, split_guids)
-                return {"splits": [states.get(g) for g in split_guids]}
-
-    except Exception:
-        # Don't let state capture failures break the tool
-        return None
-
-    return None
-
-
-def _get_split_states_batch(book, split_guids: list[str]) -> dict[str, dict | None]:
-    """Get the current state of multiple splits by GUID in a single book open.
-
-    This is much more efficient than calling _get_split_state for each GUID,
-    as it opens the book only once and iterates through transactions once.
-
-    Args:
-        book: GnuCashBook wrapper instance
-        split_guids: List of split GUIDs to find
-
-    Returns:
-        Dict mapping split GUID to state dict (or None if not found).
-    """
-    if not split_guids:
-        return {}
-
-    # Convert to set for O(1) lookup
-    guids_to_find = set(split_guids)
-    results: dict[str, dict | None] = {g: None for g in split_guids}
-
-    # Open book once and iterate through all transactions
-    with book.open(readonly=True) as piecash_book:
-        for transaction in piecash_book.transactions:
-            # Check each split in this transaction
-            for split in transaction.splits:
-                if split.guid in guids_to_find:
-                    results[split.guid] = {
-                        "guid": split.guid,
-                        "account": split.account.fullname,
-                        "amount": str(split.quantity),
-                        "reconcile_state": split.reconcile_state,
-                        "reconcile_date": (
-                            split.reconcile_date.isoformat()
-                            if split.reconcile_date
-                            else None
-                        ),
-                        # Include transaction context for human-readable logs
-                        "transaction_description": transaction.description,
-                        "transaction_date": transaction.post_date.isoformat(),
-                    }
-                    guids_to_find.discard(split.guid)
-
-                    # Early exit if we found all splits
-                    if not guids_to_find:
-                        return results
-
-    return results
-
-
 def _format_text_header(date_str: str, book_path: str, tz_name: str = "") -> str:
     """Format the header for a text audit log file."""
     line = "═" * 64
@@ -753,10 +652,6 @@ def audit_log(
             if classification == "write":
                 entry["operation"] = operation
                 entry["entity_type"] = entity_type
-                # Capture before_state for updates/deletes/voids
-                before = _capture_before_state(entity_type, operation, kwargs)
-                if before:
-                    entry["before_state"] = before
 
             debug_logger.debug(
                 f"MCP request: tool={func.__name__} params={json.dumps(kwargs)}"
@@ -766,6 +661,22 @@ def audit_log(
             try:
                 result = func(*args, **kwargs)
                 elapsed_ms = (time.time() - start_time) * 1000
+
+                # Consume any before-state the book method staged while
+                # its session was open. Always consume (even on read /
+                # create) to clear any stray value; helper returns None
+                # when nothing staged.
+                before = None
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            before = book._consume_audit_before()
+                    except Exception:
+                        # Never let consumption failures break a tool.
+                        before = None
+                if classification == "write" and before:
+                    entry["before_state"] = before
 
                 # Check if result indicates an error (JSON with "error" key)
                 try:
@@ -800,6 +711,17 @@ def audit_log(
                 elapsed_ms = (time.time() - start_time) * 1000
                 entry["result"] = "error"
                 entry["error"] = str(e)
+
+                # Drop any staged before-state so it can't leak into the
+                # next call. Failed writes don't render before_state in
+                # the error line anyway.
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            book._consume_audit_before()
+                    except Exception:
+                        pass
 
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "

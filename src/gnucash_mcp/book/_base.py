@@ -14,6 +14,7 @@ belong to — not here.
 import logging
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -500,6 +501,36 @@ class BaseGnuCashBook:
         self.book_path = Path(book_path)
         if not self.book_path.exists():
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
+        # Thread-local staging buffer for audit-log before_state.
+        # Write book methods call `_stage_audit_before(...)` while their
+        # session is open; `@audit_log` reads it back via
+        # `_consume_audit_before()` after the tool returns. This avoids
+        # a second read-only book open per write (~40-100ms).
+        self._audit_tls = threading.local()
+
+    def _stage_audit_before(self, state: dict | None) -> None:
+        """Stage a before-state dict for the next audit-log consume.
+
+        Called by write book methods before mutating — using the same
+        piecash session they already have open, so no extra open cost.
+        The `@audit_log` decorator consumes this after the tool returns.
+
+        Passing None is a no-op; passing a dict overwrites any
+        previously-staged state (shouldn't happen in a well-formed call
+        chain, but is safe).
+        """
+        self._audit_tls.before_state = state
+
+    def _consume_audit_before(self) -> dict | None:
+        """Return the staged before-state dict (if any) and clear it.
+
+        Called by `@audit_log` after the wrapped tool returns, or in its
+        exception handler to discard leftover state from a failed write.
+        Always clears on read so stale values can't leak across calls.
+        """
+        state = getattr(self._audit_tls, "before_state", None)
+        self._audit_tls.before_state = None
+        return state
 
     def _resolve_guid(self, table: str, partial: str) -> str:
         """Resolve a partial GUID prefix to a full 32-character GUID.

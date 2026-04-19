@@ -1325,6 +1325,10 @@ class CoreMixin:
             if not account:
                 raise ValueError(f"Account not found: {name}")
 
+            # Stage pre-mutation state for the audit log so the decorator
+            # doesn't have to reopen the book to capture it.
+            self._stage_audit_before(_account_to_dict(account))
+
             # Check for name conflict if renaming
             if new_name and new_name != account.name:
                 if account.parent:
@@ -1387,6 +1391,9 @@ class CoreMixin:
             if not account:
                 raise ValueError(f"Account not found: {name}")
 
+            # Stage pre-move state (fullname derives old parent for log).
+            self._stage_audit_before(_account_to_dict(account))
+
             new_parent_account = self._find_account(book, new_parent)
             if not new_parent_account:
                 raise ValueError(f"Parent account not found: {new_parent}")
@@ -1444,6 +1451,9 @@ class CoreMixin:
                     f"Move or delete transactions first."
                 )
 
+            # Stage pre-delete state for the audit log.
+            self._stage_audit_before(_account_to_dict(account))
+
             # Capture info before deletion
             result = {
                 "guid": account.guid,
@@ -1485,6 +1495,9 @@ class CoreMixin:
                     f"Transaction has reconciled splits in: {acct_names}. "
                     f"Deleting will break reconciliation. Use force=true to override."
                 )
+
+            # Stage pre-delete state for the audit log.
+            self._stage_audit_before(_transaction_to_dict(transaction))
 
             # Capture info before deletion
             result = {
@@ -1554,6 +1567,9 @@ class CoreMixin:
                         f"Modifying will break reconciliation. "
                         f"Use force=true to override."
                     )
+
+            # Stage pre-update state for the audit log.
+            self._stage_audit_before(_transaction_to_dict(transaction))
 
             # Update description if provided
             if description is not None:
@@ -1692,6 +1708,10 @@ class CoreMixin:
             previous_splits = [
                 _split_to_compact_dict(s) for s in transaction.splits
             ]
+
+            # Stage pre-replace state for the audit log (description/date
+            # aren't changing but the REPLACE_SPLITS formatter wants them).
+            self._stage_audit_before(_transaction_to_dict(transaction))
 
             # 3. Resolve and validate all accounts upfront
             resolved_accounts = []

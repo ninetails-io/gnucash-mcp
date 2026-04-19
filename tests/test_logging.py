@@ -5,7 +5,6 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -16,6 +15,24 @@ from gnucash_mcp.logging_config import (
     audit_log,
     setup_logging,
 )
+
+
+class _StagedBook:
+    """Fake GnuCashBook that yields a pre-set before-state once.
+
+    Used by tests that need to inject before_state into `@audit_log`
+    without opening a real book. Mirrors the contract of
+    `BaseGnuCashBook._consume_audit_before`: returns the staged dict
+    on first call, clears itself so subsequent calls return None.
+    """
+
+    def __init__(self, state: dict | None):
+        self._state = state
+
+    def _consume_audit_before(self) -> dict | None:
+        state = self._state
+        self._state = None
+        return state
 
 
 @pytest.fixture
@@ -210,13 +227,29 @@ class TestTextFormat:
     ):
         """UPDATE audit entry still shows new splits when response trims them.
 
-        Phase 3 of the token-efficiency pass will shrink
-        ``update_transaction``'s response. When ``after_state`` omits
-        ``splits``, ``description``, or ``date``, the audit log should
-        pull them from tool params instead so the text view keeps the
-        before/after diff detail human reviewers rely on.
+        `update_transaction`'s response is thin
+        (``{guid, date, description, status}`` — no splits). When
+        ``after_state`` omits ``splits``, ``description``, or ``date``,
+        the audit log should pull them from tool params instead so the
+        text view keeps the before/after diff detail human reviewers
+        rely on.
         """
-        setup_logging(book_path=str(temp_book_path), debug=False)
+        # Inject before_state via a fake book the decorator can consume
+        # from — mirrors what `update_transaction` would stage in
+        # production using `_stage_audit_before` from its open session.
+        staged = _StagedBook({
+            "description": "Old description",
+            "date": "2026-01-01",
+            "splits": [
+                {"account": "Expenses:Old", "value": "10.00"},
+                {"account": "Assets:Checking", "value": "-10.00"},
+            ],
+        })
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: staged,
+        )
 
         @audit_log(
             classification="write",
@@ -230,33 +263,17 @@ class TestTextFormat:
             splits: list,
         ) -> str:
             # Simulated thin response: no description, date, or splits.
-            # before_state must exist for the UPDATE handler to render —
-            # patch _capture_before_state via kwargs the decorator sees.
             return json.dumps({"guid": guid, "status": "updated"})
 
-        # Inject before_state by patching the capture helper just for
-        # this test — otherwise the decorator gets None back and the
-        # UPDATE handler emits just the header line.
-        with patch(
-            "gnucash_mcp.logging_config._capture_before_state",
-            return_value={
-                "description": "Old description",
-                "date": "2026-01-01",
-                "splits": [
-                    {"account": "Expenses:Old", "value": "10.00"},
-                    {"account": "Assets:Checking", "value": "-10.00"},
-                ],
-            },
-        ):
-            test_update(
-                guid="abcdef01",
-                description="New description",
-                transaction_date="2026-02-15",
-                splits=[
-                    {"account": "Expenses:New", "value": "20.00"},
-                    {"account": "Assets:Checking", "value": "-20.00"},
-                ],
-            )
+        test_update(
+            guid="abcdef01",
+            description="New description",
+            transaction_date="2026-02-15",
+            splits=[
+                {"account": "Expenses:New", "value": "20.00"},
+                {"account": "Assets:Checking", "value": "-20.00"},
+            ],
+        )
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
@@ -280,11 +297,23 @@ class TestTextFormat:
         """REPLACE_SPLITS audit entry uses params for new splits when
         response drops the ``splits`` echo.
 
-        Phase 3 will trim ``replace_splits`` to only return
+        ``replace_splits`` returns only
         ``{guid, status, previous_splits, warnings}`` — the new splits
-        must come from tool params in the audit log.
+        must come from tool params in the audit log. Description and
+        date come from before_state (they don't change on this op but
+        the formatter still renders them).
         """
-        setup_logging(book_path=str(temp_book_path), debug=False)
+        # Before-state gives description/date; in production this is
+        # staged by the book method from its own open session.
+        staged = _StagedBook({
+            "description": "Recategorize",
+            "date": "2026-02-10",
+        })
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: staged,
+        )
 
         @audit_log(
             classification="write",
@@ -302,22 +331,13 @@ class TestTextFormat:
                 ],
             })
 
-        # Before-state gives description/date (they don't change on
-        # replace_splits, but the audit log still wants to show them).
-        with patch(
-            "gnucash_mcp.logging_config._capture_before_state",
-            return_value={
-                "description": "Recategorize",
-                "date": "2026-02-10",
-            },
-        ):
-            test_replace_splits(
-                guid="abcdef02",
-                splits=[
-                    {"account": "Expenses:Dining", "amount": "50.00"},
-                    {"account": "Assets:Checking", "amount": "-50.00"},
-                ],
-            )
+        test_replace_splits(
+            guid="abcdef02",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        )
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
@@ -482,3 +502,70 @@ class TestAuditLogIntegration:
         # Split leaf names appear in the rendered splits block
         assert "Groceries" in content
         assert "Checking" in content
+
+
+class TestBookOpenAccounting:
+    """Regression guard: each write should open the book exactly once.
+
+    Before this work, the @audit_log decorator called
+    _capture_before_state → book.get_transaction(...) → opened the book
+    read-only; the tool then opened it again read-write. Every write
+    paid the double-open tax. Now write book methods stage their own
+    before-state via _stage_audit_before / _consume_audit_before on the
+    BaseGnuCashBook wrapper, and the decorator reads it back without
+    opening anything.
+
+    This test patches `piecash.open_book` with a counter and asserts
+    exactly one open per `update_transaction` call. If it ever starts
+    failing with count=2, someone added a read-only pre-capture back.
+    """
+
+    def test_update_transaction_opens_book_once(
+        self, test_book, monkeypatch
+    ):
+        import piecash
+
+        from gnucash_mcp.book import GnuCashBook
+
+        book_wrapper = GnuCashBook(str(test_book))
+        # Register the wrapper so audit_log's consume path has access.
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book_wrapper,
+        )
+
+        # Find an existing transaction GUID (one read-only open here —
+        # we reset the counter after).
+        with book_wrapper.open(readonly=True) as pb:
+            txn_guid = pb.transactions[0].guid
+
+        open_count = [0]
+        original = piecash.open_book
+
+        def counting_open(*args, **kwargs):
+            open_count[0] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(piecash, "open_book", counting_open)
+
+        @audit_log(
+            classification="write",
+            operation="update",
+            entity_type="transaction",
+        )
+        def update_tool(guid: str, description: str) -> str:
+            return json.dumps(
+                book_wrapper.update_transaction(
+                    guid=guid, description=description
+                )
+            )
+
+        update_tool(guid=txn_guid, description="renamed by book-open test")
+
+        assert open_count[0] == 1, (
+            f"Expected exactly 1 book open for one update_transaction "
+            f"call, got {open_count[0]}. The @audit_log decorator may "
+            f"have regained a pre-capture step that opens the book "
+            f"read-only before the write."
+        )

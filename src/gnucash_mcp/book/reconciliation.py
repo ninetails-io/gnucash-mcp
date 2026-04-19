@@ -16,8 +16,28 @@ from decimal import Decimal
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _split_to_compact_dict,
+    _transaction_to_dict,
     _unreconciled_split_to_compact_line,
 )
+
+
+def _split_state_dict(split) -> dict:
+    """Build the before-state dict for a single split.
+
+    Shape matches what the audit-log formatter expects when entity_type
+    is "split" — account path, current quantity, reconcile state/date,
+    plus transaction context for human-readable log lines.
+    """
+    rec_date = split.reconcile_date
+    return {
+        "guid": split.guid,
+        "account": split.account.fullname,
+        "amount": str(split.quantity),
+        "reconcile_state": split.reconcile_state,
+        "reconcile_date": rec_date.isoformat() if rec_date else None,
+        "transaction_description": split.transaction.description,
+        "transaction_date": split.transaction.post_date.isoformat(),
+    }
 
 
 class ReconciliationMixin:
@@ -57,6 +77,9 @@ class ReconciliationMixin:
             split = self._find_split(book, split_guid)
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
+
+            # Stage pre-update state for the audit log.
+            self._stage_audit_before(_split_state_dict(split))
 
             split.reconcile_state = state
 
@@ -227,6 +250,15 @@ class ReconciliationMixin:
                     f"Difference: {expected_balance - new_balance}"
                 )
 
+            # Stage pre-reconcile state for the audit log. Shape mirrors
+            # the multi-split payload the audit formatter expects for
+            # RECONCILE operations: {"splits": [state_dict, ...]} so it
+            # can display per-split context (description, amount) next
+            # to each short GUID in the reconciled list.
+            self._stage_audit_before(
+                {"splits": [_split_state_dict(s) for s in splits_to_reconcile]}
+            )
+
             reconcile_datetime = datetime.combine(statement_date, datetime.min.time())
             for split in splits_to_reconcile:
                 split.reconcile_state = "y"
@@ -270,6 +302,10 @@ class ReconciliationMixin:
 
             if any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is already voided")
+
+            # Stage pre-void state — the VOID formatter renders "Was:
+            # description (date)" plus the original splits from it.
+            self._stage_audit_before(_transaction_to_dict(transaction))
 
             # GnuCash slot keys for void info
             transaction["void-reason"] = reason
