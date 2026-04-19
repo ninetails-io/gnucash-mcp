@@ -14,6 +14,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from gnucash_mcp.book._base import (
+    _guid_prefix_map,
     _transaction_to_dict,
     _unreconciled_split_to_compact_line,
 )
@@ -147,7 +148,17 @@ class ReconciliationMixin:
             }
 
             if compact:
-                lines = [_unreconciled_split_to_compact_line(s) for s in unreconciled]
+                # Prefix uniqueness spans every split in the book because
+                # set_reconcile_state / reconcile_account resolve split
+                # GUIDs table-wide — not scoped to the current account.
+                all_split_guids = (
+                    s.guid for txn in book.transactions for s in txn.splits
+                )
+                prefixes = _guid_prefix_map(all_split_guids)
+                lines = [
+                    _unreconciled_split_to_compact_line(s, prefixes=prefixes)
+                    for s in unreconciled
+                ]
                 footer = f"{len(unreconciled)} splits\tcleared:{cleared_total}\tuncleared:{uncleared_total}"
                 lines.append(footer)
                 return "\n".join(lines)

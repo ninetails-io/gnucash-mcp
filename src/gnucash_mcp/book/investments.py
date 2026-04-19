@@ -19,6 +19,7 @@ import piecash
 
 from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
+    _guid_prefix_map,
     _lot_to_compact_line,
     _to_date,
 )
@@ -455,7 +456,19 @@ class InvestmentsMixin:
                 })
 
             if compact:
-                lines = [_lot_to_compact_line(d) for d in results]
+                # _resolve_guid("lots", ...) searches the whole lots table,
+                # so the prefix map has to span every lot in the book — not
+                # just lots on this account.
+                from piecash.core.transaction import Lot
+
+                all_lot_guids = [
+                    row[0]
+                    for row in book.session.query(Lot.guid).all()
+                ]
+                prefixes = _guid_prefix_map(all_lot_guids)
+                lines = [
+                    _lot_to_compact_line(d, prefixes=prefixes) for d in results
+                ]
                 return "\n".join(lines)
             else:
                 return results

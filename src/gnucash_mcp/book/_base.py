@@ -12,15 +12,22 @@ belong to — not here.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Iterable
 
 import piecash
+
+# GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
+# cases on input for ergonomics — users pasting from external tools may
+# have uppercase — and normalize to lowercase before hitting SQLite
+# (which is case-sensitive on LIKE by default).
+_HEX_GUID_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 # Debug logger - configured by logging_config.setup_logging()
 debug_logger = logging.getLogger("gnucash_mcp.debug")
@@ -109,6 +116,76 @@ def _verify_delete(session, conditions: dict, label: str) -> None:
             f"Delete verification failed: {label} still exists "
             f"after DELETE ({count} rows remain)"
         )
+
+
+# ── GUID prefix protection ────────────────────────────────────────
+#
+# Every compact-output formatter emits a GUID prefix the LLM can later
+# feed back to a tool that accepts GUIDs (via _resolve_guid). The old
+# blanket `guid[:8]` truncation is unsafe at scale: the birthday problem
+# puts the collision rate at ~1-2% by ~10,000 entries and rises fast
+# from there. A colliding prefix emitted in one response would fail the
+# ambiguity check the next time the LLM references it.
+#
+# _guid_prefix_map computes, for a set of GUIDs, each one's shortest
+# prefix (≥ 8 chars) that is unique within the set. Most GUIDs still
+# get 8; only collisions push out to 9, 10, etc. Theoretically to 32
+# if two GUIDs were identical (impossible for uuid4).
+#
+# Callers should pass the full relevant table (e.g., all transaction
+# GUIDs when formatting transaction lines), not just the filtered
+# batch — prefixes emitted to the LLM must be globally unambiguous
+# against _resolve_guid's table-wide LIKE search, not just unique
+# within the current response.
+
+
+def _lcp_length(a: str, b: str) -> int:
+    """Length of the longest common prefix between two strings."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def _guid_prefix_map(
+    guids: Iterable[str], min_len: int = 8
+) -> dict[str, str]:
+    """Map each GUID to its shortest prefix that is unique within the set.
+
+    The returned prefix is at least `min_len` characters long. When two
+    GUIDs share a prefix of length >= min_len, both get extended until
+    they diverge. Duplicate inputs map to the same prefix (the full GUID).
+
+    Algorithm: one sort + one linear pass. For each GUID, the minimum
+    unique prefix length equals max(LCP-with-left-neighbor,
+    LCP-with-right-neighbor) + 1, clamped to [min_len, len(guid)].
+    O(N log N) in the size of the input.
+
+    Args:
+        guids: Iterable of full GUID strings (typically all GUIDs from
+               one table — e.g., `[t.guid for t in book.transactions]`).
+        min_len: Minimum prefix length. Default 8, matching
+                 `_resolve_guid`'s minimum acceptable input length.
+
+    Returns:
+        Dict mapping each input GUID to a unique prefix of length
+        >= min_len. Input order is not preserved.
+    """
+    unique_guids = sorted(set(guids))
+    result: dict[str, str] = {}
+    for i, g in enumerate(unique_guids):
+        lcp_left = _lcp_length(g, unique_guids[i - 1]) if i > 0 else 0
+        lcp_right = (
+            _lcp_length(g, unique_guids[i + 1])
+            if i < len(unique_guids) - 1
+            else 0
+        )
+        required = max(lcp_left, lcp_right) + 1
+        prefix_len = max(required, min_len)
+        prefix_len = min(prefix_len, len(g))
+        result[g] = g[:prefix_len]
+    return result
 
 
 class GnuCashLockError(Exception):
@@ -216,21 +293,44 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     return "\t".join(parts)
 
 
-def _unreconciled_split_to_compact_line(split_dict: dict) -> str:
+def _short_guid(full_guid: str, prefixes: dict[str, str] | None) -> str:
+    """Resolve a GUID to its emitted prefix.
+
+    When `prefixes` contains the GUID, use that (the caller pre-computed
+    a collision-safe prefix map via `_guid_prefix_map`). Otherwise fall
+    back to the raw 8-char truncation — safe for backward compat with
+    direct callers that don't build a map.
+    """
+    if prefixes is not None and full_guid in prefixes:
+        return prefixes[full_guid]
+    return full_guid[:8]
+
+
+def _unreconciled_split_to_compact_line(
+    split_dict: dict, prefixes: dict[str, str] | None = None,
+) -> str:
     """Convert an unreconciled split dict to a compact tab-separated line.
 
     Format: "short_guid\\tYYYY-MM-DD\\tdescription\\tamount\\tstate"
+
+    Args:
+        split_dict: Split dict with guid/date/description/amount/reconcile_state/memo.
+        prefixes: Optional map from full split GUID to collision-safe prefix
+                  (built via `_guid_prefix_map`). Defaults to raw 8-char
+                  truncation when absent.
     """
-    short_guid = split_dict["guid"][:8]
+    short = _short_guid(split_dict["guid"], prefixes)
     d = split_dict["date"]
     desc = split_dict["description"]
     amount = split_dict["amount"]
     state = split_dict["reconcile_state"]
-    return f"{short_guid}\t{d}\t{desc}\t{amount}\t{state}"
+    return f"{short}\t{d}\t{desc}\t{amount}\t{state}"
 
 
 def _transaction_to_compact_line(
-    transaction: piecash.Transaction, exclude_account: str | None = None,
+    transaction: piecash.Transaction,
+    exclude_account: str | None = None,
+    prefixes: dict[str, str] | None = None,
 ) -> str:
     """Convert a piecash Transaction to a compact tab-separated line.
 
@@ -241,9 +341,12 @@ def _transaction_to_compact_line(
         exclude_account: If set, omit the split for this account (used when
                         listing transactions filtered by account — the AI
                         already knows the filtered account).
+        prefixes: Optional map from full transaction GUID to collision-safe
+                  prefix (built via `_guid_prefix_map`). Defaults to raw
+                  8-char truncation when absent.
     """
     date_str = transaction.post_date.isoformat()
-    short_guid = transaction.guid[:8]
+    short = _short_guid(transaction.guid, prefixes)
     desc = transaction.description
 
     parts = []
@@ -260,27 +363,45 @@ def _transaction_to_compact_line(
             parts.append(f"{account_name} {amount}")
 
     splits_str = ", ".join(parts)
-    line = f"{date_str}\t{short_guid}\t{desc}\t{splits_str}"
+    line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
     if transaction.notes:
         line += f"\t{transaction.notes}"
     return line
 
 
-def _lot_to_compact_line(lot_dict: dict) -> str:
-    """Convert a lot dict to a compact tab-separated line."""
-    short_guid = lot_dict["guid"][:8]
+def _lot_to_compact_line(
+    lot_dict: dict, prefixes: dict[str, str] | None = None,
+) -> str:
+    """Convert a lot dict to a compact tab-separated line.
+
+    Args:
+        lot_dict: Lot dict with guid/title/quantity/cost_basis/is_closed.
+        prefixes: Optional map from full lot GUID to collision-safe prefix
+                  (built via `_guid_prefix_map`). Defaults to raw 8-char
+                  truncation when absent.
+    """
+    short = _short_guid(lot_dict["guid"], prefixes)
     title = lot_dict["title"]
     qty = lot_dict["quantity"]
     basis = lot_dict["cost_basis"]
-    parts = [short_guid, title, f"{qty} shares", f"{basis} basis"]
+    parts = [short, title, f"{qty} shares", f"{basis} basis"]
     if lot_dict.get("is_closed"):
         parts.append("CLOSED")
     return "\t".join(parts)
 
 
-def _sx_to_compact_line(sx_dict: dict) -> str:
-    """Convert a scheduled transaction dict to a compact tab-separated line."""
-    short_guid = sx_dict["guid"][:8]
+def _sx_to_compact_line(
+    sx_dict: dict, prefixes: dict[str, str] | None = None,
+) -> str:
+    """Convert a scheduled transaction dict to a compact tab-separated line.
+
+    Args:
+        sx_dict: Scheduled transaction dict.
+        prefixes: Optional map from full scheduled-transaction GUID to
+                  collision-safe prefix (built via `_guid_prefix_map`).
+                  Defaults to raw 8-char truncation when absent.
+    """
+    short = _short_guid(sx_dict["guid"], prefixes)
     name = sx_dict["name"]
     freq = sx_dict["frequency"]
     if not sx_dict.get("enabled"):
@@ -289,17 +410,27 @@ def _sx_to_compact_line(sx_dict: dict) -> str:
         status = f"next:{sx_dict['next_occurrence']}"
     else:
         status = "no upcoming"
-    return f"{short_guid}\t{name}\t{freq}\t{status}"
+    return f"{short}\t{name}\t{freq}\t{status}"
 
 
-def _upcoming_to_compact_line(entry: dict) -> str:
-    """Convert an upcoming transaction dict to a compact tab-separated line."""
-    short_guid = entry["guid"][:8]
+def _upcoming_to_compact_line(
+    entry: dict, prefixes: dict[str, str] | None = None,
+) -> str:
+    """Convert an upcoming transaction dict to a compact tab-separated line.
+
+    Args:
+        entry: Upcoming-transaction dict (guid refers to the scheduled
+               transaction, not the yet-to-be-instantiated real one).
+        prefixes: Optional map from full scheduled-transaction GUID to
+                  collision-safe prefix (built via `_guid_prefix_map`).
+                  Defaults to raw 8-char truncation when absent.
+    """
+    short = _short_guid(entry["guid"], prefixes)
     name = entry["name"]
     occ_date = entry["occurrence_date"]
     days = entry["days_until"]
     amount = entry["amount"]
-    return f"{short_guid}\t{name}\t{occ_date}\t{days} days\t{amount}"
+    return f"{short}\t{name}\t{occ_date}\t{days} days\t{amount}"
 
 
 # ── Base class ─────────────────────────────────────────────────────
@@ -336,25 +467,50 @@ class BaseGnuCashBook:
     def _resolve_guid(self, table: str, partial: str) -> str:
         """Resolve a partial GUID prefix to a full 32-character GUID.
 
+        Validates the input (length 8..32, hex characters only) before
+        touching the database — malformed inputs raise immediately rather
+        than round-tripping through SQLite to discover they don't match
+        anything. Uppercase hex is accepted and normalized to lowercase.
+
         Uses raw SQLite in read-only mode — no piecash session needed.
 
         Args:
             table: Database table name (e.g., "transactions", "splits").
-            partial: Full or partial GUID prefix (minimum 8 characters).
+            partial: Full or partial GUID. 8..32 hex characters
+                     (case-insensitive on input, stored as lowercase).
 
         Returns:
-            Full 32-character GUID.
+            Full 32-character lowercase-hex GUID.
 
         Raises:
-            ValueError: If table invalid, prefix too short, no match,
-                       or multiple matches.
+            ValueError: If table invalid, prefix too short, too long,
+                        contains non-hex characters, no match, or
+                        multiple matches.
         """
         if table not in self._GUID_TABLES:
             raise ValueError(f"Invalid table: {table}")
-        if len(partial) < 8:
-            raise ValueError(f"GUID prefix too short (minimum 8 chars): {partial}")
 
-        if len(partial) == 32:
+        n = len(partial)
+        if n < 8:
+            raise ValueError(
+                f"GUID prefix too short (minimum 8 chars): {partial!r}"
+            )
+        if n > 32:
+            raise ValueError(
+                f"GUID too long (maximum 32 chars): {partial!r}"
+            )
+        if not _HEX_GUID_RE.fullmatch(partial):
+            raise ValueError(
+                f"GUID contains non-hex characters: {partial!r}. "
+                f"GUIDs are hex [0-9a-f]."
+            )
+
+        # Normalize to lowercase — GnuCash stores GUIDs as lowercase hex
+        # and SQLite LIKE is case-sensitive by default.
+        partial = partial.lower()
+
+        # Fast path: already a full GUID
+        if n == 32:
             return partial
 
         conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)

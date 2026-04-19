@@ -383,7 +383,7 @@ class TestGetTransaction:
     def test_get_nonexistent_transaction(self, test_book: Path):
         """Should return None for non-existent GUID."""
         gc_book = GnuCashBook(str(test_book))
-        transaction = gc_book.get_transaction("nonexistent_guid_12345")
+        transaction = gc_book.get_transaction("deadbeef00000000")
 
         assert transaction is None
 
@@ -1866,7 +1866,7 @@ class TestDeleteTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="Transaction not found"):
-            gc_book.delete_transaction("nonexistent_guid_12345")
+            gc_book.delete_transaction("deadbeef00000000")
 
     def test_delete_reconciled_transaction_rejected(self, test_book: Path):
         """Should reject deletion of transaction with reconciled splits."""
@@ -1979,7 +1979,7 @@ class TestUpdateTransaction:
 
         with pytest.raises(ValueError, match="Transaction not found"):
             gc_book.update_transaction(
-                guid="nonexistent_guid",
+                guid="deadbeef00000000",
                 description="Test",
             )
 
@@ -2647,7 +2647,7 @@ class TestSetReconcileState:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="Split not found"):
-            gc_book.set_reconcile_state("nonexistent_guid", "c")
+            gc_book.set_reconcile_state("deadbeef00000000", "c")
 
 
 class TestGetUnreconciledSplits:
@@ -2789,7 +2789,7 @@ class TestVoidTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="Transaction not found"):
-            gc_book.void_transaction("nonexistent_guid", reason="Test")
+            gc_book.void_transaction("deadbeef00000000", reason="Test")
 
     def test_void_transaction_already_voided(self, test_book: Path):
         """Should raise ValueError if already voided."""
@@ -2847,7 +2847,7 @@ class TestUnvoidTransaction:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="Transaction not found"):
-            gc_book.unvoid_transaction("nonexistent_guid")
+            gc_book.unvoid_transaction("deadbeef00000000")
 
 
 class TestSpendingByCategory:

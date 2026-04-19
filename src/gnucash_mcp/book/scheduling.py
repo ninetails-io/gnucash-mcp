@@ -20,6 +20,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _guid_prefix_map,
     _sx_to_compact_line,
     _upcoming_to_compact_line,
     _verify_composite_write,
@@ -378,7 +379,11 @@ class SchedulingMixin:
                 results.append(d)
 
             if compact:
-                lines = [_sx_to_compact_line(d) for d in results]
+                # Prefix uniqueness across all scheduled transactions
+                prefixes = _guid_prefix_map(sx.guid for sx in all_sx)
+                lines = [
+                    _sx_to_compact_line(d, prefixes=prefixes) for d in results
+                ]
                 return "\n".join(lines)
             else:
                 return results
@@ -458,7 +463,12 @@ class SchedulingMixin:
             upcoming.sort(key=lambda x: x["occurrence_date"])
 
             if compact:
-                lines = [_upcoming_to_compact_line(e) for e in upcoming]
+                # Prefix uniqueness across all scheduled transactions
+                prefixes = _guid_prefix_map(sx.guid for sx in all_sx)
+                lines = [
+                    _upcoming_to_compact_line(e, prefixes=prefixes)
+                    for e in upcoming
+                ]
                 return "\n".join(lines)
             else:
                 return upcoming
