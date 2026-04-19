@@ -116,9 +116,9 @@ class TestSetBudgetAmount:
             amount="500.00",
         )
 
+        # Response is thin — only the computed periods_set and status.
+        # Inputs (budget, account, amount) come from tool params.
         assert result["status"] == "updated"
-        assert result["account"] == "Expenses:Groceries"
-        assert result["amount"] == "500.00"
         assert len(result["periods_set"]) == 12
 
         # Verify via get_budget

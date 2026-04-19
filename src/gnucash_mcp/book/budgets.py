@@ -376,10 +376,10 @@ class BudgetsMixin:
 
             book.save()
 
+            # periods_set is computed (e.g., "q1" → [0, 1, 2]) so we keep
+            # it. The echoed inputs (budget, account, amount) come from
+            # tool params in the audit log.
             return {
-                "budget": budget_name,
-                "account": account,
-                "amount": amount,
                 "periods_set": periods,
                 "status": "updated",
             }

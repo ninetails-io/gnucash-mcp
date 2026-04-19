@@ -273,9 +273,12 @@ class TestCreateTransactionTool:
         )
 
         data = json.loads(result)
+        # dry_run responses no longer echo the proposal back — the caller
+        # knows what they submitted; response carries only new info
+        # (warnings, duplicates, auto_filled_from).
         assert data["dry_run"] is True
-        assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
-        assert "guid" not in data
+        assert "proposed_transaction" not in data
+        assert "guid" not in data  # no transaction was written
 
     def test_create_transaction_auto_fill(self, setup_book_env):
         """Should auto-fill splits from matching transaction."""

@@ -715,7 +715,12 @@ class TestDuplicateDetection:
         assert "duplicates" not in result
 
     def test_substring_description_match(self, test_book: Path):
-        """Substring matching should work in both directions."""
+        """Substring matching should work in both directions.
+
+        Match signals are now emitted as a compact 3-char string:
+        ``"DAD"`` means description + amount + date matched;
+        ``"D-D"`` means description + date matched, amount did not.
+        """
         gc_book = GnuCashBook(str(test_book))
         # "Groceries" is substring of "Weekly Groceries"
         result = gc_book.create_transaction(
@@ -729,7 +734,8 @@ class TestDuplicateDetection:
         assert result["status"] == "rejected"
         high = [d for d in result["duplicates"] if d["confidence"] == "HIGH"]
         assert len(high) > 0
-        assert high[0]["match_signals"]["description"] is True
+        # Position 0 of signals string = description match
+        assert high[0]["signals"][0] == "D"
 
     def test_amount_tolerance(self, test_book: Path):
         """Amount match should use ±$1.00 tolerance."""
@@ -744,7 +750,8 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 20),
         )
         assert result["status"] == "rejected"
-        assert result["duplicates"][0]["match_signals"]["amount"] is True
+        # Position 1 of signals string = amount match
+        assert result["duplicates"][0]["signals"][1] == "A"
 
     def test_date_window(self, test_book: Path):
         """Date match should use ±2 day window."""
@@ -759,7 +766,8 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 22),
         )
         assert result["status"] == "rejected"
-        assert result["duplicates"][0]["match_signals"]["date"] is True
+        # Position 2 of signals string = date match
+        assert result["duplicates"][0]["signals"][2] == "D"
 
     def test_no_duplicates_distant_date(self, test_book: Path):
         """Should find no duplicates when date is far from existing."""
@@ -780,7 +788,12 @@ class TestDryRun:
     """Tests for dry run mode on create_transaction."""
 
     def test_dry_run_returns_proposal(self, test_book: Path):
-        """Should return proposed transaction without writing."""
+        """Should return dry-run marker plus computed info (warnings, duplicates).
+
+        The old `proposed_transaction` echo was dropped — the caller already
+        knows what they proposed. Dry-run response only carries net-new info:
+        validation warnings, duplicate candidates, and auto-fill provenance.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Dry Run Test",
@@ -792,10 +805,10 @@ class TestDryRun:
             dry_run=True,
         )
         assert result["dry_run"] is True
-        assert result["proposed_transaction"]["description"] == "Dry Run Test"
-        assert result["proposed_transaction"]["date"] == "2024-03-01"
-        assert result["proposed_transaction"]["currency"] == "USD"
-        assert len(result["proposed_transaction"]["splits"]) == 2
+        assert "warnings" in result
+        assert "duplicates" in result
+        # Inputs (description, date, splits) are NOT echoed back
+        assert "proposed_transaction" not in result
 
     def test_dry_run_no_write(self, test_book: Path):
         """Dry run should not create a transaction in the book."""
@@ -925,7 +938,13 @@ class TestAutoFillTransaction:
             )
 
     def test_auto_fill_with_dry_run(self, test_book: Path):
-        """Should auto-fill and return proposal in dry run mode."""
+        """Should auto-fill and report the source in dry run mode.
+
+        After the token-efficiency trim, dry_run responses no longer echo
+        back the proposed splits. We still get ``auto_filled_from`` which
+        identifies the source transaction — enough to prove auto-fill ran
+        and picked the right predecessor.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Weekly Groceries",
@@ -934,10 +953,9 @@ class TestAutoFillTransaction:
         )
         assert result["dry_run"] is True
         assert "auto_filled_from" in result
-        # Proposed splits should come from the auto-fill
-        proposed_splits = result["proposed_transaction"]["splits"]
-        accounts = {s["account"] for s in proposed_splits}
-        assert "Expenses:Groceries" in accounts
+        # Source has the matching description, confirming we pulled from
+        # the right predecessor transaction
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
 
     def test_auto_fill_preserves_memo(self, test_book: Path):
         """Auto-fill should preserve memo from source transaction."""

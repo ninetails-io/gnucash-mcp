@@ -231,10 +231,10 @@ class ReconciliationMixin:
 
             book.save()
 
+            # Return only the computed info — the audit log reads inputs
+            # (account_name, statement_date, statement_balance) from tool
+            # params, so we don't echo them here.
             return {
-                "account": account_name,
-                "statement_date": statement_date.isoformat(),
-                "statement_balance": statement_balance,
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
                 "status": "reconciled",

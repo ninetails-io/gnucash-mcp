@@ -59,14 +59,15 @@ class TestSetAccountSlot:
     """Tests for set_account_slot method."""
 
     def test_set_new_slot(self, test_book: Path):
-        """Should create a new slot and return status 'created'."""
+        """Should create a new slot and return status 'created'.
+
+        Response is intentionally thin — inputs are captured by the audit
+        log from tool params, so the response only carries the new info.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.set_account_slot("Assets:Checking", "apr", "24.99")
 
-        assert result["account"] == "Assets:Checking"
-        assert result["key"] == "apr"
-        assert result["value"] == "24.99"
-        assert result["status"] == "created"
+        assert result == {"status": "created"}
 
     def test_set_existing_slot(self, test_book: Path):
         """Should update an existing slot and return status 'updated'."""
@@ -75,8 +76,7 @@ class TestSetAccountSlot:
         gc_book.set_account_slot("Assets:Checking", "apr", "24.99")
         result = gc_book.set_account_slot("Assets:Checking", "apr", "19.99")
 
-        assert result["status"] == "updated"
-        assert result["value"] == "19.99"
+        assert result == {"status": "updated"}
 
     def test_set_slot_persists(self, test_book: Path):
         """Should persist the slot value across separate reads."""
@@ -114,15 +114,16 @@ class TestDeleteAccountSlot:
     """Tests for delete_account_slot method."""
 
     def test_delete_existing_slot(self, test_book: Path):
-        """Should delete a slot and return status 'deleted'."""
+        """Should delete a slot and return status 'deleted'.
+
+        Response is thin — inputs come from tool params via the audit log.
+        """
         gc_book = GnuCashBook(str(test_book))
 
         gc_book.set_account_slot("Assets:Checking", "apr", "24.99")
         result = gc_book.delete_account_slot("Assets:Checking", "apr")
 
-        assert result["account"] == "Assets:Checking"
-        assert result["key"] == "apr"
-        assert result["status"] == "deleted"
+        assert result == {"status": "deleted"}
 
     def test_delete_slot_is_gone(self, test_book: Path):
         """Should no longer return the slot after deletion."""
