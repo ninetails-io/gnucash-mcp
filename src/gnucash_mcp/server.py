@@ -1,36 +1,20 @@
 """MCP server definition for GnuCash."""
 
+import importlib
 import json
 import logging
 import os
 import sys
-import traceback
 from datetime import date
-from functools import wraps
-from pathlib import Path
-from typing import Annotated, Callable
+from typing import Annotated
 
 from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
-from gnucash_mcp.book import GnuCashBook, GnuCashLockError
-from gnucash_mcp.logging_config import audit_log, debug_log, get_audit_format, get_log_dir, setup_logging
-
-
-def _json(obj) -> str:
-    """Serialize to minified JSON, stripping noise values."""
-    return json.dumps(_strip_noise(obj), separators=(",", ":"))
-
-
-def _strip_noise(obj):
-    """Recursively remove keys with None or empty-string values from dicts."""
-    if isinstance(obj, dict):
-        return {k: _strip_noise(v) for k, v in obj.items()
-                if v is not None and v != ""}
-    if isinstance(obj, list):
-        return [_strip_noise(item) for item in obj]
-    return obj
+from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
+from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
+from gnucash_mcp.tools._helpers import _json, safe_tool
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -183,10 +167,16 @@ TOOL_MODULES: dict[str, list[str]] = {
 
 
 def _validate_tool_modules() -> None:
-    """Verify every registered tool belongs to exactly one module.
+    """Verify every registered tool belongs to a module in TOOL_MODULES.
 
-    Developer guard — catches the case where a tool is added but not
-    placed in TOOL_MODULES, or a module lists a tool that doesn't exist.
+    Developer guard: catches the case where a tool is added in server.py
+    or a tools/<module>.py file but not placed in TOOL_MODULES, and the
+    case where TOOL_MODULES lists a tool that isn't defined anywhere.
+
+    With lazy loading, extracted modules register their tools only when
+    enabled — so 'phantom' (unregistered) tools from an extracted module
+    are expected unless that module has been loaded. The 'unmapped'
+    check still catches real typos.
     """
     all_mapped: set[str] = set()
     for tools in TOOL_MODULES.values():
@@ -199,7 +189,15 @@ def _validate_tool_modules() -> None:
             f"Tools registered but not in TOOL_MODULES: {sorted(unmapped)}. "
             f"Add them to the appropriate module."
         )
-    phantom = all_mapped - registered
+
+    # Phantom check is scoped to modules that ship their tools in server.py
+    # (the non-extracted ones). Extracted modules' tools are loaded lazily.
+    extracted = extracted_modules()
+    expected_now = set()
+    for mod_name, tools in TOOL_MODULES.items():
+        if mod_name not in extracted:
+            expected_now.update(tools)
+    phantom = expected_now - registered
     if phantom:
         raise RuntimeError(
             f"Tools in TOOL_MODULES but not registered: {sorted(phantom)}. "
@@ -207,8 +205,22 @@ def _validate_tool_modules() -> None:
         )
 
 
+def _lazy_load_tool_module(module_name: str) -> None:
+    """Import and register an extracted tool module if not already loaded."""
+    expected_tools = TOOL_MODULES.get(module_name, [])
+    # Idempotent: skip if any tool from this module is already registered
+    if any(t in mcp._tool_manager._tools for t in expected_tools):
+        return
+    tool_mod = importlib.import_module(f"gnucash_mcp.tools.{module_name}")
+    tool_mod.register(mcp, get_book)
+
+
 def _apply_module_filter(modules_str: str | None) -> list[str]:
-    """Remove tools not in the selected modules from the FastMCP registry.
+    """Enable the requested modules and remove tools not in that set.
+
+    For extracted modules (admin, ...) this also lazy-imports the matching
+    gnucash_mcp/tools/<name>.py and calls its register() function — so
+    disabled extracted modules never parse their tool definitions.
 
     Args:
         modules_str: Comma-separated module names, "all", or None (core only).
@@ -221,50 +233,59 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     else:
         enabled_modules = {m.strip() for m in modules_str.split(",")}
         if "all" in enabled_modules:
-            return sorted(TOOL_MODULES.keys())
-        # Validate module names
-        unknown = enabled_modules - set(TOOL_MODULES.keys())
-        if unknown:
-            print(
-                f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
-                f"Available: {', '.join(sorted(TOOL_MODULES.keys()))}, all",
-                file=sys.stderr,
-            )
-        # core is always included
-        enabled_modules.add("core")
+            enabled_modules = set(TOOL_MODULES.keys())
+        else:
+            unknown = enabled_modules - set(TOOL_MODULES.keys())
+            if unknown:
+                print(
+                    f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
+                    f"Available: {', '.join(sorted(TOOL_MODULES.keys()))}, all",
+                    file=sys.stderr,
+                )
+            enabled_modules.add("core")
+
+    # Keep only known module names
+    enabled_modules &= set(TOOL_MODULES.keys())
+
+    # Lazy-load any enabled extracted modules
+    extracted = extracted_modules()
+    for mod_name in sorted(enabled_modules):
+        if mod_name in extracted:
+            _lazy_load_tool_module(mod_name)
 
     # Build the set of tool names to keep
     keep: set[str] = set()
-    valid_modules: list[str] = []
     for mod_name in sorted(enabled_modules):
-        if mod_name in TOOL_MODULES:
-            keep.update(TOOL_MODULES[mod_name])
-            valid_modules.append(mod_name)
+        keep.update(TOOL_MODULES[mod_name])
 
-    # Remove tools not in the keep set
-    all_registered = list(mcp._tool_manager._tools.keys())
-    for tool_name in all_registered:
+    # Remove tools not in the keep set (covers server.py-registered tools
+    # that belong to non-enabled modules, and any stale entries)
+    for tool_name in list(mcp._tool_manager._tools.keys()):
         if tool_name not in keep:
             mcp.remove_tool(tool_name)
 
-    return valid_modules
+    return sorted(enabled_modules)
 
 
 # Runtime server state — populated by main(), read by get_server_config tool
 _server_state: dict = {}
 
 # Global book instance - initialized on first use
-_book: GnuCashBook | None = None
+_book = None
+
+# Class used to construct the book — set by main() to match enabled modules.
+# Defaults to the "all modules" class so tests and direct imports still work.
+_book_class: type = GnuCashBook
 
 
-def get_book() -> GnuCashBook:
+def get_book():
     """Get or create the GnuCashBook instance."""
     global _book
     if _book is None:
         path = os.environ.get("GNUCASH_BOOK_PATH")
         if not path:
             raise ValueError("GNUCASH_BOOK_PATH environment variable not set")
-        _book = GnuCashBook(path)
+        _book = _book_class(path)
     return _book
 
 
@@ -289,51 +310,7 @@ if _book_path and (_audit_mode or _debug_mode):
         debug_log(f"Server module loaded. Book path: {_book_path}")
 
 
-def safe_tool(func: Callable) -> Callable:
-    """Decorator that wraps tool functions with comprehensive error handling.
-
-    Catches all exceptions and returns them as JSON error responses instead of
-    crashing the MCP server.
-    """
-
-    @wraps(func)
-    def wrapper(*args, **kwargs) -> str:
-        try:
-            return func(*args, **kwargs)
-        except GnuCashLockError as e:
-            logger.warning(f"Lock error in {func.__name__}: {e}")
-            return _json(
-                {
-                    "error": str(e),
-                    "error_type": "lock_error",
-                    "suggestion": "Close GnuCash application and try again.",
-                }
-            )
-        except FileNotFoundError as e:
-            logger.error(f"File not found in {func.__name__}: {e}")
-            return _json(
-                {
-                    "error": str(e),
-                    "error_type": "file_not_found",
-                    "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
-                }
-            )
-        except ValueError as e:
-            logger.warning(f"Validation error in {func.__name__}: {e}")
-            return _json({"error": str(e), "error_type": "validation_error"})
-        except Exception as e:
-            # Catch-all for unexpected errors
-            logger.error(
-                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
-            )
-            return _json(
-                {
-                    "error": f"Unexpected error: {type(e).__name__}: {e}",
-                    "error_type": "unexpected_error",
-                }
-            )
-
-    return wrapper
+# safe_tool, _json, _strip_noise moved to gnucash_mcp/tools/_helpers.py
 
 
 # ============== Tools ==============
@@ -1629,69 +1606,9 @@ def close_lot(
     return _json(result)
 
 
-# ============== Account Slot Tools ==============
-
-
-@mcp.tool()
-@safe_tool
-@audit_log(classification="read")
-def get_account_slots(
-    account: str,
-    key: str | None = None,
-) -> str:
-    """Read slots (custom metadata) from an account.
-
-    Slots are key-value pairs stored on accounts for metadata like APR,
-    credit limit, reward rates, or any custom data.
-
-    Args:
-        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
-        key: Specific slot key to retrieve. If omitted, returns all slots.
-    """
-    book = get_book()
-    result = book.get_account_slots(account_name=account, key=key)
-    return _json(result)
-
-
-@mcp.tool()
-@safe_tool
-@audit_log(classification="write", operation="set_slot", entity_type="account_slot")
-def set_account_slot(
-    account: str,
-    key: str,
-    value: str,
-) -> str:
-    """Set a custom metadata slot on an account.
-
-    Stores a key-value pair on the account. Values are stored as strings.
-    Use for APR, credit limits, reward rates, or any per-account metadata.
-
-    Args:
-        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
-        key: Slot key (e.g., "apr", "credit_limit").
-        value: Slot value (always stored as string).
-    """
-    book = get_book()
-    result = book.set_account_slot(account_name=account, key=key, value=value)
-    return _json(result)
-
-
-@mcp.tool()
-@safe_tool
-@audit_log(classification="write", operation="delete_slot", entity_type="account_slot")
-def delete_account_slot(
-    account: str,
-    key: str,
-) -> str:
-    """Remove a custom metadata slot from an account.
-
-    Args:
-        account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
-        key: Slot key to remove.
-    """
-    book = get_book()
-    result = book.delete_account_slot(account_name=account, key=key)
-    return _json(result)
+# Admin tools (get_account_slots, set_account_slot, delete_account_slot,
+# get_audit_log) moved to gnucash_mcp/tools/admin.py — registered on
+# demand via register() when the 'admin' module is enabled.
 
 
 # ============== Business Tools ==============
@@ -2253,99 +2170,7 @@ def accounts_resource() -> str:
     return _json(accounts)
 
 
-# ============== Audit Log Tool ==============
-
-
-@mcp.tool()
-@safe_tool
-@audit_log(classification="read")
-def get_audit_log(
-    log_date: str | None = None,
-    tool_filter: str | None = None,
-    classification: str | None = None,
-    limit: int = 50,
-) -> str:
-    """Read audit log entries.
-
-    Args:
-        log_date: Date to read (YYYY-MM-DD). Defaults to today.
-        tool_filter: Filter by tool name.
-        classification: Filter by "read" or "write".
-        limit: Maximum entries to return (default 50).
-    """
-    from datetime import datetime, timezone
-
-    log_dir = get_log_dir()
-    if not log_dir:
-        return _json({"error": "Logging not initialized (no book path configured)"})
-
-    audit_dir = log_dir / "audit"
-    target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
-
-    # Try the configured format first, then fall back to the other
-    fmt = get_audit_format()
-    primary_ext = "jsonl" if fmt == "json" else "txt"
-    fallback_ext = "txt" if fmt == "json" else "jsonl"
-
-    log_file = audit_dir / f"{target_date}.{primary_ext}"
-    used_fallback = False
-    if not log_file.exists():
-        log_file = audit_dir / f"{target_date}.{fallback_ext}"
-        used_fallback = True
-
-    if not log_file.exists():
-        if fmt == "json":
-            return _json({"entries": [], "message": f"No audit log for {target_date}"})
-        else:
-            return f"No audit log for {target_date}"
-
-    # Reading a .txt file
-    if log_file.suffix == ".txt":
-        content = log_file.read_text()
-        lines = content.strip().split("\n")
-        if len(lines) > limit:
-            lines = lines[-limit:]
-        text_content = "\n".join(lines)
-
-        # If user configured json but we fell back to txt, wrap in JSON with note
-        if fmt == "json":
-            return _json({
-                "content": text_content,
-                "format": "text",
-                "note": (
-                    "No .jsonl file found for this date. Returning .txt fallback. "
-                    "Ensure GNUCASH_MCP_AUDIT_FORMAT=json is set when starting the server."
-                ),
-            })
-        else:
-            # User wants text, return raw text
-            return text_content
-
-    # Reading a .jsonl file
-    entries = []
-    for line in log_file.read_text().strip().split("\n"):
-        if not line:
-            continue
-        entry = json.loads(line)
-        if tool_filter and entry.get("tool") != tool_filter:
-            continue
-        if classification and entry.get("classification") != classification:
-            continue
-        entries.append(entry)
-
-    # If user configured text but we fell back to jsonl, format as text
-    if fmt == "text":
-        # Convert JSON entries to simple text representation
-        lines = []
-        for entry in entries[-limit:]:
-            ts = entry.get("timestamp", "")[:19]  # Trim to datetime
-            tool = entry.get("tool", "unknown")
-            result = entry.get("result", "")
-            lines.append(f"{ts}  {tool}  {result}")
-        return "\n".join(lines) if lines else "No entries"
-
-    # User wants JSON, return JSON
-    return _json({"entries": entries[-limit:], "total_count": len(entries)})
+# get_audit_log moved to gnucash_mcp/tools/admin.py.
 
 
 # ============== Debug Tool (conditionally registered) ==============
@@ -2447,9 +2272,16 @@ Logs are stored alongside the book file:
                 debug_log(f"Server starting via CLI. Book: {book_path}")
                 debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}, format={audit_format}")
 
-    # Validate and apply module filter
+    # Validate and apply module filter (also lazy-loads extracted modules)
     _validate_tool_modules()
     loaded_modules = _apply_module_filter(modules_value)
+
+    # Build a GnuCashBook class that includes only the mixins for enabled
+    # modules. If get_book() has already been called (tests / module
+    # import), leave the existing instance alone; otherwise subsequent
+    # get_book() calls will use this class.
+    global _book_class
+    _book_class = build_book_class(set(loaded_modules))
 
     # Check book health (non-fatal)
     currency_ok = None

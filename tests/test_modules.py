@@ -2,6 +2,7 @@
 
 import pytest
 
+from gnucash_mcp.book import extracted_modules
 from gnucash_mcp.server import (
     TOOL_MODULES,
     _apply_module_filter,
@@ -15,13 +16,29 @@ from gnucash_mcp.server import (
 class TestToolModulesMapping:
     """Tests for the TOOL_MODULES constant."""
 
-    def test_all_registered_tools_are_mapped(self):
-        """Every registered tool must appear in TOOL_MODULES."""
+    def test_registered_tools_are_a_subset_of_mapped(self):
+        """Every tool registered at import must appear in TOOL_MODULES.
+
+        Extracted modules (e.g. 'admin') are lazy-loaded — their tools
+        aren't registered at import time. The reverse direction
+        (everything in TOOL_MODULES can be loaded) is covered by
+        test_extracted_modules_can_be_loaded.
+        """
         all_mapped = set()
         for tools in TOOL_MODULES.values():
             all_mapped.update(tools)
         registered = set(mcp._tool_manager._tools.keys())
-        assert all_mapped == registered
+        assert registered.issubset(all_mapped)
+
+    def test_non_extracted_modules_are_fully_registered_at_import(self):
+        """Every tool in a non-extracted module must be registered at import."""
+        expected = set()
+        extracted = extracted_modules()
+        for mod_name, tools in TOOL_MODULES.items():
+            if mod_name not in extracted:
+                expected.update(tools)
+        registered = set(mcp._tool_manager._tools.keys())
+        assert expected.issubset(registered)
 
     def test_no_duplicate_tools_across_modules(self):
         """No tool should appear in more than one module."""
@@ -166,6 +183,53 @@ class TestApplyModuleFilter:
         assert "nonexistent" not in result
         assert "core" in result
         assert "reporting" in result
+
+
+class TestExtractedModuleLazyLoading:
+    """Verify that extracted module tools are lazy-loaded on demand.
+
+    Extracted modules (see `extracted_modules()` — 'admin' initially)
+    are NOT registered at server.py import time. Their tools only
+    appear in the FastMCP registry after `_apply_module_filter` enables
+    them or `_lazy_load_tool_module` is called directly.
+    """
+
+    @pytest.fixture(autouse=True)
+    def save_and_restore_tools(self):
+        original = dict(mcp._tool_manager._tools)
+        yield
+        mcp._tool_manager._tools.clear()
+        mcp._tool_manager._tools.update(original)
+
+    def test_extracted_modules_are_not_registered_at_import(self):
+        """Tools from extracted modules must not be present at import time."""
+        for mod_name in extracted_modules():
+            for tool_name in TOOL_MODULES[mod_name]:
+                assert tool_name not in mcp._tool_manager._tools, (
+                    f"{tool_name} from extracted module '{mod_name}' "
+                    f"was registered at import — defeats lazy loading."
+                )
+
+    def test_enabling_extracted_module_registers_its_tools(self):
+        """Enabling 'admin' via _apply_module_filter registers all admin tools."""
+        _apply_module_filter("admin")
+        for tool_name in TOOL_MODULES["admin"]:
+            assert tool_name in mcp._tool_manager._tools
+
+    def test_all_loads_every_extracted_module(self):
+        """--modules=all lazy-loads all extracted modules."""
+        _apply_module_filter("all")
+        all_expected = set()
+        for tools in TOOL_MODULES.values():
+            all_expected.update(tools)
+        assert set(mcp._tool_manager._tools.keys()) == all_expected
+
+    def test_lazy_load_is_idempotent(self):
+        """Enabling an extracted module twice does not duplicate tools."""
+        _apply_module_filter("admin")
+        count_after_first = len(mcp._tool_manager._tools)
+        _apply_module_filter("admin")
+        assert len(mcp._tool_manager._tools) == count_after_first
 
 
 class TestGetServerConfig:
