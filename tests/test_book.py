@@ -715,7 +715,12 @@ class TestDuplicateDetection:
         assert "duplicates" not in result
 
     def test_substring_description_match(self, test_book: Path):
-        """Substring matching should work in both directions."""
+        """Substring matching should work in both directions.
+
+        Match signals are now emitted as a compact 3-char string:
+        ``"DAD"`` means description + amount + date matched;
+        ``"D-D"`` means description + date matched, amount did not.
+        """
         gc_book = GnuCashBook(str(test_book))
         # "Groceries" is substring of "Weekly Groceries"
         result = gc_book.create_transaction(
@@ -729,7 +734,8 @@ class TestDuplicateDetection:
         assert result["status"] == "rejected"
         high = [d for d in result["duplicates"] if d["confidence"] == "HIGH"]
         assert len(high) > 0
-        assert high[0]["match_signals"]["description"] is True
+        # Position 0 of signals string = description match
+        assert high[0]["signals"][0] == "D"
 
     def test_amount_tolerance(self, test_book: Path):
         """Amount match should use ±$1.00 tolerance."""
@@ -744,7 +750,8 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 20),
         )
         assert result["status"] == "rejected"
-        assert result["duplicates"][0]["match_signals"]["amount"] is True
+        # Position 1 of signals string = amount match
+        assert result["duplicates"][0]["signals"][1] == "A"
 
     def test_date_window(self, test_book: Path):
         """Date match should use ±2 day window."""
@@ -759,7 +766,8 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 22),
         )
         assert result["status"] == "rejected"
-        assert result["duplicates"][0]["match_signals"]["date"] is True
+        # Position 2 of signals string = date match
+        assert result["duplicates"][0]["signals"][2] == "D"
 
     def test_no_duplicates_distant_date(self, test_book: Path):
         """Should find no duplicates when date is far from existing."""
@@ -780,7 +788,12 @@ class TestDryRun:
     """Tests for dry run mode on create_transaction."""
 
     def test_dry_run_returns_proposal(self, test_book: Path):
-        """Should return proposed transaction without writing."""
+        """Should return dry-run marker plus computed info (warnings, duplicates).
+
+        The old `proposed_transaction` echo was dropped — the caller already
+        knows what they proposed. Dry-run response only carries net-new info:
+        validation warnings, duplicate candidates, and auto-fill provenance.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Dry Run Test",
@@ -792,10 +805,10 @@ class TestDryRun:
             dry_run=True,
         )
         assert result["dry_run"] is True
-        assert result["proposed_transaction"]["description"] == "Dry Run Test"
-        assert result["proposed_transaction"]["date"] == "2024-03-01"
-        assert result["proposed_transaction"]["currency"] == "USD"
-        assert len(result["proposed_transaction"]["splits"]) == 2
+        assert "warnings" in result
+        assert "duplicates" in result
+        # Inputs (description, date, splits) are NOT echoed back
+        assert "proposed_transaction" not in result
 
     def test_dry_run_no_write(self, test_book: Path):
         """Dry run should not create a transaction in the book."""
@@ -925,7 +938,13 @@ class TestAutoFillTransaction:
             )
 
     def test_auto_fill_with_dry_run(self, test_book: Path):
-        """Should auto-fill and return proposal in dry run mode."""
+        """Should auto-fill and report the source in dry run mode.
+
+        After the token-efficiency trim, dry_run responses no longer echo
+        back the proposed splits. We still get ``auto_filled_from`` which
+        identifies the source transaction — enough to prove auto-fill ran
+        and picked the right predecessor.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Weekly Groceries",
@@ -934,10 +953,9 @@ class TestAutoFillTransaction:
         )
         assert result["dry_run"] is True
         assert "auto_filled_from" in result
-        # Proposed splits should come from the auto-fill
-        proposed_splits = result["proposed_transaction"]["splits"]
-        accounts = {s["account"] for s in proposed_splits}
-        assert "Expenses:Groceries" in accounts
+        # Source has the matching description, confirming we pulled from
+        # the right predecessor transaction
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
 
     def test_auto_fill_preserves_memo(self, test_book: Path):
         """Auto-fill should preserve memo from source transaction."""
@@ -2027,10 +2045,10 @@ class TestUpdateTransaction:
             notes="P2W1 groceries",
         )
 
+        # Response is thin now (guid/date/description/status). Notes
+        # persistence is verified through get_transaction below.
         assert result["status"] == "updated"
-        assert result["notes"] == "P2W1 groceries"
 
-        # Verify persistence
         updated = gc_book.get_transaction(guid)
         assert updated["notes"] == "P2W1 groceries"
 
@@ -2144,8 +2162,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Response is thin — no splits echo. Verify the new state via
+        # a follow-up read.
         assert result["status"] == "splits_replaced"
-        new_accounts = {s["account"] for s in result["splits"]}
+        refreshed = gc_book.get_transaction(guid)
+        new_accounts = {s["account"] for s in refreshed["splits"]}
         assert "Expenses:Dining" in new_accounts
         assert "Expenses:Groceries" not in new_accounts
 
@@ -2175,10 +2196,12 @@ class TestReplaceSplits:
             ],
         )
 
-        # Identity preserved
+        # guid stays in the thin response. description / date are
+        # preserved on the transaction itself — verified via read-back.
         assert result["guid"] == guid
-        assert result["date"] == original_date
-        assert result["description"] == original_description
+        refreshed = gc_book.get_transaction(guid)
+        assert refreshed["date"] == original_date
+        assert refreshed["description"] == original_description
 
     def test_returns_previous_splits(self, test_book: Path):
         """Should include previous_splits in response for audit trail."""
@@ -2460,8 +2483,10 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify new split count via read-back.
         assert result["status"] == "splits_replaced"
-        assert len(result["splits"]) == 3
+        refreshed = gc_book.get_transaction(guid)
+        assert len(refreshed["splits"]) == 3
 
     def test_reduce_to_two_splits(self, budget_book: Path):
         """Should allow recategorizing to fewer splits than original."""
@@ -2491,8 +2516,10 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify new split count via read-back.
         assert result["status"] == "splits_replaced"
-        assert len(result["splits"]) == 2
+        refreshed = gc_book.get_transaction(guid)
+        assert len(refreshed["splits"]) == 2
 
     def test_preserves_memo(self, test_book: Path):
         """Should preserve memo on new splits when provided."""
@@ -2513,9 +2540,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify memo persistence via read-back.
         assert result["status"] == "splits_replaced"
+        refreshed = gc_book.get_transaction(guid)
         groceries_split = next(
-            s for s in result["splits"] if s["account"] == "Expenses:Groceries"
+            s for s in refreshed["splits"] if s["account"] == "Expenses:Groceries"
         )
         assert groceries_split["memo"] == "Updated memo"
 
@@ -2558,9 +2587,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify the cross-currency quantity via read-back.
         assert result["status"] == "splits_replaced"
+        refreshed = gc_book.get_transaction(guid)
         eur_split = next(
-            s for s in result["splits"] if s["account"] == "Assets:Euro Savings"
+            s for s in refreshed["splits"] if s["account"] == "Assets:Euro Savings"
         )
         assert Decimal(eur_split["quantity"]) == Decimal("182.00")
 
@@ -2598,8 +2629,14 @@ class TestSetReconcileState:
 
         result = gc_book.set_reconcile_state(split_guid, "c")
 
+        # `reconcile_state` in the response was an input echo — dropped.
+        # Persistence verified below via list_transactions read-back.
         assert result["status"] == "updated"
-        assert result["reconcile_state"] == "c"
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "c"
 
     def test_set_reconcile_reconciled(self, test_book: Path):
         """Should set split to reconciled state with date."""
@@ -2612,9 +2649,15 @@ class TestSetReconcileState:
             split_guid, "y", reconcile_date=date(2024, 1, 31)
         )
 
+        # reconcile_date stays (it's computed — today if not given).
+        # reconcile_state echo is gone; persistence check below.
         assert result["status"] == "updated"
-        assert result["reconcile_state"] == "y"
         assert result["reconcile_date"] is not None
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "y"
 
     def test_set_reconcile_new(self, test_book: Path):
         """Should reset split to new state."""
@@ -2629,8 +2672,12 @@ class TestSetReconcileState:
         # Then reset to new
         result = gc_book.set_reconcile_state(split_guid, "n")
 
-        assert result["reconcile_state"] == "n"
         assert result["reconcile_date"] is None
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "n"
 
     def test_set_reconcile_invalid_state(self, test_book: Path):
         """Should raise ValueError for invalid state."""
@@ -2827,9 +2874,16 @@ class TestUnvoidTransaction:
 
         assert result["status"] == "unvoided"
 
-        # Verify values are restored
+        # unvoid response uses _split_to_compact_dict — account + value,
+        # with reconcile_state only emitted when non-default. Unvoid
+        # always restores to 'n', so no reconcile_state key present.
         for split in result["splits"]:
             assert split["value"] == original_values[split["account"]]
+            assert "reconcile_state" not in split  # default 'n' not emitted
+
+        # Post-unvoid state confirmed via read-back.
+        refreshed = gc_book.get_transaction(guid)
+        for split in refreshed["splits"]:
             assert split["reconcile_state"] == "n"
 
     def test_unvoid_transaction_not_voided(self, test_book: Path):
@@ -2862,7 +2916,7 @@ class TestSpendingByCategory:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped — LLM supplied start/end, no need to echo.
         assert "total" in result
         assert "categories" in result
         assert Decimal(result["total"]) > 0
@@ -2892,7 +2946,7 @@ class TestIncomeBySource:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped — input echo.
         assert "total" in result
         assert "sources" in result
         assert Decimal(result["total"]) > 0
@@ -2966,10 +3020,9 @@ class TestCashFlow:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped (echo); `net` dropped (derivable: inflows - outflows).
         assert "inflows" in result
         assert "outflows" in result
-        assert "net" in result
 
     def test_cash_flow_specific_account(self, test_book: Path):
         """Should calculate cash flow for specific account."""

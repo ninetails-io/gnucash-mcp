@@ -33,6 +33,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
+    _split_to_compact_dict,
     _split_to_dict,
     _transaction_to_compact_line,
     _transaction_to_dict,
@@ -651,6 +652,17 @@ class CoreMixin:
         Uses three signals: description match (case-insensitive substring),
         amount match (any split ±$1.00), and date match (±2 days).
 
+        Returns only HIGH (all three signals) and MEDIUM (two of three)
+        matches. LOW-confidence matches (single-signal) are almost always
+        noise — any given amount or description will match many unrelated
+        transactions in a real ledger — so they're suppressed. The LLM
+        can reach `search_transactions` if it needs wider coverage.
+
+        Each candidate is a compact summary, not a full transaction dict.
+        The emitted fields let the LLM recognize whether it's looking at
+        a real duplicate without dragging the full splits array along;
+        if they need more, `get_transaction(guid)` follows up.
+
         Args:
             description: Proposed transaction description.
             splits: Proposed split dicts with 'amount' keys.
@@ -658,7 +670,8 @@ class CoreMixin:
             window_days: Days before/after trans_date to search.
 
         Returns:
-            List of duplicate candidates sorted by confidence (HIGH first).
+            List of {confidence, guid, date, description, amount, signals}
+            sorted by confidence (HIGH before MEDIUM).
         """
         proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
         date_start = trans_date - timedelta(days=window_days)
@@ -694,28 +707,36 @@ class CoreMixin:
                 date_match = abs((txn.post_date - trans_date).days) <= 2
 
                 signals = sum([desc_match, amount_match, date_match])
-                if signals == 0:
+                # Suppress LOW (single-signal) matches — mostly noise
+                if signals < 2:
                     continue
 
-                if signals == 3:
-                    confidence = "HIGH"
-                elif signals == 2:
-                    confidence = "MEDIUM"
-                else:
-                    confidence = "LOW"
+                confidence = "HIGH" if signals == 3 else "MEDIUM"
+
+                # 3-char signal string: caps = matched, dash = not matched.
+                # Position: Description, Amount, Date.
+                signal_str = (
+                    ("D" if desc_match else "-")
+                    + ("A" if amount_match else "-")
+                    + ("D" if date_match else "-")
+                )
+
+                # The txn's primary amount — max absolute split value.
+                # Gives the LLM enough context to recognize the match
+                # without dragging the full splits array.
+                primary_amount = max(abs(s.value) for s in txn.splits)
 
                 candidates.append({
                     "confidence": confidence,
-                    "existing_transaction": _transaction_to_dict(txn),
-                    "match_signals": {
-                        "description": desc_match,
-                        "amount": amount_match,
-                        "date": date_match,
-                    },
+                    "guid": txn.guid,
+                    "date": txn.post_date.isoformat(),
+                    "description": txn.description,
+                    "amount": str(primary_amount),
+                    "signals": signal_str,
                 })
 
-        # Sort: HIGH first, then MEDIUM, then LOW
-        order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        # Sort: HIGH first, then MEDIUM
+        order = {"HIGH": 0, "MEDIUM": 1}
         candidates.sort(key=lambda c: order[c["confidence"]])
         return candidates
 
@@ -1021,19 +1042,15 @@ class CoreMixin:
             if auto_fill_warnings:
                 warnings.extend(auto_fill_warnings)
 
+        # Dry-run response returns only newly-computed info (warnings,
+        # duplicates, auto_filled_from). Input echoes (description, date,
+        # splits, notes) are dropped — the LLM submitted them, and they
+        # live in tool params for audit purposes.
         result = {
             "dry_run": True,
-            "proposed_transaction": {
-                "description": description,
-                "date": trans_date.isoformat(),
-                "currency": currency_mnemonic,
-                "splits": splits,
-            },
             "warnings": warnings,
             "duplicates": duplicates,
         }
-        if notes:
-            result["proposed_transaction"]["notes"] = notes
         if auto_filled_from:
             result["auto_filled_from"] = auto_filled_from
         return result
@@ -1605,7 +1622,18 @@ class CoreMixin:
 
             book.save()
 
-            return _transaction_to_dict(transaction) | {"status": "updated"}
+            # Thin response — the LLM submitted the changes, so the only
+            # fields worth echoing are enough for a quick sanity check
+            # (guid + currently-stored description/date). If they want
+            # the full post-update state they can call get_transaction.
+            # The audit log resolves splits/description/date from params
+            # when absent from after_state (see _resolve_entry_field).
+            return {
+                "guid": transaction.guid,
+                "date": transaction.post_date.isoformat(),
+                "description": transaction.description,
+                "status": "updated",
+            }
 
     def replace_splits(
         self,
@@ -1657,8 +1685,13 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # 2. Capture previous splits for audit trail (before deletion)
-            previous_splits = [_split_to_dict(s) for s in transaction.splits]
+            # 2. Capture previous splits for audit trail (before deletion).
+            # Use the compact serializer — old-split GUIDs are not
+            # addressable anymore, quantity/memo/reconcile_state only
+            # emit when non-default. ~50 chars/split vs. ~140.
+            previous_splits = [
+                _split_to_compact_dict(s) for s in transaction.splits
+            ]
 
             # 3. Resolve and validate all accounts upfront
             resolved_accounts = []
@@ -1743,10 +1776,19 @@ class CoreMixin:
             # 8. Save
             book.save()
 
-            # 9. Build response
-            result = _transaction_to_dict(transaction)
-            result["previous_splits"] = previous_splits
-            result["status"] = "splits_replaced"
+            # 9. Build thin response.
+            # - `splits` echo dropped (LLM just submitted them).
+            # - description/date/currency/notes don't change on a splits
+            #   replace, so no reason to re-send them.
+            # - previous_splits is the one piece the LLM doesn't already
+            #   have — kept so callers can diff / undo / confirm.
+            # - Audit log falls back to params for the "after" splits
+            #   (see logging_config._resolve_entry_field).
+            result = {
+                "guid": transaction.guid,
+                "status": "splits_replaced",
+                "previous_splits": previous_splits,
+            }
             if warnings:
                 result["warnings"] = warnings
 

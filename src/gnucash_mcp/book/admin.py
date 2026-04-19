@@ -61,7 +61,8 @@ class AdminMixin:
             value: Slot value. Stored as string.
 
         Returns:
-            Dict with account, key, value, and status ("created" or "updated").
+            Dict with status ("created" or "updated"). Input parameters are
+            not echoed — the audit log captures them from tool params.
 
         Raises:
             ValueError: If account not found.
@@ -81,12 +82,7 @@ class AdminMixin:
             account[key] = value
             book.save()
 
-            return {
-                "account": account_name,
-                "key": key,
-                "value": value,
-                "status": "updated" if existing else "created",
-            }
+            return {"status": "updated" if existing else "created"}
 
     def delete_account_slot(self, account_name: str, key: str) -> dict:
         """Remove a slot from an account.
@@ -96,7 +92,8 @@ class AdminMixin:
             key: Slot key to remove.
 
         Returns:
-            Dict with account, key, and status.
+            Dict with status. Input parameters are not echoed — the audit
+            log captures them from tool params.
 
         Raises:
             ValueError: If account not found or key not found.
@@ -114,8 +111,4 @@ class AdminMixin:
             del account[key]
             book.save()
 
-            return {
-                "account": account_name,
-                "key": key,
-                "status": "deleted",
-            }
+            return {"status": "deleted"}

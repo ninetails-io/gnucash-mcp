@@ -789,7 +789,8 @@ class TestGetInvoice:
         )
         result = gb.get_invoice("000001")
         assert result["type"] == "invoice"
-        assert result["is_posted"] is False
+        # is_posted dropped (derivable from date_posted).
+        assert result["date_posted"] is None
         assert len(result["entries"]) == 1
         assert Decimal(result["total"]) == Decimal("500")
         assert result["owner_name"] == "Acme Corp"
@@ -946,7 +947,7 @@ class TestPostInvoice:
             post_account="Assets:Accounts Receivable",
         )
         inv = gb.get_invoice("000001")
-        assert inv["is_posted"] is True
+        # `is_posted` dropped — derivable from non-null date_posted.
         assert inv["date_posted"] is not None
 
     def test_post_with_multiple_entries(self, business_book):

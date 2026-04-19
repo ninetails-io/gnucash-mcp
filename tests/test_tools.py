@@ -273,9 +273,12 @@ class TestCreateTransactionTool:
         )
 
         data = json.loads(result)
+        # dry_run responses no longer echo the proposal back — the caller
+        # knows what they submitted; response carries only new info
+        # (warnings, duplicates, auto_filled_from).
         assert data["dry_run"] is True
-        assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
-        assert "guid" not in data
+        assert "proposed_transaction" not in data
+        assert "guid" not in data  # no transaction was written
 
     def test_create_transaction_auto_fill(self, setup_book_env):
         """Should auto-fill splits from matching transaction."""
@@ -630,8 +633,10 @@ class TestReplaceSplitsTool:
         )
 
         data = json.loads(result)
+        # Thin response — no splits echo. Verify via get_transaction.
         assert data["status"] == "splits_replaced"
-        accounts = {s["account"] for s in data["splits"]}
+        refreshed = json.loads(server_module.get_transaction(guid))
+        accounts = {s["account"] for s in refreshed["splits"]}
         assert "Expenses:Dining" in accounts
         assert "Expenses:Groceries" not in accounts
 
@@ -701,8 +706,13 @@ class TestSetReconcileStateTool:
         result = server_module.set_reconcile_state(split_guid, "c")
 
         data = json.loads(result)
+        # `reconcile_state` echo dropped — verified through read-back.
         assert data["status"] == "updated"
-        assert data["reconcile_state"] == "c"
+        refreshed = json.loads(server_module.list_transactions(verbose=True))
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "c"
 
     def test_set_reconcile_state_invalid(self, setup_book_env):
         """Should return error for invalid state."""
@@ -1014,9 +1024,9 @@ class TestCashFlowTool:
         )
 
         data = json.loads(result)
+        # `net` dropped — derivable (inflows - outflows).
         assert "inflows" in data
         assert "outflows" in data
-        assert "net" in data
 
 
 class TestListCommoditiesTool:

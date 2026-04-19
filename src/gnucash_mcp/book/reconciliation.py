@@ -7,7 +7,7 @@ for transactions that must be preserved for audit.
 Depends on shared helpers from BaseGnuCashBook:
   - self.open, self._find_account, self._find_split,
     self._find_transaction
-  - _unreconciled_split_to_compact_line, _transaction_to_dict (module-level)
+  - _unreconciled_split_to_compact_line, _split_to_compact_dict (module-level)
 """
 
 from datetime import date, datetime
@@ -15,7 +15,7 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
-    _transaction_to_dict,
+    _split_to_compact_dict,
     _unreconciled_split_to_compact_line,
 )
 
@@ -72,11 +72,14 @@ class ReconciliationMixin:
 
             book.save()
 
+            # Response carries the resolved-from-prefix full split_guid
+            # plus context the LLM only had a GUID for (account, amount).
+            # The requested state is echo — dropped. reconcile_date
+            # stays because it's computed (today if not provided).
             return {
                 "split_guid": split.guid,
                 "account": split.account.fullname,
                 "amount": str(split.quantity),
-                "reconcile_state": state,
                 "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date and split.reconcile_date.year > 1970 else None,
                 "status": "updated",
             }
@@ -231,10 +234,10 @@ class ReconciliationMixin:
 
             book.save()
 
+            # Return only the computed info — the audit log reads inputs
+            # (account_name, statement_date, statement_balance) from tool
+            # params, so we don't echo them here.
             return {
-                "account": account_name,
-                "statement_date": statement_date.isoformat(),
-                "statement_balance": statement_balance,
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
                 "status": "reconciled",
@@ -333,4 +336,16 @@ class ReconciliationMixin:
 
             book.save()
 
-            return _transaction_to_dict(transaction) | {"status": "unvoided"}
+            # Restored splits ARE new info (they were zeroed while
+            # voided, values stashed in slots). Emit them compactly —
+            # full _split_to_dict would carry guid/reconcile_state="n"/
+            # reconcile_date=None/lot_guid=None per split, all noise.
+            return {
+                "guid": transaction.guid,
+                "date": transaction.post_date.isoformat(),
+                "description": transaction.description,
+                "splits": [
+                    _split_to_compact_dict(s) for s in transaction.splits
+                ],
+                "status": "unvoided",
+            }

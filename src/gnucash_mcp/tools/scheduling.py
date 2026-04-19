@@ -1,11 +1,11 @@
 """Scheduled transaction tools: recurring templates + instantiation."""
 
-from typing import Annotated
-
-from pydantic import Field
-
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import (
+    ScheduledTransactionGuid,
+    _json,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -26,20 +26,15 @@ def register(mcp, get_book) -> None:
         """Create a recurring transaction template.
 
         Args:
-            name: Name for the scheduled transaction (e.g., "Monthly Rent").
-            description: Transaction description when created.
-            splits: List of splits, same format as create_transaction:
-                [{"account": "Expenses:Rent", "amount": "1850.00"}, ...]
-            start_date: First occurrence date (YYYY-MM-DD).
-            frequency: How often it recurs:
-                - "weekly"
-                - "biweekly" (every 2 weeks)
-                - "monthly"
-                - "bimonthly" (every 2 months)
-                - "quarterly" (every 3 months)
-                - "yearly"
-            end_date: Optional last occurrence date (YYYY-MM-DD).
-            enabled: Whether the schedule is active. Default True.
+            name: Scheduled transaction name (e.g., "Monthly Rent").
+            description: Transaction description at instantiation.
+            splits: Same format as create_transaction, e.g.
+                ``[{"account": "Expenses:Rent", "amount": "1850.00"}, ...]``.
+            start_date: First occurrence (YYYY-MM-DD).
+            frequency: "weekly", "biweekly" (2w), "monthly",
+                "bimonthly" (2mo), "quarterly" (3mo), or "yearly".
+            end_date: Optional last occurrence (YYYY-MM-DD).
+            enabled: Active. Default True.
         """
         book = get_book()
         result = book.create_scheduled_transaction(
@@ -103,7 +98,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="create", entity_type="transaction")
     def create_transaction_from_scheduled(
-        guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
+        guid: ScheduledTransactionGuid,
         transaction_date: str | None = None,
     ) -> str:
         """Create an actual transaction from a scheduled template.
@@ -123,7 +118,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="scheduled_transaction")
     def update_scheduled_transaction(
-        guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
+        guid: ScheduledTransactionGuid,
         enabled: bool | None = None,
         end_date: str | None = None,
     ) -> str:
@@ -146,7 +141,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="scheduled_transaction")
     def delete_scheduled_transaction(
-        guid: Annotated[str, Field(description="Scheduled transaction GUID (or 8+ char prefix)")],
+        guid: ScheduledTransactionGuid,
     ) -> str:
         """Delete a scheduled transaction.
 

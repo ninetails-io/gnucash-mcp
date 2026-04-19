@@ -7,12 +7,13 @@ way (pure lazy-load orchestration, no hardcoded imports).
 """
 
 from datetime import date
-from typing import Annotated
-
-from pydantic import Field
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import (
+    TransactionGuid,
+    _json,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -122,7 +123,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def get_transaction(
-        guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
     ) -> str:
         """Get details for a specific transaction by GUID.
 
@@ -150,22 +151,21 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Create a new transaction with splits. Splits must balance to zero.
 
+        Each split: ``account`` (full path, required), ``amount``
+        (required, in transaction currency), ``quantity`` (required
+        when account commodity differs from transaction currency),
+        ``memo`` (optional).
+
         Args:
-            description: Transaction description
-            splits: List of splits. Each split has:
-                - 'account' (required): Full account path
-                - 'amount' (required): Value in transaction currency
-                - 'quantity' (optional): Amount in account's commodity. Required if
-                  account commodity differs from transaction currency.
-                - 'memo' (optional): Split memo
-            transaction_date: Transaction date in ISO format (YYYY-MM-DD). Defaults to today.
-            currency: ISO currency code for transaction (e.g., "USD", "EUR").
-                      Defaults to book's default currency.
-            notes: Transaction notes (optional). Free-text annotation stored
-                   separately from description.
-            check_duplicates: Run duplicate detection against existing transactions.
-            force_create: Create even if HIGH confidence duplicates are found.
-            dry_run: Run validation and dupe check, return proposal without writing.
+            description: Transaction description.
+            splits: List of split dicts (see above). Omit to auto-fill
+                from the most recent matching-description transaction.
+            transaction_date: ISO date (YYYY-MM-DD). Defaults to today.
+            currency: ISO currency code. Defaults to book's default.
+            notes: Optional free-text annotation.
+            check_duplicates: Run duplicate detection. Default True.
+            force_create: Create even if HIGH-confidence duplicates found.
+            dry_run: Validate + dupe check only; don't write.
         """
         book = get_book()
         trans_date = date.fromisoformat(transaction_date) if transaction_date else None
@@ -216,21 +216,18 @@ def register(mcp, get_book) -> None:
         """Create a new account in the chart of accounts.
 
         Args:
-            name: Account name (e.g., "AI Subscriptions")
-            account_type: GnuCash account type (ASSET, BANK, CASH, CREDIT, EQUITY, EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE, PAYABLE)
-            parent: Full path of parent account (e.g., "Expenses:Online Services").
-                If omitted, creates a top-level account at the book root.
-            description: Optional description
-            placeholder: If true, account is container-only. Default: false
-            commodity: Symbol for the account's commodity:
-                - For currencies: ISO code (e.g., "USD", "EUR")
-                - For investments: Fund/stock symbol (e.g., "VTSAX", "AAPL")
-                Defaults to book's default currency.
-            commodity_namespace: Namespace of the commodity:
-                - "CURRENCY" (default) for currencies
-                - "FUND" for mutual funds
-                - "NASDAQ", "NYSE", etc. for stocks
-                Required when commodity is not a currency.
+            name: Account name (e.g., "AI Subscriptions").
+            account_type: One of ASSET, BANK, CASH, CREDIT, EQUITY,
+                EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE,
+                PAYABLE.
+            parent: Full path of parent account. Omit for top-level.
+            description: Optional description.
+            placeholder: Container-only account. Default False.
+            commodity: ISO currency code ("USD") or stock/fund symbol
+                ("VTSAX"). Defaults to book's default currency.
+            commodity_namespace: "CURRENCY" (default), "FUND", or an
+                exchange ("NASDAQ", "NYSE"). Required with non-currency
+                commodities.
         """
         book = get_book()
         result = book.create_account(
@@ -309,7 +306,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="transaction")
     def delete_transaction(
-        guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
         force: bool = False,
     ) -> str:
         """Delete a transaction by GUID.
@@ -329,7 +326,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="transaction")
     def update_transaction(
-        guid: Annotated[str, Field(description="Transaction GUID to update (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
         description: str | None = None,
         transaction_date: str | None = None,
         splits: list[dict] | None = None,
@@ -364,7 +361,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
     def replace_splits(
-        guid: Annotated[str, Field(description="Transaction GUID (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
         splits: list[dict],
         force: bool = False,
     ) -> str:

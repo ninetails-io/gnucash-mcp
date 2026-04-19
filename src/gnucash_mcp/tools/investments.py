@@ -1,12 +1,14 @@
 """Investment tools: commodities, prices, and lots (cost-basis tracking)."""
 
 from datetime import date as date_type
-from typing import Annotated
-
-from pydantic import Field
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import (
+    LotGuid,
+    SplitGuid,
+    _json,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -40,21 +42,17 @@ def register(mcp, get_book) -> None:
         fraction: int = 10000,
         cusip: str | None = None,
     ) -> str:
-        """Create a new commodity (stock, mutual fund, etc.) in the book.
+        """Create a new commodity (stock, mutual fund, etc.).
 
         Args:
-            mnemonic: Symbol (e.g., "VTSAX", "AAPL"). Must be unique within namespace.
-            fullname: Full name (e.g., "Vanguard Total Stock Market Index Fund").
-            namespace: Grouping category. Common values:
-                - "FUND" for mutual funds (default)
-                - "NASDAQ", "NYSE", "AMEX" for stocks
-                - Any custom string for other assets
-            fraction: Smallest fractional unit. Use:
-                - 1 for whole units only
-                - 100 for 2 decimal places
-                - 10000 for 4 decimal places (default, standard for shares)
-                - 1000000 for 6 decimal places (crypto)
-            cusip: Optional CUSIP/ISIN identifier for the security.
+            mnemonic: Symbol (e.g., "VTSAX"). Unique within namespace.
+            fullname: Human-readable name.
+            namespace: "FUND" (default) for mutual funds, "NASDAQ"/"NYSE"/
+                "AMEX" for stocks, or any custom string.
+            fraction: Smallest fractional unit. 1 = whole units, 100 =
+                2 decimals, 10000 = 4 decimals (default, shares),
+                1000000 = 6 decimals (crypto).
+            cusip: Optional CUSIP/ISIN identifier.
         """
         book = get_book()
         result = book.create_commodity(
@@ -78,24 +76,20 @@ def register(mcp, get_book) -> None:
         price_type: str = "nav",
         source: str = "user:price",
     ) -> str:
-        """Record a price for a commodity (stock price, NAV, exchange rate).
+        """Record a price for a commodity (stock, NAV, exchange rate).
+
+        An existing price with the same commodity/currency/date/source
+        is updated rather than duplicated.
 
         Args:
-            commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
-            namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
+            commodity: Symbol (e.g., "VTSAX").
+            namespace: Commodity namespace (e.g., "FUND", "NASDAQ").
             value: Price per unit as decimal string (e.g., "250.45").
-            currency: Currency the price is denominated in. Default "USD".
-            date: Price date in ISO format (YYYY-MM-DD). Defaults to today.
-            price_type: Type of price:
-                - "nav" for mutual fund net asset value (default)
-                - "last" for last trade price
-                - "bid" / "ask" for bid/ask prices
-                - "unknown" for unspecified
+            currency: ISO currency code. Default "USD".
+            date: ISO date (YYYY-MM-DD). Defaults to today.
+            price_type: "nav" (default, mutual funds), "last", "bid",
+                "ask", or "unknown".
             source: Source identifier. Default "user:price".
-
-        Note:
-            If a price already exists for the same commodity/currency/date/source,
-            it will be updated rather than creating a duplicate.
         """
         book = get_book()
         price_date = date_type.fromisoformat(date) if date else None
@@ -223,7 +217,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def get_lot(
-        guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+        guid: LotGuid,
     ) -> str:
         """Get detailed information about a lot.
 
@@ -244,8 +238,8 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="lot")
     def assign_split_to_lot(
-        split_guid: Annotated[str, Field(description="GUID of the split (from transaction's investment account). 8+ char prefix accepted.")],
-        lot_guid: Annotated[str, Field(description="GUID of the lot (or 8+ char prefix)")],
+        split_guid: SplitGuid,
+        lot_guid: LotGuid,
     ) -> str:
         """Assign a transaction split to a lot.
 
@@ -269,7 +263,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def calculate_lot_gain(
-        lot_guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+        lot_guid: LotGuid,
         shares: str | None = None,
         sale_price: str | None = None,
     ) -> str:
@@ -295,7 +289,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="lot")
     def close_lot(
-        guid: Annotated[str, Field(description="Lot GUID (or 8+ char prefix)")],
+        guid: LotGuid,
     ) -> str:
         """Mark a lot as closed.
 

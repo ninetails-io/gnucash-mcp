@@ -567,12 +567,10 @@ class InvestmentsMixin:
                 book.save()
                 summary["is_closed"] = True
 
-            return {
-                "status": "assigned",
-                "split_guid": split.guid,
-                "lot_guid": lot.guid,
-                **summary,
-            }
+            # split_guid and lot_guid are echoed inputs — dropped.
+            # Summary (quantity, cost_basis, cost_per_share, is_closed)
+            # is the post-assignment state, the actually-useful info.
+            return {"status": "assigned", **summary}
 
     def calculate_lot_gain(
         self,
