@@ -76,48 +76,56 @@ class BusinessMixin:
         return query.first()
 
     @staticmethod
+    def _address_to_dict(entity) -> dict:
+        """Build an address dict from a piecash Customer/Vendor, omitting
+        any empty fields and dropping the `fax` field entirely (it's 2026).
+
+        Returns {} when no address data is set — caller should drop the
+        whole "address" key rather than emit an empty dict, since
+        _strip_noise leaves empty dicts in place.
+        """
+        fields = {
+            "name": entity.addr_name,
+            "addr1": entity.addr_addr1,
+            "addr2": entity.addr_addr2,
+            "addr3": entity.addr_addr3,
+            "addr4": entity.addr_addr4,
+            "phone": entity.addr_phone,
+            "email": entity.addr_email,
+        }
+        return {k: v for k, v in fields.items() if v}
+
+    @staticmethod
     def _customer_to_dict(customer) -> dict:
         """Convert a piecash Customer to a serializable dict."""
-        return {
+        result = {
             "guid": customer.guid,
             "id": customer.id,
             "name": customer.name,
             "currency": customer.currency.mnemonic if customer.currency else None,
             "notes": customer.notes or "",
             "active": bool(customer.active),
-            "address": {
-                "name": customer.addr_name or "",
-                "addr1": customer.addr_addr1 or "",
-                "addr2": customer.addr_addr2 or "",
-                "addr3": customer.addr_addr3 or "",
-                "addr4": customer.addr_addr4 or "",
-                "phone": customer.addr_phone or "",
-                "fax": customer.addr_fax or "",
-                "email": customer.addr_email or "",
-            },
         }
+        address = BusinessMixin._address_to_dict(customer)
+        if address:
+            result["address"] = address
+        return result
 
     @staticmethod
     def _vendor_to_dict(vendor) -> dict:
         """Convert a piecash Vendor to a serializable dict."""
-        return {
+        result = {
             "guid": vendor.guid,
             "id": vendor.id,
             "name": vendor.name,
             "currency": vendor.currency.mnemonic if vendor.currency else None,
             "notes": vendor.notes or "",
             "active": bool(vendor.active),
-            "address": {
-                "name": vendor.addr_name or "",
-                "addr1": vendor.addr_addr1 or "",
-                "addr2": vendor.addr_addr2 or "",
-                "addr3": vendor.addr_addr3 or "",
-                "addr4": vendor.addr_addr4 or "",
-                "phone": vendor.addr_phone or "",
-                "fax": vendor.addr_fax or "",
-                "email": vendor.addr_email or "",
-            },
         }
+        address = BusinessMixin._address_to_dict(vendor)
+        if address:
+            result["address"] = address
+        return result
 
     @staticmethod
     def _customer_to_compact_line(customer) -> str:
@@ -162,23 +170,24 @@ class BusinessMixin:
     def _invoice_to_dict(invoice, entries=None) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
+        `owner_type` (numeric 2/4) was redundant with the human-readable
+        `type` field and is dropped. `is_posted` is derivable from
+        `date_posted` (non-null = posted) and is dropped too.
+
         Args:
             invoice: piecash Invoice object.
             entries: Optional list of entry dicts. If None, entries are not included.
         """
-        is_posted = invoice.date_posted is not None
         result = {
             "guid": invoice.guid,
             "id": invoice.id,
             "type": "bill" if invoice.owner_type == 4 else "invoice",
-            "owner_type": invoice.owner_type,
             "owner_guid": invoice.owner_guid,
             "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
             "date_posted": str(invoice.date_posted.date()) if invoice.date_posted else None,
             "notes": invoice.notes or "",
             "active": bool(invoice.active),
             "currency": invoice.currency.mnemonic if invoice.currency else None,
-            "is_posted": is_posted,
         }
         if entries is not None:
             result["entries"] = entries

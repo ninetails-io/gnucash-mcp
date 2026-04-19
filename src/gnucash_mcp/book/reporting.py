@@ -95,8 +95,8 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
 
+            # period is an input echo — LLM supplied start/end dates.
             return {
-                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
                 "total": str(total),
                 "categories": categories,
             }
@@ -154,8 +154,8 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
 
+            # period is an input echo — LLM supplied start/end dates.
             return {
-                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
                 "total": str(total),
                 "sources": sources,
             }
@@ -216,6 +216,9 @@ class ReportingMixin:
                     for name, bal in sorted(accounts_dict.items())
                 ]
 
+            # as_of_date is also an input echo, but it's cheap and
+            # useful when a log is reviewed out of context. `balanced`
+            # is derivable (assets == liabilities + equity); dropped.
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {
@@ -233,7 +236,6 @@ class ReportingMixin:
                         if net_income != 0 else []
                     ),
                 },
-                "balanced": assets_total == liabilities_total + equity_total,
             }
 
     def net_worth(
@@ -357,12 +359,12 @@ class ReportingMixin:
                     else:
                         outflows += -split.quantity
 
+            # period is input echo (LLM supplied dates), net is derivable
+            # (inflows - outflows). Both dropped.
             return {
-                "period": f"{start_date.isoformat()} to {end_date.isoformat()}",
                 "account": account if account else "All cash/bank accounts",
                 "inflows": str(inflows),
                 "outflows": str(outflows),
-                "net": str(inflows - outflows),
             }
 
     # ── Debt Payoff ───────────────────────────────────────────────

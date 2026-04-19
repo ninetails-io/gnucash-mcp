@@ -6,7 +6,12 @@ from typing import Annotated
 from pydantic import Field
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import (
+    SplitGuid,
+    TransactionGuid,
+    _json,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -16,7 +21,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="set_state", entity_type="split")
     def set_reconcile_state(
-        split_guid: Annotated[str, Field(description="GUID of the split to update (32-character hex string, or 8+ char prefix)")],
+        split_guid: SplitGuid,
         state: str,
         reconcile_date: str | None = None,
     ) -> str:
@@ -100,7 +105,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="void", entity_type="transaction")
     def void_transaction(
-        guid: Annotated[str, Field(description="Transaction GUID to void (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
         reason: str,
     ) -> str:
         """Void a transaction (proper accounting void, not delete).
@@ -121,7 +126,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="unvoid", entity_type="transaction")
     def unvoid_transaction(
-        guid: Annotated[str, Field(description="Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)")],
+        guid: TransactionGuid,
     ) -> str:
         """Restore a voided transaction.
 

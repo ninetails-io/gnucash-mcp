@@ -706,8 +706,13 @@ class TestSetReconcileStateTool:
         result = server_module.set_reconcile_state(split_guid, "c")
 
         data = json.loads(result)
+        # `reconcile_state` echo dropped — verified through read-back.
         assert data["status"] == "updated"
-        assert data["reconcile_state"] == "c"
+        refreshed = json.loads(server_module.list_transactions(verbose=True))
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "c"
 
     def test_set_reconcile_state_invalid(self, setup_book_env):
         """Should return error for invalid state."""
@@ -1019,9 +1024,9 @@ class TestCashFlowTool:
         )
 
         data = json.loads(result)
+        # `net` dropped — derivable (inflows - outflows).
         assert "inflows" in data
         assert "outflows" in data
-        assert "net" in data
 
 
 class TestListCommoditiesTool:

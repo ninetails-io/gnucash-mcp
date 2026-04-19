@@ -8,11 +8,36 @@ import json
 import logging
 import traceback
 from functools import wraps
-from typing import Callable
+from typing import Annotated, Callable
+
+from pydantic import Field
 
 from gnucash_mcp.book import GnuCashLockError
 
 logger = logging.getLogger(__name__)
+
+
+# ── Shared GUID parameter annotations ──────────────────────────────
+#
+# Tools that accept GUIDs all describe the format the same way (full
+# 32-char hex or a prefix of ≥8 chars, case-insensitive — validated
+# in _resolve_guid). Centralizing the Annotated types here means one
+# place to update the description and slightly shorter schema payloads
+# across the ~15 GUID parameters the tool catalog advertises.
+
+TransactionGuid = Annotated[
+    str, Field(description="Transaction GUID (32-char hex or 8+ char prefix)")
+]
+SplitGuid = Annotated[
+    str, Field(description="Split GUID (32-char hex or 8+ char prefix)")
+]
+LotGuid = Annotated[
+    str, Field(description="Lot GUID (32-char hex or 8+ char prefix)")
+]
+ScheduledTransactionGuid = Annotated[
+    str,
+    Field(description="Scheduled transaction GUID (32-char hex or 8+ char prefix)"),
+]
 
 
 def _strip_noise(obj):

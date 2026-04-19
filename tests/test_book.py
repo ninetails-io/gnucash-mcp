@@ -2629,8 +2629,14 @@ class TestSetReconcileState:
 
         result = gc_book.set_reconcile_state(split_guid, "c")
 
+        # `reconcile_state` in the response was an input echo — dropped.
+        # Persistence verified below via list_transactions read-back.
         assert result["status"] == "updated"
-        assert result["reconcile_state"] == "c"
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "c"
 
     def test_set_reconcile_reconciled(self, test_book: Path):
         """Should set split to reconciled state with date."""
@@ -2643,9 +2649,15 @@ class TestSetReconcileState:
             split_guid, "y", reconcile_date=date(2024, 1, 31)
         )
 
+        # reconcile_date stays (it's computed — today if not given).
+        # reconcile_state echo is gone; persistence check below.
         assert result["status"] == "updated"
-        assert result["reconcile_state"] == "y"
         assert result["reconcile_date"] is not None
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "y"
 
     def test_set_reconcile_new(self, test_book: Path):
         """Should reset split to new state."""
@@ -2660,8 +2672,12 @@ class TestSetReconcileState:
         # Then reset to new
         result = gc_book.set_reconcile_state(split_guid, "n")
 
-        assert result["reconcile_state"] == "n"
         assert result["reconcile_date"] is None
+        refreshed = gc_book.list_transactions(compact=False)
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "n"
 
     def test_set_reconcile_invalid_state(self, test_book: Path):
         """Should raise ValueError for invalid state."""
@@ -2858,9 +2874,16 @@ class TestUnvoidTransaction:
 
         assert result["status"] == "unvoided"
 
-        # Verify values are restored
+        # unvoid response uses _split_to_compact_dict — account + value,
+        # with reconcile_state only emitted when non-default. Unvoid
+        # always restores to 'n', so no reconcile_state key present.
         for split in result["splits"]:
             assert split["value"] == original_values[split["account"]]
+            assert "reconcile_state" not in split  # default 'n' not emitted
+
+        # Post-unvoid state confirmed via read-back.
+        refreshed = gc_book.get_transaction(guid)
+        for split in refreshed["splits"]:
             assert split["reconcile_state"] == "n"
 
     def test_unvoid_transaction_not_voided(self, test_book: Path):
@@ -2893,7 +2916,7 @@ class TestSpendingByCategory:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped — LLM supplied start/end, no need to echo.
         assert "total" in result
         assert "categories" in result
         assert Decimal(result["total"]) > 0
@@ -2923,7 +2946,7 @@ class TestIncomeBySource:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped — input echo.
         assert "total" in result
         assert "sources" in result
         assert Decimal(result["total"]) > 0
@@ -2997,10 +3020,9 @@ class TestCashFlow:
             end_date=date(2024, 12, 31),
         )
 
-        assert "period" in result
+        # `period` dropped (echo); `net` dropped (derivable: inflows - outflows).
         assert "inflows" in result
         assert "outflows" in result
-        assert "net" in result
 
     def test_cash_flow_specific_account(self, test_book: Path):
         """Should calculate cash flow for specific account."""
