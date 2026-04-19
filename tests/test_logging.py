@@ -78,93 +78,42 @@ class TestSetupLogging:
 
 
 class TestAuditLogDecorator:
-    """Tests for the audit_log decorator (JSON format)."""
+    """Tests for the audit_log decorator's error and write handling."""
 
-    def test_read_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify read tool calls are logged with params (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
-
-        @audit_log(classification="read")
-        def test_read_tool(account_name: str) -> str:
-            return json.dumps({"balance": "100.00"})
-
-        result = test_read_tool(account_name="Assets:Checking")
-
-        # Read the log file
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        assert log_file.exists()
-
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
-        assert len(entries) >= 1
-
-        entry = entries[-1]
-        assert entry["tool"] == "test_read_tool"
-        assert entry["classification"] == "read"
-        assert entry["params"] == {"account_name": "Assets:Checking"}
-        assert entry["result"] == "success"
-        assert "before_state" not in entry
-        assert "after_state" not in entry
-
-    def test_write_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify write tool calls are logged with operation and entity_type (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+    def test_raising_tool_logged_as_error(self, temp_book_path, temp_log_dir):
+        """A tool raising an exception writes an ERROR line to the text audit log."""
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="create", entity_type="transaction")
-        def test_create_tool(description: str) -> str:
-            return json.dumps({"guid": "abc123", "status": "created"})
-
-        result = test_create_tool(description="Test transaction")
-
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
-
-        entry = entries[-1]
-        assert entry["tool"] == "test_create_tool"
-        assert entry["classification"] == "write"
-        assert entry["operation"] == "create"
-        assert entry["entity_type"] == "transaction"
-        assert entry["result"] == "success"
-        assert entry["entity_guid"] == "abc123"
-
-    def test_failed_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify failed tool calls are logged with error (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
-
-        @audit_log(classification="read")
-        def test_failing_tool(name: str) -> str:
+        def test_failing_tool(description: str) -> str:
             raise ValueError("Account not found")
 
         with pytest.raises(ValueError):
-            test_failing_tool(name="Nonexistent")
+            test_failing_tool(description="bad")
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        entry = entries[-1]
-        assert entry["tool"] == "test_failing_tool"
-        assert entry["result"] == "error"
-        assert entry["error"] == "Account not found"
+        assert "ERROR  test_failing_tool: Account not found" in content
 
-    def test_error_json_response_logged_as_error(self, temp_book_path, temp_log_dir):
-        """Verify tools returning JSON with 'error' key are logged as errors (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+    def test_write_tool_logged(self, temp_book_path, temp_log_dir):
+        """Successful write tools emit a CREATE/UPDATE/etc. header line."""
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
-        @audit_log(classification="read")
-        def test_error_response(name: str) -> str:
-            return json.dumps({"error": "Not found", "error_type": "not_found"})
+        @audit_log(classification="write", operation="create", entity_type="transaction")
+        def test_create_tool(description: str) -> str:
+            return json.dumps({"guid": "abc123", "description": description})
 
-        result = test_error_response(name="Bad")
+        test_create_tool(description="Test transaction")
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        entry = entries[-1]
-        assert entry["result"] == "error"
-        assert entry["error"] == "Not found"
+        assert "CREATE TRANSACTION" in content
+        assert "guid:abc123" in content
+        assert "Test transaction" in content
 
 
 class TestDebugLogging:
@@ -210,20 +159,9 @@ class TestDebugLogging:
 class TestTextFormat:
     """Tests for text format audit logging."""
 
-    def test_text_format_creates_txt_file(self, temp_book_path, temp_log_dir):
-        """Verify text format creates .txt file, not .jsonl."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
-
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        txt_file = temp_log_dir / "audit" / f"{today}.txt"
-        jsonl_file = temp_log_dir / "audit" / f"{today}.jsonl"
-
-        assert txt_file.exists()
-        assert not jsonl_file.exists()
-
     def test_text_format_has_header(self, temp_book_path, temp_log_dir):
         """Verify text format file has proper header."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
@@ -234,7 +172,7 @@ class TestTextFormat:
 
     def test_text_format_logs_write_operations(self, temp_book_path, temp_log_dir):
         """Verify text format logs write operations in human-readable form."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="create", entity_type="transaction")
         def test_create(description: str) -> str:
@@ -251,7 +189,7 @@ class TestTextFormat:
 
     def test_text_format_skips_read_operations(self, temp_book_path, temp_log_dir):
         """Verify text format does not log read operations."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="read")
         def test_read(name: str) -> str:
@@ -278,7 +216,7 @@ class TestTextFormat:
         pull them from tool params instead so the text view keeps the
         before/after diff detail human reviewers rely on.
         """
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(
             classification="write",
@@ -346,7 +284,7 @@ class TestTextFormat:
         ``{guid, status, previous_splits, warnings}`` — the new splits
         must come from tool params in the audit log.
         """
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(
             classification="write",
@@ -398,7 +336,7 @@ class TestTextFormat:
 
     def test_text_format_logs_replace_splits(self, temp_book_path, temp_log_dir):
         """Verify text format logs replace_splits with before and after splits."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
         def test_replace_splits(guid: str, splits: list) -> str:
@@ -510,20 +448,23 @@ class TestAuditLogIntegration:
     """Integration tests for the complete audit trail."""
 
     def test_write_operation_lifecycle(self, temp_book_path, temp_log_dir):
-        """Test a complete write operation lifecycle captures correct states (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+        """A create-transaction lifecycle renders as a readable audit entry.
 
-        # Simulate a create operation
+        The entry should carry the header (operation + short GUID), the
+        description, date, and the full split list — sourced from
+        ``after_state`` or (trimmed-response fallback) from ``params``.
+        """
+        setup_logging(book_path=str(temp_book_path), debug=False)
+
         @audit_log(classification="write", operation="create", entity_type="transaction")
-        def create_txn(description: str, splits: list) -> str:
-            return json.dumps({
-                "guid": "txn123",
-                "description": description,
-                "splits": splits,
-            })
+        def create_txn(description: str, splits: list, transaction_date: str) -> str:
+            # Simulate a thin response: just guid + status. The formatter
+            # must reach into params for description / date / splits.
+            return json.dumps({"guid": "txn12345", "status": "created"})
 
         create_txn(
             description="Grocery shopping",
+            transaction_date="2026-02-15",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
                 {"account": "Assets:Checking", "amount": "-50.00"},
@@ -531,9 +472,13 @@ class TestAuditLogIntegration:
         )
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        create_entry = [e for e in entries if e.get("operation") == "create"][-1]
-        assert create_entry["entity_guid"] == "txn123"
-        assert create_entry["after_state"]["description"] == "Grocery shopping"
+        assert "CREATE TRANSACTION" in content
+        assert "guid:txn12345" in content
+        assert "Grocery shopping" in content
+        assert "2026-02-15" in content
+        # Split leaf names appear in the rendered splits block
+        assert "Groceries" in content
+        assert "Checking" in content

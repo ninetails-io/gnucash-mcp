@@ -23,9 +23,6 @@ _get_book_func: Callable | None = None
 # Module-level reference to log directory, set during setup
 _log_dir: Path | None = None
 
-# Module-level reference to audit format ("text" or "json")
-_audit_format: str = "text"
-
 # Module-level reference to book path for text header
 _book_path_str: str | None = None
 
@@ -35,16 +32,10 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
-def get_audit_format() -> str:
-    """Get the configured audit log format ('text' or 'json')."""
-    return _audit_format
-
-
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
     audit: bool = True,
-    audit_format: str = "text",
     get_book: Callable | None = None,
 ) -> None:
     """Configure audit and debug logging.
@@ -59,20 +50,14 @@ def setup_logging(
                    {book_path}.mcp/ directory alongside the book.
         debug: Enable debug-level MCP protocol logging.
         audit: Enable audit logging. Default True. Use --noaudit to disable.
-        audit_format: Format for audit log: "text" (default, human-readable) or "json" (JSONL).
         get_book: Function to get the GnuCashBook instance (for state capture).
 
     Raises:
         ValueError: If book_path is not provided and either audit or debug is enabled.
-        ValueError: If audit_format is not "text" or "json".
     """
-    global _get_book_func, _log_dir, _audit_format, _book_path_str
+    global _get_book_func, _log_dir, _book_path_str
     _get_book_func = get_book
-    _audit_format = audit_format
     _book_path_str = book_path
-
-    if audit_format not in ("text", "json"):
-        raise ValueError(f"audit_format must be 'text' or 'json', got: {audit_format}")
 
     # If both audit and debug are disabled, no logging setup needed
     if not audit and not debug:
@@ -113,19 +98,17 @@ def setup_logging(
         audit_logger.setLevel(logging.INFO)
         audit_logger.propagate = False
 
-        # Choose file extension based on format
-        file_ext = "jsonl" if audit_format == "json" else "txt"
-        audit_file = audit_dir / f"{today}.{file_ext}"
+        audit_file = audit_dir / f"{today}.txt"
 
-        # Write header for text format if file is new
-        write_header = audit_format == "text" and not audit_file.exists()
+        # Write header if file is new
+        write_header = not audit_file.exists()
 
         audit_handler = logging.FileHandler(audit_file)
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
-        # Write text header if needed
+        # Write header if needed
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
             audit_logger.info(header)
@@ -805,15 +788,11 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms size={len(result)}bytes"
                 )
 
-                # Log in appropriate format
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # Text format - only log write operations
-                    text_entry = _format_audit_entry_text(entry)
-                    if text_entry:
-                        logger.info(text_entry)
-                        logger.info("")  # Blank line between entries
+                # Only log write operations; reads are noise in the audit trail.
+                text_entry = _format_audit_entry_text(entry)
+                if text_entry:
+                    logger.info(text_entry)
+                    logger.info("")  # Blank line between entries
                 _flush_logger(logger)
                 return result
 
@@ -827,15 +806,11 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms error={e}"
                 )
 
-                # Log errors in both formats
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # For errors in text format, log a simple error line
-                    time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                    error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
-                    logger.info(error_text)
-                    logger.info("")
+                # Log a simple error line
+                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
+                error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
+                logger.info(error_text)
+                logger.info("")
                 _flush_logger(logger)
                 raise
 

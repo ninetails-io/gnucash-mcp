@@ -292,18 +292,15 @@ def get_book():
 # Initialize logging at module import time
 # Use GNUCASH_MCP_DEBUG=1 env var to enable debug logging
 # Use GNUCASH_MCP_NOAUDIT=1 env var to disable audit logging
-# Use GNUCASH_MCP_AUDIT_FORMAT=json|text env var to set audit format (default: text)
 # Logs are stored alongside the book file: {book_path}.mcp/audit/ and {book_path}.mcp/debug/
 _debug_mode = os.environ.get("GNUCASH_MCP_DEBUG") == "1"
 _audit_mode = os.environ.get("GNUCASH_MCP_NOAUDIT") != "1"
-_audit_format = os.environ.get("GNUCASH_MCP_AUDIT_FORMAT", "text")
 _book_path = os.environ.get("GNUCASH_BOOK_PATH")
 if _book_path and (_audit_mode or _debug_mode):
     setup_logging(
         book_path=_book_path,
         debug=_debug_mode,
         audit=_audit_mode,
-        audit_format=_audit_format,
         get_book=get_book,
     )
     if _debug_mode:
@@ -387,7 +384,6 @@ Options:
                        scheduling, investments, business, admin
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
-  --audit-format=FORMAT  Audit log format: "text" (default) or "json"
   -h, --help           Show this help message
 
 Environment variables:
@@ -395,10 +391,9 @@ Environment variables:
   GNUCASH_MCP_MODULES        Tool modules to load (e.g., "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
-  GNUCASH_MCP_AUDIT_FORMAT   Audit format: "text" or "json"
 
 Logs are stored alongside the book file:
-  {book_path}.mcp/audit/YYYY-MM-DD.txt   (or .jsonl for JSON format)
+  {book_path}.mcp/audit/YYYY-MM-DD.txt
   {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
 """)
         sys.exit(0)
@@ -408,15 +403,11 @@ Logs are stored alongside the book file:
     # Parse CLI flags
     debug_flag = "--debug" in sys.argv
     noaudit_flag = "--noaudit" in sys.argv
-    audit_format = "text"  # default
     modules_value = None
 
     # Parse --key=value flags
     for arg in sys.argv[:]:
-        if arg.startswith("--audit-format="):
-            audit_format = arg.split("=", 1)[1]
-            sys.argv.remove(arg)
-        elif arg.startswith("--modules="):
+        if arg.startswith("--modules="):
             modules_value = arg.split("=", 1)[1]
             sys.argv.remove(arg)
 
@@ -430,19 +421,18 @@ Logs are stored alongside the book file:
         modules_value = os.environ.get("GNUCASH_MCP_MODULES")
 
     # Re-init logging if CLI flags override env vars
-    if debug_flag or noaudit_flag or audit_format != "text":
+    if debug_flag or noaudit_flag:
         audit_enabled = not noaudit_flag
         if book_path and (audit_enabled or debug_flag):
             setup_logging(
                 book_path=book_path,
                 debug=debug_flag,
                 audit=audit_enabled,
-                audit_format=audit_format,
                 get_book=get_book,
             )
             if debug_flag:
                 debug_log(f"Server starting via CLI. Book: {book_path}")
-                debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}, format={audit_format}")
+                debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}")
 
     # Validate and apply module filter (also lazy-loads extracted modules)
     _validate_tool_modules()
