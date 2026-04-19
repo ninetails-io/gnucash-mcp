@@ -633,8 +633,10 @@ class TestReplaceSplitsTool:
         )
 
         data = json.loads(result)
+        # Thin response — no splits echo. Verify via get_transaction.
         assert data["status"] == "splits_replaced"
-        accounts = {s["account"] for s in data["splits"]}
+        refreshed = json.loads(server_module.get_transaction(guid))
+        accounts = {s["account"] for s in refreshed["splits"]}
         assert "Expenses:Dining" in accounts
         assert "Expenses:Groceries" not in accounts
 

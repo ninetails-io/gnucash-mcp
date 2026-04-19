@@ -12,6 +12,7 @@ import pytest
 from gnucash_mcp.logging_config import (
     AUDIT_LOGGER_NAME,
     DEBUG_LOGGER_NAME,
+    _resolve_entry_field,
     audit_log,
     setup_logging,
 )
@@ -266,6 +267,135 @@ class TestTextFormat:
         assert "test_read" not in content
         assert "balance" not in content
 
+    def test_text_format_update_falls_back_to_params_for_splits(
+        self, temp_book_path, temp_log_dir
+    ):
+        """UPDATE audit entry still shows new splits when response trims them.
+
+        Phase 3 of the token-efficiency pass will shrink
+        ``update_transaction``'s response. When ``after_state`` omits
+        ``splits``, ``description``, or ``date``, the audit log should
+        pull them from tool params instead so the text view keeps the
+        before/after diff detail human reviewers rely on.
+        """
+        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+
+        @audit_log(
+            classification="write",
+            operation="update",
+            entity_type="transaction",
+        )
+        def test_update(
+            guid: str,
+            description: str,
+            transaction_date: str,
+            splits: list,
+        ) -> str:
+            # Simulated thin response: no description, date, or splits.
+            # before_state must exist for the UPDATE handler to render —
+            # patch _capture_before_state via kwargs the decorator sees.
+            return json.dumps({"guid": guid, "status": "updated"})
+
+        # Inject before_state by patching the capture helper just for
+        # this test — otherwise the decorator gets None back and the
+        # UPDATE handler emits just the header line.
+        with patch(
+            "gnucash_mcp.logging_config._capture_before_state",
+            return_value={
+                "description": "Old description",
+                "date": "2026-01-01",
+                "splits": [
+                    {"account": "Expenses:Old", "value": "10.00"},
+                    {"account": "Assets:Checking", "value": "-10.00"},
+                ],
+            },
+        ):
+            test_update(
+                guid="abcdef01",
+                description="New description",
+                transaction_date="2026-02-15",
+                splits=[
+                    {"account": "Expenses:New", "value": "20.00"},
+                    {"account": "Assets:Checking", "value": "-20.00"},
+                ],
+            )
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        # Header present
+        assert "UPDATE TRANSACTION" in content
+        # Description diff rendered from params, not response
+        assert 'Description: "Old description" → "New description"' in content
+        # Date diff rendered from params (transaction_date -> date mapping)
+        assert "Date: 2026-01-01 → 2026-02-15" in content
+        # Splits diff rendered from params (response had none)
+        assert "Splits (before):" in content
+        assert "Splits (after):" in content
+        assert "Old" in content  # old split account leaf
+        assert "New" in content  # new split account leaf
+
+    def test_text_format_replace_splits_falls_back_to_params(
+        self, temp_book_path, temp_log_dir
+    ):
+        """REPLACE_SPLITS audit entry uses params for new splits when
+        response drops the ``splits`` echo.
+
+        Phase 3 will trim ``replace_splits`` to only return
+        ``{guid, status, previous_splits, warnings}`` — the new splits
+        must come from tool params in the audit log.
+        """
+        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+
+        @audit_log(
+            classification="write",
+            operation="replace_splits",
+            entity_type="transaction",
+        )
+        def test_replace_splits(guid: str, splits: list) -> str:
+            # Simulated thin response: no splits echo, just previous_splits.
+            return json.dumps({
+                "guid": guid,
+                "status": "splits_replaced",
+                "previous_splits": [
+                    {"account": "Expenses:Groceries", "value": "50.00"},
+                    {"account": "Assets:Checking", "value": "-50.00"},
+                ],
+            })
+
+        # Before-state gives description/date (they don't change on
+        # replace_splits, but the audit log still wants to show them).
+        with patch(
+            "gnucash_mcp.logging_config._capture_before_state",
+            return_value={
+                "description": "Recategorize",
+                "date": "2026-02-10",
+            },
+        ):
+            test_replace_splits(
+                guid="abcdef02",
+                splits=[
+                    {"account": "Expenses:Dining", "amount": "50.00"},
+                    {"account": "Assets:Checking", "amount": "-50.00"},
+                ],
+            )
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        assert "REPLACE SPLITS" in content
+        # Description/date from before_state
+        assert "Recategorize" in content
+        assert "2026-02-10" in content
+        # Before splits from response (previous_splits is preserved)
+        assert "Splits (before):" in content
+        assert "Groceries" in content
+        # After splits from params (response no longer echoes them)
+        assert "Splits (after):" in content
+        assert "Dining" in content
+
     def test_text_format_logs_replace_splits(self, temp_book_path, temp_log_dir):
         """Verify text format logs replace_splits with before and after splits."""
         setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
@@ -304,6 +434,76 @@ class TestTextFormat:
         assert "Splits (after):" in content
         assert "Groceries" in content  # Old split (formatted as leaf name)
         assert "Dining" in content  # New split (formatted as leaf name)
+
+
+class TestResolveEntryField:
+    """Unit tests for the ``_resolve_entry_field`` fallback helper.
+
+    The helper unifies the lookup order across audit entry sources so
+    trimmed responses still render richly in the human-readable log:
+    after_state → params → before_state → None.
+    """
+
+    def test_after_state_wins_when_present(self):
+        entry = {
+            "after_state": {"description": "from after"},
+            "params": {"description": "from params"},
+            "before_state": {"description": "from before"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from after"
+
+    def test_falls_through_to_params_when_after_empty(self):
+        entry = {
+            "after_state": {},
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_falls_through_to_before_state(self):
+        entry = {
+            "after_state": None,
+            "params": {},
+            "before_state": {"description": "from before"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from before"
+
+    def test_returns_none_when_missing_everywhere(self):
+        assert _resolve_entry_field({}, "description") is None
+
+    def test_alternate_params_key(self):
+        """Response ``date`` maps to params ``transaction_date``."""
+        entry = {"params": {"transaction_date": "2026-01-15"}}
+        assert _resolve_entry_field(
+            entry, "date", params_key="transaction_date"
+        ) == "2026-01-15"
+
+    def test_empty_string_is_not_present(self):
+        """Falsy values fall through — after's empty desc yields to params."""
+        entry = {
+            "after_state": {"description": ""},
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_empty_list_is_not_present(self):
+        """Empty splits list falls through to a populated params list."""
+        entry = {
+            "after_state": {"splits": []},
+            "params": {"splits": [{"account": "Assets:Checking"}]},
+        }
+        assert _resolve_entry_field(entry, "splits") == [{"account": "Assets:Checking"}]
+
+    def test_none_after_state_handled(self):
+        """after_state being None (not just empty) is safe."""
+        entry = {
+            "after_state": None,
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_missing_sources_handled(self):
+        """Entries without any source keys don't crash."""
+        assert _resolve_entry_field({"timestamp": "..."}, "anything") is None
 
 
 class TestAuditLogIntegration:

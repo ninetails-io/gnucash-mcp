@@ -33,6 +33,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
+    _split_to_compact_dict,
     _split_to_dict,
     _transaction_to_compact_line,
     _transaction_to_dict,
@@ -1621,7 +1622,18 @@ class CoreMixin:
 
             book.save()
 
-            return _transaction_to_dict(transaction) | {"status": "updated"}
+            # Thin response — the LLM submitted the changes, so the only
+            # fields worth echoing are enough for a quick sanity check
+            # (guid + currently-stored description/date). If they want
+            # the full post-update state they can call get_transaction.
+            # The audit log resolves splits/description/date from params
+            # when absent from after_state (see _resolve_entry_field).
+            return {
+                "guid": transaction.guid,
+                "date": transaction.post_date.isoformat(),
+                "description": transaction.description,
+                "status": "updated",
+            }
 
     def replace_splits(
         self,
@@ -1673,8 +1685,13 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # 2. Capture previous splits for audit trail (before deletion)
-            previous_splits = [_split_to_dict(s) for s in transaction.splits]
+            # 2. Capture previous splits for audit trail (before deletion).
+            # Use the compact serializer — old-split GUIDs are not
+            # addressable anymore, quantity/memo/reconcile_state only
+            # emit when non-default. ~50 chars/split vs. ~140.
+            previous_splits = [
+                _split_to_compact_dict(s) for s in transaction.splits
+            ]
 
             # 3. Resolve and validate all accounts upfront
             resolved_accounts = []
@@ -1759,10 +1776,19 @@ class CoreMixin:
             # 8. Save
             book.save()
 
-            # 9. Build response
-            result = _transaction_to_dict(transaction)
-            result["previous_splits"] = previous_splits
-            result["status"] = "splits_replaced"
+            # 9. Build thin response.
+            # - `splits` echo dropped (LLM just submitted them).
+            # - description/date/currency/notes don't change on a splits
+            #   replace, so no reason to re-send them.
+            # - previous_splits is the one piece the LLM doesn't already
+            #   have — kept so callers can diff / undo / confirm.
+            # - Audit log falls back to params for the "after" splits
+            #   (see logging_config._resolve_entry_field).
+            result = {
+                "guid": transaction.guid,
+                "status": "splits_replaced",
+                "previous_splits": previous_splits,
+            }
             if warnings:
                 result["warnings"] = warnings
 

@@ -305,6 +305,50 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
     return "\n".join(lines)
 
 
+def _resolve_entry_field(
+    entry: dict, field: str, params_key: str | None = None
+):
+    """Look up a field in an audit entry, falling back through sources.
+
+    Write tool responses are trimmed for LLM token efficiency — several
+    fields the human-readable audit log wants to display (splits,
+    description, date) may not appear in ``after_state``. This helper
+    unifies the lookup order:
+
+    1. ``after_state`` — the tool's response, richest when present
+    2. ``params`` — the tool's inputs; for most write ops this is the
+       same information the LLM would have put in the response
+    3. ``before_state`` — the pre-write snapshot captured by the
+       audit decorator (useful for REPLACE_SPLITS where description /
+       date aren't in response OR params)
+
+    A falsy value ("", [], {}, None) in any source is treated as "not
+    present" and falls through to the next. Callers that need to
+    distinguish "really empty" from "missing" should consult the
+    individual sources directly.
+
+    Args:
+        entry: The audit entry dict.
+        field: Key to look up in ``after_state`` and ``before_state``.
+        params_key: Alternate key in ``params`` when the response and
+                    params use different names (e.g. response: "date",
+                    params: "transaction_date"). Defaults to ``field``.
+
+    Returns:
+        The resolved value, or None if not found in any source.
+    """
+    sources = (
+        (entry.get("after_state") or {}, field),
+        (entry.get("params") or {}, params_key or field),
+        (entry.get("before_state") or {}, field),
+    )
+    for src, key in sources:
+        value = src.get(key)
+        if value:
+            return value
+    return None
+
+
 def _format_audit_entry_text(entry: dict) -> str:
     """Format an audit entry as human-readable text.
 
@@ -350,29 +394,43 @@ def _format_audit_entry_text(entry: dict) -> str:
 
         elif operation == "UPDATE":
             lines.append(f"{time_part}  UPDATE TRANSACTION  guid:{guid_short}")
-            if before and after:
-                # Description change
+            if before:
+                # Description / date / splits may be trimmed out of the
+                # response to save LLM tokens — pull from params (tool
+                # inputs) as a fallback, then before_state to show
+                # "unchanged" when the caller didn't touch that field.
                 old_desc = before.get("description", "")
-                new_desc = after.get("description", "")
+                new_desc = (
+                    _resolve_entry_field(entry, "description")
+                    or old_desc
+                )
+                old_date = before.get("date", "")
+                new_date = (
+                    _resolve_entry_field(
+                        entry, "date", params_key="transaction_date"
+                    )
+                    or old_date
+                )
+                old_splits = before.get("splits") or []
+                new_splits = (
+                    _resolve_entry_field(entry, "splits") or old_splits
+                )
+
                 if old_desc != new_desc:
                     lines.append(f'{indent}Description: "{old_desc}" → "{new_desc}"')
                 else:
                     lines.append(f'{indent}Description: "{old_desc}"')
 
-                # Date change
-                old_date = before.get("date", "")
-                new_date = after.get("date", "")
                 if old_date != new_date:
                     lines.append(f"{indent}Date: {old_date} → {new_date}")
                 else:
                     lines.append(f"{indent}Date: {old_date} (unchanged)")
 
-                # Splits change
-                if before.get("splits") != after.get("splits"):
+                if old_splits != new_splits:
                     lines.append(f"{indent}Splits (before):")
-                    lines.append(_format_splits_text(before.get("splits", []), indent + "  "))
+                    lines.append(_format_splits_text(old_splits, indent + "  "))
                     lines.append(f"{indent}Splits (after):")
-                    lines.append(_format_splits_text(after.get("splits", []), indent + "  "))
+                    lines.append(_format_splits_text(new_splits, indent + "  "))
 
         elif operation == "VOID":
             lines.append(f"{time_part}  VOID TRANSACTION  guid:{guid_short}")
@@ -405,25 +463,33 @@ def _format_audit_entry_text(entry: dict) -> str:
 
         elif operation == "REPLACE_SPLITS":
             lines.append(f"{time_part}  REPLACE SPLITS  guid:{guid_short}")
-            if after:
-                desc = after.get("description", "")
-                date_str = after.get("date", "")
+            # Description and date aren't echoed in the thin response
+            # (they didn't change anyway). Pull from before_state for
+            # the "transaction header" line.
+            desc = _resolve_entry_field(entry, "description") or ""
+            date_str = _resolve_entry_field(entry, "date") or ""
+            if desc or date_str:
                 lines.append(f'{indent}"{desc}" ({date_str})')
-                # Show before splits (from previous_splits in the response)
-                prev_splits = after.get("previous_splits", [])
-                if prev_splits:
-                    lines.append(f"{indent}Splits (before):")
-                    lines.append(_format_splits_text(prev_splits, indent + "  "))
-                # Show after splits
-                new_splits = after.get("splits", [])
-                if new_splits:
-                    lines.append(f"{indent}Splits (after):")
-                    lines.append(_format_splits_text(new_splits, indent + "  "))
-                # Show warnings if any
-                warnings = after.get("warnings", [])
-                if warnings:
-                    for w in warnings:
-                        lines.append(f"{indent}Warning: {w}")
+
+            # previous_splits stays in after_state — it's the piece the
+            # LLM doesn't already know.
+            prev_splits = (after or {}).get("previous_splits", [])
+            if prev_splits:
+                lines.append(f"{indent}Splits (before):")
+                lines.append(_format_splits_text(prev_splits, indent + "  "))
+
+            # New splits: after_state may echo them back, or may be
+            # trimmed — fall back to params (what the LLM submitted).
+            new_splits = _resolve_entry_field(entry, "splits")
+            if new_splits:
+                lines.append(f"{indent}Splits (after):")
+                lines.append(_format_splits_text(new_splits, indent + "  "))
+
+            # Warnings live only in after_state (genuinely new info).
+            warnings = (after or {}).get("warnings", [])
+            if warnings:
+                for w in warnings:
+                    lines.append(f"{indent}Warning: {w}")
 
     elif entity_type == "account":
         if operation == "CREATE":

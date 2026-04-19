@@ -249,7 +249,7 @@ def _account_to_compact_line(account: piecash.Account) -> str:
 
 
 def _split_to_dict(split: piecash.Split) -> dict:
-    """Convert a piecash Split to a serializable dict."""
+    """Convert a piecash Split to a full serializable dict."""
     rec_date = split.reconcile_date
     if rec_date and rec_date.year <= 1970:
         rec_date = None
@@ -263,6 +263,43 @@ def _split_to_dict(split: piecash.Split) -> dict:
         "reconcile_date": rec_date.isoformat() if rec_date else None,
         "lot_guid": split.lot.guid if split.lot else None,
     }
+
+
+def _split_to_compact_dict(split: piecash.Split) -> dict:
+    """Tight serialization of a Split for history / audit contexts.
+
+    Emits only what's useful to an LLM reading a splits-before list:
+
+    - ``account`` — what was it categorized as
+    - ``value`` — how much (in transaction currency)
+    - ``quantity`` — only when it differs from value (cross-currency)
+    - ``memo`` — only when non-empty
+    - ``reconcile_state`` — only when non-default (not ``'n'``)
+
+    Omits:
+
+    - ``guid`` — the splits being described are replaced / gone, so
+      the LLM can't act on their GUIDs anyway
+    - ``reconcile_date`` — rarely meaningful on its own
+    - ``lot_guid`` — domain-specific; ``previous_splits`` callers today
+      don't use it
+
+    Compatible with ``_format_splits_text`` in the audit log formatter
+    (that helper reads ``account`` and ``value`` / ``amount``).
+
+    Per-split payload: ~40-60 chars vs. ~140 for the full dict.
+    """
+    result = {
+        "account": split.account.fullname,
+        "value": str(split.value),
+    }
+    if split.quantity != split.value:
+        result["quantity"] = str(split.quantity)
+    if split.memo:
+        result["memo"] = split.memo
+    if split.reconcile_state and split.reconcile_state != "n":
+        result["reconcile_state"] = split.reconcile_state
+    return result
 
 
 def _transaction_to_dict(transaction: piecash.Transaction) -> dict:

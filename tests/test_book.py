@@ -2045,10 +2045,10 @@ class TestUpdateTransaction:
             notes="P2W1 groceries",
         )
 
+        # Response is thin now (guid/date/description/status). Notes
+        # persistence is verified through get_transaction below.
         assert result["status"] == "updated"
-        assert result["notes"] == "P2W1 groceries"
 
-        # Verify persistence
         updated = gc_book.get_transaction(guid)
         assert updated["notes"] == "P2W1 groceries"
 
@@ -2162,8 +2162,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Response is thin — no splits echo. Verify the new state via
+        # a follow-up read.
         assert result["status"] == "splits_replaced"
-        new_accounts = {s["account"] for s in result["splits"]}
+        refreshed = gc_book.get_transaction(guid)
+        new_accounts = {s["account"] for s in refreshed["splits"]}
         assert "Expenses:Dining" in new_accounts
         assert "Expenses:Groceries" not in new_accounts
 
@@ -2193,10 +2196,12 @@ class TestReplaceSplits:
             ],
         )
 
-        # Identity preserved
+        # guid stays in the thin response. description / date are
+        # preserved on the transaction itself — verified via read-back.
         assert result["guid"] == guid
-        assert result["date"] == original_date
-        assert result["description"] == original_description
+        refreshed = gc_book.get_transaction(guid)
+        assert refreshed["date"] == original_date
+        assert refreshed["description"] == original_description
 
     def test_returns_previous_splits(self, test_book: Path):
         """Should include previous_splits in response for audit trail."""
@@ -2478,8 +2483,10 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify new split count via read-back.
         assert result["status"] == "splits_replaced"
-        assert len(result["splits"]) == 3
+        refreshed = gc_book.get_transaction(guid)
+        assert len(refreshed["splits"]) == 3
 
     def test_reduce_to_two_splits(self, budget_book: Path):
         """Should allow recategorizing to fewer splits than original."""
@@ -2509,8 +2516,10 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify new split count via read-back.
         assert result["status"] == "splits_replaced"
-        assert len(result["splits"]) == 2
+        refreshed = gc_book.get_transaction(guid)
+        assert len(refreshed["splits"]) == 2
 
     def test_preserves_memo(self, test_book: Path):
         """Should preserve memo on new splits when provided."""
@@ -2531,9 +2540,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify memo persistence via read-back.
         assert result["status"] == "splits_replaced"
+        refreshed = gc_book.get_transaction(guid)
         groceries_split = next(
-            s for s in result["splits"] if s["account"] == "Expenses:Groceries"
+            s for s in refreshed["splits"] if s["account"] == "Expenses:Groceries"
         )
         assert groceries_split["memo"] == "Updated memo"
 
@@ -2576,9 +2587,11 @@ class TestReplaceSplits:
             ],
         )
 
+        # Thin response — verify the cross-currency quantity via read-back.
         assert result["status"] == "splits_replaced"
+        refreshed = gc_book.get_transaction(guid)
         eur_split = next(
-            s for s in result["splits"] if s["account"] == "Assets:Euro Savings"
+            s for s in refreshed["splits"] if s["account"] == "Assets:Euro Savings"
         )
         assert Decimal(eur_split["quantity"]) == Decimal("182.00")
 
