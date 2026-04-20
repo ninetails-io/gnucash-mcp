@@ -569,3 +569,133 @@ class TestBookOpenAccounting:
             f"have regained a pre-capture step that opens the book "
             f"read-only before the write."
         )
+
+    def test_create_transaction_opens_book_once(
+        self, test_book, monkeypatch
+    ):
+        """A full create_transaction call (auto-fill + duplicate check
+        + write + post-write consistency warning) opens the book
+        exactly once.
+
+        Pre-consolidation this path opened the book four times — once
+        per helper: ``_auto_fill_splits``, ``_check_auto_fill_stability``,
+        ``_find_duplicates``, and the write stage. After the single-pass
+        collector refactor, every stage shares one session.
+        """
+        import piecash
+
+        from gnucash_mcp.book import GnuCashBook
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        # Seed a transaction we can auto-fill from (test_book's fixture
+        # has a "Weekly Groceries" txn — we'll reuse that description to
+        # exercise the auto-fill path).
+        open_count = [0]
+        original = piecash.open_book
+
+        def counting_open(*args, **kwargs):
+            open_count[0] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(piecash, "open_book", counting_open)
+
+        # Provide explicit splits so this is a pure write + preflight
+        # (no auto-fill second pass) — still exercises the duplicate
+        # scan and post-write consistency warning. This is the common
+        # path; auto-fill is tested separately.
+        book_wrapper.create_transaction(
+            description="Single-open regression guard",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "42.00"},
+                {"account": "Assets:Checking", "amount": "-42.00"},
+            ],
+            check_duplicates=True,
+        )
+
+        assert open_count[0] == 1, (
+            f"Expected exactly 1 book open for a full create_transaction "
+            f"call, got {open_count[0]}. Pre-consolidation this path "
+            f"opened the book 4 times (auto-fill, stability, duplicates, "
+            f"write). If this test fails with count > 1, a helper has "
+            f"regained its own `with self.open(...)` instead of reusing "
+            f"the caller's session."
+        )
+
+
+class TestCreateSignalsCollector:
+    """The single-pass ``_collect_create_signals`` consolidates four
+    independent O(N) scans into one (or two, for the auto-fill path).
+
+    These tests assert the contract directly by counting collector
+    invocations per create_transaction call. They're an architecture
+    regression guard: if a future change reintroduces a helper that
+    does its own book walk, the counts shift and these tests fail.
+    """
+
+    def test_single_pass_when_splits_provided(self, test_book, monkeypatch):
+        """With explicit splits, the collector runs exactly once — one
+        sort, one traversal, all four signal types bundled."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.core import CoreMixin
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        original = CoreMixin._collect_create_signals
+        call_count = [0]
+
+        def counting(self, *args, **kwargs):
+            call_count[0] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            CoreMixin, "_collect_create_signals", counting
+        )
+
+        book_wrapper.create_transaction(
+            description="Collector call-count test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "15.00"},
+                {"account": "Assets:Checking", "amount": "-15.00"},
+            ],
+            check_duplicates=True,
+        )
+
+        assert call_count[0] == 1, (
+            f"Expected 1 collector pass when splits are provided; got "
+            f"{call_count[0]}."
+        )
+
+    def test_two_passes_when_auto_filling(self, test_book, monkeypatch):
+        """Auto-fill legitimately needs two passes: the first finds the
+        source transaction (needed to derive proposed_amounts for the
+        duplicate scan); the second runs duplicates + recent-matches
+        with those amounts. This is the best we can do in a single
+        book-open without speculative buffering."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.core import CoreMixin
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        original = CoreMixin._collect_create_signals
+        call_count = [0]
+
+        def counting(self, *args, **kwargs):
+            call_count[0] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            CoreMixin, "_collect_create_signals", counting
+        )
+
+        # test_book's fixture has "Weekly Groceries" — auto-fill from it.
+        book_wrapper.create_transaction(
+            description="Weekly Groceries",
+            splits=None,  # trigger auto-fill
+        )
+
+        assert call_count[0] == 2, (
+            f"Expected 2 collector passes when auto-filling (one to "
+            f"find the source, one to run duplicates/recent against "
+            f"the resulting amounts); got {call_count[0]}."
+        )

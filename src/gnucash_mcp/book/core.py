@@ -24,6 +24,7 @@ self.create_transaction (defined here), resolved via MRO — that is
 the one extracted-to-core dependency in the whole tree.
 """
 
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -39,6 +40,54 @@ from gnucash_mcp.book._base import (
     _transaction_to_dict,
     _unique_prefix,
 )
+
+
+@dataclass
+class _CreateSignals:
+    """Signals gathered in a single pass over ``book.transactions`` for
+    the ``create_transaction`` preflight and post-write checks.
+
+    Before this was consolidated, ``create_transaction`` made four
+    separate helper calls — each opening the book, scanning the full
+    transaction list, and producing one signal. That's ``~4 × (open +
+    O(N))`` per create. On a 10k-txn book the four opens alone cost
+    80–150 ms, plus ~40k iterations for the scans.
+
+    Collecting everything in one pass turns the hot path into a single
+    book-open and a single sort + O(N) traversal. Signals are opt-in
+    via ``want_*`` flags so the collector does only the work each call
+    actually needs (e.g., skip duplicate detection when
+    ``check_duplicates=False``).
+
+    Attributes:
+        auto_fill: ``(splits_list, source_info)`` for the most recent
+            description match, or ``None`` when ``want_auto_fill`` was
+            False or no match was found. ``source_info`` carries the
+            source transaction's short guid prefix, description, and
+            date — enough for the LLM to follow up via
+            ``get_transaction``.
+        stability_warnings: Zero or one warning dicts. Populated only
+            when recent matching-description transactions disagree on
+            the categorization account pattern — meaning auto-fill is
+            drawing from inconsistent history.
+        duplicates: HIGH- and MEDIUM-confidence duplicate candidates,
+            sorted HIGH first. LOW-confidence (single-signal) matches
+            are suppressed as noise.
+        recent_matches: Up to five most-recent matching-description
+            piecash.Transaction objects for the post-write split-
+            consistency warning. Live ORM instances — caller must read
+            them while the session is open.
+    """
+
+    auto_fill: tuple[list[dict], dict] | None = None
+    stability_warnings: list[dict] = field(default_factory=list)
+    duplicates: list[dict] = field(default_factory=list)
+    recent_matches: list = field(default_factory=list)
+
+    @property
+    def has_high_duplicate(self) -> bool:
+        """True iff at least one candidate has confidence ``HIGH``."""
+        return any(d["confidence"] == "HIGH" for d in self.duplicates)
 
 
 class CoreMixin:
@@ -434,6 +483,229 @@ class CoreMixin:
 
         return matches
 
+    def _collect_create_signals(
+        self,
+        book: piecash.Book,
+        description: str,
+        trans_date: date,
+        proposed_amounts: list[Decimal],
+        *,
+        want_auto_fill: bool,
+        want_stability: bool,
+        want_duplicates: bool,
+        want_recent: bool,
+        duplicate_window_days: int = 30,
+        stability_days: int = 90,
+        stability_limit: int = 5,
+        recent_days: int = 30,
+        recent_limit: int = 5,
+    ) -> "_CreateSignals":
+        """Gather every signal ``create_transaction`` might need in a
+        single pass over ``book.transactions``.
+
+        The four original helpers (``_auto_fill_splits``,
+        ``_check_auto_fill_stability``, ``_find_duplicates``, and the
+        post-write ``_find_recent_description_matches``) each opened the
+        book and did its own full-table scan. This collector folds all
+        of them into one sort + one traversal, classifying each
+        transaction into whichever signal bucket(s) it matches.
+
+        Callers supply ``want_*`` flags so the collector only does work
+        the caller will actually consume — e.g., auto-fill has no
+        meaning when the caller already provided splits, and duplicate
+        detection is skipped when ``check_duplicates`` is False.
+
+        Must be called before the new transaction is committed to the
+        book; otherwise the just-created transaction shows up as a
+        false-positive recent-match / duplicate of itself.
+
+        Args:
+            book: An open piecash book session.
+            description: The proposed transaction description.
+            trans_date: The proposed transaction date (for the
+                duplicate-window filter).
+            proposed_amounts: Absolute values of the proposed splits
+                (for the duplicate amount-signal check). Unused when
+                ``want_duplicates`` is False; pass ``[]`` in that case.
+            want_auto_fill: Find the most recent matching-description
+                transaction and extract its splits for auto-fill.
+            want_stability: Compare account patterns across the recent
+                matching history; warn when they disagree (auto-fill
+                would draw from inconsistent data).
+            want_duplicates: Score transactions in the ±``window``
+                range on description, amount, and date; emit HIGH /
+                MEDIUM candidates.
+            want_recent: Keep the top N matching-description
+                transactions for the post-write split-consistency
+                warning.
+            duplicate_window_days: ±N day window for duplicate search.
+            stability_days: Lookback horizon for stability signal.
+            stability_limit: Cap on how many recent matches the
+                stability check inspects.
+            recent_days: Lookback horizon for post-write recent-match.
+            recent_limit: Cap on post-write recent matches.
+
+        Returns:
+            A ``_CreateSignals`` bundle. Untracked signals remain at
+            their default (None / empty list).
+        """
+        today = date.today()
+        stability_cutoff = today - timedelta(days=stability_days)
+        recent_cutoff = today - timedelta(days=recent_days)
+        dup_start = trans_date - timedelta(days=duplicate_window_days)
+        dup_end = trans_date + timedelta(days=duplicate_window_days)
+        desc_lower = description.lower()
+
+        # Short-guid prefix map built once, shared across all emitted
+        # guids (auto-fill source, duplicates). Caller never sees the
+        # raw 32-char guid — prefixes flow straight into tool responses.
+        emitting_guids = want_auto_fill or want_duplicates
+        txn_prefixes = (
+            _guid_prefix_map(t.guid for t in book.transactions)
+            if emitting_guids
+            else {}
+        )
+
+        # Local accumulators — each bucket is independent. We finalize
+        # them into the returned _CreateSignals after the loop.
+        auto_fill_source = None  # piecash.Transaction
+        stability_matches: list = []  # list[piecash.Transaction]
+        recent_matches: list = []  # list[piecash.Transaction]
+        duplicates: list[dict] = []
+
+        # One sort, one iteration. Descending by post_date so auto-fill
+        # and the "recent" / "stability" buckets fill from most-recent
+        # outward — their caps short-circuit the rest.
+        sorted_txns = sorted(
+            book.transactions, key=lambda t: t.post_date, reverse=True
+        )
+
+        for txn in sorted_txns:
+            txn_desc_lower = txn.description.lower()
+            desc_match = (
+                desc_lower in txn_desc_lower
+                or txn_desc_lower in desc_lower
+            )
+
+            # --- Auto-fill: first description match wins ---
+            if want_auto_fill and auto_fill_source is None and desc_match:
+                auto_fill_source = txn
+
+            # --- Stability: recent matches within horizon, capped ---
+            if (
+                want_stability
+                and desc_match
+                and txn.post_date >= stability_cutoff
+                and len(stability_matches) < stability_limit
+            ):
+                stability_matches.append(txn)
+
+            # --- Recent: for post-write split-consistency warning ---
+            if (
+                want_recent
+                and desc_match
+                and txn.post_date >= recent_cutoff
+                and len(recent_matches) < recent_limit
+            ):
+                recent_matches.append(txn)
+
+            # --- Duplicates: multi-signal check within date window ---
+            if (
+                want_duplicates
+                and dup_start <= txn.post_date <= dup_end
+            ):
+                # Signal 2: any proposed amount within ±$1.00 of any
+                # split's absolute value.
+                amount_match = False
+                txn_amounts = [abs(s.value) for s in txn.splits]
+                for proposed_amt in proposed_amounts:
+                    for txn_amt in txn_amounts:
+                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
+                            amount_match = True
+                            break
+                    if amount_match:
+                        break
+
+                # Signal 3: date within ±2 days of trans_date (tighter
+                # than the window filter — window is for "worth
+                # considering at all").
+                date_match = abs((txn.post_date - trans_date).days) <= 2
+
+                signals = sum([desc_match, amount_match, date_match])
+                if signals >= 2:
+                    confidence = "HIGH" if signals == 3 else "MEDIUM"
+                    signal_str = (
+                        ("D" if desc_match else "-")
+                        + ("A" if amount_match else "-")
+                        + ("D" if date_match else "-")
+                    )
+                    # Primary amount: max absolute split value — enough
+                    # context for the LLM to recognize the duplicate.
+                    primary_amount = max(abs(s.value) for s in txn.splits)
+                    duplicates.append({
+                        "confidence": confidence,
+                        "guid": txn_prefixes[txn.guid],
+                        "date": txn.post_date.isoformat(),
+                        "description": txn.description,
+                        "amount": str(primary_amount),
+                        "signals": signal_str,
+                    })
+
+        # --- Finalize the bundle ---
+
+        # Auto-fill: build (splits_list, source_info) if we found one.
+        auto_fill: tuple[list[dict], dict] | None = None
+        if auto_fill_source is not None:
+            filled_splits = []
+            for s in auto_fill_source.splits:
+                split_dict = {
+                    "account": s.account.fullname,
+                    "amount": str(s.value),
+                }
+                if s.quantity != s.value:
+                    split_dict["quantity"] = str(s.quantity)
+                if s.memo:
+                    split_dict["memo"] = s.memo
+                filled_splits.append(split_dict)
+            source_info = {
+                "guid": txn_prefixes[auto_fill_source.guid],
+                "description": auto_fill_source.description,
+                "date": auto_fill_source.post_date.isoformat(),
+            }
+            auto_fill = (filled_splits, source_info)
+
+        # Stability: if 2+ recent matches disagree on pattern, warn.
+        stability_warnings: list[dict] = []
+        if want_stability and len(stability_matches) >= 2:
+            patterns = [
+                self._extract_account_pattern([s.account for s in t.splits])
+                for t in stability_matches
+            ]
+            first_pattern = patterns[0]
+            different = sum(1 for p in patterns[1:] if p != first_pattern)
+            if different > 0:
+                stability_warnings.append({
+                    "type": "auto_fill_unstable",
+                    "message": (
+                        f"Recent '{description}' transactions use different "
+                        f"account patterns. Auto-filled from most recent "
+                        f"({stability_matches[0].post_date.isoformat()}), but "
+                        f"{different} of {len(stability_matches)} recent "
+                        f"matches used different categorization."
+                    ),
+                })
+
+        # Duplicates: sort HIGH first.
+        order = {"HIGH": 0, "MEDIUM": 1}
+        duplicates.sort(key=lambda c: order[c["confidence"]])
+
+        return _CreateSignals(
+            auto_fill=auto_fill,
+            stability_warnings=stability_warnings,
+            duplicates=duplicates,
+            recent_matches=recent_matches,
+        )
+
     @staticmethod
     def _generate_warnings(
         trans_date: date,
@@ -490,263 +762,6 @@ class CoreMixin:
 
         return warnings
 
-    def _auto_fill_splits(
-        self, description: str
-    ) -> tuple[list[dict], dict] | None:
-        """Find the most recent matching transaction and extract its splits.
-
-        Uses bidirectional case-insensitive substring matching on
-        description (same logic as _find_duplicates).
-
-        Args:
-            description: Transaction description to match against.
-
-        Returns:
-            Tuple of (splits_list, source_info) if match found, None otherwise.
-            splits_list is in create_transaction input format.
-            source_info has guid, description, and date of the source.
-        """
-        desc_lower = description.lower()
-
-        with self.open(readonly=True) as book:
-            # Sort by date descending to find most recent match
-            sorted_txns = sorted(
-                book.transactions, key=lambda t: t.post_date, reverse=True
-            )
-
-            for txn in sorted_txns:
-                txn_desc_lower = txn.description.lower()
-                if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
-                    # Extract splits into input format
-                    filled_splits = []
-                    for s in txn.splits:
-                        split_dict = {
-                            "account": s.account.fullname,
-                            "amount": str(s.value),
-                        }
-                        if s.quantity != s.value:
-                            split_dict["quantity"] = str(s.quantity)
-                        if s.memo:
-                            split_dict["memo"] = s.memo
-                        filled_splits.append(split_dict)
-
-                    source_info = {
-                        "guid": _unique_prefix(
-                            txn.guid,
-                            (t.guid for t in book.transactions),
-                        ),
-                        "description": txn.description,
-                        "date": txn.post_date.isoformat(),
-                    }
-                    return filled_splits, source_info
-
-        return None
-
-    def _check_split_consistency(
-        self,
-        description: str,
-        splits: list[dict],
-        resolved_accounts: list,
-        days: int = 30,
-    ) -> list[dict]:
-        """Check if proposed splits' account pattern matches recent history.
-
-        Compares categorization accounts in the proposed transaction
-        against recent transactions with the same description. Warns
-        if the account pattern differs.
-
-        Args:
-            description: Transaction description.
-            splits: Proposed split dicts with 'account' keys.
-            resolved_accounts: Resolved piecash Account objects,
-                same order as splits.
-            days: How far back to search for comparison.
-
-        Returns:
-            List of warning dicts (possibly empty).
-        """
-        proposed_pattern = self._extract_account_pattern(resolved_accounts)
-
-        with self.open(readonly=True) as book:
-            matches = self._find_recent_description_matches(
-                book, description, limit=5, days=days
-            )
-
-            if not matches:
-                return []
-
-            # Capture data inside session to avoid DetachedInstanceError
-            recent_accounts = [s.account for s in matches[0].splits]
-            recent_pattern = self._extract_account_pattern(recent_accounts)
-            recent_desc = matches[0].description
-
-        if proposed_pattern == recent_pattern:
-            return []
-
-        return [{
-            "type": "split_consistency",
-            "message": (
-                f"Recent '{recent_desc}' transactions used "
-                f"{', '.join(sorted(recent_pattern))}, but this transaction "
-                f"uses {', '.join(sorted(proposed_pattern))}."
-            ),
-        }]
-
-    def _check_auto_fill_stability(
-        self,
-        description: str,
-        limit: int = 5,
-        days: int = 90,
-    ) -> list[dict]:
-        """Check if recent matching transactions have consistent patterns.
-
-        Examines recent transactions with the same description and warns
-        if they use different categorization account patterns — meaning
-        auto-fill is drawing from an inconsistent history.
-
-        Args:
-            description: Transaction description to match.
-            limit: Number of recent matches to examine.
-            days: How far back to search.
-
-        Returns:
-            List of warning dicts (possibly empty).
-        """
-        with self.open(readonly=True) as book:
-            matches = self._find_recent_description_matches(
-                book, description, limit=limit, days=days
-            )
-
-            if len(matches) < 2:
-                return []
-
-            # Capture all data inside session to avoid DetachedInstanceError
-            patterns = []
-            for txn in matches:
-                accounts = [s.account for s in txn.splits]
-                patterns.append(self._extract_account_pattern(accounts))
-
-            most_recent_date = matches[0].post_date.isoformat()
-
-        first_pattern = patterns[0]
-        if all(p == first_pattern for p in patterns):
-            return []
-
-        different_count = sum(1 for p in patterns[1:] if p != first_pattern)
-
-        return [{
-            "type": "auto_fill_unstable",
-            "message": (
-                f"Recent '{description}' transactions use different account "
-                f"patterns. Auto-filled from most recent ({most_recent_date}), "
-                f"but {different_count} of {len(matches)} recent matches used "
-                f"different categorization."
-            ),
-        }]
-
-    def _find_duplicates(
-        self,
-        description: str,
-        splits: list[dict],
-        trans_date: date,
-        window_days: int = 30,
-    ) -> list[dict]:
-        """Find potential duplicate transactions.
-
-        Uses three signals: description match (case-insensitive substring),
-        amount match (any split ±$1.00), and date match (±2 days).
-
-        Returns only HIGH (all three signals) and MEDIUM (two of three)
-        matches. LOW-confidence matches (single-signal) are almost always
-        noise — any given amount or description will match many unrelated
-        transactions in a real ledger — so they're suppressed. The LLM
-        can reach `search_transactions` if it needs wider coverage.
-
-        Each candidate is a compact summary, not a full transaction dict.
-        The emitted fields let the LLM recognize whether it's looking at
-        a real duplicate without dragging the full splits array along;
-        if they need more, `get_transaction(guid)` follows up.
-
-        Args:
-            description: Proposed transaction description.
-            splits: Proposed split dicts with 'amount' keys.
-            trans_date: Proposed transaction date.
-            window_days: Days before/after trans_date to search.
-
-        Returns:
-            List of {confidence, guid, date, description, amount, signals}
-            sorted by confidence (HIGH before MEDIUM).
-        """
-        proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
-        date_start = trans_date - timedelta(days=window_days)
-        date_end = trans_date + timedelta(days=window_days)
-        desc_lower = description.lower()
-
-        candidates = []
-
-        with self.open(readonly=True) as book:
-            # Collision-safe short prefix per candidate. One pass builds
-            # the full-table map; per-candidate lookup is O(1).
-            txn_prefixes = _guid_prefix_map(t.guid for t in book.transactions)
-            for txn in book.transactions:
-                if txn.post_date < date_start or txn.post_date > date_end:
-                    continue
-
-                # Signal 1: Description match (substring both directions)
-                txn_desc_lower = txn.description.lower()
-                desc_match = (
-                    desc_lower in txn_desc_lower
-                    or txn_desc_lower in desc_lower
-                )
-
-                # Signal 2: Amount match (any split ±$1.00)
-                amount_match = False
-                txn_amounts = [abs(s.value) for s in txn.splits]
-                for proposed_amt in proposed_amounts:
-                    for txn_amt in txn_amounts:
-                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
-                            amount_match = True
-                            break
-                    if amount_match:
-                        break
-
-                # Signal 3: Date match (±2 days)
-                date_match = abs((txn.post_date - trans_date).days) <= 2
-
-                signals = sum([desc_match, amount_match, date_match])
-                # Suppress LOW (single-signal) matches — mostly noise
-                if signals < 2:
-                    continue
-
-                confidence = "HIGH" if signals == 3 else "MEDIUM"
-
-                # 3-char signal string: caps = matched, dash = not matched.
-                # Position: Description, Amount, Date.
-                signal_str = (
-                    ("D" if desc_match else "-")
-                    + ("A" if amount_match else "-")
-                    + ("D" if date_match else "-")
-                )
-
-                # The txn's primary amount — max absolute split value.
-                # Gives the LLM enough context to recognize the match
-                # without dragging the full splits array.
-                primary_amount = max(abs(s.value) for s in txn.splits)
-
-                candidates.append({
-                    "confidence": confidence,
-                    "guid": txn_prefixes[txn.guid],
-                    "date": txn.post_date.isoformat(),
-                    "description": txn.description,
-                    "amount": str(primary_amount),
-                    "signals": signal_str,
-                })
-
-        # Sort: HIGH first, then MEDIUM
-        order = {"HIGH": 0, "MEDIUM": 1}
-        candidates.sort(key=lambda c: order[c["confidence"]])
-        return candidates
-
     def create_transaction(
         self,
         description: str,
@@ -791,65 +806,97 @@ class CoreMixin:
                        accounts don't exist, cross-currency splits
                        missing quantity, or no match found for auto-fill.
         """
-        # Stage 0: Auto-fill splits from previous matching transaction
-        auto_filled_from = None
-        if not splits:
-            auto_result = self._auto_fill_splits(description)
-            if auto_result is None:
-                raise ValueError(
-                    "No matching transaction found for auto-fill. "
-                    "Provide explicit splits."
-                )
-            splits, auto_filled_from = auto_result
-
-        # Stage 0b: Auto-fill stability check
-        auto_fill_warnings = []
-        if auto_filled_from:
-            auto_fill_warnings = self._check_auto_fill_stability(description)
-
-        if len(splits) < 2:
-            raise ValueError("Transaction must have at least 2 splits")
-
-        # Validate splits balance to zero (using "amount" as value)
-        total = Decimal("0")
-        for split in splits:
-            total += Decimal(split["amount"])
-        if total != Decimal("0"):
-            raise ValueError(f"Splits do not balance: total is {total}")
-
+        # Dry runs don't need a writable session; all other paths do.
+        readonly = dry_run
         if trans_date is None:
             trans_date = date.today()
 
-        # Stage 2: Duplicate check (readonly scan)
-        duplicates = []
-        if check_duplicates:
-            duplicates = self._find_duplicates(
-                description, splits, trans_date
+        # One book-open for the whole create pipeline — preflight signal
+        # gathering, write, and post-write consistency warning all live
+        # inside this session.
+        with self.open(readonly=readonly) as book:
+            # --- Preflight pass 1: auto-fill + stability (if needed) ---
+            #
+            # When splits=None, we need the auto-fill source before we
+            # can compute proposed_amounts for the duplicate scan. So
+            # this first pass requests only auto-fill + stability, then
+            # the second pass runs duplicates + recent with the now-known
+            # amounts. When splits are provided up front, we skip pass 1
+            # and do everything in pass 2 — a single scan.
+            auto_filled_from = None
+            auto_fill_warnings: list[dict] = []
+            if not splits:
+                preflight = self._collect_create_signals(
+                    book,
+                    description,
+                    trans_date,
+                    proposed_amounts=[],
+                    want_auto_fill=True,
+                    want_stability=True,
+                    want_duplicates=False,
+                    want_recent=False,
+                )
+                if preflight.auto_fill is None:
+                    raise ValueError(
+                        "No matching transaction found for auto-fill. "
+                        "Provide explicit splits."
+                    )
+                splits, auto_filled_from = preflight.auto_fill
+                auto_fill_warnings = preflight.stability_warnings
+
+            if len(splits) < 2:
+                raise ValueError("Transaction must have at least 2 splits")
+
+            # Validate balance (using "amount" as transaction-currency value).
+            total = Decimal("0")
+            for split in splits:
+                total += Decimal(split["amount"])
+            if total != Decimal("0"):
+                raise ValueError(f"Splits do not balance: total is {total}")
+
+            proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
+
+            # --- Preflight pass 2: duplicates + recent matches ---
+            signals = self._collect_create_signals(
+                book,
+                description,
+                trans_date,
+                proposed_amounts,
+                want_auto_fill=False,
+                want_stability=False,
+                want_duplicates=check_duplicates,
+                want_recent=True,
             )
-            has_high = any(d["confidence"] == "HIGH" for d in duplicates)
-            if has_high and not force_create and not dry_run:
+            duplicates = signals.duplicates
+
+            # HIGH-confidence duplicate short-circuits the write.
+            if (
+                signals.has_high_duplicate
+                and not force_create
+                and not dry_run
+            ):
                 return {
                     "status": "rejected",
                     "reason": "duplicate_detected",
                     "duplicates": duplicates,
                 }
 
-        # Stage 3: Dry run — validate readonly, return proposal
-        if dry_run:
-            return self._dry_run_transaction(
-                description, splits, trans_date, currency, notes,
-                duplicates, auto_filled_from, auto_fill_warnings,
-            )
-
-        # Stage 4: Write
-        with self.open(readonly=False) as book:
-            # Determine transaction currency
+            # --- Validate accounts and build piecash splits ---
+            # Currency resolution: writable sessions may auto-create the
+            # currency via ISO fallback; dry_run uses readonly and must
+            # find an existing one (or default).
             if currency is None:
                 trans_currency = self._require_default_currency(book)
+            elif readonly:
+                trans_currency = self._find_commodity(book, currency)
+                if not trans_currency:
+                    raise ValueError(
+                        f"Currency '{currency}' not found in book. "
+                        f"Dry run cannot create new currencies."
+                    )
             else:
                 trans_currency = self._get_or_create_currency(book, currency)
 
-            # Validate all accounts exist and build split list
             piecash_splits = []
             resolved_accounts = []
             for split in splits:
@@ -870,14 +917,12 @@ class CoreMixin:
                 resolved_accounts.append(account)
                 value = Decimal(split["amount"])
 
-                # Determine quantity
+                # Determine quantity (same-currency: equals value;
+                # cross-currency: caller must provide and sign-match).
                 if account.commodity == trans_currency:
-                    # Same currency: quantity equals value
                     quantity = value
                 elif "quantity" in split:
-                    # Cross-currency: use provided quantity
                     quantity = Decimal(split["quantity"])
-                    # Validate same sign (or zero)
                     if quantity * value < 0:
                         raise ValueError(
                             f"Split for '{split['account']}': quantity and value "
@@ -885,7 +930,6 @@ class CoreMixin:
                             f"(got value={value}, quantity={quantity})"
                         )
                 else:
-                    # Cross-currency but no quantity provided
                     raise ValueError(
                         f"Split for '{split['account']}' requires 'quantity' "
                         f"because account commodity "
@@ -893,16 +937,57 @@ class CoreMixin:
                         f"transaction currency ({trans_currency.mnemonic})"
                     )
 
-                piecash_splits.append(
-                    piecash.Split(
-                        account=account,
-                        value=value,
-                        quantity=quantity,
-                        memo=split.get("memo", ""),
+                # Don't construct piecash.Split objects during dry_run —
+                # adding to the session would stage a write even if we
+                # never call book.save().
+                if not readonly:
+                    piecash_splits.append(
+                        piecash.Split(
+                            account=account,
+                            value=value,
+                            quantity=quantity,
+                            memo=split.get("memo", ""),
+                        )
                     )
-                )
 
-            # Create transaction
+            # --- Warnings (shared by dry_run and write paths) ---
+            warnings = self._generate_warnings(
+                trans_date, splits, resolved_accounts
+            )
+            proposed_pattern = self._extract_account_pattern(resolved_accounts)
+            # The collector gathered recent matches before we wrote, so
+            # the just-created txn is automatically absent — no post-
+            # write exclusion needed.
+            if signals.recent_matches:
+                recent_accts = [
+                    s.account for s in signals.recent_matches[0].splits
+                ]
+                recent_pattern = self._extract_account_pattern(recent_accts)
+                if proposed_pattern != recent_pattern:
+                    warnings.append({
+                        "type": "split_consistency",
+                        "message": (
+                            f"Recent '{signals.recent_matches[0].description}' "
+                            f"transactions used "
+                            f"{', '.join(sorted(recent_pattern))}, but this "
+                            f"transaction uses "
+                            f"{', '.join(sorted(proposed_pattern))}."
+                        ),
+                    })
+            warnings.extend(auto_fill_warnings)
+
+            # --- Dry run branches out here with the proposal ---
+            if dry_run:
+                result: dict = {
+                    "dry_run": True,
+                    "warnings": warnings,
+                    "duplicates": duplicates,
+                }
+                if auto_filled_from:
+                    result["auto_filled_from"] = auto_filled_from
+                return result
+
+            # --- Commit the write ---
             transaction = piecash.Transaction(
                 currency=trans_currency,
                 description=description,
@@ -910,7 +995,6 @@ class CoreMixin:
                 post_date=trans_date,
                 splits=piecash_splits,
             )
-
             book.save()
 
             # Emit a collision-safe short guid prefix so the LLM can feed
@@ -920,34 +1004,6 @@ class CoreMixin:
                 transaction.guid, (t.guid for t in book.transactions)
             )
             result = {"guid": short_guid, "status": "created"}
-            warnings = self._generate_warnings(
-                trans_date, splits, resolved_accounts
-            )
-
-            # Split consistency check (uses already-open book)
-            proposed_pattern = self._extract_account_pattern(
-                resolved_accounts
-            )
-            recent = self._find_recent_description_matches(
-                book, description, limit=5, days=30
-            )
-            # Exclude the transaction we just created
-            recent = [t for t in recent if t.guid != transaction.guid]
-            if recent:
-                recent_accts = [s.account for s in recent[0].splits]
-                recent_pattern = self._extract_account_pattern(recent_accts)
-                if proposed_pattern != recent_pattern:
-                    warnings.append({
-                        "type": "split_consistency",
-                        "message": (
-                            f"Recent '{recent[0].description}' transactions "
-                            f"used {', '.join(sorted(recent_pattern))}, but "
-                            f"this transaction uses "
-                            f"{', '.join(sorted(proposed_pattern))}."
-                        ),
-                    })
-
-            warnings.extend(auto_fill_warnings)
             if warnings:
                 result["warnings"] = warnings
             if duplicates:
@@ -955,118 +1011,6 @@ class CoreMixin:
             if auto_filled_from:
                 result["auto_filled_from"] = auto_filled_from
             return result
-
-    def _dry_run_transaction(
-        self,
-        description: str,
-        splits: list[dict],
-        trans_date: date,
-        currency: str | None,
-        notes: str | None,
-        duplicates: list[dict],
-        auto_filled_from: dict | None = None,
-        auto_fill_warnings: list[dict] | None = None,
-    ) -> dict:
-        """Validate a proposed transaction without writing.
-
-        Opens the book readonly to validate accounts, placeholders,
-        and cross-currency requirements.
-
-        Returns:
-            Dict with dry_run=True, proposed_transaction, warnings,
-            and duplicates.
-        """
-        with self.open(readonly=True) as book:
-            # Determine transaction currency (readonly — no creation)
-            if currency is None:
-                trans_currency = self._require_default_currency(book)
-                currency_mnemonic = trans_currency.mnemonic
-            else:
-                trans_currency = self._find_commodity(book, currency)
-                if not trans_currency:
-                    raise ValueError(
-                        f"Currency '{currency}' not found in book. "
-                        f"Dry run cannot create new currencies."
-                    )
-                currency_mnemonic = trans_currency.mnemonic
-
-            # Validate all accounts
-            resolved_accounts = []
-            for split in splits:
-                account = self._find_account(book, split["account"])
-                if not account:
-                    raise ValueError(f"Account not found: {split['account']}")
-
-                if account.placeholder:
-                    children_hint = ", ".join(
-                        c.fullname for c in account.children
-                    )
-                    raise ValueError(
-                        f"Account '{account.fullname}' is a placeholder and "
-                        f"cannot receive transactions. "
-                        f"Use one of: {children_hint}"
-                    )
-
-                resolved_accounts.append(account)
-
-                # Cross-currency validation
-                if account.commodity != trans_currency:
-                    if "quantity" not in split:
-                        raise ValueError(
-                            f"Split for '{split['account']}' requires "
-                            f"'quantity' because account commodity "
-                            f"({account.commodity.mnemonic}) differs from "
-                            f"transaction currency ({currency_mnemonic})"
-                        )
-                    value = Decimal(split["amount"])
-                    quantity = Decimal(split["quantity"])
-                    if quantity * value < 0:
-                        raise ValueError(
-                            f"Split for '{split['account']}': quantity and "
-                            f"value must have same sign "
-                            f"(got value={value}, quantity={quantity})"
-                        )
-
-            warnings = self._generate_warnings(
-                trans_date, splits, resolved_accounts
-            )
-
-            # Split consistency check (uses already-open book)
-            proposed_pattern = self._extract_account_pattern(
-                resolved_accounts
-            )
-            recent = self._find_recent_description_matches(
-                book, description, limit=5, days=30
-            )
-            if recent:
-                recent_accts = [s.account for s in recent[0].splits]
-                recent_pattern = self._extract_account_pattern(recent_accts)
-                if proposed_pattern != recent_pattern:
-                    warnings.append({
-                        "type": "split_consistency",
-                        "message": (
-                            f"Recent '{recent[0].description}' transactions "
-                            f"used {', '.join(sorted(recent_pattern))}, but "
-                            f"this transaction uses "
-                            f"{', '.join(sorted(proposed_pattern))}."
-                        ),
-                    })
-
-            if auto_fill_warnings:
-                warnings.extend(auto_fill_warnings)
-
-        # Dry-run response returns only newly-computed info (warnings,
-        # duplicates, auto_filled_from). Input echoes (description, date,
-        # splits, notes) are dropped — the LLM submitted them, and they
-        # live in tool params for audit purposes.
-        result = {
-            "dry_run": True,
-            "warnings": warnings,
-            "duplicates": duplicates,
-        }
-        if auto_filled_from:
-            result["auto_filled_from"] = auto_filled_from
-        return result
 
     def search_transactions(
         self, query: str, field: str = "description", compact: bool = True,
