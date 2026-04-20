@@ -22,6 +22,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _lot_to_compact_line,
     _to_date,
+    _unique_prefix,
 )
 
 
@@ -409,8 +410,12 @@ class InvestmentsMixin:
             book.session.add(lot)
             book.save()
 
+            all_lot_guids = [
+                row[0] for row in book.session.query(Lot.guid).all()
+            ]
+            short_guid = _unique_prefix(lot.guid, all_lot_guids)
             return {
-                "guid": lot.guid,
+                "guid": short_guid,
                 "title": title,
                 "account": account,
                 "notes": notes,
@@ -678,8 +683,14 @@ class InvestmentsMixin:
             lot.is_closed = -1
             book.save()
 
+            from piecash.core.transaction import Lot
+
+            all_lot_guids = [
+                row[0] for row in book.session.query(Lot.guid).all()
+            ]
+            short_guid = _unique_prefix(lot.guid, all_lot_guids)
             return {
-                "guid": lot.guid,
+                "guid": short_guid,
                 "title": lot.title,
                 "status": "closed",
             }

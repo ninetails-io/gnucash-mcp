@@ -67,7 +67,8 @@ class TestCreateLot:
         assert result["status"] == "created"
         assert result["title"] == "VTSAX 2026-01-15"
         assert result["account"] == "Assets:Investments:VTSAX"
-        assert len(result["guid"]) == 32
+        # Response now emits a short collision-safe prefix (>=8 chars).
+        assert len(result["guid"]) >= 8
 
     def test_create_lot_with_notes(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
@@ -379,4 +380,8 @@ class TestSplitToDictLotGuid:
 
         for s in txn["splits"]:
             if s["account"] == "Assets:Investments:VTSAX":
-                assert s["lot_guid"] == lot["guid"]
+                # Split's lot_guid is the full 32-char guid (read-side
+                # serializer); the create_lot response has emitted a
+                # short collision-safe prefix. The full guid must start
+                # with that prefix.
+                assert s["lot_guid"].startswith(lot["guid"])

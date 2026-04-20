@@ -256,8 +256,11 @@ def _format_audit_entry_text(entry: dict) -> str:
     indent = "          "
 
     if entity_type == "transaction":
-        guid = entry.get("entity_guid") or params.get("guid", "")[:8]
-        guid_short = guid[:8] if guid else ""
+        # Book methods already emit collision-safe short prefixes via
+        # `_unique_prefix` when returning a guid. We display whatever was
+        # provided — truncating here would reverse any birthday-problem
+        # extension (e.g., 9-char prefix back to a colliding 8).
+        guid_short = entry.get("entity_guid") or params.get("guid", "")
 
         if operation == "CREATE":
             lines.append(f"{time_part}  CREATE TRANSACTION  guid:{guid_short}")
@@ -417,9 +420,24 @@ def _format_audit_entry_text(entry: dict) -> str:
             split_guids = params.get("split_guids", [])
             lines.append(f"{indent}Splits reconciled ({len(split_guids)}):")
             for i, guid in enumerate(split_guids[:10]):  # Limit to first 10
-                guid_short = guid[:8]
-                # Try to find details for this split
-                split_info = next((s for s in split_details if s and s.get("guid") == guid), None)
+                # Use the param as-is — truncating here would undo any
+                # collision-safe extension applied upstream.
+                guid_short = guid
+                # Detail lookup tolerates full-vs-prefix mismatch: params
+                # carries whatever the LLM passed (often an 8+-char prefix),
+                # but `before_state` entries carry full GUIDs from the book
+                # method's staged snapshot. Match by startswith so either
+                # side can be a prefix of the other.
+                split_info = next(
+                    (
+                        s
+                        for s in split_details
+                        if s and (s.get("guid") == guid
+                                  or s.get("guid", "").startswith(guid)
+                                  or guid.startswith(s.get("guid", "")))
+                    ),
+                    None,
+                )
                 if split_info:
                     desc = split_info.get("transaction_description", "")
                     amount = _format_amount(split_info.get("amount"))
@@ -430,7 +448,8 @@ def _format_audit_entry_text(entry: dict) -> str:
                 lines.append(f"{indent}  ... and {len(split_guids) - 10} more")
 
         elif operation == "SET_STATE":
-            split_guid = params.get("split_guid", "")[:8]
+            # As-is: caller may have passed a collision-safe 9+-char prefix.
+            split_guid = params.get("split_guid", "")
             lines.append(f"{time_part}  SET RECONCILE STATE")
             lines.append(f"{indent}guid:{split_guid} (split)")
             if before:
@@ -533,7 +552,8 @@ def _format_audit_entry_text(entry: dict) -> str:
             if after:
                 total = after.get("total", "")
                 post_date = after.get("post_date", "")
-                txn_guid = (after.get("transaction_guid") or "")[:8]
+                # As-is — upstream emits a collision-safe prefix.
+                txn_guid = after.get("transaction_guid") or ""
                 lines.append(f'{indent}total: {total}  date: {post_date}')
                 lines.append(f'{indent}account: {post_account}  txn:{txn_guid}')
         elif operation == "PAY":
@@ -543,7 +563,8 @@ def _format_audit_entry_text(entry: dict) -> str:
                 amount = after.get("amount_paid", "")
                 remaining = after.get("remaining_balance", "")
                 pay_acct = params.get("payment_account", "")
-                txn_guid = (after.get("transaction_guid") or "")[:8]
+                # As-is — upstream emits a collision-safe prefix.
+                txn_guid = after.get("transaction_guid") or ""
                 lines.append(f'{indent}paid: {amount}  remaining: {remaining}')
                 lines.append(f'{indent}from: {pay_acct}  txn:{txn_guid}')
 

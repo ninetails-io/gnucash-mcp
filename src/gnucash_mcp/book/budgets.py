@@ -14,7 +14,11 @@ from decimal import Decimal
 
 import piecash
 
-from gnucash_mcp.book._base import _verify_composite_write, _verify_write
+from gnucash_mcp.book._base import (
+    _unique_prefix,
+    _verify_composite_write,
+    _verify_write,
+)
 
 
 class BudgetsMixin:
@@ -297,8 +301,15 @@ class BudgetsMixin:
 
             book.save()
 
+            from piecash.budget import Budget
+
+            all_budget_guids = [
+                row[0]
+                for row in book.session.query(Budget.guid).all()
+            ]
+            short_guid = _unique_prefix(budget_guid, all_budget_guids)
             return {
-                "guid": budget_guid,
+                "guid": short_guid,
                 "name": name,
                 "status": "created",
             }
@@ -572,9 +583,16 @@ class BudgetsMixin:
             if not budget:
                 raise ValueError(f"Budget not found: {name}")
 
+            from piecash.budget import Budget
+
+            all_budget_guids = [
+                row[0]
+                for row in book.session.query(Budget.guid).all()
+            ]
+            short_guid = _unique_prefix(budget.guid, all_budget_guids)
             result = {
                 "name": name,
-                "guid": budget.guid,
+                "guid": short_guid,
                 "status": "deleted",
             }
 

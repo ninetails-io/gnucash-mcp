@@ -189,6 +189,47 @@ def _guid_prefix_map(
     return result
 
 
+def _unique_prefix(
+    guid: str, siblings: Iterable[str], min_len: int = 8
+) -> str:
+    """Shortest prefix of `guid` unique among `siblings`, min `min_len` chars.
+
+    Single-GUID counterpart to `_guid_prefix_map` — optimized for the
+    write-tool-response case where we only need one prefix, not a full
+    table map. Callers pass the target guid plus an iterable of the
+    relevant table's other guids (e.g., every transaction guid in the
+    book when returning a transaction write response).
+
+    Fast path: if no sibling shares the `min_len` prefix, return that
+    `min_len`-char slice directly — no LCP math needed. Only when the
+    birthday problem actually bites (rare under ~10k entries, common at
+    scale) do we extend.
+
+    Args:
+        guid: Full GUID to shorten.
+        siblings: Iterable of every other GUID in the same table. Safe
+                  to include `guid` itself (it is filtered out).
+        min_len: Minimum prefix length. Default 8, matching
+                 `_resolve_guid`'s minimum acceptable input length.
+
+    Returns:
+        Lowercase prefix of `guid`, length >= `min_len`, guaranteed
+        unique against `siblings` under `_resolve_guid`'s LIKE match.
+    """
+    guid_lower = guid.lower()
+    min_prefix = guid_lower[:min_len]
+    collision_candidates = [
+        s.lower() for s in siblings
+        if s.lower() != guid_lower
+        and s.lower().startswith(min_prefix)
+    ]
+    if not collision_candidates:
+        return min_prefix
+    max_lcp = max(_lcp_length(guid_lower, s) for s in collision_candidates)
+    prefix_len = max(max_lcp + 1, min_len)
+    return guid_lower[: min(prefix_len, len(guid_lower))]
+
+
 class GnuCashLockError(Exception):
     """Raised when the GnuCash book is locked by another process."""
 

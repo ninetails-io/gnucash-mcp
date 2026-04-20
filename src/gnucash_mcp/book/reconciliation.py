@@ -17,6 +17,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _split_to_compact_dict,
     _transaction_to_dict,
+    _unique_prefix,
     _unreconciled_split_to_compact_line,
 )
 
@@ -95,12 +96,16 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Response carries the resolved-from-prefix full split_guid
-            # plus context the LLM only had a GUID for (account, amount).
-            # The requested state is echo — dropped. reconcile_date
+            # Response carries a collision-safe short prefix of the split
+            # GUID plus context the LLM only had a GUID for (account,
+            # amount). The requested state is echo — dropped. reconcile_date
             # stays because it's computed (today if not provided).
+            all_split_guids = (
+                s.guid for txn in book.transactions for s in txn.splits
+            )
+            short_guid = _unique_prefix(split.guid, all_split_guids)
             return {
-                "split_guid": split.guid,
+                "split_guid": short_guid,
                 "account": split.account.fullname,
                 "amount": str(split.quantity),
                 "reconcile_date": split.reconcile_date.isoformat() if split.reconcile_date and split.reconcile_date.year > 1970 else None,
@@ -322,8 +327,11 @@ class ReconciliationMixin:
 
             book.save()
 
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
             return {
-                "guid": transaction.guid,
+                "guid": short_guid,
                 "description": transaction.description,
                 "void_reason": reason,
                 "status": "voided",
@@ -376,8 +384,11 @@ class ReconciliationMixin:
             # voided, values stashed in slots). Emit them compactly —
             # full _split_to_dict would carry guid/reconcile_state="n"/
             # reconcile_date=None/lot_guid=None per split, all noise.
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
             return {
-                "guid": transaction.guid,
+                "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
                 "description": transaction.description,
                 "splits": [

@@ -37,6 +37,7 @@ from gnucash_mcp.book._base import (
     _split_to_dict,
     _transaction_to_compact_line,
     _transaction_to_dict,
+    _unique_prefix,
 )
 
 
@@ -530,7 +531,10 @@ class CoreMixin:
                         filled_splits.append(split_dict)
 
                     source_info = {
-                        "guid": txn.guid,
+                        "guid": _unique_prefix(
+                            txn.guid,
+                            (t.guid for t in book.transactions),
+                        ),
                         "description": txn.description,
                         "date": txn.post_date.isoformat(),
                     }
@@ -681,6 +685,9 @@ class CoreMixin:
         candidates = []
 
         with self.open(readonly=True) as book:
+            # Collision-safe short prefix per candidate. One pass builds
+            # the full-table map; per-candidate lookup is O(1).
+            txn_prefixes = _guid_prefix_map(t.guid for t in book.transactions)
             for txn in book.transactions:
                 if txn.post_date < date_start or txn.post_date > date_end:
                     continue
@@ -728,7 +735,7 @@ class CoreMixin:
 
                 candidates.append({
                     "confidence": confidence,
-                    "guid": txn.guid,
+                    "guid": txn_prefixes[txn.guid],
                     "date": txn.post_date.isoformat(),
                     "description": txn.description,
                     "amount": str(primary_amount),
@@ -906,7 +913,13 @@ class CoreMixin:
 
             book.save()
 
-            result = {"guid": transaction.guid, "status": "created"}
+            # Emit a collision-safe short guid prefix so the LLM can feed
+            # it straight back into guid-accepting tools without spending
+            # tokens on the full 32-char string.
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
+            result = {"guid": short_guid, "status": "created"}
             warnings = self._generate_warnings(
                 trans_date, splits, resolved_accounts
             )
@@ -1263,8 +1276,11 @@ class CoreMixin:
 
             book.save()
 
+            short_guid = _unique_prefix(
+                new_account.guid, (a.guid for a in book.accounts)
+            )
             result = {
-                "guid": new_account.guid,
+                "guid": short_guid,
                 "fullname": new_account.fullname,
                 "status": "created",
             }
@@ -1371,7 +1387,13 @@ class CoreMixin:
 
             book.save()
 
-            return _account_to_dict(account) | {"status": "updated"}
+            short_guid = _unique_prefix(
+                account.guid, (a.guid for a in book.accounts)
+            )
+            return _account_to_dict(account) | {
+                "guid": short_guid,
+                "status": "updated",
+            }
 
     def move_account(self, name: str, new_parent: str) -> dict:
         """Move an account to a new parent in the hierarchy.
@@ -1418,7 +1440,13 @@ class CoreMixin:
 
             book.save()
 
-            return _account_to_dict(account) | {"status": "moved"}
+            short_guid = _unique_prefix(
+                account.guid, (a.guid for a in book.accounts)
+            )
+            return _account_to_dict(account) | {
+                "guid": short_guid,
+                "status": "moved",
+            }
 
     def delete_account(self, name: str) -> dict:
         """Delete an account from the chart of accounts.
@@ -1454,9 +1482,13 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
 
-            # Capture info before deletion
+            # Capture info before deletion. Short guid computed against
+            # the remaining accounts (the target is still present here).
+            short_guid = _unique_prefix(
+                account.guid, (a.guid for a in book.accounts)
+            )
             result = {
-                "guid": account.guid,
+                "guid": short_guid,
                 "fullname": account.fullname,
                 "status": "deleted",
             }
@@ -1499,9 +1531,12 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # Capture info before deletion
+            # Short guid computed pre-delete (target still in the table).
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
             result = {
-                "guid": transaction.guid,
+                "guid": short_guid,
                 "description": transaction.description,
                 "status": "deleted",
             }
@@ -1644,8 +1679,11 @@ class CoreMixin:
             # the full post-update state they can call get_transaction.
             # The audit log resolves splits/description/date from params
             # when absent from after_state (see _resolve_entry_field).
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
             return {
-                "guid": transaction.guid,
+                "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
                 "description": transaction.description,
                 "status": "updated",
@@ -1804,8 +1842,11 @@ class CoreMixin:
             #   have — kept so callers can diff / undo / confirm.
             # - Audit log falls back to params for the "after" splits
             #   (see logging_config._resolve_entry_field).
+            short_guid = _unique_prefix(
+                transaction.guid, (t.guid for t in book.transactions)
+            )
             result = {
-                "guid": transaction.guid,
+                "guid": short_guid,
                 "status": "splits_replaced",
                 "previous_splits": previous_splits,
             }

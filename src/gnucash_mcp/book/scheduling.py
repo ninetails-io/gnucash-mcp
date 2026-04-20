@@ -22,6 +22,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _sx_to_compact_line,
+    _unique_prefix,
     _upcoming_to_compact_line,
     _verify_composite_write,
     _verify_delete,
@@ -336,8 +337,15 @@ class SchedulingMixin:
                 end_date=parsed_end,
             )
 
+            from piecash.core.transaction import ScheduledTransaction
+
+            all_sx_guids = [
+                row[0]
+                for row in book.session.query(ScheduledTransaction.guid).all()
+            ]
+            short_guid = _unique_prefix(sx_guid, all_sx_guids)
             return {
-                "guid": sx_guid,
+                "guid": short_guid,
                 "name": name,
                 "frequency": frequency,
                 "next_occurrence": (
@@ -602,7 +610,14 @@ class SchedulingMixin:
 
             book.save()
 
-            return self._sx_to_dict(sx)
+            from piecash.core.transaction import ScheduledTransaction
+
+            all_sx_guids = [
+                row[0]
+                for row in book.session.query(ScheduledTransaction.guid).all()
+            ]
+            short_guid = _unique_prefix(sx.guid, all_sx_guids)
+            return self._sx_to_dict(sx) | {"guid": short_guid}
 
     def delete_scheduled_transaction(self, guid: str) -> dict:
         """Delete a scheduled transaction.
@@ -618,9 +633,16 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
+            from piecash.core.transaction import ScheduledTransaction
+
+            all_sx_guids = [
+                row[0]
+                for row in book.session.query(ScheduledTransaction.guid).all()
+            ]
+            short_guid = _unique_prefix(sx.guid, all_sx_guids)
             result = {
                 "name": sx.name,
-                "guid": sx.guid,
+                "guid": short_guid,
                 "status": "deleted",
             }
 
