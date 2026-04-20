@@ -717,10 +717,14 @@ class BaseGnuCashBook:
             if "No transaction" in str(e):
                 return None
             raise
-        for transaction in book.transactions:
-            if transaction.guid == full_guid:
-                return transaction
-        return None
+        # Indexed SQL lookup via SQLAlchemy — the `guid` column is the
+        # primary key on the transactions table. Replaces an O(N) Python
+        # scan of `book.transactions`.
+        from piecash.core.transaction import Transaction
+
+        return (
+            book.session.query(Transaction).filter_by(guid=full_guid).first()
+        )
 
     def _find_split(self, book: piecash.Book, guid: str) -> piecash.Split | None:
         """Find a split by GUID or partial GUID prefix.
@@ -734,11 +738,11 @@ class BaseGnuCashBook:
             if "No split" in str(e):
                 return None
             raise
-        for transaction in book.transactions:
-            for split in transaction.splits:
-                if split.guid == full_guid:
-                    return split
-        return None
+        # Indexed SQL lookup — replaces an O(N*M) scan over every
+        # transaction's splits list.
+        from piecash.core.transaction import Split
+
+        return book.session.query(Split).filter_by(guid=full_guid).first()
 
     @staticmethod
     def _require_default_currency(book: piecash.Book) -> piecash.Commodity:
