@@ -45,3 +45,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 CLAUDE.md
+
+# Local-only working files — IDE / client state, scratch notes,
+# local test scripts that shouldn't pollute the shared repo.
+.claude/
+.mcp.json
+ERROR_TESTING.md
+test.sh

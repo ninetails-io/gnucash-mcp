@@ -139,6 +139,11 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_account_slot",
         "get_audit_log",
     ],
+    "backup": [
+        "create_backup",
+        "list_backups",
+        "prune_backups",
+    ],
     "business": [
         "create_customer",
         "list_customers",
@@ -243,6 +248,13 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
                     file=sys.stderr,
                 )
             enabled_modules.add("core")
+
+    # `backup` is never optional — the auto-snapshot hook protects
+    # every user against data loss regardless of what modules they
+    # asked for, and the three manual tools (create_backup /
+    # list_backups / prune_backups) are small enough to always
+    # advertise. Treat it the same way as `core`.
+    enabled_modules.add("backup")
 
     # Keep only known module names
     enabled_modules &= set(TOOL_MODULES.keys())
