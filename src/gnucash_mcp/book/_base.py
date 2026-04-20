@@ -14,6 +14,7 @@ belong to — not here.
 import logging
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -186,6 +187,47 @@ def _guid_prefix_map(
         prefix_len = min(prefix_len, len(g))
         result[g] = g[:prefix_len]
     return result
+
+
+def _unique_prefix(
+    guid: str, siblings: Iterable[str], min_len: int = 8
+) -> str:
+    """Shortest prefix of `guid` unique among `siblings`, min `min_len` chars.
+
+    Single-GUID counterpart to `_guid_prefix_map` — optimized for the
+    write-tool-response case where we only need one prefix, not a full
+    table map. Callers pass the target guid plus an iterable of the
+    relevant table's other guids (e.g., every transaction guid in the
+    book when returning a transaction write response).
+
+    Fast path: if no sibling shares the `min_len` prefix, return that
+    `min_len`-char slice directly — no LCP math needed. Only when the
+    birthday problem actually bites (rare under ~10k entries, common at
+    scale) do we extend.
+
+    Args:
+        guid: Full GUID to shorten.
+        siblings: Iterable of every other GUID in the same table. Safe
+                  to include `guid` itself (it is filtered out).
+        min_len: Minimum prefix length. Default 8, matching
+                 `_resolve_guid`'s minimum acceptable input length.
+
+    Returns:
+        Lowercase prefix of `guid`, length >= `min_len`, guaranteed
+        unique against `siblings` under `_resolve_guid`'s LIKE match.
+    """
+    guid_lower = guid.lower()
+    min_prefix = guid_lower[:min_len]
+    collision_candidates = [
+        s.lower() for s in siblings
+        if s.lower() != guid_lower
+        and s.lower().startswith(min_prefix)
+    ]
+    if not collision_candidates:
+        return min_prefix
+    max_lcp = max(_lcp_length(guid_lower, s) for s in collision_candidates)
+    prefix_len = max(max_lcp + 1, min_len)
+    return guid_lower[: min(prefix_len, len(guid_lower))]
 
 
 class GnuCashLockError(Exception):
@@ -500,6 +542,36 @@ class BaseGnuCashBook:
         self.book_path = Path(book_path)
         if not self.book_path.exists():
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
+        # Thread-local staging buffer for audit-log before_state.
+        # Write book methods call `_stage_audit_before(...)` while their
+        # session is open; `@audit_log` reads it back via
+        # `_consume_audit_before()` after the tool returns. This avoids
+        # a second read-only book open per write (~40-100ms).
+        self._audit_tls = threading.local()
+
+    def _stage_audit_before(self, state: dict | None) -> None:
+        """Stage a before-state dict for the next audit-log consume.
+
+        Called by write book methods before mutating — using the same
+        piecash session they already have open, so no extra open cost.
+        The `@audit_log` decorator consumes this after the tool returns.
+
+        Passing None is a no-op; passing a dict overwrites any
+        previously-staged state (shouldn't happen in a well-formed call
+        chain, but is safe).
+        """
+        self._audit_tls.before_state = state
+
+    def _consume_audit_before(self) -> dict | None:
+        """Return the staged before-state dict (if any) and clear it.
+
+        Called by `@audit_log` after the wrapped tool returns, or in its
+        exception handler to discard leftover state from a failed write.
+        Always clears on read so stale values can't leak across calls.
+        """
+        state = getattr(self._audit_tls, "before_state", None)
+        self._audit_tls.before_state = None
+        return state
 
     def _resolve_guid(self, table: str, partial: str) -> str:
         """Resolve a partial GUID prefix to a full 32-character GUID.
@@ -645,10 +717,14 @@ class BaseGnuCashBook:
             if "No transaction" in str(e):
                 return None
             raise
-        for transaction in book.transactions:
-            if transaction.guid == full_guid:
-                return transaction
-        return None
+        # Indexed SQL lookup via SQLAlchemy — the `guid` column is the
+        # primary key on the transactions table. Replaces an O(N) Python
+        # scan of `book.transactions`.
+        from piecash.core.transaction import Transaction
+
+        return (
+            book.session.query(Transaction).filter_by(guid=full_guid).first()
+        )
 
     def _find_split(self, book: piecash.Book, guid: str) -> piecash.Split | None:
         """Find a split by GUID or partial GUID prefix.
@@ -662,11 +738,11 @@ class BaseGnuCashBook:
             if "No split" in str(e):
                 return None
             raise
-        for transaction in book.transactions:
-            for split in transaction.splits:
-                if split.guid == full_guid:
-                    return split
-        return None
+        # Indexed SQL lookup — replaces an O(N*M) scan over every
+        # transaction's splits list.
+        from piecash.core.transaction import Split
+
+        return book.session.query(Split).filter_by(guid=full_guid).first()
 
     @staticmethod
     def _require_default_currency(book: piecash.Book) -> piecash.Commodity:

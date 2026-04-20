@@ -406,7 +406,10 @@ class TestCreateTransaction:
 
         assert result["status"] == "created"
         guid = result["guid"]
-        assert len(guid) == 32  # GnuCash GUID format
+        # Write responses now return a collision-safe short prefix
+        # (usually 8 chars) rather than the full 32-char GUID, to save
+        # tokens on every tool call. Resolution tolerates the prefix.
+        assert len(guid) >= 8
 
         # Verify transaction was created
         transaction = gc_book.get_transaction(guid)
@@ -1445,7 +1448,7 @@ class TestCreateAccount:
 
         assert result["status"] == "created"
         assert result["fullname"] == "Expenses:Test Category"
-        assert len(result["guid"]) == 32
+        assert len(result["guid"]) >= 8  # short collision-safe prefix
 
         # Verify account exists
         account = gc_book.get_account("Expenses:Test Category")
@@ -1873,7 +1876,8 @@ class TestDeleteTransaction:
         result = gc_book.delete_transaction(guid)
 
         assert result["status"] == "deleted"
-        assert result["guid"] == guid
+        # Response guid is a short collision-safe prefix of the full guid.
+        assert guid.startswith(result["guid"])
         assert result["description"] == description
 
         # Verify transaction is gone
@@ -2196,9 +2200,10 @@ class TestReplaceSplits:
             ],
         )
 
-        # guid stays in the thin response. description / date are
-        # preserved on the transaction itself — verified via read-back.
-        assert result["guid"] == guid
+        # guid stays in the thin response (as a short prefix).
+        # description / date are preserved on the transaction itself —
+        # verified via read-back.
+        assert guid.startswith(result["guid"])
         refreshed = gc_book.get_transaction(guid)
         assert refreshed["date"] == original_date
         assert refreshed["description"] == original_description

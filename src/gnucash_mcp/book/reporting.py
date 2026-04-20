@@ -5,6 +5,18 @@ method reads `apr` / `minimum_payment` / `credit_limit` slots on
 CREDIT/LIABILITY accounts via piecash's account[key] shortcut, so
 it does not depend on AdminMixin's slot tools.
 
+The five transaction-scanning reports (``spending_by_category``,
+``income_by_source``, ``balance_sheet``, ``net_worth``, ``cash_flow``)
+push date and account-type filters into indexed SQL via
+``_query_filtered_splits``. Aggregation stays in Python so amounts
+are summed as exact Decimals (quantity is stored as num/denom integer
+pairs that SQLite can't aggregate without lossy float conversion).
+
+The ``net_worth`` time-series uses a single-sweep cumulative sum —
+one pass over all relevant splits ordered by post_date, running
+total snapshotted at each interval boundary. Reduces a 60-month
+series from O(intervals × splits) to O(splits + intervals).
+
 Depends on shared helpers from BaseGnuCashBook:
   - self.open, self._find_account
 """
@@ -13,6 +25,15 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import piecash
+
+# Account-type groups used across the reports. Defined at module level
+# so the SQL IN() clauses share a single canonical definition rather
+# than drifting across methods.
+_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
+_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+_EQUITY_TYPES = frozenset({"EQUITY"})
+_NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
+_CASH_TYPES = frozenset({"BANK", "CASH"})
 
 
 class ReportingMixin:
@@ -42,6 +63,81 @@ class ReportingMixin:
             return account
         return path[target_depth]
 
+    # ── SQL-filtered split iterator ───────────────────────────────────
+
+    def _query_filtered_splits(
+        self,
+        book: piecash.Book,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        account_types: frozenset[str] | set[str] | None = None,
+        account_guids: frozenset[str] | set[str] | None = None,
+        order_by_post_date: bool = False,
+    ):
+        """Build an indexed SQL query over ``(Split, Transaction, Account)``
+        rows matching the given filters.
+
+        Every filter maps to an indexable WHERE clause against the
+        SQLite backing store — one query returns exactly the rows the
+        caller needs, replacing the Python-side
+        ``for txn in book.transactions: if date_match`` pattern that
+        used to touch every row in the book regardless of relevance.
+
+        The query yields ORM objects (not raw num/denom pairs) so
+        callers can aggregate ``split.quantity`` / ``split.value`` as
+        exact ``Decimal`` values in Python. Aggregating in SQL via
+        ``SUM(num * 1.0 / denom)`` would collapse to IEEE-754 floats,
+        which is unacceptable for financial arithmetic.
+
+        Null ``post_date`` rows (an old-book artifact) are excluded so
+        they don't show up in date-ranged reports.
+
+        Args:
+            book: An open piecash session.
+            start_date: Include only transactions with
+                ``post_date >= start_date``. ``None`` disables the
+                lower bound.
+            end_date: Include only transactions with
+                ``post_date <= end_date``. ``None`` disables the upper
+                bound.
+            account_types: Restrict to accounts whose
+                ``type in account_types`` (e.g., ``_ASSET_TYPES``).
+                ``None`` disables the filter.
+            account_guids: Restrict to accounts whose ``guid`` is in
+                the given set. Used by ``cash_flow`` when filtering to
+                a single named account.
+            order_by_post_date: When ``True``, rows come back sorted
+                ascending by ``post_date``. Required for the
+                cumulative-sum trick used by the ``net_worth``
+                time-series.
+
+        Returns:
+            A SQLAlchemy ``Query`` object the caller can iterate.
+        """
+        from piecash.core.account import Account
+        from piecash.core.transaction import Split, Transaction
+
+        q = (
+            book.session.query(Split, Transaction, Account)
+            .join(Transaction, Split.transaction_guid == Transaction.guid)
+            .join(Account, Split.account_guid == Account.guid)
+            .filter(Transaction.post_date.isnot(None))
+        )
+        if start_date is not None:
+            q = q.filter(Transaction.post_date >= start_date)
+        if end_date is not None:
+            q = q.filter(Transaction.post_date <= end_date)
+        if account_types is not None:
+            q = q.filter(Account.type.in_(list(account_types)))
+        if account_guids is not None:
+            q = q.filter(Account.guid.in_(list(account_guids)))
+        if order_by_post_date:
+            q = q.order_by(Transaction.post_date)
+        return q
+
+    # ── Period breakdowns ─────────────────────────────────────────────
+
     def spending_by_category(
         self,
         start_date: date,
@@ -59,29 +155,28 @@ class ReportingMixin:
             Dict with period, total, and category breakdown.
         """
         with self.open(readonly=True) as book:
+            rows = self._query_filtered_splits(
+                book,
+                start_date=start_date,
+                end_date=end_date,
+                account_types=frozenset({"EXPENSE"}),
+            )
+
             totals: dict[str, Decimal] = {}
-
-            for transaction in book.transactions:
-                if not (start_date <= transaction.post_date <= end_date):
+            for split, _txn, account in rows:
+                # Expense splits are positive when money is spent.
+                amount = split.quantity
+                if amount <= 0:
                     continue
+                group_account = self._get_account_at_depth(
+                    account, depth - 1
+                )
+                account_name = group_account.fullname
+                totals[account_name] = totals.get(
+                    account_name, Decimal("0")
+                ) + amount
 
-                for split in transaction.splits:
-                    if split.account.type != "EXPENSE":
-                        continue
-
-                    group_account = self._get_account_at_depth(
-                        split.account, depth - 1
-                    )
-                    account_name = group_account.fullname
-
-                    # Expense splits are positive when money is spent
-                    amount = split.quantity
-                    if amount > 0:
-                        totals[account_name] = totals.get(
-                            account_name, Decimal("0")
-                        ) + amount
-
-            total = sum(totals.values())
+            total = sum(totals.values()) if totals else Decimal("0")
             categories = []
             for account_name, amount in sorted(
                 totals.items(), key=lambda x: x[1], reverse=True
@@ -118,29 +213,29 @@ class ReportingMixin:
             Dict with period, total, and source breakdown.
         """
         with self.open(readonly=True) as book:
+            rows = self._query_filtered_splits(
+                book,
+                start_date=start_date,
+                end_date=end_date,
+                account_types=frozenset({"INCOME"}),
+            )
+
             totals: dict[str, Decimal] = {}
-
-            for transaction in book.transactions:
-                if not (start_date <= transaction.post_date <= end_date):
+            for split, _txn, account in rows:
+                # Income splits are stored negative (money coming in);
+                # flip to positive for the "how much did I earn" view.
+                amount = -split.quantity
+                if amount <= 0:
                     continue
+                group_account = self._get_account_at_depth(
+                    account, depth - 1
+                )
+                account_name = group_account.fullname
+                totals[account_name] = totals.get(
+                    account_name, Decimal("0")
+                ) + amount
 
-                for split in transaction.splits:
-                    if split.account.type != "INCOME":
-                        continue
-
-                    group_account = self._get_account_at_depth(
-                        split.account, depth - 1
-                    )
-                    account_name = group_account.fullname
-
-                    # Income splits are negative (money coming in)
-                    amount = -split.quantity
-                    if amount > 0:
-                        totals[account_name] = totals.get(
-                            account_name, Decimal("0")
-                        ) + amount
-
-            total = sum(totals.values())
+            total = sum(totals.values()) if totals else Decimal("0")
             sources = []
             for account_name, amount in sorted(
                 totals.items(), key=lambda x: x[1], reverse=True
@@ -160,6 +255,8 @@ class ReportingMixin:
                 "sources": sources,
             }
 
+    # ── Balance sheet and net worth ──────────────────────────────────
+
     def balance_sheet(self, as_of_date: date) -> dict:
         """Generate a balance sheet as of a specific date.
 
@@ -169,46 +266,57 @@ class ReportingMixin:
         Returns:
             Dict with assets, liabilities, equity sections and totals.
         """
+        # Sum splits across every relevant type in one SQL-filtered
+        # pass. The old code opened Python loops per account; now we
+        # hit the splits table once with an IN() clause and bucket the
+        # results in memory. Net income (Income - Expenses) is
+        # retained-earnings-equivalent and rolls into equity below.
+        all_types = (
+            _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
+        )
         with self.open(readonly=True) as book:
+            rows = self._query_filtered_splits(
+                book,
+                end_date=as_of_date,
+                account_types=all_types,
+            )
+
+            balances: dict[str, tuple[str, Decimal]] = {}
+            net_income = Decimal("0")
+            for split, _txn, account in rows:
+                if account.type in _NET_INCOME_TYPES:
+                    # Income is stored negative, expenses positive; net
+                    # income = revenues - expenses = -(sum of both).
+                    net_income -= split.quantity
+                    continue
+                key = account.fullname
+                current_type, current_bal = balances.get(
+                    key, (account.type, Decimal("0"))
+                )
+                balances[key] = (current_type, current_bal + split.quantity)
+
             assets: dict[str, Decimal] = {}
             liabilities: dict[str, Decimal] = {}
             equity: dict[str, Decimal] = {}
-
-            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
-            liability_types = {"LIABILITY", "CREDIT"}
-            equity_types = {"EQUITY"}
-
-            for account in book.accounts:
-                if account.type == "ROOT":
-                    continue
-
-                balance = Decimal("0")
-                for split in account.splits:
-                    if split.transaction.post_date <= as_of_date:
-                        balance += split.quantity
-
+            for name, (acct_type, balance) in balances.items():
                 if balance == 0:
                     continue
+                if acct_type in _ASSET_TYPES:
+                    assets[name] = balance
+                elif acct_type in _LIABILITY_TYPES:
+                    # Liabilities stored negative; display positive.
+                    liabilities[name] = -balance
+                elif acct_type in _EQUITY_TYPES:
+                    equity[name] = -balance
 
-                if account.type in asset_types:
-                    assets[account.fullname] = balance
-                elif account.type in liability_types:
-                    # Liabilities are stored as negative, show as positive
-                    liabilities[account.fullname] = -balance
-                elif account.type in equity_types:
-                    equity[account.fullname] = -balance
-
-            # Net income (Income - Expenses) rolls into equity
-            net_income = Decimal("0")
-            for account in book.accounts:
-                if account.type in ("INCOME", "EXPENSE"):
-                    for split in account.splits:
-                        if split.transaction.post_date <= as_of_date:
-                            net_income -= split.quantity  # Income negative, expense positive
-
-            assets_total = sum(assets.values())
-            liabilities_total = sum(liabilities.values())
-            equity_total = sum(equity.values()) + net_income
+            assets_total = sum(assets.values()) if assets else Decimal("0")
+            liabilities_total = (
+                sum(liabilities.values()) if liabilities else Decimal("0")
+            )
+            equity_total = (
+                (sum(equity.values()) if equity else Decimal("0"))
+                + net_income
+            )
 
             def format_accounts(accounts_dict: dict[str, Decimal]) -> list[dict]:
                 return [
@@ -256,36 +364,32 @@ class ReportingMixin:
         """
         from dateutil.relativedelta import relativedelta
 
-        def calc_net_worth_at(book: piecash.Book, at_date: date) -> Decimal:
-            """Calculate net worth at a specific date."""
-            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
-            liability_types = {"LIABILITY", "CREDIT"}
-
-            total = Decimal("0")
-            for account in book.accounts:
-                if account.type in asset_types:
-                    for split in account.splits:
-                        if split.transaction.post_date <= at_date:
-                            total += split.quantity
-                elif account.type in liability_types:
-                    for split in account.splits:
-                        if split.transaction.post_date <= at_date:
-                            total += split.quantity  # Already negative
-
-            return total
+        nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
-            # Point-in-time calculation
+            # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
-                nw = calc_net_worth_at(book, end_date)
+                rows = self._query_filtered_splits(
+                    book,
+                    end_date=end_date,
+                    account_types=nw_types,
+                )
+                total = Decimal("0")
+                for split, _txn, _account in rows:
+                    # Liabilities are stored negative, so adding
+                    # quantity directly gives assets - liabilities.
+                    total += split.quantity
                 return {
                     "as_of_date": end_date.isoformat(),
-                    "net_worth": str(nw),
+                    "net_worth": str(total),
                 }
 
-            # Time series calculation
+            # --- Time series: single sweep, cumulative sum.
             if interval not in ("month", "quarter", "year"):
-                raise ValueError(f"Invalid interval: {interval}. Use 'month', 'quarter', or 'year'")
+                raise ValueError(
+                    f"Invalid interval: {interval}. "
+                    f"Use 'month', 'quarter', or 'year'"
+                )
 
             delta = {
                 "month": relativedelta(months=1),
@@ -293,23 +397,56 @@ class ReportingMixin:
                 "year": relativedelta(years=1),
             }[interval]
 
-            series = []
-            current = start_date
-            while current <= end_date:
-                nw = calc_net_worth_at(book, current)
-                series.append({
-                    "date": current.isoformat(),
-                    "net_worth": str(nw),
-                })
-                current += delta
+            # Build the list of interval boundaries up-front. Every
+            # boundary gets a net_worth snapshot below; end_date is
+            # appended if the interval didn't land on it naturally.
+            boundaries: list[date] = []
+            cursor = start_date
+            while cursor <= end_date:
+                boundaries.append(cursor)
+                cursor += delta
+            if not boundaries or boundaries[-1] != end_date:
+                boundaries.append(end_date)
 
-            # Always include end_date if not already included
-            if series and series[-1]["date"] != end_date.isoformat():
-                nw = calc_net_worth_at(book, end_date)
+            # Pull every asset/liability split up through end_date in
+            # post_date order, then sweep once: as we cross each
+            # boundary, snapshot the running total. This replaces what
+            # was previously T × N (intervals × accounts × splits) with
+            # a single O(splits + intervals) pass.
+            rows = self._query_filtered_splits(
+                book,
+                end_date=end_date,
+                account_types=nw_types,
+                order_by_post_date=True,
+            )
+
+            series: list[dict] = []
+            running = Decimal("0")
+            b_idx = 0
+
+            for split, txn, _account in rows:
+                # For each boundary that sits before this split's
+                # post_date, the running total is already correct —
+                # snapshot it and advance.
+                while (
+                    b_idx < len(boundaries)
+                    and txn.post_date > boundaries[b_idx]
+                ):
+                    series.append({
+                        "date": boundaries[b_idx].isoformat(),
+                        "net_worth": str(running),
+                    })
+                    b_idx += 1
+                running += split.quantity
+
+            # Drain any boundaries past the last split — they all see
+            # the final running total.
+            while b_idx < len(boundaries):
                 series.append({
-                    "date": end_date.isoformat(),
-                    "net_worth": str(nw),
+                    "date": boundaries[b_idx].isoformat(),
+                    "net_worth": str(running),
                 })
+                b_idx += 1
 
             return {
                 "start_date": start_date.isoformat(),
@@ -335,29 +472,34 @@ class ReportingMixin:
             Dict with inflows, outflows, and net cash flow.
         """
         with self.open(readonly=True) as book:
+            # Two filter modes: a named account (one-GUID IN() clause)
+            # or the default "all cash/bank accounts" (account-type
+            # IN() clause). Both push the filter to SQL.
             if account:
                 target_account = self._find_account(book, account)
                 if not target_account:
                     raise ValueError(f"Account not found: {account}")
-                accounts_to_check = [target_account]
+                rows = self._query_filtered_splits(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    account_guids=frozenset({target_account.guid}),
+                )
             else:
-                cash_types = {"BANK", "CASH"}
-                accounts_to_check = [
-                    a for a in book.accounts if a.type in cash_types
-                ]
+                rows = self._query_filtered_splits(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    account_types=_CASH_TYPES,
+                )
 
             inflows = Decimal("0")
             outflows = Decimal("0")
-
-            for acc in accounts_to_check:
-                for split in acc.splits:
-                    if not (start_date <= split.transaction.post_date <= end_date):
-                        continue
-
-                    if split.quantity > 0:
-                        inflows += split.quantity
-                    else:
-                        outflows += -split.quantity
+            for split, _txn, _account in rows:
+                if split.quantity > 0:
+                    inflows += split.quantity
+                else:
+                    outflows += -split.quantity
 
             # period is input echo (LLM supplied dates), net is derivable
             # (inflows - outflows). Both dropped.

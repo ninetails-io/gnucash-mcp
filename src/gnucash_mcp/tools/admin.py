@@ -3,12 +3,10 @@
 Registered only when the 'admin' module is enabled via --modules.
 """
 
-import json
 from datetime import datetime
 
 from gnucash_mcp.logging_config import (
     audit_log,
-    get_audit_format,
     get_log_dir,
 )
 from gnucash_mcp.tools._helpers import _json, safe_tool
@@ -94,17 +92,17 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def get_audit_log(
         log_date: str | None = None,
-        tool_filter: str | None = None,
-        classification: str | None = None,
         limit: int = 50,
     ) -> str:
-        """Read audit log entries.
+        """Read audit log entries for a date.
+
+        Returns the human-readable text audit log. Each write operation
+        (CREATE, UPDATE, DELETE, VOID, RECONCILE, etc.) is one entry
+        separated by a blank line. Reads are not logged.
 
         Args:
             log_date: Date to read (YYYY-MM-DD). Defaults to today.
-            tool_filter: Filter by tool name.
-            classification: Filter by "read" or "write".
-            limit: Maximum entries to return (default 50).
+            limit: Maximum entries to return (default 50). Most recent last.
         """
         log_dir = get_log_dir()
         if not log_dir:
@@ -112,60 +110,25 @@ def register(mcp, get_book) -> None:
 
         audit_dir = log_dir / "audit"
         target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
-
-        fmt = get_audit_format()
-        primary_ext = "jsonl" if fmt == "json" else "txt"
-        fallback_ext = "txt" if fmt == "json" else "jsonl"
-
-        log_file = audit_dir / f"{target_date}.{primary_ext}"
-        if not log_file.exists():
-            log_file = audit_dir / f"{target_date}.{fallback_ext}"
+        log_file = audit_dir / f"{target_date}.txt"
 
         if not log_file.exists():
-            if fmt == "json":
-                return _json({"entries": [], "message": f"No audit log for {target_date}"})
-            else:
-                return f"No audit log for {target_date}"
+            return f"No audit log for {target_date}"
 
-        # Reading a .txt file
-        if log_file.suffix == ".txt":
-            content = log_file.read_text()
-            lines = content.strip().split("\n")
-            if len(lines) > limit:
-                lines = lines[-limit:]
-            text_content = "\n".join(lines)
+        content = log_file.read_text().strip()
+        if not content:
+            return f"No audit log for {target_date}"
 
-            if fmt == "json":
-                return _json({
-                    "content": text_content,
-                    "format": "text",
-                    "note": (
-                        "No .jsonl file found for this date. Returning .txt fallback. "
-                        "Ensure GNUCASH_MCP_AUDIT_FORMAT=json is set when starting the server."
-                    ),
-                })
-            else:
-                return text_content
+        # Entries are separated by blank lines. The first block is the
+        # day's header (box-drawing banner) — preserve it regardless of
+        # limit so the reader knows date/timezone/book context.
+        blocks = content.split("\n\n")
+        header = None
+        if blocks and "═" in blocks[0]:
+            header, blocks = blocks[0], blocks[1:]
 
-        # Reading a .jsonl file
-        entries = []
-        for line in log_file.read_text().strip().split("\n"):
-            if not line:
-                continue
-            entry = json.loads(line)
-            if tool_filter and entry.get("tool") != tool_filter:
-                continue
-            if classification and entry.get("classification") != classification:
-                continue
-            entries.append(entry)
+        if len(blocks) > limit:
+            blocks = blocks[-limit:]
 
-        if fmt == "text":
-            lines = []
-            for entry in entries[-limit:]:
-                ts = entry.get("timestamp", "")[:19]
-                tool = entry.get("tool", "unknown")
-                result = entry.get("result", "")
-                lines.append(f"{ts}  {tool}  {result}")
-            return "\n".join(lines) if lines else "No entries"
-
-        return _json({"entries": entries[-limit:], "total_count": len(entries)})
+        parts = ([header] if header else []) + blocks
+        return "\n\n".join(parts)

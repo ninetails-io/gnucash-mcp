@@ -199,7 +199,8 @@ class TestCreateTransactionTool:
         data = json.loads(result)
         assert "guid" in data
         assert data["status"] == "created"
-        assert len(data["guid"]) == 32
+        # Response guid is now a short collision-safe prefix (>=8 chars).
+        assert len(data["guid"]) >= 8
 
     def test_create_unbalanced_transaction(self, setup_book_env):
         """Should return error for unbalanced splits."""
@@ -439,7 +440,8 @@ class TestDeleteTransactionTool:
 
         data = json.loads(result)
         assert data["status"] == "deleted"
-        assert data["guid"] == guid
+        # Response is a short collision-safe prefix of the full guid.
+        assert guid.startswith(data["guid"])
 
         # Verify it's gone
         get_result = server_module.get_transaction(guid)

@@ -23,9 +23,6 @@ _get_book_func: Callable | None = None
 # Module-level reference to log directory, set during setup
 _log_dir: Path | None = None
 
-# Module-level reference to audit format ("text" or "json")
-_audit_format: str = "text"
-
 # Module-level reference to book path for text header
 _book_path_str: str | None = None
 
@@ -35,16 +32,10 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
-def get_audit_format() -> str:
-    """Get the configured audit log format ('text' or 'json')."""
-    return _audit_format
-
-
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
     audit: bool = True,
-    audit_format: str = "text",
     get_book: Callable | None = None,
 ) -> None:
     """Configure audit and debug logging.
@@ -59,20 +50,14 @@ def setup_logging(
                    {book_path}.mcp/ directory alongside the book.
         debug: Enable debug-level MCP protocol logging.
         audit: Enable audit logging. Default True. Use --noaudit to disable.
-        audit_format: Format for audit log: "text" (default, human-readable) or "json" (JSONL).
         get_book: Function to get the GnuCashBook instance (for state capture).
 
     Raises:
         ValueError: If book_path is not provided and either audit or debug is enabled.
-        ValueError: If audit_format is not "text" or "json".
     """
-    global _get_book_func, _log_dir, _audit_format, _book_path_str
+    global _get_book_func, _log_dir, _book_path_str
     _get_book_func = get_book
-    _audit_format = audit_format
     _book_path_str = book_path
-
-    if audit_format not in ("text", "json"):
-        raise ValueError(f"audit_format must be 'text' or 'json', got: {audit_format}")
 
     # If both audit and debug are disabled, no logging setup needed
     if not audit and not debug:
@@ -113,19 +98,17 @@ def setup_logging(
         audit_logger.setLevel(logging.INFO)
         audit_logger.propagate = False
 
-        # Choose file extension based on format
-        file_ext = "jsonl" if audit_format == "json" else "txt"
-        audit_file = audit_dir / f"{today}.{file_ext}"
+        audit_file = audit_dir / f"{today}.txt"
 
-        # Write header for text format if file is new
-        write_header = audit_format == "text" and not audit_file.exists()
+        # Write header if file is new
+        write_header = not audit_file.exists()
 
         audit_handler = logging.FileHandler(audit_file)
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
-        # Write text header if needed
+        # Write header if needed
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
             audit_logger.info(header)
@@ -156,107 +139,6 @@ def setup_logging(
     else:
         # Set to a level that effectively disables it
         debug_logger.setLevel(logging.CRITICAL + 1)
-
-
-def _capture_before_state(
-    entity_type: str | None, operation: str | None, params: dict
-) -> dict | None:
-    """Capture entity state before mutation.
-
-    Args:
-        entity_type: "transaction", "account", or "split"
-        operation: "create", "update", "delete", "void", "unvoid", "reconcile", "set_state"
-        params: Tool parameters
-
-    Returns:
-        State dict or None if not applicable.
-    """
-    if _get_book_func is None:
-        return None
-
-    # Creates don't have before state
-    if operation == "create":
-        return None
-
-    try:
-        book = _get_book_func()
-
-        if entity_type == "transaction":
-            guid = params.get("guid")
-            if guid:
-                return book.get_transaction(guid)
-
-        elif entity_type == "account":
-            name = params.get("name")
-            if name:
-                return book.get_account(name)
-
-        elif entity_type == "split":
-            # For set_reconcile_state
-            split_guid = params.get("split_guid")
-            if split_guid:
-                return _get_split_states_batch(book, [split_guid]).get(split_guid)
-
-            # For reconcile_account (multiple splits)
-            split_guids = params.get("split_guids")
-            if split_guids:
-                states = _get_split_states_batch(book, split_guids)
-                return {"splits": [states.get(g) for g in split_guids]}
-
-    except Exception:
-        # Don't let state capture failures break the tool
-        return None
-
-    return None
-
-
-def _get_split_states_batch(book, split_guids: list[str]) -> dict[str, dict | None]:
-    """Get the current state of multiple splits by GUID in a single book open.
-
-    This is much more efficient than calling _get_split_state for each GUID,
-    as it opens the book only once and iterates through transactions once.
-
-    Args:
-        book: GnuCashBook wrapper instance
-        split_guids: List of split GUIDs to find
-
-    Returns:
-        Dict mapping split GUID to state dict (or None if not found).
-    """
-    if not split_guids:
-        return {}
-
-    # Convert to set for O(1) lookup
-    guids_to_find = set(split_guids)
-    results: dict[str, dict | None] = {g: None for g in split_guids}
-
-    # Open book once and iterate through all transactions
-    with book.open(readonly=True) as piecash_book:
-        for transaction in piecash_book.transactions:
-            # Check each split in this transaction
-            for split in transaction.splits:
-                if split.guid in guids_to_find:
-                    results[split.guid] = {
-                        "guid": split.guid,
-                        "account": split.account.fullname,
-                        "amount": str(split.quantity),
-                        "reconcile_state": split.reconcile_state,
-                        "reconcile_date": (
-                            split.reconcile_date.isoformat()
-                            if split.reconcile_date
-                            else None
-                        ),
-                        # Include transaction context for human-readable logs
-                        "transaction_description": transaction.description,
-                        "transaction_date": transaction.post_date.isoformat(),
-                    }
-                    guids_to_find.discard(split.guid)
-
-                    # Early exit if we found all splits
-                    if not guids_to_find:
-                        return results
-
-    return results
 
 
 def _format_text_header(date_str: str, book_path: str, tz_name: str = "") -> str:
@@ -374,8 +256,11 @@ def _format_audit_entry_text(entry: dict) -> str:
     indent = "          "
 
     if entity_type == "transaction":
-        guid = entry.get("entity_guid") or params.get("guid", "")[:8]
-        guid_short = guid[:8] if guid else ""
+        # Book methods already emit collision-safe short prefixes via
+        # `_unique_prefix` when returning a guid. We display whatever was
+        # provided — truncating here would reverse any birthday-problem
+        # extension (e.g., 9-char prefix back to a colliding 8).
+        guid_short = entry.get("entity_guid") or params.get("guid", "")
 
         if operation == "CREATE":
             lines.append(f"{time_part}  CREATE TRANSACTION  guid:{guid_short}")
@@ -535,9 +420,24 @@ def _format_audit_entry_text(entry: dict) -> str:
             split_guids = params.get("split_guids", [])
             lines.append(f"{indent}Splits reconciled ({len(split_guids)}):")
             for i, guid in enumerate(split_guids[:10]):  # Limit to first 10
-                guid_short = guid[:8]
-                # Try to find details for this split
-                split_info = next((s for s in split_details if s and s.get("guid") == guid), None)
+                # Use the param as-is — truncating here would undo any
+                # collision-safe extension applied upstream.
+                guid_short = guid
+                # Detail lookup tolerates full-vs-prefix mismatch: params
+                # carries whatever the LLM passed (often an 8+-char prefix),
+                # but `before_state` entries carry full GUIDs from the book
+                # method's staged snapshot. Match by startswith so either
+                # side can be a prefix of the other.
+                split_info = next(
+                    (
+                        s
+                        for s in split_details
+                        if s and (s.get("guid") == guid
+                                  or s.get("guid", "").startswith(guid)
+                                  or guid.startswith(s.get("guid", "")))
+                    ),
+                    None,
+                )
                 if split_info:
                     desc = split_info.get("transaction_description", "")
                     amount = _format_amount(split_info.get("amount"))
@@ -548,7 +448,8 @@ def _format_audit_entry_text(entry: dict) -> str:
                 lines.append(f"{indent}  ... and {len(split_guids) - 10} more")
 
         elif operation == "SET_STATE":
-            split_guid = params.get("split_guid", "")[:8]
+            # As-is: caller may have passed a collision-safe 9+-char prefix.
+            split_guid = params.get("split_guid", "")
             lines.append(f"{time_part}  SET RECONCILE STATE")
             lines.append(f"{indent}guid:{split_guid} (split)")
             if before:
@@ -651,7 +552,8 @@ def _format_audit_entry_text(entry: dict) -> str:
             if after:
                 total = after.get("total", "")
                 post_date = after.get("post_date", "")
-                txn_guid = (after.get("transaction_guid") or "")[:8]
+                # As-is — upstream emits a collision-safe prefix.
+                txn_guid = after.get("transaction_guid") or ""
                 lines.append(f'{indent}total: {total}  date: {post_date}')
                 lines.append(f'{indent}account: {post_account}  txn:{txn_guid}')
         elif operation == "PAY":
@@ -661,7 +563,8 @@ def _format_audit_entry_text(entry: dict) -> str:
                 amount = after.get("amount_paid", "")
                 remaining = after.get("remaining_balance", "")
                 pay_acct = params.get("payment_account", "")
-                txn_guid = (after.get("transaction_guid") or "")[:8]
+                # As-is — upstream emits a collision-safe prefix.
+                txn_guid = after.get("transaction_guid") or ""
                 lines.append(f'{indent}paid: {amount}  remaining: {remaining}')
                 lines.append(f'{indent}from: {pay_acct}  txn:{txn_guid}')
 
@@ -770,10 +673,6 @@ def audit_log(
             if classification == "write":
                 entry["operation"] = operation
                 entry["entity_type"] = entity_type
-                # Capture before_state for updates/deletes/voids
-                before = _capture_before_state(entity_type, operation, kwargs)
-                if before:
-                    entry["before_state"] = before
 
             debug_logger.debug(
                 f"MCP request: tool={func.__name__} params={json.dumps(kwargs)}"
@@ -783,6 +682,22 @@ def audit_log(
             try:
                 result = func(*args, **kwargs)
                 elapsed_ms = (time.time() - start_time) * 1000
+
+                # Consume any before-state the book method staged while
+                # its session was open. Always consume (even on read /
+                # create) to clear any stray value; helper returns None
+                # when nothing staged.
+                before = None
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            before = book._consume_audit_before()
+                    except Exception:
+                        # Never let consumption failures break a tool.
+                        before = None
+                if classification == "write" and before:
+                    entry["before_state"] = before
 
                 # Check if result indicates an error (JSON with "error" key)
                 try:
@@ -805,15 +720,11 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms size={len(result)}bytes"
                 )
 
-                # Log in appropriate format
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # Text format - only log write operations
-                    text_entry = _format_audit_entry_text(entry)
-                    if text_entry:
-                        logger.info(text_entry)
-                        logger.info("")  # Blank line between entries
+                # Only log write operations; reads are noise in the audit trail.
+                text_entry = _format_audit_entry_text(entry)
+                if text_entry:
+                    logger.info(text_entry)
+                    logger.info("")  # Blank line between entries
                 _flush_logger(logger)
                 return result
 
@@ -822,20 +733,27 @@ def audit_log(
                 entry["result"] = "error"
                 entry["error"] = str(e)
 
+                # Drop any staged before-state so it can't leak into the
+                # next call. Failed writes don't render before_state in
+                # the error line anyway.
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            book._consume_audit_before()
+                    except Exception:
+                        pass
+
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "
                     f"elapsed={elapsed_ms:.0f}ms error={e}"
                 )
 
-                # Log errors in both formats
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # For errors in text format, log a simple error line
-                    time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                    error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
-                    logger.info(error_text)
-                    logger.info("")
+                # Log a simple error line
+                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
+                error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
+                logger.info(error_text)
+                logger.info("")
                 _flush_logger(logger)
                 raise
 

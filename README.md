@@ -129,7 +129,7 @@ Add `--modules=` after `"gnucash_mcp"` in the args array with a comma-separated 
 
 Use `--modules=all` to load everything (75 tools), but only if you need it. You can also set `GNUCASH_MCP_MODULES=core,reporting` as an environment variable instead of using the CLI flag.
 
-Other optional flags: `"--debug"` enables debug logging, `"--audit-format=text"` or `"--audit-format=json"` sets the audit log format.
+Other optional flags: `"--debug"` enables debug logging, `"--noaudit"` disables the audit log.
 
 ### Step 4: Restart Claude Desktop
 
@@ -296,7 +296,6 @@ This server **reads and writes your GnuCash book directly**. Your GnuCash file m
 | `GNUCASH_MCP_MODULES` | Tool modules to load (e.g., `core,reporting`). Default: `core` |
 | `GNUCASH_MCP_DEBUG` | Set to `1` for debug logging |
 | `GNUCASH_MCP_NOAUDIT` | Set to `1` to disable audit logging |
-| `GNUCASH_MCP_AUDIT_FORMAT` | `text` (default) or `json` |
 
 ### Tool Modules
 
@@ -324,7 +323,7 @@ claude mcp add-json gnucash \
   '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
 ```
 
-Replace both paths with your actual paths. Add `"--modules=core,reporting"` (or whichever modules you need), `"--debug"`, or `"--audit-format=text"` to the args array.
+Replace both paths with your actual paths. Add `"--modules=core,reporting"` (or whichever modules you need), `"--debug"`, or `"--noaudit"` to the args array.
 
 ### Other MCP Clients
 
