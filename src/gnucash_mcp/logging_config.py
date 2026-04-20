@@ -677,6 +677,22 @@ def audit_log(
             debug_logger.debug(
                 f"MCP request: tool={func.__name__} params={json.dumps(kwargs)}"
             )
+
+            # Before the first write of each process, give the backup
+            # system a chance to snapshot. BackupMixin's own flag makes
+            # subsequent calls no-op, so the cost is negligible after
+            # the first hit. Silent on failure — auto-backup must
+            # never break a user's write. Reads never trigger.
+            if classification == "write" and _get_book_func is not None:
+                try:
+                    book = _get_book_func()
+                    if book is not None and hasattr(
+                        book, "_maybe_auto_backup"
+                    ):
+                        book._maybe_auto_backup()
+                except Exception as e:  # noqa: BLE001 — must swallow
+                    debug_logger.warning(f"Auto-backup check failed: {e}")
+
             start_time = time.time()
 
             try:

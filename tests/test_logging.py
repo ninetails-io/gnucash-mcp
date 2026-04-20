@@ -540,6 +540,12 @@ class TestBookOpenAccounting:
         with book_wrapper.open(readonly=True) as pb:
             txn_guid = pb.transactions[0].guid
 
+        # Defeat the auto-backup hook for this test. The hook is a
+        # separate mechanism (tested by TestBackup* below) that legitimately
+        # adds one open to the first write of each process. We want to
+        # measure the WRITE path's opens in isolation.
+        book_wrapper._backup_checked_in_process = True
+
         open_count = [0]
         original = piecash.open_book
 

@@ -52,15 +52,20 @@ class TestToolModulesMapping:
         assert len(TOOL_MODULES["core"]) == 15
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 75."""
+        """Total tools across all modules should be 78.
+
+        78 = 75 original + 3 backup tools (create_backup,
+        list_backups, prune_backups) added in feat/backup-tool.
+        """
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 75
+        assert total == 78
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
         expected = {
             "core", "reconciliation", "reporting", "budgets",
             "scheduling", "investments", "admin", "business",
+            "backup",
         }
         assert set(TOOL_MODULES.keys()) == expected
 
@@ -84,22 +89,31 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 66 tools."""
+        """--modules=all should keep all 78 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 75
+        assert len(self._tool_names()) == 78
 
     def test_none_defaults_to_core_only(self):
-        """No --modules flag should default to core only."""
+        """No --modules flag defaults to core + backup.
+
+        ``backup`` is always added (alongside ``core``) so every
+        user's book gets auto-snapshot protection and on-demand
+        backup tools regardless of their ``--modules`` choice.
+        """
         _apply_module_filter(None)
         remaining = self._tool_names()
-        assert remaining == set(TOOL_MODULES["core"])
-        assert len(remaining) == 15
+        expected = set(TOOL_MODULES["core"]) | set(TOOL_MODULES["backup"])
+        assert remaining == expected
 
     def test_core_plus_reporting(self):
-        """--modules=core,reporting should load both modules."""
+        """--modules=core,reporting loads both + backup (always)."""
         _apply_module_filter("core,reporting")
         remaining = self._tool_names()
-        expected = set(TOOL_MODULES["core"]) | set(TOOL_MODULES["reporting"])
+        expected = (
+            set(TOOL_MODULES["core"])
+            | set(TOOL_MODULES["reporting"])
+            | set(TOOL_MODULES["backup"])
+        )
         assert remaining == expected
 
     def test_core_always_included(self):
@@ -113,12 +127,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 75
+        assert len(self._tool_names()) == 78
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 66 tools."""
+        """'all' mixed with other modules should keep all 78 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 75
+        assert len(self._tool_names()) == 78
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""
@@ -137,7 +151,11 @@ class TestApplyModuleFilter:
         """Whitespace around module names should be stripped."""
         _apply_module_filter("core , reporting")
         remaining = self._tool_names()
-        expected = set(TOOL_MODULES["core"]) | set(TOOL_MODULES["reporting"])
+        expected = (
+            set(TOOL_MODULES["core"])
+            | set(TOOL_MODULES["reporting"])
+            | set(TOOL_MODULES["backup"])
+        )
         assert remaining == expected
 
     def test_investments_module_tools(self):
@@ -163,8 +181,8 @@ class TestApplyModuleFilter:
     def test_returns_loaded_modules_sorted(self):
         """Return value should be sorted list of actually loaded modules."""
         result = _apply_module_filter("reporting,budgets")
-        # core is always added, result should be sorted
-        assert result == ["budgets", "core", "reporting"]
+        # core and backup are both always added; result is sorted.
+        assert result == ["backup", "budgets", "core", "reporting"]
 
     def test_returns_all_modules_for_all(self):
         """'all' should return all module names sorted."""
@@ -172,9 +190,9 @@ class TestApplyModuleFilter:
         assert result == sorted(TOOL_MODULES.keys())
 
     def test_returns_core_for_none(self):
-        """None should return just core."""
+        """None returns core + backup (both are unconditional)."""
         result = _apply_module_filter(None)
-        assert result == ["core"]
+        assert result == ["backup", "core"]
 
     def test_returns_excludes_unknown_modules(self):
         """Unknown module names should not appear in return value."""

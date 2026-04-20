@@ -29,6 +29,7 @@ from gnucash_mcp.book._base import (
 # through the same registration path as every other module.
 _MIXIN_MAP: dict[str, tuple[str, str]] = {
     "admin": (".admin", "AdminMixin"),
+    "backup": (".backup", "BackupMixin"),
     "budgets": (".budgets", "BudgetsMixin"),
     "business": (".business", "BusinessMixin"),
     "core": (".core", "CoreMixin"),
