@@ -101,11 +101,19 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """List transactions with optional filters.
 
-        Returns a compact one-line-per-transaction format by default.
-        Use verbose=true for full JSON with GUIDs, splits, reconcile state, etc.
+        Compact format (default):
+        - Unfiltered: ``DATE<TAB>guid<TAB>Description<TAB>splits``
+        - Filtered by account (register form):
+          ``DATE<TAB>guid<TAB>±Amount<TAB>Description<TAB>other splits``
+          Column 3 is the signed impact on the filtered account; that
+          account is dropped from the splits column.
+
+        Transactions with more than 4 splits collapse to the top 3 by
+        |value| plus ``+N more`` — call ``get_transaction`` for the
+        full breakdown.
 
         Args:
-            account: Filter by account name
+            account: Filter by account name (switches output to register form)
             start_date: Start date in ISO format (YYYY-MM-DD)
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Maximum number of transactions to return (default 50)
@@ -187,8 +195,11 @@ def register(mcp, get_book) -> None:
     def search_transactions(query: str, field: str = "description", verbose: bool = False) -> str:
         """Search transactions by description, memo, notes, or amount.
 
-        Returns a compact one-line-per-transaction format by default.
-        Use verbose=true for full JSON with GUIDs, splits, reconcile state, etc.
+        Compact format (default):
+        ``DATE<TAB>guid<TAB>Description<TAB>splits``
+        Transactions with more than 4 splits collapse to the top 3 by
+        |value| plus ``+N more`` — call ``get_transaction`` for the
+        full breakdown.
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")

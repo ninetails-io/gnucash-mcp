@@ -395,7 +395,7 @@ class CoreMixin:
                 prefixes = _guid_prefix_map(t.guid for t in book.transactions)
                 lines = [
                     _transaction_to_compact_line(
-                        t, exclude_account=account, prefixes=prefixes
+                        t, focus_account=account, prefixes=prefixes
                     )
                     for t in filtered
                 ]

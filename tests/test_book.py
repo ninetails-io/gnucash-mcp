@@ -361,6 +361,192 @@ class TestListTransactions:
             gc_book.list_transactions(account="Nonexistent:Account")
 
 
+class TestCompactTransactionFormat:
+    """Tests for the compact output shapes of list/search_transactions.
+
+    Two shapes to defend:
+      - Unfiltered: ``DATE\\tguid\\tDESC\\tsplits``
+      - Register (list_transactions(account=X)):
+        ``DATE\\tguid\\t±AMT\\tDESC\\tother splits``
+
+    And the collapse rule: transactions with > 4 splits in the rendered
+    column truncate to top-3 by |value| + "+N more". Prerelease-1 bug:
+    the old ``exclude_account`` variant dropped the filtered split
+    without putting anything in its place, and readers mis-parsed the
+    remaining split as the description.
+    """
+
+    def _paycheck_book(self, gc_book):
+        """Add a 7-split paycheck transaction to the existing fixture.
+
+        Splits (|value| in USD):
+          Income:Salary        -4865   gross
+          Assets:Checking       3000   net deposit
+          Expenses:Federal Tax   800
+          Assets:401k            400   top-3 by |value| stops here
+          Expenses:SS            350
+          Expenses:State Tax     200
+          Expenses:Groceries     115   ...the "+more" bucket
+        """
+        # Create new accounts the paycheck lands in
+        gc_book.create_account(name="Federal Tax", account_type="EXPENSE", parent="Expenses")
+        gc_book.create_account(name="State Tax", account_type="EXPENSE", parent="Expenses")
+        gc_book.create_account(name="SS", account_type="EXPENSE", parent="Expenses")
+        gc_book.create_account(name="401k", account_type="ASSET", parent="Assets")
+
+        gc_book.create_transaction(
+            description="Paycheck",
+            splits=[
+                {"account": "Income:Salary", "amount": "-4865"},
+                {"account": "Assets:Checking", "amount": "3000"},
+                {"account": "Expenses:Federal Tax", "amount": "800"},
+                {"account": "Assets:401k", "amount": "400"},
+                {"account": "Expenses:SS", "amount": "350"},
+                {"account": "Expenses:State Tax", "amount": "200"},
+                {"account": "Expenses:Groceries", "amount": "115"},
+            ],
+            trans_date=date(2026, 2, 15),
+            check_duplicates=False,
+        )
+
+    # ── Unfiltered shape (search_transactions + list_transactions w/o filter) ──
+
+    def test_unfiltered_line_has_description_in_column_3(self, test_book: Path):
+        """Unfiltered output: 4 tab-separated columns ending with splits."""
+        gc_book = GnuCashBook(str(test_book))
+        lines = gc_book.list_transactions().strip().split("\n")
+        groceries = next(l for l in lines if "Weekly Groceries" in l)
+        cols = groceries.split("\t")
+        assert len(cols) == 4
+        assert cols[0] == "2024-01-20"
+        assert len(cols[1]) >= 8  # guid prefix
+        assert cols[2] == "Weekly Groceries"
+        assert "Expenses:Groceries" in cols[3]
+        assert "Assets:Checking" in cols[3]
+
+    def test_search_output_matches_unfiltered_list_shape(self, test_book: Path):
+        """search_transactions's compact shape is identical to unfiltered list."""
+        gc_book = GnuCashBook(str(test_book))
+        search_line = gc_book.search_transactions("Groceries").strip().split("\n")[0]
+        list_line = next(
+            l for l in gc_book.list_transactions().strip().split("\n")
+            if "Weekly Groceries" in l
+        )
+        assert search_line == list_line
+
+    # ── Register shape (list_transactions with account filter) ──
+
+    def test_register_line_has_signed_amount_column(self, test_book: Path):
+        """Filtered output: 5 columns, column 3 is signed impact on focus account."""
+        gc_book = GnuCashBook(str(test_book))
+        lines = gc_book.list_transactions(account="Assets:Checking").strip().split("\n")
+        groceries = next(l for l in lines if "Weekly Groceries" in l)
+        cols = groceries.split("\t")
+        assert len(cols) == 5
+        assert cols[0] == "2024-01-20"
+        assert cols[2] == "-150"  # groceries drew $150 out of checking
+        assert cols[3] == "Weekly Groceries"
+        # Focus account is dropped from the splits column
+        assert "Assets:Checking" not in cols[4]
+        assert "Expenses:Groceries" in cols[4]
+
+    def test_register_positive_deposit_has_plus_sign(self, test_book: Path):
+        """Inflows render with an explicit '+' so sign is visible at a glance."""
+        gc_book = GnuCashBook(str(test_book))
+        lines = gc_book.list_transactions(account="Assets:Checking").strip().split("\n")
+        salary = next(l for l in lines if "Salary" in l)
+        cols = salary.split("\t")
+        assert cols[2] == "+2000"
+
+    def test_register_description_position_is_stable(self, test_book: Path):
+        """Description is always the last-but-one column in register form.
+
+        The prerelease-1 bug came from a reader parsing the filtered
+        output as 3-column 'DATE GUID SPLITS' and missing the
+        description. The register shape makes column 4 unambiguously
+        the description.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        lines = gc_book.list_transactions(account="Assets:Checking").strip().split("\n")
+        for line in lines:
+            cols = line.split("\t")
+            # 5 or 6 cols (6 if the transaction has notes)
+            assert len(cols) >= 5
+            # Column 3 parses as a signed decimal
+            assert cols[2].lstrip("+-").replace(".", "").isdigit()
+            # Column 4 is not a split (no account path / no amount pair)
+            assert ":" not in cols[3] or not any(
+                ch.isdigit() for ch in cols[3].split()[-1]
+            )
+
+    # ── Split-list collapse ──
+
+    def test_no_collapse_below_threshold(self, test_book: Path):
+        """Transactions with <= 4 splits render every split, no '+N more'."""
+        gc_book = GnuCashBook(str(test_book))
+        out = gc_book.list_transactions()
+        assert "+" not in out or "more" not in out  # nothing collapsed
+
+    def test_collapse_at_7_splits_unfiltered(self, test_book: Path):
+        """7-split paycheck collapses to 3 + '+4 more' in unfiltered output."""
+        gc_book = GnuCashBook(str(test_book))
+        self._paycheck_book(gc_book)
+        line = next(
+            l for l in gc_book.search_transactions("Paycheck").strip().split("\n")
+            if "Paycheck" in l
+        )
+        cols = line.split("\t")
+        splits_col = cols[3]
+        # Top 3 by |value|: Salary (-4865), Checking (+3000), Fed (+800)
+        assert "Income:Salary -4865" in splits_col
+        assert "Assets:Checking 3000" in splits_col
+        assert "Expenses:Federal Tax 800" in splits_col
+        assert "+4 more" in splits_col
+        # The smaller ones got collapsed away
+        assert "SS" not in splits_col
+        assert "State" not in splits_col
+        assert "Groceries 115" not in splits_col
+
+    def test_collapse_filtered_drops_focus_then_collapses(self, test_book: Path):
+        """Register form: focus account drops first, THEN top-3 collapse on the rest."""
+        gc_book = GnuCashBook(str(test_book))
+        self._paycheck_book(gc_book)
+        line = next(
+            l for l in gc_book.list_transactions(account="Assets:Checking").strip().split("\n")
+            if "Paycheck" in l
+        )
+        cols = line.split("\t")
+        assert cols[2] == "+3000"  # focus amount
+        assert cols[3] == "Paycheck"
+        splits_col = cols[4]
+        # 6 other splits → top 3 by |value|: Salary, Fed, 401k
+        assert "Income:Salary -4865" in splits_col
+        assert "Expenses:Federal Tax 800" in splits_col
+        assert "Assets:401k 400" in splits_col
+        assert "+3 more" in splits_col
+        # Focus account is absent from the splits column
+        assert "Assets:Checking" not in splits_col
+
+    def test_collapse_ranks_by_absolute_value(self, test_book: Path):
+        """Collapse ordering is by |value| descending, not by appearance or sign.
+
+        A -4865 entry outranks a +3000 entry because |4865| > |3000|.
+        Verified implicitly by the paycheck fixture where Salary is
+        first despite being negative.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        self._paycheck_book(gc_book)
+        line = next(
+            l for l in gc_book.search_transactions("Paycheck").strip().split("\n")
+            if "Paycheck" in l
+        )
+        splits_col = line.split("\t")[3]
+        # Salary (|-4865|) should appear before Checking (|3000|)
+        salary_idx = splits_col.index("Income:Salary")
+        checking_idx = splits_col.index("Assets:Checking")
+        assert salary_idx < checking_idx
+
+
 class TestGetTransaction:
     """Tests for get_transaction method."""
 
