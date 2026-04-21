@@ -29,6 +29,19 @@ class TestCreateCustomer:
         result = gb.create_customer(name="Acme Corp", currency="USD")
         assert result["status"] == "created"
 
+    def test_result_includes_resolved_currency(self, business_book):
+        """Result dict always reports the resolved currency so the audit
+        log formatter renders ``currency: USD`` instead of an empty field
+        when the caller didn't supply currency explicitly.
+        """
+        gb = GnuCashBook(str(business_book))
+        # Explicit currency
+        r1 = gb.create_customer(name="Explicit", currency="USD")
+        assert r1["currency"] == "USD"
+        # Defaulted currency (caller omits) — still populated
+        r2 = gb.create_customer(name="Defaulted")
+        assert r2["currency"] == "USD"
+
     def test_invalid_currency(self, business_book):
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError, match="Currency not found"):
