@@ -78,6 +78,79 @@ class TestGetBookSummary:
         result = gc_book.get_book_summary()
         assert f"Book: {test_book}" in result
 
+    def test_investment_valued_at_latest_price(
+        self, multi_currency_book: Path
+    ):
+        """Foreign-currency asset balance reports as USD market value.
+
+        The multi_currency_book fixture has an EUR Savings account with
+        1000 EUR in it and a USD-denominated Checking. Add a EUR→USD
+        price, then verify the summary shows the EUR balance valued
+        at that rate.
+        """
+        import piecash
+        from datetime import date as _date
+        gc_book = GnuCashBook(str(multi_currency_book))
+        with gc_book.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = None
+            for c in book.commodities:
+                if c.mnemonic == "EUR":
+                    eur = c
+                    break
+            assert eur is not None
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 1),
+                value="1.20",
+                source="user:test",
+                type="nav",
+            ))
+            book.save()
+
+        result = gc_book.get_book_summary()
+        # 1000 EUR × 1.20 = $1200. Decimal("1.20") stringifies as "1.2".
+        assert "1000 EUR @ 1.2" in result
+        assert "(USD 1200.00)" in result
+
+    def test_investment_no_price_falls_back_to_cost_basis(
+        self, multi_currency_book: Path
+    ):
+        """With no EUR→USD price on file, the summary tags the line
+        as 'no price data' and uses cost basis (sum of split values).
+
+        In the fixture the cross-currency transfer booked value=1100 USD
+        on the EUR side, so the fallback cost basis is $1,100.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.get_book_summary()
+        assert "1000 EUR — no price data" in result
+        assert "(USD 1100.00)" in result or "(USD 1100)" in result
+
+    def test_business_entities_line(self, business_book: Path):
+        """Summary includes Business line when entities exist."""
+        gc_book = GnuCashBook(str(business_book))
+        gc_book.create_customer(name="Alpha Co")
+        gc_book.create_customer(name="Beta LLC")
+        gc_book.create_vendor(name="Gamma Supplies")
+        gc_book.create_employee(name="Delta Worker")
+
+        result = gc_book.get_book_summary()
+        assert "Business: 2 customers, 1 vendor, 1 employee" in result
+
+    def test_business_line_omitted_when_empty(self, business_book: Path):
+        """No Business line when the book has no customers/vendors/employees."""
+        gc_book = GnuCashBook(str(business_book))
+        result = gc_book.get_book_summary()
+        assert "Business:" not in result
+
+    def test_budgets_line(self, budget_book: Path):
+        """Summary shows Budgets count when budgets exist."""
+        gc_book = GnuCashBook(str(budget_book))
+        gc_book.create_budget(name="Test Budget", year=2026)
+        result = gc_book.get_book_summary()
+        assert "Budgets: 1" in result
+
 
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
