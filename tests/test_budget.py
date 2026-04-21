@@ -171,6 +171,30 @@ class TestSetBudgetAmount:
 
         assert result["periods_set"] == [0, 1, 2]
 
+    def test_set_single_period_numeric_string(self, budget_book: Path):
+        """Numeric-string periods coerce to int (MCP XML param layer passes strings)."""
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+
+        # "11" should behave identically to 11.
+        result = book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="800.00",
+            period="11",
+        )
+
+        assert result["periods_set"] == [11]
+
+        budget = book.get_budget("2026 Budget")
+        grocery_amounts = None
+        for acct in budget["accounts"]:
+            if acct["account"] == "Expenses:Groceries":
+                grocery_amounts = acct["periods"]
+                break
+        assert grocery_amounts is not None
+        assert Decimal(grocery_amounts[11]) == Decimal("800.00")
+
     def test_overwrite_existing_amount(self, budget_book: Path):
         """Overwriting an existing budget amount works."""
         book = GnuCashBook(str(budget_book))
