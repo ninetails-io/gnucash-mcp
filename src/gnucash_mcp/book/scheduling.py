@@ -624,7 +624,7 @@ class SchedulingMixin:
 
         Does not affect transactions already created from this schedule.
         """
-        from sqlalchemy import text
+        from piecash.kvp import Slot
 
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
@@ -646,16 +646,18 @@ class SchedulingMixin:
                 "status": "deleted",
             }
 
-            # Delete the splits-json slot via raw SQL
+            # Delete the splits-json slot via SQLAlchemy Core — column /
+            # table renames surface as AttributeError at import, not as
+            # silent runtime failures.
             book.session.execute(
-                text(
-                    "DELETE FROM slots "
-                    "WHERE obj_guid = :guid AND name = :name"
-                ),
-                {"guid": sx.guid, "name": "splits-json"},
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == sx.guid)
+                    & (Slot.__table__.c.name == "splits-json")
+                )
             )
             _verify_delete(
                 book.session,
+                Slot.__table__,
                 {"obj_guid": sx.guid, "name": "splits-json"},
                 f"Splits slot for scheduled transaction '{result['name']}'",
             )

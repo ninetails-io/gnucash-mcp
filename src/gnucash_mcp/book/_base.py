@@ -96,18 +96,28 @@ def _verify_composite_write(
         )
 
 
-def _verify_delete(session, conditions: dict, label: str) -> None:
-    """Verify a raw SQL DELETE removed the expected row(s).
+def _verify_delete(
+    session, table, conditions: dict, label: str
+) -> None:
+    """Verify a SQL DELETE removed the expected row(s).
 
     Must be called within the same session, before book.save().
     Raises RuntimeError if matching rows still exist.
-    """
-    from sqlalchemy import text
 
-    where_parts = " AND ".join(f"{col} = :{col}" for col in conditions)
+    Shape-matches ``_verify_composite_write``: the ``table`` argument
+    is a SQLAlchemy Core Table (``Entity.__table__``). The previous
+    signature hardcoded ``FROM slots`` via raw SQL, which kept this
+    helper scoped to slot deletes; generalizing to any table lets us
+    pair deletes-with-verification for Entry / Invoice / Customer /
+    Vendor cleanup too.
+    """
+    from sqlalchemy import select, func, and_
+
+    where_clause = and_(
+        *(table.c[col] == val for col, val in conditions.items())
+    )
     count = session.execute(
-        text(f"SELECT count(*) FROM slots WHERE {where_parts}"),
-        conditions,
+        select(func.count()).select_from(table).where(where_clause)
     ).scalar()
     if count != 0:
         debug_logger.error(
@@ -406,43 +416,128 @@ def _unreconciled_split_to_compact_line(
     return f"{short}\t{d}\t{desc}\t{amount}\t{state}"
 
 
+# Split-list collapse threshold: transactions with more than this many
+# splits (in the column that would be rendered) get truncated to
+# "top-K by |value| + '+N more'". Keeps paycheck-style multi-leg
+# transactions (~17 splits: gross, taxes, 401k, insurance, net) from
+# flooding the compact view. Full breakdown is always one step away
+# via ``get_transaction(guid)``.
+_SPLIT_COLLAPSE_THRESHOLD = 4
+_SPLIT_COLLAPSE_KEEP = 3
+
+
+def _format_one_split(split: piecash.Split, transaction: piecash.Transaction) -> str:
+    """Render one split as ``account amount``, with cross-currency annotation.
+
+    Shared between the full and collapsed split-list paths so the
+    per-split rendering stays consistent with history.
+    """
+    account_name = split.account.fullname
+    amount = split.quantity
+    if split.quantity != split.value:
+        currency = transaction.currency.mnemonic
+        commodity = split.account.commodity.mnemonic
+        return f"{account_name} {amount} {commodity} (={split.value} {currency})"
+    return f"{account_name} {amount}"
+
+
+def _format_splits_collapsed(
+    splits: list[piecash.Split], transaction: piecash.Transaction,
+) -> str:
+    """Render a split list, collapsing long tails.
+
+    <= ``_SPLIT_COLLAPSE_THRESHOLD`` splits render in full, original
+    iteration order. Longer lists sort by ``|value|`` (transaction
+    currency — consistent across cross-currency splits) and render the
+    top ``_SPLIT_COLLAPSE_KEEP`` followed by ``+N more``.
+
+    Sorting by ``|value|`` rather than ``|quantity|`` avoids the cross-
+    currency pitfall where "10 shares" would outrank "$1250 cash" just
+    because 10 > 1250 in share magnitude is false but the reverse comparison
+    between incommensurable units still leads to misleading orderings.
+    """
+    if len(splits) <= _SPLIT_COLLAPSE_THRESHOLD:
+        return ", ".join(_format_one_split(s, transaction) for s in splits)
+
+    ranked = sorted(splits, key=lambda s: abs(s.value), reverse=True)
+    kept = ranked[:_SPLIT_COLLAPSE_KEEP]
+    more = len(splits) - _SPLIT_COLLAPSE_KEEP
+    shown = ", ".join(_format_one_split(s, transaction) for s in kept)
+    return f"{shown}, +{more} more"
+
+
 def _transaction_to_compact_line(
     transaction: piecash.Transaction,
-    exclude_account: str | None = None,
+    focus_account: str | None = None,
     prefixes: dict[str, str] | None = None,
 ) -> str:
     """Convert a piecash Transaction to a compact tab-separated line.
 
-    Format: "YYYY-MM-DD\\tabcd1234\\tDescription\\tAccount amount, Account amount"
+    Two output shapes, one per calling use case:
+
+    - **Unfiltered** (``focus_account is None`` — e.g. ``search_transactions``)::
+
+          YYYY-MM-DD<TAB>guid<TAB>Description<TAB>Account amount, Account amount[, ...][, +N more]
+
+    - **Register** (``focus_account`` set — ``list_transactions(account=X)``)::
+
+          YYYY-MM-DD<TAB>guid<TAB>±Amount<TAB>Description<TAB>Other splits[, +N more]
+
+      The register form is the "checking register" view: column 3 is
+      the signed impact on the filtered account (what a reconciler
+      actually reads), and the filtered account's own name is dropped
+      from the split list because the caller supplied it. Column 4 is
+      always the description.
+
+    Both shapes collapse the split list when it has more than
+    ``_SPLIT_COLLAPSE_THRESHOLD`` items, emitting the top
+    ``_SPLIT_COLLAPSE_KEEP`` by ``|value|`` followed by ``+N more``.
+    The full breakdown is always available via ``get_transaction(guid)``.
+
+    History note: earlier prereleases of this server used an
+    ``exclude_account`` variant of this function that stripped the
+    filtered split silently, which made the filtered output look like
+    it was missing the description (when really the description had
+    shifted into a column the reader was parsing as splits). Register
+    form fixes that ambiguity structurally and makes the filtered
+    account's amount first-class — the field readers care about most.
 
     Args:
         transaction: piecash Transaction object.
-        exclude_account: If set, omit the split for this account (used when
-                        listing transactions filtered by account — the AI
-                        already knows the filtered account).
-        prefixes: Optional map from full transaction GUID to collision-safe
-                  prefix (built via `_guid_prefix_map`). Defaults to raw
-                  8-char truncation when absent.
+        focus_account: If set, render register form filtered by this
+            account's full path. All splits matching this path are
+            summed into column 3 and dropped from the splits column.
+        prefixes: Optional map from full transaction GUID to
+            collision-safe prefix (built via ``_guid_prefix_map``).
+            Defaults to raw 8-char truncation when absent.
     """
     date_str = transaction.post_date.isoformat()
     short = _short_guid(transaction.guid, prefixes)
     desc = transaction.description
+    splits = list(transaction.splits)
 
-    parts = []
-    for split in transaction.splits:
-        account_name = split.account.fullname
-        if exclude_account and account_name == exclude_account:
-            continue
-        amount = split.quantity
-        if split.quantity != split.value:
-            currency = transaction.currency.mnemonic
-            commodity = split.account.commodity.mnemonic
-            parts.append(f"{account_name} {amount} {commodity} (={split.value} {currency})")
+    if focus_account is not None:
+        focus_splits = [
+            s for s in splits if s.account.fullname == focus_account
+        ]
+        other_splits = [
+            s for s in splits if s.account.fullname != focus_account
+        ]
+        focus_amt = sum(
+            (s.quantity for s in focus_splits), Decimal("0")
+        )
+        if focus_amt > 0:
+            amt_str = f"+{focus_amt}"
+        elif focus_amt < 0:
+            amt_str = str(focus_amt)
         else:
-            parts.append(f"{account_name} {amount}")
+            amt_str = "0"
+        splits_str = _format_splits_collapsed(other_splits, transaction)
+        line = f"{date_str}\t{short}\t{amt_str}\t{desc}\t{splits_str}"
+    else:
+        splits_str = _format_splits_collapsed(splits, transaction)
+        line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
 
-    splits_str = ", ".join(parts)
-    line = f"{date_str}\t{short}\t{desc}\t{splits_str}"
     if transaction.notes:
         line += f"\t{transaction.notes}"
     return line

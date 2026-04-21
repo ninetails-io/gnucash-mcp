@@ -1600,11 +1600,14 @@ class BusinessMixin:
 
     def _delete_invoice_or_bill(self, doc_id: str, owner_type: int) -> dict:
         """Shared implementation for delete_invoice and delete_bill."""
-        from sqlalchemy import text
-        from piecash.business.invoice import Invoice
+        from sqlalchemy import func, select
+        from piecash.business.invoice import Entry, Invoice
+
+        from gnucash_mcp.book._base import _verify_delete
 
         type_label = "Bill" if owner_type == 4 else "Invoice"
         entry_fk = "bill" if owner_type == 4 else "invoice"
+        entry_fk_col = getattr(Entry.__table__.c, entry_fk)
 
         with self.open(readonly=False) as book:
             inv = self._find_invoice(book, doc_id, owner_type=owner_type)
@@ -1619,19 +1622,36 @@ class BusinessMixin:
 
             inv_guid = inv.guid
 
+            # Entry cleanup — count first so the response can report how
+            # many were removed, then delete via SQLAlchemy Core. A column
+            # rename of ``entries.invoice`` or ``entries.bill`` in a
+            # future GnuCash release surfaces as AttributeError at import.
             entry_count = book.session.execute(
-                text(f"SELECT count(*) FROM entries WHERE {entry_fk} = :guid"),
-                {"guid": inv_guid},
+                select(func.count())
+                .select_from(Entry.__table__)
+                .where(entry_fk_col == inv_guid)
             ).scalar()
             if entry_count:
                 book.session.execute(
-                    text(f"DELETE FROM entries WHERE {entry_fk} = :guid"),
-                    {"guid": inv_guid},
+                    Entry.__table__.delete().where(entry_fk_col == inv_guid)
+                )
+                _verify_delete(
+                    book.session,
+                    Entry.__table__,
+                    {entry_fk: inv_guid},
+                    f"Entries for {type_label.lower()} '{doc_id}'",
                 )
 
             book.session.execute(
-                text("DELETE FROM invoices WHERE guid = :guid"),
+                Invoice.__table__.delete().where(
+                    Invoice.__table__.c.guid == inv_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Invoice.__table__,
                 {"guid": inv_guid},
+                f"{type_label} '{doc_id}'",
             )
 
             book.save()
@@ -1680,8 +1700,10 @@ class BusinessMixin:
 
     def _delete_customer_or_vendor(self, entity_id: str, is_vendor: bool) -> dict:
         """Shared implementation for delete_customer and delete_vendor."""
-        from sqlalchemy import text
         from piecash.business.invoice import Invoice
+        from piecash.kvp import Slot
+
+        from gnucash_mcp.book._base import _verify_delete
 
         if is_vendor:
             type_label = "Vendor"
@@ -1728,9 +1750,20 @@ class BusinessMixin:
                         f"Delete the {doc_label} first."
                     )
 
+            # Slot cleanup via SQLAlchemy Core. Customer/Vendor rows can
+            # accumulate slots over their lifetime (notes, tax info,
+            # etc.); they must be cleaned up first because the ``slots``
+            # table has no ON DELETE CASCADE on ``obj_guid``.
             book.session.execute(
-                text("DELETE FROM slots WHERE obj_guid = :guid"),
-                {"guid": entity_guid},
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == entity_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Slot.__table__,
+                {"obj_guid": entity_guid},
+                f"Slots for {type_label.lower()} '{entity_id}'",
             )
 
             book.session.delete(entity)
