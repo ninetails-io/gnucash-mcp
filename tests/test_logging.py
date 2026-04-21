@@ -485,7 +485,7 @@ class TestDispatchTableDegradation:
         entry = {
             "classification": "write",
             "operation": "create",
-            "entity_type": "employee",  # not yet in the dispatch table
+            "entity_type": "hologram",  # fictional entity, never in the dispatcher
             "timestamp": "2026-04-21T12:34:56",
             "params": {"name": "Test"},
             "after_state": {"id": "000001", "name": "Test"},

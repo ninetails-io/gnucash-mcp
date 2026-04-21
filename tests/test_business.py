@@ -190,6 +190,150 @@ class TestGetVendor:
             gb.get_vendor("999999")
 
 
+class TestCreateEmployee:
+    """Tests for create_employee."""
+
+    def test_basic_creation(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        result = gb.create_employee(name="Jane Smith")
+        assert result["status"] == "created"
+        assert result["name"] == "Jane Smith"
+        assert result["id"] == "000001"
+        assert len(result["guid"]) == 32
+
+    def test_auto_id_increments(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        r1 = gb.create_employee(name="Employee A")
+        r2 = gb.create_employee(name="Employee B")
+        assert r1["id"] == "000001"
+        assert r2["id"] == "000002"
+
+    def test_with_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        result = gb.create_employee(name="Jane Smith", currency="USD")
+        assert result["status"] == "created"
+
+    def test_invalid_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Currency not found"):
+            gb.create_employee(name="Jane Smith", currency="XYZ")
+
+    def test_with_address(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        addr = {
+            "name": "Jane Smith",
+            "addr1": "123 Main St",
+            "phone": "555-1234",
+            "email": "jane@example.com",
+        }
+        gb.create_employee(name="Jane Smith", address=addr)
+        result = gb.get_employee("000001")
+        assert result["address"]["addr1"] == "123 Main St"
+        assert result["address"]["email"] == "jane@example.com"
+
+    def test_no_notes_field_in_response(self, business_book):
+        """Employee dict shape omits the ``notes`` key — Employee has no
+        notes column in the schema (unlike Customer and Vendor). See
+        docs/PIECASH_REFERENCE.md."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith")
+        result = gb.get_employee("000001")
+        assert "notes" not in result
+
+    def test_employee_counter_independent(self, business_book):
+        """Employee counter is independent of Customer and Vendor counters.
+
+        Each of the three business-person types has its own counter
+        on the Book (``counter_customer`` / ``counter_vendor`` /
+        ``counter_employee``). All three first IDs should be '000001'.
+        """
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_employee(name="Jane Smith")
+        # All three just created. Each should be '000001' from its own counter.
+        assert gb.get_customer("000001")["name"] == "Acme Corp"
+        assert gb.get_vendor("000001")["name"] == "Office Depot"
+        assert gb.get_employee("000001")["name"] == "Jane Smith"
+
+
+class TestListEmployees:
+    """Tests for list_employees."""
+
+    def test_empty_list(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        result = gb.list_employees()
+        assert result == ""
+
+    def test_compact_format(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Beta Hire")
+        gb.create_employee(name="Alpha Hire")
+        result = gb.list_employees()
+        lines = result.strip().split("\n")
+        assert len(lines) == 2
+        # Sorted by name
+        assert "Alpha Hire" in lines[0]
+        assert "Beta Hire" in lines[1]
+
+    def test_verbose_format(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith")
+        result = gb.list_employees(compact=False)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["name"] == "Jane Smith"
+        assert "guid" in result[0]
+        # notes key absent (schema difference)
+        assert "notes" not in result[0]
+
+
+class TestGetEmployee:
+    """Tests for get_employee."""
+
+    def test_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith")
+        result = gb.get_employee("000001")
+        assert result["name"] == "Jane Smith"
+        assert result["id"] == "000001"
+        assert result["active"] is True
+
+    def test_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.get_employee("999999")
+
+
+class TestDeleteEmployee:
+    """Tests for delete_employee.
+
+    Employees in the 1.3.0 release have no associated documents —
+    expense vouchers are out of scope. delete_employee proceeds
+    unconditionally after slot cleanup.
+    """
+
+    def test_delete_employee(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Temp Employee")
+        result = gb.delete_employee(employee_id="000001")
+        assert result["status"] == "deleted"
+        assert result["name"] == "Temp Employee"
+        assert result["type"] == "employee"
+
+    def test_delete_employee_twice_errors(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Temp Employee")
+        gb.delete_employee(employee_id="000001")
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.delete_employee(employee_id="000001")
+
+    def test_delete_nonexistent_employee(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.delete_employee(employee_id="999999")
+
+
 class TestDeleteCustomer:
     """Tests for delete_customer."""
 
