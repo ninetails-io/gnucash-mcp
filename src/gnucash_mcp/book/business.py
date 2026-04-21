@@ -383,31 +383,35 @@ class BusinessMixin:
         book,
         name: str,
         currency: str | None = None,
-        notes: str = "",
         address: dict | None = None,
+        **extra_kwargs,
     ) -> dict:
         """Shared create path for Customer / Vendor / Employee.
 
-        All three piecash business-person classes share the same
-        constructor shape: ``(name, currency, notes, address, book)``.
-        This helper absorbs the boilerplate — currency resolution
-        (user-specified mnemonic or book default), optional Address
-        construction from a dict, entity instantiation, save, and the
-        canonical ``{guid, id, name, status}`` response.
+        Currency resolution (user-specified mnemonic or book default),
+        optional Address construction from a dict, entity instantiation,
+        ``book.save()``, and the canonical
+        ``{guid, id, name, status}`` response — all in one place.
 
-        Callers pass the class and the user-facing fields; the helper
-        neither knows nor cares what kind of business person it's
-        creating. Adding Employee is a 5-line caller against this.
+        Class-specific fields are passed via ``**extra_kwargs`` so the
+        helper stays agnostic of what each subclass accepts. Customer
+        and Vendor take ``notes=""``; Employee has no ``notes`` column
+        and rejects the kwarg — see docs/PIECASH_REFERENCE.md for the
+        full shape divergence. Callers build their own kwargs dict and
+        the helper passes it through unexamined.
 
         Args:
             cls: ``Customer``, ``Vendor``, or ``Employee`` (piecash).
             book: An open piecash book session (readonly=False).
             name: Entity display name.
             currency: ISO currency code. Defaults to book's default.
-            notes: Free-text notes.
             address: Optional dict with keys: name, addr1, addr2,
                 addr3, addr4, phone, fax, email. Empty / missing
                 fields render as empty strings in the Address record.
+            **extra_kwargs: Class-specific fields passed through to
+                ``cls(...)``. Use for ``notes`` (Customer/Vendor),
+                ``acl`` / ``language`` / ``workday`` / ``rate``
+                (Employee), etc.
 
         Returns:
             ``{"guid": ..., "id": ..., "name": ..., "status": "created"}``
@@ -441,9 +445,9 @@ class BusinessMixin:
         entity = cls(
             name=name,
             currency=currency_obj,
-            notes=notes,
             address=addr,
             book=book,
+            **extra_kwargs,
         )
         book.save()
 
@@ -478,7 +482,7 @@ class BusinessMixin:
         with self.open(readonly=False) as book:
             return self._create_business_person(
                 Customer, book=book, name=name,
-                currency=currency, notes=notes, address=address,
+                currency=currency, address=address, notes=notes,
             )
 
     def list_customers(
@@ -548,7 +552,7 @@ class BusinessMixin:
         with self.open(readonly=False) as book:
             return self._create_business_person(
                 Vendor, book=book, name=name,
-                currency=currency, notes=notes, address=address,
+                currency=currency, address=address, notes=notes,
             )
 
     def list_vendors(
