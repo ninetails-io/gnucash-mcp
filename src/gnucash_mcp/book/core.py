@@ -337,6 +337,10 @@ class CoreMixin:
 
             return balance
 
+    # Server-side ceiling for list_transactions / search_transactions
+    # limits. Caller-supplied limits above this are clamped with a note.
+    MAX_LIST_LIMIT = 250
+
     def list_transactions(
         self,
         account: str | None = None,
@@ -347,22 +351,32 @@ class CoreMixin:
     ) -> list[dict] | str:
         """List transactions with optional filters.
 
+        When the unfiltered result set exceeds ``limit``, compact output
+        appends a truncation notice so callers can tell their data is
+        incomplete. Limits above ``MAX_LIST_LIMIT`` (250) are clamped
+        server-side and flagged in the notice.
+
         Args:
             account: Filter by account full name.
             start_date: Filter transactions on or after this date.
             end_date: Filter transactions on or before this date.
-            limit: Maximum number of transactions to return.
+            limit: Maximum number of transactions to return. Capped at 250.
             compact: If True (default), return a compact newline-separated
                      string with one line per transaction. If False, return
                      the full list of transaction dicts.
 
         Returns:
-            If compact: newline-separated string of transaction lines.
-            If not compact: list of transaction dicts, most recent first.
+            If compact: newline-separated string of transaction lines, with
+                a ``[Showing N of M ...]`` notice appended when truncated.
+            If not compact: list of transaction dicts, most recent first
+                (truncated silently — callers have the list length).
 
         Raises:
             ValueError: If specified account not found.
         """
+        capped = limit > self.MAX_LIST_LIMIT
+        effective_limit = min(limit, self.MAX_LIST_LIMIT)
+
         with self.open(readonly=True) as book:
             # If filtering by account, get transactions through that account's splits
             if account:
@@ -385,8 +399,9 @@ class CoreMixin:
             # Sort by date descending
             filtered.sort(key=lambda t: t.post_date, reverse=True)
 
+            total_matched = len(filtered)
             # Apply limit
-            filtered = filtered[:limit]
+            filtered = filtered[:effective_limit]
 
             if compact:
                 # Build collision-safe prefix map across ALL transactions in
@@ -399,9 +414,54 @@ class CoreMixin:
                     )
                     for t in filtered
                 ]
+                notice = self._truncation_notice(
+                    total=total_matched,
+                    shown=len(filtered),
+                    effective_limit=effective_limit,
+                    capped=capped,
+                    suggest_narrow=True,
+                )
+                if notice:
+                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 return [_transaction_to_dict(t) for t in filtered]
+
+    @staticmethod
+    def _truncation_notice(
+        total: int,
+        shown: int,
+        effective_limit: int,
+        capped: bool,
+        suggest_narrow: bool = True,
+    ) -> str | None:
+        """Build a truncation-notice line, or return None if no notice needed.
+
+        Emits one of:
+          - "[Limit capped at 250 — narrow your criteria for larger datasets]"
+            when the caller's limit exceeded MAX_LIST_LIMIT AND results fit.
+          - "[Showing N of M transactions — use start_date/end_date to narrow,
+             or set limit= higher]" when results were truncated (capped or not).
+          - None when total <= shown (everything fit).
+        """
+        if total <= shown:
+            if capped:
+                return (
+                    f"[Limit capped at {effective_limit} — results fit under "
+                    f"the cap]"
+                )
+            return None
+        if capped:
+            return (
+                f"[Showing {shown} of {total} transactions — limit was capped "
+                f"at {effective_limit}; narrow your criteria for complete "
+                f"results]"
+            )
+        hint = (
+            "use start_date/end_date to narrow, or set limit= higher"
+            if suggest_narrow else "set limit= higher"
+        )
+        return f"[Showing {shown} of {total} transactions — {hint}]"
 
     def get_transaction(self, guid: str) -> dict | None:
         """Get details for a specific transaction by GUID.
@@ -1013,9 +1073,17 @@ class CoreMixin:
             return result
 
     def search_transactions(
-        self, query: str, field: str = "description", compact: bool = True,
+        self,
+        query: str,
+        field: str = "description",
+        limit: int = 50,
+        compact: bool = True,
     ) -> list[dict] | str:
         """Search transactions by field.
+
+        Truncation behavior mirrors ``list_transactions``: compact mode
+        appends a notice when matches exceed ``limit``; limits above
+        ``MAX_LIST_LIMIT`` (250) are clamped.
 
         Args:
             query: Search string. For 'amount' field, supports:
@@ -1025,12 +1093,14 @@ class CoreMixin:
                    - Range: "100-200"
             field: Field to search: 'description', 'memo', 'notes',
                    or 'amount'.
+            limit: Maximum number of transactions to return. Capped at 250.
             compact: If True (default), return a compact newline-separated
                      string with one line per transaction. If False, return
                      the full list of transaction dicts.
 
         Returns:
-            If compact: newline-separated string of transaction lines.
+            If compact: newline-separated string of transaction lines, with
+                a ``[Showing N of M ...]`` notice appended when truncated.
             If not compact: list of matching transaction dicts.
 
         Raises:
@@ -1038,6 +1108,9 @@ class CoreMixin:
         """
         if field not in ("description", "memo", "notes", "amount"):
             raise ValueError(f"Invalid search field: {field}")
+
+        capped = limit > self.MAX_LIST_LIMIT
+        effective_limit = min(limit, self.MAX_LIST_LIMIT)
 
         with self.open(readonly=True) as book:
             matched = []
@@ -1064,6 +1137,9 @@ class CoreMixin:
             # Sort by date descending
             matched.sort(key=lambda t: t.post_date, reverse=True)
 
+            total_matched = len(matched)
+            matched = matched[:effective_limit]
+
             if compact:
                 # Collision-safe prefix map over the whole transactions table
                 prefixes = _guid_prefix_map(t.guid for t in book.transactions)
@@ -1071,6 +1147,15 @@ class CoreMixin:
                     _transaction_to_compact_line(t, prefixes=prefixes)
                     for t in matched
                 ]
+                notice = self._truncation_notice(
+                    total=total_matched,
+                    shown=len(matched),
+                    effective_limit=effective_limit,
+                    capped=capped,
+                    suggest_narrow=False,  # no date-range hint on search
+                )
+                if notice:
+                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 return [_transaction_to_dict(t) for t in matched]

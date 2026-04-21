@@ -192,22 +192,29 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def search_transactions(query: str, field: str = "description", verbose: bool = False) -> str:
+    def search_transactions(
+        query: str,
+        field: str = "description",
+        limit: int = 50,
+        verbose: bool = False,
+    ) -> str:
         """Search transactions by description, memo, notes, or amount.
 
         Compact format (default):
         ``DATE<TAB>guid<TAB>Description<TAB>splits``
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
-        full breakdown.
+        full breakdown. When matches exceed ``limit``, a
+        ``[Showing N of M ...]`` notice is appended.
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
+            limit: Maximum number of matches to return (default 50, server cap 250).
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
-        result = book.search_transactions(query, field, compact=not verbose)
+        result = book.search_transactions(query, field, limit=limit, compact=not verbose)
         if verbose:
             return _json(result)
         return result
