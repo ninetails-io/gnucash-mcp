@@ -131,7 +131,6 @@ class TestVerifyDelete:
     def test_passes_after_valid_delete(self, scheduled_book: Path):
         """Verify passes when the slot row is successfully deleted."""
         from piecash.kvp import KVP_Type, Slot
-        from sqlalchemy import text
 
         book_obj = GnuCashBook(str(scheduled_book))
         with book_obj.open(readonly=False) as book:
@@ -144,17 +143,17 @@ class TestVerifyDelete:
                     string_val="test value",
                 )
             )
-            # Delete it
+            # Delete it via SQLAlchemy Core
             book.session.execute(
-                text(
-                    "DELETE FROM slots "
-                    "WHERE obj_guid = :obj_guid AND name = :name"
-                ),
-                {"obj_guid": obj_guid, "name": "test-slot"},
+                Slot.__table__.delete().where(
+                    (Slot.__table__.c.obj_guid == obj_guid)
+                    & (Slot.__table__.c.name == "test-slot")
+                )
             )
             # Should not raise
             _verify_delete(
                 book.session,
+                Slot.__table__,
                 {"obj_guid": obj_guid, "name": "test-slot"},
                 "Test slot deletion",
             )
@@ -178,9 +177,38 @@ class TestVerifyDelete:
             with pytest.raises(RuntimeError, match="Delete verification failed"):
                 _verify_delete(
                     book.session,
+                    Slot.__table__,
                     {"obj_guid": obj_guid, "name": "still-here"},
                     "Test slot that should still exist",
                 )
+
+    def test_passes_for_non_slot_table(self, business_book: Path):
+        """Generalized _verify_delete works for any piecash Core table.
+
+        Before this release the helper was hardcoded to ``FROM slots``;
+        the generalization was added so Entry / Invoice / etc. deletes
+        can pair with verification too.
+        """
+        from piecash.business.invoice import Invoice
+
+        book_obj = GnuCashBook(str(business_book))
+        book_obj.create_customer("Verify Client")
+        inv = book_obj.create_invoice(customer_id="000001")
+        inv_guid = inv["guid"]
+
+        with book_obj.open(readonly=False) as book:
+            book.session.execute(
+                Invoice.__table__.delete().where(
+                    Invoice.__table__.c.guid == inv_guid
+                )
+            )
+            # Should not raise — the invoice is gone
+            _verify_delete(
+                book.session,
+                Invoice.__table__,
+                {"guid": inv_guid},
+                f"Invoice {inv['id']}",
+            )
 
 
 # ── Integration: existing operations trigger verification ────────

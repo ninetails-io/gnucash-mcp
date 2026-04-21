@@ -96,18 +96,28 @@ def _verify_composite_write(
         )
 
 
-def _verify_delete(session, conditions: dict, label: str) -> None:
-    """Verify a raw SQL DELETE removed the expected row(s).
+def _verify_delete(
+    session, table, conditions: dict, label: str
+) -> None:
+    """Verify a SQL DELETE removed the expected row(s).
 
     Must be called within the same session, before book.save().
     Raises RuntimeError if matching rows still exist.
-    """
-    from sqlalchemy import text
 
-    where_parts = " AND ".join(f"{col} = :{col}" for col in conditions)
+    Shape-matches ``_verify_composite_write``: the ``table`` argument
+    is a SQLAlchemy Core Table (``Entity.__table__``). The previous
+    signature hardcoded ``FROM slots`` via raw SQL, which kept this
+    helper scoped to slot deletes; generalizing to any table lets us
+    pair deletes-with-verification for Entry / Invoice / Customer /
+    Vendor cleanup too.
+    """
+    from sqlalchemy import select, func, and_
+
+    where_clause = and_(
+        *(table.c[col] == val for col, val in conditions.items())
+    )
     count = session.execute(
-        text(f"SELECT count(*) FROM slots WHERE {where_parts}"),
-        conditions,
+        select(func.count()).select_from(table).where(where_clause)
     ).scalar()
     if count != 0:
         debug_logger.error(
