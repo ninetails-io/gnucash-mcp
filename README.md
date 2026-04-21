@@ -364,7 +364,7 @@ Example audit entry:
 
 ---
 
-## All 75 Tools
+## All 82 Tools
 
 <details>
 <summary>Click to expand full tool list</summary>
@@ -376,12 +376,13 @@ Example audit entry:
 | Commodities & Prices | `list_commodities`, `create_commodity`, `create_price`, `get_prices`, `get_latest_price` |
 | Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `replace_splits`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` |
 | Reconciliation | `set_reconcile_state`, `get_unreconciled_splits`, `reconcile_account` |
-| Reporting | `spending_by_category`, `income_by_source`, `balance_sheet`, `net_worth`, `cash_flow` |
+| Reporting | `spending_by_category`, `income_by_source`, `balance_sheet`, `net_worth`, `cash_flow`, `debt_payoff_plan` |
 | Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` |
 | Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` |
 | Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` |
-| Business | `create_customer`, `list_customers`, `get_customer`, `delete_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `delete_vendor`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `delete_invoice`, `delete_bill`, `get_outstanding_invoices`, `vendor_spending_report` |
+| Business | `create_customer`, `list_customers`, `get_customer`, `delete_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `delete_vendor`, `create_employee`, `list_employees`, `get_employee`, `delete_employee`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `delete_invoice`, `delete_bill`, `get_outstanding_invoices`, `vendor_spending_report` |
 | Account Metadata | `get_account_slots`, `set_account_slot`, `delete_account_slot` |
+| Backups | `create_backup`, `list_backups`, `prune_backups` |
 | Audit | `get_audit_log` |
 | Debug | `get_server_config` (loaded when `--debug` is set) |
 
@@ -417,6 +418,77 @@ gnucash-mcp/
 ---
 
 ## Changelog
+
+### v1.2.1 — Backups, Employees, Efficiency
+
+Protection, the third business entity, and the biggest efficiency pass
+since v1.0.2. The server now snapshots the book before the first write
+of every session, Employees join Customers and Vendors as a first-class
+entity, and most read and write paths were measured and optimized.
+
+- **Automatic backups**: The first write of each server process
+  triggers an SQLite online-backup snapshot with grandfather-father-son
+  retention (7 session / 4 weekly / 6 monthly automatic, unbounded
+  manual). Every snapshot is verified with `PRAGMA integrity_check`
+  before being declared valid. Data loss is now recoverable from
+  within the server's own directory — no OS-level backup required.
+- **Manual backup tools**: `create_backup(label)`, `list_backups`,
+  `prune_backups(dry_run=true)`. Restore is deliberately *not* a tool
+  — it's a documented filesystem procedure (see
+  [RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)) performed
+  with the server stopped.
+- **Employees**: Third business-person entity alongside Customer and
+  Vendor. `create_employee`, `list_employees`, `get_employee`,
+  `delete_employee`. Expense vouchers are out of scope for this release.
+- **Register-form compact output**: `list_transactions(account=X)`
+  now renders in bank-register form — `DATE  guid  ±amount  desc
+  other-splits` — with the signed impact on the filtered account in
+  column 3. Fixes a reported confusion where the earlier format made
+  the description look like it blended into the remaining split.
+- **Split-list collapse**: Transactions with more than 4 splits in
+  the rendered column render the top 3 by |value| plus `+N more`.
+  A 17-split paycheck now fits on one legible line; call
+  `get_transaction(guid)` for the full breakdown when needed.
+- **Short collision-safe GUIDs in write responses**: Write tools now
+  return an 8-character GUID prefix (extended only when the birthday
+  problem actually bites at scale) instead of the full 32-char hex.
+  Tools that accept GUIDs accept the prefix seamlessly via
+  `_resolve_guid`. Large savings on every follow-up call.
+- **Thin write responses**: `update_transaction`, `replace_splits`,
+  and many other write tools now return only the new information the
+  caller couldn't already know. The audit log pulls missing fields
+  from tool parameters to preserve full before/after diff detail in
+  the human-readable trail.
+- **Single book-open per write**: The audit decorator used to open
+  the book twice per write (once to capture before-state, once for
+  the actual write). Now write methods stage their before-state
+  inside the same session they already have open, halving write
+  latency.
+- **SQL-pushed reporting**: `spending_by_category`, `income_by_source`,
+  `balance_sheet`, `net_worth`, and `cash_flow` now push date, account
+  type, and account GUID filters into SQLite rather than scanning
+  `book.transactions` in Python. Aggregation stays in Python to
+  preserve exact `Decimal` arithmetic.
+- **Cumulative-sum `net_worth` series**: A 60-month net-worth
+  time series used to be O(intervals × splits); now it's O(splits
+  + intervals) via a single sorted sweep.
+- **Business module DRY refactor**: Create and delete paths for
+  Customer, Vendor, and Employee share a single implementation each
+  — parameterized on the piecash class and small config / callback
+  parameters. Identical behavior, substantially less duplication.
+- **Audit log dispatcher**: The text-format audit log's 380-line
+  if/elif chain was flattened into a dispatch table keyed on
+  `(entity_type, operation)`. New entity types are now a dict entry,
+  not another elif branch.
+- **Structured deletes**: Every raw `text("DELETE FROM ...")` site in
+  the codebase was replaced with SQLAlchemy Core
+  (`Table.__table__.delete().where(...)`) with post-delete
+  verification. Future GnuCash schema changes surface as loud import
+  errors rather than silent runtime failures.
+- **Linter & formatter config**: `ruff` and `black` sections added
+  to `pyproject.toml`. No bulk reformat in this release — style
+  drift gets fixed on the next touch to each file, when it's cheapest.
+- **Version**: 1.2.1 (701 tests)
 
 ### v1.2.0 — Business Module
 
