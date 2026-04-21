@@ -60,6 +60,14 @@ class BusinessMixin:
         return None
 
     @staticmethod
+    def _find_employee(book, employee_id: str):
+        """Find an employee by their human-readable ID (e.g., '000001')."""
+        for e in book.employees:
+            if e.id == employee_id:
+                return e
+        return None
+
+    @staticmethod
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
@@ -128,6 +136,28 @@ class BusinessMixin:
         return result
 
     @staticmethod
+    def _employee_to_dict(employee) -> dict:
+        """Convert a piecash Employee to a serializable dict.
+
+        Employee's schema has no ``notes`` column (unlike Customer
+        and Vendor — see docs/PIECASH_REFERENCE.md), so the response
+        shape omits the ``notes`` key. Employee-specific fields
+        (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
+        scope for the 1.3.0 CRUD surface and are not serialized.
+        """
+        result = {
+            "guid": employee.guid,
+            "id": employee.id,
+            "name": employee.name,
+            "currency": employee.currency.mnemonic if employee.currency else None,
+            "active": bool(employee.active),
+        }
+        address = BusinessMixin._address_to_dict(employee)
+        if address:
+            result["address"] = address
+        return result
+
+    @staticmethod
     def _customer_to_compact_line(customer) -> str:
         """One-line compact: 'id  name  currency'."""
         return f"{customer.id}\t{customer.name}\t{customer.currency.mnemonic}"
@@ -136,6 +166,11 @@ class BusinessMixin:
     def _vendor_to_compact_line(vendor) -> str:
         """One-line compact: 'id  name  currency'."""
         return f"{vendor.id}\t{vendor.name}\t{vendor.currency.mnemonic}"
+
+    @staticmethod
+    def _employee_to_compact_line(employee) -> str:
+        """One-line compact: 'id  name  currency'."""
+        return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
 
     @staticmethod
     def _billterm_to_dict(bt) -> dict:
@@ -597,6 +632,79 @@ class BusinessMixin:
             if not vendor:
                 raise ValueError(f"Vendor not found: {vendor_id}")
             return self._vendor_to_dict(vendor)
+
+    def create_employee(
+        self,
+        name: str,
+        currency: str | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Create a new employee.
+
+        Employee has no ``notes`` field (unlike Customer and Vendor).
+        Employee-specific fields (``acl`` / ``language`` / ``workday``
+        / ``rate``) are out of scope for the 1.3.0 release. See
+        docs/PIECASH_REFERENCE.md for the full schema shape.
+
+        Args:
+            name: Employee name.
+            currency: ISO currency code. Defaults to book's default currency.
+            address: Optional address dict with keys: name, addr1, addr2,
+                     addr3, addr4, phone, fax, email.
+
+        Returns:
+            Dict with guid, id, name, status.
+        """
+        from piecash.business.person import Employee
+
+        with self.open(readonly=False) as book:
+            return self._create_business_person(
+                Employee, book=book, name=name,
+                currency=currency, address=address,
+            )
+
+    def list_employees(
+        self,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List all employees.
+
+        Args:
+            active_only: If True, only return active employees.
+            compact: If True, return compact one-line-per-employee string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        with self.open() as book:
+            employees = sorted(book.employees, key=lambda e: e.name)
+            if active_only:
+                employees = [e for e in employees if e.active]
+
+            if compact:
+                lines = [self._employee_to_compact_line(e) for e in employees]
+                return "\n".join(lines)
+            else:
+                return [self._employee_to_dict(e) for e in employees]
+
+    def get_employee(self, employee_id: str) -> dict:
+        """Get employee details by ID.
+
+        Args:
+            employee_id: Human-readable employee ID (e.g., '000001').
+
+        Returns:
+            Dict with full employee details.
+
+        Raises:
+            ValueError: If employee not found.
+        """
+        with self.open() as book:
+            employee = self._find_employee(book, employee_id)
+            if not employee:
+                raise ValueError(f"Employee not found: {employee_id}")
+            return self._employee_to_dict(employee)
 
     def create_billterm(
         self,
@@ -1853,6 +1961,30 @@ class BusinessMixin:
                 owner_type=4,
                 doc_label="bills",
             ),
+        )
+
+    def delete_employee(self, employee_id: str) -> dict:
+        """Delete an employee.
+
+        Employees in the 1.3.0 release have no associated documents —
+        expense vouchers (``counter_exp_voucher`` / ``owner_type=5``)
+        are out of scope. The delete proceeds unconditionally after
+        slot cleanup.
+
+        Args:
+            employee_id: Employee ID (e.g., '000001').
+
+        Returns:
+            Dict with id, guid, name, status.
+
+        Raises:
+            ValueError: If employee not found.
+        """
+        return self._delete_business_person(
+            entity_id=employee_id,
+            entity_label="Employee",
+            find_entity_method="_find_employee",
+            # Employees own nothing in 1.3.0 — no dependency check.
         )
 
     # ── Reporting ────────────────────────────────────────────────
