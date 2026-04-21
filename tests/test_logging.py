@@ -464,6 +464,58 @@ class TestResolveEntryField:
         assert _resolve_entry_field({"timestamp": "..."}, "anything") is None
 
 
+class TestDispatchTableDegradation:
+    """Unknown (entity_type, operation) pairs must degrade gracefully.
+
+    The audit text formatter was flattened from a 380-line if/elif
+    chain into a dispatch table in the prerelease-2 polish cycle.
+    The chain's default behavior was to silently skip unmapped combos
+    (falling off the bottom of the if/elif); the dispatcher preserves
+    that semantic — a new classification wired in book code but not
+    yet wired to a handler returns empty string, not a crash.
+
+    Lets Employee handlers land before Employee write tools without
+    failing rendering of any write the user happens to make in the
+    interim.
+    """
+
+    def test_unknown_entity_type_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "write",
+            "operation": "create",
+            "entity_type": "employee",  # not yet in the dispatch table
+            "timestamp": "2026-04-21T12:34:56",
+            "params": {"name": "Test"},
+            "after_state": {"id": "000001", "name": "Test"},
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+    def test_unknown_operation_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "write",
+            "operation": "hypnotize",  # fictional op on a real entity
+            "entity_type": "transaction",
+            "timestamp": "2026-04-21T12:34:56",
+            "params": {},
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+    def test_read_classification_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "read",
+            "operation": "create",
+            "entity_type": "transaction",
+            "timestamp": "2026-04-21T12:34:56",
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+
 class TestAuditLogIntegration:
     """Integration tests for the complete audit trail."""
 

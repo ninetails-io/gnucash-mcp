@@ -231,383 +231,591 @@ def _resolve_entry_field(
     return None
 
 
-def _format_audit_entry_text(entry: dict) -> str:
-    """Format an audit entry as human-readable text.
+# ── Audit text-format dispatcher ───────────────────────────────────
+#
+# Write operations render to the human-readable audit log as short
+# multi-line blocks. Each (entity_type, operation) pair has its own
+# tiny handler that pulls what it needs from the entry (params,
+# before_state, after_state) and returns a list of lines.
+#
+# Adding a new entity type is a dict entry, not another ``elif`` in a
+# 380-line chain. Unknown keys degrade to empty output so new audit
+# classifications added in book code don't crash log rendering before
+# a handler lands.
 
-    Only formats write operations (mutations). Read operations return empty string.
-    """
-    if entry.get("classification") != "write":
-        return ""  # Don't log read operations in text format
+_INDENT = "          "  # 10 spaces; every handler indents its detail lines here
+_INDENT_SPLITS = _INDENT + "  "  # nested indent for split blocks
 
+
+def _extract_time(entry: dict) -> str:
+    """Pull HH:MM:SS from an ISO-ish timestamp, defensively."""
     timestamp = entry.get("timestamp", "")
-    # Extract just the time portion (HH:MM:SS)
     if "T" in timestamp:
-        time_part = timestamp.split("T")[1][:8]
-    else:
-        time_part = timestamp[:8] if len(timestamp) >= 8 else timestamp
+        return timestamp.split("T")[1][:8]
+    return timestamp[:8] if len(timestamp) >= 8 else timestamp
 
-    operation = entry.get("operation", "").upper()
-    entity_type = entry.get("entity_type", "")
-    params = entry.get("params", {})
+
+def _transaction_guid(entry: dict) -> str:
+    """GUID for a transaction log line — short prefix if upstream supplied one.
+
+    Book methods emit collision-safe prefixes via ``_unique_prefix`` on
+    write responses. We display whatever was provided — re-truncating
+    here would undo any birthday-problem extension (e.g., collapse a
+    9-char safe prefix back to a colliding 8).
+    """
+    params = entry.get("params") or {}
+    return entry.get("entity_guid") or params.get("guid", "")
+
+
+# ── Transaction handlers ──────────────────────────────────────────
+
+
+def _fmt_transaction_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
+    desc = after.get("description") or params.get("description", "")
+    date_str = after.get("date") or params.get("transaction_date", "")
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    # after_state preferred; fall back to params (thin-response case)
+    splits = after.get("splits") or params.get("splits") or []
+    if splits:
+        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
+    if not before:
+        return lines
+
+    # update_transaction's response is thin (no description/date/splits
+    # echo). Resolve through after_state → params → before_state so
+    # the text log keeps the full diff readable.
+    old_desc = before.get("description", "")
+    new_desc = _resolve_entry_field(entry, "description") or old_desc
+    old_date = before.get("date", "")
+    new_date = (
+        _resolve_entry_field(entry, "date", params_key="transaction_date")
+        or old_date
+    )
+    old_splits = before.get("splits") or []
+    new_splits = _resolve_entry_field(entry, "splits") or old_splits
+
+    if old_desc != new_desc:
+        lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+    else:
+        lines.append(f'{_INDENT}Description: "{old_desc}"')
+
+    if old_date != new_date:
+        lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
+    else:
+        lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    if old_splits != new_splits:
+        lines.append(f"{_INDENT}Splits (before):")
+        lines.append(_format_splits_text(old_splits, _INDENT_SPLITS))
+        lines.append(f"{_INDENT}Splits (after):")
+        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_void(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [
+        f"{time_part}  VOID TRANSACTION  guid:{guid}",
+        f'{_INDENT}Reason: "{params.get("reason", "")}"',
+    ]
+    if before:
+        desc = before.get("description", "")
+        date_str = before.get("date", "")
+        lines.append(f'{_INDENT}Was: "{desc}" ({date_str})')
+        if before.get("splits"):
+            lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_unvoid(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    after = entry.get("after_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  UNVOID TRANSACTION  guid:{guid}"]
+    if after:
+        desc = after.get("description", "")
+        date_str = after.get("date", "")
+        lines.append(f'{_INDENT}Restored: "{desc}" ({date_str})')
+        if after.get("splits"):
+            lines.append(_format_splits_text(after["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  DELETE TRANSACTION  guid:{guid}"]
+    if before:
+        desc = before.get("description", "")
+        date_str = before.get("date", "")
+        lines.append(f'{_INDENT}Was: "{desc}" ({date_str})')
+        if before.get("splits"):
+            lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_replace_splits(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  REPLACE SPLITS  guid:{guid}"]
+
+    # description / date don't change on this op, but show them from
+    # before_state so a reviewer has context for which transaction.
+    desc = _resolve_entry_field(entry, "description") or ""
+    date_str = _resolve_entry_field(entry, "date") or ""
+    if desc or date_str:
+        lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    # previous_splits is the piece the LLM doesn't already know.
+    prev_splits = after.get("previous_splits", [])
+    if prev_splits:
+        lines.append(f"{_INDENT}Splits (before):")
+        lines.append(_format_splits_text(prev_splits, _INDENT_SPLITS))
+
+    # New splits fall through after_state → params (the LLM's input).
+    new_splits = _resolve_entry_field(entry, "splits")
+    if new_splits:
+        lines.append(f"{_INDENT}Splits (after):")
+        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+
+    for w in after.get("warnings", []) or []:
+        lines.append(f"{_INDENT}Warning: {w}")
+    return lines
+
+
+# ── Account handlers ──────────────────────────────────────────────
+
+
+def _fmt_account_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  CREATE ACCOUNT"]
+    if after:
+        lines.append(f"{_INDENT}{after.get('fullname', params.get('name', ''))}")
+        lines.append(
+            f"{_INDENT}Type: {after.get('type', params.get('account_type', ''))}"
+        )
+        desc = after.get("description", params.get("description", ""))
+        if desc:
+            lines.append(f'{_INDENT}Description: "{desc}"')
+    return lines
+
+
+def _fmt_account_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
     before = entry.get("before_state")
     after = entry.get("after_state")
 
-    lines = []
-    indent = "          "
+    lines = [
+        f"{time_part}  UPDATE ACCOUNT",
+        f"{_INDENT}{params.get('name', '')}",
+    ]
+    if before and after:
+        old_name = before.get("name", "")
+        new_name = after.get("name", "")
+        if old_name != new_name:
+            lines.append(f'{_INDENT}Name: "{old_name}" → "{new_name}"')
+        old_desc = before.get("description", "")
+        new_desc = after.get("description", "")
+        if old_desc != new_desc:
+            lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+    return lines
 
-    if entity_type == "transaction":
-        # Book methods already emit collision-safe short prefixes via
-        # `_unique_prefix` when returning a guid. We display whatever was
-        # provided — truncating here would reverse any birthday-problem
-        # extension (e.g., 9-char prefix back to a colliding 8).
-        guid_short = entry.get("entity_guid") or params.get("guid", "")
 
-        if operation == "CREATE":
-            lines.append(f"{time_part}  CREATE TRANSACTION  guid:{guid_short}")
-            desc = params.get("description", "")
-            date_str = params.get("transaction_date", "")
-            if after:
-                desc = after.get("description", desc)
-                date_str = after.get("date", date_str)
-            lines.append(f'{indent}"{desc}" ({date_str})')
-            # Get splits from after_state or params
-            splits = after.get("splits") if after else None
-            if not splits:
-                splits = params.get("splits", [])
-            if splits:
-                lines.append(_format_splits_text(splits, indent + "  "))
+def _fmt_account_move(entry: dict) -> list[str]:
+    """MOVE is logged as UPDATE with ``new_parent`` in params — the
+    dispatcher remaps the operation key before lookup so this handler
+    fires cleanly."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
 
-        elif operation == "UPDATE":
-            lines.append(f"{time_part}  UPDATE TRANSACTION  guid:{guid_short}")
-            if before:
-                # Description / date / splits may be trimmed out of the
-                # response to save LLM tokens — pull from params (tool
-                # inputs) as a fallback, then before_state to show
-                # "unchanged" when the caller didn't touch that field.
-                old_desc = before.get("description", "")
-                new_desc = (
-                    _resolve_entry_field(entry, "description")
-                    or old_desc
+    lines = [
+        f"{time_part}  MOVE ACCOUNT",
+        f"{_INDENT}{params.get('name', '')}",
+    ]
+    if before:
+        old_parent = (
+            ":".join(before.get("fullname", "").split(":")[:-1]) or "(root)"
+        )
+        lines.append(f"{_INDENT}From: {old_parent}")
+    lines.append(f"{_INDENT}To: {params.get('new_parent', '')}")
+    return lines
+
+
+def _fmt_account_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+
+    lines = [f"{time_part}  DELETE ACCOUNT"]
+    if before:
+        lines.append(
+            f"{_INDENT}Was: {before.get('fullname', params.get('name', ''))}"
+        )
+        lines.append(f"{_INDENT}Type: {before.get('type', '')}")
+        desc = before.get("description", "")
+        if desc:
+            lines.append(f'{_INDENT}Description: "{desc}"')
+    return lines
+
+
+# ── Split handlers ────────────────────────────────────────────────
+
+
+def _fmt_split_reconcile(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+    split_details = (before or {}).get("splits", []) if before else []
+    split_guids = params.get("split_guids", []) or []
+
+    lines = [
+        f"{time_part}  RECONCILE  {params.get('account', '')}",
+        f"{_INDENT}Statement date: {params.get('statement_date', '')}",
+        f"{_INDENT}Statement balance: {_format_amount(params.get('statement_balance'))}",
+        f"{_INDENT}Splits reconciled ({len(split_guids)}):",
+    ]
+
+    # Show first 10 reconciled splits with description + amount if the
+    # before_state carried the per-split context. Prefix/full GUID
+    # tolerance: params may be an 8+-char prefix, before_state carries
+    # full GUIDs from the book method's staged snapshot. Match either way.
+    for guid in split_guids[:10]:
+        split_info = next(
+            (
+                s for s in split_details
+                if s and (
+                    s.get("guid") == guid
+                    or s.get("guid", "").startswith(guid)
+                    or guid.startswith(s.get("guid", ""))
                 )
-                old_date = before.get("date", "")
-                new_date = (
-                    _resolve_entry_field(
-                        entry, "date", params_key="transaction_date"
-                    )
-                    or old_date
-                )
-                old_splits = before.get("splits") or []
-                new_splits = (
-                    _resolve_entry_field(entry, "splits") or old_splits
-                )
+            ),
+            None,
+        )
+        if split_info:
+            desc = split_info.get("transaction_description", "")
+            amount = _format_amount(split_info.get("amount"))
+            lines.append(f'{_INDENT}  guid:{guid}  "{desc}"  {amount:>10}')
+        else:
+            lines.append(f"{_INDENT}  guid:{guid}")
+    if len(split_guids) > 10:
+        lines.append(f"{_INDENT}  ... and {len(split_guids) - 10} more")
+    return lines
 
-                if old_desc != new_desc:
-                    lines.append(f'{indent}Description: "{old_desc}" → "{new_desc}"')
-                else:
-                    lines.append(f'{indent}Description: "{old_desc}"')
 
-                if old_date != new_date:
-                    lines.append(f"{indent}Date: {old_date} → {new_date}")
-                else:
-                    lines.append(f"{indent}Date: {old_date} (unchanged)")
+def _fmt_split_set_state(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
 
-                if old_splits != new_splits:
-                    lines.append(f"{indent}Splits (before):")
-                    lines.append(_format_splits_text(old_splits, indent + "  "))
-                    lines.append(f"{indent}Splits (after):")
-                    lines.append(_format_splits_text(new_splits, indent + "  "))
+    split_guid = params.get("split_guid", "")
+    state = params.get("state", "")
+    old_state = (before or {}).get("reconcile_state", "n") if before else "n"
 
-        elif operation == "VOID":
-            lines.append(f"{time_part}  VOID TRANSACTION  guid:{guid_short}")
-            reason = params.get("reason", "")
-            lines.append(f'{indent}Reason: "{reason}"')
-            if before:
-                desc = before.get("description", "")
-                date_str = before.get("date", "")
-                lines.append(f'{indent}Was: "{desc}" ({date_str})')
-                if before.get("splits"):
-                    lines.append(_format_splits_text(before["splits"], indent + "  "))
+    lines = [
+        f"{time_part}  SET RECONCILE STATE",
+        f"{_INDENT}guid:{split_guid} (split)",
+    ]
+    if before:
+        account = before.get("account", "").split(":")[-1]
+        lines.append(f"{_INDENT}Account: {account}")
+        desc = before.get("transaction_description", "")
+        amount = _format_amount(before.get("amount"))
+        if desc:
+            lines.append(f'{_INDENT}"{desc}"  {amount}')
+    lines.append(f"{_INDENT}State: {old_state} → {state}")
+    return lines
 
-        elif operation == "UNVOID":
-            lines.append(f"{time_part}  UNVOID TRANSACTION  guid:{guid_short}")
-            if after:
-                desc = after.get("description", "")
-                date_str = after.get("date", "")
-                lines.append(f'{indent}Restored: "{desc}" ({date_str})')
-                if after.get("splits"):
-                    lines.append(_format_splits_text(after["splits"], indent + "  "))
 
-        elif operation == "DELETE":
-            lines.append(f"{time_part}  DELETE TRANSACTION  guid:{guid_short}")
-            if before:
-                desc = before.get("description", "")
-                date_str = before.get("date", "")
-                lines.append(f'{indent}Was: "{desc}" ({date_str})')
-                if before.get("splits"):
-                    lines.append(_format_splits_text(before["splits"], indent + "  "))
+# ── Account-slot handlers ─────────────────────────────────────────
 
-        elif operation == "REPLACE_SPLITS":
-            lines.append(f"{time_part}  REPLACE SPLITS  guid:{guid_short}")
-            # Description and date aren't echoed in the thin response
-            # (they didn't change anyway). Pull from before_state for
-            # the "transaction header" line.
-            desc = _resolve_entry_field(entry, "description") or ""
-            date_str = _resolve_entry_field(entry, "date") or ""
-            if desc or date_str:
-                lines.append(f'{indent}"{desc}" ({date_str})')
 
-            # previous_splits stays in after_state — it's the piece the
-            # LLM doesn't already know.
-            prev_splits = (after or {}).get("previous_splits", [])
-            if prev_splits:
-                lines.append(f"{indent}Splits (before):")
-                lines.append(_format_splits_text(prev_splits, indent + "  "))
+def _fmt_account_slot_set(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
 
-            # New splits: after_state may echo them back, or may be
-            # trimmed — fall back to params (what the LLM submitted).
-            new_splits = _resolve_entry_field(entry, "splits")
-            if new_splits:
-                lines.append(f"{indent}Splits (after):")
-                lines.append(_format_splits_text(new_splits, indent + "  "))
+    account = params.get("account", "")
+    key = params.get("key", "")
+    value = params.get("value", "")
+    status = (after or {}).get("status", "") if after else ""
 
-            # Warnings live only in after_state (genuinely new info).
-            warnings = (after or {}).get("warnings", [])
-            if warnings:
-                for w in warnings:
-                    lines.append(f"{indent}Warning: {w}")
+    return [
+        f"{time_part}  SET ACCOUNT SLOT  account:{account}",
+        f'{_INDENT}key: "{key}"  value: "{value}"  ({status})',
+    ]
 
-    elif entity_type == "account":
-        if operation == "CREATE":
-            lines.append(f"{time_part}  CREATE ACCOUNT")
-            if after:
-                lines.append(f"{indent}{after.get('fullname', params.get('name', ''))}")
-                lines.append(f"{indent}Type: {after.get('type', params.get('account_type', ''))}")
-                desc = after.get("description", params.get("description", ""))
-                if desc:
-                    lines.append(f'{indent}Description: "{desc}"')
 
-        elif operation == "UPDATE":
-            lines.append(f"{time_part}  UPDATE ACCOUNT")
-            account_name = params.get("name", "")
-            lines.append(f"{indent}{account_name}")
-            if before and after:
-                old_name = before.get("name", "")
-                new_name = after.get("name", "")
-                if old_name != new_name:
-                    lines.append(f'{indent}Name: "{old_name}" → "{new_name}"')
-                old_desc = before.get("description", "")
-                new_desc = after.get("description", "")
-                if old_desc != new_desc:
-                    lines.append(f'{indent}Description: "{old_desc}" → "{new_desc}"')
+def _fmt_account_slot_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    return [
+        f"{time_part}  DELETE ACCOUNT SLOT  account:{params.get('account', '')}",
+        f'{_INDENT}key: "{params.get("key", "")}"',
+    ]
 
-        elif operation == "DELETE":
-            lines.append(f"{time_part}  DELETE ACCOUNT")
-            if before:
-                lines.append(f"{indent}Was: {before.get('fullname', params.get('name', ''))}")
-                lines.append(f"{indent}Type: {before.get('type', '')}")
-                desc = before.get("description", "")
-                if desc:
-                    lines.append(f'{indent}Description: "{desc}"')
 
-    elif entity_type == "split":
-        if operation == "RECONCILE":
-            account = params.get("account", "")
-            lines.append(f"{time_part}  RECONCILE  {account}")
-            lines.append(f"{indent}Statement date: {params.get('statement_date', '')}")
-            lines.append(f"{indent}Statement balance: {_format_amount(params.get('statement_balance'))}")
-            # Get split details from before_state if available
-            split_details = before.get("splits", []) if before else []
-            split_guids = params.get("split_guids", [])
-            lines.append(f"{indent}Splits reconciled ({len(split_guids)}):")
-            for i, guid in enumerate(split_guids[:10]):  # Limit to first 10
-                # Use the param as-is — truncating here would undo any
-                # collision-safe extension applied upstream.
-                guid_short = guid
-                # Detail lookup tolerates full-vs-prefix mismatch: params
-                # carries whatever the LLM passed (often an 8+-char prefix),
-                # but `before_state` entries carry full GUIDs from the book
-                # method's staged snapshot. Match by startswith so either
-                # side can be a prefix of the other.
-                split_info = next(
-                    (
-                        s
-                        for s in split_details
-                        if s and (s.get("guid") == guid
-                                  or s.get("guid", "").startswith(guid)
-                                  or guid.startswith(s.get("guid", "")))
-                    ),
-                    None,
-                )
-                if split_info:
-                    desc = split_info.get("transaction_description", "")
-                    amount = _format_amount(split_info.get("amount"))
-                    lines.append(f'{indent}  guid:{guid_short}  "{desc}"  {amount:>10}')
-                else:
-                    lines.append(f"{indent}  guid:{guid_short}")
-            if len(split_guids) > 10:
-                lines.append(f"{indent}  ... and {len(split_guids) - 10} more")
+# ── Business handlers ─────────────────────────────────────────────
 
-        elif operation == "SET_STATE":
-            # As-is: caller may have passed a collision-safe 9+-char prefix.
-            split_guid = params.get("split_guid", "")
-            lines.append(f"{time_part}  SET RECONCILE STATE")
-            lines.append(f"{indent}guid:{split_guid} (split)")
-            if before:
-                account = before.get("account", "").split(":")[-1]  # Short name
-                lines.append(f"{indent}Account: {account}")
-                desc = before.get("transaction_description", "")
-                amount = _format_amount(before.get("amount"))
-                if desc:
-                    lines.append(f'{indent}"{desc}"  {amount}')
-            state = params.get("state", "")
-            old_state = before.get("reconcile_state", "n") if before else "n"
-            lines.append(f"{indent}State: {old_state} → {state}")
 
-    elif entity_type == "account_slot":
-        account = params.get("account", "")
-        key = params.get("key", "")
+def _fmt_person_create(entry: dict, type_label: str) -> list[str]:
+    """Shared CREATE renderer for customer / vendor / employee.
 
-        if operation == "SET_SLOT":
-            value = params.get("value", "")
-            status = ""
-            if after:
-                status = after.get("status", "")
-            lines.append(f"{time_part}  SET ACCOUNT SLOT  account:{account}")
-            lines.append(f'{indent}key: "{key}"  value: "{value}"  ({status})')
+    The three entity types share CRUD shape (see
+    _create_business_person in business.py). Their audit rendering is
+    the same shape too; only the label differs.
+    """
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
 
-        elif operation == "DELETE_SLOT":
-            lines.append(f"{time_part}  DELETE ACCOUNT SLOT  account:{account}")
-            lines.append(f'{indent}key: "{key}"')
+    person_id = after.get("id", "")
+    person_name = after.get("name", params.get("name", ""))
+    currency = after.get("currency") or params.get("currency", "") or ""
 
-    elif entity_type == "customer":
-        if operation == "CREATE":
-            cust_id = ""
-            cust_name = params.get("name", "")
-            if after:
-                cust_id = after.get("id", "")
-                cust_name = after.get("name", cust_name)
-            lines.append(f"{time_part}  CREATE CUSTOMER  id:{cust_id}")
-            currency = params.get("currency", "")
-            if after:
-                currency = after.get("currency", currency) or ""
-            lines.append(f'{indent}name: "{cust_name}"  currency: {currency}')
-        elif operation == "DELETE":
-            cust_id = params.get("customer_id", "")
-            lines.append(f"{time_part}  DELETE CUSTOMER  id:{cust_id}")
-            if after:
-                cust_name = after.get("name", "")
-                if cust_name:
-                    lines.append(f'{indent}name: "{cust_name}"')
+    return [
+        f"{time_part}  CREATE {type_label.upper()}  id:{person_id}",
+        f'{_INDENT}name: "{person_name}"  currency: {currency}',
+    ]
 
-    elif entity_type == "vendor":
-        if operation == "CREATE":
-            vend_id = ""
-            vend_name = params.get("name", "")
-            if after:
-                vend_id = after.get("id", "")
-                vend_name = after.get("name", vend_name)
-            lines.append(f"{time_part}  CREATE VENDOR  id:{vend_id}")
-            currency = params.get("currency", "")
-            if after:
-                currency = after.get("currency", currency) or ""
-            lines.append(f'{indent}name: "{vend_name}"  currency: {currency}')
-        elif operation == "DELETE":
-            vend_id = params.get("vendor_id", "")
-            lines.append(f"{time_part}  DELETE VENDOR  id:{vend_id}")
-            if after:
-                vend_name = after.get("name", "")
-                if vend_name:
-                    lines.append(f'{indent}name: "{vend_name}"')
 
-    elif entity_type == "billterm":
-        if operation == "CREATE":
-            bt_name = params.get("name", "")
-            due_days = params.get("due_days", "")
-            if after:
-                bt_name = after.get("name", bt_name)
-                due_days = after.get("due_days", due_days)
-            lines.append(f"{time_part}  CREATE BILLTERM")
-            lines.append(f'{indent}name: "{bt_name}"  due: {due_days} days')
+def _fmt_person_delete(
+    entry: dict, type_label: str, id_param: str,
+) -> list[str]:
+    """Shared DELETE renderer for customer / vendor / employee."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
 
-    elif entity_type == "invoice":
-        if operation == "CREATE":
-            inv_id = ""
-            customer_id = params.get("customer_id", "")
-            if after:
-                inv_id = after.get("id", "")
-                customer_id = after.get("customer_id", customer_id)
-            lines.append(f"{time_part}  CREATE INVOICE  id:{inv_id}")
-            lines.append(f'{indent}customer: {customer_id}')
-        elif operation == "DELETE":
-            inv_id = params.get("invoice_id", "")
-            lines.append(f"{time_part}  DELETE INVOICE  id:{inv_id}")
-            if after:
-                entries = after.get("entries_deleted", 0)
-                if entries:
-                    lines.append(f"{indent}entries removed: {entries}")
-        elif operation == "POST":
-            inv_id = params.get("id", "")
-            post_account = params.get("post_account", "")
-            lines.append(f"{time_part}  POST INVOICE  id:{inv_id}")
-            if after:
-                total = after.get("total", "")
-                post_date = after.get("post_date", "")
-                # As-is — upstream emits a collision-safe prefix.
-                txn_guid = after.get("transaction_guid") or ""
-                lines.append(f'{indent}total: {total}  date: {post_date}')
-                lines.append(f'{indent}account: {post_account}  txn:{txn_guid}')
-        elif operation == "PAY":
-            inv_id = params.get("id", "")
-            lines.append(f"{time_part}  PAY INVOICE  id:{inv_id}")
-            if after:
-                amount = after.get("amount_paid", "")
-                remaining = after.get("remaining_balance", "")
-                pay_acct = params.get("payment_account", "")
-                # As-is — upstream emits a collision-safe prefix.
-                txn_guid = after.get("transaction_guid") or ""
-                lines.append(f'{indent}paid: {amount}  remaining: {remaining}')
-                lines.append(f'{indent}from: {pay_acct}  txn:{txn_guid}')
+    person_id = params.get(id_param, "")
+    lines = [f"{time_part}  DELETE {type_label.upper()}  id:{person_id}"]
+    person_name = after.get("name", "") if after else ""
+    if person_name:
+        lines.append(f'{_INDENT}name: "{person_name}"')
+    return lines
 
-    elif entity_type == "bill":
-        if operation == "CREATE":
-            bill_id = ""
-            vendor_id = params.get("vendor_id", "")
-            if after:
-                bill_id = after.get("id", "")
-                vendor_id = after.get("vendor_id", vendor_id)
-            lines.append(f"{time_part}  CREATE BILL  id:{bill_id}")
-            lines.append(f'{indent}vendor: {vendor_id}')
-        elif operation == "DELETE":
-            bill_id = params.get("bill_id", "")
-            lines.append(f"{time_part}  DELETE BILL  id:{bill_id}")
-            if after:
-                entries = after.get("entries_deleted", 0)
-                if entries:
-                    lines.append(f"{indent}entries removed: {entries}")
 
-    elif entity_type == "entry":
-        if operation == "CREATE":
-            desc = params.get("description", "")
-            total = ""
-            if after:
-                desc = after.get("description", desc)
-                total = after.get("total", "")
-            inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
-            lines.append(f"{time_part}  CREATE ENTRY")
-            lines.append(f'{indent}"{desc}"  total: {total}  on: {inv_id}')
+def _fmt_customer_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "customer")
 
-    # Handle move_account specially (it's logged as "update" but is conceptually a move)
-    if entity_type == "account" and "new_parent" in params:
-        # This is actually a MOVE operation
-        lines = [f"{time_part}  MOVE ACCOUNT"]
-        account_name = params.get("name", "")
-        new_parent = params.get("new_parent", "")
-        lines.append(f"{indent}{account_name}")
-        if before:
-            old_parent = ":".join(before.get("fullname", "").split(":")[:-1]) or "(root)"
-            lines.append(f"{indent}From: {old_parent}")
-        lines.append(f"{indent}To: {new_parent}")
 
+def _fmt_customer_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "customer", "customer_id")
+
+
+def _fmt_vendor_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "vendor")
+
+
+def _fmt_vendor_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "vendor", "vendor_id")
+
+
+def _fmt_billterm_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    due_days = after.get("due_days", params.get("due_days", ""))
+    return [
+        f"{time_part}  CREATE BILLTERM",
+        f'{_INDENT}name: "{name}"  due: {due_days} days',
+    ]
+
+
+def _fmt_invoice_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    inv_id = after.get("id", "")
+    customer_id = after.get("customer_id", params.get("customer_id", ""))
+    return [
+        f"{time_part}  CREATE INVOICE  id:{inv_id}",
+        f"{_INDENT}customer: {customer_id}",
+    ]
+
+
+def _fmt_invoice_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  DELETE INVOICE  id:{params.get('invoice_id', '')}"]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+def _fmt_invoice_post(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  POST INVOICE  id:{params.get('id', '')}"]
+    if after:
+        total = after.get("total", "")
+        post_date = after.get("post_date", "")
+        txn_guid = after.get("transaction_guid") or ""
+        lines.append(f"{_INDENT}total: {total}  date: {post_date}")
+        lines.append(
+            f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
+        )
+    return lines
+
+
+def _fmt_invoice_pay(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
+    if after:
+        amount = after.get("amount_paid", "")
+        remaining = after.get("remaining_balance", "")
+        txn_guid = after.get("transaction_guid") or ""
+        lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
+        lines.append(
+            f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
+        )
+    return lines
+
+
+def _fmt_bill_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    bill_id = after.get("id", "")
+    vendor_id = after.get("vendor_id", params.get("vendor_id", ""))
+    return [
+        f"{time_part}  CREATE BILL  id:{bill_id}",
+        f"{_INDENT}vendor: {vendor_id}",
+    ]
+
+
+def _fmt_bill_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  DELETE BILL  id:{params.get('bill_id', '')}"]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+def _fmt_entry_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    desc = after.get("description", params.get("description", ""))
+    total = after.get("total", "")
+    inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
+    return [
+        f"{time_part}  CREATE ENTRY",
+        f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
+    ]
+
+
+# ── Dispatch table ────────────────────────────────────────────────
+#
+# Key shape: (entity_type, operation). Both in their canonical forms —
+# entity_type lowercase, operation UPPERCASE. Adding a new entity type
+# is one row here plus one handler function above.
+
+_AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
+    ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "UPDATE"): _fmt_transaction_update,
+    ("transaction", "VOID"): _fmt_transaction_void,
+    ("transaction", "UNVOID"): _fmt_transaction_unvoid,
+    ("transaction", "DELETE"): _fmt_transaction_delete,
+    ("transaction", "REPLACE_SPLITS"): _fmt_transaction_replace_splits,
+    ("account", "CREATE"): _fmt_account_create,
+    ("account", "UPDATE"): _fmt_account_update,
+    ("account", "MOVE"): _fmt_account_move,
+    ("account", "DELETE"): _fmt_account_delete,
+    ("split", "RECONCILE"): _fmt_split_reconcile,
+    ("split", "SET_STATE"): _fmt_split_set_state,
+    ("account_slot", "SET_SLOT"): _fmt_account_slot_set,
+    ("account_slot", "DELETE_SLOT"): _fmt_account_slot_delete,
+    ("customer", "CREATE"): _fmt_customer_create,
+    ("customer", "DELETE"): _fmt_customer_delete,
+    ("vendor", "CREATE"): _fmt_vendor_create,
+    ("vendor", "DELETE"): _fmt_vendor_delete,
+    ("billterm", "CREATE"): _fmt_billterm_create,
+    ("invoice", "CREATE"): _fmt_invoice_create,
+    ("invoice", "DELETE"): _fmt_invoice_delete,
+    ("invoice", "POST"): _fmt_invoice_post,
+    ("invoice", "PAY"): _fmt_invoice_pay,
+    ("bill", "CREATE"): _fmt_bill_create,
+    ("bill", "DELETE"): _fmt_bill_delete,
+    ("entry", "CREATE"): _fmt_entry_create,
+}
+
+
+def _format_audit_entry_text(entry: dict) -> str:
+    """Format an audit entry as human-readable text.
+
+    Only formats write operations (mutations). Reads and unmapped
+    (entity_type, operation) combos return the empty string so a new
+    classification added in book code but not yet wired to a handler
+    degrades silently rather than crashing log rendering.
+
+    The account ``MOVE`` operation is logged upstream as ``UPDATE``
+    with ``new_parent`` in params — we remap the key here before
+    lookup so the dedicated move handler fires instead of the update
+    one.
+    """
+    if entry.get("classification") != "write":
+        return ""
+
+    entity_type = entry.get("entity_type") or ""
+    operation = (entry.get("operation") or "").upper()
+
+    # Account update with new_parent → MOVE
+    if (
+        entity_type == "account"
+        and operation == "UPDATE"
+        and "new_parent" in (entry.get("params") or {})
+    ):
+        operation = "MOVE"
+
+    handler = _AUDIT_HANDLERS.get((entity_type, operation))
+    if handler is None:
+        return ""
+    lines = handler(entry)
     return "\n".join(lines) if lines else ""
 
 
