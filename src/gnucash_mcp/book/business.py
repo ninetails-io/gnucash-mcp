@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import piecash
 
-from gnucash_mcp.book._base import _verify_composite_write, _verify_write
+from gnucash_mcp.book._base import _to_date, _verify_composite_write, _verify_write
 
 
 class BusinessMixin:
@@ -57,6 +57,71 @@ class BusinessMixin:
         for v in book.vendors:
             if v.guid == guid:
                 return v
+        return None
+
+    @staticmethod
+    def _find_exchange_rate(book, from_commodity, to_commodity, as_of: date):
+        """Look up an exchange rate from book.prices for a cross-currency
+        payment: 1 unit of ``from_commodity`` equals how many of
+        ``to_commodity`` on or near ``as_of``.
+
+        Prefers prices on or before ``as_of`` (most recent). Falls back to
+        the earliest price after ``as_of`` if none exist before. Accepts
+        inverse prices (e.g., a USD→EUR price can resolve EUR→USD by
+        inversion).
+
+        Skips prices with ``type='transaction'`` — those are auto-
+        created at 1.0 by piecash when a cross-currency invoice is
+        posted without an explicit rate, and would mask the absence of
+        a real user-supplied rate.
+
+        Returns a Decimal rate, or None if no usable (non-transaction)
+        price exists in either direction.
+        """
+        if from_commodity == to_commodity:
+            return Decimal("1")
+
+        best_before_direct = None   # (days_before, Decimal rate)
+        best_after_direct = None    # (days_after, Decimal rate)
+        best_before_inverse = None
+        best_after_inverse = None
+
+        for p in book.prices:
+            # Skip piecash's auto-created post-invoice default rates.
+            if p.type == "transaction":
+                continue
+
+            p_date = _to_date(p.date)
+            # Direct: p.commodity == from, p.currency == to → rate = p.value
+            if p.commodity == from_commodity and p.currency == to_commodity:
+                days = (as_of - p_date).days
+                rate = Decimal(str(p.value))
+                if days >= 0:
+                    if best_before_direct is None or days < best_before_direct[0]:
+                        best_before_direct = (days, rate)
+                else:
+                    if best_after_direct is None or -days < best_after_direct[0]:
+                        best_after_direct = (-days, rate)
+            # Inverse: p.commodity == to, p.currency == from → rate = 1/p.value
+            elif p.commodity == to_commodity and p.currency == from_commodity:
+                days = (as_of - p_date).days
+                if Decimal(str(p.value)) == 0:
+                    continue
+                rate = Decimal("1") / Decimal(str(p.value))
+                if days >= 0:
+                    if best_before_inverse is None or days < best_before_inverse[0]:
+                        best_before_inverse = (days, rate)
+                else:
+                    if best_after_inverse is None or -days < best_after_inverse[0]:
+                        best_after_inverse = (-days, rate)
+
+        # Priority: before-direct > before-inverse > after-direct > after-inverse
+        for candidate in (
+            best_before_direct, best_before_inverse,
+            best_after_direct, best_after_inverse,
+        ):
+            if candidate is not None:
+                return candidate[1]
         return None
 
     @staticmethod
@@ -1422,29 +1487,53 @@ class BusinessMixin:
                 date.fromisoformat(due_date) if due_date else None
             )
 
+            # Helper: convert a value in invoice currency to the
+            # equivalent quantity in the given account's commodity,
+            # using book.prices at parsed_date. Returns the value
+            # unchanged when currencies match.
+            def _qty_for_split(acct, value_in_invoice_ccy):
+                if acct.commodity == inv.currency:
+                    return value_in_invoice_ccy
+                rate = self._find_exchange_rate(
+                    book,
+                    from_commodity=inv.currency,
+                    to_commodity=acct.commodity,
+                    as_of=parsed_date,
+                )
+                if rate is None:
+                    raise ValueError(
+                        f"Cross-currency posting requires an exchange "
+                        f"rate: invoice currency "
+                        f"{inv.currency.mnemonic} differs from "
+                        f"account commodity {acct.commodity.mnemonic} "
+                        f"({acct.fullname}), and no matching price was "
+                        f"found for "
+                        f"{inv.currency.mnemonic}/"
+                        f"{acct.commodity.mnemonic} on or near "
+                        f"{parsed_date}. Add a price with "
+                        f"create_price, then retry."
+                    )
+                return (value_in_invoice_ccy * rate).quantize(
+                    Decimal("0.01")
+                )
+
             # Build transaction splits
             # For customer invoice: A/R debit (positive), income credit (negative)
             # For vendor bill: A/P credit (negative), expense debit (positive)
             piecash_splits = []
 
             if is_bill:
-                ar_ap_split = piecash.Split(
-                    account=post_acct,
-                    value=-grand_total,
-                    quantity=-grand_total,
-                    memo="",
-                    action="Invoice",
-                    reconcile_date=datetime(1970, 1, 1),
-                )
+                ar_ap_value = -grand_total
             else:
-                ar_ap_split = piecash.Split(
-                    account=post_acct,
-                    value=grand_total,
-                    quantity=grand_total,
-                    memo="",
-                    action="Invoice",
-                    reconcile_date=datetime(1970, 1, 1),
-                )
+                ar_ap_value = grand_total
+            ar_ap_split = piecash.Split(
+                account=post_acct,
+                value=ar_ap_value,
+                quantity=_qty_for_split(post_acct, ar_ap_value),
+                memo="",
+                action="Invoice",
+                reconcile_date=datetime(1970, 1, 1),
+            )
             piecash_splits.append(ar_ap_split)
 
             for acct_guid, acct_total in acct_totals.items():
@@ -1467,7 +1556,7 @@ class BusinessMixin:
                     piecash.Split(
                         account=entry_acct,
                         value=split_value,
-                        quantity=split_value,
+                        quantity=_qty_for_split(entry_acct, split_value),
                         memo="",
                     )
                 )
@@ -1539,19 +1628,30 @@ class BusinessMixin:
         to the invoice's lot for balance tracking. Partial payments
         are supported.
 
+        ``amount`` is always in the **invoice's currency**. For same-
+        currency payments (invoice currency == payment account commodity)
+        the payment account is credited/debited with the same amount. For
+        cross-currency payments the payment account's quantity is
+        computed from the book's price table at ``payment_date`` (most
+        recent price on or before the date, falling back to closest
+        after). A clear error is raised if no matching price exists.
+
         Args:
             invoice_id: Human-readable ID (e.g., '000001').
             payment_account: Bank or cash account path.
-            amount: Payment amount as decimal string (e.g., '500.00').
+            amount: Payment amount in the invoice currency (e.g., '500.00').
             payment_date: ISO date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction.
             owner_type: 'customer' or 'vendor' for disambiguation.
 
         Returns:
-            Dict with payment details and remaining balance.
+            Dict with payment details and remaining balance. For cross-
+            currency payments also includes ``exchange_rate`` and
+            ``payment_account_amount``.
 
         Raises:
-            ValueError: If invoice not found, not posted, or invalid account.
+            ValueError: If invoice not found, not posted, invalid account,
+                or cross-currency payment with no exchange rate available.
         """
         ot = None
         if owner_type == "customer":
@@ -1622,6 +1722,38 @@ class BusinessMixin:
             owner_name = owner.name if owner else ""
             txn_desc = description or owner_name
 
+            # Cross-currency payment: if the payment account's commodity
+            # differs from the invoice currency, find the exchange rate
+            # from book.prices and compute the payment account's quantity.
+            # The transaction currency stays as the invoice currency, so
+            # all split ``value``s remain in invoice currency (the
+            # transaction balances in EUR for an EUR invoice); the pay
+            # account's ``quantity`` reflects the actual USD/GBP/whatever
+            # amount deposited or withdrawn.
+            exchange_rate = None
+            pay_quantity = payment_amount
+            if pay_acct.commodity != inv.currency:
+                exchange_rate = self._find_exchange_rate(
+                    book,
+                    from_commodity=inv.currency,
+                    to_commodity=pay_acct.commodity,
+                    as_of=parsed_date,
+                )
+                if exchange_rate is None:
+                    raise ValueError(
+                        f"Cross-currency payment requires an exchange rate: "
+                        f"invoice currency {inv.currency.mnemonic} differs "
+                        f"from payment account commodity "
+                        f"{pay_acct.commodity.mnemonic}, and no matching "
+                        f"price was found in the book for "
+                        f"{inv.currency.mnemonic}/{pay_acct.commodity.mnemonic} "
+                        f"on or near {parsed_date}. Add a price with "
+                        f"create_price, then retry."
+                    )
+                pay_quantity = (payment_amount * exchange_rate).quantize(
+                    Decimal("0.01")
+                )
+
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
                 ar_ap_split = piecash.Split(
@@ -1634,7 +1766,7 @@ class BusinessMixin:
                 bank_split = piecash.Split(
                     account=pay_acct,
                     value=-payment_amount,
-                    quantity=-payment_amount,
+                    quantity=-pay_quantity,
                     memo="",
                 )
             else:
@@ -1649,7 +1781,7 @@ class BusinessMixin:
                 bank_split = piecash.Split(
                     account=pay_acct,
                     value=payment_amount,
-                    quantity=payment_amount,
+                    quantity=pay_quantity,
                     memo="",
                 )
 
@@ -1683,6 +1815,11 @@ class BusinessMixin:
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
+            if exchange_rate is not None:
+                result["exchange_rate"] = str(exchange_rate)
+                result["payment_account_amount"] = str(pay_quantity)
+                result["invoice_currency"] = inv.currency.mnemonic
+                result["payment_account_currency"] = pay_acct.commodity.mnemonic
 
         return result
 
