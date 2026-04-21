@@ -640,6 +640,14 @@ def _fmt_vendor_delete(entry: dict) -> list[str]:
     return _fmt_person_delete(entry, "vendor", "vendor_id")
 
 
+def _fmt_employee_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "employee")
+
+
+def _fmt_employee_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "employee", "employee_id")
+
+
 def _fmt_billterm_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -774,6 +782,8 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("customer", "DELETE"): _fmt_customer_delete,
     ("vendor", "CREATE"): _fmt_vendor_create,
     ("vendor", "DELETE"): _fmt_vendor_delete,
+    ("employee", "CREATE"): _fmt_employee_create,
+    ("employee", "DELETE"): _fmt_employee_delete,
     ("billterm", "CREATE"): _fmt_billterm_create,
     ("invoice", "CREATE"): _fmt_invoice_create,
     ("invoice", "DELETE"): _fmt_invoice_delete,
