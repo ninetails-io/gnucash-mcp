@@ -99,13 +99,21 @@ class CoreMixin:
         Provides instant orientation: account structure, transaction volume,
         key balances, commodities, and scheduled transactions — all in one call.
 
+        Investment accounts (STOCK, MUTUAL, and any other account whose
+        commodity differs from the book's default currency) are valued at
+        ``shares × latest_price`` from book.prices. When no price is on
+        file, cost basis (sum of split values in the transaction currency)
+        is used as a fallback and the line is tagged accordingly.
+
         Returns:
             Pre-formatted text summary string.
         """
+        from piecash.budget import Budget
         from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
-            currency = self._require_default_currency(book).mnemonic
+            default_currency = self._require_default_currency(book)
+            currency = default_currency.mnemonic
 
             # --- Identify template accounts (scheduled transaction placeholders) ---
             template_guids = set()
@@ -121,15 +129,57 @@ class CoreMixin:
                 if account.parent and account.parent.type != "ROOT":
                     parent_guids.add(account.parent.guid)
 
+            # --- Latest-price lookup for non-default-currency commodities ---
+            # Precompute once to avoid O(N*M) when many investment accounts
+            # share a small commodity set. Skip piecash's auto-created
+            # type='transaction' prices (they capture the effective rate of
+            # a cross-currency txn; we want user-supplied market prices).
+            latest_prices: dict[str, Decimal] = {}
+            for p in book.prices:
+                if p.currency != default_currency:
+                    continue
+                if p.type == "transaction":
+                    continue
+                key = p.commodity.guid
+                existing = latest_prices.get(key + ":date")
+                p_date = p.date
+                if hasattr(p_date, "date") and callable(p_date.date):
+                    p_date = p_date.date()
+                if existing is None or p_date > existing:
+                    latest_prices[key + ":date"] = p_date
+                    latest_prices[key] = Decimal(str(p.value))
+
+            def _market_value(account, quantity: Decimal) -> tuple[Decimal, str | None]:
+                """Return (USD value, note) for an account's quantity.
+
+                ``note`` is None for default-currency accounts, a formatted
+                "N.NNN SYM @ $X.XX" string for priced foreign-currency
+                accounts, and a "no price data" marker otherwise.
+                """
+                if account.commodity == default_currency:
+                    return quantity, None
+                sym = account.commodity.mnemonic
+                rate = latest_prices.get(account.commodity.guid)
+                if rate is not None:
+                    return (quantity * rate), f"{quantity} {sym} @ {rate}"
+                # Fallback: cost basis from split values (transaction currency).
+                cost_basis = Decimal("0")
+                for s in account.splits:
+                    cost_basis += Decimal(str(s.value))
+                return cost_basis, f"{quantity} {sym} — no price data"
+
             # --- Account stats ---
             asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
 
-            # Assets: (leaf_name, balance) for non-placeholder leaf accounts
-            asset_leaves: list[tuple[str, Decimal]] = []
+            # Assets: (leaf_name, usd_value, note) for non-placeholder leaf accounts
+            asset_leaves: list[tuple[str, Decimal, str | None]] = []
             # Liabilities: (leaf_name, positive_balance) grouped by category
             credit_cards: list[tuple[str, Decimal]] = []
             loan_accts: list[tuple[str, Decimal]] = []
             other_liab_accts: list[tuple[str, Decimal]] = []
+            # Receivables / Payables (separate sections, per Abe's spec)
+            receivable_accts: list[tuple[str, Decimal]] = []
+            payable_accts: list[tuple[str, Decimal]] = []
 
             income_active = 0
             income_total = 0
@@ -147,7 +197,7 @@ class CoreMixin:
                 has_activity = len(account.splits) > 0
                 is_leaf = account.guid not in parent_guids
 
-                # Calculate balance
+                # Calculate balance in the account's own commodity.
                 balance = Decimal("0")
                 for split in account.splits:
                     balance += split.quantity
@@ -156,7 +206,8 @@ class CoreMixin:
 
                 if account.type in asset_types:
                     if is_leaf and balance != 0:
-                        asset_leaves.append((leaf, balance))
+                        usd_value, note = _market_value(account, balance)
+                        asset_leaves.append((leaf, usd_value, note))
                 elif account.type == "CREDIT":
                     if is_leaf:
                         credit_cards.append((leaf, -balance))
@@ -167,6 +218,16 @@ class CoreMixin:
                             loan_accts.append((leaf, neg_balance))
                         else:
                             other_liab_accts.append((leaf, neg_balance))
+                elif account.type == "RECEIVABLE":
+                    if is_leaf and balance != 0:
+                        # A/R is debit-natural: positive balance = owed to us.
+                        usd_value, _ = _market_value(account, balance)
+                        receivable_accts.append((leaf, usd_value))
+                elif account.type == "PAYABLE":
+                    if is_leaf and balance != 0:
+                        # A/P is credit-natural: negate for "what we owe".
+                        usd_value, _ = _market_value(account, -balance)
+                        payable_accts.append((leaf, usd_value))
                 elif account.type == "INCOME":
                     income_total += 1
                     if has_activity:
@@ -180,11 +241,19 @@ class CoreMixin:
             def _r2(v: Decimal) -> Decimal:
                 return v.quantize(Decimal("0.01"))
 
-            assets_total = _r2(sum(b for _, b in asset_leaves) if asset_leaves else Decimal(0))
+            assets_total = _r2(
+                sum((v for _, v, _ in asset_leaves), Decimal("0"))
+            )
             credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
             loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
             other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
             liabilities_total = _r2(credit_total + loan_total + other_liab_total)
+            receivables_total = _r2(
+                sum((b for _, b in receivable_accts), Decimal("0"))
+            )
+            payables_total = _r2(
+                sum((b for _, b in payable_accts), Decimal("0"))
+            )
             net_worth = _r2(assets_total - liabilities_total)
 
             # All liability leaves sorted by balance descending for top-N
@@ -211,6 +280,14 @@ class CoreMixin:
             all_sx = book.session.query(ScheduledTransaction).all()
             enabled_sx = sum(1 for sx in all_sx if sx.enabled)
 
+            # --- Business entities ---
+            n_customers = len(list(book.customers))
+            n_vendors = len(list(book.vendors))
+            n_employees = len(list(book.employees))
+
+            # --- Budgets ---
+            n_budgets = book.session.query(Budget).count()
+
             # --- Commodities ---
             commodity_mnemonics = sorted(set(
                 c.mnemonic for c in book.commodities
@@ -226,10 +303,17 @@ class CoreMixin:
 
             lines.append(f"Accounts: {total_accounts} total")
 
-            # Assets section — leaf accounts with balances
+            # Assets section — leaf accounts with USD-valued balances
             lines.append(f"Assets: {len(asset_leaves)} accounts, {currency} {assets_total}")
-            for name, bal in sorted(asset_leaves, key=lambda x: x[1], reverse=True):
-                lines.append(f"  {name}: {currency} {_r2(bal)}")
+            for name, usd_value, note in sorted(
+                asset_leaves, key=lambda x: x[1], reverse=True
+            ):
+                if note is None:
+                    lines.append(f"  {name}: {currency} {_r2(usd_value)}")
+                else:
+                    lines.append(
+                        f"  {name}: {note} ({currency} {_r2(usd_value)})"
+                    )
 
             # Liabilities section — grouped subtotals + top 3
             liab_count = len(credit_cards) + len(loan_accts) + len(other_liab_accts)
@@ -245,6 +329,24 @@ class CoreMixin:
                 top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
                 lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
 
+            # Receivables / Payables — only if non-zero
+            if receivable_accts:
+                lines.append(
+                    f"Receivables: {len(receivable_accts)} account"
+                    f"{'s' if len(receivable_accts) != 1 else ''}, "
+                    f"{currency} {receivables_total}"
+                )
+                for name, bal in sorted(receivable_accts, key=lambda x: x[1], reverse=True):
+                    lines.append(f"  {name}: {currency} {_r2(bal)}")
+            if payable_accts:
+                lines.append(
+                    f"Payables: {len(payable_accts)} account"
+                    f"{'s' if len(payable_accts) != 1 else ''}, "
+                    f"{currency} {payables_total}"
+                )
+                for name, bal in sorted(payable_accts, key=lambda x: x[1], reverse=True):
+                    lines.append(f"  {name}: {currency} {_r2(bal)}")
+
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
 
@@ -252,6 +354,22 @@ class CoreMixin:
 
             if enabled_sx > 0:
                 lines.append(f"Scheduled: {enabled_sx} recurring")
+
+            # Business + budgets — one line each, only if present
+            if n_customers or n_vendors or n_employees:
+                parts = []
+                if n_customers:
+                    parts.append(f"{n_customers} customer"
+                                 f"{'s' if n_customers != 1 else ''}")
+                if n_vendors:
+                    parts.append(f"{n_vendors} vendor"
+                                 f"{'s' if n_vendors != 1 else ''}")
+                if n_employees:
+                    parts.append(f"{n_employees} employee"
+                                 f"{'s' if n_employees != 1 else ''}")
+                lines.append(f"Business: {', '.join(parts)}")
+            if n_budgets:
+                lines.append(f"Budgets: {n_budgets}")
 
             lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
             lines.append(f"Net worth: {currency} {net_worth}")
