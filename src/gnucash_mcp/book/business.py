@@ -684,6 +684,162 @@ class BusinessMixin:
                 return [self._billterm_to_dict(t) for t in terms]
 
     # ── Invoice / Bill creation, posting, payment ─────────────────
+    #
+    # Customer invoices and vendor bills share the ``invoices`` table,
+    # differing only in ``owner_type`` (2 vs 4) and a matched set of
+    # label / counter / finder conventions. The config table below
+    # captures those conventions; ``_create_business_document`` consumes
+    # it and services both create paths from a single implementation.
+
+    _BUSINESS_DOC_CONFIG: dict[int, dict] = {
+        2: {  # customer invoice
+            "owner_label": "Customer",
+            "doc_label": "Invoice",
+            "owner_id_key": "customer_id",
+            "doc_id_param": "invoice_id",
+            "counter_attr": "counter_invoice",
+            "find_owner_method": "_find_customer",
+        },
+        4: {  # vendor bill
+            "owner_label": "Vendor",
+            "doc_label": "Bill",
+            "owner_id_key": "vendor_id",
+            "doc_id_param": "bill_id",
+            "counter_attr": "counter_bill",
+            "find_owner_method": "_find_vendor",
+        },
+    }
+
+    def _create_business_document(
+        self,
+        *,
+        owner_type: int,
+        owner_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        doc_id: str | None = None,
+    ) -> dict:
+        """Shared create path for customer invoice and vendor bill.
+
+        Both hit the ``invoices`` table with the same 18-column insert,
+        differing only in ``owner_type`` and the label / counter /
+        finder conventions captured in ``_BUSINESS_DOC_CONFIG``. The
+        helper opens the book, resolves owner + currency + billterm,
+        handles the custom-ID-vs-auto-counter branch, writes the row
+        with ``_verify_write``, and returns the canonical response.
+
+        Args:
+            owner_type: 2 = customer invoice, 4 = vendor bill.
+            owner_id: Customer ID or vendor ID (human-readable '000001').
+            date_opened: ISO date; defaults to now.
+            notes: Free-text notes.
+            currency: ISO currency code; defaults to book default.
+            term: Billterm name; optional.
+            doc_id: Custom invoice/bill number; auto-generated from the
+                relevant counter when omitted.
+
+        Returns:
+            ``{guid, id, <owner_id_key>, date_opened, status}``
+        """
+        import uuid
+        from piecash.business.invoice import Billterm, Invoice
+
+        if owner_type not in self._BUSINESS_DOC_CONFIG:
+            raise ValueError(f"Unknown owner_type: {owner_type}")
+        config = self._BUSINESS_DOC_CONFIG[owner_type]
+        find_owner = getattr(self, config["find_owner_method"])
+
+        open_date = (
+            datetime.strptime(date_opened, "%Y-%m-%d")
+            if date_opened
+            else datetime.now()
+        )
+
+        with self.open(readonly=False) as book:
+            owner = find_owner(book, owner_id)
+            if not owner:
+                raise ValueError(
+                    f"{config['owner_label']} not found: {owner_id}"
+                )
+
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+                currency_guid = currency_obj.guid
+            else:
+                currency_guid = self._require_default_currency(book).guid
+
+            term_guid = None
+            if term:
+                bt = book.session.query(Billterm).filter(
+                    Billterm.name == term, Billterm.invisible == 0
+                ).first()
+                if not bt:
+                    raise ValueError(f"Billterm not found: {term}")
+                term_guid = bt.guid
+
+            if doc_id is not None:
+                if not doc_id.strip():
+                    raise ValueError(
+                        f"{config['doc_id_param']} must not be blank"
+                    )
+                existing = self._find_invoice(
+                    book, doc_id, owner_type=owner_type
+                )
+                if existing:
+                    raise ValueError(
+                        f"{config['doc_label']} with ID "
+                        f"'{doc_id}' already exists"
+                    )
+            else:
+                cnt = getattr(book, config["counter_attr"]) + 1
+                setattr(book, config["counter_attr"], cnt)
+                doc_id = f"{cnt:06d}"
+
+            inv_guid = uuid.uuid4().hex
+            book.session.execute(
+                Invoice.__table__.insert().values(
+                    guid=inv_guid,
+                    id=doc_id,
+                    date_opened=open_date,
+                    date_posted=None,
+                    notes=notes,
+                    active=1,
+                    currency=currency_guid,
+                    owner_type=owner_type,
+                    owner_guid=owner.guid,
+                    terms=term_guid,
+                    billing_id="",
+                    post_txn=None,
+                    post_lot=None,
+                    post_acc=None,
+                    billto_type=0,
+                    billto_guid=None,
+                    charge_amt_num=0,
+                    charge_amt_denom=1,
+                )
+            )
+            _verify_write(
+                book.session, Invoice.__table__, inv_guid,
+                f"{config['doc_label']} '{doc_id}'",
+            )
+
+            book.save()
+
+            return {
+                "guid": inv_guid,
+                "id": doc_id,
+                config["owner_id_key"]: owner_id,
+                "date_opened": str(open_date.date()),
+                "status": "created",
+            }
 
     def create_invoice(
         self,
@@ -708,91 +864,15 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, customer_id, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Billterm
-
-        open_date = (
-            datetime.strptime(date_opened, "%Y-%m-%d")
-            if date_opened
-            else datetime.now()
+        return self._create_business_document(
+            owner_type=2,
+            owner_id=customer_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=invoice_id,
         )
-
-        with self.open(readonly=False) as book:
-            customer = self._find_customer(book, customer_id)
-            if not customer:
-                raise ValueError(f"Customer not found: {customer_id}")
-
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-                currency_guid = currency_obj.guid
-            else:
-                currency_guid = self._require_default_currency(book).guid
-
-            term_guid = None
-            if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
-                if not bt:
-                    raise ValueError(f"Billterm not found: {term}")
-                term_guid = bt.guid
-
-            if invoice_id is not None:
-                if not invoice_id.strip():
-                    raise ValueError("invoice_id must not be blank")
-                existing = self._find_invoice(book, invoice_id, owner_type=2)
-                if existing:
-                    raise ValueError(
-                        f"Invoice with ID '{invoice_id}' already exists"
-                    )
-            else:
-                cnt = book.counter_invoice + 1
-                book.counter_invoice = cnt
-                invoice_id = f"{cnt:06d}"
-            inv_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Invoice.__table__.insert().values(
-                    guid=inv_guid,
-                    id=invoice_id,
-                    date_opened=open_date,
-                    date_posted=None,
-                    notes=notes,
-                    active=1,
-                    currency=currency_guid,
-                    owner_type=2,  # Customer
-                    owner_guid=customer.guid,
-                    terms=term_guid,
-                    billing_id="",
-                    post_txn=None,
-                    post_lot=None,
-                    post_acc=None,
-                    billto_type=0,
-                    billto_guid=None,
-                    charge_amt_num=0,
-                    charge_amt_denom=1,
-                )
-            )
-            _verify_write(
-                book.session, Invoice.__table__, inv_guid,
-                f"Invoice '{invoice_id}'",
-            )
-
-            book.save()
-
-            return {
-                "guid": inv_guid,
-                "id": invoice_id,
-                "customer_id": customer_id,
-                "date_opened": str(open_date.date()),
-                "status": "created",
-            }
 
     def create_bill(
         self,
@@ -817,91 +897,15 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, vendor_id, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Billterm
-
-        open_date = (
-            datetime.strptime(date_opened, "%Y-%m-%d")
-            if date_opened
-            else datetime.now()
+        return self._create_business_document(
+            owner_type=4,
+            owner_id=vendor_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=bill_id,
         )
-
-        with self.open(readonly=False) as book:
-            vendor = self._find_vendor(book, vendor_id)
-            if not vendor:
-                raise ValueError(f"Vendor not found: {vendor_id}")
-
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-                currency_guid = currency_obj.guid
-            else:
-                currency_guid = self._require_default_currency(book).guid
-
-            term_guid = None
-            if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
-                if not bt:
-                    raise ValueError(f"Billterm not found: {term}")
-                term_guid = bt.guid
-
-            if bill_id is not None:
-                if not bill_id.strip():
-                    raise ValueError("bill_id must not be blank")
-                existing = self._find_invoice(book, bill_id, owner_type=4)
-                if existing:
-                    raise ValueError(
-                        f"Bill with ID '{bill_id}' already exists"
-                    )
-            else:
-                cnt = book.counter_bill + 1
-                book.counter_bill = cnt
-                bill_id = f"{cnt:06d}"
-            inv_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Invoice.__table__.insert().values(
-                    guid=inv_guid,
-                    id=bill_id,
-                    date_opened=open_date,
-                    date_posted=None,
-                    notes=notes,
-                    active=1,
-                    currency=currency_guid,
-                    owner_type=4,  # Vendor
-                    owner_guid=vendor.guid,
-                    terms=term_guid,
-                    billing_id="",
-                    post_txn=None,
-                    post_lot=None,
-                    post_acc=None,
-                    billto_type=0,
-                    billto_guid=None,
-                    charge_amt_num=0,
-                    charge_amt_denom=1,
-                )
-            )
-            _verify_write(
-                book.session, Invoice.__table__, inv_guid,
-                f"Bill '{bill_id}'",
-            )
-
-            book.save()
-
-            return {
-                "guid": inv_guid,
-                "id": bill_id,
-                "vendor_id": vendor_id,
-                "date_opened": str(open_date.date()),
-                "status": "created",
-            }
 
     def add_invoice_entry(
         self,
