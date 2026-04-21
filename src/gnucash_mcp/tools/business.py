@@ -140,6 +140,70 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="employee")
+    def create_employee(
+        name: str,
+        currency: str | None = None,
+        address: dict | None = None,
+    ) -> str:
+        """Create a new employee.
+
+        Employee has no ``notes`` field (unlike Customer and Vendor).
+        Address shape is identical.
+
+        Args:
+            name: Employee name (e.g., "Jane Smith").
+            currency: ISO currency code (e.g., "USD", "EUR").
+                      Defaults to book's default currency.
+            address: Optional address with keys: name, addr1, addr2,
+                     addr3, addr4, phone, fax, email.
+        """
+        book = get_book()
+        result = book.create_employee(
+            name=name, currency=currency, address=address,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def list_employees(
+        active_only: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """List all employees.
+
+        Returns a compact one-line-per-employee format by default.
+        Use verbose=true for full JSON with guid, address, etc.
+
+        Args:
+            active_only: If True, only show active employees. Default True.
+            verbose: If true, return full JSON details for each employee.
+        """
+        book = get_book()
+        result = book.list_employees(active_only=active_only, compact=not verbose)
+        if verbose:
+            return json.dumps(result, indent=2)
+        return result
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def get_employee(
+        id: str,
+    ) -> str:
+        """Get details for a specific employee by ID.
+
+        Args:
+            id: Employee ID (e.g., "000001"). This is the human-readable
+                ID shown in GnuCash, not the internal GUID.
+        """
+        book = get_book()
+        result = book.get_employee(employee_id=id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="write", operation="create", entity_type="billterm")
     def create_billterm(
         name: str,
@@ -484,6 +548,22 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         result = book.delete_vendor(vendor_id=vendor_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="employee")
+    def delete_employee(employee_id: str) -> str:
+        """Delete an employee.
+
+        Employees in the 1.3.0 release have no associated documents;
+        the delete proceeds unconditionally after slot cleanup.
+
+        Args:
+            employee_id: Employee ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.delete_employee(employee_id=employee_id)
         return _json(result)
 
     @mcp.tool()

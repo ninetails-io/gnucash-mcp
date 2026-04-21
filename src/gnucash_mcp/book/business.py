@@ -60,6 +60,14 @@ class BusinessMixin:
         return None
 
     @staticmethod
+    def _find_employee(book, employee_id: str):
+        """Find an employee by their human-readable ID (e.g., '000001')."""
+        for e in book.employees:
+            if e.id == employee_id:
+                return e
+        return None
+
+    @staticmethod
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
@@ -128,6 +136,28 @@ class BusinessMixin:
         return result
 
     @staticmethod
+    def _employee_to_dict(employee) -> dict:
+        """Convert a piecash Employee to a serializable dict.
+
+        Employee's schema has no ``notes`` column (unlike Customer
+        and Vendor — see docs/PIECASH_REFERENCE.md), so the response
+        shape omits the ``notes`` key. Employee-specific fields
+        (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
+        scope for the 1.3.0 CRUD surface and are not serialized.
+        """
+        result = {
+            "guid": employee.guid,
+            "id": employee.id,
+            "name": employee.name,
+            "currency": employee.currency.mnemonic if employee.currency else None,
+            "active": bool(employee.active),
+        }
+        address = BusinessMixin._address_to_dict(employee)
+        if address:
+            result["address"] = address
+        return result
+
+    @staticmethod
     def _customer_to_compact_line(customer) -> str:
         """One-line compact: 'id  name  currency'."""
         return f"{customer.id}\t{customer.name}\t{customer.currency.mnemonic}"
@@ -136,6 +166,11 @@ class BusinessMixin:
     def _vendor_to_compact_line(vendor) -> str:
         """One-line compact: 'id  name  currency'."""
         return f"{vendor.id}\t{vendor.name}\t{vendor.currency.mnemonic}"
+
+    @staticmethod
+    def _employee_to_compact_line(employee) -> str:
+        """One-line compact: 'id  name  currency'."""
+        return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
 
     @staticmethod
     def _billterm_to_dict(bt) -> dict:
@@ -376,6 +411,88 @@ class BusinessMixin:
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
+    def _create_business_person(
+        self,
+        cls,
+        *,
+        book,
+        name: str,
+        currency: str | None = None,
+        address: dict | None = None,
+        **extra_kwargs,
+    ) -> dict:
+        """Shared create path for Customer / Vendor / Employee.
+
+        Currency resolution (user-specified mnemonic or book default),
+        optional Address construction from a dict, entity instantiation,
+        ``book.save()``, and the canonical
+        ``{guid, id, name, status}`` response — all in one place.
+
+        Class-specific fields are passed via ``**extra_kwargs`` so the
+        helper stays agnostic of what each subclass accepts. Customer
+        and Vendor take ``notes=""``; Employee has no ``notes`` column
+        and rejects the kwarg — see docs/PIECASH_REFERENCE.md for the
+        full shape divergence. Callers build their own kwargs dict and
+        the helper passes it through unexamined.
+
+        Args:
+            cls: ``Customer``, ``Vendor``, or ``Employee`` (piecash).
+            book: An open piecash book session (readonly=False).
+            name: Entity display name.
+            currency: ISO currency code. Defaults to book's default.
+            address: Optional dict with keys: name, addr1, addr2,
+                addr3, addr4, phone, fax, email. Empty / missing
+                fields render as empty strings in the Address record.
+            **extra_kwargs: Class-specific fields passed through to
+                ``cls(...)``. Use for ``notes`` (Customer/Vendor),
+                ``acl`` / ``language`` / ``workday`` / ``rate``
+                (Employee), etc.
+
+        Returns:
+            ``{"guid": ..., "id": ..., "name": ..., "status": "created"}``
+        """
+        from piecash.business.person import Address
+
+        if currency:
+            currency_obj = None
+            for c in book.currencies:
+                if c.mnemonic == currency:
+                    currency_obj = c
+                    break
+            if not currency_obj:
+                raise ValueError(f"Currency not found: {currency}")
+        else:
+            currency_obj = self._require_default_currency(book)
+
+        addr = None
+        if address:
+            addr = Address(
+                name=address.get("name", name),
+                addr1=address.get("addr1", ""),
+                addr2=address.get("addr2", ""),
+                addr3=address.get("addr3", ""),
+                addr4=address.get("addr4", ""),
+                phone=address.get("phone", ""),
+                fax=address.get("fax", ""),
+                email=address.get("email", ""),
+            )
+
+        entity = cls(
+            name=name,
+            currency=currency_obj,
+            address=addr,
+            book=book,
+            **extra_kwargs,
+        )
+        book.save()
+
+        return {
+            "guid": entity.guid,
+            "id": entity.id,
+            "name": entity.name,
+            "status": "created",
+        }
+
     def create_customer(
         self,
         name: str,
@@ -395,48 +512,13 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, name, status.
         """
-        from piecash.business.person import Customer, Address
+        from piecash.business.person import Customer
 
         with self.open(readonly=False) as book:
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-            else:
-                currency_obj = self._require_default_currency(book)
-
-            addr = None
-            if address:
-                addr = Address(
-                    name=address.get("name", name),
-                    addr1=address.get("addr1", ""),
-                    addr2=address.get("addr2", ""),
-                    addr3=address.get("addr3", ""),
-                    addr4=address.get("addr4", ""),
-                    phone=address.get("phone", ""),
-                    fax=address.get("fax", ""),
-                    email=address.get("email", ""),
-                )
-
-            customer = Customer(
-                name=name,
-                currency=currency_obj,
-                notes=notes,
-                address=addr,
-                book=book,
+            return self._create_business_person(
+                Customer, book=book, name=name,
+                currency=currency, address=address, notes=notes,
             )
-            book.save()
-
-            return {
-                "guid": customer.guid,
-                "id": customer.id,
-                "name": customer.name,
-                "status": "created",
-            }
 
     def list_customers(
         self,
@@ -500,48 +582,13 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, name, status.
         """
-        from piecash.business.person import Vendor, Address
+        from piecash.business.person import Vendor
 
         with self.open(readonly=False) as book:
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-            else:
-                currency_obj = self._require_default_currency(book)
-
-            addr = None
-            if address:
-                addr = Address(
-                    name=address.get("name", name),
-                    addr1=address.get("addr1", ""),
-                    addr2=address.get("addr2", ""),
-                    addr3=address.get("addr3", ""),
-                    addr4=address.get("addr4", ""),
-                    phone=address.get("phone", ""),
-                    fax=address.get("fax", ""),
-                    email=address.get("email", ""),
-                )
-
-            vendor = Vendor(
-                name=name,
-                currency=currency_obj,
-                notes=notes,
-                address=addr,
-                book=book,
+            return self._create_business_person(
+                Vendor, book=book, name=name,
+                currency=currency, address=address, notes=notes,
             )
-            book.save()
-
-            return {
-                "guid": vendor.guid,
-                "id": vendor.id,
-                "name": vendor.name,
-                "status": "created",
-            }
 
     def list_vendors(
         self,
@@ -585,6 +632,79 @@ class BusinessMixin:
             if not vendor:
                 raise ValueError(f"Vendor not found: {vendor_id}")
             return self._vendor_to_dict(vendor)
+
+    def create_employee(
+        self,
+        name: str,
+        currency: str | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Create a new employee.
+
+        Employee has no ``notes`` field (unlike Customer and Vendor).
+        Employee-specific fields (``acl`` / ``language`` / ``workday``
+        / ``rate``) are out of scope for the 1.3.0 release. See
+        docs/PIECASH_REFERENCE.md for the full schema shape.
+
+        Args:
+            name: Employee name.
+            currency: ISO currency code. Defaults to book's default currency.
+            address: Optional address dict with keys: name, addr1, addr2,
+                     addr3, addr4, phone, fax, email.
+
+        Returns:
+            Dict with guid, id, name, status.
+        """
+        from piecash.business.person import Employee
+
+        with self.open(readonly=False) as book:
+            return self._create_business_person(
+                Employee, book=book, name=name,
+                currency=currency, address=address,
+            )
+
+    def list_employees(
+        self,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List all employees.
+
+        Args:
+            active_only: If True, only return active employees.
+            compact: If True, return compact one-line-per-employee string.
+
+        Returns:
+            Compact string or list of dicts.
+        """
+        with self.open() as book:
+            employees = sorted(book.employees, key=lambda e: e.name)
+            if active_only:
+                employees = [e for e in employees if e.active]
+
+            if compact:
+                lines = [self._employee_to_compact_line(e) for e in employees]
+                return "\n".join(lines)
+            else:
+                return [self._employee_to_dict(e) for e in employees]
+
+    def get_employee(self, employee_id: str) -> dict:
+        """Get employee details by ID.
+
+        Args:
+            employee_id: Human-readable employee ID (e.g., '000001').
+
+        Returns:
+            Dict with full employee details.
+
+        Raises:
+            ValueError: If employee not found.
+        """
+        with self.open() as book:
+            employee = self._find_employee(book, employee_id)
+            if not employee:
+                raise ValueError(f"Employee not found: {employee_id}")
+            return self._employee_to_dict(employee)
 
     def create_billterm(
         self,
@@ -676,6 +796,162 @@ class BusinessMixin:
                 return [self._billterm_to_dict(t) for t in terms]
 
     # ── Invoice / Bill creation, posting, payment ─────────────────
+    #
+    # Customer invoices and vendor bills share the ``invoices`` table,
+    # differing only in ``owner_type`` (2 vs 4) and a matched set of
+    # label / counter / finder conventions. The config table below
+    # captures those conventions; ``_create_business_document`` consumes
+    # it and services both create paths from a single implementation.
+
+    _BUSINESS_DOC_CONFIG: dict[int, dict] = {
+        2: {  # customer invoice
+            "owner_label": "Customer",
+            "doc_label": "Invoice",
+            "owner_id_key": "customer_id",
+            "doc_id_param": "invoice_id",
+            "counter_attr": "counter_invoice",
+            "find_owner_method": "_find_customer",
+        },
+        4: {  # vendor bill
+            "owner_label": "Vendor",
+            "doc_label": "Bill",
+            "owner_id_key": "vendor_id",
+            "doc_id_param": "bill_id",
+            "counter_attr": "counter_bill",
+            "find_owner_method": "_find_vendor",
+        },
+    }
+
+    def _create_business_document(
+        self,
+        *,
+        owner_type: int,
+        owner_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        doc_id: str | None = None,
+    ) -> dict:
+        """Shared create path for customer invoice and vendor bill.
+
+        Both hit the ``invoices`` table with the same 18-column insert,
+        differing only in ``owner_type`` and the label / counter /
+        finder conventions captured in ``_BUSINESS_DOC_CONFIG``. The
+        helper opens the book, resolves owner + currency + billterm,
+        handles the custom-ID-vs-auto-counter branch, writes the row
+        with ``_verify_write``, and returns the canonical response.
+
+        Args:
+            owner_type: 2 = customer invoice, 4 = vendor bill.
+            owner_id: Customer ID or vendor ID (human-readable '000001').
+            date_opened: ISO date; defaults to now.
+            notes: Free-text notes.
+            currency: ISO currency code; defaults to book default.
+            term: Billterm name; optional.
+            doc_id: Custom invoice/bill number; auto-generated from the
+                relevant counter when omitted.
+
+        Returns:
+            ``{guid, id, <owner_id_key>, date_opened, status}``
+        """
+        import uuid
+        from piecash.business.invoice import Billterm, Invoice
+
+        if owner_type not in self._BUSINESS_DOC_CONFIG:
+            raise ValueError(f"Unknown owner_type: {owner_type}")
+        config = self._BUSINESS_DOC_CONFIG[owner_type]
+        find_owner = getattr(self, config["find_owner_method"])
+
+        open_date = (
+            datetime.strptime(date_opened, "%Y-%m-%d")
+            if date_opened
+            else datetime.now()
+        )
+
+        with self.open(readonly=False) as book:
+            owner = find_owner(book, owner_id)
+            if not owner:
+                raise ValueError(
+                    f"{config['owner_label']} not found: {owner_id}"
+                )
+
+            if currency:
+                currency_obj = None
+                for c in book.currencies:
+                    if c.mnemonic == currency:
+                        currency_obj = c
+                        break
+                if not currency_obj:
+                    raise ValueError(f"Currency not found: {currency}")
+                currency_guid = currency_obj.guid
+            else:
+                currency_guid = self._require_default_currency(book).guid
+
+            term_guid = None
+            if term:
+                bt = book.session.query(Billterm).filter(
+                    Billterm.name == term, Billterm.invisible == 0
+                ).first()
+                if not bt:
+                    raise ValueError(f"Billterm not found: {term}")
+                term_guid = bt.guid
+
+            if doc_id is not None:
+                if not doc_id.strip():
+                    raise ValueError(
+                        f"{config['doc_id_param']} must not be blank"
+                    )
+                existing = self._find_invoice(
+                    book, doc_id, owner_type=owner_type
+                )
+                if existing:
+                    raise ValueError(
+                        f"{config['doc_label']} with ID "
+                        f"'{doc_id}' already exists"
+                    )
+            else:
+                cnt = getattr(book, config["counter_attr"]) + 1
+                setattr(book, config["counter_attr"], cnt)
+                doc_id = f"{cnt:06d}"
+
+            inv_guid = uuid.uuid4().hex
+            book.session.execute(
+                Invoice.__table__.insert().values(
+                    guid=inv_guid,
+                    id=doc_id,
+                    date_opened=open_date,
+                    date_posted=None,
+                    notes=notes,
+                    active=1,
+                    currency=currency_guid,
+                    owner_type=owner_type,
+                    owner_guid=owner.guid,
+                    terms=term_guid,
+                    billing_id="",
+                    post_txn=None,
+                    post_lot=None,
+                    post_acc=None,
+                    billto_type=0,
+                    billto_guid=None,
+                    charge_amt_num=0,
+                    charge_amt_denom=1,
+                )
+            )
+            _verify_write(
+                book.session, Invoice.__table__, inv_guid,
+                f"{config['doc_label']} '{doc_id}'",
+            )
+
+            book.save()
+
+            return {
+                "guid": inv_guid,
+                "id": doc_id,
+                config["owner_id_key"]: owner_id,
+                "date_opened": str(open_date.date()),
+                "status": "created",
+            }
 
     def create_invoice(
         self,
@@ -700,91 +976,15 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, customer_id, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Billterm
-
-        open_date = (
-            datetime.strptime(date_opened, "%Y-%m-%d")
-            if date_opened
-            else datetime.now()
+        return self._create_business_document(
+            owner_type=2,
+            owner_id=customer_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=invoice_id,
         )
-
-        with self.open(readonly=False) as book:
-            customer = self._find_customer(book, customer_id)
-            if not customer:
-                raise ValueError(f"Customer not found: {customer_id}")
-
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-                currency_guid = currency_obj.guid
-            else:
-                currency_guid = self._require_default_currency(book).guid
-
-            term_guid = None
-            if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
-                if not bt:
-                    raise ValueError(f"Billterm not found: {term}")
-                term_guid = bt.guid
-
-            if invoice_id is not None:
-                if not invoice_id.strip():
-                    raise ValueError("invoice_id must not be blank")
-                existing = self._find_invoice(book, invoice_id, owner_type=2)
-                if existing:
-                    raise ValueError(
-                        f"Invoice with ID '{invoice_id}' already exists"
-                    )
-            else:
-                cnt = book.counter_invoice + 1
-                book.counter_invoice = cnt
-                invoice_id = f"{cnt:06d}"
-            inv_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Invoice.__table__.insert().values(
-                    guid=inv_guid,
-                    id=invoice_id,
-                    date_opened=open_date,
-                    date_posted=None,
-                    notes=notes,
-                    active=1,
-                    currency=currency_guid,
-                    owner_type=2,  # Customer
-                    owner_guid=customer.guid,
-                    terms=term_guid,
-                    billing_id="",
-                    post_txn=None,
-                    post_lot=None,
-                    post_acc=None,
-                    billto_type=0,
-                    billto_guid=None,
-                    charge_amt_num=0,
-                    charge_amt_denom=1,
-                )
-            )
-            _verify_write(
-                book.session, Invoice.__table__, inv_guid,
-                f"Invoice '{invoice_id}'",
-            )
-
-            book.save()
-
-            return {
-                "guid": inv_guid,
-                "id": invoice_id,
-                "customer_id": customer_id,
-                "date_opened": str(open_date.date()),
-                "status": "created",
-            }
 
     def create_bill(
         self,
@@ -809,91 +1009,15 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, vendor_id, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Billterm
-
-        open_date = (
-            datetime.strptime(date_opened, "%Y-%m-%d")
-            if date_opened
-            else datetime.now()
+        return self._create_business_document(
+            owner_type=4,
+            owner_id=vendor_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=bill_id,
         )
-
-        with self.open(readonly=False) as book:
-            vendor = self._find_vendor(book, vendor_id)
-            if not vendor:
-                raise ValueError(f"Vendor not found: {vendor_id}")
-
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-                currency_guid = currency_obj.guid
-            else:
-                currency_guid = self._require_default_currency(book).guid
-
-            term_guid = None
-            if term:
-                bt = book.session.query(Billterm).filter(
-                    Billterm.name == term, Billterm.invisible == 0
-                ).first()
-                if not bt:
-                    raise ValueError(f"Billterm not found: {term}")
-                term_guid = bt.guid
-
-            if bill_id is not None:
-                if not bill_id.strip():
-                    raise ValueError("bill_id must not be blank")
-                existing = self._find_invoice(book, bill_id, owner_type=4)
-                if existing:
-                    raise ValueError(
-                        f"Bill with ID '{bill_id}' already exists"
-                    )
-            else:
-                cnt = book.counter_bill + 1
-                book.counter_bill = cnt
-                bill_id = f"{cnt:06d}"
-            inv_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Invoice.__table__.insert().values(
-                    guid=inv_guid,
-                    id=bill_id,
-                    date_opened=open_date,
-                    date_posted=None,
-                    notes=notes,
-                    active=1,
-                    currency=currency_guid,
-                    owner_type=4,  # Vendor
-                    owner_guid=vendor.guid,
-                    terms=term_guid,
-                    billing_id="",
-                    post_txn=None,
-                    post_lot=None,
-                    post_acc=None,
-                    billto_type=0,
-                    billto_guid=None,
-                    charge_amt_num=0,
-                    charge_amt_denom=1,
-                )
-            )
-            _verify_write(
-                book.session, Invoice.__table__, inv_guid,
-                f"Bill '{bill_id}'",
-            )
-
-            book.save()
-
-            return {
-                "guid": inv_guid,
-                "id": bill_id,
-                "vendor_id": vendor_id,
-                "date_opened": str(open_date.date()),
-                "status": "created",
-            }
 
     def add_invoice_entry(
         self,
@@ -1664,6 +1788,129 @@ class BusinessMixin:
                 "status": "deleted",
             }
 
+    def _delete_business_person(
+        self,
+        *,
+        entity_id: str,
+        entity_label: str,
+        find_entity_method: str,
+        dependency_check=None,
+    ) -> dict:
+        """Shared delete path for Customer / Vendor / Employee.
+
+        Skeleton:
+          1. Open the book (readwrite).
+          2. Find the entity via ``find_entity_method``; raise if absent.
+          3. Run the caller's ``dependency_check(book, entity_guid)``
+             if provided — customer/vendor both block on existing
+             documents; Employee may or may not, depending on schema.
+             The callback raises ValueError with its own message.
+          4. Clean up the ``slots`` table via SQLAlchemy Core +
+             ``_verify_delete`` (Customer / Vendor / Employee rows can
+             accumulate slots over their lifetime — no ON DELETE
+             CASCADE on ``obj_guid``, so we clean up explicitly).
+          5. ORM-delete the entity; save.
+          6. Return the canonical ``{id, guid, name, type, status}``
+             response dict.
+
+        Args:
+            entity_id: Human-readable ID ('000001').
+            entity_label: "Customer" / "Vendor" / "Employee" — used
+                in error messages and the response's ``type`` key
+                (lowercased).
+            find_entity_method: Name of the finder method on ``self``;
+                resolved via ``getattr``.
+            dependency_check: Optional callable
+                ``(book, entity_guid) -> None`` that raises
+                ``ValueError`` if the entity has dependent rows that
+                block deletion. When None, the entity is deleted
+                unconditionally after slot cleanup.
+
+        Returns:
+            ``{id, guid, name, type, status}``
+        """
+        from piecash.kvp import Slot
+
+        from gnucash_mcp.book._base import _verify_delete
+
+        find_entity = getattr(self, find_entity_method)
+
+        with self.open(readonly=False) as book:
+            entity = find_entity(book, entity_id)
+            if not entity:
+                raise ValueError(f"{entity_label} not found: {entity_id}")
+
+            entity_guid = entity.guid
+            entity_name = entity.name
+
+            if dependency_check is not None:
+                dependency_check(book, entity_guid)
+
+            # Slot cleanup via SQLAlchemy Core. Slots on business-person
+            # rows (notes, tax info, etc.) have no ON DELETE CASCADE
+            # on ``obj_guid``, so we clean them explicitly before the
+            # ORM delete.
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == entity_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Slot.__table__,
+                {"obj_guid": entity_guid},
+                f"Slots for {entity_label.lower()} '{entity_id}'",
+            )
+
+            book.session.delete(entity)
+            book.save()
+
+            return {
+                "id": entity_id,
+                "guid": entity_guid,
+                "name": entity_name,
+                "type": entity_label.lower(),
+                "status": "deleted",
+            }
+
+    @staticmethod
+    def _invoice_dependency_check(
+        entity_label: str, owner_type: int, doc_label: str,
+    ):
+        """Build a dependency_check callback for business-person delete.
+
+        Used by Customer and Vendor delete paths (and potentially
+        Employee, if Employees own documents). Returns a closure that
+        queries Invoice rows matching the owner_type and raises a
+        ValueError with posted/unposted-specific wording if any exist.
+        """
+        from piecash.business.invoice import Invoice
+
+        def check(book, entity_guid):
+            invoices = book.session.query(Invoice).filter(
+                Invoice.owner_guid == entity_guid,
+                Invoice.owner_type == owner_type,
+            ).all()
+            if not invoices:
+                return
+            posted = [i for i in invoices if i.date_posted is not None]
+            unposted = [i for i in invoices if i.date_posted is None]
+            if posted:
+                posted_ids = ", ".join(i.id for i in posted)
+                raise ValueError(
+                    f"Cannot delete {entity_label.lower()} with posted "
+                    f"{doc_label}: {posted_ids}. "
+                    f"Void them or issue credit notes first."
+                )
+            unposted_ids = ", ".join(i.id for i in unposted)
+            raise ValueError(
+                f"Cannot delete {entity_label.lower()} with "
+                f"{doc_label}: {unposted_ids}. "
+                f"Delete the {doc_label} first."
+            )
+
+        return check
+
     def delete_customer(self, customer_id: str) -> dict:
         """Delete a customer with no invoices.
 
@@ -1679,7 +1926,16 @@ class BusinessMixin:
         Raises:
             ValueError: If customer not found or has invoices.
         """
-        return self._delete_customer_or_vendor(customer_id, is_vendor=False)
+        return self._delete_business_person(
+            entity_id=customer_id,
+            entity_label="Customer",
+            find_entity_method="_find_customer",
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Customer",
+                owner_type=2,
+                doc_label="invoices",
+            ),
+        )
 
     def delete_vendor(self, vendor_id: str) -> dict:
         """Delete a vendor with no bills.
@@ -1696,86 +1952,40 @@ class BusinessMixin:
         Raises:
             ValueError: If vendor not found or has bills.
         """
-        return self._delete_customer_or_vendor(vendor_id, is_vendor=True)
+        return self._delete_business_person(
+            entity_id=vendor_id,
+            entity_label="Vendor",
+            find_entity_method="_find_vendor",
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Vendor",
+                owner_type=4,
+                doc_label="bills",
+            ),
+        )
 
-    def _delete_customer_or_vendor(self, entity_id: str, is_vendor: bool) -> dict:
-        """Shared implementation for delete_customer and delete_vendor."""
-        from piecash.business.invoice import Invoice
-        from piecash.kvp import Slot
+    def delete_employee(self, employee_id: str) -> dict:
+        """Delete an employee.
 
-        from gnucash_mcp.book._base import _verify_delete
+        Employees in the 1.3.0 release have no associated documents —
+        expense vouchers (``counter_exp_voucher`` / ``owner_type=5``)
+        are out of scope. The delete proceeds unconditionally after
+        slot cleanup.
 
-        if is_vendor:
-            type_label = "Vendor"
-            owner_type = 4
-            doc_label = "bills"
-        else:
-            type_label = "Customer"
-            owner_type = 2
-            doc_label = "invoices"
+        Args:
+            employee_id: Employee ID (e.g., '000001').
 
-        with self.open(readonly=False) as book:
-            if is_vendor:
-                entity = self._find_vendor(book, entity_id)
-            else:
-                entity = self._find_customer(book, entity_id)
+        Returns:
+            Dict with id, guid, name, status.
 
-            if not entity:
-                raise ValueError(f"{type_label} not found: {entity_id}")
-
-            entity_guid = entity.guid
-            entity_name = entity.name
-
-            invoices = book.session.query(Invoice).filter(
-                Invoice.owner_guid == entity_guid,
-                Invoice.owner_type == owner_type,
-            ).all()
-
-            if invoices:
-                posted = [i for i in invoices if i.date_posted is not None]
-                unposted = [i for i in invoices if i.date_posted is None]
-
-                if posted:
-                    posted_ids = ", ".join(i.id for i in posted)
-                    raise ValueError(
-                        f"Cannot delete {type_label.lower()} with posted "
-                        f"{doc_label}: {posted_ids}. "
-                        f"Void them or issue credit notes first."
-                    )
-                else:
-                    unposted_ids = ", ".join(i.id for i in unposted)
-                    raise ValueError(
-                        f"Cannot delete {type_label.lower()} with "
-                        f"{doc_label}: {unposted_ids}. "
-                        f"Delete the {doc_label} first."
-                    )
-
-            # Slot cleanup via SQLAlchemy Core. Customer/Vendor rows can
-            # accumulate slots over their lifetime (notes, tax info,
-            # etc.); they must be cleaned up first because the ``slots``
-            # table has no ON DELETE CASCADE on ``obj_guid``.
-            book.session.execute(
-                Slot.__table__.delete().where(
-                    Slot.__table__.c.obj_guid == entity_guid
-                )
-            )
-            _verify_delete(
-                book.session,
-                Slot.__table__,
-                {"obj_guid": entity_guid},
-                f"Slots for {type_label.lower()} '{entity_id}'",
-            )
-
-            book.session.delete(entity)
-            book.save()
-
-            return {
-                "id": entity_id,
-                "guid": entity_guid,
-                "name": entity_name,
-                "type": type_label.lower(),
-                "status": "deleted",
-            }
+        Raises:
+            ValueError: If employee not found.
+        """
+        return self._delete_business_person(
+            entity_id=employee_id,
+            entity_label="Employee",
+            find_entity_method="_find_employee",
+            # Employees own nothing in 1.3.0 — no dependency check.
+        )
 
     # ── Reporting ────────────────────────────────────────────────
 

@@ -52,13 +52,14 @@ class TestToolModulesMapping:
         assert len(TOOL_MODULES["core"]) == 15
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 78.
+        """Total tools across all modules should be 82.
 
-        78 = 75 original + 3 backup tools (create_backup,
-        list_backups, prune_backups) added in feat/backup-tool.
+        82 = 78 pre-Employee + 4 Employee CRUD tools (create_employee,
+        list_employees, get_employee, delete_employee) added in the
+        feat/employees branch.
         """
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 78
+        assert total == 82
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
@@ -89,9 +90,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 78 tools."""
+        """--modules=all should keep all 82 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 78
+        assert len(self._tool_names()) == 82
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to core + backup.
@@ -127,12 +128,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 78
+        assert len(self._tool_names()) == 82
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 78 tools."""
+        """'all' mixed with other modules should keep all 82 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 78
+        assert len(self._tool_names()) == 82
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""
