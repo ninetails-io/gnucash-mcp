@@ -376,6 +376,84 @@ class BusinessMixin:
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
+    def _create_business_person(
+        self,
+        cls,
+        *,
+        book,
+        name: str,
+        currency: str | None = None,
+        notes: str = "",
+        address: dict | None = None,
+    ) -> dict:
+        """Shared create path for Customer / Vendor / Employee.
+
+        All three piecash business-person classes share the same
+        constructor shape: ``(name, currency, notes, address, book)``.
+        This helper absorbs the boilerplate — currency resolution
+        (user-specified mnemonic or book default), optional Address
+        construction from a dict, entity instantiation, save, and the
+        canonical ``{guid, id, name, status}`` response.
+
+        Callers pass the class and the user-facing fields; the helper
+        neither knows nor cares what kind of business person it's
+        creating. Adding Employee is a 5-line caller against this.
+
+        Args:
+            cls: ``Customer``, ``Vendor``, or ``Employee`` (piecash).
+            book: An open piecash book session (readonly=False).
+            name: Entity display name.
+            currency: ISO currency code. Defaults to book's default.
+            notes: Free-text notes.
+            address: Optional dict with keys: name, addr1, addr2,
+                addr3, addr4, phone, fax, email. Empty / missing
+                fields render as empty strings in the Address record.
+
+        Returns:
+            ``{"guid": ..., "id": ..., "name": ..., "status": "created"}``
+        """
+        from piecash.business.person import Address
+
+        if currency:
+            currency_obj = None
+            for c in book.currencies:
+                if c.mnemonic == currency:
+                    currency_obj = c
+                    break
+            if not currency_obj:
+                raise ValueError(f"Currency not found: {currency}")
+        else:
+            currency_obj = self._require_default_currency(book)
+
+        addr = None
+        if address:
+            addr = Address(
+                name=address.get("name", name),
+                addr1=address.get("addr1", ""),
+                addr2=address.get("addr2", ""),
+                addr3=address.get("addr3", ""),
+                addr4=address.get("addr4", ""),
+                phone=address.get("phone", ""),
+                fax=address.get("fax", ""),
+                email=address.get("email", ""),
+            )
+
+        entity = cls(
+            name=name,
+            currency=currency_obj,
+            notes=notes,
+            address=addr,
+            book=book,
+        )
+        book.save()
+
+        return {
+            "guid": entity.guid,
+            "id": entity.id,
+            "name": entity.name,
+            "status": "created",
+        }
+
     def create_customer(
         self,
         name: str,
@@ -395,48 +473,13 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, name, status.
         """
-        from piecash.business.person import Customer, Address
+        from piecash.business.person import Customer
 
         with self.open(readonly=False) as book:
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-            else:
-                currency_obj = self._require_default_currency(book)
-
-            addr = None
-            if address:
-                addr = Address(
-                    name=address.get("name", name),
-                    addr1=address.get("addr1", ""),
-                    addr2=address.get("addr2", ""),
-                    addr3=address.get("addr3", ""),
-                    addr4=address.get("addr4", ""),
-                    phone=address.get("phone", ""),
-                    fax=address.get("fax", ""),
-                    email=address.get("email", ""),
-                )
-
-            customer = Customer(
-                name=name,
-                currency=currency_obj,
-                notes=notes,
-                address=addr,
-                book=book,
+            return self._create_business_person(
+                Customer, book=book, name=name,
+                currency=currency, notes=notes, address=address,
             )
-            book.save()
-
-            return {
-                "guid": customer.guid,
-                "id": customer.id,
-                "name": customer.name,
-                "status": "created",
-            }
 
     def list_customers(
         self,
@@ -500,48 +543,13 @@ class BusinessMixin:
         Returns:
             Dict with guid, id, name, status.
         """
-        from piecash.business.person import Vendor, Address
+        from piecash.business.person import Vendor
 
         with self.open(readonly=False) as book:
-            if currency:
-                currency_obj = None
-                for c in book.currencies:
-                    if c.mnemonic == currency:
-                        currency_obj = c
-                        break
-                if not currency_obj:
-                    raise ValueError(f"Currency not found: {currency}")
-            else:
-                currency_obj = self._require_default_currency(book)
-
-            addr = None
-            if address:
-                addr = Address(
-                    name=address.get("name", name),
-                    addr1=address.get("addr1", ""),
-                    addr2=address.get("addr2", ""),
-                    addr3=address.get("addr3", ""),
-                    addr4=address.get("addr4", ""),
-                    phone=address.get("phone", ""),
-                    fax=address.get("fax", ""),
-                    email=address.get("email", ""),
-                )
-
-            vendor = Vendor(
-                name=name,
-                currency=currency_obj,
-                notes=notes,
-                address=addr,
-                book=book,
+            return self._create_business_person(
+                Vendor, book=book, name=name,
+                currency=currency, notes=notes, address=address,
             )
-            book.save()
-
-            return {
-                "guid": vendor.guid,
-                "id": vendor.id,
-                "name": vendor.name,
-                "status": "created",
-            }
 
     def list_vendors(
         self,
