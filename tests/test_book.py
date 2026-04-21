@@ -433,6 +433,36 @@ class TestListTransactions:
         with pytest.raises(ValueError, match="Account not found"):
             gc_book.list_transactions(account="Nonexistent:Account")
 
+    def test_compact_truncation_notice_when_over_limit(self, test_book: Path):
+        """Compact mode appends [Showing N of M ...] when results truncate."""
+        gc_book = GnuCashBook(str(test_book))
+        # test_book has 3 transactions; limit=2 triggers truncation.
+        result = gc_book.list_transactions(limit=2, compact=True)
+        assert "[Showing 2 of 3 transactions" in result
+        assert "start_date/end_date" in result
+
+    def test_compact_no_notice_when_under_limit(self, test_book: Path):
+        """No notice when results fit under the limit."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_transactions(limit=50, compact=True)
+        assert "Showing" not in result
+
+    def test_compact_cap_note_when_limit_over_max(self, test_book: Path):
+        """Limit above MAX_LIST_LIMIT (250) gets clamped with a note when
+        results fit, or included in the truncation message when they don't."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_transactions(limit=10000, compact=True)
+        # test_book has only 3, fits under the cap
+        assert "Limit capped at 250" in result
+        assert "results fit under the cap" in result
+
+    def test_verbose_mode_no_notice(self, test_book: Path):
+        """Non-compact (dict) mode returns list silently — no notice field."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_transactions(limit=2, compact=False)
+        assert isinstance(result, list)
+        assert len(result) == 2
+
 
 class TestCompactTransactionFormat:
     """Tests for the compact output shapes of list/search_transactions.
@@ -1689,6 +1719,21 @@ class TestSearchTransactions:
 
         with pytest.raises(ValueError, match="Invalid amount query"):
             gc_book.search_transactions(">notanumber", field="amount")
+
+    def test_search_compact_truncation_notice(self, test_book: Path):
+        """Compact mode appends truncation notice when matches exceed limit."""
+        gc_book = GnuCashBook(str(test_book))
+        # Match all 3 transactions on a common substring, limit=2 forces truncation.
+        # 'a' appears in "Opening Balance", "Salary Deposit", "Weekly Groceries".
+        # Actually just use a broad amount filter for certainty.
+        result = gc_book.search_transactions(">0", field="amount", limit=2, compact=True)
+        assert "[Showing 2 of 3 transactions" in result
+
+    def test_search_compact_cap_applied(self, test_book: Path):
+        """Limits above MAX_LIST_LIMIT get clamped with a note."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.search_transactions(">0", field="amount", limit=10000, compact=True)
+        assert "Limit capped at 250" in result
 
 
 class TestCreateAccount:
