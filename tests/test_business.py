@@ -1333,6 +1333,126 @@ class TestPostInvoice:
         finally:
             conn.close()
 
+    def test_cross_currency_post_missing_rate_raises(self, business_book):
+        """Posting a cross-currency invoice with no usable price in the
+        book fails with a clear error pointing at create_price.
+        """
+        import piecash
+        import pytest
+
+        gb = GnuCashBook(str(business_book))
+
+        with gb.open(readonly=False) as book:
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+            assets = None
+            for a in book.accounts:
+                if a.fullname == "Assets":
+                    assets = a
+                    break
+            piecash.Account(name="Accounts Receivable EUR",
+                            type="RECEIVABLE", parent=assets,
+                            commodity=eur)
+            book.save()
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(invoice_id="000001",
+                             account="Income:Consulting",  # USD
+                             description="EUR services",
+                             quantity="1", price="100.00")
+
+        with pytest.raises(ValueError, match="exchange rate"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable EUR",
+                post_date="2026-03-10",
+            )
+
+    def test_cross_currency_post_uses_price_table(self, business_book):
+        """EUR invoice posted to EUR A/R with USD income account converts
+        the income split's quantity at the price-table rate. The A/R
+        split stays 1:1 because A/R is EUR (matches invoice currency).
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+
+            assets = None
+            for a in book.accounts:
+                if a.fullname == "Assets":
+                    assets = a
+                    break
+            ar_eur = piecash.Account(
+                name="Accounts Receivable EUR",
+                type="RECEIVABLE",
+                parent=assets,
+                commodity=eur,
+            )
+            book.session.add(ar_eur)
+
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10), value="1.10",
+                source="user:test", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",  # USD account
+            description="EUR services",
+            quantity="1", price="1000.00",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+
+        assert result["status"] == "posted"
+
+        # Inspect the transaction's splits: income quantity should be
+        # 1000 * 1.10 = 1100 USD while value stays at 1000 EUR.
+        with gb.open(readonly=True) as book:
+            inv = None
+            for i in book.session.query(piecash.business.Invoice).all():
+                if i.id == "000001":
+                    inv = i
+                    break
+            assert inv is not None
+            txn = inv.post_txn
+            assert txn is not None
+
+            income_split = None
+            ar_split = None
+            for s in txn.splits:
+                if s.account.fullname == "Income:Consulting":
+                    income_split = s
+                elif s.account.fullname == "Assets:Accounts Receivable EUR":
+                    ar_split = s
+
+            assert income_split is not None
+            assert ar_split is not None
+            # A/R EUR matches invoice currency, so quantity == value
+            assert Decimal(str(ar_split.value)) == Decimal("1000")
+            assert Decimal(str(ar_split.quantity)) == Decimal("1000")
+            # Income USD: value in EUR (invoice ccy), quantity in USD at rate
+            assert Decimal(str(income_split.value)) == Decimal("-1000")
+            assert Decimal(str(income_split.quantity)) == Decimal("-1100.00")
+
 
 # ============== Pay Invoice Tests ==============
 
@@ -1577,6 +1697,158 @@ class TestPayInvoice:
             ), "lot should remain open after partial payment"
         finally:
             conn.close()
+
+    def test_cross_currency_payment_uses_price_table(self, business_book):
+        """EUR invoice paid from USD Checking converts at book.prices rate.
+
+        The A/R split stays in invoice currency (EUR), the pay account's
+        quantity is the USD amount derived from the EUR→USD price on or
+        before payment_date. Result includes exchange_rate and
+        payment_account_amount.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+
+        # Prep: add EUR commodity, EUR A/R sub-account, and a EUR→USD price
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+
+            receivables = None
+            for a in book.accounts:
+                if a.fullname == "Assets":
+                    receivables = a
+                    break
+
+            ar_eur = piecash.Account(
+                name="Accounts Receivable EUR",
+                type="RECEIVABLE",
+                parent=receivables,
+                commodity=eur,
+            )
+            book.session.add(ar_eur)
+
+            price = piecash.Price(
+                commodity=eur,
+                currency=usd,
+                date=_date(2026, 3, 10),
+                value="1.10",
+                source="user:test",
+                type="nav",
+            )
+            book.session.add(price)
+            book.save()
+
+        # Customer in EUR, invoice in EUR
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001",
+            currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="EUR services",
+            quantity="1",
+            price="4500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-10",
+        )
+
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        # Cross-currency fields present (rate may stringify as "1.1" or "1.10")
+        assert Decimal(result["exchange_rate"]) == Decimal("1.10")
+        assert Decimal(result["payment_account_amount"]) == Decimal("4950.00")
+        assert result["invoice_currency"] == "EUR"
+        assert result["payment_account_currency"] == "USD"
+
+        # Balance checks: EUR A/R cleared, USD Checking credited at the rate
+        ar_balance = gb.get_balance(account_name="Assets:Accounts Receivable EUR")
+        assert ar_balance == Decimal("0")
+        checking_balance = gb.get_balance(account_name="Assets:Checking")
+        # Business book opens with $10,000 in checking per the fixture
+        assert checking_balance == Decimal("14950.00")
+
+    def test_cross_currency_payment_to_matching_currency_account(self, business_book):
+        """When the payment account's commodity matches the invoice
+        currency, no rate lookup is needed (same-currency payment on a
+        cross-currency-denominated invoice). Example: paying an EUR
+        invoice from a EUR-denominated bank account.
+        """
+        import piecash
+
+        gb = GnuCashBook(str(business_book))
+
+        with gb.open(readonly=False) as book:
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+            assets = None
+            for a in book.accounts:
+                if a.fullname == "Assets":
+                    assets = a
+                    break
+            piecash.Account(name="Euro Checking", type="BANK",
+                            parent=assets, commodity=eur)
+            piecash.Account(name="Accounts Receivable EUR",
+                            type="RECEIVABLE", parent=assets,
+                            commodity=eur)
+            book.save()
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(invoice_id="000001",
+                             account="Income:Consulting",  # USD, but trivial
+                             description="EUR services",
+                             quantity="1", price="100.00")
+
+        # Add a price so the USD income side of post_invoice can be converted.
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = None
+            for c in book.commodities:
+                if c.mnemonic == "EUR":
+                    eur = c
+                    break
+            from datetime import date as _date
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10),
+                value="1.10", source="user:test", type="nav",
+            ))
+            book.save()
+
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Assets:Accounts Receivable EUR",
+                        post_date="2026-03-10")
+
+        # Pay from EUR bank account — same currency as invoice, no rate needed.
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Euro Checking",
+            amount="100.00",
+            payment_date="2026-03-10",
+        )
+
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        # Same-currency payment: no exchange_rate field in result.
+        assert "exchange_rate" not in result
 
 
 # ============== Outstanding Invoices Tests ==============
