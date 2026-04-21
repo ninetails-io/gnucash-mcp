@@ -555,6 +555,7 @@ class BusinessMixin:
             "guid": entity.guid,
             "id": entity.id,
             "name": entity.name,
+            "currency": currency_obj.mnemonic,
             "status": "created",
         }
 
