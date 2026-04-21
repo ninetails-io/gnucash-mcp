@@ -117,6 +117,20 @@ class BudgetsMixin:
                 return p
         return None
 
+    @staticmethod
+    def _coerce_period_str(period):
+        """Coerce a numeric string like '6' to int 6.
+
+        MCP tool calls route string-typed parameters through the XML
+        parameter layer as strings even when the schema's anyOf permits
+        integers. This normalizer lets callers pass '6' and get the same
+        behavior as int 6. Non-digit strings (e.g. 'all', 'q3', 'ytd')
+        and non-string values pass through untouched.
+        """
+        if isinstance(period, str) and period.isdigit():
+            return int(period)
+        return period
+
     def _resolve_periods(
         self, budget, period: int | str | None
     ) -> list[int]:
@@ -132,6 +146,7 @@ class BudgetsMixin:
         Raises:
             ValueError: If period is invalid or out of range.
         """
+        period = self._coerce_period_str(period)
         num = budget.num_periods
 
         if period is None or period == "all":
@@ -427,6 +442,8 @@ class BudgetsMixin:
             budget = self._find_budget(book, budget_name)
             if not budget:
                 raise ValueError(f"Budget not found: {budget_name}")
+
+            period = self._coerce_period_str(period)
 
             if period is None:
                 current = self._current_period(budget)
