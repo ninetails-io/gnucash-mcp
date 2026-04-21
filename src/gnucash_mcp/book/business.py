@@ -1676,6 +1676,129 @@ class BusinessMixin:
                 "status": "deleted",
             }
 
+    def _delete_business_person(
+        self,
+        *,
+        entity_id: str,
+        entity_label: str,
+        find_entity_method: str,
+        dependency_check=None,
+    ) -> dict:
+        """Shared delete path for Customer / Vendor / Employee.
+
+        Skeleton:
+          1. Open the book (readwrite).
+          2. Find the entity via ``find_entity_method``; raise if absent.
+          3. Run the caller's ``dependency_check(book, entity_guid)``
+             if provided — customer/vendor both block on existing
+             documents; Employee may or may not, depending on schema.
+             The callback raises ValueError with its own message.
+          4. Clean up the ``slots`` table via SQLAlchemy Core +
+             ``_verify_delete`` (Customer / Vendor / Employee rows can
+             accumulate slots over their lifetime — no ON DELETE
+             CASCADE on ``obj_guid``, so we clean up explicitly).
+          5. ORM-delete the entity; save.
+          6. Return the canonical ``{id, guid, name, type, status}``
+             response dict.
+
+        Args:
+            entity_id: Human-readable ID ('000001').
+            entity_label: "Customer" / "Vendor" / "Employee" — used
+                in error messages and the response's ``type`` key
+                (lowercased).
+            find_entity_method: Name of the finder method on ``self``;
+                resolved via ``getattr``.
+            dependency_check: Optional callable
+                ``(book, entity_guid) -> None`` that raises
+                ``ValueError`` if the entity has dependent rows that
+                block deletion. When None, the entity is deleted
+                unconditionally after slot cleanup.
+
+        Returns:
+            ``{id, guid, name, type, status}``
+        """
+        from piecash.kvp import Slot
+
+        from gnucash_mcp.book._base import _verify_delete
+
+        find_entity = getattr(self, find_entity_method)
+
+        with self.open(readonly=False) as book:
+            entity = find_entity(book, entity_id)
+            if not entity:
+                raise ValueError(f"{entity_label} not found: {entity_id}")
+
+            entity_guid = entity.guid
+            entity_name = entity.name
+
+            if dependency_check is not None:
+                dependency_check(book, entity_guid)
+
+            # Slot cleanup via SQLAlchemy Core. Slots on business-person
+            # rows (notes, tax info, etc.) have no ON DELETE CASCADE
+            # on ``obj_guid``, so we clean them explicitly before the
+            # ORM delete.
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == entity_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Slot.__table__,
+                {"obj_guid": entity_guid},
+                f"Slots for {entity_label.lower()} '{entity_id}'",
+            )
+
+            book.session.delete(entity)
+            book.save()
+
+            return {
+                "id": entity_id,
+                "guid": entity_guid,
+                "name": entity_name,
+                "type": entity_label.lower(),
+                "status": "deleted",
+            }
+
+    @staticmethod
+    def _invoice_dependency_check(
+        entity_label: str, owner_type: int, doc_label: str,
+    ):
+        """Build a dependency_check callback for business-person delete.
+
+        Used by Customer and Vendor delete paths (and potentially
+        Employee, if Employees own documents). Returns a closure that
+        queries Invoice rows matching the owner_type and raises a
+        ValueError with posted/unposted-specific wording if any exist.
+        """
+        from piecash.business.invoice import Invoice
+
+        def check(book, entity_guid):
+            invoices = book.session.query(Invoice).filter(
+                Invoice.owner_guid == entity_guid,
+                Invoice.owner_type == owner_type,
+            ).all()
+            if not invoices:
+                return
+            posted = [i for i in invoices if i.date_posted is not None]
+            unposted = [i for i in invoices if i.date_posted is None]
+            if posted:
+                posted_ids = ", ".join(i.id for i in posted)
+                raise ValueError(
+                    f"Cannot delete {entity_label.lower()} with posted "
+                    f"{doc_label}: {posted_ids}. "
+                    f"Void them or issue credit notes first."
+                )
+            unposted_ids = ", ".join(i.id for i in unposted)
+            raise ValueError(
+                f"Cannot delete {entity_label.lower()} with "
+                f"{doc_label}: {unposted_ids}. "
+                f"Delete the {doc_label} first."
+            )
+
+        return check
+
     def delete_customer(self, customer_id: str) -> dict:
         """Delete a customer with no invoices.
 
@@ -1691,7 +1814,16 @@ class BusinessMixin:
         Raises:
             ValueError: If customer not found or has invoices.
         """
-        return self._delete_customer_or_vendor(customer_id, is_vendor=False)
+        return self._delete_business_person(
+            entity_id=customer_id,
+            entity_label="Customer",
+            find_entity_method="_find_customer",
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Customer",
+                owner_type=2,
+                doc_label="invoices",
+            ),
+        )
 
     def delete_vendor(self, vendor_id: str) -> dict:
         """Delete a vendor with no bills.
@@ -1708,86 +1840,16 @@ class BusinessMixin:
         Raises:
             ValueError: If vendor not found or has bills.
         """
-        return self._delete_customer_or_vendor(vendor_id, is_vendor=True)
-
-    def _delete_customer_or_vendor(self, entity_id: str, is_vendor: bool) -> dict:
-        """Shared implementation for delete_customer and delete_vendor."""
-        from piecash.business.invoice import Invoice
-        from piecash.kvp import Slot
-
-        from gnucash_mcp.book._base import _verify_delete
-
-        if is_vendor:
-            type_label = "Vendor"
-            owner_type = 4
-            doc_label = "bills"
-        else:
-            type_label = "Customer"
-            owner_type = 2
-            doc_label = "invoices"
-
-        with self.open(readonly=False) as book:
-            if is_vendor:
-                entity = self._find_vendor(book, entity_id)
-            else:
-                entity = self._find_customer(book, entity_id)
-
-            if not entity:
-                raise ValueError(f"{type_label} not found: {entity_id}")
-
-            entity_guid = entity.guid
-            entity_name = entity.name
-
-            invoices = book.session.query(Invoice).filter(
-                Invoice.owner_guid == entity_guid,
-                Invoice.owner_type == owner_type,
-            ).all()
-
-            if invoices:
-                posted = [i for i in invoices if i.date_posted is not None]
-                unposted = [i for i in invoices if i.date_posted is None]
-
-                if posted:
-                    posted_ids = ", ".join(i.id for i in posted)
-                    raise ValueError(
-                        f"Cannot delete {type_label.lower()} with posted "
-                        f"{doc_label}: {posted_ids}. "
-                        f"Void them or issue credit notes first."
-                    )
-                else:
-                    unposted_ids = ", ".join(i.id for i in unposted)
-                    raise ValueError(
-                        f"Cannot delete {type_label.lower()} with "
-                        f"{doc_label}: {unposted_ids}. "
-                        f"Delete the {doc_label} first."
-                    )
-
-            # Slot cleanup via SQLAlchemy Core. Customer/Vendor rows can
-            # accumulate slots over their lifetime (notes, tax info,
-            # etc.); they must be cleaned up first because the ``slots``
-            # table has no ON DELETE CASCADE on ``obj_guid``.
-            book.session.execute(
-                Slot.__table__.delete().where(
-                    Slot.__table__.c.obj_guid == entity_guid
-                )
-            )
-            _verify_delete(
-                book.session,
-                Slot.__table__,
-                {"obj_guid": entity_guid},
-                f"Slots for {type_label.lower()} '{entity_id}'",
-            )
-
-            book.session.delete(entity)
-            book.save()
-
-            return {
-                "id": entity_id,
-                "guid": entity_guid,
-                "name": entity_name,
-                "type": type_label.lower(),
-                "status": "deleted",
-            }
+        return self._delete_business_person(
+            entity_id=vendor_id,
+            entity_label="Vendor",
+            find_entity_method="_find_vendor",
+            dependency_check=self._invoice_dependency_check(
+                entity_label="Vendor",
+                owner_type=4,
+                doc_label="bills",
+            ),
+        )
 
     # ── Reporting ────────────────────────────────────────────────
 
