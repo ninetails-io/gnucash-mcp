@@ -394,9 +394,11 @@ Example audit entry:
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
 cd gnucash-mcp
-uv sync
+uv sync --extra dev
 uv run pytest           # Run tests
 uv run pytest -x -v     # Stop on first failure, verbose
+uv run ruff check src/ tests/     # Lint
+uv run black --check src/ tests/  # Formatter check (no reformat)
 ```
 
 ### Project Structure
