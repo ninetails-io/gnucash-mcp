@@ -44,7 +44,10 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-CLAUDE.md
+
+# Claude Code local-only notes (cross-session handoffs, personal context).
+# The committed CLAUDE.md is the public contributor guide.
+CLAUDE.local.md
 
 # Local-only working files — IDE / client state, scratch notes,
 # local test scripts that shouldn't pollute the shared repo.
