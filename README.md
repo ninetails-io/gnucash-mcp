@@ -440,6 +440,15 @@ entity, and most read and write paths were measured and optimized.
 - **Employees**: Third business-person entity alongside Customer and
   Vendor. `create_employee`, `list_employees`, `get_employee`,
   `delete_employee`. Expense vouchers are out of scope for this release.
+- **Cross-currency invoicing**: `post_invoice` and `pay_invoice` now
+  apply exchange rates from `book.prices` when the invoice currency
+  differs from the A/R, A/P, or payment account commodity. Splits are
+  written with `value` in invoice currency and `quantity` in the
+  account's commodity, so the transaction balances correctly while
+  real USD flows reflect the actual conversion. Skips piecash's
+  auto-created `type='transaction'` 1:1 rates so a transaction-derived
+  placeholder can't mask a missing user-supplied market price. Clear
+  error when no usable rate is on file, pointing at `create_price`.
 - **Register-form compact output**: `list_transactions(account=X)`
   now renders in bank-register form — `DATE  guid  ±amount  desc
   other-splits` — with the signed impact on the filtered account in
@@ -488,7 +497,41 @@ entity, and most read and write paths were measured and optimized.
 - **Linter & formatter config**: `ruff` and `black` sections added
   to `pyproject.toml`. No bulk reformat in this release — style
   drift gets fixed on the next touch to each file, when it's cheapest.
-- **Version**: 1.2.1 (701 tests)
+- **Synthetic-book generation scripts**: `scripts/synthetic_book/`
+  now ships with an 8-phase pipeline that builds the Alex
+  Chen-Morales test persona book end-to-end — 1,797 transactions
+  covering scheduled-instantiation, daily/weekly patterns, LLC
+  business flows (including EUR-denominated invoices), investment
+  activity with lots, credit-card lifecycle, reconciliation, edge
+  cases, and a 1,000-transaction volume stress. Each phase is
+  self-contained, deterministically seeded, and re-runnable from
+  its own `.pre-phaseN.gnucash` backup.
+- **Pre-release correctness sweep**: Five issues surfaced while
+  stress-testing against the synthetic book.
+  - `get_book_summary` now values investment accounts at
+    `shares × latest_price` from the price table instead of summing
+    raw quantities as the default currency — Alex's net worth was
+    understated by ~\$57K before the fix. Falls back to cost basis
+    with a "no price data" tag when no user-supplied price exists.
+  - Same summary gained Receivables, Payables, Business entity
+    counts (`3 customers, 2 vendors, 1 employee`), and Budget count
+    sections, each rendered only when non-empty.
+  - `list_transactions` and `search_transactions` now append
+    `[Showing N of M — …]` to compact output when the result set
+    exceeds the limit. Silent truncation was a trust issue for
+    accountants who'd filter a month and see 50 of 93 without
+    knowing. Limits above 250 are clamped server-side with a note.
+  - `search_transactions` gained a `limit` parameter (it didn't
+    have one; results were unbounded).
+  - `create_customer` / `create_vendor` / `create_employee` now
+    include the resolved currency in their return dicts so the
+    audit log renders `currency: USD` instead of an empty field
+    when the caller relied on the book's default.
+  - Budget tool `period` parameter now coerces numeric-string
+    values to int. XML-routed MCP calls pass `"11"` as a string;
+    the handler previously rejected it despite the schema allowing
+    strings alongside integers.
+- **Version**: 1.2.1 (718 tests)
 
 ### v1.2.0 — Business Module
 
