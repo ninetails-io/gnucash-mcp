@@ -59,6 +59,79 @@ class BusinessMixin:
                 return v
         return None
 
+    # Path for the auto-created realized-FX-gain/loss income account.
+    # Single credit-natural account: positive balance = net gain, negative
+    # = net loss across the period. Named to match GAAP convention
+    # ("Foreign Exchange Gain (Loss)") while staying one account for
+    # simplicity.
+    FX_GAIN_LOSS_PATH = "Income:Foreign Exchange Gain/Loss"
+
+    def _get_or_create_fx_account(self, book):
+        """Find or lazily create ``Income:Foreign Exchange Gain/Loss``.
+
+        Created on first cross-currency pay whose post-date rate
+        differs from its pay-date rate, so books without foreign-
+        currency activity never accumulate an unused account.
+
+        Raises:
+            ValueError: If the parent ``Income`` account doesn't exist.
+                Caller must create it first — we won't auto-create a
+                top-level account.
+        """
+        fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
+        if fx_acct is not None:
+            return fx_acct
+
+        income = self._find_account(book, "Income")
+        if income is None:
+            raise ValueError(
+                "Realized FX gain/loss on cross-currency payment needs "
+                "an Income parent account, but none exists. Create "
+                "Income (type=INCOME, placeholder) first."
+            )
+
+        default_currency = self._require_default_currency(book)
+        # Construct — piecash.Account auto-adds to the session via the
+        # parent linkage. Don't flush here: the caller is still building
+        # the payment transaction, and orphan Split objects already in
+        # the session would trip a NOT NULL on splits.tx_guid. The
+        # final book.save() at the end of pay_invoice flushes everything
+        # together with their now-set tx_guids.
+        fx_acct = piecash.Account(
+            name="Foreign Exchange Gain/Loss",
+            type="INCOME",
+            parent=income,
+            commodity=default_currency,
+            description=(
+                "Realized gains and losses from cross-currency "
+                "invoice settlements (rate drift between post-date "
+                "and pay-date). Auto-created on first use."
+            ),
+        )
+        return fx_acct
+
+    @staticmethod
+    def _rate_from_post_transaction(post_txn, invoice_currency):
+        """Derive the exchange rate that was applied at invoice-posting.
+
+        Inspects the posting transaction's splits for one whose account
+        commodity differs from the invoice currency (the income, expense,
+        or A/R side that received the rate). The ratio of |quantity|
+        (account commodity) to |value| (transaction currency) is the
+        rate that was in force at posting.
+
+        Returns the Decimal rate, or None if no cross-currency split
+        is present (same-currency post, or post predates the rate fix).
+        """
+        for s in post_txn.splits:
+            if s.account.commodity == invoice_currency:
+                continue
+            s_value = abs(Decimal(str(s.value)))
+            s_quantity = abs(Decimal(str(s.quantity)))
+            if s_value > 0:
+                return s_quantity / s_value
+        return None
+
     @staticmethod
     def _find_exchange_rate(book, from_commodity, to_commodity, as_of: date):
         """Look up an exchange rate from book.prices for a cross-currency
@@ -1786,12 +1859,62 @@ class BusinessMixin:
                     memo="",
                 )
 
+            # Realized FX gain/loss: when cross-currency and the rate
+            # moved between post-date and pay-date, the USD actually
+            # received/spent differs from what was originally recorded
+            # as income/expense. That delta is taxable FX gain (or
+            # loss); book it to an auto-created Income:FX Gain/Loss
+            # account. The split has value=0 in the transaction
+            # currency (so EUR/GBP/etc. balance is preserved) but
+            # non-zero quantity in the book's default currency. Same
+            # account for both directions; sign determines gain vs
+            # loss.
+            splits = [ar_ap_split, bank_split]
+            fx_gain_loss = None
+            fx_diff = Decimal("0")
+            fx_acct = None
+            if exchange_rate is not None:
+                rate_at_post = self._rate_from_post_transaction(
+                    inv.post_txn, inv.currency
+                )
+                if rate_at_post is not None:
+                    expected_at_post = (
+                        payment_amount * rate_at_post
+                    ).quantize(Decimal("0.01"))
+                    fx_diff = pay_quantity - expected_at_post
+                    if abs(fx_diff) >= Decimal("0.01"):
+                        fx_acct = self._get_or_create_fx_account(book)
+                        # Customer (is_bill=False): we received MORE
+                        # USD than income recorded → gain → credit
+                        # income account (quantity = -fx_diff for a
+                        # gain, +|fx_diff| for a loss).
+                        # Vendor bill (is_bill=True): we spent MORE
+                        # USD than expense recorded → loss → debit
+                        # income account (quantity = +fx_diff for a
+                        # loss, -|fx_diff| for a gain).
+                        quantity_sign = 1 if is_bill else -1
+                        is_loss = (is_bill and fx_diff > 0) or (
+                            not is_bill and fx_diff < 0
+                        )
+                        fx_gain_loss = piecash.Split(
+                            account=fx_acct,
+                            value=Decimal("0"),
+                            quantity=quantity_sign * fx_diff,
+                            memo=(
+                                f"FX {'loss' if is_loss else 'gain'} "
+                                f"on invoice {inv.id}: post-rate "
+                                f"{rate_at_post:.4f}, pay-rate "
+                                f"{exchange_rate}"
+                            ),
+                        )
+                        splits.append(fx_gain_loss)
+
             txn = piecash.Transaction(
                 currency=inv.currency,
                 description=txn_desc,
                 post_date=parsed_date,
                 num="",
-                splits=[ar_ap_split, bank_split],
+                splits=splits,
             )
 
             ar_ap_split.lot = lot_obj
@@ -1821,6 +1944,17 @@ class BusinessMixin:
                 result["payment_account_amount"] = str(pay_quantity)
                 result["invoice_currency"] = inv.currency.mnemonic
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
+                if fx_gain_loss is not None:
+                    direction = (
+                        "loss" if (is_bill and fx_diff > 0)
+                        or (not is_bill and fx_diff < 0)
+                        else "gain"
+                    )
+                    result["fx_realized"] = {
+                        "amount": str(abs(fx_diff).quantize(Decimal("0.01"))),
+                        "direction": direction,
+                        "account": fx_acct.fullname,
+                    }
 
         return result
 
