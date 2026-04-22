@@ -1797,6 +1797,151 @@ class TestPayInvoice:
         # Business book opens with $10,000 in checking per the fixture
         assert checking_balance == Decimal("14950.00")
 
+    def _add_eur_ar_and_price(self, gb, rate_date, rate_value):
+        """Helper: add EUR commodity, EUR A/R subaccount, and a EUR/USD price."""
+        import piecash
+        from datetime import date as _date
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = None
+            for c in book.commodities:
+                if c.mnemonic == "EUR":
+                    eur = c
+                    break
+            if eur is None:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+            if not any(a.fullname == "Assets:Accounts Receivable EUR"
+                       for a in book.accounts):
+                assets = next(a for a in book.accounts if a.fullname == "Assets")
+                book.session.add(piecash.Account(
+                    name="Accounts Receivable EUR", type="RECEIVABLE",
+                    parent=assets, commodity=eur,
+                ))
+            parsed = rate_date if isinstance(rate_date, _date) else _date.fromisoformat(rate_date)
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=parsed,
+                value=str(rate_value), source="user:test", type="nav",
+            ))
+            book.save()
+
+    def test_cross_currency_fx_gain_on_customer_payment(self, business_book):
+        """When the pay-date rate is higher than the post-date rate, the
+        extra USD received is recognized as FX gain.
+
+        Post Mar 10 at 1.10 (income $4,950). Pay Mar 20 at 1.12
+        ($5,040 received). Gain = $90, booked to
+        Income:Foreign Exchange Gain/Loss with value=0 and
+        quantity=-90 (credit to credit-natural income account).
+        """
+        import piecash
+        gb = GnuCashBook(str(business_book))
+
+        # Two prices: post-date and pay-date rates.
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(invoice_id="000001",
+                             account="Income:Consulting",
+                             description="EUR services",
+                             quantity="1", price="4500.00")
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Assets:Accounts Receivable EUR",
+                        post_date="2026-03-10")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+
+        # Checking credited at pay-date rate
+        assert Decimal(result["payment_account_amount"]) == Decimal("5040.00")
+        # FX realized: gain of $90
+        assert "fx_realized" in result
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("90.00")
+        assert result["fx_realized"]["account"] == "Income:Foreign Exchange Gain/Loss"
+
+        # FX account balance: credit of $90 (income earned)
+        fx_balance = gb.get_balance(account_name="Income:Foreign Exchange Gain/Loss")
+        # Income is credit-natural; credit balance stored as negative.
+        assert fx_balance == Decimal("-90")
+        # Consulting income unchanged at post-date rate
+        consulting = gb.get_balance(account_name="Income:Consulting")
+        assert consulting == Decimal("-4950")
+        # Checking holds full $5,040 + $10,000 opening
+        checking = gb.get_balance(account_name="Assets:Checking")
+        assert checking == Decimal("15040.00")
+        # Net income (Consulting + FX) matches cash received
+        assert -consulting + -fx_balance == checking - Decimal("10000")
+
+    def test_cross_currency_fx_loss_on_customer_payment(self, business_book):
+        """Pay-date rate lower than post-date rate → FX loss.
+
+        Post at 1.12 ($5,040 income). Pay at 1.10 ($4,950 received).
+        Loss = $90, split has positive quantity = +90 (debit to
+        credit-natural income = loss recognized).
+        """
+        gb = GnuCashBook(str(business_book))
+
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.12")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.10")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(invoice_id="000001",
+                             account="Income:Consulting",
+                             description="EUR services",
+                             quantity="1", price="4500.00")
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Assets:Accounts Receivable EUR",
+                        post_date="2026-03-10")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+
+        assert Decimal(result["payment_account_amount"]) == Decimal("4950.00")
+        assert result["fx_realized"]["direction"] == "loss"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("90.00")
+        # FX Gain/Loss has a debit = positive stored value (credit-natural
+        # account with a debit shows as positive).
+        fx_balance = gb.get_balance(account_name="Income:Foreign Exchange Gain/Loss")
+        assert fx_balance == Decimal("90")
+
+    def test_cross_currency_same_rate_no_fx_split(self, business_book):
+        """Post and pay at the identical rate → no FX split, no FX account."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(invoice_id="000001",
+                             account="Income:Consulting",
+                             description="EUR services",
+                             quantity="1", price="4500.00")
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Assets:Accounts Receivable EUR",
+                        post_date="2026-03-10")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-10",
+        )
+
+        assert "fx_realized" not in result
+        # FX account wasn't auto-created since no FX drift.
+        assert gb.get_account(name="Income:Foreign Exchange Gain/Loss") is None
+
     def test_cross_currency_payment_to_matching_currency_account(self, business_book):
         """When the payment account's commodity matches the invoice
         currency, no rate lookup is needed (same-currency payment on a
