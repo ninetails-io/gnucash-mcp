@@ -3618,31 +3618,71 @@ class TestMultiCurrencyBalances:
         # 5000 (opening) + 3000 (salary) - 1100 (transfer) - 200 (groceries)
         assert balance == Decimal("6700")
 
-    def test_balance_sheet_uses_quantity(self, multi_currency_book: Path):
-        """Balance sheet should report account balances in their own commodity."""
+    def test_balance_sheet_values_foreign_currency_at_cost_basis_without_price(
+        self, multi_currency_book: Path
+    ):
+        """Without a EUR/USD price on file, balance_sheet falls back
+        to cost basis (split.value, in transaction currency) for the
+        EUR account. The fixture's FX transfer booked value=1100 USD
+        on the EUR side, so cost basis = $1,100.
+        """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
-
         asset_accounts = {
             a["account"]: Decimal(a["balance"])
             for a in result["assets"]["accounts"]
         }
         assert asset_accounts["Assets:Checking"] == Decimal("6700")
-        # EUR savings should show 1000 (EUR quantity), not 1100 (USD value)
-        assert asset_accounts["Assets:Euro Savings"] == Decimal("1000")
+        # Cost-basis fallback in the default currency
+        assert asset_accounts["Assets:Euro Savings"] == Decimal("1100")
 
-    def test_net_worth_uses_quantity(self, multi_currency_book: Path):
-        """Net worth should use quantity for each account."""
+    def test_balance_sheet_values_foreign_currency_at_market_with_price(
+        self, multi_currency_book: Path
+    ):
+        """With an EUR/USD price on file, balance_sheet values the EUR
+        savings account at shares × rate = 1000 × 1.20 = $1,200.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gc_book = GnuCashBook(str(multi_currency_book))
+        with gc_book.open(readonly=False) as b:
+            usd = b.default_currency
+            eur = next(c for c in b.commodities if c.mnemonic == "EUR")
+            b.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2024, 12, 31),
+                value="1.20", source="user:test", type="nav",
+            ))
+            b.save()
+
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        asset_accounts = {
+            a["account"]: Decimal(a["balance"])
+            for a in result["assets"]["accounts"]
+        }
+        assert asset_accounts["Assets:Euro Savings"] == Decimal("1200")
+
+    def test_net_worth_converts_foreign_currency(
+        self, multi_currency_book: Path
+    ):
+        """Net worth uses market value (or cost-basis fallback) for
+        non-default-currency accounts rather than summing raw
+        quantities as if they were USD.
+        """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.net_worth(end_date=date(2024, 12, 31))
         net = Decimal(result["net_worth"])
-        # Assets: Checking 6700 + Euro Savings 1000 = 7700
-        # (Note: mixing currencies, but that's the current behavior —
-        # the important thing is we use quantity, not value)
-        assert net == Decimal("7700")
+        # Without a price: Checking 6700 + Euro Savings 1100 (cost basis)
+        assert net == Decimal("7800")
 
-    def test_cash_flow_uses_quantity(self, multi_currency_book: Path):
-        """Cash flow should use quantity for account splits."""
+    def test_cash_flow_converts_foreign_currency(
+        self, multi_currency_book: Path
+    ):
+        """Cash flow aggregates USD-equivalent amounts across cash
+        and bank accounts (using cost basis as fallback when no
+        market rate is on file).
+        """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.cash_flow(
             start_date=date(2024, 1, 1),
@@ -3652,8 +3692,8 @@ class TestMultiCurrencyBalances:
         outflows = Decimal(result["outflows"])
         # Checking inflows: 5000 + 3000 = 8000
         # Checking outflows: 1100 + 200 = 1300
-        # EUR Savings inflows: 1000 (quantity, not 1100 value)
-        assert inflows == Decimal("9000")
+        # EUR Savings inflow at cost basis (no price): 1100
+        assert inflows == Decimal("9100")
         assert outflows == Decimal("1300")
 
     def test_spending_by_category_uses_quantity(self, multi_currency_book: Path):
