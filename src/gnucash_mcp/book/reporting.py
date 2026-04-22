@@ -63,6 +63,83 @@ class ReportingMixin:
             return account
         return path[target_depth]
 
+    # ── Cross-commodity conversion helpers ────────────────────────────
+    #
+    # For reports that aggregate asset balances across accounts with
+    # different commodities (e.g. USD Checking + VTSAX shares + EUR
+    # Savings), split.quantity lives in each account's own commodity
+    # and can't be summed directly. Convert each account's quantity
+    # to the book's default currency at the latest user-supplied
+    # market price before aggregating. Fallback: split.value (which
+    # is in the transaction currency, generally the book default for
+    # USD-denominated investment buys) is used when no price is on
+    # file — that yields cost basis, which is a reasonable default
+    # when no market price has been loaded.
+
+    def _latest_market_rates(
+        self, book: piecash.Book
+    ) -> dict[str, Decimal]:
+        """Return {commodity_guid: Decimal} — latest user-supplied
+        price for each non-default-currency commodity in the book
+        currency. Skips piecash's auto-created ``type='transaction'``
+        prices (they capture the effective rate of a cross-currency
+        txn; we want explicit market prices).
+        """
+        default_currency = self._require_default_currency(book)
+        latest: dict[str, tuple] = {}  # guid → (date, Decimal rate)
+        for p in book.prices:
+            if p.currency != default_currency:
+                continue
+            if p.type == "transaction":
+                continue
+            p_date = p.date
+            if hasattr(p_date, "date") and callable(p_date.date):
+                p_date = p_date.date()
+            key = p.commodity.guid
+            existing = latest.get(key)
+            if existing is None or p_date > existing[0]:
+                latest[key] = (p_date, Decimal(str(p.value)))
+        return {guid: rate for guid, (_date, rate) in latest.items()}
+
+    def _account_conversion_factors(
+        self, book: piecash.Book
+    ) -> dict[str, Decimal | None]:
+        """Return {account_guid: Decimal factor or None}.
+
+        ``factor * split.quantity = amount in default currency``.
+        A factor of 1 means the account is already in the default
+        currency. ``None`` means no rate is available — callers
+        should fall back to ``split.value`` (transaction-currency
+        amount), which correctly reflects cost basis for USD-
+        denominated investment buys.
+        """
+        default_currency = self._require_default_currency(book)
+        rates = self._latest_market_rates(book)
+        factors: dict[str, Decimal | None] = {}
+        for acct in book.accounts:
+            if acct.commodity == default_currency:
+                factors[acct.guid] = Decimal("1")
+            else:
+                factors[acct.guid] = rates.get(acct.commodity.guid)
+        return factors
+
+    @staticmethod
+    def _split_in_default_currency(
+        split,
+        account,
+        factor: Decimal | None,
+    ) -> Decimal:
+        """Value a single split in the book's default currency.
+
+        Uses ``factor * quantity`` when a factor is available. Falls
+        back to ``split.value`` otherwise — correct for STOCK/MUTUAL
+        splits whose transaction currency is the book default, and a
+        reasonable cost-basis approximation for other cases.
+        """
+        if factor is not None:
+            return Decimal(str(split.quantity)) * factor
+        return Decimal(str(split.value))
+
     # ── SQL-filtered split iterator ───────────────────────────────────
 
     def _query_filtered_splits(
@@ -275,6 +352,7 @@ class ReportingMixin:
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
         )
         with self.open(readonly=True) as book:
+            factors = self._account_conversion_factors(book)
             rows = self._query_filtered_splits(
                 book,
                 end_date=as_of_date,
@@ -284,16 +362,23 @@ class ReportingMixin:
             balances: dict[str, tuple[str, Decimal]] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
+                # Value the split in the book's default currency so
+                # investment shares (VTSAX @ $128, etc.) and foreign-
+                # currency holdings contribute their market/USD value
+                # to balance-sheet totals rather than raw share counts.
+                amt = self._split_in_default_currency(
+                    split, account, factors.get(account.guid)
+                )
                 if account.type in _NET_INCOME_TYPES:
                     # Income is stored negative, expenses positive; net
                     # income = revenues - expenses = -(sum of both).
-                    net_income -= split.quantity
+                    net_income -= amt
                     continue
                 key = account.fullname
                 current_type, current_bal = balances.get(
                     key, (account.type, Decimal("0"))
                 )
-                balances[key] = (current_type, current_bal + split.quantity)
+                balances[key] = (current_type, current_bal + amt)
 
             assets: dict[str, Decimal] = {}
             liabilities: dict[str, Decimal] = {}
@@ -367,6 +452,8 @@ class ReportingMixin:
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
+            factors = self._account_conversion_factors(book)
+
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
                 rows = self._query_filtered_splits(
@@ -375,10 +462,15 @@ class ReportingMixin:
                     account_types=nw_types,
                 )
                 total = Decimal("0")
-                for split, _txn, _account in rows:
-                    # Liabilities are stored negative, so adding
-                    # quantity directly gives assets - liabilities.
-                    total += split.quantity
+                for split, _txn, account in rows:
+                    # Liabilities are stored negative, so adding the
+                    # converted amount directly gives assets minus
+                    # liabilities. Investments and foreign-currency
+                    # holdings are valued in the book's default
+                    # currency via their latest market price.
+                    total += self._split_in_default_currency(
+                        split, account, factors.get(account.guid)
+                    )
                 return {
                     "as_of_date": end_date.isoformat(),
                     "net_worth": str(total),
@@ -424,7 +516,7 @@ class ReportingMixin:
             running = Decimal("0")
             b_idx = 0
 
-            for split, txn, _account in rows:
+            for split, txn, account in rows:
                 # For each boundary that sits before this split's
                 # post_date, the running total is already correct —
                 # snapshot it and advance.
@@ -437,7 +529,9 @@ class ReportingMixin:
                         "net_worth": str(running),
                     })
                     b_idx += 1
-                running += split.quantity
+                running += self._split_in_default_currency(
+                    split, account, factors.get(account.guid)
+                )
 
             # Drain any boundaries past the last split — they all see
             # the final running total.
@@ -493,13 +587,17 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
+            factors = self._account_conversion_factors(book)
             inflows = Decimal("0")
             outflows = Decimal("0")
-            for split, _txn, _account in rows:
-                if split.quantity > 0:
-                    inflows += split.quantity
-                else:
-                    outflows += -split.quantity
+            for split, _txn, acct in rows:
+                amt = self._split_in_default_currency(
+                    split, acct, factors.get(acct.guid)
+                )
+                if amt > 0:
+                    inflows += amt
+                elif amt < 0:
+                    outflows += -amt
 
             # period is input echo (LLM supplied dates), net is derivable
             # (inflows - outflows). Both dropped.
