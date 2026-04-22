@@ -494,6 +494,8 @@ class BudgetsMixin:
 
             # Gather budgeted amounts
             budgeted: dict[str, Decimal] = {}
+            # Keep a handle to each budgeted account for descendant walking.
+            budgeted_accounts: dict[str, object] = {}
             for ba in budget.amounts:
                 if ba.period_num not in report_periods:
                     continue
@@ -503,6 +505,29 @@ class BudgetsMixin:
                 budgeted[acct_name] = budgeted.get(
                     acct_name, Decimal("0")
                 ) + ba.amount
+                budgeted_accounts[acct_name] = ba.account
+
+            # Roll-up map: descendant-account-fullname → nearest-ancestor-
+            # fullname that is itself budgeted. Lets budgets set on a
+            # placeholder parent (e.g. Expenses:Utilities) sum the actuals
+            # from all its non-budgeted children (Electric, Gas, Water...).
+            # A child that is itself separately budgeted is NOT rolled up —
+            # its actuals stay on its own line to avoid double-counting.
+            rollup_map: dict[str, str] = {}
+            for acct_name, budgeted_acct in budgeted_accounts.items():
+                rollup_map.setdefault(acct_name, acct_name)
+                descendants: set = set()
+                self._collect_descendants(budgeted_acct, descendants)
+                for desc in descendants:
+                    if desc.fullname in budgeted:
+                        continue  # separately budgeted — don't roll up
+                    # If multiple budgeted ancestors cover this descendant
+                    # (nested parents), keep the nearest one (the deepest
+                    # budgeted ancestor). A simple proxy: prefer the longer
+                    # ancestor path.
+                    existing = rollup_map.get(desc.fullname)
+                    if existing is None or len(acct_name) > len(existing):
+                        rollup_map[desc.fullname] = acct_name
 
             # Calculate actuals from transactions
             actuals: dict[str, Decimal] = {}
@@ -511,16 +536,17 @@ class BudgetsMixin:
                     continue
                 for split in transaction.splits:
                     acct_name = split.account.fullname
-                    if acct_name not in budgeted:
+                    rollup_target = rollup_map.get(acct_name)
+                    if rollup_target is None:
                         continue
                     amount = split.quantity
                     if split.account.type == "EXPENSE" and amount > 0:
-                        actuals[acct_name] = actuals.get(
-                            acct_name, Decimal("0")
+                        actuals[rollup_target] = actuals.get(
+                            rollup_target, Decimal("0")
                         ) + amount
                     elif split.account.type == "INCOME" and amount < 0:
-                        actuals[acct_name] = actuals.get(
-                            acct_name, Decimal("0")
+                        actuals[rollup_target] = actuals.get(
+                            rollup_target, Decimal("0")
                         ) + (-amount)
 
             accounts_result = []

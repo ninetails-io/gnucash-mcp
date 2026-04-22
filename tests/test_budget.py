@@ -418,6 +418,138 @@ class TestGetBudgetReport:
         assert Decimal(report["totals"]["actual"]) == Decimal("650")
         assert Decimal(report["totals"]["remaining"]) == Decimal("150")
 
+    def test_parent_placeholder_rolls_up_children_actuals(
+        self, budget_book: Path
+    ):
+        """Budget set on a parent placeholder sums children's actuals.
+
+        Adds `Expenses:Utilities` (placeholder) with children
+        `Electric` + `Gas`. Budget $450 on the parent only. Post a
+        $95 charge to Electric and $65 to Gas. Report should show
+        `Expenses:Utilities` actual = $160 — not $0.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            expenses = next(a for a in b.accounts if a.fullname == "Expenses")
+            checking = next(a for a in b.accounts if a.fullname == "Assets:Checking")
+            utilities = piecash.Account(
+                name="Utilities", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            electric = piecash.Account(
+                name="Electric", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            gas = piecash.Account(
+                name="Gas", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            piecash.Transaction(
+                currency=usd, description="Electric bill",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-95")),
+                    piecash.Split(account=electric, value=Decimal("95")),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Gas bill",
+                post_date=_date(2026, 1, 20),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-65")),
+                    piecash.Split(account=gas, value=Decimal("65")),
+                ],
+            )
+            b.save()
+
+        gc.create_budget(name="Util Budget", year=2026, num_periods=12)
+        gc.set_budget_amount(
+            budget_name="Util Budget",
+            account="Expenses:Utilities",
+            amount="450.00",
+            period=0,
+        )
+
+        report = gc.get_budget_report(
+            budget_name="Util Budget",
+            period=0,
+        )
+        util_line = next(
+            a for a in report["accounts"]
+            if a["account"] == "Expenses:Utilities"
+        )
+        assert Decimal(util_line["budgeted"]) == Decimal("450")
+        assert Decimal(util_line["actual"]) == Decimal("160")
+        assert Decimal(util_line["remaining"]) == Decimal("290")
+
+    def test_separately_budgeted_child_does_not_double_count(
+        self, budget_book: Path
+    ):
+        """When both a parent and a child are budgeted, the child's
+        actuals stay on its own line — the parent only collects
+        actuals from its *non-budgeted* descendants.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            expenses = next(a for a in b.accounts if a.fullname == "Expenses")
+            checking = next(a for a in b.accounts if a.fullname == "Assets:Checking")
+            utilities = piecash.Account(
+                name="Utilities", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            electric = piecash.Account(
+                name="Electric", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            gas = piecash.Account(
+                name="Gas", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            piecash.Transaction(
+                currency=usd, description="Electric",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-95")),
+                    piecash.Split(account=electric, value=Decimal("95")),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Gas",
+                post_date=_date(2026, 1, 20),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-65")),
+                    piecash.Split(account=gas, value=Decimal("65")),
+                ],
+            )
+            b.save()
+
+        gc.create_budget(name="Mixed Budget", year=2026, num_periods=12)
+        # Parent budget of $450 + child Electric explicitly budgeted $100.
+        # Electric's $95 actual should stay on Electric, not roll up.
+        # Only Gas's $65 should roll up to the parent.
+        gc.set_budget_amount(
+            budget_name="Mixed Budget",
+            account="Expenses:Utilities", amount="450", period=0,
+        )
+        gc.set_budget_amount(
+            budget_name="Mixed Budget",
+            account="Expenses:Utilities:Electric", amount="100", period=0,
+        )
+        report = gc.get_budget_report(
+            budget_name="Mixed Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        assert Decimal(by_acct["Expenses:Utilities"]["actual"]) == Decimal("65")
+        assert Decimal(by_acct["Expenses:Utilities:Electric"]["actual"]) == Decimal("95")
+
     def test_report_nonexistent_budget_raises(self, budget_book: Path):
         """Reporting on nonexistent budget raises ValueError."""
         book = GnuCashBook(str(budget_book))
