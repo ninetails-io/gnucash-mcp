@@ -1112,6 +1112,124 @@ class TestDuplicateDetection:
         assert "duplicates" not in result
 
 
+class TestDuplicateAmountPrimaryOnly:
+    """The amount signal compares the proposed transaction's primary
+    amount (max absolute split value) to each candidate's primary
+    amount — not any-to-any across every split pair.
+
+    Earlier iterations compared all proposed splits against all
+    candidate splits, which produced false-positive MEDIUM matches
+    on multi-split transactions whenever a tiny deduction happened
+    to land within ±$1 of some unrelated single-split transaction's
+    total. The bookkeeper's 2026-01-09 paycheck fired MEDIUM-AD
+    matches against two same-day coffee purchases ($5.67 Analog,
+    $5.29 Slate) because one of the paycheck's deduction lines was
+    in that ~$5 range — completely unrelated transactions,
+    meaninglessly flagged.
+
+    These tests pin the new behavior: multi-split transactions only
+    amount-match when their HEADLINE number (what a human reading
+    the register would call "the amount") lines up.
+    """
+
+    def test_paycheck_does_not_false_match_coffee(self, test_book: Path):
+        """Regression for the bookkeeper's -AD paycheck/coffee false
+        positive. A paycheck with a ~$5 deduction line and a
+        same-day coffee purchase near $5 must not surface as
+        duplicates of each other."""
+        gc = GnuCashBook(str(test_book))
+        # Seed Analog Coffee $5.67 on 2026-01-09.
+        gc.create_transaction(
+            description="Analog Coffee",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "5.67"},
+                {"account": "Assets:Checking", "amount": "-5.67"},
+            ],
+            trans_date=date(2026, 1, 9),
+            check_duplicates=False,
+        )
+        # Paycheck on the same day. Gross 3269.23, net 2141.84,
+        # deductions including a $5.65 line that's within $1 of the
+        # coffee's $5.67 total. The old any-to-any predicate would
+        # fire MEDIUM-AD; primary-max ignores deduction-tail
+        # coincidences.
+        result = gc.create_transaction(
+            description="Robin's Paycheck (UW Medical)",
+            splits=[
+                {"account": "Income:Salary", "amount": "-3269.23"},
+                {"account": "Assets:Checking", "amount": "2141.84"},
+                {"account": "Expenses:Groceries", "amount": "980.00"},
+                {"account": "Expenses:Groceries", "amount": "141.74"},
+                {"account": "Expenses:Groceries", "amount": "5.65"},
+            ],
+            trans_date=date(2026, 1, 9),
+            check_duplicates=True,
+        )
+        assert result["status"] == "created"
+        dups = _parse_duplicates(result.get("duplicates", ""))
+        # No coffee in the duplicate list — it would have shown up
+        # with signals "-AD" under the old predicate.
+        descriptions = [d["description"] for d in dups]
+        assert "Analog Coffee" not in descriptions
+
+    def test_paycheck_matches_paycheck(self, test_book: Path):
+        """The positive case: two paychecks with matching gross (the
+        primary amount on each side) still surface as duplicates.
+        Verifies primary-max didn't over-prune."""
+        gc = GnuCashBook(str(test_book))
+        # Seed an earlier paycheck with the same gross.
+        gc.create_transaction(
+            description="Robin's Paycheck (UW Medical)",
+            splits=[
+                {"account": "Income:Salary", "amount": "-3269.23"},
+                {"account": "Assets:Checking", "amount": "2141.84"},
+                {"account": "Expenses:Groceries", "amount": "1127.39"},
+            ],
+            trans_date=date(2025, 12, 26),
+            check_duplicates=False,
+        )
+        # Now create a same-gross paycheck two weeks later (same
+        # ±30d window, different date → D, A, not D → MEDIUM-DA-).
+        result = gc.create_transaction(
+            description="Robin's Paycheck (UW Medical)",
+            splits=[
+                {"account": "Income:Salary", "amount": "-3269.23"},
+                {"account": "Assets:Checking", "amount": "2141.84"},
+                {"account": "Expenses:Groceries", "amount": "1127.39"},
+            ],
+            trans_date=date(2026, 1, 9),
+            check_duplicates=True,
+        )
+        dups = _parse_duplicates(result.get("duplicates", ""))
+        assert any(
+            d["description"] == "Robin's Paycheck (UW Medical)"
+            and d["signals"] == "DA-"
+            for d in dups
+        )
+
+    def test_two_split_transactions_still_amount_match(
+        self, test_book: Path,
+    ):
+        """Two-split transactions (the common case) weren't touched by
+        this change — their primary amount IS their headline amount,
+        so near-match detection keeps working."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.99"},
+                {"account": "Assets:Checking", "amount": "-150.99"},
+            ],
+            # Existing fixture transaction is same-desc $150 on
+            # 2024-01-20; within ±$1 and ±2 days → HIGH.
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        dups = _parse_duplicates(result["duplicates"])
+        assert dups[0]["confidence"] == "HIGH"
+        assert dups[0]["signals"] == "DAD"
+
+
 class TestDuplicatesTsvShape:
     """The ``duplicates`` response field is a newline-separated TSV
     string, not a list of dicts. Abe's bookkeeper thread parses it

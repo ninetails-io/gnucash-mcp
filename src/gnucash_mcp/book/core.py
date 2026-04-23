@@ -745,6 +745,13 @@ class CoreMixin:
             else {}
         )
 
+        # Proposed primary — the headline amount (max abs split value)
+        # used by the duplicate amount-signal. Computed once; when
+        # ``want_duplicates`` is False the caller passed ``[]`` and
+        # this stays zero (harmless — the amount-signal branch never
+        # runs on that code path).
+        proposed_primary = max(proposed_amounts) if proposed_amounts else Decimal("0")
+
         # Local accumulators — each bucket is independent. We finalize
         # them into the returned _CreateSignals after the loop.
         auto_fill_source = None  # piecash.Transaction
@@ -793,17 +800,25 @@ class CoreMixin:
                 want_duplicates
                 and dup_start <= txn.post_date <= dup_end
             ):
-                # Signal 2: any proposed amount within ±$1.00 of any
-                # split's absolute value.
-                amount_match = False
-                txn_amounts = [abs(s.value) for s in txn.splits]
-                for proposed_amt in proposed_amounts:
-                    for txn_amt in txn_amounts:
-                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
-                            amount_match = True
-                            break
-                    if amount_match:
-                        break
+                # Signal 2: proposed PRIMARY amount (max abs split
+                # value) within ±$1.00 of candidate's primary amount.
+                #
+                # Earlier iterations compared any-to-any across every
+                # split pair. On multi-split transactions (paychecks
+                # with 10+ deduction splits) that produced
+                # false-positive MEDIUM matches whenever a tiny
+                # deduction happened to land within ±$1 of a
+                # candidate's amount — e.g. a paycheck-vs-coffee-shop
+                # match because some $5-ish union/medicare deduction
+                # sat near the coffee's $5.67 total. "Primary" means
+                # the headline number a human reading the register
+                # uses to recognize a transaction; matching on that
+                # kills the noise without losing real duplicates
+                # (paycheck-vs-paycheck still matches on gross).
+                primary_amount = max(abs(s.value) for s in txn.splits)
+                amount_match = (
+                    abs(proposed_primary - primary_amount) <= Decimal("1.00")
+                )
 
                 # Signal 3: date within ±2 days of trans_date (tighter
                 # than the window filter — window is for "worth
@@ -818,9 +833,6 @@ class CoreMixin:
                         + ("A" if amount_match else "-")
                         + ("D" if date_match else "-")
                     )
-                    # Primary amount: max absolute split value — enough
-                    # context for the LLM to recognize the duplicate.
-                    primary_amount = max(abs(s.value) for s in txn.splits)
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
