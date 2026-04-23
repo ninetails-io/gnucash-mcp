@@ -10,7 +10,7 @@ import traceback
 from functools import wraps
 from typing import Annotated, Callable
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError
 
@@ -38,6 +38,97 @@ ScheduledTransactionGuid = Annotated[
     str,
     Field(description="Scheduled transaction GUID (32-char hex or 8+ char prefix)"),
 ]
+
+
+# ── Split payload schema ──────────────────────────────────────────
+#
+# Transaction-creating tools (create_transaction, update_transaction,
+# replace_splits, create_scheduled_transaction) all take a list of
+# split dicts. Before this model existed, the tool signature was
+# ``splits: list[dict]`` — pydantic doesn't descend into bare ``dict``,
+# so the inner ``amount`` / ``quantity`` values round-tripped through
+# whatever type the JSON parser produced. When a client sent a bare
+# JSON number (``"amount": 94.87``), the parser emitted a float, and
+# ``Decimal(split["amount"])`` inside the book method inherited the
+# IEEE-754 epsilon ( ``0.8699999999999999955591...`` ) — causing
+# spurious "splits do not balance" errors on non-dyadic decimals.
+#
+# ``SplitInput`` enforces ``amount`` / ``quantity`` as strings at the
+# MCP boundary. With ``coerce_numbers_to_str=True`` pydantic routes a
+# stray JSON number through Python's ``str()`` (shortest-repr) before
+# we ever construct a Decimal — so ``94.87`` becomes ``"94.87"``, not
+# a noisy float. Internal book methods also wrap every
+# user-derived ``Decimal(...)`` call with ``_to_decimal(...)`` as
+# belt-and-suspenders for direct callers (tests, scripts) that
+# bypass this layer.
+
+
+class SplitInput(BaseModel):
+    """One split in a transaction-creating tool call.
+
+    Fields mirror the dict shape the book methods already consume:
+    ``account`` (required), ``amount`` (required, string, in
+    transaction currency), ``quantity`` (optional, string, required
+    only when the account commodity differs from the transaction
+    currency), and ``memo`` (optional).
+    """
+
+    model_config = ConfigDict(
+        coerce_numbers_to_str=True,
+        extra="ignore",
+    )
+
+    account: Annotated[str, Field(description="Full account path (e.g. 'Expenses:Rent')")]
+    amount: Annotated[
+        str,
+        Field(description="Value in transaction currency, as a decimal string (e.g. '94.87')"),
+    ]
+    quantity: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Amount in the account's commodity, as a decimal string. Required "
+                "when the account's commodity differs from the transaction currency."
+            ),
+        ),
+    ] = None
+    memo: Annotated[
+        str | None,
+        Field(default=None, description="Optional split memo."),
+    ] = None
+
+
+def _splits_to_dicts(
+    splits: list | None,
+) -> list[dict] | None:
+    """Normalize a splits list to plain dicts the book methods expect.
+
+    In production the MCP layer decodes each entry through
+    ``SplitInput`` (pydantic) and we receive a list of models. Tests
+    call the tool callable directly with raw dicts and never hit
+    pydantic. Accept both: models go through ``model_dump``, dicts
+    are coerced through ``SplitInput`` so the test path gets the same
+    ``amount`` / ``quantity`` stringification the production path
+    does.
+
+    ``exclude_none=True`` preserves the "key present iff value set"
+    contract — so ``"quantity" in split`` and ``split.get("memo", "")``
+    keep behaving the way they did when splits arrived as loose dicts.
+
+    ``None`` passes through unchanged (auto-fill path in
+    ``create_transaction``).
+    """
+    if splits is None:
+        return None
+    result: list[dict] = []
+    for s in splits:
+        if isinstance(s, SplitInput):
+            model = s
+        else:
+            model = SplitInput.model_validate(s)
+        result.append(model.model_dump(exclude_none=True))
+    return result
 
 
 def _strip_noise(obj):

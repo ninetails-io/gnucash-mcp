@@ -3,7 +3,9 @@
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     ScheduledTransactionGuid,
+    SplitInput,
     _json,
+    _splits_to_dicts,
     safe_tool,
 )
 
@@ -17,7 +19,7 @@ def register(mcp, get_book) -> None:
     def create_scheduled_transaction(
         name: str,
         description: str,
-        splits: list[dict],
+        splits: list[SplitInput],
         start_date: str,
         frequency: str,
         end_date: str | None = None,
@@ -30,6 +32,7 @@ def register(mcp, get_book) -> None:
             description: Transaction description at instantiation.
             splits: Same format as create_transaction, e.g.
                 ``[{"account": "Expenses:Rent", "amount": "1850.00"}, ...]``.
+                ``amount`` / ``quantity`` must be decimal strings.
             start_date: First occurrence (YYYY-MM-DD).
             frequency: "weekly", "biweekly" (2w), "monthly",
                 "bimonthly" (2mo), "quarterly" (3mo), or "yearly".
@@ -40,7 +43,7 @@ def register(mcp, get_book) -> None:
         result = book.create_scheduled_transaction(
             name=name,
             description=description,
-            splits=splits,
+            splits=_splits_to_dicts(splits),
             start_date=start_date,
             frequency=frequency,
             end_date=end_date,

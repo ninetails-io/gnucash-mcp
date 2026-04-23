@@ -36,6 +36,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _split_to_compact_dict,
     _split_to_dict,
+    _to_decimal,
     _transaction_to_compact_line,
     _transaction_to_dict,
     _unique_prefix,
@@ -920,7 +921,7 @@ class CoreMixin:
             })
 
         for split_data, account in zip(splits, accounts):
-            amount = Decimal(split_data["amount"])
+            amount = _to_decimal(split_data["amount"])
             if account.type == "EXPENSE" and amount < 0:
                 warnings.append({
                     "type": "negative_expense",
@@ -1026,13 +1027,16 @@ class CoreMixin:
                 raise ValueError("Transaction must have at least 2 splits")
 
             # Validate balance (using "amount" as transaction-currency value).
+            # _to_decimal routes through str() so a float that slipped past
+            # the pydantic boundary decimalizes via shortest-repr instead of
+            # embedding IEEE-754 epsilon in the sum.
             total = Decimal("0")
             for split in splits:
-                total += Decimal(split["amount"])
+                total += _to_decimal(split["amount"])
             if total != Decimal("0"):
                 raise ValueError(f"Splits do not balance: total is {total}")
 
-            proposed_amounts = [abs(Decimal(s["amount"])) for s in splits]
+            proposed_amounts = [abs(_to_decimal(s["amount"])) for s in splits]
 
             # --- Preflight pass 2: duplicates + recent matches ---
             signals = self._collect_create_signals(
@@ -1093,14 +1097,14 @@ class CoreMixin:
                     )
 
                 resolved_accounts.append(account)
-                value = Decimal(split["amount"])
+                value = _to_decimal(split["amount"])
 
                 # Determine quantity (same-currency: equals value;
                 # cross-currency: caller must provide and sign-match).
                 if account.commodity == trans_currency:
                     quantity = value
                 elif "quantity" in split:
-                    quantity = Decimal(split["quantity"])
+                    quantity = _to_decimal(split["quantity"])
                     if quantity * value < 0:
                         raise ValueError(
                             f"Split for '{split['account']}': quantity and value "
@@ -1770,7 +1774,7 @@ class CoreMixin:
                 # Validate splits balance to zero
                 total = Decimal("0")
                 for split in splits:
-                    total += Decimal(split["amount"])
+                    total += _to_decimal(split["amount"])
                 if total != Decimal("0"):
                     raise ValueError(f"Splits do not balance: total is {total}")
 
@@ -1784,14 +1788,14 @@ class CoreMixin:
                     account_name = split.account.fullname
                     if account_name in split_updates:
                         update = split_updates[account_name]
-                        new_value = Decimal(update["amount"])
+                        new_value = _to_decimal(update["amount"])
                         split.value = new_value
 
                         # Determine quantity
                         if split.account.commodity == trans_currency:
                             split.quantity = new_value
                         elif "quantity" in update:
-                            new_quantity = Decimal(update["quantity"])
+                            new_quantity = _to_decimal(update["quantity"])
                             if new_quantity * new_value < 0:
                                 raise ValueError(
                                     f"Split for '{account_name}': quantity and value "
@@ -1873,8 +1877,9 @@ class CoreMixin:
         if len(splits) < 2:
             raise ValueError("At least 2 splits required")
 
-        # Validate balance upfront
-        total = sum(Decimal(s["amount"]) for s in splits)
+        # Validate balance upfront. _to_decimal guards against float input
+        # slipping past the pydantic boundary (see tools/_helpers.SplitInput).
+        total = sum((_to_decimal(s["amount"]) for s in splits), Decimal("0"))
         if total != Decimal("0"):
             raise ValueError(f"Splits do not balance: total is {total}")
 
@@ -1949,13 +1954,13 @@ class CoreMixin:
             # 7. Create new splits
             trans_currency = transaction.currency
             for account, split_data in resolved_accounts:
-                amount = Decimal(split_data["amount"])
+                amount = _to_decimal(split_data["amount"])
 
                 # Determine quantity
                 if account.commodity == trans_currency:
                     quantity = amount
                 elif "quantity" in split_data:
-                    quantity = Decimal(split_data["quantity"])
+                    quantity = _to_decimal(split_data["quantity"])
                     if quantity * amount < 0:
                         raise ValueError(
                             f"Split for '{account.fullname}': quantity and "

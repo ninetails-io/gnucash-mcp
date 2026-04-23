@@ -19,7 +19,12 @@ from decimal import Decimal
 
 import piecash
 
-from gnucash_mcp.book._base import _to_date, _verify_composite_write, _verify_write
+from gnucash_mcp.book._base import (
+    _to_date,
+    _to_decimal,
+    _verify_composite_write,
+    _verify_write,
+)
 
 
 class BusinessMixin:
@@ -868,7 +873,7 @@ class BusinessMixin:
         import uuid
         from piecash.business.invoice import Billterm
 
-        discount = Decimal(discount_percent)
+        discount = _to_decimal(discount_percent)
         disc_str = str(discount)
         if "." in disc_str:
             decimals = len(disc_str.split(".")[1])
@@ -1181,8 +1186,8 @@ class BusinessMixin:
         import uuid
         from piecash.business.invoice import Invoice, Entry
 
-        qty = Decimal(quantity)
-        unit_price = Decimal(price)
+        qty = _to_decimal(quantity)
+        unit_price = _to_decimal(price)
 
         with self.open(readonly=False) as book:
             inv = self._find_invoice(book, invoice_id, owner_type=2)
@@ -1283,8 +1288,8 @@ class BusinessMixin:
         import uuid
         from piecash.business.invoice import Invoice, Entry
 
-        qty = Decimal(quantity)
-        unit_price = Decimal(price)
+        qty = _to_decimal(quantity)
+        unit_price = _to_decimal(price)
 
         with self.open(readonly=False) as book:
             inv = self._find_invoice(book, bill_id, owner_type=4)
@@ -1733,7 +1738,7 @@ class BusinessMixin:
         elif owner_type == "vendor":
             ot = 4
 
-        payment_amount = Decimal(amount)
+        payment_amount = _to_decimal(amount)
         if payment_amount <= 0:
             raise ValueError("Payment amount must be positive")
 

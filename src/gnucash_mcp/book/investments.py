@@ -22,6 +22,7 @@ from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _lot_to_compact_line,
     _to_date,
+    _to_decimal,
     _unique_prefix,
 )
 
@@ -197,7 +198,7 @@ class InvestmentsMixin:
                     break
 
             if existing:
-                existing.value = Decimal(value)
+                existing.value = _to_decimal(value)
                 existing.type = price_type
             else:
                 # piecash expects datetime.date, not datetime.datetime
@@ -205,7 +206,7 @@ class InvestmentsMixin:
                     commodity=comm,
                     currency=curr,
                     date=price_date,
-                    value=Decimal(value),
+                    value=_to_decimal(value),
                     type=price_type,
                     source=source,
                 )
@@ -613,7 +614,7 @@ class InvestmentsMixin:
                 raise ValueError("Lot has no remaining shares")
 
             if shares is not None:
-                shares_to_sell = Decimal(shares)
+                shares_to_sell = _to_decimal(shares)
                 if shares_to_sell > remaining:
                     raise ValueError(
                         f"Cannot sell {shares_to_sell}; lot has {remaining} shares"
@@ -622,7 +623,7 @@ class InvestmentsMixin:
                 shares_to_sell = remaining
 
             if sale_price is not None:
-                price = Decimal(sale_price)
+                price = _to_decimal(sale_price)
             else:
                 # Look up latest price inline (we're inside an open session)
                 commodity = lot.account.commodity

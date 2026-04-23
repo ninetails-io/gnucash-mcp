@@ -15,6 +15,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _to_decimal,
     _unique_prefix,
     _verify_composite_write,
     _verify_write,
@@ -356,7 +357,7 @@ class BudgetsMixin:
         """
         from piecash.budget import BudgetAmount
 
-        amount_decimal = Decimal(amount)
+        amount_decimal = _to_decimal(amount)
 
         with self.open(readonly=False) as book:
             budget = self._find_budget(book, budget_name)
