@@ -64,6 +64,7 @@ class SchedulingMixin:
         frequency: str,
         after: date | None = None,
         end_date: date | None = None,
+        last_occur: date | None = None,
     ) -> date | None:
         """Calculate the next occurrence of a scheduled transaction.
 
@@ -72,6 +73,11 @@ class SchedulingMixin:
             frequency: One of VALID_FREQUENCIES.
             after: Find next occurrence after this date. Defaults to today.
             end_date: If set, return None if next occurrence past this date.
+            last_occur: Last instantiation date. If set and greater than
+                        `after`, the search threshold is raised to
+                        `last_occur` so already-instantiated occurrences
+                        aren't returned (e.g., when GnuCash desktop has
+                        run the schedule ahead).
 
         Returns:
             Next occurrence date, or None if past end_date.
@@ -80,6 +86,9 @@ class SchedulingMixin:
 
         if after is None:
             after = date.today()
+
+        if last_occur is not None and last_occur > after:
+            after = last_occur
 
         delta_map = {
             "weekly": relativedelta(weeks=1),
@@ -126,7 +135,7 @@ class SchedulingMixin:
 
         next_occ = self._next_occurrence(
             start, frequency, after=date.today() - timedelta(days=1),
-            end_date=end,
+            end_date=end, last_occur=last,
         ) if frequency != "unknown" else None
 
         return {
@@ -450,10 +459,14 @@ class SchedulingMixin:
                 if isinstance(end, datetime):
                     end = end.date()
 
+                last = sx.last_occur
+                if isinstance(last, datetime):
+                    last = last.date()
+
                 next_occ = self._next_occurrence(
                     start, frequency,
                     after=today - timedelta(days=1),
-                    end_date=end,
+                    end_date=end, last_occur=last,
                 )
 
                 if next_occ and next_occ <= window_end:
@@ -541,18 +554,34 @@ class SchedulingMixin:
             if isinstance(end, datetime):
                 end = end.date()
 
+            last = sx.last_occur
+            if isinstance(last, datetime):
+                last = last.date()
+
             if transaction_date:
                 txn_date = date.fromisoformat(transaction_date)
             else:
                 txn_date = self._next_occurrence(
                     start, frequency,
                     after=date.today() - timedelta(days=1),
-                    end_date=end,
+                    end_date=end, last_occur=last,
                 )
                 if not txn_date:
                     raise ValueError(
                         "No upcoming occurrence (past end date)"
                     )
+
+            # Preflight: refuse to instantiate an occurrence on or before
+            # last_occur. GnuCash desktop's "Since Last Run" updates
+            # last_occur when it auto-creates transactions; running this
+            # tool with a prior date would silently create a duplicate.
+            if last and txn_date <= last:
+                raise ValueError(
+                    f"Transaction date {txn_date.isoformat()} is not "
+                    f"after last occurrence {last.isoformat()}. The "
+                    f"schedule has already been run through that date "
+                    f"(possibly by GnuCash desktop). Use a later date."
+                )
 
             splits = self._get_sx_splits(book, sx)
             if not splits:
@@ -561,7 +590,9 @@ class SchedulingMixin:
                     "transaction"
                 )
 
-            sx.last_occur = txn_date
+            # Never rewind last_occur. If desktop pre-created ahead and
+            # we're backfilling an earlier gap, keep the later marker.
+            sx.last_occur = max(last, txn_date) if last else txn_date
             sx.instance_count += 1
 
             sx_name = sx.name

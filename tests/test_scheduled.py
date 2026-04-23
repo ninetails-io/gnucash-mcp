@@ -352,6 +352,56 @@ class TestCreateFromScheduled:
                 transaction_date="2026-02-01",
             )
 
+    def test_duplicate_occurrence_rejected(self, scheduled_book):
+        """Cannot instantiate the same date twice.
+
+        Guards against double-billing when the bookkeeper thread and
+        GnuCash desktop both try to run the same occurrence.
+        """
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-02-01",
+        )
+        with pytest.raises(ValueError, match="not after last occurrence"):
+            gb.create_transaction_from_scheduled(
+                guid=sx["guid"], transaction_date="2026-02-01",
+            )
+
+    def test_backfill_before_last_occur_rejected(self, scheduled_book):
+        """Cannot instantiate a date earlier than last_occur.
+
+        Desktop's adv_creation may create occurrences months ahead;
+        backfilling a gap that's already been run would duplicate.
+        """
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-03-01",
+        )
+        with pytest.raises(ValueError, match="not after last occurrence"):
+            gb.create_transaction_from_scheduled(
+                guid=sx["guid"], transaction_date="2026-02-01",
+            )
+
 
 # ── Update ──────────────────────────────────────────────────
 
@@ -494,6 +544,34 @@ class TestNextOccurrence:
             after=date(2026, 6, 1),
         )
         assert result == date(2027, 1, 1)
+
+    def test_last_occur_raises_threshold(self, scheduled_book):
+        """last_occur past `after` pushes the search forward.
+
+        Prevents returning an occurrence that desktop (or a prior run)
+        has already instantiated.
+        """
+        gb = GnuCashBook(str(scheduled_book))
+        # Without last_occur: after=2026-03-15 → next monthly is 2026-04-01.
+        # With last_occur=2026-05-15 (desktop ran ahead): next is 2026-06-01.
+        result = gb._next_occurrence(
+            start_date=date(2026, 1, 1),
+            frequency="monthly",
+            after=date(2026, 3, 15),
+            last_occur=date(2026, 5, 15),
+        )
+        assert result == date(2026, 6, 1)
+
+    def test_last_occur_earlier_than_after_ignored(self, scheduled_book):
+        """last_occur older than `after` doesn't lower the threshold."""
+        gb = GnuCashBook(str(scheduled_book))
+        result = gb._next_occurrence(
+            start_date=date(2026, 1, 1),
+            frequency="monthly",
+            after=date(2026, 3, 15),
+            last_occur=date(2026, 2, 1),
+        )
+        assert result == date(2026, 4, 1)
 
 
 # ── Integration ─────────────────────────────────────────────
