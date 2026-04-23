@@ -9,6 +9,33 @@ import pytest
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
 
 
+def _parse_duplicates(tsv: str) -> list[dict]:
+    """Parse the create_transaction duplicates TSV into a list of dicts.
+
+    ``create_transaction`` emits duplicate candidates as a compact
+    newline-separated TSV (see ``_duplicates_to_tsv``). Tests were
+    written against the old list-of-dicts shape; this helper lets
+    them assert on the structured view without the response
+    actually carrying the overhead.
+
+    Empty / missing string returns ``[]``.
+    """
+    if not tsv:
+        return []
+    rows = []
+    for line in tsv.split("\n"):
+        parts = line.split("\t")
+        rows.append({
+            "confidence": parts[0],
+            "guid": parts[1],
+            "date": parts[2],
+            "amount": parts[3],
+            "description": parts[4],
+            "signals": parts[5],
+        })
+    return rows
+
+
 class TestGnuCashBookInit:
     """Tests for GnuCashBook initialization."""
 
@@ -935,8 +962,9 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "rejected"
         assert result["reason"] == "duplicate_detected"
-        assert len(result["duplicates"]) > 0
-        assert result["duplicates"][0]["confidence"] == "HIGH"
+        dups = _parse_duplicates(result["duplicates"])
+        assert len(dups) > 0
+        assert dups[0]["confidence"] == "HIGH"
 
     def test_high_duplicate_force_create(self, test_book: Path):
         """Should create when force_create overrides HIGH duplicate."""
@@ -952,7 +980,7 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "created"
         assert "guid" in result
-        assert len(result["duplicates"]) > 0
+        assert len(_parse_duplicates(result["duplicates"])) > 0
 
     def test_medium_duplicate_allowed(self, test_book: Path):
         """Should allow creation with MEDIUM confidence (2/3 signals)."""
@@ -968,7 +996,8 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "created"
         assert any(
-            d["confidence"] == "MEDIUM" for d in result.get("duplicates", [])
+            d["confidence"] == "MEDIUM"
+            for d in _parse_duplicates(result.get("duplicates", ""))
         )
 
     def test_low_duplicate_included(self, test_book: Path):
@@ -984,10 +1013,14 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 25),
         )
         assert result["status"] == "created"
-        # Should have LOW confidence match (amount only)
+        # Should have LOW confidence match (amount only). Note: LOW is
+        # currently suppressed by _collect_create_signals (only HIGH/
+        # MEDIUM emit), so this assertion no-ops when duplicates is
+        # empty — retained for the day LOW is re-enabled.
         if result.get("duplicates"):
             assert any(
-                d["confidence"] == "LOW" for d in result["duplicates"]
+                d["confidence"] == "LOW"
+                for d in _parse_duplicates(result["duplicates"])
             )
 
     def test_check_duplicates_false_skips(self, test_book: Path):
@@ -1024,7 +1057,10 @@ class TestDuplicateDetection:
             trans_date=date(2024, 1, 20),
         )
         assert result["status"] == "rejected"
-        high = [d for d in result["duplicates"] if d["confidence"] == "HIGH"]
+        high = [
+            d for d in _parse_duplicates(result["duplicates"])
+            if d["confidence"] == "HIGH"
+        ]
         assert len(high) > 0
         # Position 0 of signals string = description match
         assert high[0]["signals"][0] == "D"
@@ -1043,7 +1079,7 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "rejected"
         # Position 1 of signals string = amount match
-        assert result["duplicates"][0]["signals"][1] == "A"
+        assert _parse_duplicates(result["duplicates"])[0]["signals"][1] == "A"
 
     def test_date_window(self, test_book: Path):
         """Date match should use ±2 day window."""
@@ -1059,7 +1095,7 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "rejected"
         # Position 2 of signals string = date match
-        assert result["duplicates"][0]["signals"][2] == "D"
+        assert _parse_duplicates(result["duplicates"])[0]["signals"][2] == "D"
 
     def test_no_duplicates_distant_date(self, test_book: Path):
         """Should find no duplicates when date is far from existing."""
@@ -1074,6 +1110,134 @@ class TestDuplicateDetection:
         )
         assert result["status"] == "created"
         assert "duplicates" not in result
+
+
+class TestDuplicatesTsvShape:
+    """The ``duplicates`` response field is a newline-separated TSV
+    string, not a list of dicts. Abe's bookkeeper thread parses it
+    column-wise to decide whether to retry with ``force_create=True``
+    or back off — compact shape matters because a rejection often
+    fires mid-conversation and the full JSON form was blowing
+    through the context budget.
+
+    Contract:
+
+        confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+
+    One row per candidate, newline-separated, no header. HIGH before
+    MEDIUM.
+    """
+
+    def test_rejected_duplicates_is_tsv_string(self, test_book: Path):
+        """The rejection path always carries duplicates; response
+        must be a str, not a list."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        assert result["status"] == "rejected"
+        assert isinstance(result["duplicates"], str)
+        # No legacy leak of list-of-dicts.
+        assert not result["duplicates"].startswith("[")
+        assert "{" not in result["duplicates"]
+
+    def test_tsv_columns_and_order(self, test_book: Path):
+        """Each row is six tab-separated columns in the documented
+        order. The first row is the one with the strongest match
+        (HIGH confidence when all three signals hit)."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        first_line = result["duplicates"].split("\n")[0]
+        cols = first_line.split("\t")
+        assert len(cols) == 6
+        confidence, guid, dt, amount, description, signals = cols
+        assert confidence == "HIGH"
+        assert len(guid) >= 8  # short prefix, never a raw 32-char guid
+        assert dt == "2024-01-20"
+        # piecash's GncNumeric strips trailing zeros (150, not 150.00),
+        # so compare numerically rather than asserting exact text.
+        assert Decimal(amount) == Decimal("150")
+        assert description == "Weekly Groceries"
+        assert signals == "DAD"
+
+    def test_tsv_row_count_matches_candidates(self, test_book: Path):
+        """Number of newline-separated rows == number of unique
+        duplicate candidates returned."""
+        gc_book = GnuCashBook(str(test_book))
+        # Seed a second HIGH match to guarantee two rows.
+        gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.50"},
+                {"account": "Assets:Checking", "amount": "-150.50"},
+            ],
+            trans_date=date(2024, 1, 21),
+            force_create=True,
+        )
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        lines = result["duplicates"].split("\n")
+        # Both matches should appear as separate rows.
+        assert len(lines) >= 2
+
+    def test_success_path_drops_empty_duplicates_in_json(
+        self, test_book: Path,
+    ):
+        """When there are no duplicates on a successful create, the
+        field is absent from the response (book method returns dict
+        without the key) rather than carrying an empty string."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Totally New Description For This Book",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "7.42"},
+                {"account": "Assets:Checking", "amount": "-7.42"},
+            ],
+            trans_date=date(2025, 8, 1),
+        )
+        assert result["status"] == "created"
+        assert "duplicates" not in result
+
+    def test_tsv_shape_in_json_response(self, test_book: Path):
+        """Sanity: after ``_json`` serialization the TSV string lands
+        in the response verbatim (modulo JSON string escaping) — no
+        accidental re-listification by the serializer."""
+        import json as _json_lib
+
+        from gnucash_mcp.tools._helpers import _json
+
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "150.00"},
+                {"account": "Assets:Checking", "amount": "-150.00"},
+            ],
+            trans_date=date(2024, 1, 20),
+        )
+        encoded = _json(result)
+        decoded = _json_lib.loads(encoded)
+        assert isinstance(decoded["duplicates"], str)
+        # The TSV tabs survived encoding and round-trip.
+        assert "\t" in decoded["duplicates"]
 
 
 class TestDryRun:
@@ -1146,7 +1310,7 @@ class TestDryRun:
             dry_run=True,
         )
         assert result["dry_run"] is True
-        assert len(result["duplicates"]) > 0
+        assert len(_parse_duplicates(result["duplicates"])) > 0
 
     def test_dry_run_validation_errors_raised(self, test_book: Path):
         """Dry run should still raise validation errors."""

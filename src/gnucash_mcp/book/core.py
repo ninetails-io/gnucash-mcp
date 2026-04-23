@@ -886,6 +886,38 @@ class CoreMixin:
         )
 
     @staticmethod
+    def _duplicates_to_tsv(duplicates: list[dict]) -> str:
+        """Render the duplicate-candidates list as a compact TSV string.
+
+        Each duplicate becomes one tab-separated line in this column
+        order (no header — documented in ``create_transaction``'s
+        docstring so the LLM knows the shape without paying for a
+        header row every call)::
+
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+
+        A list-of-dicts JSON response to the bookkeeper was
+        ~120 chars per candidate; the TSV form is closer to 40. The
+        rejection path emits two or three candidates typically, and
+        the savings compound when the LLM retries a mis-hit.
+
+        Returns ``""`` for empty input. ``_strip_noise`` in the
+        response serializer drops empty-string values, so callers can
+        unconditionally assign ``result["duplicates"] = _duplicates_to_tsv(...)``
+        without worrying about an empty-key leak into the output.
+
+        The internal ``_CreateSignals.duplicates`` list-of-dicts is
+        kept rich so ``has_high_duplicate`` (and any future callers
+        that need to reason about matches) can still read structured
+        fields — only the response boundary renders TSV.
+        """
+        return "\n".join(
+            f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
+            f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            for d in duplicates
+        )
+
+    @staticmethod
     def _generate_warnings(
         trans_date: date,
         splits: list[dict],
@@ -980,6 +1012,15 @@ class CoreMixin:
             instead. In dry_run mode, returns 'dry_run': True with
             proposed transaction.
 
+            The 'duplicates' field, when present, is a newline-separated
+            TSV string (not a list of dicts) with columns::
+
+                confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+
+            Confidence is ``HIGH`` or ``MEDIUM``. Signals is a
+            three-char code (D/A/D for description / amount / date,
+            dash for no match). See ``_duplicates_to_tsv``.
+
         Raises:
             ValueError: If splits don't balance, fewer than 2 splits,
                        accounts don't exist, cross-currency splits
@@ -1051,7 +1092,9 @@ class CoreMixin:
             )
             duplicates = signals.duplicates
 
-            # HIGH-confidence duplicate short-circuits the write.
+            # HIGH-confidence duplicate short-circuits the write. The
+            # rejection always carries at least one candidate, so
+            # rendering TSV directly is safe (no empty-string case).
             if (
                 signals.has_high_duplicate
                 and not force_create
@@ -1060,7 +1103,7 @@ class CoreMixin:
                 return {
                     "status": "rejected",
                     "reason": "duplicate_detected",
-                    "duplicates": duplicates,
+                    "duplicates": self._duplicates_to_tsv(duplicates),
                 }
 
             # --- Validate accounts and build piecash splits ---
@@ -1163,7 +1206,7 @@ class CoreMixin:
                 result: dict = {
                     "dry_run": True,
                     "warnings": warnings,
-                    "duplicates": duplicates,
+                    "duplicates": self._duplicates_to_tsv(duplicates),
                 }
                 if auto_filled_from:
                     result["auto_filled_from"] = auto_filled_from
@@ -1189,7 +1232,7 @@ class CoreMixin:
             if warnings:
                 result["warnings"] = warnings
             if duplicates:
-                result["duplicates"] = duplicates
+                result["duplicates"] = self._duplicates_to_tsv(duplicates)
             if auto_filled_from:
                 result["auto_filled_from"] = auto_filled_from
             return result

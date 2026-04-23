@@ -168,6 +168,18 @@ def register(mcp, get_book) -> None:
         strings (e.g. "94.87") — never raw JSON numbers, which would
         lose precision on non-dyadic decimals.
 
+        When duplicate detection surfaces candidates (either rejecting
+        the write with ``status: "rejected"`` or returning alongside a
+        successful create), ``duplicates`` in the response is a
+        newline-separated TSV string, not a list of dicts. Columns::
+
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+
+        Confidence is ``HIGH`` (all three signals match) or ``MEDIUM``
+        (two of three). Signals is a three-char code: position 0
+        description, position 1 amount (±$1 tolerance), position 2
+        date (±2 days); ``D``/``A``/``D`` for match, ``-`` for miss.
+
         Args:
             description: Transaction description.
             splits: List of split dicts (see above). Omit to auto-fill
