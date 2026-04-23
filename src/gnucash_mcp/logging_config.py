@@ -829,6 +829,33 @@ def _format_audit_entry_text(entry: dict) -> str:
     return "\n".join(lines) if lines else ""
 
 
+def _normalize_for_audit(value):
+    """Recursively convert pydantic models to plain dicts/primitives.
+
+    The audit decorator captures the tool's ``kwargs`` into
+    ``entry["params"]`` and also stringifies them into the debug log
+    via ``json.dumps``. When a tool declares a pydantic model in its
+    signature (e.g. ``splits: list[SplitInput]`` on
+    ``create_transaction``), FastMCP hands us live model instances —
+    not JSON-serializable, and the audit text formatters expect the
+    raw dict shape (``split.get("account")``, etc.).
+
+    This normalizer walks the kwargs once and produces an equivalent
+    value with every pydantic model replaced by ``model_dump
+    (exclude_none=True)``. Plain dicts, lists, and scalars pass
+    through untouched (``exclude_none`` preserves the
+    "key present iff value set" contract the book methods depend
+    on — ``"quantity" in split`` keeps working).
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_normalize_for_audit(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_for_audit(v) for k, v in value.items()}
+    return value
+
+
 def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
     """Extract entity state from tool result JSON.
 
@@ -881,11 +908,17 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
+            # Normalize up front so pydantic models (e.g. list[SplitInput]
+            # from the transaction-creating tools) become plain dicts before
+            # they hit json.dumps in the debug line or the text-audit
+            # formatters that read from entry["params"].
+            normalized_kwargs = _normalize_for_audit(kwargs)
+
             entry = {
                 "timestamp": timestamp,
                 "tool": func.__name__,
                 "classification": classification,
-                "params": kwargs,
+                "params": normalized_kwargs,
             }
 
             if classification == "write":
@@ -893,7 +926,8 @@ def audit_log(
                 entry["entity_type"] = entity_type
 
             debug_logger.debug(
-                f"MCP request: tool={func.__name__} params={json.dumps(kwargs)}"
+                f"MCP request: tool={func.__name__} "
+                f"params={json.dumps(normalized_kwargs)}"
             )
 
             # Before the first write of each process, give the backup

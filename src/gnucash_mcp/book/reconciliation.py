@@ -16,6 +16,7 @@ from decimal import Decimal
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _split_to_compact_dict,
+    _to_decimal,
     _transaction_to_dict,
     _unique_prefix,
     _unreconciled_split_to_compact_line,
@@ -217,7 +218,7 @@ class ReconciliationMixin:
         Raises:
             ValueError: If account not found, split not found, or balance mismatch.
         """
-        expected_balance = Decimal(statement_balance)
+        expected_balance = _to_decimal(statement_balance)
 
         with self.open(readonly=False) as book:
             account = self._find_account(book, account_name)

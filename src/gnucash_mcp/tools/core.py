@@ -10,8 +10,10 @@ from datetime import date
 
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
+    SplitInput,
     TransactionGuid,
     _json,
+    _splits_to_dicts,
     safe_tool,
 )
 
@@ -149,7 +151,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="create", entity_type="transaction")
     def create_transaction(
         description: str,
-        splits: list[dict] | None = None,
+        splits: list[SplitInput] | None = None,
         transaction_date: str | None = None,
         currency: str | None = None,
         notes: str | None = None,
@@ -162,7 +164,9 @@ def register(mcp, get_book) -> None:
         Each split: ``account`` (full path, required), ``amount``
         (required, in transaction currency), ``quantity`` (required
         when account commodity differs from transaction currency),
-        ``memo`` (optional).
+        ``memo`` (optional). ``amount`` and ``quantity`` are decimal
+        strings (e.g. "94.87") — never raw JSON numbers, which would
+        lose precision on non-dyadic decimals.
 
         Args:
             description: Transaction description.
@@ -179,7 +183,7 @@ def register(mcp, get_book) -> None:
         trans_date = date.fromisoformat(transaction_date) if transaction_date else None
         result = book.create_transaction(
             description=description,
-            splits=splits,
+            splits=_splits_to_dicts(splits),
             trans_date=trans_date,
             currency=currency,
             notes=notes,
@@ -347,7 +351,7 @@ def register(mcp, get_book) -> None:
         guid: TransactionGuid,
         description: str | None = None,
         transaction_date: str | None = None,
-        splits: list[dict] | None = None,
+        splits: list[SplitInput] | None = None,
         notes: str | None = None,
         force: bool = False,
     ) -> str:
@@ -360,6 +364,7 @@ def register(mcp, get_book) -> None:
             splits: List of split updates with 'account' and 'amount' (optional).
                     Must match existing splits by account name and balance to zero.
                     For cross-currency splits, include 'quantity' (amount in account's commodity).
+                    ``amount``/``quantity`` are decimal strings (e.g. "94.87").
             notes: New transaction notes (optional). Pass empty string to clear.
             force: Allow modifying transactions with reconciled splits
         """
@@ -369,7 +374,7 @@ def register(mcp, get_book) -> None:
             guid=guid,
             description=description,
             trans_date=trans_date,
-            splits=splits,
+            splits=_splits_to_dicts(splits),
             notes=notes,
             force=force,
         )
@@ -380,7 +385,7 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
     def replace_splits(
         guid: TransactionGuid,
-        splits: list[dict],
+        splits: list[SplitInput],
         force: bool = False,
     ) -> str:
         """Replace all splits in a transaction with a new set.
@@ -393,8 +398,8 @@ def register(mcp, get_book) -> None:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
             splits: Complete new set of splits. Each split needs:
                 - 'account' (required): Full account path
-                - 'amount' (required): Value in transaction currency
-                - 'quantity' (optional): Amount in account's commodity.
+                - 'amount' (required): Value in transaction currency, as a decimal string
+                - 'quantity' (optional): Amount in account's commodity, as a decimal string.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo
             force: Allow replacing reconciled splits or splits in lots
@@ -402,7 +407,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.replace_splits(
             guid=guid,
-            splits=splits,
+            splits=_splits_to_dicts(splits),
             force=force,
         )
         return _json(result)

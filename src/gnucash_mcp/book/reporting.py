@@ -26,6 +26,8 @@ from decimal import Decimal, InvalidOperation
 
 import piecash
 
+from gnucash_mcp.book._base import _to_decimal
+
 # Account-type groups used across the reports. Defined at module level
 # so the SQL IN() clauses share a single canonical definition rather
 # than drifting across methods.
@@ -703,11 +705,15 @@ class ReportingMixin:
             ValueError: If no debt accounts found, budget invalid, or budget
                         less than sum of minimum payments.
         """
-        budget = Decimal(monthly_budget)
+        budget = _to_decimal(monthly_budget)
         if budget <= 0:
             raise ValueError("monthly_budget must be a positive number")
 
-        purchase_amount = Decimal(additional_purchase) if additional_purchase else Decimal("1.00")
+        purchase_amount = (
+            _to_decimal(additional_purchase)
+            if additional_purchase
+            else Decimal("1.00")
+        )
         if purchase_amount <= 0:
             raise ValueError("additional_purchase must be a positive number")
 

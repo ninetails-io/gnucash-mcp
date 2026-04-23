@@ -48,6 +48,32 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+def _to_decimal(value) -> Decimal:
+    """Safe Decimal construction for user-supplied monetary values.
+
+    Routes through ``Decimal(str(value))`` so a ``float`` that slipped
+    past the pydantic boundary (e.g. because the MCP client sent a bare
+    JSON number instead of the advertised string) decimalizes via
+    Python's shortest-repr algorithm — `str(94.87) == "94.87"` —
+    instead of directly via ``Decimal(float)``, which would embed the
+    IEEE-754 epsilon (`0.8699999999999999955591...`) in the result and
+    break the sum-to-zero balance check.
+
+    Exact-decimal inputs (``str``, ``int``, ``Decimal``) round-trip
+    unchanged; only ``float`` is rescued.
+
+    Use everywhere a user-supplied monetary value hits ``Decimal(...)``.
+    This is belt-and-suspenders against the boundary contract: even
+    when the pydantic schema enforces ``str`` at the tool layer,
+    direct callers (tests, scripts) bypass that coercion, and the
+    book methods themselves should never corrupt storage if someone
+    hands them a float.
+    """
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 def _verify_write(session, table, guid: str, label: str) -> None:
     """Verify a raw SQL INSERT persisted by reading back the primary key.
 

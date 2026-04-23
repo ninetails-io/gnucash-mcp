@@ -22,6 +22,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
     _sx_to_compact_line,
+    _to_decimal,
     _unique_prefix,
     _upcoming_to_compact_line,
     _verify_composite_write,
@@ -226,9 +227,12 @@ class SchedulingMixin:
             date.fromisoformat(end_date) if end_date else None
         )
 
+        # _to_decimal routes any stray float (direct caller bypassing the
+        # tool-layer SplitInput model) through Python's shortest-repr so
+        # the balance check doesn't fail on IEEE-754 noise.
         total = Decimal("0")
         for s in splits:
-            total += Decimal(s["amount"])
+            total += _to_decimal(s["amount"])
         if total != 0:
             raise ValueError(
                 f"Splits must balance to zero (total: {total})"
@@ -306,11 +310,16 @@ class SchedulingMixin:
                 f"Recurrence for scheduled transaction '{name}'",
             )
 
-            # Store split templates as JSON in a slot
+            # Store split templates as JSON in a slot. Normalize `amount`
+            # through _to_decimal → str so the persisted JSON is always a
+            # clean decimal string, even if the caller handed us a float.
+            # Otherwise a float would survive json.dumps as a numeric
+            # literal, and every future instantiation would replay the
+            # IEEE-754 epsilon.
             splits_json = json.dumps([
                 {
                     "account": s["account"],
-                    "amount": s["amount"],
+                    "amount": str(_to_decimal(s["amount"])),
                     "memo": s.get("memo", ""),
                 }
                 for s in splits
@@ -450,10 +459,12 @@ class SchedulingMixin:
                 if next_occ and next_occ <= window_end:
                     splits = self._get_sx_splits(book, sx)
 
-                    # Calculate total amount (sum of positive splits)
+                    # Calculate total amount (sum of positive splits).
+                    # _to_decimal is defensive for any legacy slots whose
+                    # pre-fix JSON may still carry a numeric literal.
                     total = Decimal("0")
                     for s in splits:
-                        amt = Decimal(s["amount"])
+                        amt = _to_decimal(s["amount"])
                         if amt > 0:
                             total += amt
 
