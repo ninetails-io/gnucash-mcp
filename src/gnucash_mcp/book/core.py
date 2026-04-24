@@ -751,6 +751,19 @@ class CoreMixin:
             else {}
         )
 
+        # Template-account GUID set — used to skip scheduled-transaction
+        # template transactions. GnuCash persists each SX's split
+        # template as a real Transaction row whose splits post to
+        # accounts under book.root_template. Those are recipes, not
+        # events — a user entering a mortgage payment for the first
+        # time would otherwise always see the Mortgage template as a
+        # "duplicate" candidate via description + date match, even
+        # with a stale template amount that kills the A signal.
+        # Filtering at the iteration boundary blocks leakage into
+        # every bucket the collector fills: auto-fill, stability,
+        # duplicates, and recent-matches.
+        template_guids = self._template_account_guids(book)
+
         # Proposed primary — the headline amount (max abs split value)
         # used by the duplicate amount-signal. Computed once; when
         # ``want_duplicates`` is False the caller passed ``[]`` and
@@ -773,6 +786,17 @@ class CoreMixin:
         )
 
         for txn in sorted_txns:
+            # Skip scheduled-transaction template rows — their splits
+            # post to Template Accounts, they have no bearing on the
+            # user's chart, and they'd otherwise fire D-D matches on
+            # every near-cadence description (mortgage, HOA, auto
+            # loans, etc.), training the user to ignore the
+            # duplicate warning.
+            if template_guids and any(
+                s.account.guid in template_guids for s in txn.splits
+            ):
+                continue
+
             txn_desc_lower = txn.description.lower()
             desc_match = (
                 desc_lower in txn_desc_lower

@@ -4,9 +4,58 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import piecash
 import pytest
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
+
+
+def _seed_template_transaction(
+    gc: GnuCashBook,
+    description: str,
+    amount: str,
+    trans_date: date,
+) -> str:
+    """Seed a GnuCash-style scheduled-transaction TEMPLATE as a real
+    Transaction whose splits post to accounts under root_template.
+
+    GnuCash persists each scheduled-transaction's split recipe as a
+    Transaction row whose splits reference accounts rooted at
+    ``book.root_template``. Our MCP creates schedules via a
+    ``splits-json`` Slot instead (see ``create_scheduled_transaction``)
+    so the MCP never produces these rows directly — but books
+    touched by the GnuCash desktop UI are full of them, and the
+    bookkeeper hit exactly that on Alex's mortgage backfill. Tests
+    fabricate one via piecash directly to exercise the filter.
+
+    Returns the transaction's GUID so tests can assert it never
+    resurfaces in user-facing output.
+    """
+    with gc.open(readonly=False) as book:
+        template_acct = piecash.Account(
+            name=f"{description} Template",
+            type="BANK",
+            parent=book.root_template,
+            commodity=book.default_currency,
+        )
+        book.session.add(template_acct)
+        book.flush()
+        txn = piecash.Transaction(
+            currency=book.default_currency,
+            description=description,
+            post_date=trans_date,
+            splits=[
+                piecash.Split(
+                    account=template_acct, value=Decimal(amount),
+                ),
+                piecash.Split(
+                    account=template_acct, value=-Decimal(amount),
+                ),
+            ],
+        )
+        book.session.add(txn)
+        book.save()
+        return txn.guid
 
 
 def _parse_duplicates(tsv: str) -> list[dict]:
@@ -1332,6 +1381,140 @@ class TestDuplicateAmountPrimaryOnly:
         dups = _parse_duplicates(result["duplicates"])
         assert dups[0]["confidence"] == "HIGH"
         assert dups[0]["signals"] == "DAD"
+
+
+class TestTemplateTransactionsExcluded:
+    """Scheduled-transaction template rows are recipes, not events.
+    GnuCash desktop persists each SX's splits as a real Transaction
+    whose splits post to accounts under ``root_template``. The
+    duplicate-detection scan must filter those out — otherwise a
+    user entering a mortgage payment for the first time would always
+    see the mortgage template as a "duplicate" candidate (D-D
+    typically, since template amounts drift from reality but
+    descriptions and cadence match), training them to ignore the
+    duplicate warning.
+
+    Regression for Abe's 2026-04-23 filing, which surfaced $2,485
+    mortgage-template MEDIUM matches against $2,850 real-world
+    payments on Alex's book.
+    """
+
+    def test_template_transaction_never_surfaces_as_duplicate(
+        self, test_book: Path,
+    ):
+        """The exact bookkeeper scenario: a template transaction for
+        'Mortgage Payment' at a stale $2,485 must not appear in the
+        duplicates list when the user enters a real mortgage payment
+        at $2,850."""
+        gc = GnuCashBook(str(test_book))
+        template_guid = _seed_template_transaction(
+            gc,
+            description="Mortgage Payment",
+            amount="2485",
+            trans_date=date(2025, 1, 1),
+        )
+        result = gc.create_transaction(
+            description="Mortgage Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "2850.00"},
+                {"account": "Assets:Checking", "amount": "-2850.00"},
+            ],
+            trans_date=date(2026, 1, 1),
+            check_duplicates=True,
+        )
+        assert result["status"] == "created"
+        dups_tsv = result.get("duplicates", "")
+        # The template's short-guid prefix must not appear anywhere
+        # in the TSV response.
+        assert template_guid[:8] not in dups_tsv
+
+    def test_real_transaction_still_surfaces_even_with_template_present(
+        self, test_book: Path,
+    ):
+        """Having a template on file doesn't suppress legitimate
+        duplicate detection against real user transactions that share
+        the same description."""
+        gc = GnuCashBook(str(test_book))
+        _seed_template_transaction(
+            gc,
+            description="Mortgage Payment",
+            amount="2485",
+            trans_date=date(2025, 1, 1),
+        )
+        # A real, user-posted mortgage transaction (not in the
+        # template subtree).
+        real = gc.create_transaction(
+            description="Mortgage Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "2850.00"},
+                {"account": "Assets:Checking", "amount": "-2850.00"},
+            ],
+            trans_date=date(2026, 1, 1),
+            check_duplicates=False,
+        )
+        # Now try to enter the same mortgage payment again → should
+        # flag the REAL one (HIGH, all three signals), not the
+        # template.
+        result = gc.create_transaction(
+            description="Mortgage Payment",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "2850.00"},
+                {"account": "Assets:Checking", "amount": "-2850.00"},
+            ],
+            trans_date=date(2026, 1, 1),
+            check_duplicates=True,
+        )
+        assert result["status"] == "rejected"
+        dups = _parse_duplicates(result["duplicates"])
+        assert dups[0]["confidence"] == "HIGH"
+        # Short-guid of the real transaction, not the template.
+        assert dups[0]["guid"] == real["guid"]
+
+    def test_template_not_used_for_auto_fill(self, test_book: Path):
+        """Auto-fill pulls the most-recent matching-description
+        transaction's splits when the user omits ``splits``. A
+        template row near the top of the sorted list by date could
+        hijack auto-fill and poison the created transaction with
+        template-account splits — verify the filter keeps it clear."""
+        gc = GnuCashBook(str(test_book))
+        # Seed a template in 2026 (most recent by date) and a real
+        # transaction earlier. If the filter misses, auto-fill grabs
+        # the template; if it holds, auto-fill uses the real one.
+        _seed_template_transaction(
+            gc,
+            description="Utility Bill",
+            amount="500",
+            trans_date=date(2026, 3, 1),
+        )
+        gc.create_transaction(
+            description="Utility Bill",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "120.50"},
+                {"account": "Assets:Checking", "amount": "-120.50"},
+            ],
+            trans_date=date(2026, 1, 15),
+            check_duplicates=False,
+        )
+        # Omit splits — force auto-fill.
+        result = gc.create_transaction(
+            description="Utility Bill",
+            trans_date=date(2026, 4, 1),
+            check_duplicates=False,
+        )
+        assert result["status"] == "created"
+        # The auto-fill source should be the real transaction, not
+        # the template. If it were the template, the created
+        # transaction's splits would point at template accounts
+        # (which would also throw balance-sheet reporting off).
+        # Verify by fetching the new transaction.
+        created = gc.get_transaction(result["guid"])
+        accounts = {s["account"] for s in created["splits"]}
+        # Template accounts have "Utility Bill Template" in their
+        # fullname; real transaction uses Expenses:Groceries /
+        # Assets:Checking.
+        assert not any("Template" in a for a in accounts), accounts
+        assert "Assets:Checking" in accounts
+        assert "Expenses:Groceries" in accounts
 
 
 class TestDuplicatesTsvShape:
