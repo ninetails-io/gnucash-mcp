@@ -814,8 +814,21 @@ class BaseGnuCashBook:
             raise last_error
 
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
-        """Find an account by its full name path."""
+        """Find an account by its full name path.
+
+        Scheduled-transaction template accounts (under
+        ``book.root_template``) are never returned — they're GnuCash
+        internals, not part of the user's chart of accounts. Callers
+        that legitimately need to touch a template (currently only
+        ``create_scheduled_transaction`` / ``delete_scheduled_transaction``)
+        access it through piecash's typed relationships
+        (``sx.template_account``, ``book.root_template.children``),
+        not by name.
+        """
+        template_guids = self._template_account_guids(book)
         for account in book.accounts:
+            if account.guid in template_guids:
+                continue
             if account.fullname == fullname:
                 return account
         return None
@@ -912,3 +925,28 @@ class BaseGnuCashBook:
         for child in account.children:
             result.add(child)
             self._collect_descendants(child, result)
+
+    def _template_account_guids(self, book: piecash.Book) -> set[str]:
+        """GUIDs for every account in the scheduled-transaction
+        template subtree (``book.root_template`` and all descendants).
+
+        GnuCash persists scheduled-transaction split templates as real
+        Account rows rooted at ``root_template``. Piecash surfaces
+        them in ``book.accounts`` alongside the user's chart of
+        accounts, but they're bookkeeping scaffolding — not
+        transactions the user posts to or a balance they care about.
+        Every user-facing account iteration path should filter this
+        set out before serving results.
+
+        Returns an empty set when the book has no template root
+        (books created by very old GnuCash versions, or freshly-created
+        books that haven't materialized the template root yet).
+        """
+        rt = book.root_template
+        if rt is None:
+            return set()
+        guids = {rt.guid}
+        descendants: set = set()
+        self._collect_descendants(rt, descendants)
+        guids.update(a.guid for a in descendants)
+        return guids

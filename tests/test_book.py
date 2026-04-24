@@ -371,6 +371,110 @@ class TestGetAccount:
         assert account is None
 
 
+class TestTemplateAccountsHidden:
+    """Scheduled transactions persist their split templates as real
+    Account rows under ``book.root_template``. piecash surfaces those
+    in ``book.accounts`` alongside the user's chart of accounts, but
+    they're GnuCash internals — not transactions the user posts to
+    or a balance they care about. Every user-facing lookup path
+    filters them out.
+
+    Exercising this end-to-end: create a scheduled transaction
+    (which creates a template account with the same name), then
+    verify ``list_accounts`` and ``get_account`` both hide it.
+    """
+
+    def test_list_accounts_hides_template(self, scheduled_book: Path):
+        """The template account created by ``create_scheduled_transaction``
+        must not surface in ``list_accounts``."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="MonthlyRentTemplate",
+            description="Monthly Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-05-01",
+            frequency="monthly",
+        )
+        # Compact and verbose paths must both hide the template.
+        compact = gc.list_accounts()
+        assert "MonthlyRentTemplate" not in compact
+
+        verbose = gc.list_accounts(compact=False)
+        names = {a["fullname"] for a in verbose}
+        assert not any("MonthlyRentTemplate" in n for n in names)
+        # User's chart of accounts still appears normally.
+        assert "Assets:Checking" in {a["fullname"] for a in verbose}
+        assert "Expenses:Rent" in {a["fullname"] for a in verbose}
+
+    def test_get_account_hides_template(self, scheduled_book: Path):
+        """Looking up a template account by name returns None, same
+        shape as a missing account."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="AnotherTemplate",
+            description="Whatever",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date="2026-05-01",
+            frequency="monthly",
+        )
+        # Whatever piecash's fullname for the template happens to be,
+        # neither the bare name nor any plausible templated path
+        # should resolve.
+        assert gc.get_account("AnotherTemplate") is None
+        assert gc.get_account("Template Root:AnotherTemplate") is None
+
+    def test_scheduled_instantiation_still_works(
+        self, scheduled_book: Path,
+    ):
+        """Canary: filtering templates from the user-facing lookup
+        paths must not break the scheduled-transaction instantiation
+        path, which reaches templates through piecash relationships
+        (``sx.template_account``), not by name."""
+        gc = GnuCashBook(str(scheduled_book))
+        sx = gc.create_scheduled_transaction(
+            name="RentToInstantiate",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-05-01",
+            frequency="monthly",
+        )
+        result = gc.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-05-01",
+        )
+        assert result["status"] == "created"
+
+    def test_root_filter_does_not_surface_templates(
+        self, scheduled_book: Path,
+    ):
+        """Even with an aggressive ``root=`` filter that could
+        conceivably match the template subtree name, templates stay
+        hidden. Belt-and-suspenders for edge-case GnuCash namings."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="TemplatedThing",
+            description="x",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date="2026-05-01",
+            frequency="monthly",
+        )
+        # Any list_accounts call, filtered or not, omits templates.
+        for root in (None, "Assets", "Expenses", "Template Root"):
+            result = gc.list_accounts(root=root)
+            assert "TemplatedThing" not in result
+
+
 class TestGetBalance:
     """Tests for get_balance method."""
 

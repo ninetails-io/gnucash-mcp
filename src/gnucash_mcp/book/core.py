@@ -116,13 +116,12 @@ class CoreMixin:
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
-            # --- Identify template accounts (scheduled transaction placeholders) ---
-            template_guids = set()
-            rt = book.root_template
-            if rt:
-                template_guids.add(rt.guid)
-                for child in rt.children:
-                    template_guids.add(child.guid)
+            # Identify template accounts (scheduled-transaction scaffolding).
+            # Shared helper on BaseGnuCashBook walks the whole subtree; the
+            # old inline version only captured root_template + direct
+            # children, which worked because create_scheduled_transaction
+            # creates flat templates — but tolerates deeper nesting now.
+            template_guids = self._template_account_guids(book)
 
             # --- Collect parent GUIDs (placeholder containers) ---
             parent_guids = set()
@@ -396,9 +395,16 @@ class CoreMixin:
             If not compact: flat list of account dicts with full paths.
         """
         with self.open(readonly=True) as book:
+            # Hide scheduled-transaction template accounts — they live
+            # under book.root_template as real Account rows (piecash
+            # surfaces them in book.accounts), but they're GnuCash
+            # internals, not part of the user's chart of accounts.
+            template_guids = self._template_account_guids(book)
             filtered = []
             for account in book.accounts:
                 if account.type == "ROOT":
+                    continue
+                if account.guid in template_guids:
                     continue
                 if root is not None:
                     fn = account.fullname
