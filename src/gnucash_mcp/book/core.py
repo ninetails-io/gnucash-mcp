@@ -116,13 +116,12 @@ class CoreMixin:
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
-            # --- Identify template accounts (scheduled transaction placeholders) ---
-            template_guids = set()
-            rt = book.root_template
-            if rt:
-                template_guids.add(rt.guid)
-                for child in rt.children:
-                    template_guids.add(child.guid)
+            # Identify template accounts (scheduled-transaction scaffolding).
+            # Shared helper on BaseGnuCashBook walks the whole subtree; the
+            # old inline version only captured root_template + direct
+            # children, which worked because create_scheduled_transaction
+            # creates flat templates — but tolerates deeper nesting now.
+            template_guids = self._template_account_guids(book)
 
             # --- Collect parent GUIDs (placeholder containers) ---
             parent_guids = set()
@@ -396,9 +395,16 @@ class CoreMixin:
             If not compact: flat list of account dicts with full paths.
         """
         with self.open(readonly=True) as book:
+            # Hide scheduled-transaction template accounts — they live
+            # under book.root_template as real Account rows (piecash
+            # surfaces them in book.accounts), but they're GnuCash
+            # internals, not part of the user's chart of accounts.
+            template_guids = self._template_account_guids(book)
             filtered = []
             for account in book.accounts:
                 if account.type == "ROOT":
+                    continue
+                if account.guid in template_guids:
                     continue
                 if root is not None:
                     fn = account.fullname
@@ -745,6 +751,26 @@ class CoreMixin:
             else {}
         )
 
+        # Template-account GUID set — used to skip scheduled-transaction
+        # template transactions. GnuCash persists each SX's split
+        # template as a real Transaction row whose splits post to
+        # accounts under book.root_template. Those are recipes, not
+        # events — a user entering a mortgage payment for the first
+        # time would otherwise always see the Mortgage template as a
+        # "duplicate" candidate via description + date match, even
+        # with a stale template amount that kills the A signal.
+        # Filtering at the iteration boundary blocks leakage into
+        # every bucket the collector fills: auto-fill, stability,
+        # duplicates, and recent-matches.
+        template_guids = self._template_account_guids(book)
+
+        # Proposed primary — the headline amount (max abs split value)
+        # used by the duplicate amount-signal. Computed once; when
+        # ``want_duplicates`` is False the caller passed ``[]`` and
+        # this stays zero (harmless — the amount-signal branch never
+        # runs on that code path).
+        proposed_primary = max(proposed_amounts) if proposed_amounts else Decimal("0")
+
         # Local accumulators — each bucket is independent. We finalize
         # them into the returned _CreateSignals after the loop.
         auto_fill_source = None  # piecash.Transaction
@@ -760,6 +786,17 @@ class CoreMixin:
         )
 
         for txn in sorted_txns:
+            # Skip scheduled-transaction template rows — their splits
+            # post to Template Accounts, they have no bearing on the
+            # user's chart, and they'd otherwise fire D-D matches on
+            # every near-cadence description (mortgage, HOA, auto
+            # loans, etc.), training the user to ignore the
+            # duplicate warning.
+            if template_guids and any(
+                s.account.guid in template_guids for s in txn.splits
+            ):
+                continue
+
             txn_desc_lower = txn.description.lower()
             desc_match = (
                 desc_lower in txn_desc_lower
@@ -793,17 +830,25 @@ class CoreMixin:
                 want_duplicates
                 and dup_start <= txn.post_date <= dup_end
             ):
-                # Signal 2: any proposed amount within ±$1.00 of any
-                # split's absolute value.
-                amount_match = False
-                txn_amounts = [abs(s.value) for s in txn.splits]
-                for proposed_amt in proposed_amounts:
-                    for txn_amt in txn_amounts:
-                        if abs(proposed_amt - txn_amt) <= Decimal("1.00"):
-                            amount_match = True
-                            break
-                    if amount_match:
-                        break
+                # Signal 2: proposed PRIMARY amount (max abs split
+                # value) within ±$1.00 of candidate's primary amount.
+                #
+                # Earlier iterations compared any-to-any across every
+                # split pair. On multi-split transactions (paychecks
+                # with 10+ deduction splits) that produced
+                # false-positive MEDIUM matches whenever a tiny
+                # deduction happened to land within ±$1 of a
+                # candidate's amount — e.g. a paycheck-vs-coffee-shop
+                # match because some $5-ish union/medicare deduction
+                # sat near the coffee's $5.67 total. "Primary" means
+                # the headline number a human reading the register
+                # uses to recognize a transaction; matching on that
+                # kills the noise without losing real duplicates
+                # (paycheck-vs-paycheck still matches on gross).
+                primary_amount = max(abs(s.value) for s in txn.splits)
+                amount_match = (
+                    abs(proposed_primary - primary_amount) <= Decimal("1.00")
+                )
 
                 # Signal 3: date within ±2 days of trans_date (tighter
                 # than the window filter — window is for "worth
@@ -818,9 +863,6 @@ class CoreMixin:
                         + ("A" if amount_match else "-")
                         + ("D" if date_match else "-")
                     )
-                    # Primary amount: max absolute split value — enough
-                    # context for the LLM to recognize the duplicate.
-                    primary_amount = max(abs(s.value) for s in txn.splits)
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
