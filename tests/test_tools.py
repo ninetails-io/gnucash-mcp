@@ -59,7 +59,10 @@ class TestGetBookSummaryTool:
         assert "Book:" in result
         assert "Currency: USD" in result
         assert "Accounts:" in result
-        assert "Net worth:" in result
+        # The bottom-line "Net worth:" line was retired in favor of
+        # the trajectory section's "now" anchor — single source of
+        # truth for the net-worth number.
+        assert "Net worth trajectory:" in result
 
 
 class TestListAccountsTool:

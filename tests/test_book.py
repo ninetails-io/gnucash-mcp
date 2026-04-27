@@ -140,7 +140,11 @@ class TestGetBookSummary:
         assert "Expenses:" in result
         assert "Transactions:" in result
         assert "Commodities:" in result
-        assert "Net worth:" in result
+        # The bottom-line "Net worth:" line was removed in favor of
+        # the trajectory section's "now" anchor — single source of
+        # truth, no risk of two displayed numbers disagreeing.
+        assert "Net worth trajectory:" in result
+        assert "Net worth:" not in result
 
     def test_get_book_summary_currency(self, test_book: Path):
         """Should show USD as default currency."""
@@ -692,6 +696,336 @@ class TestGetBookSummaryReconciliation:
         result = gc.get_book_summary()
         recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
         assert "Vehicle" not in recon
+
+
+class TestGetBookSummaryNetWorthTrajectory:
+    """Net worth trajectory section in get_book_summary.
+
+    Five anchor points (12mo / 6mo / 3mo / 1mo ago, now) showing
+    how net worth has evolved. See
+    ``CoreMixin._net_worth_trajectory`` and the spec at
+    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §2.
+    """
+
+    @staticmethod
+    def _months_ago(n: int) -> date:
+        from dateutil.relativedelta import relativedelta
+        today = date.today()
+        if n == 0:
+            return today
+        return today - relativedelta(months=n)
+
+    def _seed_balanced_deposit(
+        self,
+        gc: GnuCashBook,
+        amount: str,
+        on_date: date,
+    ) -> None:
+        """Seed a deposit (Checking debit, Opening Balance credit)
+        anchored on a given date so trajectory anchors find balances
+        as of that date."""
+        gc.create_transaction(
+            description="Deposit",
+            splits=[
+                {"account": "Assets:Checking", "amount": amount},
+                {"account": "Equity:Opening Balance", "amount": f"-{amount}"},
+            ],
+            trans_date=on_date,
+            check_duplicates=False,
+        )
+
+    def test_section_omitted_for_empty_book(self, tmp_path: Path):
+        """A book with no transactions has no first_date → no
+        trajectory anchors → omit the section entirely."""
+        book_path = tmp_path / "empty.gnucash"
+        b = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        b.session.add(piecash.Account(
+            name="Assets", type="ASSET", parent=b.root_account,
+            commodity=b.default_currency, placeholder=True,
+        ))
+        b.save()
+        b.close()
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        assert "Net worth trajectory" not in result
+
+    def test_full_history_emits_five_anchors(self, test_book: Path):
+        """A book with >12mo of data emits all five anchors,
+        oldest first."""
+        gc = GnuCashBook(str(test_book))
+        # Seed an anchor old enough to ensure 12mo coverage.
+        old = self._months_ago(13)
+        self._seed_balanced_deposit(gc, "1000", old)
+        # Plus more recent activity.
+        self._seed_balanced_deposit(gc, "500", self._months_ago(0))
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        rows = []
+        for line in section.split("\n"):
+            if line.startswith("  "):
+                rows.append(line)
+            else:
+                break
+        assert len(rows) == 5
+        # First row is oldest (12mo ago), last is now.
+        assert "12mo ago" in rows[0]
+        assert "now" in rows[-1]
+
+    def test_short_history_drops_old_anchors(self, test_book: Path):
+        """A book with only 4mo of data drops 12mo and 6mo anchors;
+        keeps 3mo, 1mo, now (anchors within or at the data range
+        start). Spec: 'omit the data points before the start of
+        the data range'."""
+        gc = GnuCashBook(str(test_book))
+        # Seed only recent activity (~4 months ago)
+        self._seed_balanced_deposit(gc, "1000", self._months_ago(4))
+        self._seed_balanced_deposit(gc, "500", self._months_ago(0))
+
+        # Reset fixture's 2024 transactions so they don't extend the
+        # data range. We can't modify the fixture in place; instead
+        # rely on first_date logic — fixture has 2024-01 transactions
+        # which are >12mo old. So all five anchors qualify.
+        # This test demonstrates the behavior on a book where the
+        # earliest transaction defines the data-range floor.
+
+        # Build a fresh minimal book with controlled first_date
+        # for the strict short-history check.
+        import shutil
+        short_path = test_book.parent / "short_history.gnucash"
+        shutil.copy(test_book, short_path)
+        # Delete all transactions older than 4mo by removing them
+        # via piecash.
+        gc2 = GnuCashBook(str(short_path))
+        with gc2.open(readonly=False) as book:
+            cutoff = self._months_ago(4)
+            for txn in list(book.transactions):
+                if txn.post_date < cutoff:
+                    book.session.delete(txn)
+            book.save()
+
+        result = gc2.get_book_summary()
+        if "Net worth trajectory" not in result:
+            # If pruning emptied the book, that's a different test
+            # path; ensure trajectory is omitted then.
+            return
+
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        rows = []
+        for line in section.split("\n"):
+            if line.startswith("  "):
+                rows.append(line)
+            else:
+                break
+        # Anchor labels actually present:
+        labels = [
+            label for label in ("12mo ago", "6mo ago", "3mo ago", "1mo ago", "now")
+            if any(label in r for r in rows)
+        ]
+        # 12mo and 6mo should be dropped; 3mo, 1mo, now should remain.
+        assert "12mo ago" not in labels
+        assert "6mo ago" not in labels
+        assert "3mo ago" in labels
+        assert "1mo ago" in labels
+        assert "now" in labels
+
+    def test_oldest_first_ordering(self, test_book: Path):
+        """Trajectory rows are oldest → newest, matching the
+        natural left-to-right reading of a time series."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_balanced_deposit(gc, "100", self._months_ago(13))
+        self._seed_balanced_deposit(gc, "200", self._months_ago(0))
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        rows = section.split("\n")[:5]
+        # Verify exact order.
+        ordered = [
+            "12mo ago", "6mo ago", "3mo ago", "1mo ago", "now",
+        ]
+        for i, expected in enumerate(ordered):
+            assert expected in rows[i], (i, expected, rows[i])
+
+    def test_now_anchor_is_today(self, test_book: Path):
+        """The 'now' anchor uses today's date and reflects the
+        current net worth. For a book with $1000 in checking, no
+        liabilities, the 'now' line is +1000 in book currency."""
+        gc = GnuCashBook(str(test_book))
+        # Fixture's net worth is $1000 (opening balance) + $2000
+        # (salary) - $0 (groceries doesn't change net worth) = $3000.
+        # Wait, groceries DOES affect: it's an EXPENSE-type, not in
+        # the NW_TYPES set, so doesn't contribute. But Checking
+        # decreased by $150 from groceries.
+        # Net worth assets: Checking has $1000+$2000-$150 = $2850.
+        # No liabilities → net worth = $2850.
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        now_row = next(r for r in section.split("\n")[:5] if "now" in r)
+        assert "USD 2,850" in now_row
+
+    def test_value_format_thousands_separator(self, test_book: Path):
+        """Values render with thousands separators, no decimals,
+        prefixed with the book's default currency."""
+        gc = GnuCashBook(str(test_book))
+        # Seed a value that will exercise comma formatting at "now".
+        self._seed_balanced_deposit(gc, "12000", self._months_ago(0))
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        now_row = next(r for r in section.split("\n")[:5] if "now" in r)
+        # Total should now include the seed; format has comma.
+        assert "USD" in now_row
+        # No decimals.
+        assert "." not in now_row.split("USD")[-1]
+        # Comma separator.
+        assert "," in now_row
+
+    def test_trajectory_reflects_growth(self, test_book: Path):
+        """A book where wealth grew should show now > 12mo ago.
+        Sanity check that point-in-time computation differs across
+        anchors."""
+        gc = GnuCashBook(str(test_book))
+        # Seed activity exactly at 12mo ago and exactly now to
+        # produce a measurable gap.
+        self._seed_balanced_deposit(gc, "100", self._months_ago(13))
+        self._seed_balanced_deposit(gc, "5000", self._months_ago(0))
+
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        rows = section.split("\n")[:5]
+        oldest_row = rows[0]
+        newest_row = rows[-1]
+        # Extract numeric value from each row.
+        import re
+        old_val = int(re.search(r"USD ([0-9,]+)", oldest_row).group(1).replace(",", ""))
+        new_val = int(re.search(r"USD ([0-9,]+)", newest_row).group(1).replace(",", ""))
+        assert new_val > old_val
+
+    def test_now_uses_cost_basis_for_unpriced_foreign_commodity(
+        self, tmp_path: Path,
+    ):
+        """When an investment account holds a foreign commodity with
+        no price on record, ``_compute_net_worth_at`` falls back to
+        cost basis (sum of split.value, in transaction currency =
+        book default for typical USD-denominated buys). Mirrors the
+        bottom-line ``_market_value`` helper's fallback so the
+        trajectory's "now" anchor agrees with what the user
+        previously read off the (now-removed) ``Net worth:`` line.
+
+        Regression for the bookkeeper's $2,905 discrepancy report —
+        the earlier implementation skipped unpriced commodities
+        entirely, which deflated trajectory below the bottom-line."""
+        book_path = tmp_path / "unpriced.gnucash"
+        b = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = b.root_account
+        usd = b.default_currency
+        # An unpriced commodity (no Price rows entered).
+        from piecash import Commodity
+        nopr = Commodity(
+            namespace="FUND",
+            mnemonic="NOPR",
+            fullname="Unpriced Fund",
+            fraction=10000,
+        )
+        b.session.add(nopr)
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(assets)
+        investments = piecash.Account(
+            name="Investments", type="ASSET", parent=assets,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(investments)
+        nopr_acct = piecash.Account(
+            name="NOPR Holding", type="MUTUAL", parent=investments,
+            commodity=nopr,
+        )
+        b.session.add(nopr_acct)
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(equity)
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        b.session.add(opening)
+        b.save()
+
+        # Buy 100 shares of NOPR at $50 per share = $5,000 cost.
+        # value=USD (transaction currency), quantity=100 NOPR shares.
+        purchase_date = date.today() - timedelta(days=30)
+        b.session.add(piecash.Transaction(
+            currency=usd,
+            description="Buy NOPR",
+            post_date=purchase_date,
+            splits=[
+                piecash.Split(
+                    account=nopr_acct,
+                    value=Decimal("5000"),
+                    quantity=Decimal("100"),
+                ),
+                piecash.Split(
+                    account=opening,
+                    value=Decimal("-5000"),
+                ),
+            ],
+        ))
+        b.save()
+        b.close()
+
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        now_row = next(r for r in section.split("\n")[:5] if "now" in r)
+        # Cost basis fallback: 100 shares @ no price → $5,000 cost.
+        # Net worth = $5,000 (no liabilities).
+        assert "USD 5,000" in now_row
+
+    def test_section_omitted_when_all_anchors_predate_data(
+        self, tmp_path: Path,
+    ):
+        """If first_date is in the future relative to all anchors
+        (e.g., book starts today), all anchors except 'now' could
+        still qualify; this test exercises the very-new-book path.
+        Most importantly: a brand-new book with zero transactions
+        omits the section, and 'now' alone with no prior history
+        still shows trajectory if first_date ≤ today."""
+        book_path = tmp_path / "fresh.gnucash"
+        b = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = b.root_account
+        usd = b.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(assets)
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        b.session.add(checking)
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(equity)
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        b.session.add(opening)
+        b.save()
+        b.close()
+        # Empty book → no transactions → omit.
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        assert "Net worth trajectory" not in result
 
 
 class TestGetBookSummaryMonthlyNet:

@@ -206,6 +206,219 @@ class CoreMixin:
         results.sort(key=lambda r: r["account"])
         return results
 
+    def _rates_as_of(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity,
+    ) -> dict[str, Decimal]:
+        """For each non-default-currency commodity, return the most
+        recent user-supplied price (in default currency) on or before
+        ``as_of``. Skips piecash's auto-created
+        ``type='transaction'`` placeholder prices the same way the
+        rest of the codebase does — those are post-invoice
+        bookkeeping artifacts, not market quotes.
+
+        Returns ``{commodity_guid: rate}``. Commodities without a
+        price <= as_of don't appear; callers should fall back to
+        skipping that account for trajectory purposes (or use cost
+        basis, depending on the caller's contract).
+        """
+        latest: dict[str, tuple[date, Decimal]] = {}
+        for p in book.prices:
+            if p.currency != default_currency:
+                continue
+            if p.type == "transaction":
+                continue
+            p_date = p.date
+            if hasattr(p_date, "date") and callable(p_date.date):
+                p_date = p_date.date()
+            if p_date > as_of:
+                continue
+            cguid = p.commodity.guid
+            prev = latest.get(cguid)
+            if prev is None or p_date > prev[0]:
+                latest[cguid] = (p_date, Decimal(str(p.value)))
+        return {k: v[1] for k, v in latest.items()}
+
+    # Asset-side and liability-side type sets used by the net-worth
+    # computation. Mirrors the existing in-summary breakdown — the
+    # asset section iterates these types into per-leaf rows; the
+    # liability section iterates the liability set. Receivables and
+    # payables are intentionally excluded from net worth — they live
+    # in their own dedicated sections of the summary and aren't part
+    # of the assets_total − liabilities_total convention.
+    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
+    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+
+    def _compute_net_worth_at(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity,
+    ) -> Decimal:
+        """Net worth in book-default currency as of ``as_of``.
+
+        Single source of truth for the net-worth number the summary
+        displays. Trajectory's "now" anchor and the (former) bottom-
+        line "Net worth:" line both agreed-by-construction when both
+        existed; the bottom-line has since been retired in favor of
+        the trajectory's "now", but this helper preserves the
+        semantics so the user's reference number stays the same.
+
+        Algorithm mirrors the per-leaf breakdown elsewhere in
+        ``get_book_summary``:
+
+        - **Leaf-only iteration.** Parents with children are skipped
+          (their balances are already represented by their children).
+          Matches the per-leaf display structure of the assets and
+          liabilities sections.
+        - **Skips:** ROOT, template-subtree accounts, placeholders.
+        - **Asset accounts** (ASSET / BANK / CASH / STOCK / MUTUAL):
+          balance × most-recent-rate-on-or-before-``as_of``. If the
+          commodity has no price by ``as_of``, fall back to cost
+          basis (sum of split.value, which is in transaction
+          currency = book default for typical USD-denominated buys).
+          That fallback is the same one the assets-section
+          ``_market_value`` helper uses; preserves user-expected
+          numbers for unpriced foreign holdings.
+        - **Liability accounts** (LIABILITY / CREDIT): subtract the
+          raw balance from net worth. Liabilities are stored as
+          negative balances; ``-balance`` gives the positive
+          liability magnitude that's then subtracted. No conversion —
+          matches the existing bottom-line behavior, which assumes
+          liabilities denominated in default currency (the common
+          case for personal books).
+
+        Receivables and payables: excluded from the result because
+        they have their own sections in the summary and aren't part
+        of the canonical assets_total − liabilities_total formula.
+        """
+        template_guids = self._template_account_guids(book)
+        rates = self._rates_as_of(book, as_of, default_currency)
+
+        # is_leaf: an account with no children. Compute the parent
+        # set once and check membership per account.
+        parent_guids: set[str] = set()
+        for a in book.accounts:
+            if a.parent and a.parent.type != "ROOT":
+                parent_guids.add(a.parent.guid)
+
+        assets_total = Decimal("0")
+        liabilities_total = Decimal("0")
+
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+            if account.guid in parent_guids:
+                continue
+
+            if account.type not in self._NW_ASSET_TYPES \
+                    and account.type not in self._NW_LIABILITY_TYPES:
+                continue
+
+            balance = Decimal("0")
+            for split in account.splits:
+                if split.transaction.post_date <= as_of:
+                    balance += split.quantity
+
+            if account.type in self._NW_ASSET_TYPES:
+                if balance == 0:
+                    continue
+                if account.commodity == default_currency:
+                    assets_total += balance
+                else:
+                    rate = rates.get(account.commodity.guid)
+                    if rate is not None:
+                        assets_total += balance * rate
+                    else:
+                        # Cost-basis fallback: split values are in
+                        # transaction currency (= book default for
+                        # typical purchases of foreign-commodity
+                        # assets). Approximation but the same one
+                        # the existing summary uses.
+                        cost_basis = Decimal("0")
+                        for split in account.splits:
+                            if split.transaction.post_date <= as_of:
+                                cost_basis += Decimal(str(split.value))
+                        assets_total += cost_basis
+            else:
+                # Liability bucket. Negate to get positive magnitude;
+                # subtract from net worth via liabilities_total.
+                liabilities_total += -balance
+
+        return assets_total - liabilities_total
+
+    def _net_worth_trajectory(
+        self,
+        book: piecash.Book,
+        first_date: date | None,
+    ) -> list[dict]:
+        """Five-point net-worth trajectory: 12mo / 6mo / 3mo / 1mo
+        ago and now. Implements GET_BOOK_SUMMARY_SPEC §2.
+
+        A slope number alone (one signal, lossy) hides acceleration
+        and recent breaks; a chart is too expensive in tokens. Five
+        data points is the spec's sweet spot — costs ~30 tokens,
+        lets the LLM see whether recent months broke the trend.
+
+        Anchors before the book's first transaction date are
+        dropped (the book didn't exist then; emitting "0" would
+        falsely suggest zero net worth a year ago when the user
+        simply hadn't started the book yet). Anchors within the
+        data range that predate any transaction activity are kept
+        — the spec calls a flat trajectory through that span the
+        right answer; the LLM draws correct conclusions from it.
+
+        Returns a list of ``{label, net_worth}`` dicts ordered
+        oldest-first (matches the natural left-to-right reading of
+        the rendered output). Empty list when the book has no
+        transactions at all → caller omits the section entirely.
+        """
+        if first_date is None:
+            return []
+
+        from dateutil.relativedelta import relativedelta
+
+        today = date.today()
+        # (months_ago, label) — labels right-padded to 8 chars so
+        # the rendered values column visually aligns even with the
+        # uneven label widths the spec example uses.
+        candidates: list[tuple[int, str]] = [
+            (12, "12mo ago"),
+            (6, " 6mo ago"),
+            (3, " 3mo ago"),
+            (1, " 1mo ago"),
+            (0, "     now"),
+        ]
+        anchors: list[tuple[date, str]] = []
+        for months_ago, label in candidates:
+            anchor_date = (
+                today if months_ago == 0
+                else today - relativedelta(months=months_ago)
+            )
+            if anchor_date >= first_date:
+                anchors.append((anchor_date, label))
+
+        if not anchors:
+            return []
+
+        default_currency = self._require_default_currency(book)
+
+        return [
+            {
+                "label": label,
+                "net_worth": self._compute_net_worth_at(
+                    book, anchor_date, default_currency,
+                ).quantize(Decimal("1")),
+            }
+            for anchor_date, label in anchors
+        ]
+
     def _monthly_net_income(
         self, book: piecash.Book, months: int = 6,
     ) -> list[dict]:
@@ -665,6 +878,20 @@ class CoreMixin:
                         f"  {never_count} account{plural} never reconciled ⚠"
                     )
 
+            # Net worth trajectory (12mo / 6mo / 3mo / 1mo ago, now).
+            # Surfaces acceleration and trend breaks that a single
+            # net-worth number can't. Empty list = book has no
+            # transactions or every anchor predates the data range
+            # → omit the section entirely.
+            trajectory = self._net_worth_trajectory(book, first_date)
+            if trajectory:
+                lines.append("Net worth trajectory:")
+                for entry in trajectory:
+                    lines.append(
+                        f"  {entry['label']}: {currency} "
+                        f"{int(entry['net_worth']):,}"
+                    )
+
             # Monthly net income (last 6 months). Surfaces seasonality
             # and recent anomalies. Empty list = no income/expense
             # activity in the window → omit the section entirely.
@@ -701,7 +928,14 @@ class CoreMixin:
                 lines.append(f"Budgets: {n_budgets}")
 
             lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
-            lines.append(f"Net worth: {currency} {net_worth}")
+
+            # Bottom-line "Net worth: USD X" line removed. The
+            # trajectory section's "now" anchor is now the
+            # authoritative net-worth number, computed via
+            # _compute_net_worth_at — the user sees one number,
+            # by construction matching the per-leaf
+            # assets_total − liabilities_total semantics that
+            # used to render here.
 
             return "\n".join(lines)
 
