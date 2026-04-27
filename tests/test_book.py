@@ -694,6 +694,201 @@ class TestGetBookSummaryReconciliation:
         assert "Vehicle" not in recon
 
 
+class TestGetBookSummaryMonthlyNet:
+    """Monthly cash flow section in get_book_summary.
+
+    Last 6 calendar months of net income (income − expenses), most
+    recent first, with current-month MTD marker. See
+    ``CoreMixin._monthly_net_income`` and the spec at
+    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §3.
+    """
+
+    def _seed_income(
+        self,
+        gc: GnuCashBook,
+        amount: str,
+        on_date: date,
+        description: str = "Income",
+    ) -> None:
+        """Seed a single income transaction (Income:Salary credited
+        for ``amount``, Assets:Checking debited)."""
+        gc.create_transaction(
+            description=description,
+            splits=[
+                {"account": "Income:Salary", "amount": f"-{amount}"},
+                {"account": "Assets:Checking", "amount": amount},
+            ],
+            trans_date=on_date,
+            check_duplicates=False,
+        )
+
+    def _seed_expense(
+        self,
+        gc: GnuCashBook,
+        amount: str,
+        on_date: date,
+        description: str = "Expense",
+    ) -> None:
+        """Seed a single expense (Expenses:Groceries debited,
+        Assets:Checking credited)."""
+        gc.create_transaction(
+            description=description,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+            trans_date=on_date,
+            check_duplicates=False,
+        )
+
+    @staticmethod
+    def _months_ago(n: int) -> date:
+        """First day of the calendar month ``n`` months before today.
+        Plain (year, month) arithmetic to match the production
+        helper, no dateutil dependency."""
+        today = date.today()
+        year, month = today.year, today.month
+        for _ in range(n):
+            if month == 1:
+                year, month = year - 1, 12
+            else:
+                month -= 1
+        return date(year, month, 1)
+
+    def test_section_omitted_with_no_income_or_expense_activity(
+        self, test_book: Path,
+    ):
+        """A book with no income/expense activity in the last 6
+        months emits no Monthly net section. The fixture's
+        2024-01 activity is well outside the rolling 6-month
+        window from any current run-date."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Monthly net" not in result
+
+    def test_section_present_when_recent_activity(
+        self, test_book: Path,
+    ):
+        """Seed activity inside the window → section appears."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        result = gc.get_book_summary()
+        assert "Monthly net (last 6 months):" in result
+
+    def test_six_months_emitted_oldest_to_newest(
+        self, test_book: Path,
+    ):
+        """When the section emits, it's exactly 6 month-rows in
+        most-recent-first order."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        # Section runs until the next non-indented line.
+        rows = []
+        for line in section.split("\n"):
+            if line.startswith("  "):
+                rows.append(line)
+            else:
+                break
+        assert len(rows) == 6
+        # Most recent first: row 0 is the current month.
+        today = date.today()
+        current_label = today.strftime("%b %Y")
+        assert current_label in rows[0]
+        # Row 5 is 5 months ago.
+        oldest_label = self._months_ago(5).strftime("%b %Y")
+        assert oldest_label in rows[5]
+
+    def test_current_month_marked_mtd(self, test_book: Path):
+        """The current calendar month is partial — its row carries
+        a (MTD) suffix on the label."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        first_row = section.split("\n", 1)[0]
+        assert "(MTD)" in first_row
+
+    def test_zero_month_reports_zero_not_omitted(
+        self, test_book: Path,
+    ):
+        """Months with no income/expense activity render as ``+0``,
+        they don't fall out of the section."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        # No activity 3 months ago.
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        three_ago_label = self._months_ago(3).strftime("%b %Y")
+        three_ago_row = next(
+            line for line in section.split("\n")
+            if three_ago_label in line
+        )
+        assert "+0" in three_ago_row
+
+    def test_signed_format(self, test_book: Path):
+        """Positive net: ``+N``. Negative net: ``-N`` (native sign).
+        Zero: ``+0``. Always prefixed with explicit sign."""
+        gc = GnuCashBook(str(test_book))
+        # Current month: net positive (income > expense)
+        self._seed_income(gc, "2000", date.today())
+        self._seed_expense(gc, "500", date.today())
+        # 1 month ago: net negative
+        one_ago = self._months_ago(1)
+        # Use mid-month so it doesn't roll into a different month
+        one_ago_mid = date(one_ago.year, one_ago.month, 15)
+        self._seed_expense(gc, "300", one_ago_mid)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        rows = section.split("\n")[:6]
+
+        # Current month: +1500
+        assert "+1,500" in rows[0]
+        # 1 month ago: -300
+        one_ago_row = next(
+            r for r in rows
+            if one_ago.strftime("%b %Y") in r
+        )
+        assert "-300" in one_ago_row
+
+    def test_income_minus_expense_arithmetic(self, test_book: Path):
+        """Sanity: net = income contributions − expense contributions
+        for the same month, regardless of how many transactions."""
+        gc = GnuCashBook(str(test_book))
+        d = date.today()
+        self._seed_income(gc, "5000", d, "salary 1")
+        self._seed_income(gc, "1000", d, "salary 2")
+        self._seed_expense(gc, "1500", d, "groceries 1")
+        self._seed_expense(gc, "200", d, "groceries 2")
+        # Net: 6000 - 1700 = 4300
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        first_row = section.split("\n", 1)[0]
+        assert "+4,300" in first_row
+
+    def test_old_activity_outside_window_excluded(
+        self, test_book: Path,
+    ):
+        """Income from 12 months ago doesn't bleed into the 6-month
+        window. The section either omits entirely (if no in-window
+        activity) or shows the 6 months and ignores ancient data."""
+        gc = GnuCashBook(str(test_book))
+        # Seed activity in current month so the section renders,
+        # plus old activity that should be ignored.
+        self._seed_income(gc, "100", date.today())
+        old = self._months_ago(11)
+        old_mid = date(old.year, old.month, 15)
+        self._seed_income(gc, "999999", old_mid)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        # No row should contain the old amount.
+        rows = section.split("\n")[:6]
+        assert not any("999,999" in r for r in rows)
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 

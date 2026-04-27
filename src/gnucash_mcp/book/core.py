@@ -206,6 +206,125 @@ class CoreMixin:
         results.sort(key=lambda r: r["account"])
         return results
 
+    def _monthly_net_income(
+        self, book: piecash.Book, months: int = 6,
+    ) -> list[dict]:
+        """Per-month net income for the last ``months`` calendar
+        months. Implements GET_BOOK_SUMMARY_SPEC §3.
+
+        Net = INCOME credits − EXPENSE debits. INCOME splits are
+        stored negative (the credit side of the double-entry
+        bookkeeping convention) so they're sign-flipped to a positive
+        contribution; EXPENSE splits are stored positive and subtract.
+
+        Returns a list of dicts ordered **most recent month first**::
+
+            [
+              {"label": "Apr 2026", "net": Decimal("1247"), "is_mtd": True},
+              {"label": "Mar 2026", "net": Decimal("890"),  "is_mtd": False},
+              ...
+            ]
+
+        ``is_mtd`` is True only for the current calendar month
+        (which is, by definition, partial). Callers render that as
+        a "(MTD)" suffix on the label.
+
+        Returns an empty list when the window contains no income or
+        expense activity at all — the caller should omit the section
+        entirely rather than emit six "+0" lines that say nothing.
+
+        Multi-currency caveat: ``split.value`` is in transaction
+        currency, not account commodity. For typical books where
+        income/expense accounts share the book default currency
+        (and transactions are recorded in that currency), the sum is
+        accurate. Cross-currency income/expense activity sums raw
+        without per-month FX conversion — flagged as a refinement
+        target in the spec; rare in practice for personal/household
+        books.
+        """
+        today = date.today()
+
+        # Build the calendar-month windows, oldest → newest. Plain
+        # arithmetic on (year, month) avoids a dateutil dependency
+        # at this layer; the budgets/scheduling mixins already pull
+        # in relativedelta for their own needs but core stays light.
+        month_starts: list[date] = []
+        cursor = date(today.year, today.month, 1)
+        for _ in range(months):
+            month_starts.append(cursor)
+            if cursor.month == 1:
+                cursor = date(cursor.year - 1, 12, 1)
+            else:
+                cursor = date(cursor.year, cursor.month - 1, 1)
+        month_starts.reverse()
+
+        month_ends: list[date] = []
+        for i, start in enumerate(month_starts):
+            if i + 1 < len(month_starts):
+                nxt = month_starts[i + 1]
+                month_ends.append(
+                    date(nxt.year, nxt.month, 1) - timedelta(days=1)
+                )
+            else:
+                if start.month == 12:
+                    month_ends.append(date(start.year, 12, 31))
+                else:
+                    month_ends.append(
+                        date(start.year, start.month + 1, 1) - timedelta(days=1)
+                    )
+
+        nets = [Decimal("0") for _ in month_starts]
+        window_start = month_starts[0]
+        window_end = month_ends[-1]
+        has_activity = False
+
+        # Single pass over book.transactions. Index math: the bucket
+        # for a transaction is (year_delta * 12 + month_delta) from
+        # the window start. O(transactions); the date-range gate
+        # short-circuits transactions outside the window.
+        for txn in book.transactions:
+            d = txn.post_date
+            if d < window_start or d > window_end:
+                continue
+            idx = (
+                (d.year - window_start.year) * 12
+                + (d.month - window_start.month)
+            )
+            if idx < 0 or idx >= len(nets):
+                continue
+            for s in txn.splits:
+                atype = s.account.type
+                if atype == "INCOME":
+                    nets[idx] += -Decimal(str(s.value))
+                    has_activity = True
+                elif atype == "EXPENSE":
+                    nets[idx] -= Decimal(str(s.value))
+                    has_activity = True
+
+        if not has_activity:
+            return []
+
+        today_month_start = date(today.year, today.month, 1)
+        result: list[dict] = []
+        for i in range(len(month_starts) - 1, -1, -1):
+            start = month_starts[i]
+            result.append({
+                "label": start.strftime("%b %Y"),
+                "net": nets[i].quantize(Decimal("1")),
+                "is_mtd": start == today_month_start,
+            })
+        return result
+
+    @staticmethod
+    def _format_monthly_net(net: Decimal) -> str:
+        """Render a monthly net value as ``+1,247`` / ``-234`` / ``+0``.
+
+        Always shows an explicit sign; thousands separator. Whole
+        dollars (the spec's example output is whole-number; cents
+        would noise up the summary view without adding signal).
+        """
+        return f"{int(net):+,}"
+
     @staticmethod
     def _format_reconciliation_lag(days_behind: int) -> str:
         """Render a parenthesized "(N months behind)" / "(N days
@@ -544,6 +663,20 @@ class CoreMixin:
                     plural = "s" if never_count != 1 else ""
                     lines.append(
                         f"  {never_count} account{plural} never reconciled ⚠"
+                    )
+
+            # Monthly net income (last 6 months). Surfaces seasonality
+            # and recent anomalies. Empty list = no income/expense
+            # activity in the window → omit the section entirely.
+            monthly = self._monthly_net_income(book, months=6)
+            if monthly:
+                lines.append("Monthly net (last 6 months):")
+                for entry in monthly:
+                    label = entry["label"]
+                    if entry["is_mtd"]:
+                        label += " (MTD)"
+                    lines.append(
+                        f"  {label}: {self._format_monthly_net(entry['net'])}"
                     )
 
             lines.append(f"Transactions: {total_txns}")
