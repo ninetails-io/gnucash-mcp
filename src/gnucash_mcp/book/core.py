@@ -94,6 +94,134 @@ class _CreateSignals:
 class CoreMixin:
     """Accounts, transactions, and the book-summary view. Always loaded."""
 
+    # Account types where bank-statement reconciliation is meaningful.
+    # ASSET is added conditionally on a per-account basis when the
+    # account has any cleared/reconciled history (brokerage cash,
+    # escrow, prepaid accounts the user actually reconciles).
+    _RECONCILABLE_TYPES = frozenset({"BANK", "CREDIT", "LIABILITY"})
+
+    # Reconciliation freshness threshold. Accounts whose last
+    # reconciled date is more than this many days behind today (or
+    # which have never been reconciled despite having transactions)
+    # earn a warning marker. Matches monthly statement cycles plus a
+    # ~2-week grace period.
+    _RECONCILE_WARN_DAYS = 45
+
+    def _account_reconciliation_status(
+        self, book: piecash.Book,
+    ) -> list[dict]:
+        """Per-account reconciliation freshness for the book summary.
+
+        For each reconcilable account with transaction activity,
+        returns a dict with::
+
+            {
+              "account": fullname,
+              "status": "through YYYY-MM-DD" | "never reconciled",
+              "days_behind": int | None,   # None iff "never reconciled"
+            }
+
+        The single-int "N unreconciled" count this replaces was
+        operationally useless: it included income/expense/equity
+        splits that conceptually can't be reconciled, so the number
+        was misleadingly large and gave the LLM no actionable signal
+        about which accounts had drifted from reality.
+
+        Filtering rules:
+
+        - Always include: BANK, CREDIT, LIABILITY (the canonical
+          reconcilable types — bank accounts, credit cards, loans
+          with monthly statements).
+        - Conditionally include: ASSET, but only when the account
+          has any 'y' or 'c' history. Catches brokerage cash, escrow,
+          and prepaid accounts the user reconciles, while skipping
+          investment positions and other ASSET accounts where
+          reconciliation doesn't apply.
+        - Always exclude: placeholder accounts, template-subtree
+          accounts (scheduled-transaction scaffolding), the ROOT,
+          and any account with no transaction activity at all (an
+          unused account isn't "behind on reconciliation" — it
+          simply hasn't been used).
+
+        Results are sorted by fullname for deterministic output.
+        Empty list = no reconcilable activity in the book; the
+        caller should omit the Reconciliation section entirely
+        rather than emit an empty header.
+        """
+        template_guids = self._template_account_guids(book)
+        today = date.today()
+
+        results: list[dict] = []
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+
+            # Type gate. ASSET passes only when it has reconcilable
+            # history; the more common ASSET use cases (investment
+            # positions, real estate, vehicles) carry no 'y' or 'c'
+            # splits and rightly skip.
+            if account.type in self._RECONCILABLE_TYPES:
+                pass
+            elif account.type == "ASSET":
+                if not any(
+                    s.reconcile_state in ("y", "c")
+                    for s in account.splits
+                ):
+                    continue
+            else:
+                continue
+
+            if not account.splits:
+                # No activity at all — not "behind," just unused.
+                continue
+
+            # Most recent 'y' split's post_date wins the "through"
+            # date. 'c' (cleared) doesn't count — that's a partial
+            # state that hasn't been finalized to a statement.
+            latest_y_date = None
+            for s in account.splits:
+                if s.reconcile_state == "y":
+                    pd = s.transaction.post_date
+                    if latest_y_date is None or pd > latest_y_date:
+                        latest_y_date = pd
+
+            if latest_y_date is None:
+                results.append({
+                    "account": account.fullname,
+                    "status": "never reconciled",
+                    "days_behind": None,
+                })
+            else:
+                days_behind = (today - latest_y_date).days
+                results.append({
+                    "account": account.fullname,
+                    "status": f"through {latest_y_date.isoformat()}",
+                    "days_behind": days_behind,
+                })
+
+        results.sort(key=lambda r: r["account"])
+        return results
+
+    @staticmethod
+    def _format_reconciliation_lag(days_behind: int) -> str:
+        """Render a parenthesized "(N months behind)" / "(N days
+        behind)" suffix for a reconciliation status warning.
+
+        Months scale once we're past 60 days because that's how users
+        think about reconciliation lag — "two months behind" reads
+        more naturally than "67 days behind." Below 60 days we stay
+        in days for precision; the warning threshold itself is 45
+        days, so the days-form covers the 45–59 window.
+        """
+        if days_behind >= 60:
+            months = days_behind // 30
+            return f"({months} months behind)"
+        return f"({days_behind} days behind)"
+
     def get_book_summary(self) -> str:
         """Return a compact text summary of the entire book.
 
@@ -261,9 +389,14 @@ class CoreMixin:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
 
             # --- Transaction stats ---
+            # Per-split unreconciled counting was dropped — the old
+            # "Transactions: N (M unreconciled)" suffix included
+            # income/expense/equity splits that can't be reconciled,
+            # so the count was operationally useless. The new
+            # Reconciliation section below (per-account, per-status)
+            # is the actionable replacement.
             transactions = list(book.transactions)
             total_txns = len(transactions)
-            unreconciled_txns = 0
             first_date = None
             last_date = None
 
@@ -273,8 +406,6 @@ class CoreMixin:
                     first_date = d
                 if last_date is None or d > last_date:
                     last_date = d
-                if any(s.reconcile_state != "y" for s in txn.splits):
-                    unreconciled_txns += 1
 
             # --- Scheduled transactions ---
             all_sx = book.session.query(ScheduledTransaction).all()
@@ -350,7 +481,72 @@ class CoreMixin:
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
 
-            lines.append(f"Transactions: {total_txns} ({unreconciled_txns} unreconciled)")
+            # Reconciliation: per-account state for reconcilable
+            # account types. Section omitted entirely when the book
+            # has no reconcilable activity (no header line either —
+            # absence is the signal, per the spec's principle).
+            #
+            # Render shape splits the per-account list into THREE
+            # buckets, each carrying a distinct payload class:
+            #
+            # 1. STALE (reconciled at some point but >45 days behind)
+            #    — render individually with their through-date and
+            #    a "(N days/months behind) ⚠" lag suffix. The
+            #    information *how stale is each one* is per-account
+            #    and can't be aggregated. These are the lines a
+            #    bookkeeper LLM actually acts on.
+            # 2. CURRENT (reconciled within 45 days) — collapse into
+            #    a single "<N> accounts current" line. Each
+            #    individual through-date carries the same payload
+            #    ("this one's fine"), repeated; the count preserves
+            #    the affirmative signal without paying per-account
+            #    for it.
+            # 3. NEVER RECONCILED (activity but no 'y' splits) —
+            #    collapse into "<N> account(s) never reconciled ⚠".
+            #    Same logic as the current bucket: identical
+            #    per-line content compresses to a count.
+            #
+            # The principle: per-account-distinct information stays
+            # per-account; identical-across-accounts information
+            # collapses. A 50-account power-user book emits ~3-5
+            # lines; an Alex-sized book emits ~3-5 lines. Signal
+            # density is uniform regardless of book size.
+            #
+            # Each collapse line is omitted when its count is zero
+            # (absence-as-signal): a book with no current accounts
+            # never sees "0 accounts current."
+            reconciliation = self._account_reconciliation_status(book)
+            if reconciliation:
+                stale: list[dict] = []
+                current_count = 0
+                never_count = 0
+                for entry in reconciliation:
+                    if entry["status"] == "never reconciled":
+                        never_count += 1
+                    elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+                        stale.append(entry)
+                    else:
+                        current_count += 1
+
+                lines.append("Reconciliation:")
+                for entry in stale:
+                    leaf = entry["account"].split(":")[-1]
+                    lag = self._format_reconciliation_lag(entry["days_behind"])
+                    lines.append(
+                        f"  {leaf}: {entry['status']} {lag} ⚠"
+                    )
+                if current_count:
+                    plural = "s" if current_count != 1 else ""
+                    lines.append(
+                        f"  {current_count} account{plural} current"
+                    )
+                if never_count:
+                    plural = "s" if never_count != 1 else ""
+                    lines.append(
+                        f"  {never_count} account{plural} never reconciled ⚠"
+                    )
+
+            lines.append(f"Transactions: {total_txns}")
 
             if enabled_sx > 0:
                 lines.append(f"Scheduled: {enabled_sx} recurring")

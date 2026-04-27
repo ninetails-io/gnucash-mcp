@@ -228,6 +228,472 @@ class TestGetBookSummary:
         assert "Budgets: 1" in result
 
 
+class TestGetBookSummaryReconciliation:
+    """Reconciliation section in get_book_summary.
+
+    Replaces the old "Transactions: N (M unreconciled)" suffix —
+    which counted unreconciled splits across all account types and
+    was operationally useless — with per-account last-reconciled
+    state for reconcilable account types. See
+    ``CoreMixin._account_reconciliation_status`` and the spec at
+    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §1.
+    """
+
+    def _reconcile_split(
+        self,
+        gc: GnuCashBook,
+        account: str,
+        on_date: date,
+    ) -> None:
+        """Mark every split on the given account-on-date as
+        reconciled. Helper for setting up test fixtures with a
+        known reconciliation history.
+        """
+        with gc.open(readonly=False) as book:
+            acct = gc._find_account(book, account)
+            assert acct is not None, account
+            for s in acct.splits:
+                if s.transaction.post_date == on_date:
+                    s.reconcile_state = "y"
+                    from datetime import datetime as _dt
+                    s.reconcile_date = _dt.combine(on_date, _dt.min.time())
+            book.save()
+
+    def test_unreconciled_count_removed_from_transactions_line(
+        self, test_book: Path,
+    ):
+        """The old '(M unreconciled)' suffix on the Transactions
+        line is gone — its information was misleading."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        # "Transactions: N" remains, but no "(... unreconciled)" tail.
+        txn_line = next(
+            l for l in result.split("\n") if l.startswith("Transactions:")
+        )
+        assert "unreconciled" not in txn_line
+
+    def test_reconciliation_section_present_when_activity(
+        self, test_book: Path,
+    ):
+        """Reconciliation section appears when there's at least
+        one reconcilable account with transaction activity. With
+        the fixture's Checking having activity but no reconciled
+        splits, that activity surfaces as the collapsed
+        '<N> account never reconciled' footer rather than a
+        per-account line."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Reconciliation:" in result
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        assert "1 account never reconciled ⚠" in recon
+
+    def test_recent_reconciliation_collapses_to_current_count(
+        self, test_book: Path,
+    ):
+        """Account reconciled within the 45-day freshness window
+        does NOT surface individually — its through-date carries no
+        actionable signal beyond "this one's fine," so it joins
+        the collapsed '<N> account(s) current' line. No warning
+        marker on that line; current accounts are by definition
+        not behind."""
+        gc = GnuCashBook(str(test_book))
+        recent = date.today() - timedelta(days=10)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            t = piecash.Transaction(
+                currency=book.default_currency,
+                description="Recent reconciled deposit",
+                post_date=recent,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            )
+            book.session.add(t)
+            book.save()
+        self._reconcile_split(gc, "Assets:Checking", recent)
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        # No per-account through-date line for the now-current Checking.
+        assert f"through {recent.isoformat()}" not in recon
+        # Collapsed into the current count.
+        assert "1 account current" in recon
+        # No ⚠ on the current line — current accounts are by definition
+        # not stale. The whole section may still have a ⚠ from the
+        # never-reconciled footer covering other accounts, so check
+        # the current line specifically.
+        current_line = next(
+            line for line in recon.split("\n")
+            if "account current" in line and "never" not in line
+        )
+        assert "⚠" not in current_line
+
+    def test_stale_reconciliation_warns_with_months_lag(
+        self, test_book: Path,
+    ):
+        """Account whose last reconcile is well past 45 days shows
+        '(N months behind) ⚠'."""
+        gc = GnuCashBook(str(test_book))
+        old = date.today() - timedelta(days=120)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            t = piecash.Transaction(
+                currency=book.default_currency,
+                description="Old reconciled deposit",
+                post_date=old,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("50")),
+                    piecash.Split(account=opening, value=Decimal("-50")),
+                ],
+            )
+            book.session.add(t)
+            book.save()
+        self._reconcile_split(gc, "Assets:Checking", old)
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\n")
+        checking_line = next(l for l in recon if "Checking" in l)
+        assert "months behind" in checking_line
+        assert "⚠" in checking_line
+
+    def test_stale_45_to_60_days_uses_days_unit(
+        self, test_book: Path,
+    ):
+        """The 45-59 day window uses days, not months — months
+        scale only kicks in at 60+."""
+        gc = GnuCashBook(str(test_book))
+        d50 = date.today() - timedelta(days=50)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            t = piecash.Transaction(
+                currency=book.default_currency,
+                description="50-day-old reconcile",
+                post_date=d50,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("10")),
+                    piecash.Split(account=opening, value=Decimal("-10")),
+                ],
+            )
+            book.session.add(t)
+            book.save()
+        self._reconcile_split(gc, "Assets:Checking", d50)
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\n")
+        checking_line = next(l for l in recon if "Checking" in l)
+        assert "days behind" in checking_line
+        assert "⚠" in checking_line
+
+    def test_never_reconciled_collapses_to_count_line(
+        self, test_book: Path,
+    ):
+        """Accounts with transaction activity but no 'y' splits
+        do NOT surface individually — they collapse into a single
+        '<N> account(s) never reconciled ⚠' footer line. Naming
+        each one would balloon the section on production books;
+        a 15-card power user would otherwise see 20+ identical
+        lines.
+
+        The fixture's Checking is the only reconcilable-with-
+        activity account and it has nothing reconciled, so the
+        count is 1 (singular grammar)."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        assert "Checking: never reconciled" not in recon
+        assert "1 account never reconciled ⚠" in recon
+
+    def test_never_reconciled_pluralizes(self, test_book: Path):
+        """Multiple never-reconciled accounts → '<N> accounts'
+        with the plural 's'. Smoke-tests grammar transition."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Visa", account_type="CREDIT", parent="Liabilities",
+        )
+        gc.create_account(
+            name="Mastercard", account_type="CREDIT", parent="Liabilities",
+        )
+        with gc.open(readonly=False) as book:
+            visa = gc._find_account(book, "Liabilities:Visa")
+            mc = gc._find_account(book, "Liabilities:Mastercard")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Visa charge",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=visa, value=Decimal("-50")),
+                    piecash.Split(account=opening, value=Decimal("50")),
+                ],
+            ))
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Mastercard charge",
+                post_date=date.today() - timedelta(days=5),
+                splits=[
+                    piecash.Split(account=mc, value=Decimal("-75")),
+                    piecash.Split(account=opening, value=Decimal("75")),
+                ],
+            ))
+            book.save()
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        # 3 never-reconciled: Checking + Visa + Mastercard.
+        assert "3 accounts never reconciled ⚠" in recon
+        # None named individually.
+        assert "Visa: never reconciled" not in recon
+        assert "Mastercard: never reconciled" not in recon
+
+    def test_stale_individual_alongside_current_and_never_collapse(
+        self, test_book: Path,
+    ):
+        """Three buckets coexist: stale reconciled accounts render
+        individually with their lag; current reconciled accounts
+        collapse; never-reconciled accounts collapse separately.
+        Per-account-distinct info stays per-account; identical-
+        across-accounts info collapses to a count."""
+        gc = GnuCashBook(str(test_book))
+        # Never-reconciled bucket: add Visa with activity, no recon.
+        gc.create_account(
+            name="Visa", account_type="CREDIT", parent="Liabilities",
+        )
+        with gc.open(readonly=False) as book:
+            visa = gc._find_account(book, "Liabilities:Visa")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Visa charge",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=visa, value=Decimal("-50")),
+                    piecash.Split(account=opening, value=Decimal("50")),
+                ],
+            ))
+            book.save()
+        # Current bucket: Checking gets a recent reconciled split.
+        recent = date.today() - timedelta(days=5)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Recent reconciled deposit",
+                post_date=recent,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            ))
+            book.save()
+        self._reconcile_split(gc, "Assets:Checking", recent)
+        # Stale bucket: add Mortgage with an old reconciled split.
+        gc.create_account(
+            name="Mortgage", account_type="LIABILITY", parent="Liabilities",
+        )
+        old = date.today() - timedelta(days=120)
+        with gc.open(readonly=False) as book:
+            mortgage = gc._find_account(book, "Liabilities:Mortgage")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Mortgage opening",
+                post_date=old,
+                splits=[
+                    piecash.Split(account=mortgage, value=Decimal("-1000")),
+                    piecash.Split(account=opening, value=Decimal("1000")),
+                ],
+            ))
+            book.save()
+        self._reconcile_split(gc, "Liabilities:Mortgage", old)
+
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        # Stale: by-name with months-behind warning.
+        assert "Mortgage:" in recon
+        assert "months behind" in recon
+        # Current: 1 (Checking), no per-account line.
+        assert "1 account current" in recon
+        assert f"Checking: through {recent.isoformat()}" not in recon
+        # Never: 1 (Visa).
+        assert "1 account never reconciled ⚠" in recon
+        assert "Visa: never reconciled" not in recon
+
+    def test_current_pluralizes(self, test_book: Path):
+        """Multiple current accounts → '<N> accounts current' with
+        plural 's'. Symmetric grammar with the never-reconciled
+        bucket."""
+        gc = GnuCashBook(str(test_book))
+        # Add a second BANK account.
+        gc.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        recent = date.today() - timedelta(days=5)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            savings = gc._find_account(book, "Assets:Savings")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Checking deposit",
+                post_date=recent,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            ))
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Savings deposit",
+                post_date=recent,
+                splits=[
+                    piecash.Split(account=savings, value=Decimal("200")),
+                    piecash.Split(account=opening, value=Decimal("-200")),
+                ],
+            ))
+            book.save()
+        self._reconcile_split(gc, "Assets:Checking", recent)
+        self._reconcile_split(gc, "Assets:Savings", recent)
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        assert "2 accounts current" in recon
+
+    def test_unused_account_skipped(self, test_book: Path):
+        """A reconcilable account with no transaction activity is
+        not 'behind' — it's just unused. It shouldn't appear in
+        the Reconciliation section at all."""
+        gc = GnuCashBook(str(test_book))
+        # Add a brand-new credit card account with no transactions.
+        gc.create_account(
+            name="Unused Card",
+            account_type="CREDIT",
+            parent="Liabilities",
+        )
+        result = gc.get_book_summary()
+        # Section exists (Checking has activity), but the unused
+        # card must not be in it.
+        recon = result.split("Reconciliation:")[1].split("\n", 1)[1]
+        # Stop at the next top-level section (no leading whitespace).
+        recon_block = recon.split("\nTransactions:")[0]
+        assert "Unused Card" not in recon_block
+
+    def test_income_expense_equity_excluded(self, test_book: Path):
+        """Reconciliation only applies to BANK / CREDIT / LIABILITY
+        (and qualifying ASSETs). Income / Expense / Equity accounts
+        never appear regardless of activity."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        for excluded in ("Salary", "Groceries", "Opening Balance"):
+            assert excluded not in recon
+
+    def test_section_omitted_when_no_reconcilable_activity(
+        self, tmp_path: Path,
+    ):
+        """A book with only INCOME/EXPENSE/EQUITY accounts (no BANK,
+        no CREDIT, no LIABILITY with activity) emits no
+        Reconciliation section — not even the header."""
+        # Build a minimal book with only non-reconcilable account
+        # types.
+        book_path = tmp_path / "no_reconcilable.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        income = piecash.Account(
+            name="Income", type="INCOME", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        book.session.add(income)
+        salary = piecash.Account(
+            name="Salary", type="INCOME", parent=income, commodity=usd,
+        )
+        book.session.add(salary)
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        book.session.add(equity)
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        book.session.add(opening)
+        book.save()
+        book.close()
+
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        assert "Reconciliation:" not in result
+
+    def test_asset_with_reconciled_history_included(
+        self, test_book: Path,
+    ):
+        """ASSET accounts with any reconciled history surface — the
+        spec calls out brokerage cash, escrow, prepaid as legitimate
+        ASSET-typed reconcilable accounts.
+
+        Use a stale reconciliation date so the brokerage shows up
+        by name (the stale bucket renders individually). A current
+        ASSET would collapse into the count and we couldn't prove
+        the filter let it through."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Brokerage Cash", account_type="ASSET", parent="Assets",
+        )
+        old = date.today() - timedelta(days=120)
+        with gc.open(readonly=False) as book:
+            broker = gc._find_account(book, "Assets:Brokerage Cash")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            t = piecash.Transaction(
+                currency=book.default_currency,
+                description="Initial brokerage deposit",
+                post_date=old,
+                splits=[
+                    piecash.Split(account=broker, value=Decimal("1000")),
+                    piecash.Split(account=opening, value=Decimal("-1000")),
+                ],
+            )
+            book.session.add(t)
+            book.save()
+        self._reconcile_split(gc, "Assets:Brokerage Cash", old)
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        # Stale ASSET surfaces individually.
+        assert "Brokerage Cash" in recon
+        assert "months behind" in recon
+
+    def test_asset_without_reconciled_history_excluded(
+        self, test_book: Path,
+    ):
+        """ASSET accounts with no 'y' or 'c' history are skipped —
+        most ASSET accounts (real estate, vehicles, investment
+        positions) don't get reconciled and shouldn't surface."""
+        gc = GnuCashBook(str(test_book))
+        # ASSET-typed account with activity but no reconciled splits.
+        gc.create_account(
+            name="Vehicle", account_type="ASSET", parent="Assets",
+        )
+        with gc.open(readonly=False) as book:
+            vehicle = gc._find_account(book, "Assets:Vehicle")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            t = piecash.Transaction(
+                currency=book.default_currency,
+                description="Vehicle purchase",
+                post_date=date(2024, 1, 1),
+                splits=[
+                    piecash.Split(account=vehicle, value=Decimal("15000")),
+                    piecash.Split(account=opening, value=Decimal("-15000")),
+                ],
+            )
+            book.session.add(t)
+            book.save()
+        result = gc.get_book_summary()
+        recon = result.split("Reconciliation:")[1].split("\nTransactions:")[0]
+        assert "Vehicle" not in recon
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 
