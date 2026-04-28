@@ -6585,7 +6585,7 @@ class TestSpendingByCategory:
         """Should return spending breakdown."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
         )
@@ -6599,7 +6599,7 @@ class TestSpendingByCategory:
         """Should return zero for period with no transactions."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2020, 1, 1),
             end_date=date(2020, 1, 31),
         )
@@ -6615,7 +6615,7 @@ class TestIncomeBySource:
         """Should return income breakdown."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.income_by_source(
+        result = gc_book.income_by_source(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
         )
@@ -7127,7 +7127,7 @@ class TestMultiCurrencyBalances:
     def test_spending_by_category_uses_quantity(self, multi_currency_book: Path):
         """Expense reporting should use quantity."""
         gc_book = GnuCashBook(str(multi_currency_book))
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             depth=2,
@@ -7139,7 +7139,7 @@ class TestMultiCurrencyBalances:
     def test_income_by_source_uses_quantity(self, multi_currency_book: Path):
         """Income reporting should use quantity."""
         gc_book = GnuCashBook(str(multi_currency_book))
-        result = gc_book.income_by_source(
+        result = gc_book.income_by_source(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             depth=2,

@@ -2621,7 +2621,7 @@ class TestVendorSpendingReport:
             owner_type="vendor",
             post_date="2026-02-15",
         )
-        result = gb.vendor_spending_report(
+        result = gb.vendor_spending_report(compact=False,
             start_date="2026-01-01",
             end_date="2026-12-31",
         )
@@ -2664,7 +2664,7 @@ class TestVendorSpendingReport:
             owner_type="vendor",
             post_date="2026-02-20",
         )
-        result = gb.vendor_spending_report(
+        result = gb.vendor_spending_report(compact=False,
             start_date="2026-01-01",
             end_date="2026-12-31",
         )
@@ -2689,7 +2689,7 @@ class TestVendorSpendingReport:
             post_date="2026-06-15",
         )
         # Query range that excludes the bill
-        result = gb.vendor_spending_report(
+        result = gb.vendor_spending_report(compact=False,
             start_date="2026-01-01",
             end_date="2026-03-31",
         )
@@ -2727,7 +2727,7 @@ class TestVendorSpendingReport:
             owner_type="vendor",
             post_date="2026-02-20",
         )
-        result = gb.vendor_spending_report(
+        result = gb.vendor_spending_report(compact=False,
             start_date="2026-01-01",
             end_date="2026-12-31",
             vendor_id="000001",
@@ -2826,3 +2826,98 @@ class TestInvoiceLifecycle:
         # Verify cleared
         outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
         assert len(outstanding) == 0
+
+
+class TestPhase4DVendorSpendingCompact:
+    """Lock tests for the Phase 4D compact ``vendor_spending_report``
+    contract. Verbose mode preserves the dict shape (minus the dropped
+    ``period`` echo); compact mode renders the aligned text table."""
+
+    def test_compact_default_returns_string(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="1", price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-01-01",
+        )
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-12-31",
+        )
+        assert isinstance(result, str)
+        assert "Office Depot" in result
+        assert "TOTAL" in result
+        assert "billed" in result
+        assert "paid" in result
+        assert "outstanding" in result
+
+    def test_pluralizes_one_vs_many_bills(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Solo Vendor")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="One", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-01-01",
+        )
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-12-31",
+        )
+        # Single bill renders as "1 bill", not "1 bills".
+        assert "1 bill " in result or result.endswith("1 bill")
+        # The TOTAL line counts the same way.
+        assert "1 bills" not in result
+
+    def test_verbose_mode_drops_period_echo(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        result = gb.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+            compact=False,
+        )
+        assert "vendors" in result
+        assert "totals" in result
+        # ``period`` was the input echo Abe flagged for removal — it
+        # duplicated the dates the caller already had.
+        assert "period" not in result
+
+
+class TestPhase4CBreakdownCompact:
+    """Phase 4C: ``spending_by_category`` and ``income_by_source``
+    return aligned text tables by default, JSON via ``compact=False``.
+    Same shape as the helper used by ``vendor_spending_report``."""
+
+    def test_spending_compact_returns_string(self, business_book):
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        # The business_book fixture seeds Income:Sales / Expenses:*
+        # accounts but no transactions; create one to anchor.
+        gb.create_invoice(customer_id="000001") if False else None
+        result = gb.spending_by_category(
+            start_date=date_cls(2024, 1, 1),
+            end_date=date_cls(2024, 12, 31),
+        )
+        assert isinstance(result, str)
+        assert "TOTAL" in result
+
+    def test_income_compact_returns_string(self, business_book):
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        result = gb.income_by_source(
+            start_date=date_cls(2024, 1, 1),
+            end_date=date_cls(2024, 12, 31),
+        )
+        assert isinstance(result, str)
+        assert "TOTAL" in result

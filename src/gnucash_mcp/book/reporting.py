@@ -39,6 +39,53 @@ _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
 
 
+def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> str:
+    """Render a category/source breakdown as a compact aligned table.
+
+    Format::
+
+        Business              22,336.90  39.3%
+        Taxes                  9,479.04  16.7%
+        ...
+        TOTAL                 56,944.26
+
+    Account names render as their leaf component when unambiguous —
+    spending breakdowns at depth=1 typically yield "Expenses:Business",
+    "Expenses:Taxes", etc., which all share the "Expenses:" prefix and
+    read better with the prefix stripped. Width-padded so the amount /
+    percent columns align.
+    """
+    if not rows:
+        return f"TOTAL  {total:,.2f}"
+
+    # Strip a common leading "Expenses:" / "Income:" prefix when every
+    # row shares it. This keeps the leaf-name column readable without
+    # losing information for mixed-source breakdowns (where the prefix
+    # is heterogeneous and we should keep the full path).
+    full_names = [r[label_key] for r in rows]
+    common_prefix = ""
+    if full_names and ":" in full_names[0]:
+        candidate = full_names[0].split(":")[0] + ":"
+        if all(n.startswith(candidate) for n in full_names):
+            common_prefix = candidate
+    leaves = [n[len(common_prefix):] for n in full_names]
+
+    name_width = max(len(n) for n in leaves) if leaves else 0
+    amount_strs = [f"{Decimal(r['amount']):,.2f}" for r in rows]
+    amount_width = max(len(a) for a in amount_strs) if amount_strs else 0
+
+    lines = []
+    for leaf, row, amt_str in zip(leaves, rows, amount_strs):
+        percent = row.get("percent", "0")
+        lines.append(
+            f"{leaf:<{name_width}}  {amt_str:>{amount_width}}  {percent}%"
+        )
+    lines.append(
+        f"{'TOTAL':<{name_width}}  {total:>{amount_width},.2f}"
+    )
+    return "\n".join(lines)
+
+
 def _money_compact(value: Decimal) -> str:
     """Format a dollar amount for compact-mode reports.
 
@@ -319,16 +366,21 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
         depth: int = 1,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get spending breakdown by expense category.
 
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
             depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+            compact: If True (default), return an aligned text table
+                     suitable for direct LLM consumption (Phase 4C).
+                     Verbose mode returns the structured dict.
 
         Returns:
-            Dict with period, total, and category breakdown.
+            If compact: string with one line per category plus a TOTAL.
+            If not compact: dict with ``total`` and ``categories`` list.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -366,6 +418,8 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
 
+            if compact:
+                return _format_breakdown_tsv(categories, total, "account")
             # period is an input echo — LLM supplied start/end dates.
             return {
                 "total": str(total),
@@ -377,16 +431,21 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
         depth: int = 1,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get income breakdown by source.
 
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
             depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+            compact: If True (default), return an aligned text table
+                     suitable for direct LLM consumption (Phase 4C).
+                     Verbose mode returns the structured dict.
 
         Returns:
-            Dict with period, total, and source breakdown.
+            If compact: string with one line per source plus a TOTAL.
+            If not compact: dict with ``total`` and ``sources`` list.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -425,6 +484,8 @@ class ReportingMixin:
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
 
+            if compact:
+                return _format_breakdown_tsv(sources, total, "account")
             # period is an input echo — LLM supplied start/end dates.
             return {
                 "total": str(total),
@@ -578,6 +639,8 @@ class ReportingMixin:
                         })
                 return rows
 
+            # as_of_date is also an input echo, but it's cheap and
+            # useful when a log is reviewed out of context. `balanced`
             # ``balanced`` is derivable (assets == liabilities + equity)
             # and was dropped in an earlier audit pass. Rollup totals
             # flow through ``_format_number`` (2 decimals, currency
@@ -884,7 +947,16 @@ class ReportingMixin:
                      programmatic consumers.
 
         Returns:
-            If compact: text summary (kill order + YETI line + totals).
+            If compact: text summary, e.g.::
+
+                Kill order ($10,000/mo → debt-free Apr 2030, $59,022 interest):
+                  1. Business Amex    $13,091  24.49%  payoff: mo 8   interest: $1,125
+                  2. Chase Sapphire   $22,127  21.49%  payoff: mo 18  interest: $5,034
+                  ...
+                YETI at this budget: 1.59x ($1 spent costs $1.59 in total debt impact)
+                Total interest: $59,022
+                Debt-free: April 2030
+
             If not compact: dict with the original full structure.
 
         Raises:

@@ -617,21 +617,29 @@ def register(mcp, get_book) -> None:
         start_date: str,
         end_date: str,
         vendor_id: str | None = None,
+        verbose: bool = False,
     ) -> str:
         """Get spending breakdown by vendor for a period.
 
         Analyzes posted vendor bills to show total billed, total paid,
         and outstanding amounts per vendor.
 
+        Returns a compact aligned text table by default. Use verbose=true
+        for the full structured dict (programmatic consumers).
+
         Args:
             start_date: Start of period (YYYY-MM-DD).
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to a specific vendor.
+            verbose: If true, return the structured dict.
         """
         book = get_book()
         result = book.vendor_spending_report(
             start_date=start_date,
             end_date=end_date,
             vendor_id=vendor_id,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result

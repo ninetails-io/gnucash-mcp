@@ -16,21 +16,29 @@ def register(mcp, get_book) -> None:
         start_date: str,
         end_date: str,
         depth: int = 1,
+        verbose: bool = False,
     ) -> str:
         """Get spending breakdown by expense category for a period.
+
+        Returns a compact aligned text table by default. Use verbose=true
+        for the full structured dict (programmatic consumers, plotting).
 
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+            verbose: If true, return the structured dict.
         """
         book = get_book()
         result = book.spending_by_category(
             start_date=date.fromisoformat(start_date),
             end_date=date.fromisoformat(end_date),
             depth=depth,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
@@ -39,21 +47,29 @@ def register(mcp, get_book) -> None:
         start_date: str,
         end_date: str,
         depth: int = 1,
+        verbose: bool = False,
     ) -> str:
         """Get income breakdown by source for a period.
+
+        Returns a compact aligned text table by default. Use verbose=true
+        for the full structured dict.
 
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
+            verbose: If true, return the structured dict.
         """
         book = get_book()
         result = book.income_by_source(
             start_date=date.fromisoformat(start_date),
             end_date=date.fromisoformat(end_date),
             depth=depth,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
@@ -133,7 +149,10 @@ def register(mcp, get_book) -> None:
 
         Returns a compact text summary by default — kill order with
         balances/APRs/payoff months, YETI line, totals, debt-free date.
-        Use verbose=true for the full structured dict.
+        Use verbose=true for the full structured dict (per-account
+        ``interest_paid`` / ``credit_limit`` / ``minimum_payment``,
+        plus the structured ``yeti`` block) suitable for programmatic
+        consumers.
 
         YETI (Your Expense's True Impact) shows the true cost of a purchase when
         carrying debt: "A $1.00 purchase will cost you $1.68 by the time your
@@ -142,7 +161,8 @@ def register(mcp, get_book) -> None:
         Args:
             monthly_budget: Total monthly amount available for all debt payments combined
             additional_purchase: Dollar amount to calculate YETI for (default "1.00")
-            verbose: If true, return the full structured dict.
+            verbose: If true, return the full structured dict instead
+                     of the compact text summary.
         """
         book = get_book()
         result = book.debt_payoff_plan(
