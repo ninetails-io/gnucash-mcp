@@ -27,6 +27,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.book._base import _to_decimal
+from gnucash_mcp._format import _format_number
 
 # Account-type groups used across the reports. Defined at module level
 # so the SQL IN() clauses share a single canonical definition rather
@@ -457,7 +458,12 @@ class ReportingMixin:
                 account_types=all_types,
             )
 
-            balances: dict[str, tuple[str, Decimal]] = {}
+            # Track per-account: (acct_type, USD-converted balance,
+            # commodity-quantity, account ref). The quantity / commodity
+            # bits are needed to render the "230.7600 VTSAX @ 156.23
+            # (USD 36,043.66)" triplet for non-default-currency accounts
+            # (Phase 4B). Currency-default accounts ignore that detail.
+            balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
                 # Value the split in the book's default currency so
@@ -473,57 +479,127 @@ class ReportingMixin:
                     net_income -= amt
                     continue
                 key = account.fullname
-                current_type, current_bal = balances.get(
-                    key, (account.type, Decimal("0"))
-                )
-                balances[key] = (current_type, current_bal + amt)
+                if key not in balances:
+                    balances[key] = {
+                        "type": account.type,
+                        "usd": Decimal("0"),
+                        "quantity": Decimal("0"),
+                        "commodity": account.commodity,
+                    }
+                balances[key]["usd"] += amt
+                balances[key]["quantity"] += split.quantity
 
-            assets: dict[str, Decimal] = {}
-            liabilities: dict[str, Decimal] = {}
-            equity: dict[str, Decimal] = {}
-            for name, (acct_type, balance) in balances.items():
-                if balance == 0:
+            default_currency = self._require_default_currency(book)
+            # Latest market rates keyed by commodity guid — same data
+            # ``_market_value`` in get_book_summary uses for the per-
+            # account display. ``_latest_market_rates`` already excludes
+            # piecash auto-created ``type='transaction'`` prices.
+            latest_rates = self._latest_market_rates(book)
+
+            assets: dict[str, dict] = {}
+            liabilities: dict[str, dict] = {}
+            equity: dict[str, dict] = {}
+            for name, info in balances.items():
+                bal = info["usd"]
+                if bal == 0:
                     continue
-                if acct_type in _ASSET_TYPES:
-                    assets[name] = balance
-                elif acct_type in _LIABILITY_TYPES:
-                    # Liabilities stored negative; display positive.
-                    liabilities[name] = -balance
-                elif acct_type in _EQUITY_TYPES:
-                    equity[name] = -balance
+                if info["type"] in _ASSET_TYPES:
+                    assets[name] = info
+                elif info["type"] in _LIABILITY_TYPES:
+                    info["usd"] = -bal  # display positive
+                    info["quantity"] = -info["quantity"]
+                    liabilities[name] = info
+                elif info["type"] in _EQUITY_TYPES:
+                    info["usd"] = -bal
+                    info["quantity"] = -info["quantity"]
+                    equity[name] = info
 
-            assets_total = sum(assets.values()) if assets else Decimal("0")
+            assets_total = (
+                sum(i["usd"] for i in assets.values())
+                if assets else Decimal("0")
+            )
             liabilities_total = (
-                sum(liabilities.values()) if liabilities else Decimal("0")
+                sum(i["usd"] for i in liabilities.values())
+                if liabilities else Decimal("0")
             )
             equity_total = (
-                (sum(equity.values()) if equity else Decimal("0"))
+                (sum(i["usd"] for i in equity.values()) if equity else Decimal("0"))
                 + net_income
             )
 
-            def format_accounts(accounts_dict: dict[str, Decimal]) -> list[dict]:
-                return [
-                    {"account": name, "balance": str(bal)}
-                    for name, bal in sorted(accounts_dict.items())
-                ]
+            def format_accounts(accounts_dict: dict[str, dict]) -> list[dict]:
+                """Render each account row with the right balance shape.
 
-            # as_of_date is also an input echo, but it's cheap and
-            # useful when a log is reviewed out of context. `balanced`
-            # is derivable (assets == liabilities + equity); dropped.
+                Currency-default accounts:
+                  ``{"account": name, "balance": "5234.56"}``.
+                  No ``usd_value`` — it would just repeat ``balance``.
+
+                Non-currency accounts (STOCK / MUTUAL / FUND): the
+                ``balance`` field shows the human-readable triplet
+                ``"230.7600 VTSAX @ 156.23 (USD 36,043.66)"`` — same
+                format ``get_book_summary`` uses — and ``usd_value``
+                carries the parseable number rounded to 2 decimals so
+                programmatic callers don't have to parse the triplet.
+
+                All numeric outputs flow through ``_format_number``
+                (currency-style: 2 decimals always padded). Pre-fix
+                the per-account values leaked Decimal precision noise
+                (e.g. ``"612011.489832"``) into responses.
+                """
+                rows = []
+                for name, info in sorted(accounts_dict.items()):
+                    commodity = info["commodity"]
+                    usd_rounded = _format_number(info["usd"], decimals=2)
+                    if commodity == default_currency:
+                        rows.append({
+                            "account": name,
+                            "balance": usd_rounded,
+                        })
+                    else:
+                        rate = latest_rates.get(commodity.guid)
+                        sym = commodity.mnemonic
+                        qty = info["quantity"]
+                        if rate is not None:
+                            balance_str = (
+                                f"{qty} {sym} @ {rate} "
+                                f"(USD {info['usd']:,.2f})"
+                            )
+                        else:
+                            # No price on file — fall back to cost basis
+                            # already accumulated in ``info['usd']``.
+                            balance_str = (
+                                f"{qty} {sym} (USD {info['usd']:,.2f}, "
+                                f"no price data)"
+                            )
+                        rows.append({
+                            "account": name,
+                            "balance": balance_str,
+                            "usd_value": usd_rounded,
+                        })
+                return rows
+
+            # ``balanced`` is derivable (assets == liabilities + equity)
+            # and was dropped in an earlier audit pass. Rollup totals
+            # flow through ``_format_number`` (2 decimals, currency
+            # style) so the response no longer leaks Decimal precision
+            # noise like ``"612011.489832"``.
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {
-                    "total": str(assets_total),
+                    "total": _format_number(assets_total, decimals=2),
                     "accounts": format_accounts(assets),
                 },
                 "liabilities": {
-                    "total": str(liabilities_total),
+                    "total": _format_number(liabilities_total, decimals=2),
                     "accounts": format_accounts(liabilities),
                 },
                 "equity": {
-                    "total": str(equity_total),
+                    "total": _format_number(equity_total, decimals=2),
                     "accounts": format_accounts(equity) + (
-                        [{"account": "Retained Earnings", "balance": str(net_income)}]
+                        [{
+                            "account": "Retained Earnings",
+                            "balance": _format_number(net_income, decimals=2),
+                        }]
                         if net_income != 0 else []
                     ),
                 },
