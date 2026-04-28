@@ -93,7 +93,10 @@ class TestListAccountsTool:
         result = server_module.list_accounts(root="Expenses")
         lines = result.strip().split("\n")
         for line in lines:
-            assert line.startswith("Expenses")
+            # Compact line format: '%shortguid<TAB>fullname [ANNOTATION]'.
+            # Pull the path portion off before checking the prefix.
+            path = line.split("\t", 1)[1] if "\t" in line else line
+            assert path.startswith("Expenses")
 
     def test_list_accounts_root_with_verbose(self, setup_book_env):
         """root + verbose should return filtered JSON."""

@@ -1879,6 +1879,15 @@ class CoreMixin:
     ) -> list[dict] | str:
         """List all accounts in the chart of accounts.
 
+        Compact output emits one ``%shortguid<TAB>fullname [ANNOTATION]``
+        line per account. The short GUID is the LLM's compact handle
+        for re-referencing the account in subsequent tool calls — much
+        cheaper than re-quoting a long path like
+        ``"Assets:Current Assets:Savings Account"`` every time. Tools
+        that accept an account reference resolve ``%xxxxxxx``, full
+        GUIDs, and paths interchangeably via
+        :meth:`BaseGnuCashBook._resolve_account`.
+
         Args:
             root: Optional root account path to filter to a subtree.
                   E.g., "Expenses" returns only Expenses and descendants.
@@ -1887,8 +1896,10 @@ class CoreMixin:
                      the full list of account dicts.
 
         Returns:
-            If compact: newline-separated string of account lines.
-            If not compact: flat list of account dicts with full paths.
+            If compact: newline-separated string. Each line is
+                ``"%shortguid<TAB>fullname [ANNOTATION]"``.
+            If not compact: flat list of account dicts with full paths
+                and full GUIDs.
         """
         with self.open(readonly=True) as book:
             # Hide scheduled-transaction template accounts — they live
@@ -1911,7 +1922,14 @@ class CoreMixin:
             filtered.sort(key=lambda a: a.fullname)
 
             if compact:
-                lines = [_account_to_compact_line(a) for a in filtered]
+                # Build the short-guid map across the *whole* book so
+                # prefixes are unambiguous against every resolvable
+                # account, not just the (possibly filtered) subset.
+                short_map = self._account_short_guid_map(book)
+                lines = [
+                    f"{short_map[a.guid]}\t{_account_to_compact_line(a)}"
+                    for a in filtered
+                ]
                 return "\n".join(lines)
             else:
                 return [_account_to_dict(a) for a in filtered]
