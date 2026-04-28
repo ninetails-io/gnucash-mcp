@@ -25,7 +25,7 @@ the one extracted-to-core dependency in the whole tree.
 """
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import piecash
@@ -419,6 +419,13 @@ class CoreMixin:
             for anchor_date, label in anchors
         ]
 
+    # Budget overspend warning threshold. Variance over +10% (used%
+    # ahead of elapsed%) earns a ⚠ marker — under that, the user
+    # is "on pace" or close enough; the threshold gives some
+    # breathing room for the lumpy spending patterns most household
+    # budgets exhibit.
+    _BUDGET_WARN_VARIANCE_PCT = 10
+
     # Runway warning threshold. < 60 days earns a ⚠ marker — that's
     # roughly two months, the window where a household should be
     # actively concerned about cash position rather than just
@@ -456,6 +463,143 @@ class CoreMixin:
     # as BANK and it will count; the structural type is honored as
     # the source of truth.
     _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
+
+    def _budget_headline(self, book: piecash.Book) -> dict | None:
+        """One-line headline for the budget covering today, if any.
+        Implements GET_BOOK_SUMMARY_SPEC §6.
+
+        Surface logic: pick the budget whose period range includes
+        today; if multiple match, prefer the one with the latest
+        start date (= most recently effective). Books with no
+        budgets — or no budget covering today — get None and the
+        caller omits the section.
+
+        piecash's Budget rows don't carry a ``last_modified``
+        timestamp the spec's "most recently updated" wording
+        suggested; the fallback the spec calls out — "use the
+        budget whose period range includes the current date" — is
+        what's implemented. This is the right behavior for the
+        common case anyway: the user cares about the budget
+        currently being lived inside.
+
+        Returns ``{name, used_pct, elapsed_pct, variance_pct}``
+        with percentages as Decimals (already quantized to whole
+        numbers; caller renders).
+
+        - ``used_pct`` = sum of actuals in budgeted accounts ÷
+          sum of budget targets × 100
+        - ``elapsed_pct`` = (today − period_start + 1) ÷
+          (period_end − period_start + 1) × 100
+        - ``variance_pct`` = used_pct − elapsed_pct (positive =
+          spending ahead of pace; caller renders + sign and ⚠
+          marker at the configured threshold).
+
+        Actuals come straight from EXPENSE / INCOME splits in the
+        budgeted accounts themselves (no parent rollup). The full
+        budget report — which does roll children up to budgeted
+        ancestors — is a separate tool the LLM can call for
+        category-level detail. The headline trades that detail for
+        a single-line summary the LLM can reference proactively
+        ("you're 11% over pace; want me to identify which
+        categories are driving it?").
+        """
+        from piecash.budget import Budget
+
+        budgets = book.session.query(Budget).all()
+        if not budgets:
+            return None
+
+        from dateutil.relativedelta import relativedelta
+
+        today = date.today()
+        candidate = None
+        for b in budgets:
+            rec = b.recurrence
+            period_start = rec.recurrence_period_start
+            if isinstance(period_start, datetime):
+                period_start = period_start.date()
+
+            period_type = rec.recurrence_period_type
+            mult = rec.recurrence_mult
+            num_periods = b.num_periods
+            if period_type == "month":
+                period_end = (
+                    period_start
+                    + relativedelta(months=mult * num_periods)
+                    - timedelta(days=1)
+                )
+            elif period_type == "week":
+                period_end = (
+                    period_start
+                    + timedelta(weeks=mult * num_periods)
+                    - timedelta(days=1)
+                )
+            else:
+                # Unknown recurrence type — skip.
+                continue
+
+            if period_start <= today <= period_end:
+                if candidate is None or period_start > candidate["start"]:
+                    candidate = {
+                        "budget": b,
+                        "start": period_start,
+                        "end": period_end,
+                    }
+
+        if candidate is None:
+            return None
+
+        budget = candidate["budget"]
+        period_start = candidate["start"]
+        period_end = candidate["end"]
+
+        # Sum budget targets across all (account, period) pairs.
+        # BudgetAmount.amount is a Decimal already.
+        total_budgeted = Decimal("0")
+        budgeted_account_guids: set[str] = set()
+        for ba in budget.amounts:
+            total_budgeted += Decimal(str(ba.amount))
+            budgeted_account_guids.add(ba.account.guid)
+
+        if total_budgeted <= 0:
+            return None
+
+        # Actuals: iterate transactions in the budget's date range
+        # once, accumulating EXPENSE positives and INCOME absolute-
+        # value flows for splits in budgeted accounts. INCOME is
+        # stored negative; flip to a positive contribution to match
+        # the spend-vs-target framing.
+        actuals = Decimal("0")
+        for txn in book.transactions:
+            if txn.post_date < period_start or txn.post_date > period_end:
+                continue
+            for s in txn.splits:
+                if s.account.guid not in budgeted_account_guids:
+                    continue
+                if s.account.type == "EXPENSE" and s.quantity > 0:
+                    actuals += s.quantity
+                elif s.account.type == "INCOME" and s.quantity < 0:
+                    actuals += -s.quantity
+
+        # Period progression.
+        total_days = (period_end - period_start).days + 1
+        elapsed_days = (today - period_start).days + 1
+        elapsed_days = max(0, min(elapsed_days, total_days))
+
+        elapsed_pct = (
+            Decimal(elapsed_days) / Decimal(total_days) * Decimal(100)
+        ).quantize(Decimal("1"))
+        used_pct = (
+            actuals / total_budgeted * Decimal(100)
+        ).quantize(Decimal("1"))
+        variance_pct = used_pct - elapsed_pct
+
+        return {
+            "name": budget.name,
+            "used_pct": used_pct,
+            "elapsed_pct": elapsed_pct,
+            "variance_pct": variance_pct,
+        }
 
     def _runway_metrics(
         self,
@@ -1079,6 +1223,30 @@ class CoreMixin:
                         f"({currency} {liquid:,} liquid / "
                         f"{currency} {burn:,}/day burn)"
                     )
+
+            # Budget headline: one line for the budget covering today.
+            # None = no budget exists or none covers today → omit.
+            # Variance > +10% earns ⚠ (spending ahead of pace).
+            budget = self._budget_headline(book)
+            if budget is not None:
+                used = int(budget["used_pct"])
+                elapsed = int(budget["elapsed_pct"])
+                variance = int(budget["variance_pct"])
+                if variance > 0:
+                    variance_str = f"(+{variance}% over pace)"
+                elif variance < 0:
+                    variance_str = f"({-variance}% under pace)"
+                else:
+                    variance_str = "(on pace)"
+                warn = (
+                    " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT
+                    else ""
+                )
+                lines.append(
+                    f"Budget ({budget['name']}): "
+                    f"{used}% used / {elapsed}% elapsed "
+                    f"{variance_str}{warn}"
+                )
 
             lines.append(f"Transactions: {total_txns}")
 

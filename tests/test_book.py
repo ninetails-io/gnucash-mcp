@@ -1538,6 +1538,181 @@ class TestGetBookSummaryRunway:
         assert "7,170" in runway_line
 
 
+class TestGetBookSummaryBudgetHeadline:
+    """Budget headline section in get_book_summary.
+
+    One line per active budget (the one whose period range covers
+    today). See ``CoreMixin._budget_headline`` and
+    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §6.
+    """
+
+    def _make_budget_covering_today(
+        self,
+        gc: GnuCashBook,
+        name: str = "Test Budget",
+    ) -> str:
+        """Create a 12-month budget anchored to the current year so
+        today falls within its range. Returns the budget name."""
+        gc.create_budget(name=name, year=date.today().year, num_periods=12)
+        return name
+
+    def test_section_omitted_when_no_budgets(self, test_book: Path):
+        """A book with no budgets gets no headline."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Budget (" not in result
+
+    def test_section_omitted_when_no_budget_covers_today(
+        self, test_book: Path,
+    ):
+        """A budget anchored to a year that doesn't include today
+        is skipped — there's no budget the user is currently
+        living inside."""
+        gc = GnuCashBook(str(test_book))
+        # Anchor budget to 2020, which doesn't include today.
+        gc.create_budget(
+            name="Stale 2020", year=2020, num_periods=12,
+        )
+        result = gc.get_book_summary()
+        assert "Budget (" not in result
+
+    def test_section_present_with_active_budget(
+        self, budget_book: Path,
+    ):
+        """Active budget covering today renders a headline line."""
+        gc = GnuCashBook(str(budget_book))
+        name = self._make_budget_covering_today(gc, "Annual Test")
+        gc.set_budget_amount(
+            budget_name=name,
+            account="Expenses:Groceries",
+            amount="500",
+        )
+        result = gc.get_book_summary()
+        assert "Budget (Annual Test):" in result
+
+    def test_format_components(self, budget_book: Path):
+        """Headline format: name, % used, % elapsed, variance,
+        optional ⚠. Currency-free, all percentage values."""
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Test Budget")
+        gc.set_budget_amount(
+            budget_name="Test Budget",
+            account="Expenses:Groceries",
+            amount="500",
+        )
+        result = gc.get_book_summary()
+        budget_line = next(
+            l for l in result.split("\n") if l.startswith("Budget (")
+        )
+        # Format pieces — no currency markers (this is %).
+        assert "% used" in budget_line
+        assert "% elapsed" in budget_line
+        # Either "+X% over pace" / "X% under pace" / "on pace" form.
+        assert (
+            "over pace" in budget_line
+            or "under pace" in budget_line
+            or "on pace" in budget_line
+        )
+
+    def test_overspend_variance_warns_at_10_pct(
+        self, budget_book: Path,
+    ):
+        """Variance > +10% (used% ahead of elapsed% by more than
+        10 points) earns a ⚠ marker."""
+        # Build a fresh budget book where we control exact numbers.
+        gc = GnuCashBook(str(budget_book))
+        # Anchor the budget to start of current year, num_periods=12
+        # → covers ~all of this calendar year.
+        self._make_budget_covering_today(gc, "Overspend")
+        # Tiny budget target → easy to exceed.
+        gc.set_budget_amount(
+            budget_name="Overspend",
+            account="Expenses:Groceries",
+            amount="100",  # $100/month × 12 = $1,200 total
+        )
+        # Big actual spend in the budget's accounts.
+        gc.create_transaction(
+            description="Massive grocery run",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "5000"},
+                {"account": "Assets:Checking", "amount": "-5000"},
+            ],
+            trans_date=date.today(),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        budget_line = next(
+            l for l in result.split("\n") if l.startswith("Budget (")
+        )
+        # Used: 5000 / 1200 = 416% (capped semantically by intent).
+        # Variance vs elapsed = ~416 - elapsed%, well over +10.
+        assert "⚠" in budget_line
+        assert "over pace" in budget_line
+
+    def test_underspend_no_warning(self, budget_book: Path):
+        """Variance ≤ +10% (under pace or close) → no warning marker."""
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Underspend")
+        gc.set_budget_amount(
+            budget_name="Underspend",
+            account="Expenses:Groceries",
+            amount="10000",
+        )
+        # No actuals at all in the budgeted account during the
+        # budget period.
+        result = gc.get_book_summary()
+        budget_line = next(
+            l for l in result.split("\n") if l.startswith("Budget (")
+        )
+        assert "⚠" not in budget_line
+        # 0% used vs ~partial-year% elapsed → "under pace".
+        assert "under pace" in budget_line
+
+    def test_multiple_budgets_picks_latest_start(
+        self, budget_book: Path,
+    ):
+        """When multiple budgets cover today, the headline shows
+        the one with the latest start date — most recently
+        effective."""
+        gc = GnuCashBook(str(budget_book))
+        # Two budgets covering today; one anchored to current year,
+        # the other to a year that started slightly later (still
+        # covering today). The fixture has plenty of history; pick
+        # both to start in this current year.
+        gc.create_budget(
+            name="Older", year=date.today().year - 1, num_periods=24,
+        )
+        gc.create_budget(
+            name="Newer", year=date.today().year, num_periods=12,
+        )
+        # Both need at least one BudgetAmount to qualify.
+        for n in ("Older", "Newer"):
+            gc.set_budget_amount(
+                budget_name=n,
+                account="Expenses:Groceries",
+                amount="100",
+            )
+        result = gc.get_book_summary()
+        budget_line = next(
+            l for l in result.split("\n") if l.startswith("Budget (")
+        )
+        # The Newer budget (starts current year) wins.
+        assert "Newer" in budget_line
+        assert "Older" not in budget_line
+
+    def test_zero_target_budget_omits_section(
+        self, budget_book: Path,
+    ):
+        """A budget with no BudgetAmount rows (or all zero) has
+        nothing to compare actuals against; omit rather than
+        divide by zero."""
+        gc = GnuCashBook(str(budget_book))
+        self._make_budget_covering_today(gc, "Empty")
+        # No set_budget_amount calls — no targets at all.
+        result = gc.get_book_summary()
+        assert "Budget (Empty)" not in result
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 
