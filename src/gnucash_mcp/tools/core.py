@@ -63,7 +63,7 @@ def register(mcp, get_book) -> None:
         """Get details for a specific account by name.
 
         Args:
-            name: Full account name (e.g., 'Assets:Bank:Checking')
+            name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
         """
         book = get_book()
         result = book.get_account(name)
@@ -83,7 +83,7 @@ def register(mcp, get_book) -> None:
         an explicit ``as_of_date`` past today.
 
         Args:
-            account_name: Full account name (e.g., 'Assets:Bank:Checking')
+            account_name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
         """
         book = get_book()
@@ -260,7 +260,8 @@ def register(mcp, get_book) -> None:
             account_type: One of ASSET, BANK, CASH, CREDIT, EQUITY,
                 EXPENSE, INCOME, LIABILITY, MUTUAL, STOCK, RECEIVABLE,
                 PAYABLE.
-            parent: Full path of parent account. Omit for top-level.
+            parent: Parent account ref (full path, %short GUID, or full
+                32-char GUID). Omit for top-level.
             description: Optional description.
             placeholder: Container-only account. Default False.
             commodity: ISO currency code ("USD") or stock/fund symbol
@@ -294,7 +295,7 @@ def register(mcp, get_book) -> None:
         """Update an existing account's properties.
 
         Args:
-            name: Full account path to update (e.g., "Expenses:Groceries")
+            name: Account ref to update (full path e.g. "Expenses:Groceries", %short GUID, or full 32-char GUID)
             new_name: New name for the account (just the leaf name, not full path)
             description: New description
             placeholder: New placeholder status (true = container only)
@@ -320,8 +321,8 @@ def register(mcp, get_book) -> None:
         """Move an account to a new parent in the hierarchy.
 
         Args:
-            name: Full account path to move (e.g., "Expenses:Old:Account")
-            new_parent: Full path of the new parent account (e.g., "Expenses:New")
+            name: Account ref to move (full path e.g. "Expenses:Old:Account", %short GUID, or full 32-char GUID)
+            new_parent: New parent account ref (full path, %short GUID, or full 32-char GUID)
         """
         book = get_book()
         result = book.move_account(name=name, new_parent=new_parent)
@@ -336,7 +337,7 @@ def register(mcp, get_book) -> None:
         Safeguards prevent deletion if the account has children or transactions.
 
         Args:
-            name: Full account path to delete (e.g., "Expenses:Old Category")
+            name: Account ref to delete (full path, %short GUID, or full 32-char GUID)
         """
         book = get_book()
         result = book.delete_account(name=name)
@@ -415,7 +416,7 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
             splits: Complete new set of splits. Each split needs:
-                - 'account' (required): Full account path
+                - 'account' (required): Account ref — full path, %short GUID, or full 32-char GUID
                 - 'amount' (required): Value in transaction currency, as a decimal string
                 - 'quantity' (optional): Amount in account's commodity, as a decimal string.
                   Required if account commodity differs from transaction currency.

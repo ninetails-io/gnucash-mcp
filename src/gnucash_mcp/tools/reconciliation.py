@@ -55,7 +55,7 @@ def register(mcp, get_book) -> None:
         Use verbose=true for full JSON with split GUIDs, amounts, and totals.
 
         Args:
-            account: Full account name (e.g., 'Assets:Bank:Checking')
+            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
             verbose: If true, return full JSON details. Default compact one-line format.
         """
@@ -86,7 +86,7 @@ def register(mcp, get_book) -> None:
         reconciled or none are.
 
         Args:
-            account: Full account name (e.g., 'Assets:Bank:Checking')
+            account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             statement_date: Statement ending date (YYYY-MM-DD)
             statement_balance: Expected balance from statement (as string, e.g., '1234.56')
             split_guids: List of split GUIDs to mark as reconciled (8+ char prefixes accepted)

@@ -181,7 +181,7 @@ def register(mcp, get_book) -> None:
         calculating capital gains when selling.
 
         Args:
-            account: Full path of investment account (e.g., "Assets:Investments:VTSAX").
+            account: Account ref for the investment account: full path (e.g., "Assets:Investments:VTSAX"), %short GUID, or full 32-char GUID.
             title: Lot identifier (e.g., "VTSAX 2026-01-15 purchase").
             notes: Optional notes.
         """
@@ -203,7 +203,7 @@ def register(mcp, get_book) -> None:
         Use verbose=true for full JSON with guid, title, notes, etc.
 
         Args:
-            account: Full path of investment account.
+            account: Account ref (full path, %short GUID, or full 32-char GUID).
             include_closed: If True, include fully-sold lots. Default False.
             verbose: If true, return full JSON details for each lot.
         """

@@ -824,6 +824,11 @@ class BaseGnuCashBook:
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
         """Find an account by its full name path.
 
+        Path-only lookup. For user-supplied input (which may be a path,
+        ``%short`` GUID, or full GUID), call :meth:`_resolve_account`
+        instead. This method is the path-lookup leaf that
+        ``_resolve_account`` falls through to.
+
         Scheduled-transaction template accounts (under
         ``book.root_template``) are never returned — they're GnuCash
         internals, not part of the user's chart of accounts. Callers

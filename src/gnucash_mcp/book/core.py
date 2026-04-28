@@ -1907,6 +1907,15 @@ class CoreMixin:
             # surfaces them in book.accounts), but they're GnuCash
             # internals, not part of the user's chart of accounts.
             template_guids = self._template_account_guids(book)
+
+            # ``root`` accepts a path, ``%short`` GUID, or full GUID.
+            # Normalize to a fullname for the prefix comparisons below.
+            if root is not None and (
+                root.startswith(self._SHORT_ACCOUNT_GUID_PREFIX) or len(root) == 32
+            ):
+                resolved_root = self._resolve_account(book, root)
+                root = resolved_root.fullname if resolved_root else root
+
             filtered = []
             for account in book.accounts:
                 if account.type == "ROOT":
@@ -1944,7 +1953,7 @@ class CoreMixin:
             Account dict if found, None otherwise.
         """
         with self.open(readonly=True) as book:
-            account = self._find_account(book, name)
+            account = self._resolve_account(book, name)
             if account:
                 return _account_to_dict(account)
             return None
@@ -1973,7 +1982,7 @@ class CoreMixin:
         if as_of_date is None:
             as_of_date = date.today()
         with self.open(readonly=True) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
@@ -2026,10 +2035,17 @@ class CoreMixin:
 
         with self.open(readonly=True) as book:
             # If filtering by account, get transactions through that account's splits
+            focus_fullname: str | None = None
             if account:
-                acct = self._find_account(book, account)
+                acct = self._resolve_account(book, account)
                 if not acct:
                     raise ValueError(f"Account not found: {account}")
+                # Capture the canonical fullname for register-form
+                # rendering. _transaction_to_compact_line compares the
+                # focus to ``split.account.fullname``, so passing the
+                # raw input (which may be a ``%short`` GUID) would
+                # silently fall through to the multi-split form.
+                focus_fullname = acct.fullname
                 transactions = {split.transaction for split in acct.splits}
             else:
                 transactions = set(book.transactions)
@@ -2057,7 +2073,7 @@ class CoreMixin:
                 prefixes = _guid_prefix_map(t.guid for t in book.transactions)
                 lines = [
                     _transaction_to_compact_line(
-                        t, focus_account=account, prefixes=prefixes
+                        t, focus_account=focus_fullname, prefixes=prefixes
                     )
                     for t in filtered
                 ]
@@ -2689,7 +2705,7 @@ class CoreMixin:
             piecash_splits = []
             resolved_accounts = []
             for split in splits:
-                account = self._find_account(book, split["account"])
+                account = self._resolve_account(book, split["account"])
                 if not account:
                     raise ValueError(f"Account not found: {split['account']}")
 
@@ -2996,7 +3012,7 @@ class CoreMixin:
                 parent_account = book.root_account
                 parent_label = "root"
             else:
-                parent_account = self._find_account(book, parent)
+                parent_account = self._resolve_account(book, parent)
                 if not parent_account:
                     raise ValueError(f"Parent account not found: {parent}")
                 parent_label = parent
@@ -3095,7 +3111,7 @@ class CoreMixin:
                 change would flip debit/credit polarity.
         """
         with self.open(readonly=False) as book:
-            account = self._find_account(book, name)
+            account = self._resolve_account(book, name)
             if not account:
                 raise ValueError(f"Account not found: {name}")
 
@@ -3167,14 +3183,14 @@ class CoreMixin:
             ValueError: If account or parent not found, or would create cycle.
         """
         with self.open(readonly=False) as book:
-            account = self._find_account(book, name)
+            account = self._resolve_account(book, name)
             if not account:
                 raise ValueError(f"Account not found: {name}")
 
             # Stage pre-move state (fullname derives old parent for log).
             self._stage_audit_before(_account_to_dict(account))
 
-            new_parent_account = self._find_account(book, new_parent)
+            new_parent_account = self._resolve_account(book, new_parent)
             if not new_parent_account:
                 raise ValueError(f"Parent account not found: {new_parent}")
 
@@ -3219,7 +3235,7 @@ class CoreMixin:
             ValueError: If account not found, has children, or has transactions.
         """
         with self.open(readonly=False) as book:
-            account = self._find_account(book, name)
+            account = self._resolve_account(book, name)
             if not account:
                 raise ValueError(f"Account not found: {name}")
 
@@ -3514,7 +3530,7 @@ class CoreMixin:
             resolved_accounts = []
             for split_data in splits:
                 account_name = split_data["account"]
-                account = self._find_account(book, account_name)
+                account = self._resolve_account(book, account_name)
                 if not account:
                     raise ValueError(f"Account not found: {account_name}")
                 if account.placeholder:

@@ -78,7 +78,15 @@ class SplitInput(BaseModel):
         extra="ignore",
     )
 
-    account: Annotated[str, Field(description="Full account path (e.g. 'Expenses:Rent')")]
+    account: Annotated[
+        str,
+        Field(
+            description=(
+                "Account ref: full path (e.g. 'Expenses:Rent'), "
+                "%short GUID (e.g. '%2e78c86'), or full 32-char GUID"
+            )
+        ),
+    ]
     amount: Annotated[
         str,
         Field(description="Value in transaction currency, as a decimal string (e.g. '94.87')"),

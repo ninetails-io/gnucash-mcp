@@ -2956,6 +2956,126 @@ class TestResolveAccount:
                 assert resolved.fullname == path
 
 
+class TestShortGuidEndToEnd:
+    """Each book method that takes an account ref now flows through
+    ``_resolve_account``, so short GUIDs ('%XXXXXXX') and full GUIDs
+    work interchangeably with the original full-path form.
+
+    These tests cover one representative method per mixin to lock in
+    that the wiring is plumbed through end-to-end. Unit-level coverage
+    of the resolver itself lives in ``TestResolveAccount``; this class
+    is the integration sweep.
+    """
+
+    @staticmethod
+    def _short_for(gc_book, fullname: str) -> str:
+        """Resolve a fullname into the '%shortguid' a tool would receive."""
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, fullname)
+            return gc_book._account_short_guid(book, account)
+
+    # --- core ---
+
+    def test_get_balance_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        # Same answer the path-form returns.
+        assert gc_book.get_balance(short) == gc_book.get_balance("Assets:Checking")
+
+    def test_get_account_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_account(short)
+        assert result is not None
+        assert result["fullname"] == "Assets:Checking"
+
+    def test_list_transactions_filter_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.list_transactions(account=short)
+        by_path = gc_book.list_transactions(account="Assets:Checking")
+        assert by_short == by_path
+
+    def test_create_transaction_split_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short_check = self._short_for(gc_book, "Assets:Checking")
+        short_dining = self._short_for(gc_book, "Expenses:Groceries")
+        baseline = gc_book.get_balance("Assets:Checking")
+        gc_book.create_transaction(
+            description="Lunch (split via short GUIDs)",
+            splits=[
+                {"account": short_check, "amount": "-12.50"},
+                {"account": short_dining, "amount": "12.50"},
+            ],
+            check_duplicates=False,
+        )
+        # Posted: balance drops by 12.50 in checking.
+        assert gc_book.get_balance("Assets:Checking") == baseline - Decimal("12.50")
+
+    def test_update_account_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Expenses:Groceries")
+        gc_book.update_account(name=short, description="Renamed via short GUID")
+        # Path lookup confirms the side effect.
+        result = gc_book.get_account("Expenses:Groceries")
+        assert result["description"] == "Renamed via short GUID"
+
+    # --- list_accounts root= ---
+
+    def test_list_accounts_root_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Expenses")
+        by_short = gc_book.list_accounts(root=short)
+        by_path = gc_book.list_accounts(root="Expenses")
+        assert by_short == by_path
+
+    # --- reporting ---
+
+    def test_cash_flow_account_filter_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account=short,
+        )
+        by_path = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account="Assets:Checking",
+        )
+        assert by_short == by_path
+
+    # --- admin (slot CRUD) ---
+
+    def test_set_account_slot_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        gc_book.set_account_slot(short, "color", "blue")
+        # Round-trip through path-form to confirm storage. The book
+        # method returns ``{"account": ..., "slots": {...}}`` — the
+        # nested ``slots`` dict is what we're verifying.
+        result = gc_book.get_account_slots("Assets:Checking")
+        assert result["slots"].get("color") == "blue"
+
+    # --- reconciliation ---
+
+    def test_get_unreconciled_splits_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.get_unreconciled_splits(short)
+        by_path = gc_book.get_unreconciled_splits("Assets:Checking")
+        assert by_short == by_path
+
+    def test_full_guid_also_works(self, test_book: Path):
+        """The third input form (32-char full GUID) round-trips too."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, "Assets:Checking")
+            full_guid = account.guid
+        assert gc_book.get_balance(full_guid) == gc_book.get_balance("Assets:Checking")
+
+
 class TestTemplateAccountsHidden:
     """Scheduled transactions persist their split templates as real
     Account rows under ``book.root_template``. piecash surfaces those

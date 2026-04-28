@@ -400,7 +400,7 @@ class InvestmentsMixin:
         from piecash.core.transaction import Lot
 
         with self.open(readonly=False) as book:
-            acct = self._find_account(book, account)
+            acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
@@ -447,7 +447,7 @@ class InvestmentsMixin:
             ValueError: If account not found.
         """
         with self.open(readonly=True) as book:
-            acct = self._find_account(book, account)
+            acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 

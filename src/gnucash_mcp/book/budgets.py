@@ -364,7 +364,7 @@ class BudgetsMixin:
             if not budget:
                 raise ValueError(f"Budget not found: {budget_name}")
 
-            acct = self._find_account(book, account)
+            acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
@@ -480,7 +480,7 @@ class BudgetsMixin:
             )
 
             if account:
-                filter_acct = self._find_account(book, account)
+                filter_acct = self._resolve_account(book, account)
                 if not filter_acct:
                     raise ValueError(f"Account not found: {account}")
 

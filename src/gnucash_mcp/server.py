@@ -35,14 +35,23 @@ DOUBLE-ENTRY BASICS:
 - Credit card payment example: checking -200 (credit), credit card +200 (debit) — reduces both balances.
 - Income received: checking +3000 (debit), income -3000 (credit).
 
-ACCOUNT PATHS:
-- Always use full paths: "Expenses:Groceries" not "Groceries".
+ACCOUNT REFERENCES:
+- Anywhere a tool takes an account, you can pass a full path
+  ("Expenses:Groceries"), a short GUID ("%2e78c86"), or a full
+  32-char GUID. All three resolve to the same account.
+- Short GUIDs are emitted by list_accounts at the start of each line:
+  "%2e78c86<TAB>Assets:Current Assets:Savings Account [BANK]". Reuse
+  them in subsequent calls — they're ~80% smaller than full paths.
+- Paths remain useful when you're naming a new account or when your
+  reasoning depends on the hierarchy. Short GUIDs win for everything
+  else (transactions, balances, slots, lots, invoices, budgets).
 - Paths are colon-delimited and case-sensitive.
-- When unsure of a path, use list_accounts or get_account to verify.
 
-GUID PREFIXES:
+GUID PREFIXES (transactions, splits, etc.):
 - All tools accepting GUIDs also accept 8+ character prefixes.
 - Use the short prefix from list_transactions output — no need to look up full GUIDs.
+- Account short GUIDs are 7+ hex chars *with* a leading "%" marker.
+  Transaction/split GUID prefixes are bare hex (no marker).
 
 RECONCILIATION WORKFLOW:
 1. list_transactions for the account and date range
