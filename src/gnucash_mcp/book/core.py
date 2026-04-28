@@ -531,14 +531,14 @@ class CoreMixin:
           is skipped — no benchmark to compare against.
         - **Overdue invoices / bills** — posted invoices/bills with
           a non-zero lot balance whose due date is in the past.
-          Due date is read from the ``trans-date-due`` slot on the
-          posting transaction; when that slot is absent (the user
-          posted without specifying due_date), the check falls
-          back to ``date_posted + 30 days`` and annotates the
-          warning with ``(posted without terms)`` so the
-          bookkeeper knows the duration is approximated.
-          Requires BusinessMixin to be loaded for the
-          lot-balance helper; gracefully skipped otherwise.
+          Due date resolution: ``trans-date-due`` slot first, then
+          the invoice's ``terms`` reference, then a ``date_posted +
+          30 days`` default. When the default fires, the warning
+          renders ``N days past 30-day default ... (no term set)``
+          to anchor the days count to its assumption rather than
+          claiming a contractual due date was missed. Requires
+          BusinessMixin to be loaded for the lot-balance helper;
+          gracefully skipped otherwise.
         - **Overdue scheduled** — enabled scheduled transactions
           whose next occurrence is in the past. Uses the
           SchedulingMixin's ``_next_occurrence`` helper when
@@ -707,16 +707,15 @@ class CoreMixin:
                         #    accurate due dates without needing an
                         #    explicit due_date parameter; relying
                         #    only on the slot misses this very
-                        #    common case (Berlin Digital on Alex's
-                        #    book triggered the inconsistency:
-                        #    "55 days overdue (posted without
-                        #    terms)" was reported when the
-                        #    Net-30-derived date was correct).
+                        #    common case.
                         # 3. 30-day default — only when neither
-                        #    slot nor terms reference exists.
-                        #    Annotate the warning so the
-                        #    bookkeeper knows the duration is a
-                        #    guess.
+                        #    slot nor terms reference exists. The
+                        #    rendered warning anchors the days
+                        #    count to the assumption ("N days past
+                        #    30-day default") and tags "(no term
+                        #    set)" so the bookkeeper sees both the
+                        #    duration and the data gap without the
+                        #    string reading as contractual.
                         no_terms = False
                         due_date = None
 
@@ -820,15 +819,32 @@ class CoreMixin:
                             else default_currency.mnemonic
                         )
                         amount_str = f"{int(abs(balance)):,}"
-                        terms_note = (
-                            " (posted without terms)" if no_terms else ""
+                        # When no term and no explicit due_date were
+                        # set, anchor the days count to the assumption
+                        # that produced it ("days past 30-day default")
+                        # rather than to "overdue" — which reads as
+                        # contractual and contradicts "(no term set)".
+                        # Same number, honest framing: the bookkeeper
+                        # sees the invoice has been unpaid past a
+                        # reasonable default AND that no term was
+                        # specified, with no implication that a
+                        # contractual due date was missed.
+                        if no_terms:
+                            msg = (
+                                f"Past due {doc_type}: {owner_name} "
+                                f"{days_overdue} days past 30-day "
+                                f"default, {currency} {amount_str} "
+                                f"(no term set)"
+                            )
+                        else:
+                            msg = (
+                                f"Past due {doc_type}: {owner_name} "
+                                f"{days_overdue} days overdue, "
+                                f"{currency} {amount_str}"
+                            )
+                        overdue_inv_entries.append(
+                            (days_overdue, msg),
                         )
-                        overdue_inv_entries.append((
-                            days_overdue,
-                            f"Past due {doc_type}: {owner_name} "
-                            f"{days_overdue} days overdue, "
-                            f"{currency} {amount_str}{terms_note}",
-                        ))
                     except Exception:
                         continue
                 overdue_inv_entries.sort(reverse=True)
@@ -945,6 +961,9 @@ class CoreMixin:
             except Exception:
                 pass
 
+        # Integrity tier (imbalance/orphan) leads — actual data
+        # corruption that calls every other number into question.
+        # The remaining categories follow in operational urgency.
         return (
             integrity
             + low_cash
@@ -1913,13 +1932,19 @@ class CoreMixin:
             return None
 
     def get_balance(self, account_name: str, as_of_date: date | None = None) -> Decimal:
-        """Get balance for an account, optionally as of a specific date.
+        """Get balance for an account as of a specific date.
 
         Returns raw GnuCash balance (accounting sign convention).
 
+        Defaults to today, so future-dated transactions (scheduled
+        payments, accrued interest, mid-month bills already entered)
+        are excluded. To project a balance forward — including future
+        entries — pass an explicit ``as_of_date`` past today.
+
         Args:
             account_name: Full account path.
-            as_of_date: Date to calculate balance as of. Defaults to all time.
+            as_of_date: Date to calculate balance as of. Defaults to
+                today's date.
 
         Returns:
             Account balance as Decimal.
@@ -1927,6 +1952,8 @@ class CoreMixin:
         Raises:
             ValueError: If account not found.
         """
+        if as_of_date is None:
+            as_of_date = date.today()
         with self.open(readonly=True) as book:
             account = self._find_account(book, account_name)
             if not account:
@@ -1934,7 +1961,7 @@ class CoreMixin:
 
             balance = Decimal("0")
             for split in account.splits:
-                if as_of_date is None or split.transaction.post_date <= as_of_date:
+                if split.transaction.post_date <= as_of_date:
                     balance += split.quantity
 
             return balance

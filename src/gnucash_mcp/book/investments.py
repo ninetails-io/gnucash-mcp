@@ -213,7 +213,7 @@ class InvestmentsMixin:
 
             book.save()
 
-            return {
+            result = {
                 "commodity": commodity,
                 "namespace": namespace,
                 "currency": currency,
@@ -222,6 +222,8 @@ class InvestmentsMixin:
                 "type": price_type,
                 "status": "updated" if existing else "created",
             }
+
+            return result
 
     def get_prices(
         self,

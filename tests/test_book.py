@@ -2453,10 +2453,12 @@ class TestGetBookSummaryWarnings:
     def test_past_due_invoice_without_terms_falls_back_to_30_days(
         self, business_book: Path,
     ):
-        """An invoice posted without an explicit due_date falls
-        back to date_posted + 30 days, with a '(posted without
-        terms)' annotation so the bookkeeper knows the duration
-        is approximated."""
+        """An invoice posted without an explicit due_date AND
+        without a billterm falls back to date_posted + 30 days.
+        The warning anchors the days count to that assumption
+        ('N days past 30-day default') and tags '(no term set)'
+        so the bookkeeper sees both the duration and the data
+        gap without the string reading as contractual."""
         gc = GnuCashBook(str(business_book))
         gc.create_customer(name="No Terms Co", currency="USD")
         gc.create_invoice(
@@ -2470,7 +2472,7 @@ class TestGetBookSummaryWarnings:
             quantity="1",
             price="1500",
         )
-        # post_date 50 days ago + 30-day fallback = 20 days overdue.
+        # post_date 50 days ago + 30-day fallback = 20 days past.
         # No due_date passed → falls back.
         gc.post_invoice(
             invoice_id="000001",
@@ -2484,8 +2486,11 @@ class TestGetBookSummaryWarnings:
         )[0]
         assert "Past due invoice" in warnings_block
         assert "No Terms Co" in warnings_block
-        assert "20 days overdue" in warnings_block
-        assert "(posted without terms)" in warnings_block
+        assert "20 days past 30-day default" in warnings_block
+        assert "(no term set)" in warnings_block
+        # Regression: the old wording shouldn't reappear.
+        assert "20 days overdue" not in warnings_block
+        assert "(posted without terms)" not in warnings_block
 
     def test_past_due_invoice_uses_term_duedays_no_terms_annotation(
         self, business_book: Path,
@@ -2922,6 +2927,40 @@ class TestGetBalance:
 
         with pytest.raises(ValueError, match="Account not found"):
             gc_book.get_balance("Nonexistent:Account")
+
+    def test_get_balance_excludes_future_dated_by_default(self, test_book: Path):
+        """Default (no as_of_date) should treat 'today' as the cutoff,
+        excluding future-dated entries.
+
+        Regression test for the bug where a future-dated paycheck or
+        accrued-interest entry would inflate (or future-dated bill
+        deflate) the displayed balance, misleading planners about
+        what is actually in the account right now.
+        """
+        from datetime import date as date_cls, timedelta
+
+        gc_book = GnuCashBook(str(test_book))
+        baseline = gc_book.get_balance("Assets:Checking")
+
+        # Post a future-dated salary deposit (one year out).
+        future_date = date_cls.today() + timedelta(days=365)
+        gc_book.create_transaction(
+            description="Salary (post-dated, scheduled deposit)",
+            splits=[
+                {"account": "Assets:Checking", "amount": "1000.00"},
+                {"account": "Income:Salary", "amount": "-1000.00"},
+            ],
+            trans_date=future_date,
+        )
+
+        # Default get_balance must NOT include the future entry.
+        assert gc_book.get_balance("Assets:Checking") == baseline
+
+        # Explicit future as_of_date DOES include it.
+        projected = gc_book.get_balance(
+            "Assets:Checking", as_of_date=future_date
+        )
+        assert projected == baseline + Decimal("1000")
 
 
 class TestListTransactions:
