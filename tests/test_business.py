@@ -2279,7 +2279,7 @@ class TestGetOutstandingInvoices:
 
     def test_empty_when_none_posted(self, business_book):
         gb = GnuCashBook(str(business_book))
-        result = gb.get_outstanding_invoices()
+        result = gb.get_outstanding_invoices(compact=False)
         assert result == []
 
     def test_shows_posted_unpaid(self, business_book):
@@ -2297,7 +2297,7 @@ class TestGetOutstandingInvoices:
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
         )
-        result = gb.get_outstanding_invoices()
+        result = gb.get_outstanding_invoices(compact=False)
         assert len(result) == 1
         assert result[0]["id"] == "000001"
         assert Decimal(result[0]["amount_due"]) == Decimal("500")
@@ -2322,7 +2322,7 @@ class TestGetOutstandingInvoices:
             payment_account="Assets:Checking",
             amount="500",
         )
-        result = gb.get_outstanding_invoices()
+        result = gb.get_outstanding_invoices(compact=False)
         assert len(result) == 0
 
     def test_partially_paid_shows_correct_amounts(self, business_book):
@@ -2345,7 +2345,7 @@ class TestGetOutstandingInvoices:
             payment_account="Assets:Checking",
             amount="200",
         )
-        result = gb.get_outstanding_invoices()
+        result = gb.get_outstanding_invoices(compact=False)
         assert len(result) == 1
         assert Decimal(result[0]["amount_due"]) == Decimal("300")
         assert Decimal(result[0]["amount_paid"]) == Decimal("200")
@@ -2378,7 +2378,7 @@ class TestGetOutstandingInvoices:
             invoice_id="000002",
             post_account="Assets:Accounts Receivable",
         )
-        result = gb.get_outstanding_invoices(customer_id="000001")
+        result = gb.get_outstanding_invoices(customer_id="000001", compact=False)
         assert len(result) == 1
         assert result[0]["owner_name"] == "Acme Corp"
 
@@ -2398,9 +2398,167 @@ class TestGetOutstandingInvoices:
             post_account="Liabilities:Accounts Payable",
             owner_type="vendor",
         )
-        result = gb.get_outstanding_invoices(owner_type="vendor")
+        result = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
         assert len(result) == 1
         assert result[0]["type"] == "bill"
+
+
+class TestPhase3CommsContracts:
+    """Lock tests for the comms-audit Phase 3 daily-reads contracts.
+    Future refactors must preserve these shapes — they're what the
+    bookkeeper relies on when scanning invoices and outstanding lists."""
+
+    # ── 3A: get_outstanding_invoices action columns ──────────────
+
+    def test_outstanding_compact_includes_due_date_and_days(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+            due_date="2026-02-01",
+        )
+        compact = gb.get_outstanding_invoices()
+        # Compact output is a string (default mode).
+        assert isinstance(compact, str)
+        assert "Acme Corp" in compact
+        assert "due:2026-02-01" in compact
+        assert "posted:2026-01-01" in compact
+        # By 2026-04-28 (test fixture's "today") this is 86 days past
+        # an explicit due date — no "30-day default" annotation.
+        assert "past due" in compact
+        assert "30-day default" not in compact
+
+    def test_outstanding_compact_no_terms_annotates_default(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+            # no due_date and no billterm — falls back to 30-day default
+        )
+        compact = gb.get_outstanding_invoices()
+        assert "30-day default" in compact
+
+    def test_outstanding_compact_marks_bill_with_tag(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper", quantity="1", price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-01-01",
+        )
+        compact = gb.get_outstanding_invoices(owner_type="vendor")
+        assert "(BILL)" in compact, (
+            f"BILL tag missing from compact output:\n{compact}"
+        )
+        assert "Office Depot" in compact
+
+    def test_outstanding_verbose_mode_returns_dicts(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+        )
+        result = gb.get_outstanding_invoices(compact=False)
+        assert isinstance(result, list)
+        assert result[0]["due_date"] is not None
+        assert result[0]["days_past_due"] is not None
+
+    # ── 3B: list_invoices owner name + amount ────────────────────
+
+    def test_list_invoices_compact_includes_owner_and_amount(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Emerald Analytics")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Q1 retainer", quantity="1", price="3500.00",
+        )
+        compact = gb.list_invoices()
+        assert "Emerald Analytics" in compact
+        # Amount should appear in either USD-prefixed or bare form.
+        assert "3,500" in compact or "3500" in compact
+
+    def test_list_invoices_marks_bill_tag(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="BookkeepingCo")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Bookkeeping", quantity="1", price="450.00",
+        )
+        compact = gb.list_invoices()
+        assert "BILL" in compact
+        assert "BookkeepingCo" in compact
+
+    # ── 3C: get_invoice resolves account paths ───────────────────
+
+    def test_get_invoice_entries_use_account_path_not_guid(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        result = gb.get_invoice(invoice_id="000001")
+        assert "entries" in result
+        assert len(result["entries"]) == 1
+        entry = result["entries"][0]
+        # New shape: ``account`` (path) replaces ``account_guid`` (hex).
+        assert entry.get("account") == "Income:Sales"
+        assert "account_guid" not in entry
+
+    def test_get_invoice_drops_owner_guid_keeps_owner_name(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        result = gb.get_invoice(invoice_id="000001")
+        assert result["owner_name"] == "Acme Corp"
+        assert "owner_guid" not in result
 
 
 # ============== Vendor Spending Report Tests ==============
@@ -2573,7 +2731,7 @@ class TestInvoiceLifecycle:
         assert Decimal(post_result["total"]) == Decimal("1000")
 
         # Verify outstanding
-        outstanding = gb.get_outstanding_invoices()
+        outstanding = gb.get_outstanding_invoices(compact=False)
         assert len(outstanding) == 1
         assert Decimal(outstanding[0]["amount_due"]) == Decimal("1000")
 
@@ -2586,7 +2744,7 @@ class TestInvoiceLifecycle:
         assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
 
         # Verify no longer outstanding
-        outstanding = gb.get_outstanding_invoices()
+        outstanding = gb.get_outstanding_invoices(compact=False)
         assert len(outstanding) == 0
 
     def test_full_bill_lifecycle(self, business_book):
@@ -2616,7 +2774,7 @@ class TestInvoiceLifecycle:
         assert Decimal(post_result["total"]) == Decimal("100")
 
         # Verify outstanding
-        outstanding = gb.get_outstanding_invoices(owner_type="vendor")
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
         assert len(outstanding) == 1
 
         # Pay
@@ -2629,5 +2787,5 @@ class TestInvoiceLifecycle:
         assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
 
         # Verify cleared
-        outstanding = gb.get_outstanding_invoices(owner_type="vendor")
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
         assert len(outstanding) == 0

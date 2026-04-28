@@ -61,6 +61,56 @@ def _is_invoice_posted(inv) -> bool:
     return _safe_date_posted(inv) is not None
 
 
+def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
+    """Render outstanding invoices/bills as a one-line-per-doc string.
+
+    Format per row:
+
+        000028  Berlin Digital GmbH  EUR 4,200  posted:2026-02-01  due:2026-03-03  55 days past due
+        000011  BookkeepingCo (BILL)  USD 450  posted:2026-03-15  due:2026-04-14  13 days past due
+
+    Action columns are the win here: ``due:`` and the days-past-due
+    count tell the bookkeeper exactly which invoice is bleeding the
+    most days, without forcing a separate calculation. ``(BILL)`` is
+    appended to vendor-bill owners so receivables and payables don't
+    get confused at a glance.
+
+    When the due date came from the 30-day default (``no_terms`` flag),
+    the days count is anchored to the assumption ("days past 30-day
+    default") rather than reading as contractual.
+    """
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        owner = r.get("owner_name") or f"#{r['id']}"
+        if r.get("type") == "bill":
+            owner = f"{owner} (BILL)"
+        ccy = r.get("currency") or ""
+        # Strip trailing zeros for compact display: "4200.00" → "4,200".
+        amount_dec = Decimal(r.get("amount_due") or "0")
+        amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
+        posted = r.get("date_posted") or "?"
+        due = r.get("due_date") or "?"
+        days = r.get("days_past_due")
+        if days is None:
+            days_str = ""
+        elif days > 0:
+            anchor = (
+                "30-day default" if r.get("no_terms") else "past due"
+            )
+            days_str = f"  {days} days past {anchor}"
+        elif days == 0:
+            days_str = "  due today"
+        else:
+            days_str = f"  due in {-days} days"
+        lines.append(
+            f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
+            f"posted:{posted}\tdue:{due}{days_str}"
+        )
+    return "\n".join(lines)
+
+
 class BusinessMixin:
     """Customer/vendor/invoice/bill operations."""
 
@@ -414,22 +464,28 @@ class BusinessMixin:
         return num, denom
 
     @staticmethod
-    def _invoice_to_dict(invoice, entries=None) -> dict:
+    def _invoice_to_dict(invoice, entries=None, owner_name: str | None = None) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
-        `owner_type` (numeric 2/4) was redundant with the human-readable
-        `type` field and is dropped. `is_posted` is derivable from
-        `date_posted` (non-null = posted) and is dropped too.
+        ``owner_type`` (numeric 2/4) was redundant with the
+        human-readable ``type`` field and is dropped. ``is_posted``
+        is derivable from ``date_posted`` (non-null = posted) and
+        is dropped too. Phase 3C: ``owner_guid`` (raw 32-char hex)
+        is dropped in favor of ``owner_name`` resolved by the caller
+        — the same readability swap we did for entry account refs.
 
         Args:
             invoice: piecash Invoice object.
             entries: Optional list of entry dicts. If None, entries are not included.
+            owner_name: Resolved customer/vendor name. The static-method
+                shape means we can't query for it here; the caller
+                (``get_invoice``) does the lookup once and threads it.
         """
         result = {
             "guid": invoice.guid,
             "id": invoice.id,
             "type": "bill" if invoice.owner_type == 4 else "invoice",
-            "owner_guid": invoice.owner_guid,
+            "owner_name": owner_name,
             "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
             "date_posted": (
                 str(_safe_date_posted(invoice).date())
@@ -443,21 +499,77 @@ class BusinessMixin:
             result["entries"] = entries
         return result
 
-    @staticmethod
-    def _invoice_to_compact_line(invoice) -> str:
-        """One-line compact: 'id  type  owner_id  date_opened  status'."""
+    def _invoice_to_compact_line(self, book, invoice) -> str:
+        """One-line compact format with action columns:
+
+            ``id  TYPE  owner_name  CCY total  date_opened  status``
+
+        Pre-Phase-3B this rendered as ``"000027  INV  2026-05-01
+        posted"`` — no owner, no amount, useless for scanning. With
+        owner and total in place a bookkeeper can scan a hundred
+        invoices and immediately spot what's outstanding for whom.
+
+        Currency is shown when present so multi-currency books read
+        unambiguously. Bills get the ``BILL`` tag (was already there).
+        """
         inv_type = "BILL" if invoice.owner_type == 4 else "INV"
-        date_str = str(invoice.date_opened.date()) if invoice.date_opened else "n/a"
+        date_str = (
+            str(invoice.date_opened.date())
+            if invoice.date_opened
+            else "n/a"
+        )
         status = "posted" if _is_invoice_posted(invoice) else "open"
-        return f"{invoice.id}\t{inv_type}\t{date_str}\t{status}"
+
+        # Owner lookup — vendors and customers share the same
+        # ``owner_guid`` namespace (different table, but same handle
+        # shape). Picking the right finder by ``owner_type`` matches
+        # how every other code path in this file resolves it.
+        if invoice.owner_type == 4:
+            owner = self._find_vendor_by_guid(book, invoice.owner_guid)
+        else:
+            owner = self._find_customer_by_guid(book, invoice.owner_guid)
+        owner_name = owner.name if owner else "?"
+
+        # Total: sum of (quantity * price) across entries. Falls back
+        # to "?" when entries can't be loaded — keeps the row legible
+        # even on data-corruption edge cases.
+        try:
+            _, _, grand_total = self._get_invoice_entries_and_total(
+                book, invoice,
+            )
+            ccy = (
+                invoice.currency.mnemonic
+                if invoice.currency else ""
+            )
+            if grand_total == int(grand_total):
+                amount_str = f"{ccy} {int(grand_total):,}".strip()
+            else:
+                amount_str = f"{ccy} {grand_total:,.2f}".strip()
+        except Exception:
+            amount_str = "?"
+
+        return (
+            f"{invoice.id}\t{inv_type}\t{owner_name}\t{amount_str}\t"
+            f"{date_str}\t{status}"
+        )
 
     @staticmethod
-    def _entry_to_dict(entry_row, is_bill: bool = False) -> dict:
+    def _entry_to_dict(
+        entry_row,
+        is_bill: bool = False,
+        account_paths: dict | None = None,
+    ) -> dict:
         """Convert an entry row (from raw SQL) to a serializable dict.
 
         Args:
             entry_row: SQLAlchemy row from entries table.
             is_bill: If True, read b_* columns; otherwise read i_* columns.
+            account_paths: Optional mapping of account-GUID to fullname.
+                When provided, the response uses ``account`` (path) in
+                place of ``account_guid`` (raw 32-char hex). The caller
+                builds this map once per invoice and passes it through;
+                this keeps the static-method shape while letting the
+                response be readable to humans/LLMs.
         """
         q_num = entry_row.quantity_num or 0
         q_denom = entry_row.quantity_denom or 1
@@ -484,15 +596,23 @@ class BusinessMixin:
         else:
             date_str = str(raw_date.date())
 
-        return {
+        result = {
             "guid": entry_row.guid,
             "date": date_str,
             "description": entry_row.description or "",
-            "account_guid": acct_guid or "",
             "quantity": str(quantity),
             "price": str(price),
             "total": str(total),
         }
+        if account_paths is not None and acct_guid:
+            # Phase 3C: surface the readable path. Falls back to the
+            # raw GUID when a stale entry references a deleted account.
+            result["account"] = account_paths.get(
+                acct_guid, acct_guid,
+            )
+        else:
+            result["account_guid"] = acct_guid or ""
+        return result
 
     @staticmethod
     def _write_gncinvoice_slot(book, obj_guid: str, invoice_guid: str):
@@ -1609,12 +1729,26 @@ class BusinessMixin:
             )
 
             if compact:
-                lines = [self._invoice_to_compact_line(i) for i in invoices]
+                lines = [self._invoice_to_compact_line(book, i) for i in invoices]
                 if notice:
                     lines.append(notice)
                 return "\n".join(lines)
             else:
-                return [self._invoice_to_dict(i) for i in invoices]
+                # Verbose path: resolve owner per invoice so each dict
+                # carries the readable name. ``owner_guid`` was dropped
+                # from the dict shape in Phase 3C.
+                results = []
+                for i in invoices:
+                    if i.owner_type == 4:
+                        o = self._find_vendor_by_guid(book, i.owner_guid)
+                    else:
+                        o = self._find_customer_by_guid(book, i.owner_guid)
+                    results.append(
+                        self._invoice_to_dict(
+                            i, owner_name=o.name if o else None,
+                        )
+                    )
+                return results
 
     def get_invoice(self, invoice_id: str, owner_type: str | None = None) -> dict:
         """Get full details for an invoice or bill, including entries.
@@ -1659,7 +1793,22 @@ class BusinessMixin:
                     {"guid": inv.guid},
                 ).fetchall()
 
-            entries = [self._entry_to_dict(r, is_bill=is_bill) for r in rows]
+            # Phase 3C: build a guid → fullname map once (covers every
+            # account referenced by entries on this invoice), then
+            # thread it through ``_entry_to_dict`` so each entry shows
+            # ``account: "Income:LLC Revenue"`` instead of an opaque
+            # 32-char hex GUID. One query, ``account_paths`` shared
+            # across all entries.
+            account_paths: dict[str, str] = {}
+            for a in book.accounts:
+                account_paths[a.guid] = a.fullname
+
+            entries = [
+                self._entry_to_dict(
+                    r, is_bill=is_bill, account_paths=account_paths,
+                )
+                for r in rows
+            ]
 
             total = sum(
                 Decimal(e["quantity"]) * Decimal(e["price"])
@@ -1676,10 +1825,10 @@ class BusinessMixin:
                 if customer:
                     owner_name = customer.name
 
-            result = self._invoice_to_dict(inv, entries=entries)
+            result = self._invoice_to_dict(
+                inv, entries=entries, owner_name=owner_name,
+            )
             result["total"] = str(total)
-            if owner_name:
-                result["owner_name"] = owner_name
             return result
 
     def post_invoice(
@@ -2522,18 +2671,32 @@ class BusinessMixin:
         owner_type: str | None = None,
         customer_id: str | None = None,
         vendor_id: str | None = None,
-    ) -> list[dict]:
+        compact: bool = True,
+    ) -> list[dict] | str:
         """Get all posted invoices/bills with outstanding balances.
 
         Args:
             owner_type: Filter by 'customer' or 'vendor'. Omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
+            compact: If True (default), return a compact one-line-per-doc
+                     string with action columns: due date, days past due,
+                     currency, BILL tag, owner. Verbose mode returns the
+                     structured list dicts kept for ``pay_invoice``
+                     workflows.
 
         Returns:
-            List of dicts with invoice details and balance info.
+            If compact: newline-separated lines, each
+                ``"id  owner  CCY amount  posted:YYYY-MM-DD  due:YYYY-MM-DD  N days past due"``,
+                ordered most-overdue-first. Bills tagged ``(BILL)``.
+                Empty string when nothing is outstanding.
+            If not compact: list of dicts (caller pays the wire cost
+                in exchange for the full ``original_amount`` /
+                ``amount_paid`` / ``amount_due`` breakdown).
         """
         from piecash.business.invoice import Invoice
+
+        today = date.today()
 
         with self.open() as book:
             query = book.session.query(Invoice).filter(
@@ -2626,19 +2789,47 @@ class BusinessMixin:
                         owner_name = c.name
 
                 posted_dt = _safe_date_posted(inv)
+                # Resolve the due date through the same three-step
+                # chain the warnings collector uses, so the bookkeeper
+                # sees identical numbers in both places.
+                due_date, no_terms = self._resolve_invoice_due_date(
+                    book, inv,
+                )
+                days_past_due = (
+                    (today - due_date).days
+                    if due_date is not None
+                    else None
+                )
+                currency = (
+                    inv.currency.mnemonic if inv.currency else None
+                )
                 results.append({
                     "id": inv.id,
                     "type": "bill" if is_bill else "invoice",
                     "owner_name": owner_name,
+                    "currency": currency,
                     "date_posted": (
                         str(posted_dt.date()) if posted_dt else None
                     ),
+                    "due_date": (
+                        str(due_date) if due_date is not None else None
+                    ),
+                    "days_past_due": days_past_due,
+                    "no_terms": no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(abs(balance)),
                 })
 
-        return results
+            # Sort: most overdue first (largest days_past_due), so the
+            # bookkeeper sees the urgent receivables / bills at the top.
+            results.sort(
+                key=lambda r: -(r["days_past_due"] or 0),
+            )
+
+            if compact:
+                return _format_outstanding_invoices_compact(results)
+            return results
 
     def vendor_spending_report(
         self,
