@@ -489,6 +489,396 @@ class CoreMixin:
             for part in account.fullname.split(":")
         )
 
+    # Stale-price threshold. Prices older than this in days surface
+    # in the Warnings section. Matches the cadence at which most
+    # users would expect to refresh quotes for active investment
+    # holdings; commodities with no price update in over a month
+    # are likely producing inaccurate net-worth and runway numbers.
+    _STALE_PRICE_DAYS = 30
+
+    def _collect_warnings(self, book: piecash.Book) -> list[str]:
+        """Collect warnings for the consolidated Warnings section.
+        Implements GET_BOOK_SUMMARY_SPEC §5.
+
+        Returns a list of formatted warning strings ready for
+        rendering, ordered by category::
+
+            data integrity → critically low cash → overdue
+            invoices/bills → overdue scheduled → stale prices
+
+        Within each category, most-severe / most-overdue first.
+        The category ordering puts operational urgency (cash
+        flow signals) above data-quality concerns: a near-empty
+        bank account or unpaid receivable is the conversation
+        Robin needs to have today; stale prices are next-week
+        cleanup.
+
+        Coverage:
+
+        - **Integrity** — non-zero balance on any
+          ``Imbalance-{ccy}`` / ``Orphan-{ccy}`` account. GnuCash
+          auto-creates these when a transaction can't balance or
+          when accounts are deleted with their splits orphaned.
+          Non-zero balance there is a real structural defect.
+        - **Critically low cash** — non-placeholder, non-retirement
+          BANK / CASH accounts with positive balance below 1 day of
+          daily burn (``_daily_expense_burn``). Catches accounts
+          that can't cover tomorrow's expenses on their own; scales
+          with the user's actual spending rather than a fixed
+          dollar threshold (a $100 floor is "average person" and
+          wrong for users on either end of the spectrum). When the
+          book has no expense activity (no burn signal), this check
+          is skipped — no benchmark to compare against.
+        - **Overdue invoices / bills** — posted invoices/bills with
+          a non-zero lot balance whose due date is in the past.
+          Due date is read from the ``trans-date-due`` slot on the
+          posting transaction; when that slot is absent (the user
+          posted without specifying due_date), the check falls
+          back to ``date_posted + 30 days`` and annotates the
+          warning with ``(posted without terms)`` so the
+          bookkeeper knows the duration is approximated.
+          Requires BusinessMixin to be loaded for the
+          lot-balance helper; gracefully skipped otherwise.
+        - **Overdue scheduled** — enabled scheduled transactions
+          whose next occurrence is in the past. Uses the
+          SchedulingMixin's ``_next_occurrence`` helper when
+          present; gracefully skipped otherwise.
+        - **Stale prices** — non-default commodities in active use
+          (referenced by some account or price record) whose latest
+          non-``transaction`` price is more than
+          ``_STALE_PRICE_DAYS`` days old, or that have no price on
+          file. Includes ISO currencies — a stale FX rate cascades
+          into wrong receivables totals on multi-currency books.
+
+        Reconciliation-behind warnings are intentionally NOT
+        duplicated here — the dedicated Reconciliation section
+        already surfaces stale per-account state with detail. The
+        spec lists it as a Warnings category, but emitting both
+        creates redundant signals; the principle elsewhere in this
+        summary (don't repeat information that another section
+        already conveys) takes precedence.
+
+        Each per-category collector swallows its own exceptions
+        per spec — a failed check in one category never breaks
+        the rest of the section.
+        """
+        today = date.today()
+        default_currency = self._require_default_currency(book)
+
+        # ── 1. Data integrity: Imbalance / Orphan accounts ──
+        integrity: list[str] = []
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            name = account.name
+            if not (name.startswith("Imbalance-") or name.startswith("Orphan-")):
+                continue
+            balance = Decimal("0")
+            for split in account.splits:
+                balance += split.quantity
+            if balance != 0:
+                integrity.append(
+                    f"{name}: {balance} (data integrity issue)"
+                )
+        # Sort by absolute magnitude descending — biggest defects
+        # first within the integrity bucket.
+        integrity.sort(
+            key=lambda msg: abs(
+                Decimal(msg.split(":")[1].split("(")[0].strip())
+            ),
+            reverse=True,
+        )
+
+        # ── 2. Critically low cash ──
+        # Per-account threshold: positive balance below 1 day of
+        # daily burn (in book default currency). Scales with the
+        # user's actual spending rather than an "average person"
+        # fixed dollar floor. Skipped when the book has no expense
+        # activity (no daily-burn signal to compare against).
+        low_cash: list[str] = []
+        try:
+            daily_burn = self._daily_expense_burn(book)
+            if daily_burn > 0:
+                template_guids = self._template_account_guids(book)
+                rates = self._rates_as_of(
+                    book, today, default_currency,
+                )
+                low_cash_entries: list[tuple[Decimal, str]] = []
+                for account in book.accounts:
+                    if account.type not in ("BANK", "CASH"):
+                        continue
+                    if account.placeholder:
+                        continue
+                    if account.guid in template_guids:
+                        continue
+                    if self._is_in_retirement_subtree(account):
+                        continue
+
+                    balance_qty = Decimal("0")
+                    for split in account.splits:
+                        balance_qty += split.quantity
+                    if balance_qty <= 0:
+                        # Zero = unused, not low. Negative = overdraft,
+                        # captured separately by runway's
+                        # negative_liquid path.
+                        continue
+
+                    # Convert to default currency for the threshold
+                    # comparison. Without a rate, skip rather than
+                    # invent a number.
+                    if account.commodity == default_currency:
+                        balance_default = balance_qty
+                    else:
+                        rate = rates.get(account.commodity.guid)
+                        if rate is None:
+                            continue
+                        balance_default = balance_qty * rate
+
+                    if balance_default >= daily_burn:
+                        continue
+
+                    leaf = account.fullname.split(":")[-1]
+                    amount_str = f"{int(balance_default):,}"
+                    low_cash_entries.append((
+                        balance_default,
+                        f"Critically low cash: {leaf} at "
+                        f"{default_currency.mnemonic} {amount_str} "
+                        f"(under 1 day of burn)",
+                    ))
+                # Lowest balance first within the bucket — those are
+                # the most urgent.
+                low_cash_entries.sort(key=lambda e: e[0])
+                low_cash = [msg for _, msg in low_cash_entries]
+        except Exception:
+            pass
+
+        # ── 3. Overdue invoices and bills ──
+        # Each posted invoice/bill with non-zero lot balance whose
+        # due date is in the past. Due date is read from the
+        # ``trans-date-due`` slot on the posting transaction; when
+        # absent, falls back to date_posted + 30 days and annotates
+        # the warning so the bookkeeper knows the duration is
+        # approximated. Requires BusinessMixin's
+        # _calculate_lot_balance helper; gracefully skipped when
+        # the business module isn't loaded.
+        overdue_invoices: list[str] = []
+        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
+        if calc_lot_balance is not None:
+            try:
+                from piecash.business.invoice import Invoice
+                from sqlalchemy import text
+                find_customer_by_guid = getattr(
+                    self, "_find_customer_by_guid", None,
+                )
+                find_vendor_by_guid = getattr(
+                    self, "_find_vendor_by_guid", None,
+                )
+                overdue_inv_entries: list[tuple[int, str]] = []
+                for inv in book.session.query(Invoice).filter(
+                    Invoice.date_posted.isnot(None)
+                ).all():
+                    try:
+                        txn = inv.post_txn
+                        if txn is None:
+                            continue
+                        # Read the trans-date-due slot.
+                        row = book.session.execute(
+                            text(
+                                "SELECT gdate_val FROM slots "
+                                "WHERE obj_guid = :guid "
+                                "AND name = 'trans-date-due'"
+                            ),
+                            {"guid": txn.guid},
+                        ).first()
+                        no_terms = False
+                        if row and row[0]:
+                            gdate_val = row[0]
+                            if isinstance(gdate_val, str):
+                                due_date = date.fromisoformat(
+                                    gdate_val[:10]
+                                )
+                            elif isinstance(gdate_val, datetime):
+                                due_date = gdate_val.date()
+                            else:
+                                due_date = gdate_val
+                        else:
+                            posted = inv.date_posted
+                            if isinstance(posted, datetime):
+                                posted = posted.date()
+                            due_date = posted + timedelta(days=30)
+                            no_terms = True
+
+                        if due_date >= today:
+                            continue
+
+                        lot = inv.post_lot
+                        if lot is None:
+                            continue
+                        balance = calc_lot_balance(lot)
+                        if balance == 0:
+                            continue
+
+                        days_overdue = (today - due_date).days
+                        is_bill = (inv.owner_type == 4)
+                        doc_type = "bill" if is_bill else "invoice"
+
+                        if is_bill and find_vendor_by_guid is not None:
+                            owner = find_vendor_by_guid(
+                                book, inv.owner_guid,
+                            )
+                        elif (
+                            not is_bill
+                            and find_customer_by_guid is not None
+                        ):
+                            owner = find_customer_by_guid(
+                                book, inv.owner_guid,
+                            )
+                        else:
+                            owner = None
+                        owner_name = (
+                            owner.name if owner
+                            else f"#{inv.id}"
+                        )
+
+                        currency = (
+                            inv.currency.mnemonic
+                            if inv.currency
+                            else default_currency.mnemonic
+                        )
+                        amount_str = f"{int(abs(balance)):,}"
+                        terms_note = (
+                            " (posted without terms)" if no_terms else ""
+                        )
+                        overdue_inv_entries.append((
+                            days_overdue,
+                            f"Past due {doc_type}: {owner_name} "
+                            f"{days_overdue} days overdue, "
+                            f"{currency} {amount_str}{terms_note}",
+                        ))
+                    except Exception:
+                        continue
+                overdue_inv_entries.sort(reverse=True)
+                overdue_invoices = [
+                    msg for _, msg in overdue_inv_entries
+                ]
+            except Exception:
+                pass
+
+        # ── 5. Stale prices ──
+        stale_prices: list[str] = []
+        try:
+            in_use: set = set()
+            for a in book.accounts:
+                if a.type != "ROOT":
+                    in_use.add(a.commodity.guid)
+            for p in book.prices:
+                in_use.add(p.commodity.guid)
+
+            cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
+            by_commodity_latest: dict[str, date] = {}
+            for p in book.prices:
+                if p.type == "transaction":
+                    continue
+                p_date = p.date
+                if hasattr(p_date, "date") and callable(p_date.date):
+                    p_date = p_date.date()
+                cguid = p.commodity.guid
+                if (
+                    cguid not in by_commodity_latest
+                    or p_date > by_commodity_latest[cguid]
+                ):
+                    by_commodity_latest[cguid] = p_date
+
+            # Track (sort_key, message) so we can order most-stale
+            # first regardless of whether the commodity has a price
+            # at all (None entries sort to the top).
+            stale_entries: list[tuple[int, str]] = []
+            for commodity in book.commodities:
+                if commodity == default_currency:
+                    continue
+                if commodity.guid not in in_use:
+                    continue
+                latest = by_commodity_latest.get(commodity.guid)
+                if latest is None:
+                    stale_entries.append((
+                        10**9,  # arbitrary large sort key — top
+                        f"Stale price: {commodity.mnemonic} no price on file",
+                    ))
+                elif latest < cutoff:
+                    days_old = (today - latest).days
+                    stale_entries.append((
+                        days_old,
+                        f"Stale price: {commodity.mnemonic} "
+                        f"last updated {days_old} days ago",
+                    ))
+            stale_entries.sort(reverse=True)
+            stale_prices = [msg for _, msg in stale_entries]
+        except Exception:
+            # Per spec: skip failed checks, emit the rest.
+            pass
+
+        # ── 4. Overdue scheduled transactions ──
+        # Requires SchedulingMixin's helpers (_next_occurrence,
+        # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
+        # the attribute lookup degrades gracefully via getattr.
+        overdue_scheduled: list[str] = []
+        next_occ_fn = getattr(self, "_next_occurrence", None)
+        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
+        if next_occ_fn is not None and rec_to_freq is not None:
+            try:
+                from piecash.core.transaction import ScheduledTransaction
+                overdue_entries: list[tuple[int, str]] = []
+                for sx in book.session.query(ScheduledTransaction).all():
+                    if not sx.enabled:
+                        continue
+                    try:
+                        rec = sx.recurrence
+                        key = (
+                            rec.recurrence_period_type,
+                            rec.recurrence_mult,
+                        )
+                        frequency = rec_to_freq.get(key)
+                        if not frequency:
+                            continue
+                        start = sx.start_date
+                        if isinstance(start, datetime):
+                            start = start.date()
+                        end = sx.end_date
+                        if isinstance(end, datetime):
+                            end = end.date()
+                        last = sx.last_occur
+                        if isinstance(last, datetime):
+                            last = last.date()
+                        # Search relative to "yesterday" so today's
+                        # occurrence isn't classified as overdue
+                        # before the user has a chance to enter it.
+                        next_occ = next_occ_fn(
+                            start, frequency,
+                            after=start - timedelta(days=1),
+                            end_date=end, last_occur=last,
+                        )
+                        if next_occ and next_occ < today:
+                            days_overdue = (today - next_occ).days
+                            overdue_entries.append((
+                                days_overdue,
+                                f"Overdue scheduled: {sx.name} "
+                                f"due {next_occ.isoformat()}",
+                            ))
+                    except Exception:
+                        continue
+                overdue_entries.sort(reverse=True)
+                overdue_scheduled = [msg for _, msg in overdue_entries]
+            except Exception:
+                pass
+
+        return (
+            integrity
+            + low_cash
+            + overdue_invoices
+            + overdue_scheduled
+            + stale_prices
+        )
+
     def _budget_headline(self, book: piecash.Book) -> dict | None:
         """One-line headline for the budget covering today, if any.
         Implements GET_BOOK_SUMMARY_SPEC §6.
@@ -626,6 +1016,35 @@ class CoreMixin:
             "variance_pct": variance_pct,
         }
 
+    def _daily_expense_burn(
+        self,
+        book: piecash.Book,
+        days: int | None = None,
+    ) -> Decimal:
+        """Average daily EXPENSE outflow over the last ``days`` days.
+
+        Shared between the runway calculation (used to compute days
+        of cash on hand) and the critically-low-cash warning (used
+        to set a relative threshold "less than 1 day of burn").
+        Both want the same number — extracting the helper guarantees
+        they agree.
+
+        Returns ``Decimal("0")`` when no expense activity in window
+        — caller treats that as "no daily-burn signal."
+        """
+        if days is None:
+            days = self._RUNWAY_BURN_DAYS
+        today = date.today()
+        window_start = today - timedelta(days=days)
+        expenses = Decimal("0")
+        for txn in book.transactions:
+            if txn.post_date < window_start or txn.post_date > today:
+                continue
+            for s in txn.splits:
+                if s.account.type == "EXPENSE":
+                    expenses += Decimal(str(s.value))
+        return expenses / Decimal(days)
+
     def _runway_metrics(
         self,
         book: piecash.Book,
@@ -679,8 +1098,6 @@ class CoreMixin:
           caller renders the days line with optional ⚠ at <60.
         """
         today = date.today()
-        window_start = today - timedelta(days=self._RUNWAY_BURN_DAYS)
-
         template_guids = self._template_account_guids(book)
         rates = self._rates_as_of(book, today, default_currency)
 
@@ -733,16 +1150,12 @@ class CoreMixin:
                         cost_basis += Decimal(str(split.value))
                     liquid += cost_basis
 
-        # --- Daily burn pass over book.transactions ---
-        expenses_window = Decimal("0")
-        for txn in book.transactions:
-            if txn.post_date < window_start or txn.post_date > today:
-                continue
-            for s in txn.splits:
-                if s.account.type == "EXPENSE":
-                    expenses_window += Decimal(str(s.value))
-
-        daily_burn = expenses_window / Decimal(self._RUNWAY_BURN_DAYS)
+        # Daily burn comes from the shared helper so the warnings
+        # section's "less than 1 day of burn" threshold and runway's
+        # divisor-of-liquid agree by construction.
+        daily_burn = self._daily_expense_burn(
+            book, days=self._RUNWAY_BURN_DAYS,
+        )
 
         if daily_burn <= 0:
             return None
@@ -1106,6 +1519,20 @@ class CoreMixin:
 
             if first_date and last_date:
                 lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
+
+            # Warnings: scan-first section. Lives near the top of
+            # the output (right after book metadata) because if
+            # there's data integrity trouble or stale prices
+            # informing the rest of the summary, the LLM should see
+            # that BEFORE reading numbers that depend on them.
+            # Section omitted entirely when no warnings — absence
+            # is the signal; the spec explicitly calls out not
+            # printing "Warnings: none."
+            warnings = self._collect_warnings(book)
+            if warnings:
+                lines.append("Warnings:")
+                for msg in warnings:
+                    lines.append(f"  ⚠ {msg}")
 
             lines.append(f"Accounts: {total_accounts} total")
 

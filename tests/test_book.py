@@ -1812,6 +1812,678 @@ class TestGetBookSummaryBudgetHeadline:
         assert "Budget (Empty)" not in result
 
 
+class TestGetBookSummaryWarnings:
+    """Consolidated Warnings section in get_book_summary.
+
+    Lives near the top of the output so the LLM sees data
+    integrity issues, stale prices, and overdue items BEFORE
+    reading numbers that depend on them. See
+    ``CoreMixin._collect_warnings`` and
+    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §5.
+    """
+
+    def test_section_omitted_when_no_warnings(self, test_book: Path):
+        """No warnings → no header, no body — absence is the signal.
+        The fixture is a clean book with no integrity issues, no
+        stale prices, no overdue scheduled."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Warnings:" not in result
+
+    def test_imbalance_account_with_balance_warns(
+        self, test_book: Path,
+    ):
+        """A non-zero balance on Imbalance-{ccy} indicates a
+        structural defect — flag with a data-integrity note."""
+        gc = GnuCashBook(str(test_book))
+        # Build the auto-created Imbalance account that GnuCash
+        # would have created for an unbalanced transaction. We're
+        # simulating the post-defect state.
+        with gc.open(readonly=False) as book:
+            assets = gc._find_account(book, "Assets")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            imbalance = piecash.Account(
+                name="Imbalance-USD",
+                type="BANK",
+                parent=book.root_account,
+                commodity=book.default_currency,
+            )
+            book.session.add(imbalance)
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Phantom imbalance",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(
+                        account=imbalance, value=Decimal("42.50"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-42.50"),
+                    ),
+                ],
+            ))
+            book.save()
+
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split("\n")
+        joined = "\n".join(warnings_block)
+        assert "Imbalance-USD" in joined
+        assert "data integrity issue" in joined
+        assert "⚠" in joined
+
+    def test_orphan_account_with_balance_warns(self, test_book: Path):
+        """Orphan-{ccy} non-zero balance → data integrity warning,
+        same shape as Imbalance."""
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=False) as book:
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            orphan = piecash.Account(
+                name="Orphan-USD",
+                type="BANK",
+                parent=book.root_account,
+                commodity=book.default_currency,
+            )
+            book.session.add(orphan)
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Orphaned residue",
+                post_date=date.today() - timedelta(days=20),
+                splits=[
+                    piecash.Split(
+                        account=orphan, value=Decimal("3.14"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-3.14"),
+                    ),
+                ],
+            ))
+            book.save()
+
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split("\n")
+        joined = "\n".join(warnings_block)
+        assert "Orphan-USD" in joined
+        assert "data integrity issue" in joined
+
+    def test_zero_balance_imbalance_does_not_warn(
+        self, test_book: Path,
+    ):
+        """An Imbalance- account with a zero balance is fine — only
+        non-zero balance is a defect."""
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=False) as book:
+            piecash.Account(
+                name="Imbalance-USD",
+                type="BANK",
+                parent=book.root_account,
+                commodity=book.default_currency,
+            )
+            book.save()
+        result = gc.get_book_summary()
+        # Section may emit for other reasons; verify Imbalance-USD
+        # specifically is not in any warning line.
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Imbalance-USD" not in warnings_block
+
+    def test_stale_price_warns(self, investment_book: Path):
+        """A non-default commodity in active use whose latest price
+        is older than the staleness threshold gets a Warnings
+        line. The investment_book fixture has VTSAX with a
+        single price on 2026-01-15, which is now well past the
+        30-day cutoff."""
+        gc = GnuCashBook(str(investment_book))
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "VTSAX" in warnings_block
+        assert "Stale price" in warnings_block
+        assert "days ago" in warnings_block
+
+    def test_unpriced_commodity_in_use_warns_no_price_on_file(
+        self, test_book: Path,
+    ):
+        """A commodity referenced by an account but with no price
+        record at all → 'no price on file' warning."""
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=False) as book:
+            from piecash import Commodity
+            wild = Commodity(
+                namespace="NYSE",
+                mnemonic="WILD",
+                fullname="Wild Stock",
+                fraction=10000,
+            )
+            book.session.add(wild)
+            assets = gc._find_account(book, "Assets")
+            piecash.Account(
+                name="WILD",
+                type="STOCK",
+                parent=assets,
+                commodity=wild,
+            )
+            book.save()
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "WILD" in warnings_block
+        assert "no price on file" in warnings_block
+
+    def test_iso_currency_in_use_with_stale_rate_warns(
+        self, tmp_path: Path,
+    ):
+        """ISO currencies (CURRENCY namespace) get the same stale-
+        price treatment as commodity tickers when they're in active
+        use. A multi-currency book with a foreign-currency
+        receivable account but no recent FX rate fires
+        'Stale price: EUR' so the bookkeeper knows converted
+        totals (e.g., 'Receivables: USD X') are unreliable.
+
+        Regression for the cousin's review note on Alex's book:
+        stale FX rates cascade into wrong receivables totals; not
+        flagging them leaves the user with no visibility into
+        whether the displayed conversion is current."""
+        book_path = tmp_path / "fx_stale.gnucash"
+        b = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        from piecash import factories
+        eur = factories.create_currency_from_ISO("EUR")
+        b.session.add(eur)
+
+        root = b.root_account
+        usd = b.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(assets)
+        # EUR-typed receivable — pulls EUR into in_use.
+        ar_eur = piecash.Account(
+            name="Accounts Receivable EUR",
+            type="RECEIVABLE",
+            parent=assets,
+            commodity=eur,
+        )
+        b.session.add(ar_eur)
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(equity)
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        b.session.add(opening)
+        b.save()
+
+        # Seed an old EUR price (well past the 30-day staleness
+        # threshold). The book has EUR in_use via the AR account
+        # but the latest non-transaction price is ancient.
+        old_price = piecash.Price(
+            commodity=eur,
+            currency=usd,
+            date=date.today() - timedelta(days=400),
+            value=Decimal("1.10"),
+            type="last",
+            source="user:test",
+        )
+        b.session.add(old_price)
+        b.save()
+        b.close()
+
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "EUR" in warnings_block
+        assert "Stale price" in warnings_block
+
+    def test_unused_commodity_does_not_warn(self, test_book: Path):
+        """A commodity in book.commodities but referenced by no
+        account or price doesn't earn a warning — the user isn't
+        actually depending on it."""
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=False) as book:
+            from piecash import Commodity
+            unused = Commodity(
+                namespace="NYSE",
+                mnemonic="UNUSED",
+                fullname="Unused Symbol",
+                fraction=10000,
+            )
+            book.session.add(unused)
+            book.save()
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "UNUSED" not in warnings_block
+
+    def test_default_currency_never_stale_warned(
+        self, test_book: Path,
+    ):
+        """The book's default currency doesn't need a price; never
+        flag it as stale."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            # USD is the fixture's default currency.
+            assert "USD" not in warnings_block.replace(
+                "Imbalance-USD", ""
+            ).replace("Orphan-USD", "")
+
+    def test_overdue_scheduled_warns(self, scheduled_book: Path):
+        """A scheduled transaction whose next occurrence is in the
+        past surfaces in Warnings."""
+        gc = GnuCashBook(str(scheduled_book))
+        # Anchor a schedule far enough in the past that today's
+        # next-occurrence would already be overdue regardless of
+        # frequency.
+        gc.create_scheduled_transaction(
+            name="Overdue Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() - timedelta(days=400)).isoformat(),
+            frequency="monthly",
+        )
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Overdue scheduled" in warnings_block
+        assert "Overdue Rent" in warnings_block
+
+    def test_disabled_scheduled_does_not_warn(
+        self, scheduled_book: Path,
+    ):
+        """A disabled scheduled transaction isn't fired regardless
+        of dates → not overdue."""
+        gc = GnuCashBook(str(scheduled_book))
+        sx = gc.create_scheduled_transaction(
+            name="Disabled Schedule",
+            description="x",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            start_date=(date.today() - timedelta(days=400)).isoformat(),
+            frequency="monthly",
+        )
+        gc.update_scheduled_transaction(guid=sx["guid"], enabled=False)
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Disabled Schedule" not in warnings_block
+
+    def test_low_cash_below_one_day_burn_warns(
+        self, test_book: Path,
+    ):
+        """A BANK / CASH account whose balance falls below one day
+        of daily expense burn earns a 'Critically low cash:'
+        warning. Threshold scales with the user's actual spending,
+        not a fixed dollar floor.
+
+        Regression for the cousin's report on Alex's $6 Savings
+        account at $683/day burn — relative threshold catches it
+        cleanly."""
+        gc = GnuCashBook(str(test_book))
+        # Seed enough expense activity that daily_burn is high
+        # enough to flag fixture's tiny accounts. With $36,000
+        # over 180 days → $200/day burn. Fixture's Savings doesn't
+        # exist, so add one with a $5 balance.
+        gc.create_account(
+            name="Savings", account_type="BANK", parent="Assets",
+        )
+        with gc.open(readonly=False) as book:
+            savings = gc._find_account(book, "Assets:Savings")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Token deposit",
+                post_date=date.today() - timedelta(days=20),
+                splits=[
+                    piecash.Split(account=savings, value=Decimal("5")),
+                    piecash.Split(account=opening, value=Decimal("-5")),
+                ],
+            ))
+            book.save()
+        # Seed $36,000 of expenses → $200/day burn.
+        gc.create_transaction(
+            description="Burn",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "36000"},
+                {"account": "Assets:Checking", "amount": "-36000"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Critically low cash" in warnings_block
+        assert "Savings" in warnings_block
+        assert "under 1 day of burn" in warnings_block
+
+    def test_low_cash_above_one_day_burn_does_not_warn(
+        self, test_book: Path,
+    ):
+        """An account with balance above 1 day of burn doesn't
+        flag — that's not critically low, just normal-low."""
+        gc = GnuCashBook(str(test_book))
+        # Tiny burn: $90 over 180 days = $0.50/day. Even Cash at
+        # $1,668 (well above $0.50) doesn't qualify as low.
+        gc.create_transaction(
+            description="Tiny burn",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "90"},
+                {"account": "Assets:Checking", "amount": "-90"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Critically low cash" not in warnings_block
+
+    def test_low_cash_zero_balance_does_not_warn(
+        self, test_book: Path,
+    ):
+        """Zero balance on a bank account = unused, not critically
+        low. Only positive-but-low qualifies."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Empty Savings", account_type="BANK", parent="Assets",
+        )
+        # Seed enough burn to set a high threshold, so any other
+        # account would fire — but Empty Savings stays out because
+        # it has zero balance.
+        gc.create_transaction(
+            description="Burn",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "36000"},
+                {"account": "Assets:Checking", "amount": "-36000"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Empty Savings" not in warnings_block
+
+    def test_low_cash_retirement_account_excluded(
+        self, test_book: Path,
+    ):
+        """Retirement-subtree BANK accounts don't enter the low-
+        cash check (they're already excluded from runway, same
+        heuristic). A retirement holding can be tiny without
+        being a cash-flow problem."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement", account_type="ASSET", parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="Roth IRA", account_type="BANK",
+            parent="Assets:Retirement",
+        )
+        with gc.open(readonly=False) as book:
+            roth = gc._find_account(book, "Assets:Retirement:Roth IRA")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Roth seed",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=roth, value=Decimal("3")),
+                    piecash.Split(account=opening, value=Decimal("-3")),
+                ],
+            ))
+            book.save()
+        # Burn high enough to put threshold above $3.
+        gc.create_transaction(
+            description="Burn",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "36000"},
+                {"account": "Assets:Checking", "amount": "-36000"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Roth IRA" not in warnings_block
+
+    def test_low_cash_skipped_when_no_burn(self, test_book: Path):
+        """When the book has no expense activity in the burn
+        window, there's no daily-burn benchmark. Skip the
+        low-cash check entirely rather than guess a threshold."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Empty Savings", account_type="BANK", parent="Assets",
+        )
+        with gc.open(readonly=False) as book:
+            savings = gc._find_account(book, "Assets:Savings") if \
+                gc._find_account(book, "Assets:Savings") else \
+                gc._find_account(book, "Assets:Empty Savings")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Trivial deposit",
+                post_date=date.today() - timedelta(days=5),
+                splits=[
+                    piecash.Split(account=savings, value=Decimal("3")),
+                    piecash.Split(account=opening, value=Decimal("-3")),
+                ],
+            ))
+            book.save()
+        # No expense activity in the 180-day window.
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Critically low cash" not in warnings_block
+
+    def test_past_due_invoice_warns(self, business_book: Path):
+        """A posted invoice with a past due_date and non-zero lot
+        balance fires a 'Past due invoice:' warning."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Acme Corp", currency="USD")
+        gc.create_invoice(
+            customer_id="000001",
+            date_opened=(date.today() - timedelta(days=60)).isoformat(),
+        )
+        gc.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Service",
+            quantity="1",
+            price="5000",
+        )
+        gc.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=60)).isoformat(),
+            due_date=(date.today() - timedelta(days=30)).isoformat(),
+        )
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Past due invoice" in warnings_block
+        assert "Acme Corp" in warnings_block
+        assert "30 days overdue" in warnings_block
+        assert "USD 5,000" in warnings_block
+
+    def test_past_due_bill_warns(self, business_book: Path):
+        """A posted vendor bill with past due_date and non-zero
+        lot balance fires 'Past due bill:'."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_vendor(name="Office Depot", currency="USD")
+        gc.create_bill(
+            vendor_id="000001",
+            date_opened=(date.today() - timedelta(days=45)).isoformat(),
+        )
+        gc.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Pens",
+            quantity="1",
+            price="250",
+        )
+        gc.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            post_date=(date.today() - timedelta(days=45)).isoformat(),
+            due_date=(date.today() - timedelta(days=15)).isoformat(),
+            owner_type="vendor",
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Past due bill" in warnings_block
+        assert "Office Depot" in warnings_block
+        assert "15 days overdue" in warnings_block
+
+    def test_past_due_invoice_without_terms_falls_back_to_30_days(
+        self, business_book: Path,
+    ):
+        """An invoice posted without an explicit due_date falls
+        back to date_posted + 30 days, with a '(posted without
+        terms)' annotation so the bookkeeper knows the duration
+        is approximated."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="No Terms Co", currency="USD")
+        gc.create_invoice(
+            customer_id="000001",
+            date_opened=(date.today() - timedelta(days=50)).isoformat(),
+        )
+        gc.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Service",
+            quantity="1",
+            price="1500",
+        )
+        # post_date 50 days ago + 30-day fallback = 20 days overdue.
+        # No due_date passed → falls back.
+        gc.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=50)).isoformat(),
+            due_date=None,
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        assert "Past due invoice" in warnings_block
+        assert "No Terms Co" in warnings_block
+        assert "20 days overdue" in warnings_block
+        assert "(posted without terms)" in warnings_block
+
+    def test_paid_invoice_does_not_warn(self, business_book: Path):
+        """A posted invoice that's been fully paid (lot balance
+        zero) doesn't fire — no outstanding receivable."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Prompt Payer", currency="USD")
+        gc.create_invoice(
+            customer_id="000001",
+            date_opened=(date.today() - timedelta(days=60)).isoformat(),
+        )
+        gc.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Done",
+            quantity="1",
+            price="2000",
+        )
+        gc.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=60)).isoformat(),
+            due_date=(date.today() - timedelta(days=30)).isoformat(),
+        )
+        gc.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="2000",
+            payment_date=(date.today() - timedelta(days=10)).isoformat(),
+        )
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Prompt Payer" not in warnings_block
+
+    def test_unposted_invoice_does_not_warn(
+        self, business_book: Path,
+    ):
+        """An invoice in draft (no date_posted) isn't past due —
+        it's not yet a receivable."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Draft Co", currency="USD")
+        gc.create_invoice(
+            customer_id="000001",
+            date_opened=(date.today() - timedelta(days=60)).isoformat(),
+        )
+        # No post_invoice call — invoice stays in draft.
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            assert "Draft Co" not in warnings_block
+
+    def test_warnings_section_above_accounts(
+        self, investment_book: Path,
+    ):
+        """When emitted, Warnings appears above Accounts — that's
+        the scan-first ordering the spec calls for."""
+        gc = GnuCashBook(str(investment_book))
+        result = gc.get_book_summary()
+        assert "Warnings:" in result
+        warnings_idx = result.index("Warnings:")
+        accounts_idx = result.index("Accounts:")
+        assert warnings_idx < accounts_idx
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 
