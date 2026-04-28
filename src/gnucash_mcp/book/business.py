@@ -14,7 +14,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 `_verify_composite_write` from _base.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import piecash
@@ -572,6 +572,98 @@ class BusinessMixin:
         for split in lot.splits:
             total += Decimal(str(split.value))
         return total
+
+    @staticmethod
+    def _resolve_invoice_due_date(
+        book, inv,
+    ) -> tuple[date | None, bool]:
+        """Resolve an invoice/bill due date through three sources.
+
+        Returns ``(due_date, no_terms_flag)``. ``due_date`` is ``None``
+        when the invoice isn't posted yet. ``no_terms_flag`` is True
+        when the 30-day default was used (so callers can annotate the
+        rendering as approximated).
+
+        Resolution order — first source that resolves wins:
+
+        1. ``trans-date-due`` slot on the posting transaction. Present
+           only when the user explicitly passed ``due_date`` to
+           ``post_invoice``.
+        2. ``Invoice.terms`` reference. Present when the user posted
+           with a billterm (e.g., "Net 30"). Read raw via SQL because
+           ``inv.terms`` exposes a relationship that's reliable only
+           through specific paths; raw SQL matches the pattern used
+           elsewhere in this codebase for slot-style reads. The
+           billterm's ``duedays`` is added to ``date_posted``.
+        3. 30-day default. Anchors the days count to the assumption.
+           Callers should annotate any "overdue" rendering as
+           approximated when this branch fires.
+
+        This helper exists so the warnings collector and
+        ``get_outstanding_invoices`` produce identical due-date math.
+        Without it the two were diverging — warnings used the full
+        three-step chain, ``get_outstanding_invoices`` had nothing.
+        """
+        from sqlalchemy import text
+
+        if not _is_invoice_posted(inv):
+            return None, False
+
+        txn = inv.post_txn
+        if txn is None:
+            return None, False
+
+        # Step 1: explicit due-date slot.
+        row = book.session.execute(
+            text(
+                "SELECT gdate_val FROM slots "
+                "WHERE obj_guid = :guid "
+                "AND name = 'trans-date-due'"
+            ),
+            {"guid": txn.guid},
+        ).first()
+        if row and row[0]:
+            gdate_val = row[0]
+            if isinstance(gdate_val, str):
+                return date.fromisoformat(gdate_val[:10]), False
+            if isinstance(gdate_val, datetime):
+                return gdate_val.date(), False
+            return gdate_val, False
+
+        # Step 2: billterm via the raw ``terms`` column.
+        try:
+            terms_row = book.session.execute(
+                text(
+                    "SELECT terms FROM invoices "
+                    "WHERE guid = :guid"
+                ),
+                {"guid": inv.guid},
+            ).first()
+            term_guid = terms_row[0] if terms_row else None
+            if term_guid:
+                from piecash.business.invoice import Billterm
+
+                bt = (
+                    book.session.query(Billterm)
+                    .filter_by(guid=term_guid)
+                    .first()
+                )
+                if bt and bt.duedays:
+                    posted = inv.date_posted
+                    if isinstance(posted, datetime):
+                        posted = posted.date()
+                    return (
+                        posted + timedelta(days=int(bt.duedays)),
+                        False,
+                    )
+        except Exception:
+            pass
+
+        # Step 3: 30-day default. Annotate.
+        posted = inv.date_posted
+        if isinstance(posted, datetime):
+            posted = posted.date()
+        return posted + timedelta(days=30), True
 
     def _get_invoice_entries_and_total(self, book, inv):
         """Query entries for an invoice/bill and compute total.

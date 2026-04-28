@@ -678,110 +678,20 @@ class CoreMixin:
                     Invoice.date_posted.isnot(None)
                 ).all():
                     try:
-                        txn = inv.post_txn
-                        if txn is None:
+                        # Three-step due-date resolution lives on
+                        # ``BusinessMixin`` (``_resolve_invoice_due_date``)
+                        # so the warnings collector and
+                        # ``get_outstanding_invoices`` produce identical
+                        # math. ``no_terms`` is True when the helper
+                        # fell through to the 30-day default; we
+                        # annotate the rendered line accordingly.
+                        resolve_due = getattr(
+                            self, "_resolve_invoice_due_date", None,
+                        )
+                        if resolve_due is None:
                             continue
-                        # Read the trans-date-due slot.
-                        row = book.session.execute(
-                            text(
-                                "SELECT gdate_val FROM slots "
-                                "WHERE obj_guid = :guid "
-                                "AND name = 'trans-date-due'"
-                            ),
-                            {"guid": txn.guid},
-                        ).first()
-                        # Three-step due-date resolution. The
-                        # first source that resolves wins; only the
-                        # last (30-day fallback) annotates the
-                        # warning as approximated.
-                        #
-                        # 1. ``trans-date-due`` slot — present only
-                        #    when the user explicitly passed
-                        #    ``due_date`` to ``post_invoice``.
-                        # 2. ``Invoice.terms`` reference — present
-                        #    when the user posted with a billterm
-                        #    (e.g., "Net 30"). Look up the
-                        #    billterm's ``duedays`` and add to
-                        #    date_posted. The bookkeeper LLM
-                        #    expects "Net 30" terms to produce
-                        #    accurate due dates without needing an
-                        #    explicit due_date parameter; relying
-                        #    only on the slot misses this very
-                        #    common case.
-                        # 3. 30-day default — only when neither
-                        #    slot nor terms reference exists. The
-                        #    rendered warning anchors the days
-                        #    count to the assumption ("N days past
-                        #    30-day default") and tags "(no term
-                        #    set)" so the bookkeeper sees both the
-                        #    duration and the data gap without the
-                        #    string reading as contractual.
-                        no_terms = False
-                        due_date = None
-
-                        # Step 1: explicit due-date slot.
-                        if row and row[0]:
-                            gdate_val = row[0]
-                            if isinstance(gdate_val, str):
-                                due_date = date.fromisoformat(
-                                    gdate_val[:10]
-                                )
-                            elif isinstance(gdate_val, datetime):
-                                due_date = gdate_val.date()
-                            else:
-                                due_date = gdate_val
-
-                        # Step 2: billterm via the raw ``terms``
-                        # column. Bypasses any ORM relationship
-                        # lazy-load — in this codebase ``inv.terms``
-                        # exposes a relationship that's reliable
-                        # only when triggered through specific
-                        # paths; raw SQL is the same pattern used
-                        # elsewhere in the warnings collector for
-                        # slot reads.
-                        if due_date is None:
-                            try:
-                                terms_row = book.session.execute(
-                                    text(
-                                        "SELECT terms FROM invoices "
-                                        "WHERE guid = :guid"
-                                    ),
-                                    {"guid": inv.guid},
-                                ).first()
-                                term_guid = (
-                                    terms_row[0] if terms_row else None
-                                )
-                                if term_guid:
-                                    from piecash.business.invoice import (
-                                        Billterm,
-                                    )
-                                    bt = (
-                                        book.session.query(Billterm)
-                                        .filter_by(guid=term_guid)
-                                        .first()
-                                    )
-                                    if bt and bt.duedays:
-                                        posted = inv.date_posted
-                                        if isinstance(posted, datetime):
-                                            posted = posted.date()
-                                        due_date = (
-                                            posted + timedelta(
-                                                days=int(bt.duedays)
-                                            )
-                                        )
-                            except Exception:
-                                pass
-
-                        # Step 3: 30-day default. Annotate so the
-                        # bookkeeper knows the duration is a guess.
-                        if due_date is None:
-                            posted = inv.date_posted
-                            if isinstance(posted, datetime):
-                                posted = posted.date()
-                            due_date = posted + timedelta(days=30)
-                            no_terms = True
-
-                        if due_date >= today:
+                        due_date, no_terms = resolve_due(book, inv)
+                        if due_date is None or due_date >= today:
                             continue
 
                         lot = inv.post_lot
