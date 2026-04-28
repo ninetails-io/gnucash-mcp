@@ -75,19 +75,25 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def get_balance(account_name: str, as_of_date: str | None = None) -> str:
-        """Get the balance of an account, optionally as of a specific date.
+        """Get the balance of an account as of a specific date.
+
+        Defaults to today's date — future-dated transactions
+        (scheduled payments, accrued interest) are excluded. To
+        project a balance forward including future entries, pass
+        an explicit ``as_of_date`` past today.
 
         Args:
             account_name: Full account name (e.g., 'Assets:Bank:Checking')
-            as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to current date.
+            as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
         """
         book = get_book()
         date_obj = date.fromisoformat(as_of_date) if as_of_date else None
         balance = book.get_balance(account_name, date_obj)
+        resolved_date = as_of_date if as_of_date else date.today().isoformat()
         result = {
             "account": account_name,
             "balance": str(balance),
-            "as_of_date": as_of_date if as_of_date else "current",
+            "as_of_date": resolved_date,
         }
         return _json(result)
 

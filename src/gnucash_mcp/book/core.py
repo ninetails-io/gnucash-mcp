@@ -25,7 +25,7 @@ the one extracted-to-core dependency in the whole tree.
 """
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import piecash
@@ -94,6 +94,1315 @@ class _CreateSignals:
 class CoreMixin:
     """Accounts, transactions, and the book-summary view. Always loaded."""
 
+    # Account types where bank-statement reconciliation is meaningful.
+    # ASSET is added conditionally on a per-account basis when the
+    # account has any cleared/reconciled history (brokerage cash,
+    # escrow, prepaid accounts the user actually reconciles).
+    _RECONCILABLE_TYPES = frozenset({"BANK", "CREDIT", "LIABILITY"})
+
+    # Reconciliation freshness threshold. Accounts whose last
+    # reconciled date is more than this many days behind today (or
+    # which have never been reconciled despite having transactions)
+    # earn a warning marker. Matches monthly statement cycles plus a
+    # ~2-week grace period.
+    _RECONCILE_WARN_DAYS = 45
+
+    def _account_reconciliation_status(
+        self, book: piecash.Book,
+    ) -> list[dict]:
+        """Per-account reconciliation freshness for the book summary.
+
+        For each reconcilable account with transaction activity,
+        returns a dict with::
+
+            {
+              "account": fullname,
+              "status": "through YYYY-MM-DD" | "never reconciled",
+              "days_behind": int | None,   # None iff "never reconciled"
+            }
+
+        The single-int "N unreconciled" count this replaces was
+        operationally useless: it included income/expense/equity
+        splits that conceptually can't be reconciled, so the number
+        was misleadingly large and gave the LLM no actionable signal
+        about which accounts had drifted from reality.
+
+        Filtering rules:
+
+        - Always include: BANK, CREDIT, LIABILITY (the canonical
+          reconcilable types — bank accounts, credit cards, loans
+          with monthly statements).
+        - Conditionally include: ASSET, but only when the account
+          has any 'y' or 'c' history. Catches brokerage cash, escrow,
+          and prepaid accounts the user reconciles, while skipping
+          investment positions and other ASSET accounts where
+          reconciliation doesn't apply.
+        - Always exclude: placeholder accounts, template-subtree
+          accounts (scheduled-transaction scaffolding), the ROOT,
+          and any account with no transaction activity at all (an
+          unused account isn't "behind on reconciliation" — it
+          simply hasn't been used).
+
+        Results are sorted by fullname for deterministic output.
+        Empty list = no reconcilable activity in the book; the
+        caller should omit the Reconciliation section entirely
+        rather than emit an empty header.
+        """
+        template_guids = self._template_account_guids(book)
+        today = date.today()
+
+        results: list[dict] = []
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+
+            # Type gate. ASSET passes only when it has reconcilable
+            # history; the more common ASSET use cases (investment
+            # positions, real estate, vehicles) carry no 'y' or 'c'
+            # splits and rightly skip.
+            if account.type in self._RECONCILABLE_TYPES:
+                pass
+            elif account.type == "ASSET":
+                if not any(
+                    s.reconcile_state in ("y", "c")
+                    for s in account.splits
+                ):
+                    continue
+            else:
+                continue
+
+            if not account.splits:
+                # No activity at all — not "behind," just unused.
+                continue
+
+            # Most recent 'y' split's post_date wins the "through"
+            # date. 'c' (cleared) doesn't count — that's a partial
+            # state that hasn't been finalized to a statement.
+            latest_y_date = None
+            for s in account.splits:
+                if s.reconcile_state == "y":
+                    pd = s.transaction.post_date
+                    if latest_y_date is None or pd > latest_y_date:
+                        latest_y_date = pd
+
+            if latest_y_date is None:
+                results.append({
+                    "account": account.fullname,
+                    "status": "never reconciled",
+                    "days_behind": None,
+                })
+            else:
+                days_behind = (today - latest_y_date).days
+                results.append({
+                    "account": account.fullname,
+                    "status": f"through {latest_y_date.isoformat()}",
+                    "days_behind": days_behind,
+                })
+
+        results.sort(key=lambda r: r["account"])
+        return results
+
+    def _rates_as_of(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity,
+    ) -> dict[str, Decimal]:
+        """For each non-default-currency commodity, return the most
+        recent user-supplied price (in default currency) on or before
+        ``as_of``. Skips piecash's auto-created
+        ``type='transaction'`` placeholder prices the same way the
+        rest of the codebase does — those are post-invoice
+        bookkeeping artifacts, not market quotes.
+
+        Returns ``{commodity_guid: rate}``. Commodities without a
+        price <= as_of don't appear; callers should fall back to
+        skipping that account for trajectory purposes (or use cost
+        basis, depending on the caller's contract).
+        """
+        latest: dict[str, tuple[date, Decimal]] = {}
+        for p in book.prices:
+            if p.currency != default_currency:
+                continue
+            if p.type == "transaction":
+                continue
+            p_date = p.date
+            if hasattr(p_date, "date") and callable(p_date.date):
+                p_date = p_date.date()
+            if p_date > as_of:
+                continue
+            cguid = p.commodity.guid
+            prev = latest.get(cguid)
+            if prev is None or p_date > prev[0]:
+                latest[cguid] = (p_date, Decimal(str(p.value)))
+        return {k: v[1] for k, v in latest.items()}
+
+    # Asset-side and liability-side type sets used by the net-worth
+    # computation. Mirrors the existing in-summary breakdown — the
+    # asset section iterates these types into per-leaf rows; the
+    # liability section iterates the liability set. Receivables and
+    # payables are intentionally excluded from net worth — they live
+    # in their own dedicated sections of the summary and aren't part
+    # of the assets_total − liabilities_total convention.
+    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
+    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+
+    def _compute_net_worth_at(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity,
+    ) -> Decimal:
+        """Net worth in book-default currency as of ``as_of``.
+
+        Single source of truth for the net-worth number the summary
+        displays. Trajectory's "now" anchor and the (former) bottom-
+        line "Net worth:" line both agreed-by-construction when both
+        existed; the bottom-line has since been retired in favor of
+        the trajectory's "now", but this helper preserves the
+        semantics so the user's reference number stays the same.
+
+        Algorithm mirrors the per-leaf breakdown elsewhere in
+        ``get_book_summary``:
+
+        - **Leaf-only iteration.** Parents with children are skipped
+          (their balances are already represented by their children).
+          Matches the per-leaf display structure of the assets and
+          liabilities sections.
+        - **Skips:** ROOT, template-subtree accounts, placeholders.
+        - **Asset accounts** (ASSET / BANK / CASH / STOCK / MUTUAL):
+          balance × most-recent-rate-on-or-before-``as_of``. If the
+          commodity has no price by ``as_of``, fall back to cost
+          basis (sum of split.value, which is in transaction
+          currency = book default for typical USD-denominated buys).
+          That fallback is the same one the assets-section
+          ``_market_value`` helper uses; preserves user-expected
+          numbers for unpriced foreign holdings.
+        - **Liability accounts** (LIABILITY / CREDIT): subtract the
+          raw balance from net worth. Liabilities are stored as
+          negative balances; ``-balance`` gives the positive
+          liability magnitude that's then subtracted. No conversion —
+          matches the existing bottom-line behavior, which assumes
+          liabilities denominated in default currency (the common
+          case for personal books).
+
+        Receivables and payables: excluded from the result because
+        they have their own sections in the summary and aren't part
+        of the canonical assets_total − liabilities_total formula.
+        """
+        template_guids = self._template_account_guids(book)
+        rates = self._rates_as_of(book, as_of, default_currency)
+
+        # is_leaf: an account with no children. Compute the parent
+        # set once and check membership per account.
+        parent_guids: set[str] = set()
+        for a in book.accounts:
+            if a.parent and a.parent.type != "ROOT":
+                parent_guids.add(a.parent.guid)
+
+        assets_total = Decimal("0")
+        liabilities_total = Decimal("0")
+
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+            if account.guid in parent_guids:
+                continue
+
+            if account.type not in self._NW_ASSET_TYPES \
+                    and account.type not in self._NW_LIABILITY_TYPES:
+                continue
+
+            balance = Decimal("0")
+            for split in account.splits:
+                if split.transaction.post_date <= as_of:
+                    balance += split.quantity
+
+            if account.type in self._NW_ASSET_TYPES:
+                if balance == 0:
+                    continue
+                if account.commodity == default_currency:
+                    assets_total += balance
+                else:
+                    rate = rates.get(account.commodity.guid)
+                    if rate is not None:
+                        assets_total += balance * rate
+                    else:
+                        # Cost-basis fallback: split values are in
+                        # transaction currency (= book default for
+                        # typical purchases of foreign-commodity
+                        # assets). Approximation but the same one
+                        # the existing summary uses.
+                        cost_basis = Decimal("0")
+                        for split in account.splits:
+                            if split.transaction.post_date <= as_of:
+                                cost_basis += Decimal(str(split.value))
+                        assets_total += cost_basis
+            else:
+                # Liability bucket. Negate to get positive magnitude;
+                # subtract from net worth via liabilities_total.
+                liabilities_total += -balance
+
+        return assets_total - liabilities_total
+
+    def _net_worth_trajectory(
+        self,
+        book: piecash.Book,
+        first_date: date | None,
+    ) -> list[dict]:
+        """Five-point net-worth trajectory: 12mo / 6mo / 3mo / 1mo
+        ago and now. Implements GET_BOOK_SUMMARY_SPEC §2.
+
+        A slope number alone (one signal, lossy) hides acceleration
+        and recent breaks; a chart is too expensive in tokens. Five
+        data points is the spec's sweet spot — costs ~30 tokens,
+        lets the LLM see whether recent months broke the trend.
+
+        Anchors before the book's first transaction date are
+        dropped (the book didn't exist then; emitting "0" would
+        falsely suggest zero net worth a year ago when the user
+        simply hadn't started the book yet). Anchors within the
+        data range that predate any transaction activity are kept
+        — the spec calls a flat trajectory through that span the
+        right answer; the LLM draws correct conclusions from it.
+
+        Returns a list of ``{label, net_worth}`` dicts ordered
+        oldest-first (matches the natural left-to-right reading of
+        the rendered output). Empty list when the book has no
+        transactions at all → caller omits the section entirely.
+        """
+        if first_date is None:
+            return []
+
+        from dateutil.relativedelta import relativedelta
+
+        today = date.today()
+        # (months_ago, label) — labels right-padded to 8 chars so
+        # the rendered values column visually aligns even with the
+        # uneven label widths the spec example uses.
+        candidates: list[tuple[int, str]] = [
+            (12, "12mo ago"),
+            (6, " 6mo ago"),
+            (3, " 3mo ago"),
+            (1, " 1mo ago"),
+            (0, "     now"),
+        ]
+        anchors: list[tuple[date, str]] = []
+        for months_ago, label in candidates:
+            anchor_date = (
+                today if months_ago == 0
+                else today - relativedelta(months=months_ago)
+            )
+            if anchor_date >= first_date:
+                anchors.append((anchor_date, label))
+
+        if not anchors:
+            return []
+
+        default_currency = self._require_default_currency(book)
+
+        return [
+            {
+                "label": label,
+                "net_worth": self._compute_net_worth_at(
+                    book, anchor_date, default_currency,
+                ).quantize(Decimal("1")),
+            }
+            for anchor_date, label in anchors
+        ]
+
+    # Budget overspend warning threshold. Variance over +10% (used%
+    # ahead of elapsed%) earns a ⚠ marker — under that, the user
+    # is "on pace" or close enough; the threshold gives some
+    # breathing room for the lumpy spending patterns most household
+    # budgets exhibit.
+    _BUDGET_WARN_VARIANCE_PCT = 10
+
+    # Runway warning threshold. < 60 days earns a ⚠ marker — that's
+    # roughly two months, the window where a household should be
+    # actively concerned about cash position rather than just
+    # tracking it.
+    _RUNWAY_WARN_DAYS = 60
+
+    # Days in the burn-rate averaging window. 180 days smooths over
+    # monthly billing cycles and seasonal variance without diluting
+    # recent changes. The spec also calls this out as bounded
+    # compute — the iteration is gated to splits within the window.
+    _RUNWAY_BURN_DAYS = 180
+
+    # Liquid account types for runway computation. Cash and near-cash
+    # only — real estate, vehicles, and other fixed assets aren't
+    # runway even if they're wealth.
+    #
+    # The spec originally proposed including ASSET-typed accounts
+    # whose commodity is the book default ("cash-equivalent ASSET")
+    # as a heuristic for catching brokerage cash and escrow. In
+    # practice GnuCash's ASSET type is structurally for fixed assets
+    # — users code real estate, vehicles, and similar wealth as
+    # ASSET in default currency, and that heuristic over-counts.
+    # The bookkeeper hit this on Alex's book: a USD-default condo
+    # ($473K) and vehicle ($28K) added $501K of "liquid" that Alex
+    # cannot use to make payroll next week. 768 days of runway
+    # ("Alex is fine for two years") vs. 116 days ("Alex has four
+    # months to collect receivables or restructure") is a very
+    # different conversation.
+    #
+    # Cleaner rule, observed across actual user books: BANK, CASH,
+    # STOCK, MUTUAL. Brokerage positions (STOCK/MUTUAL) ARE liquid
+    # — they're sellable in a day at market price. Real fixed
+    # assets (ASSET-typed) are not. Users who legitimately have a
+    # cash-equivalent ASSET (HSA, prepaid USD) can recategorize it
+    # as BANK and it will count; the structural type is honored as
+    # the source of truth.
+    _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
+
+    @staticmethod
+    def _is_in_retirement_subtree(account) -> bool:
+        """True if any path component of the account's fullname
+        contains "retirement" (case-insensitive).
+
+        Heuristic for excluding retirement accounts (IRA, 401k,
+        403b, pension) from the runway liquid pool. Users typically
+        organize these under a "Retirement" placeholder parent —
+        ``Assets:Investments:Retirement:401k`` and similar — which
+        gives the runway calculation a structural signal that's
+        more reliable than guessing from the account's own name
+        ("401k" alone could be ambiguous if the user has a
+        retirement-themed expense account, etc.).
+
+        Caveats: a user who names the subtree "Tax-advantaged" or
+        "IRA Holdings" without the word "Retirement" gets their
+        retirement balance counted as liquid. That's documented in
+        the runway docstring; the long-term semantic answer is a
+        slot-based ``is_retirement`` flag the user explicitly sets.
+        """
+        return any(
+            "retirement" in part.lower()
+            for part in account.fullname.split(":")
+        )
+
+    # Stale-price threshold. Prices older than this in days surface
+    # in the Warnings section. Matches the cadence at which most
+    # users would expect to refresh quotes for active investment
+    # holdings; commodities with no price update in over a month
+    # are likely producing inaccurate net-worth and runway numbers.
+    _STALE_PRICE_DAYS = 30
+
+    def _collect_warnings(self, book: piecash.Book) -> list[str]:
+        """Collect warnings for the consolidated Warnings section.
+        Implements GET_BOOK_SUMMARY_SPEC §5.
+
+        Returns a list of formatted warning strings ready for
+        rendering, ordered by category::
+
+            data integrity → critically low cash → overdue
+            invoices/bills → overdue scheduled → stale prices
+
+        Within each category, most-severe / most-overdue first.
+        The category ordering puts operational urgency (cash
+        flow signals) above data-quality concerns: a near-empty
+        bank account or unpaid receivable is the conversation
+        Robin needs to have today; stale prices are next-week
+        cleanup.
+
+        Coverage:
+
+        - **Integrity** — non-zero balance on any
+          ``Imbalance-{ccy}`` / ``Orphan-{ccy}`` account. GnuCash
+          auto-creates these when a transaction can't balance or
+          when accounts are deleted with their splits orphaned.
+          Non-zero balance there is a real structural defect.
+        - **Critically low cash** — non-placeholder, non-retirement
+          BANK / CASH accounts with positive balance below 1 day of
+          daily burn (``_daily_expense_burn``). Catches accounts
+          that can't cover tomorrow's expenses on their own; scales
+          with the user's actual spending rather than a fixed
+          dollar threshold (a $100 floor is "average person" and
+          wrong for users on either end of the spectrum). When the
+          book has no expense activity (no burn signal), this check
+          is skipped — no benchmark to compare against.
+        - **Overdue invoices / bills** — posted invoices/bills with
+          a non-zero lot balance whose due date is in the past.
+          Due date resolution: ``trans-date-due`` slot first, then
+          the invoice's ``terms`` reference, then a ``date_posted +
+          30 days`` default. When the default fires, the warning
+          renders ``N days past 30-day default ... (no term set)``
+          to anchor the days count to its assumption rather than
+          claiming a contractual due date was missed. Requires
+          BusinessMixin to be loaded for the lot-balance helper;
+          gracefully skipped otherwise.
+        - **Overdue scheduled** — enabled scheduled transactions
+          whose next occurrence is in the past. Uses the
+          SchedulingMixin's ``_next_occurrence`` helper when
+          present; gracefully skipped otherwise.
+        - **Stale prices** — non-default commodities in active use
+          (referenced by some account or price record) whose latest
+          non-``transaction`` price is more than
+          ``_STALE_PRICE_DAYS`` days old, or that have no price on
+          file. Includes ISO currencies — a stale FX rate cascades
+          into wrong receivables totals on multi-currency books.
+
+        Reconciliation-behind warnings are intentionally NOT
+        duplicated here — the dedicated Reconciliation section
+        already surfaces stale per-account state with detail. The
+        spec lists it as a Warnings category, but emitting both
+        creates redundant signals; the principle elsewhere in this
+        summary (don't repeat information that another section
+        already conveys) takes precedence.
+
+        Each per-category collector swallows its own exceptions
+        per spec — a failed check in one category never breaks
+        the rest of the section.
+        """
+        today = date.today()
+        default_currency = self._require_default_currency(book)
+
+        # ── 1. Data integrity: Imbalance / Orphan accounts ──
+        integrity: list[str] = []
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            name = account.name
+            if not (name.startswith("Imbalance-") or name.startswith("Orphan-")):
+                continue
+            balance = Decimal("0")
+            for split in account.splits:
+                balance += split.quantity
+            if balance != 0:
+                integrity.append(
+                    f"{name}: {balance} (data integrity issue)"
+                )
+        # Sort by absolute magnitude descending — biggest defects
+        # first within the integrity bucket.
+        integrity.sort(
+            key=lambda msg: abs(
+                Decimal(msg.split(":")[1].split("(")[0].strip())
+            ),
+            reverse=True,
+        )
+
+        # ── 2. Critically low cash ──
+        # Per-account threshold: positive balance below 1 day of
+        # daily burn (in book default currency). Scales with the
+        # user's actual spending rather than an "average person"
+        # fixed dollar floor. Skipped when the book has no expense
+        # activity (no daily-burn signal to compare against).
+        low_cash: list[str] = []
+        try:
+            daily_burn = self._daily_expense_burn(book)
+            if daily_burn > 0:
+                template_guids = self._template_account_guids(book)
+                rates = self._rates_as_of(
+                    book, today, default_currency,
+                )
+                low_cash_entries: list[tuple[Decimal, str]] = []
+                for account in book.accounts:
+                    if account.type not in ("BANK", "CASH"):
+                        continue
+                    if account.placeholder:
+                        continue
+                    if account.guid in template_guids:
+                        continue
+                    if self._is_in_retirement_subtree(account):
+                        continue
+
+                    balance_qty = Decimal("0")
+                    for split in account.splits:
+                        balance_qty += split.quantity
+                    if balance_qty <= 0:
+                        # Zero = unused, not low. Negative = overdraft,
+                        # captured separately by runway's
+                        # negative_liquid path.
+                        continue
+
+                    # Convert to default currency for the threshold
+                    # comparison. Without a rate, skip rather than
+                    # invent a number.
+                    if account.commodity == default_currency:
+                        balance_default = balance_qty
+                    else:
+                        rate = rates.get(account.commodity.guid)
+                        if rate is None:
+                            continue
+                        balance_default = balance_qty * rate
+
+                    if balance_default >= daily_burn:
+                        continue
+
+                    leaf = account.fullname.split(":")[-1]
+                    amount_str = f"{int(balance_default):,}"
+                    low_cash_entries.append((
+                        balance_default,
+                        f"Critically low cash: {leaf} at "
+                        f"{default_currency.mnemonic} {amount_str} "
+                        f"(under 1 day of burn)",
+                    ))
+                # Lowest balance first within the bucket — those are
+                # the most urgent.
+                low_cash_entries.sort(key=lambda e: e[0])
+                low_cash = [msg for _, msg in low_cash_entries]
+        except Exception:
+            pass
+
+        # ── 3. Overdue invoices and bills ──
+        # Each posted invoice/bill with non-zero lot balance whose
+        # due date is in the past. Due date is read from the
+        # ``trans-date-due`` slot on the posting transaction; when
+        # absent, falls back to date_posted + 30 days and annotates
+        # the warning so the bookkeeper knows the duration is
+        # approximated. Requires BusinessMixin's
+        # _calculate_lot_balance helper; gracefully skipped when
+        # the business module isn't loaded.
+        overdue_invoices: list[str] = []
+        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
+        if calc_lot_balance is not None:
+            try:
+                from piecash.business.invoice import Invoice
+                from sqlalchemy import text
+                find_customer_by_guid = getattr(
+                    self, "_find_customer_by_guid", None,
+                )
+                find_vendor_by_guid = getattr(
+                    self, "_find_vendor_by_guid", None,
+                )
+                overdue_inv_entries: list[tuple[int, str]] = []
+                for inv in book.session.query(Invoice).filter(
+                    Invoice.date_posted.isnot(None)
+                ).all():
+                    try:
+                        txn = inv.post_txn
+                        if txn is None:
+                            continue
+                        # Read the trans-date-due slot.
+                        row = book.session.execute(
+                            text(
+                                "SELECT gdate_val FROM slots "
+                                "WHERE obj_guid = :guid "
+                                "AND name = 'trans-date-due'"
+                            ),
+                            {"guid": txn.guid},
+                        ).first()
+                        # Three-step due-date resolution. The
+                        # first source that resolves wins; only the
+                        # last (30-day fallback) annotates the
+                        # warning as approximated.
+                        #
+                        # 1. ``trans-date-due`` slot — present only
+                        #    when the user explicitly passed
+                        #    ``due_date`` to ``post_invoice``.
+                        # 2. ``Invoice.terms`` reference — present
+                        #    when the user posted with a billterm
+                        #    (e.g., "Net 30"). Look up the
+                        #    billterm's ``duedays`` and add to
+                        #    date_posted. The bookkeeper LLM
+                        #    expects "Net 30" terms to produce
+                        #    accurate due dates without needing an
+                        #    explicit due_date parameter; relying
+                        #    only on the slot misses this very
+                        #    common case.
+                        # 3. 30-day default — only when neither
+                        #    slot nor terms reference exists. The
+                        #    rendered warning anchors the days
+                        #    count to the assumption ("N days past
+                        #    30-day default") and tags "(no term
+                        #    set)" so the bookkeeper sees both the
+                        #    duration and the data gap without the
+                        #    string reading as contractual.
+                        no_terms = False
+                        due_date = None
+
+                        # Step 1: explicit due-date slot.
+                        if row and row[0]:
+                            gdate_val = row[0]
+                            if isinstance(gdate_val, str):
+                                due_date = date.fromisoformat(
+                                    gdate_val[:10]
+                                )
+                            elif isinstance(gdate_val, datetime):
+                                due_date = gdate_val.date()
+                            else:
+                                due_date = gdate_val
+
+                        # Step 2: billterm via the raw ``terms``
+                        # column. Bypasses any ORM relationship
+                        # lazy-load — in this codebase ``inv.terms``
+                        # exposes a relationship that's reliable
+                        # only when triggered through specific
+                        # paths; raw SQL is the same pattern used
+                        # elsewhere in the warnings collector for
+                        # slot reads.
+                        if due_date is None:
+                            try:
+                                terms_row = book.session.execute(
+                                    text(
+                                        "SELECT terms FROM invoices "
+                                        "WHERE guid = :guid"
+                                    ),
+                                    {"guid": inv.guid},
+                                ).first()
+                                term_guid = (
+                                    terms_row[0] if terms_row else None
+                                )
+                                if term_guid:
+                                    from piecash.business.invoice import (
+                                        Billterm,
+                                    )
+                                    bt = (
+                                        book.session.query(Billterm)
+                                        .filter_by(guid=term_guid)
+                                        .first()
+                                    )
+                                    if bt and bt.duedays:
+                                        posted = inv.date_posted
+                                        if isinstance(posted, datetime):
+                                            posted = posted.date()
+                                        due_date = (
+                                            posted + timedelta(
+                                                days=int(bt.duedays)
+                                            )
+                                        )
+                            except Exception:
+                                pass
+
+                        # Step 3: 30-day default. Annotate so the
+                        # bookkeeper knows the duration is a guess.
+                        if due_date is None:
+                            posted = inv.date_posted
+                            if isinstance(posted, datetime):
+                                posted = posted.date()
+                            due_date = posted + timedelta(days=30)
+                            no_terms = True
+
+                        if due_date >= today:
+                            continue
+
+                        lot = inv.post_lot
+                        if lot is None:
+                            continue
+                        balance = calc_lot_balance(lot)
+                        if balance == 0:
+                            continue
+
+                        days_overdue = (today - due_date).days
+                        is_bill = (inv.owner_type == 4)
+                        doc_type = "bill" if is_bill else "invoice"
+
+                        if is_bill and find_vendor_by_guid is not None:
+                            owner = find_vendor_by_guid(
+                                book, inv.owner_guid,
+                            )
+                        elif (
+                            not is_bill
+                            and find_customer_by_guid is not None
+                        ):
+                            owner = find_customer_by_guid(
+                                book, inv.owner_guid,
+                            )
+                        else:
+                            owner = None
+                        owner_name = (
+                            owner.name if owner
+                            else f"#{inv.id}"
+                        )
+
+                        currency = (
+                            inv.currency.mnemonic
+                            if inv.currency
+                            else default_currency.mnemonic
+                        )
+                        amount_str = f"{int(abs(balance)):,}"
+                        # When no term and no explicit due_date were
+                        # set, anchor the days count to the assumption
+                        # that produced it ("days past 30-day default")
+                        # rather than to "overdue" — which reads as
+                        # contractual and contradicts "(no term set)".
+                        # Same number, honest framing: the bookkeeper
+                        # sees the invoice has been unpaid past a
+                        # reasonable default AND that no term was
+                        # specified, with no implication that a
+                        # contractual due date was missed.
+                        if no_terms:
+                            msg = (
+                                f"Past due {doc_type}: {owner_name} "
+                                f"{days_overdue} days past 30-day "
+                                f"default, {currency} {amount_str} "
+                                f"(no term set)"
+                            )
+                        else:
+                            msg = (
+                                f"Past due {doc_type}: {owner_name} "
+                                f"{days_overdue} days overdue, "
+                                f"{currency} {amount_str}"
+                            )
+                        overdue_inv_entries.append(
+                            (days_overdue, msg),
+                        )
+                    except Exception:
+                        continue
+                overdue_inv_entries.sort(reverse=True)
+                overdue_invoices = [
+                    msg for _, msg in overdue_inv_entries
+                ]
+            except Exception:
+                pass
+
+        # ── 5. Stale prices ──
+        stale_prices: list[str] = []
+        try:
+            in_use: set = set()
+            for a in book.accounts:
+                if a.type != "ROOT":
+                    in_use.add(a.commodity.guid)
+            for p in book.prices:
+                in_use.add(p.commodity.guid)
+
+            cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
+            by_commodity_latest: dict[str, date] = {}
+            for p in book.prices:
+                if p.type == "transaction":
+                    continue
+                p_date = p.date
+                if hasattr(p_date, "date") and callable(p_date.date):
+                    p_date = p_date.date()
+                cguid = p.commodity.guid
+                if (
+                    cguid not in by_commodity_latest
+                    or p_date > by_commodity_latest[cguid]
+                ):
+                    by_commodity_latest[cguid] = p_date
+
+            # Track (sort_key, message) so we can order most-stale
+            # first regardless of whether the commodity has a price
+            # at all (None entries sort to the top).
+            stale_entries: list[tuple[int, str]] = []
+            for commodity in book.commodities:
+                if commodity == default_currency:
+                    continue
+                if commodity.guid not in in_use:
+                    continue
+                latest = by_commodity_latest.get(commodity.guid)
+                if latest is None:
+                    stale_entries.append((
+                        10**9,  # arbitrary large sort key — top
+                        f"Stale price: {commodity.mnemonic} no price on file",
+                    ))
+                elif latest < cutoff:
+                    days_old = (today - latest).days
+                    stale_entries.append((
+                        days_old,
+                        f"Stale price: {commodity.mnemonic} "
+                        f"last updated {days_old} days ago",
+                    ))
+            stale_entries.sort(reverse=True)
+            stale_prices = [msg for _, msg in stale_entries]
+        except Exception:
+            # Per spec: skip failed checks, emit the rest.
+            pass
+
+        # ── 4. Overdue scheduled transactions ──
+        # Requires SchedulingMixin's helpers (_next_occurrence,
+        # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
+        # the attribute lookup degrades gracefully via getattr.
+        overdue_scheduled: list[str] = []
+        next_occ_fn = getattr(self, "_next_occurrence", None)
+        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
+        if next_occ_fn is not None and rec_to_freq is not None:
+            try:
+                from piecash.core.transaction import ScheduledTransaction
+                overdue_entries: list[tuple[int, str]] = []
+                for sx in book.session.query(ScheduledTransaction).all():
+                    if not sx.enabled:
+                        continue
+                    try:
+                        rec = sx.recurrence
+                        key = (
+                            rec.recurrence_period_type,
+                            rec.recurrence_mult,
+                        )
+                        frequency = rec_to_freq.get(key)
+                        if not frequency:
+                            continue
+                        start = sx.start_date
+                        if isinstance(start, datetime):
+                            start = start.date()
+                        end = sx.end_date
+                        if isinstance(end, datetime):
+                            end = end.date()
+                        last = sx.last_occur
+                        if isinstance(last, datetime):
+                            last = last.date()
+                        # Search relative to "yesterday" so today's
+                        # occurrence isn't classified as overdue
+                        # before the user has a chance to enter it.
+                        next_occ = next_occ_fn(
+                            start, frequency,
+                            after=start - timedelta(days=1),
+                            end_date=end, last_occur=last,
+                        )
+                        if next_occ and next_occ < today:
+                            days_overdue = (today - next_occ).days
+                            overdue_entries.append((
+                                days_overdue,
+                                f"Overdue scheduled: {sx.name} "
+                                f"due {next_occ.isoformat()}",
+                            ))
+                    except Exception:
+                        continue
+                overdue_entries.sort(reverse=True)
+                overdue_scheduled = [msg for _, msg in overdue_entries]
+            except Exception:
+                pass
+
+        # Integrity tier (imbalance/orphan) leads — actual data
+        # corruption that calls every other number into question.
+        # The remaining categories follow in operational urgency.
+        return (
+            integrity
+            + low_cash
+            + overdue_invoices
+            + overdue_scheduled
+            + stale_prices
+        )
+
+    def _budget_headline(self, book: piecash.Book) -> dict | None:
+        """One-line headline for the budget covering today, if any.
+        Implements GET_BOOK_SUMMARY_SPEC §6.
+
+        Surface logic: pick the budget whose period range includes
+        today; if multiple match, prefer the one with the latest
+        start date (= most recently effective). Books with no
+        budgets — or no budget covering today — get None and the
+        caller omits the section.
+
+        piecash's Budget rows don't carry a ``last_modified``
+        timestamp the spec's "most recently updated" wording
+        suggested; the fallback the spec calls out — "use the
+        budget whose period range includes the current date" — is
+        what's implemented. This is the right behavior for the
+        common case anyway: the user cares about the budget
+        currently being lived inside.
+
+        Returns ``{name, used_pct, elapsed_pct, variance_pct}``
+        with percentages as Decimals (already quantized to whole
+        numbers; caller renders).
+
+        - ``used_pct`` = sum of actuals in budgeted accounts ÷
+          sum of budget targets × 100
+        - ``elapsed_pct`` = (today − period_start + 1) ÷
+          (period_end − period_start + 1) × 100
+        - ``variance_pct`` = used_pct − elapsed_pct (positive =
+          spending ahead of pace; caller renders + sign and ⚠
+          marker at the configured threshold).
+
+        Actuals come straight from EXPENSE / INCOME splits in the
+        budgeted accounts themselves (no parent rollup). The full
+        budget report — which does roll children up to budgeted
+        ancestors — is a separate tool the LLM can call for
+        category-level detail. The headline trades that detail for
+        a single-line summary the LLM can reference proactively
+        ("you're 11% over pace; want me to identify which
+        categories are driving it?").
+        """
+        from piecash.budget import Budget
+
+        budgets = book.session.query(Budget).all()
+        if not budgets:
+            return None
+
+        from dateutil.relativedelta import relativedelta
+
+        today = date.today()
+        candidate = None
+        for b in budgets:
+            rec = b.recurrence
+            period_start = rec.recurrence_period_start
+            if isinstance(period_start, datetime):
+                period_start = period_start.date()
+
+            period_type = rec.recurrence_period_type
+            mult = rec.recurrence_mult
+            num_periods = b.num_periods
+            if period_type == "month":
+                period_end = (
+                    period_start
+                    + relativedelta(months=mult * num_periods)
+                    - timedelta(days=1)
+                )
+            elif period_type == "week":
+                period_end = (
+                    period_start
+                    + timedelta(weeks=mult * num_periods)
+                    - timedelta(days=1)
+                )
+            else:
+                # Unknown recurrence type — skip.
+                continue
+
+            if period_start <= today <= period_end:
+                if candidate is None or period_start > candidate["start"]:
+                    candidate = {
+                        "budget": b,
+                        "start": period_start,
+                        "end": period_end,
+                    }
+
+        if candidate is None:
+            return None
+
+        budget = candidate["budget"]
+        period_start = candidate["start"]
+        period_end = candidate["end"]
+
+        # Sum budget targets across all (account, period) pairs.
+        # BudgetAmount.amount is a Decimal already.
+        total_budgeted = Decimal("0")
+        budgeted_account_guids: set[str] = set()
+        for ba in budget.amounts:
+            total_budgeted += Decimal(str(ba.amount))
+            budgeted_account_guids.add(ba.account.guid)
+
+        if total_budgeted <= 0:
+            return None
+
+        # Actuals: iterate transactions in the budget's date range
+        # once, accumulating EXPENSE positives and INCOME absolute-
+        # value flows for splits in budgeted accounts. INCOME is
+        # stored negative; flip to a positive contribution to match
+        # the spend-vs-target framing.
+        actuals = Decimal("0")
+        for txn in book.transactions:
+            if txn.post_date < period_start or txn.post_date > period_end:
+                continue
+            for s in txn.splits:
+                if s.account.guid not in budgeted_account_guids:
+                    continue
+                if s.account.type == "EXPENSE" and s.quantity > 0:
+                    actuals += s.quantity
+                elif s.account.type == "INCOME" and s.quantity < 0:
+                    actuals += -s.quantity
+
+        # Period progression.
+        total_days = (period_end - period_start).days + 1
+        elapsed_days = (today - period_start).days + 1
+        elapsed_days = max(0, min(elapsed_days, total_days))
+
+        elapsed_pct = (
+            Decimal(elapsed_days) / Decimal(total_days) * Decimal(100)
+        ).quantize(Decimal("1"))
+        used_pct = (
+            actuals / total_budgeted * Decimal(100)
+        ).quantize(Decimal("1"))
+        variance_pct = used_pct - elapsed_pct
+
+        return {
+            "name": budget.name,
+            "used_pct": used_pct,
+            "elapsed_pct": elapsed_pct,
+            "variance_pct": variance_pct,
+        }
+
+    def _daily_expense_burn(
+        self,
+        book: piecash.Book,
+        days: int | None = None,
+    ) -> Decimal:
+        """Average daily EXPENSE outflow over the last ``days`` days.
+
+        Shared between the runway calculation (used to compute days
+        of cash on hand) and the critically-low-cash warning (used
+        to set a relative threshold "less than 1 day of burn").
+        Both want the same number — extracting the helper guarantees
+        they agree.
+
+        Returns ``Decimal("0")`` when no expense activity in window
+        — caller treats that as "no daily-burn signal."
+        """
+        if days is None:
+            days = self._RUNWAY_BURN_DAYS
+        today = date.today()
+        window_start = today - timedelta(days=days)
+        expenses = Decimal("0")
+        for txn in book.transactions:
+            if txn.post_date < window_start or txn.post_date > today:
+                continue
+            for s in txn.splits:
+                if s.account.type == "EXPENSE":
+                    expenses += Decimal(str(s.value))
+        return expenses / Decimal(days)
+
+    def _runway_metrics(
+        self,
+        book: piecash.Book,
+        default_currency: piecash.Commodity,
+    ) -> dict | None:
+        """Compute runway: how many days the household could survive
+        on current liquid assets at current burn rate if income
+        stopped today. Implements GET_BOOK_SUMMARY_SPEC §4.
+
+        Returns ``None`` when there's no expense activity in the
+        window (no daily-burn signal → no runway to compute → caller
+        omits the section). Otherwise returns a dict the caller
+        renders.
+
+        **Liquid assets** = sum of balances in
+        ``_RUNWAY_LIQUID_TYPES`` (BANK + CASH + STOCK + MUTUAL),
+        with two exclusions layered on top:
+
+        1. ASSET-typed accounts. Structurally for fixed assets
+           (real estate, vehicles) in observed user practice,
+           even when in default currency.
+        2. Any account in a "Retirement" subtree (any ancestor
+           with "retirement" in its name, case-insensitive).
+           IRA / 401k / 403b balances share BANK / STOCK / MUTUAL
+           types with truly liquid accounts but carry
+           early-withdrawal penalties — not really runway. See
+           ``_is_in_retirement_subtree``.
+
+        STOCK and MUTUAL positions value at
+        ``shares × latest_price`` using the same date-aware rate
+        helper net worth uses. When no price is on file, fall back
+        to cost basis (sum of split.value, in transaction currency)
+        — same fallback as net worth. Foreign-currency BANK/CASH
+        accounts likewise convert at latest rate, with cost-basis
+        fallback for the unpriced case.
+
+        **Daily burn** = sum of expense splits over the last
+        ``_RUNWAY_BURN_DAYS`` days, divided by that window size.
+        Uses ``split.value`` (transaction currency) — for typical
+        books where expense accounts share the book default
+        currency, accurate; multi-currency expenses sum raw without
+        per-day FX conversion (rare in personal bookkeeping).
+
+        Special cases:
+        - ``daily_burn <= 0`` (no expense data): return None →
+          omit the section.
+        - ``liquid_assets < 0`` (overdrafts exceed positive cash
+          positions): return a flag dict; caller renders
+          "0 days — liquid position is negative ⚠".
+        - Otherwise: return ``{runway_days, liquid, daily_burn}``;
+          caller renders the days line with optional ⚠ at <60.
+        """
+        today = date.today()
+        template_guids = self._template_account_guids(book)
+        rates = self._rates_as_of(book, today, default_currency)
+
+        # --- Liquid assets pass over book.accounts ---
+        liquid = Decimal("0")
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+            if account.type not in self._RUNWAY_LIQUID_TYPES:
+                continue
+            if self._is_in_retirement_subtree(account):
+                # Retirement accounts (IRA, 401k, 403b, pension, etc.)
+                # share BANK / STOCK / MUTUAL types with truly liquid
+                # accounts but carry early-withdrawal penalties that
+                # disqualify them from "if income stops today" runway.
+                # The bookkeeper hit this on Alex's book: a $13,716
+                # 401k under Assets:Investments:Retirement was being
+                # counted as liquid, inflating runway from ~95 days
+                # to 124. Filtering by ancestor-named-Retirement is
+                # the structural-intent heuristic — fragile if a user
+                # names the subtree "Tax-advantaged" instead, but
+                # clean enough for the standard naming convention.
+                continue
+
+            balance = Decimal("0")
+            for split in account.splits:
+                balance += split.quantity
+            if balance == 0:
+                continue
+
+            if account.commodity == default_currency:
+                liquid += balance
+            else:
+                rate = rates.get(account.commodity.guid)
+                if rate is not None:
+                    liquid += balance * rate
+                else:
+                    # Cost-basis fallback: sum split.value
+                    # (transaction currency = book default for
+                    # typical buys of foreign-commodity holdings).
+                    # Same fallback the assets section uses, and
+                    # the same one _compute_net_worth_at uses for
+                    # consistency.
+                    cost_basis = Decimal("0")
+                    for split in account.splits:
+                        cost_basis += Decimal(str(split.value))
+                    liquid += cost_basis
+
+        # Daily burn comes from the shared helper so the warnings
+        # section's "less than 1 day of burn" threshold and runway's
+        # divisor-of-liquid agree by construction.
+        daily_burn = self._daily_expense_burn(
+            book, days=self._RUNWAY_BURN_DAYS,
+        )
+
+        if daily_burn <= 0:
+            return None
+
+        if liquid < 0:
+            return {
+                "negative_liquid": True,
+                "liquid": liquid.quantize(Decimal("1")),
+                "daily_burn": daily_burn.quantize(Decimal("1")),
+            }
+
+        runway_days = int(liquid / daily_burn)
+        return {
+            "negative_liquid": False,
+            "runway_days": runway_days,
+            "liquid": liquid.quantize(Decimal("1")),
+            "daily_burn": daily_burn.quantize(Decimal("1")),
+        }
+
+    def _monthly_net_income(
+        self, book: piecash.Book, months: int = 6,
+    ) -> list[dict]:
+        """Per-month net income for the last ``months`` calendar
+        months. Implements GET_BOOK_SUMMARY_SPEC §3.
+
+        Net = INCOME credits − EXPENSE debits. INCOME splits are
+        stored negative (the credit side of the double-entry
+        bookkeeping convention) so they're sign-flipped to a positive
+        contribution; EXPENSE splits are stored positive and subtract.
+
+        Returns a list of dicts ordered **most recent month first**::
+
+            [
+              {"label": "Apr 2026", "net": Decimal("1247"), "is_mtd": True},
+              {"label": "Mar 2026", "net": Decimal("890"),  "is_mtd": False},
+              ...
+            ]
+
+        ``is_mtd`` is True only for the current calendar month
+        (which is, by definition, partial). Callers render that as
+        a "(MTD)" suffix on the label.
+
+        Returns an empty list when the window contains no income or
+        expense activity at all — the caller should omit the section
+        entirely rather than emit six "+0" lines that say nothing.
+
+        Multi-currency caveat: ``split.value`` is in transaction
+        currency, not account commodity. For typical books where
+        income/expense accounts share the book default currency
+        (and transactions are recorded in that currency), the sum is
+        accurate. Cross-currency income/expense activity sums raw
+        without per-month FX conversion — flagged as a refinement
+        target in the spec; rare in practice for personal/household
+        books.
+        """
+        today = date.today()
+
+        # Build the calendar-month windows, oldest → newest. Plain
+        # arithmetic on (year, month) avoids a dateutil dependency
+        # at this layer; the budgets/scheduling mixins already pull
+        # in relativedelta for their own needs but core stays light.
+        month_starts: list[date] = []
+        cursor = date(today.year, today.month, 1)
+        for _ in range(months):
+            month_starts.append(cursor)
+            if cursor.month == 1:
+                cursor = date(cursor.year - 1, 12, 1)
+            else:
+                cursor = date(cursor.year, cursor.month - 1, 1)
+        month_starts.reverse()
+
+        month_ends: list[date] = []
+        for i, start in enumerate(month_starts):
+            if i + 1 < len(month_starts):
+                nxt = month_starts[i + 1]
+                month_ends.append(
+                    date(nxt.year, nxt.month, 1) - timedelta(days=1)
+                )
+            else:
+                if start.month == 12:
+                    month_ends.append(date(start.year, 12, 31))
+                else:
+                    month_ends.append(
+                        date(start.year, start.month + 1, 1) - timedelta(days=1)
+                    )
+
+        nets = [Decimal("0") for _ in month_starts]
+        window_start = month_starts[0]
+        window_end = month_ends[-1]
+        has_activity = False
+
+        # Single pass over book.transactions. Index math: the bucket
+        # for a transaction is (year_delta * 12 + month_delta) from
+        # the window start. O(transactions); the date-range gate
+        # short-circuits transactions outside the window.
+        for txn in book.transactions:
+            d = txn.post_date
+            if d < window_start or d > window_end:
+                continue
+            idx = (
+                (d.year - window_start.year) * 12
+                + (d.month - window_start.month)
+            )
+            if idx < 0 or idx >= len(nets):
+                continue
+            for s in txn.splits:
+                atype = s.account.type
+                if atype == "INCOME":
+                    nets[idx] += -Decimal(str(s.value))
+                    has_activity = True
+                elif atype == "EXPENSE":
+                    nets[idx] -= Decimal(str(s.value))
+                    has_activity = True
+
+        if not has_activity:
+            return []
+
+        today_month_start = date(today.year, today.month, 1)
+        result: list[dict] = []
+        for i in range(len(month_starts) - 1, -1, -1):
+            start = month_starts[i]
+            result.append({
+                "label": start.strftime("%b %Y"),
+                "net": nets[i].quantize(Decimal("1")),
+                "is_mtd": start == today_month_start,
+            })
+        return result
+
+    @staticmethod
+    def _format_monthly_net(net: Decimal) -> str:
+        """Render a monthly net value as ``+1,247`` / ``-234`` / ``+0``.
+
+        Always shows an explicit sign; thousands separator. Whole
+        dollars (the spec's example output is whole-number; cents
+        would noise up the summary view without adding signal).
+        """
+        return f"{int(net):+,}"
+
+    @staticmethod
+    def _format_reconciliation_lag(days_behind: int) -> str:
+        """Render a parenthesized "(N months behind)" / "(N days
+        behind)" suffix for a reconciliation status warning.
+
+        Months scale once we're past 60 days because that's how users
+        think about reconciliation lag — "two months behind" reads
+        more naturally than "67 days behind." Below 60 days we stay
+        in days for precision; the warning threshold itself is 45
+        days, so the days-form covers the 45–59 window.
+        """
+        if days_behind >= 60:
+            months = days_behind // 30
+            return f"({months} months behind)"
+        return f"({days_behind} days behind)"
+
     def get_book_summary(self) -> str:
         """Return a compact text summary of the entire book.
 
@@ -115,6 +1424,18 @@ class CoreMixin:
         with self.open(readonly=True) as book:
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
+
+            # All balances and price lookups in this summary are
+            # computed as-of-today. Trajectory's "now" anchor uses
+            # the same cutoff (via ``_compute_net_worth_at(today)``
+            # and ``_rates_as_of(today)``), so the displayed Assets
+            # / Liabilities totals agree with trajectory's "now"
+            # by construction. Without this filter, future-dated
+            # transactions or prices in the book would skew the
+            # current snapshot — bookkeeper hit this on Alex's
+            # book where 34 days of data past today produced a
+            # $2,906 gap between Assets-Liabilities and trajectory.
+            today = date.today()
 
             # Identify template accounts (scheduled-transaction scaffolding).
             # Shared helper on BaseGnuCashBook walks the whole subtree; the
@@ -140,11 +1461,16 @@ class CoreMixin:
                     continue
                 if p.type == "transaction":
                     continue
-                key = p.commodity.guid
-                existing = latest_prices.get(key + ":date")
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
                     p_date = p_date.date()
+                if p_date > today:
+                    # Future-dated prices excluded so _market_value
+                    # agrees with trajectory's _rates_as_of(today)
+                    # by construction.
+                    continue
+                key = p.commodity.guid
+                existing = latest_prices.get(key + ":date")
                 if existing is None or p_date > existing:
                     latest_prices[key + ":date"] = p_date
                     latest_prices[key] = Decimal(str(p.value))
@@ -163,9 +1489,13 @@ class CoreMixin:
                 if rate is not None:
                     return (quantity * rate), f"{quantity} {sym} @ {rate}"
                 # Fallback: cost basis from split values (transaction currency).
+                # Same today filter as the balance computation —
+                # without it, future-dated buys would inflate cost
+                # basis past the as-of-today snapshot.
                 cost_basis = Decimal("0")
                 for s in account.splits:
-                    cost_basis += Decimal(str(s.value))
+                    if s.transaction.post_date <= today:
+                        cost_basis += Decimal(str(s.value))
                 return cost_basis, f"{quantity} {sym} — no price data"
 
             # --- Account stats ---
@@ -198,9 +1528,13 @@ class CoreMixin:
                 is_leaf = account.guid not in parent_guids
 
                 # Calculate balance in the account's own commodity.
+                # Date filter excludes future-dated transactions so
+                # trajectory's "now" anchor agrees with the
+                # displayed Assets / Liabilities totals.
                 balance = Decimal("0")
                 for split in account.splits:
-                    balance += split.quantity
+                    if split.transaction.post_date <= today:
+                        balance += split.quantity
 
                 leaf = account.fullname.split(":")[-1]
 
@@ -261,9 +1595,14 @@ class CoreMixin:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
 
             # --- Transaction stats ---
+            # Per-split unreconciled counting was dropped — the old
+            # "Transactions: N (M unreconciled)" suffix included
+            # income/expense/equity splits that can't be reconciled,
+            # so the count was operationally useless. The new
+            # Reconciliation section below (per-account, per-status)
+            # is the actionable replacement.
             transactions = list(book.transactions)
             total_txns = len(transactions)
-            unreconciled_txns = 0
             first_date = None
             last_date = None
 
@@ -273,8 +1612,6 @@ class CoreMixin:
                     first_date = d
                 if last_date is None or d > last_date:
                     last_date = d
-                if any(s.reconcile_state != "y" for s in txn.splits):
-                    unreconciled_txns += 1
 
             # --- Scheduled transactions ---
             all_sx = book.session.query(ScheduledTransaction).all()
@@ -300,6 +1637,20 @@ class CoreMixin:
 
             if first_date and last_date:
                 lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
+
+            # Warnings: scan-first section. Lives near the top of
+            # the output (right after book metadata) because if
+            # there's data integrity trouble or stale prices
+            # informing the rest of the summary, the LLM should see
+            # that BEFORE reading numbers that depend on them.
+            # Section omitted entirely when no warnings — absence
+            # is the signal; the spec explicitly calls out not
+            # printing "Warnings: none."
+            warnings = self._collect_warnings(book)
+            if warnings:
+                lines.append("Warnings:")
+                for msg in warnings:
+                    lines.append(f"  ⚠ {msg}")
 
             lines.append(f"Accounts: {total_accounts} total")
 
@@ -350,7 +1701,145 @@ class CoreMixin:
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
 
-            lines.append(f"Transactions: {total_txns} ({unreconciled_txns} unreconciled)")
+            # Reconciliation: per-account state for reconcilable
+            # account types. Section omitted entirely when the book
+            # has no reconcilable activity (no header line either —
+            # absence is the signal, per the spec's principle).
+            #
+            # Render shape splits the per-account list into THREE
+            # buckets, each carrying a distinct payload class:
+            #
+            # 1. STALE (reconciled at some point but >45 days behind)
+            #    — render individually with their through-date and
+            #    a "(N days/months behind) ⚠" lag suffix. The
+            #    information *how stale is each one* is per-account
+            #    and can't be aggregated. These are the lines a
+            #    bookkeeper LLM actually acts on.
+            # 2. CURRENT (reconciled within 45 days) — collapse into
+            #    a single "<N> accounts current" line. Each
+            #    individual through-date carries the same payload
+            #    ("this one's fine"), repeated; the count preserves
+            #    the affirmative signal without paying per-account
+            #    for it.
+            # 3. NEVER RECONCILED (activity but no 'y' splits) —
+            #    collapse into "<N> account(s) never reconciled ⚠".
+            #    Same logic as the current bucket: identical
+            #    per-line content compresses to a count.
+            #
+            # The principle: per-account-distinct information stays
+            # per-account; identical-across-accounts information
+            # collapses. A 50-account power-user book emits ~3-5
+            # lines; an Alex-sized book emits ~3-5 lines. Signal
+            # density is uniform regardless of book size.
+            #
+            # Each collapse line is omitted when its count is zero
+            # (absence-as-signal): a book with no current accounts
+            # never sees "0 accounts current."
+            reconciliation = self._account_reconciliation_status(book)
+            if reconciliation:
+                stale: list[dict] = []
+                current_count = 0
+                never_count = 0
+                for entry in reconciliation:
+                    if entry["status"] == "never reconciled":
+                        never_count += 1
+                    elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+                        stale.append(entry)
+                    else:
+                        current_count += 1
+
+                lines.append("Reconciliation:")
+                for entry in stale:
+                    leaf = entry["account"].split(":")[-1]
+                    lag = self._format_reconciliation_lag(entry["days_behind"])
+                    lines.append(
+                        f"  {leaf}: {entry['status']} {lag} ⚠"
+                    )
+                if current_count:
+                    plural = "s" if current_count != 1 else ""
+                    lines.append(
+                        f"  {current_count} account{plural} current"
+                    )
+                if never_count:
+                    plural = "s" if never_count != 1 else ""
+                    lines.append(
+                        f"  {never_count} account{plural} never reconciled ⚠"
+                    )
+
+            # Net worth trajectory (12mo / 6mo / 3mo / 1mo ago, now).
+            # Surfaces acceleration and trend breaks that a single
+            # net-worth number can't. Empty list = book has no
+            # transactions or every anchor predates the data range
+            # → omit the section entirely.
+            trajectory = self._net_worth_trajectory(book, first_date)
+            if trajectory:
+                lines.append("Net worth trajectory:")
+                for entry in trajectory:
+                    lines.append(
+                        f"  {entry['label']}: {currency} "
+                        f"{int(entry['net_worth']):,}"
+                    )
+
+            # Monthly net income (last 6 months). Surfaces seasonality
+            # and recent anomalies. Empty list = no income/expense
+            # activity in the window → omit the section entirely.
+            monthly = self._monthly_net_income(book, months=6)
+            if monthly:
+                lines.append("Monthly net (last 6 months):")
+                for entry in monthly:
+                    label = entry["label"]
+                    if entry["is_mtd"]:
+                        label += " (MTD)"
+                    lines.append(
+                        f"  {label}: {self._format_monthly_net(entry['net'])}"
+                    )
+
+            # Runway: liquid assets / daily burn → days. The single
+            # most actionable personal-finance number that doesn't
+            # appear on standard financial statements. None = no
+            # expense data in the burn window → omit section.
+            runway = self._runway_metrics(book, default_currency)
+            if runway is not None:
+                if runway.get("negative_liquid"):
+                    lines.append(
+                        "Runway: 0 days — liquid position is negative ⚠"
+                    )
+                else:
+                    days = runway["runway_days"]
+                    liquid = int(runway["liquid"])
+                    burn = int(runway["daily_burn"])
+                    warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
+                    lines.append(
+                        f"Runway: {days} days{warn} "
+                        f"({currency} {liquid:,} liquid / "
+                        f"{currency} {burn:,}/day burn)"
+                    )
+
+            # Budget headline: one line for the budget covering today.
+            # None = no budget exists or none covers today → omit.
+            # Variance > +10% earns ⚠ (spending ahead of pace).
+            budget = self._budget_headline(book)
+            if budget is not None:
+                used = int(budget["used_pct"])
+                elapsed = int(budget["elapsed_pct"])
+                variance = int(budget["variance_pct"])
+                if variance > 0:
+                    variance_str = f"(+{variance}% over pace)"
+                elif variance < 0:
+                    variance_str = f"({-variance}% under pace)"
+                else:
+                    variance_str = "(on pace)"
+                warn = (
+                    " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT
+                    else ""
+                )
+                lines.append(
+                    f"Budget ({budget['name']}): "
+                    f"{used}% used / {elapsed}% elapsed "
+                    f"{variance_str}{warn}"
+                )
+
+            lines.append(f"Transactions: {total_txns}")
 
             if enabled_sx > 0:
                 lines.append(f"Scheduled: {enabled_sx} recurring")
@@ -372,7 +1861,14 @@ class CoreMixin:
                 lines.append(f"Budgets: {n_budgets}")
 
             lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
-            lines.append(f"Net worth: {currency} {net_worth}")
+
+            # Bottom-line "Net worth: USD X" line removed. The
+            # trajectory section's "now" anchor is now the
+            # authoritative net-worth number, computed via
+            # _compute_net_worth_at — the user sees one number,
+            # by construction matching the per-leaf
+            # assets_total − liabilities_total semantics that
+            # used to render here.
 
             return "\n".join(lines)
 
@@ -436,13 +1932,19 @@ class CoreMixin:
             return None
 
     def get_balance(self, account_name: str, as_of_date: date | None = None) -> Decimal:
-        """Get balance for an account, optionally as of a specific date.
+        """Get balance for an account as of a specific date.
 
         Returns raw GnuCash balance (accounting sign convention).
 
+        Defaults to today, so future-dated transactions (scheduled
+        payments, accrued interest, mid-month bills already entered)
+        are excluded. To project a balance forward — including future
+        entries — pass an explicit ``as_of_date`` past today.
+
         Args:
             account_name: Full account path.
-            as_of_date: Date to calculate balance as of. Defaults to all time.
+            as_of_date: Date to calculate balance as of. Defaults to
+                today's date.
 
         Returns:
             Account balance as Decimal.
@@ -450,6 +1952,8 @@ class CoreMixin:
         Raises:
             ValueError: If account not found.
         """
+        if as_of_date is None:
+            as_of_date = date.today()
         with self.open(readonly=True) as book:
             account = self._find_account(book, account_name)
             if not account:
@@ -457,7 +1961,7 @@ class CoreMixin:
 
             balance = Decimal("0")
             for split in account.splits:
-                if as_of_date is None or split.transaction.post_date <= as_of_date:
+                if split.transaction.post_date <= as_of_date:
                     balance += split.quantity
 
             return balance

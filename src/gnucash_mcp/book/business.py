@@ -27,6 +27,39 @@ from gnucash_mcp.book._base import (
 )
 
 
+def _safe_date_posted(inv):
+    """Read ``inv.date_posted`` defensively.
+
+    Returns the datetime (or whatever the ORM gives back) when
+    the column holds a real value, or ``None`` when the column
+    is NULL, empty, or malformed enough that piecash's
+    ``_DateTime`` TypeDecorator raises ``ValueError`` on access.
+
+    The bookkeeper hit this on Alex Chen-Morales's book: a
+    freshly auto-id'd bill's ``date_posted`` came back as ``''``
+    in SQL. SQLAlchemy's regex-based DATETIME parser raises
+    "Couldn't parse datetime string" when reading that — a hard
+    crash on a never-posted document. Wrapping the access lets
+    every caller treat the document as not-posted gracefully.
+    """
+    try:
+        dp = inv.date_posted
+        return dp if dp else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_invoice_posted(inv) -> bool:
+    """True iff ``inv`` has a real datetime in ``date_posted``.
+
+    Single chokepoint for "is this document posted?" across the
+    business module. Built on ``_safe_date_posted`` so the
+    tolerant semantics (None / "" / unparseable values all read
+    as not-posted) apply uniformly.
+    """
+    return _safe_date_posted(inv) is not None
+
+
 class BusinessMixin:
     """Customer/vendor/invoice/bill operations."""
 
@@ -214,6 +247,25 @@ class BusinessMixin:
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
+        Self-heals malformed ``date_posted=''`` values to NULL on
+        writable sessions before the ORM query runs. piecash's
+        ``_DateTime`` TypeDecorator's regex parser raises
+        ``ValueError: Couldn't parse datetime string: ''`` when
+        loading a row whose ``date_posted`` is an empty string —
+        a hard crash that blocks every subsequent invoice/bill
+        operation. The bookkeeper hit this on Alex Chen-Morales's
+        book where a freshly auto-id'd bill's ``date_posted``
+        landed as ``''`` instead of NULL through some persistence
+        path. Coercing to NULL upstream of the query is the only
+        reliable fix; the ORM never sees the malformed value.
+
+        piecash doesn't expose a readonly flag, so the heal is
+        always attempted; the try/except absorbs the failure when
+        the session is readonly. Books that need healing must be
+        touched through a write operation at least once; after
+        that, the cleanup persists and readonly operations
+        succeed too.
+
         Args:
             book: piecash Book instance.
             invoice_id: Human-readable ID (e.g., '000001').
@@ -221,6 +273,22 @@ class BusinessMixin:
                         None returns first match of either type.
         """
         from piecash.business.invoice import Invoice
+        from sqlalchemy import text
+
+        try:
+            book.session.execute(
+                text(
+                    "UPDATE invoices SET date_posted = NULL "
+                    "WHERE date_posted = ''"
+                )
+            )
+            book.session.flush()
+        except Exception:
+            # Best-effort heal — readonly sessions, locked
+            # connections, and other rare failures fall through;
+            # never break a lookup over a self-heal attempt.
+            pass
+
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
             query = query.filter(Invoice.owner_type == owner_type)
@@ -362,7 +430,10 @@ class BusinessMixin:
             "type": "bill" if invoice.owner_type == 4 else "invoice",
             "owner_guid": invoice.owner_guid,
             "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
-            "date_posted": str(invoice.date_posted.date()) if invoice.date_posted else None,
+            "date_posted": (
+                str(_safe_date_posted(invoice).date())
+                if _safe_date_posted(invoice) else None
+            ),
             "notes": invoice.notes or "",
             "active": bool(invoice.active),
             "currency": invoice.currency.mnemonic if invoice.currency else None,
@@ -376,7 +447,7 @@ class BusinessMixin:
         """One-line compact: 'id  type  owner_id  date_opened  status'."""
         inv_type = "BILL" if invoice.owner_type == 4 else "INV"
         date_str = str(invoice.date_opened.date()) if invoice.date_opened else "n/a"
-        status = "posted" if invoice.date_posted else "open"
+        status = "posted" if _is_invoice_posted(invoice) else "open"
         return f"{invoice.id}\t{inv_type}\t{date_str}\t{status}"
 
     @staticmethod
@@ -1055,7 +1126,39 @@ class BusinessMixin:
                         f"'{doc_id}' already exists"
                     )
             else:
-                cnt = getattr(book, config["counter_attr"]) + 1
+                # Auto-generate the next document ID. The book
+                # counter (``counter_invoice`` / ``counter_bill``)
+                # SHOULD be the canonical source, but it can drift
+                # below the actual MAX(id) — e.g. when historical
+                # documents are imported via raw SQL without
+                # bumping the counter, or when the file was edited
+                # outside the MCP server's lifecycle. The
+                # bookkeeper hit this on Alex's synthetic book:
+                # 2025 bills sat at IDs 000006 / 000007 but the
+                # counter was lower, so a new 2026 ``create_bill``
+                # auto-assigned 000006 — colliding with the
+                # 2025 row and breaking every subsequent
+                # ``post_invoice`` / ``get_outstanding_invoices``
+                # lookup that resolved to the wrong record.
+                #
+                # Fix: take the max of (book counter, actual max
+                # numeric ID in the table for this owner_type) and
+                # use that + 1. Re-sync the book counter so the
+                # next auto-id picks up where this one left off.
+                # Non-numeric existing IDs (custom strings the
+                # user supplied) are skipped — they're irrelevant
+                # to numeric auto-numbering.
+                book_counter = getattr(book, config["counter_attr"])
+                existing_ids = book.session.query(Invoice.id).filter(
+                    Invoice.owner_type == owner_type
+                ).all()
+                max_numeric = 0
+                for (existing_id,) in existing_ids:
+                    try:
+                        max_numeric = max(max_numeric, int(existing_id))
+                    except (ValueError, TypeError):
+                        continue
+                cnt = max(book_counter, max_numeric) + 1
                 setattr(book, config["counter_attr"], cnt)
                 doc_id = f"{cnt:06d}"
 
@@ -1198,7 +1301,7 @@ class BusinessMixin:
                     f"'{invoice_id}' is a vendor bill, not a customer invoice. "
                     f"Use add_bill_entry instead."
                 )
-            if inv.date_posted is not None:
+            if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Invoice '{invoice_id}' is already posted. "
                     f"Cannot add entries to posted invoices."
@@ -1300,7 +1403,7 @@ class BusinessMixin:
                     f"'{bill_id}' is a customer invoice, not a vendor bill. "
                     f"Use add_invoice_entry instead."
                 )
-            if inv.date_posted is not None:
+            if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Bill '{bill_id}' is already posted. "
                     f"Cannot add entries to posted bills."
@@ -1396,9 +1499,9 @@ class BusinessMixin:
             invoices = query.order_by(Invoice.date_opened.desc()).all()
 
             if status == "posted":
-                invoices = [i for i in invoices if i.date_posted is not None]
+                invoices = [i for i in invoices if _is_invoice_posted(i)]
             elif status == "open":
-                invoices = [i for i in invoices if i.date_posted is None]
+                invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
             if compact:
                 lines = [self._invoice_to_compact_line(i) for i in invoices]
@@ -1516,13 +1619,54 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            # GnuCash uses separate ID sequences for customer
+            # invoices (owner_type=2) and vendor bills
+            # (owner_type=4) but stores both in the ``invoices``
+            # table. IDs collide across sequences (a $5K Emerald
+            # Analytics invoice and a $250 Office Depot bill can
+            # both be id=000010). Without an owner_type filter,
+            # ``_find_invoice`` returns whichever row hits first
+            # — the bookkeeper hit this on Alex's book trying to
+            # post a vendor bill 000010 and getting back an
+            # already-posted customer invoice 000010, raising
+            # spurious "already posted".
+            #
+            # When the caller didn't specify ``owner_type``,
+            # disambiguate by reading the post_account type:
+            # a RECEIVABLE account can only receive customer
+            # invoices, a PAYABLE only vendor bills. The
+            # post_account validation later in this method already
+            # uses the same predicate; using it upstream for the
+            # lookup eliminates the collision class entirely.
+            if ot is None:
+                pa = self._find_account(book, post_account)
+                if pa is not None:
+                    if pa.type == "RECEIVABLE":
+                        ot = 2
+                    elif pa.type == "PAYABLE":
+                        ot = 4
+
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
                     f"Invoice/bill not found: {invoice_id}"
                 )
 
-            if inv.date_posted is not None:
+            # Truthy check rather than ``is not None``: piecash's
+            # _DateTime TypeDecorator can return falsy non-None
+            # values (empty string in some persistence paths) for
+            # never-posted documents. The bookkeeper hit this on
+            # Alex's book where freshly auto-id'd bill 000008 had
+            # ``date_posted=""`` in SQL and post_invoice raised
+            # "already posted" on it. ``if inv.date_posted`` treats
+            # both None and "" as "not posted"; only a real
+            # datetime is truthy. Same fix applied to all other
+            # date_posted checks in this module — see also
+            # ``add_invoice_entry``, ``add_bill_entry``,
+            # ``pay_invoice``, ``list_invoices`` filter,
+            # ``_delete_invoice_or_bill``, and the dependency
+            # check in ``_invoice_dependency_check``.
+            if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Invoice {invoice_id} is already posted"
                 )
@@ -1754,7 +1898,7 @@ class BusinessMixin:
                     f"Invoice/bill not found: {invoice_id}"
                 )
 
-            if inv.date_posted is None:
+            if not _is_invoice_posted(inv):
                 raise ValueError(
                     f"Invoice {invoice_id} is not posted — "
                     f"post it before recording payment"
@@ -2015,7 +2159,7 @@ class BusinessMixin:
             if not inv:
                 raise ValueError(f"{type_label} not found: {doc_id}")
 
-            if inv.date_posted is not None:
+            if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Cannot delete posted {type_label.lower()} '{doc_id}'. "
                     f"Void it or issue a credit note instead."
@@ -2170,8 +2314,8 @@ class BusinessMixin:
             ).all()
             if not invoices:
                 return
-            posted = [i for i in invoices if i.date_posted is not None]
-            unposted = [i for i in invoices if i.date_posted is None]
+            posted = [i for i in invoices if _is_invoice_posted(i)]
+            unposted = [i for i in invoices if not _is_invoice_posted(i)]
             if posted:
                 posted_ids = ", ".join(i.id for i in posted)
                 raise ValueError(
@@ -2374,13 +2518,13 @@ class BusinessMixin:
                     if c:
                         owner_name = c.name
 
+                posted_dt = _safe_date_posted(inv)
                 results.append({
                     "id": inv.id,
                     "type": "bill" if is_bill else "invoice",
                     "owner_name": owner_name,
                     "date_posted": (
-                        str(inv.date_posted.date())
-                        if inv.date_posted else None
+                        str(posted_dt.date()) if posted_dt else None
                     ),
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
@@ -2435,11 +2579,17 @@ class BusinessMixin:
 
             bills = query.all()
 
-            # Filter by date range (date_posted is datetime)
-            bills = [
-                b for b in bills
-                if parsed_start <= b.date_posted.date() <= parsed_end
-            ]
+            # Filter by date range. ``_safe_date_posted`` returns
+            # None for records where date_posted is missing or
+            # malformed (empty-string state) — those drop out.
+            filtered_bills = []
+            for b in bills:
+                posted = _safe_date_posted(b)
+                if posted is None:
+                    continue
+                if parsed_start <= posted.date() <= parsed_end:
+                    filtered_bills.append(b)
+            bills = filtered_bills
 
             vendor_data: dict[str, dict] = {}
             for bill in bills:
