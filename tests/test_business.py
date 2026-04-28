@@ -1286,6 +1286,65 @@ class TestPostInvoice:
         )
         return "000001"
 
+    def test_post_disambiguates_id_collision_via_post_account(
+        self, business_book,
+    ):
+        """When customer invoices and vendor bills share the same
+        ID (separate sequences in piecash), ``post_invoice``
+        disambiguates from ``post_account`` even when the caller
+        doesn't pass ``owner_type``. Bookkeeper hit this on Alex's
+        book: a vendor bill 000010 was unfindable because the
+        already-posted customer invoice 000010 came back from the
+        unfiltered lookup and raised "already posted."
+
+        Verifies the inferred-owner-type path: post_account
+        type=RECEIVABLE → customer invoice 2; PAYABLE → vendor
+        bill 4."""
+        gb = GnuCashBook(str(business_book))
+        # Post a customer invoice 000001.
+        self._setup_invoice(gb)
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        # Now create a vendor bill that lands at the SAME id
+        # (separate sequence). Verify owner_type counter-fix
+        # got it to 000001 (no other bills exist).
+        self._setup_bill(gb)
+        # Critical scenario: post WITHOUT owner_type. Should
+        # infer vendor from PAYABLE post_account, find the bill
+        # (not the already-posted invoice).
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "bill"
+        # Sanity: invoice 000001 stays posted, didn't get re-touched.
+        inv = gb.get_invoice("000001", owner_type="customer")
+        assert inv["date_posted"] is not None
+
+    def test_post_explicit_owner_type_still_works(
+        self, business_book,
+    ):
+        """Explicit owner_type continues to disambiguate when
+        post_account isn't enough (e.g. typo'd or a placeholder).
+        Belt-and-suspenders: explicit > inferred > unfiltered."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_invoice(gb)
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        self._setup_bill(gb)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "bill"
+
     def test_basic_post(self, business_book):
         gb = GnuCashBook(str(business_book))
         self._setup_invoice(gb)

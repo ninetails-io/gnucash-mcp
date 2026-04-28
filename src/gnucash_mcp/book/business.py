@@ -1619,6 +1619,33 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
+            # GnuCash uses separate ID sequences for customer
+            # invoices (owner_type=2) and vendor bills
+            # (owner_type=4) but stores both in the ``invoices``
+            # table. IDs collide across sequences (a $5K Emerald
+            # Analytics invoice and a $250 Office Depot bill can
+            # both be id=000010). Without an owner_type filter,
+            # ``_find_invoice`` returns whichever row hits first
+            # — the bookkeeper hit this on Alex's book trying to
+            # post a vendor bill 000010 and getting back an
+            # already-posted customer invoice 000010, raising
+            # spurious "already posted".
+            #
+            # When the caller didn't specify ``owner_type``,
+            # disambiguate by reading the post_account type:
+            # a RECEIVABLE account can only receive customer
+            # invoices, a PAYABLE only vendor bills. The
+            # post_account validation later in this method already
+            # uses the same predicate; using it upstream for the
+            # lookup eliminates the collision class entirely.
+            if ot is None:
+                pa = self._find_account(book, post_account)
+                if pa is not None:
+                    if pa.type == "RECEIVABLE":
+                        ot = 2
+                    elif pa.type == "PAYABLE":
+                        ot = 4
+
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
