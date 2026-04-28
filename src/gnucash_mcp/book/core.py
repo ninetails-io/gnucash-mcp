@@ -419,6 +419,159 @@ class CoreMixin:
             for anchor_date, label in anchors
         ]
 
+    # Runway warning threshold. < 60 days earns a ⚠ marker — that's
+    # roughly two months, the window where a household should be
+    # actively concerned about cash position rather than just
+    # tracking it.
+    _RUNWAY_WARN_DAYS = 60
+
+    # Days in the burn-rate averaging window. 180 days smooths over
+    # monthly billing cycles and seasonal variance without diluting
+    # recent changes. The spec also calls this out as bounded
+    # compute — the iteration is gated to splits within the window.
+    _RUNWAY_BURN_DAYS = 180
+
+    # Liquid account types for runway computation. Cash and near-cash
+    # only — real estate, vehicles, and other fixed assets aren't
+    # runway even if they're wealth.
+    #
+    # The spec originally proposed including ASSET-typed accounts
+    # whose commodity is the book default ("cash-equivalent ASSET")
+    # as a heuristic for catching brokerage cash and escrow. In
+    # practice GnuCash's ASSET type is structurally for fixed assets
+    # — users code real estate, vehicles, and similar wealth as
+    # ASSET in default currency, and that heuristic over-counts.
+    # The bookkeeper hit this on Alex's book: a USD-default condo
+    # ($473K) and vehicle ($28K) added $501K of "liquid" that Alex
+    # cannot use to make payroll next week. 768 days of runway
+    # ("Alex is fine for two years") vs. 116 days ("Alex has four
+    # months to collect receivables or restructure") is a very
+    # different conversation.
+    #
+    # Cleaner rule, observed across actual user books: BANK, CASH,
+    # STOCK, MUTUAL. Brokerage positions (STOCK/MUTUAL) ARE liquid
+    # — they're sellable in a day at market price. Real fixed
+    # assets (ASSET-typed) are not. Users who legitimately have a
+    # cash-equivalent ASSET (HSA, prepaid USD) can recategorize it
+    # as BANK and it will count; the structural type is honored as
+    # the source of truth.
+    _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
+
+    def _runway_metrics(
+        self,
+        book: piecash.Book,
+        default_currency: piecash.Commodity,
+    ) -> dict | None:
+        """Compute runway: how many days the household could survive
+        on current liquid assets at current burn rate if income
+        stopped today. Implements GET_BOOK_SUMMARY_SPEC §4.
+
+        Returns ``None`` when there's no expense activity in the
+        window (no daily-burn signal → no runway to compute → caller
+        omits the section). Otherwise returns a dict the caller
+        renders.
+
+        **Liquid assets** = sum of balances in
+        ``_RUNWAY_LIQUID_TYPES`` (BANK + CASH + STOCK + MUTUAL).
+        ASSET-typed accounts are excluded — they're structurally
+        for fixed assets (real estate, vehicles) in observed user
+        practice, even when in default currency.
+
+        STOCK and MUTUAL positions value at
+        ``shares × latest_price`` using the same date-aware rate
+        helper net worth uses. When no price is on file, fall back
+        to cost basis (sum of split.value, in transaction currency)
+        — same fallback as net worth. Foreign-currency BANK/CASH
+        accounts likewise convert at latest rate, with cost-basis
+        fallback for the unpriced case.
+
+        **Daily burn** = sum of expense splits over the last
+        ``_RUNWAY_BURN_DAYS`` days, divided by that window size.
+        Uses ``split.value`` (transaction currency) — for typical
+        books where expense accounts share the book default
+        currency, accurate; multi-currency expenses sum raw without
+        per-day FX conversion (rare in personal bookkeeping).
+
+        Special cases:
+        - ``daily_burn <= 0`` (no expense data): return None →
+          omit the section.
+        - ``liquid_assets < 0`` (overdrafts exceed positive cash
+          positions): return a flag dict; caller renders
+          "0 days — liquid position is negative ⚠".
+        - Otherwise: return ``{runway_days, liquid, daily_burn}``;
+          caller renders the days line with optional ⚠ at <60.
+        """
+        today = date.today()
+        window_start = today - timedelta(days=self._RUNWAY_BURN_DAYS)
+
+        template_guids = self._template_account_guids(book)
+        rates = self._rates_as_of(book, today, default_currency)
+
+        # --- Liquid assets pass over book.accounts ---
+        liquid = Decimal("0")
+        for account in book.accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            if account.placeholder:
+                continue
+            if account.type not in self._RUNWAY_LIQUID_TYPES:
+                continue
+
+            balance = Decimal("0")
+            for split in account.splits:
+                balance += split.quantity
+            if balance == 0:
+                continue
+
+            if account.commodity == default_currency:
+                liquid += balance
+            else:
+                rate = rates.get(account.commodity.guid)
+                if rate is not None:
+                    liquid += balance * rate
+                else:
+                    # Cost-basis fallback: sum split.value
+                    # (transaction currency = book default for
+                    # typical buys of foreign-commodity holdings).
+                    # Same fallback the assets section uses, and
+                    # the same one _compute_net_worth_at uses for
+                    # consistency.
+                    cost_basis = Decimal("0")
+                    for split in account.splits:
+                        cost_basis += Decimal(str(split.value))
+                    liquid += cost_basis
+
+        # --- Daily burn pass over book.transactions ---
+        expenses_window = Decimal("0")
+        for txn in book.transactions:
+            if txn.post_date < window_start or txn.post_date > today:
+                continue
+            for s in txn.splits:
+                if s.account.type == "EXPENSE":
+                    expenses_window += Decimal(str(s.value))
+
+        daily_burn = expenses_window / Decimal(self._RUNWAY_BURN_DAYS)
+
+        if daily_burn <= 0:
+            return None
+
+        if liquid < 0:
+            return {
+                "negative_liquid": True,
+                "liquid": liquid.quantize(Decimal("1")),
+                "daily_burn": daily_burn.quantize(Decimal("1")),
+            }
+
+        runway_days = int(liquid / daily_burn)
+        return {
+            "negative_liquid": False,
+            "runway_days": runway_days,
+            "liquid": liquid.quantize(Decimal("1")),
+            "daily_burn": daily_burn.quantize(Decimal("1")),
+        }
+
     def _monthly_net_income(
         self, book: piecash.Book, months: int = 6,
     ) -> list[dict]:
@@ -904,6 +1057,27 @@ class CoreMixin:
                         label += " (MTD)"
                     lines.append(
                         f"  {label}: {self._format_monthly_net(entry['net'])}"
+                    )
+
+            # Runway: liquid assets / daily burn → days. The single
+            # most actionable personal-finance number that doesn't
+            # appear on standard financial statements. None = no
+            # expense data in the burn window → omit section.
+            runway = self._runway_metrics(book, default_currency)
+            if runway is not None:
+                if runway.get("negative_liquid"):
+                    lines.append(
+                        "Runway: 0 days — liquid position is negative ⚠"
+                    )
+                else:
+                    days = runway["runway_days"]
+                    liquid = int(runway["liquid"])
+                    burn = int(runway["daily_burn"])
+                    warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
+                    lines.append(
+                        f"Runway: {days} days{warn} "
+                        f"({currency} {liquid:,} liquid / "
+                        f"{currency} {burn:,}/day burn)"
                     )
 
             lines.append(f"Transactions: {total_txns}")

@@ -1223,6 +1223,321 @@ class TestGetBookSummaryMonthlyNet:
         assert not any("999,999" in r for r in rows)
 
 
+class TestGetBookSummaryRunway:
+    """Runway section in get_book_summary.
+
+    Days the household could survive on liquid assets at current
+    burn rate if income stopped today. See ``CoreMixin._runway_metrics``
+    and the spec at ``docs/GET_BOOK_SUMMARY_SPEC.md`` §4.
+    """
+
+    def _seed_recent_expense(
+        self,
+        gc: GnuCashBook,
+        amount: str,
+        days_ago: int,
+    ) -> None:
+        """Seed an expense transaction that lands within the runway
+        burn window."""
+        when = date.today() - timedelta(days=days_ago)
+        gc.create_transaction(
+            description=f"Expense {days_ago}d ago",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": amount},
+                {"account": "Assets:Checking", "amount": f"-{amount}"},
+            ],
+            trans_date=when,
+            check_duplicates=False,
+        )
+
+    def test_section_omitted_with_no_expenses_in_window(
+        self, test_book: Path,
+    ):
+        """No expense activity in the 180-day burn window → no
+        runway computable → omit section. The fixture's $150
+        groceries transaction is 2024-01-20, outside any current
+        180-day window."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Runway:" not in result
+
+    def test_section_present_with_expense_activity(
+        self, test_book: Path,
+    ):
+        """A book with recent expenses emits the runway section."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_recent_expense(gc, "100", 30)
+        result = gc.get_book_summary()
+        assert "Runway:" in result
+
+    def test_runway_format(self, test_book: Path):
+        """Runway line carries days, parenthesized liquid + burn,
+        currency-prefixed thousands-separated values, no decimals."""
+        gc = GnuCashBook(str(test_book))
+        # $180 of expenses over 180 days → $1/day burn.
+        # Fixture's Checking starts at $2,850; this seeded expense
+        # subtracts $180 from it via the offsetting split, leaving
+        # liquid = $2,670. Runway = 2,670 days, far above 60 → no ⚠.
+        self._seed_recent_expense(gc, "180", 30)
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        assert "days" in runway_line
+        assert "USD" in runway_line
+        assert "liquid" in runway_line
+        assert "/day burn" in runway_line
+        # Comma-separated for the liquid (2,670).
+        assert "2,670" in runway_line
+        # No decimals.
+        assert "." not in runway_line
+
+    def test_warning_below_60_days(self, test_book: Path):
+        """Runway < 60 days → ⚠ marker."""
+        gc = GnuCashBook(str(test_book))
+        # Burn $100/day for 180 days = $18,000.
+        # Liquid in fixture: $2,850. Runway = 28 days. Under 60.
+        self._seed_recent_expense(gc, "18000", 30)
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        assert "⚠" in runway_line
+
+    def test_no_warning_at_or_above_60_days(self, test_book: Path):
+        """Runway ≥ 60 days → no ⚠ marker; absence is the signal."""
+        gc = GnuCashBook(str(test_book))
+        # Tiny burn: $90 over 180 days = $0.50/day.
+        # Liquid $2,850. Runway = 5,700 days. No warning.
+        self._seed_recent_expense(gc, "90", 30)
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        assert "⚠" not in runway_line
+
+    def test_negative_liquid_position(self, tmp_path: Path):
+        """Overdrafts exceeding positive cash → '0 days — liquid
+        position is negative ⚠'."""
+        book_path = tmp_path / "neg_liquid.gnucash"
+        b = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = b.root_account
+        usd = b.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(assets)
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        b.session.add(checking)
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(expenses)
+        groc = piecash.Account(
+            name="Groceries", type="EXPENSE", parent=expenses,
+            commodity=usd,
+        )
+        b.session.add(groc)
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        b.session.add(equity)
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        b.session.add(opening)
+        b.save()
+        # Overdraft Checking by $100, expense the same.
+        b.session.add(piecash.Transaction(
+            currency=usd,
+            description="Overdraft expense",
+            post_date=date.today() - timedelta(days=10),
+            splits=[
+                piecash.Split(account=groc, value=Decimal("100")),
+                piecash.Split(account=checking, value=Decimal("-100")),
+            ],
+        ))
+        b.save()
+        b.close()
+
+        gc = GnuCashBook(str(book_path))
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        assert "0 days" in runway_line
+        assert "negative" in runway_line
+        assert "⚠" in runway_line
+
+    def test_asset_typed_account_excluded_from_liquid(
+        self, test_book: Path,
+    ):
+        """ASSET-typed accounts (real estate, vehicles, fixed assets)
+        do NOT count as liquid even when in the book's default
+        currency. Regression for the bookkeeper's report on Alex's
+        2026-04-23 review: a $473K condo and $28K vehicle were
+        wrongly counted as liquid, inflating runway from 116 days
+        to 768 days (4 months vs 2 years — different conversation
+        with the user)."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Condo", account_type="ASSET", parent="Assets",
+        )
+        with gc.open(readonly=False) as book:
+            condo = gc._find_account(book, "Assets:Condo")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Condo purchase",
+                post_date=date.today() - timedelta(days=120),
+                splits=[
+                    piecash.Split(
+                        account=condo, value=Decimal("473250"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-473250"),
+                    ),
+                ],
+            ))
+            book.save()
+        self._seed_recent_expense(gc, "180", 30)
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        # Condo MUST NOT contribute. Liquid stays at $2,670 (the
+        # fixture's Checking, after the seeded expense).
+        assert "2,670" in runway_line
+        assert "473,250" not in runway_line
+        assert "475,920" not in runway_line  # 2,670 + 473,250 NOT
+
+    def test_stock_with_market_price_valued_at_market(
+        self, investment_book: Path,
+    ):
+        """STOCK / MUTUAL accounts ARE liquid — brokerage positions
+        sell in a day at market price. Valuation: shares × latest
+        user-supplied price. The investment_book fixture seeds VTSAX
+        at $125/share."""
+        gc = GnuCashBook(str(investment_book))
+        # Buy 50 shares of VTSAX at $125/share = $6,250 cost. The
+        # account commodity is VTSAX (FUND); the fixture's price
+        # row makes the latest rate $125 USD per share.
+        with gc.open(readonly=False) as book:
+            vtsax_acct = gc._find_account(book, "Assets:Investments:VTSAX")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Buy VTSAX",
+                post_date=date.today() - timedelta(days=20),
+                splits=[
+                    piecash.Split(
+                        account=vtsax_acct,
+                        value=Decimal("6250"),
+                        quantity=Decimal("50"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-6250"),
+                    ),
+                ],
+            ))
+            book.save()
+        # Add expense activity so runway is computable.
+        gc.create_transaction(
+            description="Some expense",
+            splits=[
+                {"account": "Income:Capital Gains", "amount": "-180"},
+                {"account": "Assets:Checking", "amount": "180"},
+            ],
+            trans_date=date.today() - timedelta(days=10),
+            check_duplicates=False,
+        )
+        # Need EXPENSE-typed account for daily_burn. The fixture
+        # doesn't have one; create one and post against it.
+        gc.create_account(
+            name="Misc", account_type="EXPENSE", parent=None,
+        )
+        gc.create_transaction(
+            description="Misc expense",
+            splits=[
+                {"account": "Misc", "amount": "180"},
+                {"account": "Assets:Checking", "amount": "-180"},
+            ],
+            trans_date=date.today() - timedelta(days=15),
+            check_duplicates=False,
+        )
+
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        # Liquid: Checking starts at $10,000 + $180 (income) - $180
+        # (misc) = $10,000. Plus VTSAX 50 shares × $125 = $6,250.
+        # Total liquid: $16,250.
+        assert "16,250" in runway_line
+
+    def test_stock_without_price_uses_cost_basis(
+        self, test_book: Path,
+    ):
+        """STOCK without a price falls back to cost basis (sum of
+        split.value, in transaction currency = book default). Same
+        fallback net worth uses, so runway and net worth agree on
+        the value of unpriced holdings."""
+        gc = GnuCashBook(str(test_book))
+        # Build a STOCK account with no Price rows. piecash needs
+        # a non-currency commodity for STOCK accounts.
+        with gc.open(readonly=False) as book:
+            from piecash import Commodity
+            wild = Commodity(
+                namespace="NYSE",
+                mnemonic="WILD",
+                fullname="Unpriced Wild Stock",
+                fraction=10000,
+            )
+            book.session.add(wild)
+            assets = gc._find_account(book, "Assets")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            wild_acct = piecash.Account(
+                name="WILD",
+                type="STOCK",
+                parent=assets,
+                commodity=wild,
+            )
+            book.session.add(wild_acct)
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Buy WILD at cost",
+                post_date=date.today() - timedelta(days=15),
+                splits=[
+                    piecash.Split(
+                        account=wild_acct,
+                        value=Decimal("4500"),
+                        quantity=Decimal("100"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-4500"),
+                    ),
+                ],
+            ))
+            book.save()
+        self._seed_recent_expense(gc, "180", 30)
+
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        # Cost basis $4,500. Plus Checking $2,670 (after seeded
+        # expense). Liquid total: $7,170.
+        assert "7,170" in runway_line
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 
