@@ -127,13 +127,17 @@ class TestGetBalanceTool:
     """Tests for get_balance tool."""
 
     def test_get_balance_current(self, setup_book_env):
-        """Should return current balance."""
+        """Should return current balance with today's date as the resolved cutoff."""
+        from datetime import date as date_cls
+
         result = server_module.get_balance("Assets:Checking")
 
         data = json.loads(result)
         assert data["account"] == "Assets:Checking"
         assert data["balance"] == "2850"
-        assert data["as_of_date"] == "current"
+        # Resolved date is today's ISO string — future-dated transactions
+        # would be excluded from the cutoff.
+        assert data["as_of_date"] == date_cls.today().isoformat()
 
     def test_get_balance_as_of_date(self, setup_book_env):
         """Should return balance as of date."""
