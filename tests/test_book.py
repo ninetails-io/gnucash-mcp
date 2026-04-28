@@ -1483,6 +1483,105 @@ class TestGetBookSummaryRunway:
         # Total liquid: $16,250.
         assert "16,250" in runway_line
 
+    def test_retirement_subtree_excluded_from_liquid(
+        self, test_book: Path,
+    ):
+        """Accounts under a 'Retirement' parent (IRA / 401k / 403b
+        and similar) are excluded from runway liquid even when
+        their type is otherwise liquid (BANK / STOCK / MUTUAL).
+        Early-withdrawal penalties make them unavailable for
+        'if income stops today' runway purposes.
+
+        Regression for the bookkeeper's report on Alex's book: a
+        $13,716 401k was being counted as liquid because BANK type
+        passed the filter."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="401k",
+            account_type="BANK",
+            parent="Assets:Retirement",
+        )
+        with gc.open(readonly=False) as book:
+            k401 = gc._find_account(book, "Assets:Retirement:401k")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="401k contribution",
+                post_date=date.today() - timedelta(days=15),
+                splits=[
+                    piecash.Split(
+                        account=k401, value=Decimal("13716"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-13716"),
+                    ),
+                ],
+            ))
+            book.save()
+        self._seed_recent_expense(gc, "180", 30)
+
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        # 401k stays out of liquid; runway uses $2,670 Checking only.
+        assert "2,670" in runway_line
+        assert "13,716" not in runway_line
+        assert "16,386" not in runway_line  # 2,670 + 13,716 NOT
+
+    def test_retirement_match_is_case_insensitive(
+        self, test_book: Path,
+    ):
+        """The retirement-subtree check is case-insensitive — a
+        user who writes "RETIREMENT" or "Retirement" in any path
+        component still gets their child accounts excluded."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="RETIREMENT ACCOUNTS",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="Roth IRA",
+            account_type="BANK",
+            parent="Assets:RETIREMENT ACCOUNTS",
+        )
+        with gc.open(readonly=False) as book:
+            roth = gc._find_account(
+                book, "Assets:RETIREMENT ACCOUNTS:Roth IRA",
+            )
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Roth contribution",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(
+                        account=roth, value=Decimal("7000"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-7000"),
+                    ),
+                ],
+            ))
+            book.save()
+        self._seed_recent_expense(gc, "180", 30)
+
+        result = gc.get_book_summary()
+        runway_line = next(
+            l for l in result.split("\n") if l.startswith("Runway:")
+        )
+        # Roth IRA stays out; runway uses $2,670 Checking only.
+        assert "7,000" not in runway_line
+        assert "2,670" in runway_line
+
     def test_stock_without_price_uses_cost_basis(
         self, test_book: Path,
     ):

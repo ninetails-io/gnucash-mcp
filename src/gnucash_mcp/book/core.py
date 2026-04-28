@@ -464,6 +464,31 @@ class CoreMixin:
     # the source of truth.
     _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
 
+    @staticmethod
+    def _is_in_retirement_subtree(account) -> bool:
+        """True if any path component of the account's fullname
+        contains "retirement" (case-insensitive).
+
+        Heuristic for excluding retirement accounts (IRA, 401k,
+        403b, pension) from the runway liquid pool. Users typically
+        organize these under a "Retirement" placeholder parent —
+        ``Assets:Investments:Retirement:401k`` and similar — which
+        gives the runway calculation a structural signal that's
+        more reliable than guessing from the account's own name
+        ("401k" alone could be ambiguous if the user has a
+        retirement-themed expense account, etc.).
+
+        Caveats: a user who names the subtree "Tax-advantaged" or
+        "IRA Holdings" without the word "Retirement" gets their
+        retirement balance counted as liquid. That's documented in
+        the runway docstring; the long-term semantic answer is a
+        slot-based ``is_retirement`` flag the user explicitly sets.
+        """
+        return any(
+            "retirement" in part.lower()
+            for part in account.fullname.split(":")
+        )
+
     def _budget_headline(self, book: piecash.Book) -> dict | None:
         """One-line headline for the budget covering today, if any.
         Implements GET_BOOK_SUMMARY_SPEC §6.
@@ -616,10 +641,18 @@ class CoreMixin:
         renders.
 
         **Liquid assets** = sum of balances in
-        ``_RUNWAY_LIQUID_TYPES`` (BANK + CASH + STOCK + MUTUAL).
-        ASSET-typed accounts are excluded — they're structurally
-        for fixed assets (real estate, vehicles) in observed user
-        practice, even when in default currency.
+        ``_RUNWAY_LIQUID_TYPES`` (BANK + CASH + STOCK + MUTUAL),
+        with two exclusions layered on top:
+
+        1. ASSET-typed accounts. Structurally for fixed assets
+           (real estate, vehicles) in observed user practice,
+           even when in default currency.
+        2. Any account in a "Retirement" subtree (any ancestor
+           with "retirement" in its name, case-insensitive).
+           IRA / 401k / 403b balances share BANK / STOCK / MUTUAL
+           types with truly liquid accounts but carry
+           early-withdrawal penalties — not really runway. See
+           ``_is_in_retirement_subtree``.
 
         STOCK and MUTUAL positions value at
         ``shares × latest_price`` using the same date-aware rate
@@ -661,6 +694,19 @@ class CoreMixin:
             if account.placeholder:
                 continue
             if account.type not in self._RUNWAY_LIQUID_TYPES:
+                continue
+            if self._is_in_retirement_subtree(account):
+                # Retirement accounts (IRA, 401k, 403b, pension, etc.)
+                # share BANK / STOCK / MUTUAL types with truly liquid
+                # accounts but carry early-withdrawal penalties that
+                # disqualify them from "if income stops today" runway.
+                # The bookkeeper hit this on Alex's book: a $13,716
+                # 401k under Assets:Investments:Retirement was being
+                # counted as liquid, inflating runway from ~95 days
+                # to 124. Filtering by ancestor-named-Retirement is
+                # the structural-intent heuristic — fragile if a user
+                # names the subtree "Tax-advantaged" instead, but
+                # clean enough for the standard naming convention.
                 continue
 
             balance = Decimal("0")
