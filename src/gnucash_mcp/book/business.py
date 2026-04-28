@@ -1721,6 +1721,7 @@ class BusinessMixin:
             elif status == "open":
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
+            total = len(invoices)
             invoices, notice = _apply_limit(
                 invoices,
                 limit=limit,
@@ -1748,7 +1749,20 @@ class BusinessMixin:
                             i, owner_name=o.name if o else None,
                         )
                     )
-                return results
+                # Envelope shape matches ``get_unreconciled_splits`` and
+                # ``get_prices`` so verbose-mode callers see truncation
+                # signal in the response. The bookkeeper noticed verbose
+                # was the odd one out: compact got the [Showing N of M]
+                # notice appended, but the dict version had no count /
+                # total / notice fields at all. ``count`` = truncated
+                # length, ``total`` = full filter set size, ``notice``
+                # is the same string compact appends (or None).
+                return {
+                    "invoices": results,
+                    "count": len(results),
+                    "total": total,
+                    "notice": notice,
+                }
 
     def get_invoice(self, invoice_id: str, owner_type: str | None = None) -> dict:
         """Get full details for an invoice or bill, including entries.

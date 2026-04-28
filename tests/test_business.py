@@ -1101,9 +1101,19 @@ class TestListInvoices:
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
         result = gb.list_invoices(compact=False)
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert result[0]["type"] == "invoice"
+        # Verbose mode returns the envelope shape that matches
+        # get_unreconciled_splits / get_prices: invoices list +
+        # count + total + notice.
+        assert isinstance(result, dict)
+        assert "invoices" in result
+        assert "count" in result
+        assert "total" in result
+        assert "notice" in result
+        invoices = result["invoices"]
+        assert len(invoices) == 1
+        assert invoices[0]["type"] == "invoice"
+        assert result["total"] == 1
+        assert result["notice"] is None  # nothing truncated
 
     def test_filter_by_customer_type(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1112,8 +1122,9 @@ class TestListInvoices:
         gb.create_invoice(customer_id="000001")
         gb.create_bill(vendor_id="000001")
         result = gb.list_invoices(owner_type="customer", compact=False)
-        assert len(result) == 1
-        assert result[0]["type"] == "invoice"
+        invoices = result["invoices"]
+        assert len(invoices) == 1
+        assert invoices[0]["type"] == "invoice"
 
     def test_filter_by_vendor_type(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1122,8 +1133,9 @@ class TestListInvoices:
         gb.create_invoice(customer_id="000001")
         gb.create_bill(vendor_id="000001")
         result = gb.list_invoices(owner_type="vendor", compact=False)
-        assert len(result) == 1
-        assert result[0]["type"] == "bill"
+        invoices = result["invoices"]
+        assert len(invoices) == 1
+        assert invoices[0]["type"] == "bill"
 
     def test_filter_by_status(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1131,9 +1143,9 @@ class TestListInvoices:
         gb.create_invoice(customer_id="000001")
         # All invoices are open (not posted)
         result = gb.list_invoices(status="open", compact=False)
-        assert len(result) == 1
+        assert len(result["invoices"]) == 1
         result = gb.list_invoices(status="posted", compact=False)
-        assert len(result) == 0
+        assert len(result["invoices"]) == 0
 
 
 class TestGetInvoice:
@@ -2559,6 +2571,31 @@ class TestPhase3CommsContracts:
         result = gb.get_invoice(invoice_id="000001")
         assert result["owner_name"] == "Acme Corp"
         assert "owner_guid" not in result
+
+    # ── 3B follow-up: list_invoices verbose envelope ─────────────
+
+    def test_list_invoices_verbose_envelope_with_truncation(
+        self, business_book,
+    ):
+        """Bookkeeper-flagged inconsistency: compact mode appended a
+        ``[Showing N of M]`` notice when truncated, but verbose mode
+        returned just a bare list with no truncation signal.
+        Now both modes carry ``count`` / ``total`` / ``notice`` so a
+        verbose-mode caller knows the result is incomplete.
+        """
+        gb = GnuCashBook(str(business_book))
+        # 5 invoices, ask for 3.
+        for i in range(5):
+            gb.create_customer(name=f"Customer {i}")
+            gb.create_invoice(customer_id=f"{i+1:06d}")
+        result = gb.list_invoices(compact=False, limit=3)
+        assert isinstance(result, dict)
+        assert len(result["invoices"]) == 3
+        assert result["count"] == 3
+        assert result["total"] == 5
+        assert result["notice"] is not None
+        assert "Showing 3 of 5" in result["notice"]
+        assert "invoices" in result["notice"]
 
 
 # ============== Vendor Spending Report Tests ==============
