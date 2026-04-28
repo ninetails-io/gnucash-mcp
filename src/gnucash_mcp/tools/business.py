@@ -580,21 +580,35 @@ def register(mcp, get_book) -> None:
         owner_type: str | None = None,
         customer_id: str | None = None,
         vendor_id: str | None = None,
+        verbose: bool = False,
     ) -> str:
         """Get all posted invoices/bills with outstanding balances.
+
+        Returns a compact one-line-per-doc format by default with action
+        columns (due date, days past due, currency, BILL tag, owner).
+        Sorted most-overdue-first so the bookkeeper sees the urgent
+        items at the top.
+
+        Use verbose=true for full JSON with ``original_amount`` /
+        ``amount_paid`` / ``amount_due`` breakdown — the shape
+        ``pay_invoice`` workflows expect.
 
         Args:
             owner_type: Filter by "customer" or "vendor". Omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
+            verbose: If true, return full JSON details.
         """
         book = get_book()
         result = book.get_outstanding_invoices(
             owner_type=owner_type,
             customer_id=customer_id,
             vendor_id=vendor_id,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
