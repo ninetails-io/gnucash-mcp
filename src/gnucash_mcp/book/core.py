@@ -3119,6 +3119,12 @@ class CoreMixin:
             # doesn't have to reopen the book to capture it.
             self._stage_audit_before(_account_to_dict(account))
 
+            # Track which fields the caller actually changed. Echoing
+            # only the diff (vs. the entire account record) keeps the
+            # write response small and tells the caller exactly what
+            # landed — matches the ``update_transaction`` precedent.
+            changed: dict = {}
+
             # Check for name conflict if renaming
             if new_name and new_name != account.name:
                 if account.parent:
@@ -3129,12 +3135,15 @@ class CoreMixin:
                                 f"'{account.parent.fullname}'"
                             )
                 account.name = new_name
+                changed["name"] = new_name
 
-            if description is not None:
+            if description is not None and description != account.description:
                 account.description = description
+                changed["description"] = description
 
-            if placeholder is not None:
+            if placeholder is not None and bool(placeholder) != bool(account.placeholder):
                 account.placeholder = placeholder
+                changed["placeholder"] = bool(placeholder)
 
             if account_type is not None:
                 new_type = account_type.upper()
@@ -3158,14 +3167,13 @@ class CoreMixin:
                         )
 
                     account.type = new_type
+                    changed["type"] = new_type
 
             book.save()
 
-            short_guid = _unique_prefix(
-                account.guid, (a.guid for a in book.accounts)
-            )
-            return _account_to_dict(account) | {
-                "guid": short_guid,
+            return {
+                "guid": self._account_short_guid(book, account),
+                **changed,
                 "status": "updated",
             }
 
@@ -3214,11 +3222,14 @@ class CoreMixin:
 
             book.save()
 
-            short_guid = _unique_prefix(
-                account.guid, (a.guid for a in book.accounts)
-            )
-            return _account_to_dict(account) | {
-                "guid": short_guid,
+            return {
+                "guid": self._account_short_guid(book, account),
+                # Both ``fullname`` (the new path) and ``parent`` (the
+                # destination) are useful here: ``fullname`` answers
+                # "where did it land?" and ``parent`` makes the move
+                # legible without re-parsing the path.
+                "fullname": account.fullname,
+                "parent": account.parent.fullname,
                 "status": "moved",
             }
 
