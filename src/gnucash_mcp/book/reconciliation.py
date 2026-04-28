@@ -21,6 +21,7 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _unreconciled_split_to_compact_line,
 )
+from gnucash_mcp._format import _apply_limit
 
 
 def _split_state_dict(split) -> dict:
@@ -118,8 +119,15 @@ class ReconciliationMixin:
         account_name: str,
         as_of_date: date | None = None,
         compact: bool = True,
+        limit: int | None = None,
     ) -> dict | str:
-        """Get all unreconciled splits for an account.
+        """Get unreconciled splits for an account.
+
+        Returns up to ``limit`` splits (default 50) ordered by post-date
+        ascending. The cleared / uncleared totals reflect the **full**
+        unreconciled set on the account, not just the truncated slice —
+        so the summary footer still tells you how far behind the
+        reconciliation is even when individual lines are clipped.
 
         Args:
             account_name: Full account path.
@@ -127,10 +135,17 @@ class ReconciliationMixin:
             compact: If True (default), return a compact newline-separated
                      string with one line per split plus a summary footer.
                      If False, return the full dict with splits list.
+            limit: Maximum splits to return. Defaults to 50, capped at
+                   250 server-side. The full count is always reflected
+                   in the summary footer / ``count`` field.
 
         Returns:
-            If compact: newline-separated string of split lines with summary.
-            If not compact: dict with account info, splits list, and totals.
+            If compact: newline-separated string of split lines + footer
+                + optional truncation notice.
+            If not compact: dict with account info, splits list (possibly
+                truncated), totals reflecting the full unreconciled set,
+                ``count`` (truncated length), ``total`` (untruncated),
+                and ``notice`` (truncation message or None).
 
         Raises:
             ValueError: If account not found.
@@ -140,7 +155,7 @@ class ReconciliationMixin:
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
-            unreconciled = []
+            all_unreconciled = []
             cleared_total = Decimal("0")
             uncleared_total = Decimal("0")
 
@@ -163,20 +178,32 @@ class ReconciliationMixin:
                         "reconcile_state": split.reconcile_state,
                         "memo": split.memo or "",
                     }
-                    unreconciled.append(split_dict)
+                    all_unreconciled.append(split_dict)
 
                     if split.reconcile_state == "c":
                         cleared_total += split.quantity
                     else:
                         uncleared_total += split.quantity
 
+            unreconciled, notice = _apply_limit(
+                all_unreconciled,
+                limit=limit,
+                entity_name="splits",
+                suggest_narrow=True,
+            )
+            total_count = len(all_unreconciled)
+
             result = {
                 "account": account.fullname,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
                 "splits": unreconciled,
+                # Totals always reflect the full unreconciled set —
+                # truncation hides line items, never the headline summary.
                 "cleared_total": str(cleared_total),
                 "uncleared_total": str(uncleared_total),
                 "count": len(unreconciled),
+                "total": total_count,
+                "notice": notice,
             }
 
             if compact:
@@ -191,8 +218,13 @@ class ReconciliationMixin:
                     _unreconciled_split_to_compact_line(s, prefixes=prefixes)
                     for s in unreconciled
                 ]
-                footer = f"{len(unreconciled)} splits\tcleared:{cleared_total}\tuncleared:{uncleared_total}"
+                footer = (
+                    f"{total_count} splits\tcleared:{cleared_total}\t"
+                    f"uncleared:{uncleared_total}"
+                )
                 lines.append(footer)
+                if notice:
+                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 return result

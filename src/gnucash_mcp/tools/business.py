@@ -373,6 +373,7 @@ def register(mcp, get_book) -> None:
         owner_type: str | None = None,
         status: str | None = None,
         verbose: bool = False,
+        limit: int = 50,
     ) -> str:
         """List invoices and/or vendor bills.
 
@@ -384,10 +385,16 @@ def register(mcp, get_book) -> None:
                         "vendor" for bills, or omit for all.
             status: Filter by status: "posted" or "open", or omit for all.
             verbose: If true, return full JSON details.
+            limit: Maximum invoices to return. Defaults to 50, capped
+                   at 250. Compact output appends a truncation notice
+                   when results are clipped.
         """
         book = get_book()
         result = book.list_invoices(
-            owner_type=owner_type, status=status, compact=not verbose,
+            owner_type=owner_type,
+            status=status,
+            compact=not verbose,
+            limit=limit,
         )
         if verbose:
             return json.dumps(result, indent=2)

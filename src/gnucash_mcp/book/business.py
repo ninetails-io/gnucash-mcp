@@ -25,6 +25,7 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
+from gnucash_mcp._format import _apply_limit
 
 
 def _safe_date_posted(inv):
@@ -1475,6 +1476,7 @@ class BusinessMixin:
         owner_type: str | None = None,
         status: str | None = None,
         compact: bool = True,
+        limit: int | None = None,
     ) -> list[dict] | str:
         """List invoices and/or bills.
 
@@ -1482,9 +1484,13 @@ class BusinessMixin:
             owner_type: Filter by type: 'customer', 'vendor', or None for all.
             status: Filter by status: 'posted', 'open', or None for all.
             compact: If True, return compact one-line-per-invoice string.
+            limit: Maximum invoices to return. Defaults to 50, capped at
+                   250 server-side. Pre-fix this method dumped every
+                   invoice in the book regardless of caller intent.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string (with optional truncation notice) or list of
+            dicts (truncated silently — caller has ``len()``).
         """
         from piecash.business.invoice import Invoice
 
@@ -1503,8 +1509,17 @@ class BusinessMixin:
             elif status == "open":
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
+            invoices, notice = _apply_limit(
+                invoices,
+                limit=limit,
+                entity_name="invoices",
+                suggest_narrow=True,
+            )
+
             if compact:
                 lines = [self._invoice_to_compact_line(i) for i in invoices]
+                if notice:
+                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 return [self._invoice_to_dict(i) for i in invoices]

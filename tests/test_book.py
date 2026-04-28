@@ -7168,8 +7168,10 @@ class TestPrices:
         assert result["value"] == "127.50"
         assert result["date"] == "2026-02-07"
 
-        # Verify via get_prices
-        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        # Verify via get_prices (now returns dict with prices/count/total/notice)
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        prices = result["prices"]
+        assert result["total"] == 1
         assert len(prices) == 1
         assert Decimal(prices[0]["value"]) == Decimal("127.50")
         assert prices[0]["type"] == "nav"
@@ -7204,7 +7206,8 @@ class TestPrices:
         assert result["value"] == "128.75"
 
         # Should still be only 1 price, not 2
-        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        prices = result["prices"]
         assert len(prices) == 1
         assert prices[0]["value"] == "128.75"
 
@@ -7233,17 +7236,19 @@ class TestPrices:
         )
 
         # Filter to middle date
-        prices = gc_book.get_prices(
+        result = gc_book.get_prices(
             commodity="VTSAX",
             namespace="FUND",
             start_date=date(2026, 2, 3),
             end_date=date(2026, 2, 8),
         )
+        prices = result["prices"]
         assert len(prices) == 1
         assert Decimal(prices[0]["value"]) == Decimal("126.50")
 
         # All prices, should be descending
-        all_prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        all_result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        all_prices = all_result["prices"]
         assert len(all_prices) == 3
         assert all_prices[0]["date"] == "2026-02-10"  # Most recent first
         assert all_prices[2]["date"] == "2026-02-01"  # Oldest last
