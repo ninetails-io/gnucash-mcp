@@ -15,7 +15,7 @@ class TestDebtPayoffPlan:
         """Should pay highest APR debt first (Visa 23.49% before Mastercard 18.99%)."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         # Visa (23.49%) should be first in payoff order
         assert result["payoff_order"][0] == "Liabilities:Visa"
@@ -47,7 +47,7 @@ class TestDebtPayoffPlan:
         """Should calculate YETI > 1.0 (debt makes purchases cost more)."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         yeti = result["yeti"]
         assert "multiplier" in yeti
@@ -75,6 +75,7 @@ class TestDebtPayoffPlan:
         gc_book = GnuCashBook(str(debt_book))
 
         result = gc_book.debt_payoff_plan(
+            compact=False,
             monthly_budget="1000",
             additional_purchase="100",
         )
@@ -89,20 +90,20 @@ class TestDebtPayoffPlan:
         gc_book = GnuCashBook(str(test_book))
 
         with pytest.raises(ValueError, match="No debt accounts found"):
-            gc_book.debt_payoff_plan(monthly_budget="500")
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
 
     def test_budget_less_than_minimums(self, debt_book: Path):
         """Should raise ValueError when budget can't cover minimum payments."""
         gc_book = GnuCashBook(str(debt_book))
 
         with pytest.raises(ValueError, match="less than the sum of minimum"):
-            gc_book.debt_payoff_plan(monthly_budget="100")
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="100")
 
     def test_minimum_payment_from_slot(self, debt_book: Path):
         """Should use minimum_payment slot when present."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         # Car Loan has minimum_payment slot set to 350
         for d in result["debts"]:
@@ -116,7 +117,7 @@ class TestDebtPayoffPlan:
         """Should calculate 2% of balance when no minimum_payment slot."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         # Visa: $5000 charges - $200 payment = $4800 balance, 2% = $96
         for d in result["debts"]:
@@ -130,7 +131,7 @@ class TestDebtPayoffPlan:
         """Should fall back to 2% of balance when no slot and no payments."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         # Mastercard has no minimum_payment slot and no payment transactions
         # Balance is $3000, 2% = $60
@@ -163,7 +164,7 @@ class TestDebtPayoffPlan:
             trans_date=date(2026, 1, 1),
         )
 
-        result = gc_book.debt_payoff_plan(monthly_budget="200")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="200")
 
         assert len(result["debts"]) == 1
         assert result["debts"][0]["account"] == "Liabilities:Credit Card"
@@ -185,13 +186,13 @@ class TestDebtPayoffPlan:
 
         # Should fail because no debt accounts with positive balance
         with pytest.raises(ValueError, match="No debt accounts found"):
-            gc_book.debt_payoff_plan(monthly_budget="500")
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
 
     def test_credit_limit_included(self, debt_book: Path):
         """Should include credit_limit in output when slot is present."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         # Visa has credit_limit slot set to 10000
         visa_detail = None
@@ -215,20 +216,20 @@ class TestDebtPayoffPlan:
         gc_book = GnuCashBook(str(debt_book))
 
         with pytest.raises(ValueError, match="must be a positive number"):
-            gc_book.debt_payoff_plan(monthly_budget="0")
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="0")
 
     def test_invalid_budget_negative(self, debt_book: Path):
         """Should raise ValueError for negative budget."""
         gc_book = GnuCashBook(str(debt_book))
 
         with pytest.raises(ValueError, match="must be a positive number"):
-            gc_book.debt_payoff_plan(monthly_budget="-500")
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="-500")
 
     def test_total_paid_equals_balance_plus_interest(self, debt_book: Path):
         """Total paid should equal total balance + total interest."""
         gc_book = GnuCashBook(str(debt_book))
 
-        result = gc_book.debt_payoff_plan(monthly_budget="1000")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="1000")
 
         total_balance = Decimal(result["total_balance"])
         total_interest = Decimal(result["total_interest"])
@@ -257,7 +258,7 @@ class TestDebtPayoffPlan:
             trans_date=date(2026, 1, 1),
         )
 
-        result = gc_book.debt_payoff_plan(monthly_budget="50")
+        result = gc_book.debt_payoff_plan(compact=False, monthly_budget="50")
 
         for d in result["debts"]:
             if d["account"] == "Liabilities:Almost Paid":
@@ -266,3 +267,78 @@ class TestDebtPayoffPlan:
                 break
         else:
             pytest.fail("Almost Paid not found in results")
+
+
+class TestDebtPayoffCompactFormat:
+    """Phase 4A lock tests for the compact text-table output.
+    The verbose dict (existing tests above) is now opt-in; the default
+    is a compact summary the LLM can read directly without paying for
+    the full ``debts`` / ``yeti`` structure on every call."""
+
+    def test_compact_default_returns_string(self, debt_book):
+        from datetime import date
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.create_transaction(
+            description="Visa charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-1000"},
+                {"account": "Expenses:Groceries", "amount": "1000"},
+            ],
+            trans_date=date(2026, 1, 1),
+        )
+        result = gc_book.debt_payoff_plan(monthly_budget="2000")
+        assert isinstance(result, str)
+
+    def test_compact_includes_kill_order_header(self, debt_book):
+        from datetime import date
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.create_transaction(
+            description="Visa charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-1000"},
+                {"account": "Expenses:Groceries", "amount": "1000"},
+            ],
+            trans_date=date(2026, 1, 1),
+        )
+        result = gc_book.debt_payoff_plan(monthly_budget="2000")
+        # Header gives budget → debt-free month → total interest at a glance.
+        assert "Kill order" in result
+        assert "/mo" in result
+        assert "debt-free" in result
+        assert "interest" in result
+
+    def test_compact_includes_yeti_line(self, debt_book):
+        from datetime import date
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.create_transaction(
+            description="Visa charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-1000"},
+                {"account": "Expenses:Groceries", "amount": "1000"},
+            ],
+            trans_date=date(2026, 1, 1),
+        )
+        result = gc_book.debt_payoff_plan(monthly_budget="2000")
+        assert "YETI" in result
+        # The plain-English explanation lives on the YETI line itself.
+        assert "total debt impact" in result
+
+    def test_compact_drops_per_account_yeti_explanation(self, debt_book):
+        """The pre-fix verbose response embedded a multi-line YETI
+        explanation per account. Compact mode must NOT replicate that
+        bloat — the YETI signal lives on a single summary line."""
+        from datetime import date
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.create_transaction(
+            description="Visa charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-1000"},
+                {"account": "Expenses:Groceries", "amount": "1000"},
+            ],
+            trans_date=date(2026, 1, 1),
+        )
+        result = gc_book.debt_payoff_plan(monthly_budget="2000")
+        # Each "by the time your debt is paid off" string was repeated
+        # per account in the old shape. Should appear at most once now
+        # (or zero times — we use "total debt impact" wording instead).
+        assert result.count("by the time your debt is paid off") <= 1

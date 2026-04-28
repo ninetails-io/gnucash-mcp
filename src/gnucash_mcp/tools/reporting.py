@@ -124,11 +124,16 @@ def register(mcp, get_book) -> None:
     def debt_payoff_plan(
         monthly_budget: str,
         additional_purchase: str | None = None,
+        verbose: bool = False,
     ) -> str:
         """Calculate an avalanche-method debt payoff schedule with YETI multiplier.
 
         Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
         Set APRs via set_account_slot (e.g., set_account_slot("Liabilities:Visa", "apr", "23.49")).
+
+        Returns a compact text summary by default — kill order with
+        balances/APRs/payoff months, YETI line, totals, debt-free date.
+        Use verbose=true for the full structured dict.
 
         YETI (Your Expense's True Impact) shows the true cost of a purchase when
         carrying debt: "A $1.00 purchase will cost you $1.68 by the time your
@@ -137,10 +142,14 @@ def register(mcp, get_book) -> None:
         Args:
             monthly_budget: Total monthly amount available for all debt payments combined
             additional_purchase: Dollar amount to calculate YETI for (default "1.00")
+            verbose: If true, return the full structured dict.
         """
         book = get_book()
         result = book.debt_payoff_plan(
             monthly_budget=monthly_budget,
             additional_purchase=additional_purchase,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
