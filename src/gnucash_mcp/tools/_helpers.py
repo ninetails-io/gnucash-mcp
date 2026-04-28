@@ -14,6 +14,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError
 
+# Re-exports from the layer-neutral format module. Tool wrappers can
+# keep importing from ``tools._helpers`` (the historical home) without
+# concern for which file the implementation lives in. Book-layer code
+# imports directly from ``gnucash_mcp._format`` to preserve the
+# one-way ``tools → book`` dependency.
+from gnucash_mcp._format import _apply_limit, _format_number  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 
