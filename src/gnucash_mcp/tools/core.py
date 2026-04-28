@@ -88,10 +88,19 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+        # Resolve once to capture the canonical fullname for the
+        # response. Echoing the path the caller passed in (or, when
+        # they passed a %short, resolving to the readable form they'd
+        # rather see back) gives a uniform contract: every tool that
+        # echoes an account responds with the canonical full path.
+        account_dict = book.get_account(account_name)
+        if account_dict is None:
+            raise ValueError(f"Account not found: {account_name}")
+        canonical_name = account_dict["fullname"]
         balance = book.get_balance(account_name, date_obj)
         resolved_date = as_of_date if as_of_date else date.today().isoformat()
         result = {
-            "account": account_name,
+            "account": canonical_name,
             "balance": str(balance),
             "as_of_date": resolved_date,
         }

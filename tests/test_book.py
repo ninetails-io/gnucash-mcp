@@ -3076,6 +3076,48 @@ class TestShortGuidEndToEnd:
         assert gc_book.get_balance(full_guid) == gc_book.get_balance("Assets:Checking")
 
 
+class TestCanonicalAccountEcho:
+    """Every tool that echoes an account back in its response must
+    return the canonical full path — not the raw input string. The
+    caller passes ``%2e78c86`` and gets back ``Assets:Current Assets:
+    Savings Account``, which is more informative AND keeps the
+    contract uniform across the tool surface.
+
+    Locks the design so a future refactor can't regress to "echo
+    whatever came in." Bookkeeper-driven: the inconsistency between
+    get_balance (was echoing input) and replace_splits (always
+    canonical) was the trigger for this contract.
+    """
+
+    @staticmethod
+    def _short_for(gc_book, fullname: str) -> str:
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, fullname)
+            return gc_book._account_short_guid(book, account)
+
+    def test_get_account_slots_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_account_slots(account_name=short)
+        assert result["account"] == "Assets:Checking"
+
+    def test_get_unreconciled_splits_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_unreconciled_splits(account_name=short, compact=False)
+        assert result["account"] == "Assets:Checking"
+
+    def test_cash_flow_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account=short,
+        )
+        assert result["account"] == "Assets:Checking"
+
+
 class TestTemplateAccountsHidden:
     """Scheduled transactions persist their split templates as real
     Account rows under ``book.root_template``. piecash surfaces those

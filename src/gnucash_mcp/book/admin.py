@@ -46,7 +46,7 @@ class AdminMixin:
                     slots[k] = str(v.value)
 
             return {
-                "account": account_name,
+                "account": account.fullname,
                 "slots": slots,
             }
 

@@ -150,6 +150,34 @@ class TestGetBalanceTool:
         assert data["balance"] == "1000"
         assert data["as_of_date"] == "2024-01-10"
 
+    def test_get_balance_short_guid_input_echoes_canonical(
+        self, setup_book_env
+    ):
+        """When called with a %short GUID, the response echoes the
+        canonical full path — not the input string.
+
+        Locks the bookkeeper-flagged inconsistency: prior to this fix,
+        get_balance echoed whatever came in (so %xxxxxxx flowed back
+        into the response), making it the odd one out among the tools
+        that always returned the readable path.
+        """
+        # Find Checking's short GUID by pulling list_accounts and
+        # picking the line with our path.
+        listing = server_module.list_accounts()
+        checking_line = next(
+            line for line in listing.split("\n")
+            if "Assets:Checking" in line and "[BANK]" in line
+        )
+        short = checking_line.split("\t", 1)[0]
+        assert short.startswith("%")
+
+        result = server_module.get_balance(short)
+        data = json.loads(result)
+        assert data["account"] == "Assets:Checking", (
+            f"expected canonical fullname echo, got {data['account']!r}"
+        )
+        assert data["balance"] == "2850"
+
 
 class TestListTransactionsTool:
     """Tests for list_transactions tool."""

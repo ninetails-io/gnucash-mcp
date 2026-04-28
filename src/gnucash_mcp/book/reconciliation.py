@@ -171,7 +171,7 @@ class ReconciliationMixin:
                         uncleared_total += split.quantity
 
             result = {
-                "account": account_name,
+                "account": account.fullname,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
                 "splits": unreconciled,
                 "cleared_total": str(cleared_total),

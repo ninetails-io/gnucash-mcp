@@ -420,7 +420,7 @@ class InvestmentsMixin:
             return {
                 "guid": short_guid,
                 "title": title,
-                "account": account,
+                "account": acct.fullname,
                 "notes": notes,
                 "status": "created",
             }
