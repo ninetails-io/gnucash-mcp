@@ -25,6 +25,7 @@ from gnucash_mcp.book._base import (
     _to_decimal,
     _unique_prefix,
 )
+from gnucash_mcp._format import _apply_limit, _format_number
 
 
 class InvestmentsMixin:
@@ -232,7 +233,8 @@ class InvestmentsMixin:
         start_date: date | None = None,
         end_date: date | None = None,
         currency: str | None = None,
-    ) -> list[dict]:
+        limit: int | None = None,
+    ) -> dict:
         """Get price history for a commodity.
 
         Args:
@@ -241,9 +243,16 @@ class InvestmentsMixin:
             start_date: Optional start date filter.
             end_date: Optional end date filter.
             currency: Optional currency filter (e.g., "USD").
+            limit: Maximum prices to return. Defaults to 50, capped at
+                   250 server-side. Pre-fix this method dumped every
+                   matching price regardless of caller intent.
 
         Returns:
-            List of price dicts sorted by date descending (most recent first).
+            Dict with ``prices`` (list, possibly truncated), ``count``
+            (truncated length), ``total`` (untruncated), and ``notice``
+            (truncation message or None). Sorted by date descending —
+            most recent first, so a small ``limit`` still surfaces the
+            freshest data.
 
         Raises:
             ValueError: If commodity not found.
@@ -269,15 +278,27 @@ class InvestmentsMixin:
 
                 prices.append({
                     "date": p_date.isoformat(),
-                    "value": str(p.value),
+                    "value": _format_number(p.value, decimals=4, strip_trailing=True),
                     "currency": p.currency.mnemonic,
                     "type": p.type,
                     "source": p.source,
                 })
 
             prices.sort(key=lambda x: x["date"], reverse=True)
+            total = len(prices)
+            prices, notice = _apply_limit(
+                prices,
+                limit=limit,
+                entity_name="prices",
+                suggest_narrow=True,
+            )
 
-            return prices
+            return {
+                "prices": prices,
+                "count": len(prices),
+                "total": total,
+                "notice": notice,
+            }
 
     def get_latest_price(
         self,
@@ -369,9 +390,13 @@ class InvestmentsMixin:
             remaining_cost_basis = Decimal(0)
 
         return {
-            "quantity": str(remaining),
-            "cost_basis": str(remaining_cost_basis),
-            "cost_per_share": str(cost_per_share),
+            # Quantity is shares (or other commodity units): 4 decimals
+            # is a good default for funds and stocks. Crypto callers
+            # who need finer granularity get the same _format_number
+            # logic at decimals=6 in their own paths.
+            "quantity": _format_number(remaining, decimals=4),
+            "cost_basis": _format_number(remaining_cost_basis, decimals=2),
+            "cost_per_share": _format_number(cost_per_share, decimals=4),
             "is_closed": bool(lot.is_closed),
         }
 
@@ -652,11 +677,15 @@ class InvestmentsMixin:
             gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
 
             return {
-                "shares": str(shares_to_sell),
-                "cost_basis": str(cost_basis),
-                "sale_proceeds": str(proceeds),
-                "capital_gain": str(gain),
-                "gain_percent": str(gain_pct),
+                "shares": _format_number(shares_to_sell, decimals=4),
+                "cost_basis": _format_number(cost_basis, decimals=2),
+                "sale_proceeds": _format_number(proceeds, decimals=2),
+                "capital_gain": _format_number(gain, decimals=2),
+                # The 26-digit case the spec called out — ``(gain /
+                # cost_basis) * 100`` produces an unbounded repeating
+                # decimal in the general case. 2 decimal places is
+                # what humans and reports actually use.
+                "gain_percent": _format_number(gain_pct, decimals=2),
             }
 
     def close_lot(self, guid: str) -> dict:

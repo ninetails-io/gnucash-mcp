@@ -5220,15 +5220,19 @@ class TestUpdateAccount:
         assert result["description"] == "Weekly grocery shopping"
 
     def test_update_account_placeholder(self, test_book: Path):
-        """Should update placeholder status."""
+        """Should update placeholder status — and echo the change."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.update_account(
-            name="Expenses",
-            placeholder=True,
-        )
+        # The test fixture's "Expenses" is already a placeholder, so
+        # passing ``placeholder=True`` would be a no-op under the new
+        # diff-only contract. Toggle it off first to make the second
+        # call observably change the account.
+        gc_book.update_account(name="Expenses", placeholder=False)
+        result = gc_book.update_account(name="Expenses", placeholder=True)
 
         assert result["status"] == "updated"
+        # ``placeholder`` only appears in the response when it actually
+        # changed — diff-style write echo (Phase 2 of the comms-audit).
         assert result["placeholder"] is True
 
     def test_update_account_not_found(self, test_book: Path):
@@ -5333,13 +5337,73 @@ class TestUpdateAccount:
             )
 
     def test_update_account_type_same_type_noop(self, test_book: Path):
-        """Changing to the same type should succeed without error."""
+        """Changing to the same type should succeed without error AND
+        the diff-style response should NOT echo ``type`` (no change)."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.update_account(
             name="Assets:Checking", account_type="BANK",
         )
         assert result["status"] == "updated"
-        assert result["type"] == "BANK"
+        # Pre-Phase-2 the response echoed every field. New contract:
+        # only fields that actually changed appear. Same-type set
+        # changes nothing, so ``type`` is absent.
+        assert "type" not in result
+
+
+class TestWriteResponseShape:
+    """Tests for the trimmed write-response contract introduced in
+    Phase 2 of the comms-audit fixes. ``update_account`` and
+    ``move_account`` previously echoed the entire account record on
+    every write; the new contract returns ``{guid, status, ...changed
+    fields}`` only. Locks the shape so future refactors don't
+    regress to "echo everything"."""
+
+    def test_update_account_response_omits_unchanged_fields(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.update_account(
+            name="Expenses:Groceries",
+            description="Updated description",
+        )
+        assert result["status"] == "updated"
+        # ``description`` changed — present.
+        assert result["description"] == "Updated description"
+        # Other fields didn't change — absent.
+        assert "name" not in result
+        assert "type" not in result
+        assert "placeholder" not in result
+        assert "fullname" not in result
+        # ``guid`` is always returned (the caller's handle).
+        assert result["guid"].startswith("%")
+
+    def test_update_account_response_carries_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.update_account(
+            name="Expenses:Groceries",
+            description="Refresh",
+        )
+        # Short account GUID format: '%' + ≥7 hex chars.
+        import re
+        assert re.fullmatch(r"%[0-9a-f]{7,32}", result["guid"]), (
+            f"unexpected guid shape: {result['guid']!r}"
+        )
+
+    def test_move_account_response_shape(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # Set up a destination parent for the move.
+        gc_book.create_account(
+            name="Daily Expenses", account_type="EXPENSE",
+            parent="Expenses", placeholder=True,
+        )
+        result = gc_book.move_account(
+            name="Expenses:Groceries",
+            new_parent="Expenses:Daily Expenses",
+        )
+        assert result["status"] == "moved"
+        assert result["fullname"] == "Expenses:Daily Expenses:Groceries"
+        assert result["parent"] == "Expenses:Daily Expenses"
+        assert result["guid"].startswith("%")
+        # Shape contract: nothing else.
+        assert set(result.keys()) == {"guid", "fullname", "parent", "status"}
 
 
 class TestMoveAccount:
@@ -7168,8 +7232,10 @@ class TestPrices:
         assert result["value"] == "127.50"
         assert result["date"] == "2026-02-07"
 
-        # Verify via get_prices
-        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        # Verify via get_prices (now returns dict with prices/count/total/notice)
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        prices = result["prices"]
+        assert result["total"] == 1
         assert len(prices) == 1
         assert Decimal(prices[0]["value"]) == Decimal("127.50")
         assert prices[0]["type"] == "nav"
@@ -7204,7 +7270,8 @@ class TestPrices:
         assert result["value"] == "128.75"
 
         # Should still be only 1 price, not 2
-        prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        prices = result["prices"]
         assert len(prices) == 1
         assert prices[0]["value"] == "128.75"
 
@@ -7233,17 +7300,19 @@ class TestPrices:
         )
 
         # Filter to middle date
-        prices = gc_book.get_prices(
+        result = gc_book.get_prices(
             commodity="VTSAX",
             namespace="FUND",
             start_date=date(2026, 2, 3),
             end_date=date(2026, 2, 8),
         )
+        prices = result["prices"]
         assert len(prices) == 1
         assert Decimal(prices[0]["value"]) == Decimal("126.50")
 
         # All prices, should be descending
-        all_prices = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        all_result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        all_prices = all_result["prices"]
         assert len(all_prices) == 3
         assert all_prices[0]["date"] == "2026-02-10"  # Most recent first
         assert all_prices[2]["date"] == "2026-02-01"  # Oldest last

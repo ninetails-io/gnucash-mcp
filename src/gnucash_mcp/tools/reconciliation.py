@@ -48,16 +48,23 @@ def register(mcp, get_book) -> None:
         account: str,
         as_of_date: str | None = None,
         verbose: bool = False,
+        limit: int = 50,
     ) -> str:
-        """Get all unreconciled splits for an account.
+        """Get unreconciled splits for an account.
 
-        Returns a compact one-line-per-split format by default with a summary footer.
-        Use verbose=true for full JSON with split GUIDs, amounts, and totals.
+        Returns up to ``limit`` splits in a compact one-line-per-split
+        format by default with a summary footer reflecting the **full**
+        unreconciled set (so the headline is honest even when individual
+        lines are clipped).
+
+        Use verbose=true for full JSON with split GUIDs, amounts, totals,
+        and the truncation notice as a structured field.
 
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
             verbose: If true, return full JSON details. Default compact one-line format.
+            limit: Maximum splits to return. Defaults to 50, capped at 250.
         """
         book = get_book()
         date_obj = date.fromisoformat(as_of_date) if as_of_date else None
@@ -65,6 +72,7 @@ def register(mcp, get_book) -> None:
             account_name=account,
             as_of_date=date_obj,
             compact=not verbose,
+            limit=limit,
         )
         if verbose:
             return _json(result)

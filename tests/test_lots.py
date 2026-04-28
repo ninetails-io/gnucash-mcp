@@ -134,8 +134,10 @@ class TestGetLot:
         result = book.get_lot(guid=lot["guid"])
         assert result["title"] == "Empty Lot"
         assert result["splits"] == []
-        assert result["summary"]["quantity"] == "0"
-        assert result["summary"]["cost_basis"] == "0"
+        # _format_number renders quantities at 4 decimals (share-style)
+        # and currency at 2 — empty lot is zero either way.
+        assert result["summary"]["quantity"] == "0.0000"
+        assert result["summary"]["cost_basis"] == "0.00"
 
     def test_get_lot_with_splits(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
