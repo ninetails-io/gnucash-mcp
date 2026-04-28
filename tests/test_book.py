@@ -900,6 +900,76 @@ class TestGetBookSummaryNetWorthTrajectory:
         new_val = int(re.search(r"USD ([0-9,]+)", newest_row).group(1).replace(",", ""))
         assert new_val > old_val
 
+    def test_now_agrees_with_assets_minus_liabilities(
+        self, test_book: Path,
+    ):
+        """Trajectory's "now" anchor and the displayed Assets /
+        Liabilities sections agree on net worth — both filter at
+        today, both use the same conversion semantics. Locks in the
+        bookkeeper's $2,906 gap fix on Alex's book.
+
+        Builds a book with a future-dated transaction (data range
+        extends past today). Without the today-filter, the Assets
+        section sums all splits including the future entry while
+        trajectory's "now" filters at today, producing a
+        discrepancy. With the filter, both align."""
+        gc = GnuCashBook(str(test_book))
+        # Seed a future-dated transaction. Its $5,000 deposit
+        # should NOT count toward today's net worth, neither in
+        # Assets section nor in trajectory's "now" anchor.
+        future = date.today() + timedelta(days=10)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Future-dated entry",
+                post_date=future,
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("5000"),
+                    ),
+                    piecash.Split(
+                        account=opening, value=Decimal("-5000"),
+                    ),
+                ],
+            ))
+            book.save()
+
+        result = gc.get_book_summary()
+        # Parse Assets total and Liabilities total from the output.
+        import re
+        assets_line = next(
+            l for l in result.split("\n")
+            if l.startswith("Assets: ")
+        )
+        assets_match = re.search(r"USD\s+([\d.]+)", assets_line)
+        assets_total = Decimal(assets_match.group(1))
+
+        liabilities_line = next(
+            l for l in result.split("\n")
+            if l.startswith("Liabilities: ")
+        )
+        liab_match = re.search(r"USD\s+([\d.]+)", liabilities_line)
+        liabilities_total = Decimal(liab_match.group(1))
+
+        # Trajectory's "now" line.
+        section = result.split("Net worth trajectory:\n", 1)[1]
+        now_row = next(
+            r for r in section.split("\n")[:5] if "now" in r
+        )
+        now_match = re.search(r"USD\s+([\d,]+)", now_row)
+        now_value = Decimal(now_match.group(1).replace(",", ""))
+
+        # The two computations must agree by construction (within
+        # quantize-to-whole-dollar rounding).
+        balance_sheet_net_worth = (assets_total - liabilities_total)
+        assert abs(balance_sheet_net_worth - now_value) < Decimal("1"), (
+            f"Assets ({assets_total}) - Liabilities "
+            f"({liabilities_total}) = {balance_sheet_net_worth}, "
+            f"but trajectory's 'now' = {now_value}"
+        )
+
     def test_now_uses_cost_basis_for_unpriced_foreign_commodity(
         self, tmp_path: Path,
     ):
@@ -2416,6 +2486,49 @@ class TestGetBookSummaryWarnings:
         assert "No Terms Co" in warnings_block
         assert "20 days overdue" in warnings_block
         assert "(posted without terms)" in warnings_block
+
+    def test_past_due_invoice_uses_term_duedays_no_terms_annotation(
+        self, business_book: Path,
+    ):
+        """When an invoice was posted with a billterm (e.g. Net 30)
+        but no explicit ``due_date``, the warning should compute
+        the due date from the billterm's ``duedays`` and NOT
+        annotate '(posted without terms)' — the term IS known.
+
+        Regression for the Berlin Digital case on Alex's book:
+        the warning correctly computed 55 days overdue from
+        Net 30 + posting date, but contradicted itself by saying
+        '(posted without terms)' — undermining the number."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_billterm(name="Net 30", due_days=30)
+        gc.create_customer(name="Berlin Digital", currency="USD")
+        gc.create_invoice(
+            customer_id="000001",
+            date_opened=(date.today() - timedelta(days=85)).isoformat(),
+            term="Net 30",
+        )
+        gc.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Service",
+            quantity="1",
+            price="4200",
+        )
+        # Post WITHOUT explicit due_date — relies on the term.
+        gc.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=(date.today() - timedelta(days=85)).isoformat(),
+        )
+        result = gc.get_book_summary()
+        warnings_block = result.split("Warnings:")[1].split(
+            "Accounts:"
+        )[0]
+        # Net 30 + 85 days posted = 55 days overdue.
+        assert "Berlin Digital" in warnings_block
+        assert "55 days overdue" in warnings_block
+        # The term IS known; no contradiction annotation.
+        assert "(posted without terms)" not in warnings_block
 
     def test_paid_invoice_does_not_warn(self, business_book: Path):
         """A posted invoice that's been fully paid (lot balance

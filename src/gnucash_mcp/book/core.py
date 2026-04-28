@@ -690,7 +690,37 @@ class CoreMixin:
                             ),
                             {"guid": txn.guid},
                         ).first()
+                        # Three-step due-date resolution. The
+                        # first source that resolves wins; only the
+                        # last (30-day fallback) annotates the
+                        # warning as approximated.
+                        #
+                        # 1. ``trans-date-due`` slot — present only
+                        #    when the user explicitly passed
+                        #    ``due_date`` to ``post_invoice``.
+                        # 2. ``Invoice.terms`` reference — present
+                        #    when the user posted with a billterm
+                        #    (e.g., "Net 30"). Look up the
+                        #    billterm's ``duedays`` and add to
+                        #    date_posted. The bookkeeper LLM
+                        #    expects "Net 30" terms to produce
+                        #    accurate due dates without needing an
+                        #    explicit due_date parameter; relying
+                        #    only on the slot misses this very
+                        #    common case (Berlin Digital on Alex's
+                        #    book triggered the inconsistency:
+                        #    "55 days overdue (posted without
+                        #    terms)" was reported when the
+                        #    Net-30-derived date was correct).
+                        # 3. 30-day default — only when neither
+                        #    slot nor terms reference exists.
+                        #    Annotate the warning so the
+                        #    bookkeeper knows the duration is a
+                        #    guess.
                         no_terms = False
+                        due_date = None
+
+                        # Step 1: explicit due-date slot.
                         if row and row[0]:
                             gdate_val = row[0]
                             if isinstance(gdate_val, str):
@@ -701,7 +731,51 @@ class CoreMixin:
                                 due_date = gdate_val.date()
                             else:
                                 due_date = gdate_val
-                        else:
+
+                        # Step 2: billterm via the raw ``terms``
+                        # column. Bypasses any ORM relationship
+                        # lazy-load — in this codebase ``inv.terms``
+                        # exposes a relationship that's reliable
+                        # only when triggered through specific
+                        # paths; raw SQL is the same pattern used
+                        # elsewhere in the warnings collector for
+                        # slot reads.
+                        if due_date is None:
+                            try:
+                                terms_row = book.session.execute(
+                                    text(
+                                        "SELECT terms FROM invoices "
+                                        "WHERE guid = :guid"
+                                    ),
+                                    {"guid": inv.guid},
+                                ).first()
+                                term_guid = (
+                                    terms_row[0] if terms_row else None
+                                )
+                                if term_guid:
+                                    from piecash.business.invoice import (
+                                        Billterm,
+                                    )
+                                    bt = (
+                                        book.session.query(Billterm)
+                                        .filter_by(guid=term_guid)
+                                        .first()
+                                    )
+                                    if bt and bt.duedays:
+                                        posted = inv.date_posted
+                                        if isinstance(posted, datetime):
+                                            posted = posted.date()
+                                        due_date = (
+                                            posted + timedelta(
+                                                days=int(bt.duedays)
+                                            )
+                                        )
+                            except Exception:
+                                pass
+
+                        # Step 3: 30-day default. Annotate so the
+                        # bookkeeper knows the duration is a guess.
+                        if due_date is None:
                             posted = inv.date_posted
                             if isinstance(posted, datetime):
                                 posted = posted.date()
@@ -1332,6 +1406,18 @@ class CoreMixin:
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
+            # All balances and price lookups in this summary are
+            # computed as-of-today. Trajectory's "now" anchor uses
+            # the same cutoff (via ``_compute_net_worth_at(today)``
+            # and ``_rates_as_of(today)``), so the displayed Assets
+            # / Liabilities totals agree with trajectory's "now"
+            # by construction. Without this filter, future-dated
+            # transactions or prices in the book would skew the
+            # current snapshot — bookkeeper hit this on Alex's
+            # book where 34 days of data past today produced a
+            # $2,906 gap between Assets-Liabilities and trajectory.
+            today = date.today()
+
             # Identify template accounts (scheduled-transaction scaffolding).
             # Shared helper on BaseGnuCashBook walks the whole subtree; the
             # old inline version only captured root_template + direct
@@ -1356,11 +1442,16 @@ class CoreMixin:
                     continue
                 if p.type == "transaction":
                     continue
-                key = p.commodity.guid
-                existing = latest_prices.get(key + ":date")
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
                     p_date = p_date.date()
+                if p_date > today:
+                    # Future-dated prices excluded so _market_value
+                    # agrees with trajectory's _rates_as_of(today)
+                    # by construction.
+                    continue
+                key = p.commodity.guid
+                existing = latest_prices.get(key + ":date")
                 if existing is None or p_date > existing:
                     latest_prices[key + ":date"] = p_date
                     latest_prices[key] = Decimal(str(p.value))
@@ -1379,9 +1470,13 @@ class CoreMixin:
                 if rate is not None:
                     return (quantity * rate), f"{quantity} {sym} @ {rate}"
                 # Fallback: cost basis from split values (transaction currency).
+                # Same today filter as the balance computation —
+                # without it, future-dated buys would inflate cost
+                # basis past the as-of-today snapshot.
                 cost_basis = Decimal("0")
                 for s in account.splits:
-                    cost_basis += Decimal(str(s.value))
+                    if s.transaction.post_date <= today:
+                        cost_basis += Decimal(str(s.value))
                 return cost_basis, f"{quantity} {sym} — no price data"
 
             # --- Account stats ---
@@ -1414,9 +1509,13 @@ class CoreMixin:
                 is_leaf = account.guid not in parent_guids
 
                 # Calculate balance in the account's own commodity.
+                # Date filter excludes future-dated transactions so
+                # trajectory's "now" anchor agrees with the
+                # displayed Assets / Liabilities totals.
                 balance = Decimal("0")
                 for split in account.splits:
-                    balance += split.quantity
+                    if split.transaction.post_date <= today:
+                        balance += split.quantity
 
                 leaf = account.fullname.split(":")[-1]
 
