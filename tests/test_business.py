@@ -724,6 +724,112 @@ class TestCreateBill:
             f"000006/000007), got {result['id']}"
         )
 
+    def test_auto_id_bill_can_be_posted(
+        self, business_book,
+    ):
+        """After the auto-id collision fix, the resulting bill must
+        be POSTABLE — exercising the full lifecycle, not just the
+        ID assignment. Regression for the bookkeeper's report:
+        Bill 000008 was correctly auto-id'd past existing
+        000006/000007, but ``post_invoice`` then raised "already
+        posted" on the unposted bill.
+
+        Reproduces the exact Alex-book scenario."""
+        import uuid
+        from piecash.business.invoice import Invoice
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Old Vendor")
+        gb.create_vendor(name="New Vendor")
+        with gb.open(readonly=False) as book:
+            old_vendor = gb._find_vendor(book, "000001")
+            usd = book.default_currency
+            for inv_id in ("000006", "000007"):
+                book.session.execute(
+                    Invoice.__table__.insert().values(
+                        guid=uuid.uuid4().hex,
+                        id=inv_id,
+                        date_opened=None,
+                        date_posted=None,
+                        notes="historical",
+                        active=1,
+                        currency=usd.guid,
+                        owner_type=4,
+                        owner_guid=old_vendor.guid,
+                        terms=None,
+                        billing_id="",
+                        post_txn=None,
+                        post_lot=None,
+                        post_acc=None,
+                        billto_type=0,
+                        billto_guid=None,
+                        charge_amt_num=0,
+                        charge_amt_denom=1,
+                    )
+                )
+            book.save()
+        # Create new bill via auto-id — should land at 000008.
+        new_bill = gb.create_bill(vendor_id="000002")
+        assert new_bill["id"] == "000008"
+        # Add an entry and post — neither should fail.
+        gb.add_bill_entry(
+            bill_id="000008",
+            account="Expenses:Office Supplies",
+            description="Pens",
+            quantity="1",
+            price="50",
+        )
+        result = gb.post_invoice(
+            invoice_id="000008",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+
+    def test_post_succeeds_when_date_posted_is_empty_string(
+        self, business_book,
+    ):
+        """``date_posted`` can land in SQL as an empty string
+        (rather than NULL) on certain persistence paths — observed
+        on Alex Chen-Morales's book where freshly auto-id'd bill
+        000008 had ``date_posted=""`` in the database. The
+        ``is not None`` check then evaluated truthy on the unposted
+        bill and ``post_invoice`` raised "already posted",
+        blocking the entire vendor bill lifecycle.
+
+        Fix: treat any falsy value (None, "") as "not posted".
+        Only a real datetime is truthy, so the check still
+        rejects genuinely-posted documents."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Test Vendor")
+        bill = gb.create_bill(vendor_id="000001")
+        # Force the broken state Stephen observed: empty string
+        # rather than NULL in date_posted.
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "UPDATE invoices SET date_posted = '' "
+                    "WHERE id = :id AND owner_type = 4"
+                ),
+                {"id": bill["id"]},
+            )
+            book.save()
+        # add_bill_entry must succeed (uses same date_posted check).
+        gb.add_bill_entry(
+            bill_id=bill["id"],
+            account="Expenses:Office Supplies",
+            description="Test",
+            quantity="1",
+            price="100",
+        )
+        # post_invoice must succeed despite the broken state.
+        result = gb.post_invoice(
+            invoice_id=bill["id"],
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+
     def test_auto_id_skips_existing_for_invoices_too(
         self, business_book,
     ):
