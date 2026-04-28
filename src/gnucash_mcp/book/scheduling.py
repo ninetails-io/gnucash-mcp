@@ -253,7 +253,7 @@ class SchedulingMixin:
 
         with self.open(readonly=False) as book:
             for s in splits:
-                acct = self._find_account(book, s["account"])
+                acct = self._resolve_account(book, s["account"])
                 if not acct:
                     raise ValueError(
                         f"Account not found: {s['account']}"

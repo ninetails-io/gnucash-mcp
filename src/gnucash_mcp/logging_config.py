@@ -795,6 +795,129 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
 }
 
 
+_ACCOUNT_REF_KEYS_ALWAYS = frozenset({
+    "account",
+    "account_name",
+    "post_account",
+    "payment_account",
+    "new_parent",
+    "parent",
+})
+
+# Keys whose values are account refs ONLY for specific (entity_type,
+# operation) pairs. ``name`` is the canonical example: it's the leaf
+# name on CREATE ACCOUNT (e.g. ``"Groceries"``) but the full ref on
+# UPDATE / MOVE / DELETE.
+_ACCOUNT_REF_KEYS_CONDITIONAL: dict[tuple[str, str], frozenset[str]] = {
+    ("account", "UPDATE"): frozenset({"name"}),
+    ("account", "MOVE"): frozenset({"name"}),
+    ("account", "DELETE"): frozenset({"name"}),
+}
+
+
+def _looks_like_guid_ref(value) -> bool:
+    """True iff ``value`` is a string worth resolving — short GUID
+    (``%xxxxxxx``) or 32-char hex full GUID. Path strings are already
+    canonical and skipped."""
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("%"):
+        return True
+    if len(value) == 32:
+        try:
+            int(value, 16)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _normalize_account_refs_for_audit(
+    params: dict, entity_type: str, operation: str
+) -> dict:
+    """Resolve any short / full-GUID account refs in ``params`` to
+    canonical full paths for audit-log rendering.
+
+    The audit log is the one human-facing surface in the app — the LLM
+    can read short GUIDs fine, but a human reviewing the log shouldn't
+    have to look up ``%2e78c86`` to know what got reconciled. This
+    function walks ``params`` once and rewrites every known account-ref
+    key (and split-list ``account`` values) to the matching
+    ``Account.fullname``.
+
+    One book open per entry, regardless of how many refs are resolved.
+    Resolution failures degrade gracefully — we leave the original
+    string in place rather than crashing log rendering.
+    """
+    if not params:
+        return params
+
+    keys_to_normalize = set(_ACCOUNT_REF_KEYS_ALWAYS) | (
+        _ACCOUNT_REF_KEYS_CONDITIONAL.get((entity_type, operation)) or set()
+    )
+
+    # Pass 1: collect every unique ref string that's worth a lookup.
+    refs: set[str] = set()
+    for key, value in params.items():
+        if key in keys_to_normalize and _looks_like_guid_ref(value):
+            refs.add(value)
+        elif key == "splits" and isinstance(value, list):
+            for split in value:
+                if isinstance(split, dict):
+                    acct_ref = split.get("account")
+                    if _looks_like_guid_ref(acct_ref):
+                        refs.add(acct_ref)
+
+    if not refs:
+        # All values are paths already (or nothing to normalize).
+        return params
+
+    # Pass 2: one book open, resolve everything.
+    resolved: dict[str, str] = {}
+    if _get_book_func is not None:
+        try:
+            book_wrapper = _get_book_func()
+            if book_wrapper is not None:
+                with book_wrapper.open(readonly=True) as book:
+                    for ref in refs:
+                        try:
+                            account = book_wrapper._resolve_account(book, ref)
+                            if account is not None:
+                                resolved[ref] = account.fullname
+                        except Exception:
+                            # Stale, ambiguous, malformed — leave the raw
+                            # ref in place; the log line is still useful.
+                            continue
+        except Exception:
+            # Book unavailable: fall back to raw refs everywhere.
+            pass
+
+    if not resolved:
+        return params
+
+    def _replace(s):
+        return resolved.get(s, s) if isinstance(s, str) else s
+
+    # Pass 3: rewrite. Non-destructive — return a new dict so the
+    # debug-log line that already captured the original params is
+    # unaffected.
+    out: dict = {}
+    for key, value in params.items():
+        if key in keys_to_normalize:
+            out[key] = _replace(value)
+        elif key == "splits" and isinstance(value, list):
+            new_splits = []
+            for split in value:
+                if isinstance(split, dict) and "account" in split:
+                    new_splits.append({**split, "account": _replace(split["account"])})
+                else:
+                    new_splits.append(split)
+            out[key] = new_splits
+        else:
+            out[key] = value
+    return out
+
+
 def _format_audit_entry_text(entry: dict) -> str:
     """Format an audit entry as human-readable text.
 
@@ -807,6 +930,11 @@ def _format_audit_entry_text(entry: dict) -> str:
     with ``new_parent`` in params — we remap the key here before
     lookup so the dedicated move handler fires instead of the update
     one.
+
+    Account refs in ``params`` (``%shortguid`` or full 32-char GUIDs)
+    are resolved to canonical full paths before handlers see them.
+    Audit logs are read by humans; short GUIDs are convenient on the
+    wire but would force a manual lookup at review time.
     """
     if entry.get("classification") != "write":
         return ""
@@ -825,6 +953,16 @@ def _format_audit_entry_text(entry: dict) -> str:
     handler = _AUDIT_HANDLERS.get((entity_type, operation))
     if handler is None:
         return ""
+
+    # Substitute canonical fullnames in for any %short / full-GUID
+    # account refs the LLM passed. Non-destructive: the source entry
+    # (and the debug log already written from it) keeps the raw values.
+    normalized_params = _normalize_account_refs_for_audit(
+        entry.get("params") or {}, entity_type, operation
+    )
+    if normalized_params is not (entry.get("params") or {}):
+        entry = {**entry, "params": normalized_params}
+
     lines = handler(entry)
     return "\n".join(lines) if lines else ""
 

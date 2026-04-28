@@ -33,7 +33,7 @@ def register(mcp, get_book) -> None:
         credit limit, reward rates, or any custom data.
 
         Args:
-            account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
             key: Specific slot key to retrieve. If omitted, returns all slots.
         """
         book = get_book()
@@ -58,7 +58,7 @@ def register(mcp, get_book) -> None:
         Use for APR, credit limits, reward rates, or any per-account metadata.
 
         Args:
-            account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
             key: Slot key (e.g., "apr", "credit_limit").
             value: Slot value (always stored as string).
         """
@@ -80,7 +80,7 @@ def register(mcp, get_book) -> None:
         """Remove a custom metadata slot from an account.
 
         Args:
-            account: Full account path (e.g., "Liabilities:Credit Cards:Capital One").
+            account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.
             key: Slot key to remove.
         """
         book = get_book()

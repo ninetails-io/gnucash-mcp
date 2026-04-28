@@ -84,7 +84,7 @@ def register(mcp, get_book) -> None:
 
         Args:
             budget_name: Name of the budget.
-            account: Full account path (e.g., "Expenses:Groceries").
+            account: Account ref: full path (e.g., "Expenses:Groceries"), %short GUID, or full 32-char GUID.
             amount: Monthly budget amount as string (e.g., "500.00").
             period: Which period(s) to set:
                 - None or "all": Set same amount for all periods (default)

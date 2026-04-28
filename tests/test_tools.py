@@ -93,7 +93,10 @@ class TestListAccountsTool:
         result = server_module.list_accounts(root="Expenses")
         lines = result.strip().split("\n")
         for line in lines:
-            assert line.startswith("Expenses")
+            # Compact line format: '%shortguid<TAB>fullname [ANNOTATION]'.
+            # Pull the path portion off before checking the prefix.
+            path = line.split("\t", 1)[1] if "\t" in line else line
+            assert path.startswith("Expenses")
 
     def test_list_accounts_root_with_verbose(self, setup_book_env):
         """root + verbose should return filtered JSON."""
@@ -146,6 +149,34 @@ class TestGetBalanceTool:
         data = json.loads(result)
         assert data["balance"] == "1000"
         assert data["as_of_date"] == "2024-01-10"
+
+    def test_get_balance_short_guid_input_echoes_canonical(
+        self, setup_book_env
+    ):
+        """When called with a %short GUID, the response echoes the
+        canonical full path — not the input string.
+
+        Locks the bookkeeper-flagged inconsistency: prior to this fix,
+        get_balance echoed whatever came in (so %xxxxxxx flowed back
+        into the response), making it the odd one out among the tools
+        that always returned the readable path.
+        """
+        # Find Checking's short GUID by pulling list_accounts and
+        # picking the line with our path.
+        listing = server_module.list_accounts()
+        checking_line = next(
+            line for line in listing.split("\n")
+            if "Assets:Checking" in line and "[BANK]" in line
+        )
+        short = checking_line.split("\t", 1)[0]
+        assert short.startswith("%")
+
+        result = server_module.get_balance(short)
+        data = json.loads(result)
+        assert data["account"] == "Assets:Checking", (
+            f"expected canonical fullname echo, got {data['account']!r}"
+        )
+        assert data["balance"] == "2850"
 
 
 class TestListTransactionsTool:

@@ -30,7 +30,7 @@ class AdminMixin:
             ValueError: If account not found.
         """
         with self.open(readonly=True) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
@@ -46,7 +46,7 @@ class AdminMixin:
                     slots[k] = str(v.value)
 
             return {
-                "account": account_name,
+                "account": account.fullname,
                 "slots": slots,
             }
 
@@ -68,7 +68,7 @@ class AdminMixin:
             ValueError: If account not found.
         """
         with self.open(readonly=False) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
@@ -99,7 +99,7 @@ class AdminMixin:
             ValueError: If account not found or key not found.
         """
         with self.open(readonly=False) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 

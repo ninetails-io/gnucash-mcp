@@ -136,7 +136,7 @@ class ReconciliationMixin:
             ValueError: If account not found.
         """
         with self.open(readonly=True) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
@@ -171,7 +171,7 @@ class ReconciliationMixin:
                         uncleared_total += split.quantity
 
             result = {
-                "account": account_name,
+                "account": account.fullname,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
                 "splits": unreconciled,
                 "cleared_total": str(cleared_total),
@@ -221,7 +221,7 @@ class ReconciliationMixin:
         expected_balance = _to_decimal(statement_balance)
 
         with self.open(readonly=False) as book:
-            account = self._find_account(book, account_name)
+            account = self._resolve_account(book, account_name)
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 

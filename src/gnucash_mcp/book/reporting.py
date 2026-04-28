@@ -572,7 +572,7 @@ class ReportingMixin:
             # or the default "all cash/bank accounts" (account-type
             # IN() clause). Both push the filter to SQL.
             if account:
-                target_account = self._find_account(book, account)
+                target_account = self._resolve_account(book, account)
                 if not target_account:
                     raise ValueError(f"Account not found: {account}")
                 rows = self._query_filtered_splits(
@@ -603,8 +603,15 @@ class ReportingMixin:
 
             # period is input echo (LLM supplied dates), net is derivable
             # (inflows - outflows). Both dropped.
+            #
+            # Echo the canonical fullname rather than the raw input —
+            # so callers passing %short or full-GUID input always see
+            # a readable account name in the response.
             return {
-                "account": account if account else "All cash/bank accounts",
+                "account": (
+                    target_account.fullname if account
+                    else "All cash/bank accounts"
+                ),
                 "inflows": str(inflows),
                 "outflows": str(outflows),
             }

@@ -556,6 +556,202 @@ class TestAuditLogIntegration:
         assert "Checking" in content
 
 
+class TestAuditLogResolvesAccountRefs:
+    """The audit log is the one human-readable surface in the app.
+    Short GUIDs ``%xxxxxxx`` and full 32-char GUIDs are convenient on
+    the wire but noise to a reviewer scanning the log. The formatter
+    resolves them back to canonical full paths via book lookup before
+    handing the entry to the per-operation formatter.
+
+    Path inputs are unchanged. Resolution failures degrade gracefully
+    (raw value stays in place) so logging never crashes a tool.
+    """
+
+    def test_short_guid_in_top_level_account_param_resolved(
+        self, test_book
+    ):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        # Discover Checking's short GUID the same way the LLM would —
+        # off the list_accounts compact line.
+        with book.open(readonly=True) as b:
+            account = book._find_account(b, "Assets:Checking")
+            short = book._account_short_guid(b, account)
+
+        # Build a synthetic RECONCILE entry with the short GUID where
+        # the LLM would normally pass it.
+        entry = {
+            "classification": "write",
+            "operation": "reconcile",
+            "entity_type": "split",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": short,
+                "statement_date": "2026-04-27",
+                "statement_balance": "2850.00",
+                "split_guids": [],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered, (
+            f"audit log should resolve {short!r} to the full path; "
+            f"got:\n{rendered}"
+        )
+        assert short not in rendered, (
+            f"audit log still contains the raw short GUID {short!r}:\n{rendered}"
+        )
+
+    def test_short_guid_in_split_list_resolved(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        with book.open(readonly=True) as b:
+            checking = book._find_account(b, "Assets:Checking")
+            groceries = book._find_account(b, "Expenses:Groceries")
+            short_check = book._account_short_guid(b, checking)
+            short_grocery = book._account_short_guid(b, groceries)
+
+        # Synthetic CREATE TRANSACTION entry with shorts in both splits.
+        entry = {
+            "classification": "write",
+            "operation": "create",
+            "entity_type": "transaction",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "description": "Lunch",
+                "transaction_date": "2026-04-27",
+                "splits": [
+                    {"account": short_check, "amount": "-12.50"},
+                    {"account": short_grocery, "amount": "12.50"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        # Transaction-split rendering deliberately uses leaf names for
+        # compactness (``_format_splits_text``). Pre-normalization the
+        # leaf would be the raw short GUID itself (no colons → leaf == ref).
+        # After normalization we get the human leaf names. Both branches
+        # of that contract:
+        assert "Checking" in rendered
+        assert "Groceries" in rendered
+        assert short_check not in rendered
+        assert short_grocery not in rendered
+
+    def test_full_guid_resolved_too(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+        with book.open(readonly=True) as b:
+            account = book._find_account(b, "Assets:Checking")
+            full_guid = account.guid
+
+        entry = {
+            "classification": "write",
+            "operation": "set_slot",
+            "entity_type": "account_slot",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": full_guid,
+                "key": "color",
+                "value": "blue",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered
+        assert full_guid not in rendered
+
+    def test_path_input_unchanged(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        entry = {
+            "classification": "write",
+            "operation": "set_slot",
+            "entity_type": "account_slot",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": "Assets:Checking",
+                "key": "color",
+                "value": "blue",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered
+
+    def test_unresolvable_short_guid_left_in_place(self, test_book):
+        """Resolution failure (well-formed prefix that matches nothing)
+        must NOT crash the formatter — it falls through to the raw value.
+        Better to log ``%deadbe0`` than to drop the entry."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        entry = {
+            "classification": "write",
+            "operation": "reconcile",
+            "entity_type": "split",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": "%deadbe0",
+                "statement_date": "2026-04-27",
+                "statement_balance": "0.00",
+                "split_guids": [],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        # Raw value preserved when resolution fails.
+        assert "%deadbe0" in rendered
+
+
 class TestBookOpenAccounting:
     """Regression guard: each write should open the book exactly once.
 

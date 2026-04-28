@@ -2652,6 +2652,16 @@ class TestMissingDefaultCurrency:
         assert result["guid"]
 
 
+def _path_from_compact_line(line: str) -> str:
+    """Extract the 'fullname [ANNOTATION]' portion from a compact line.
+
+    New format is '%shortguid<TAB>fullname [ANNOTATION]'. This helper
+    keeps the assertions in this test module readable without scattering
+    the split logic everywhere.
+    """
+    return line.split("\t", 1)[1] if "\t" in line else line
+
+
 class TestListAccounts:
     """Tests for list_accounts method."""
 
@@ -2671,8 +2681,12 @@ class TestListAccounts:
         result = gc_book.list_accounts()
 
         lines = result.strip().split("\n")
-        # Extract fullname (before any annotation bracket)
-        names = [line.split(" [")[0] for line in lines]
+        # Extract fullname (before any annotation bracket); skip past
+        # the '%shortguid<TAB>' prefix introduced by short GUIDs.
+        names = [
+            _path_from_compact_line(line).split(" [")[0]
+            for line in lines
+        ]
         assert names == sorted(names)
 
     def test_list_accounts_structure_verbose(self, test_book: Path):
@@ -2694,33 +2708,33 @@ class TestListAccounts:
         """Non-obvious types should be annotated, obvious ones not."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts()
-        lines = result.strip().split("\n")
+        # Compare on the path-portion of each line (strip the
+        # '%shortguid<TAB>' prefix).
+        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")]
 
         # Assets:Checking is BANK (not default ASSET) → annotated
-        checking = [l for l in lines if l.startswith("Assets:Checking")][0]
+        checking = [p for p in paths if p.startswith("Assets:Checking")][0]
         assert "[BANK]" in checking
 
         # Expenses:Groceries is EXPENSE (default under Expenses) → no annotation
-        groceries = [l for l in lines if l.startswith("Expenses:Groceries")][0]
+        groceries = [p for p in paths if p.startswith("Expenses:Groceries")][0]
         assert "[" not in groceries
 
         # Income:Salary is INCOME (default under Income) → no annotation
-        salary = [l for l in lines if l.startswith("Income:Salary")][0]
+        salary = [p for p in paths if p.startswith("Income:Salary")][0]
         assert "[" not in salary
 
     def test_compact_placeholder(self, test_book: Path):
         """Placeholder accounts should be annotated."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts()
-        lines = result.strip().split("\n")
+        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")]
 
         # "Assets" is ASSET (default) + placeholder → [PLACEHOLDER]
-        assets_line = [l for l in lines if l == "Assets [PLACEHOLDER]"]
-        assert len(assets_line) == 1
+        assert "Assets [PLACEHOLDER]" in paths
 
         # "Expenses" is EXPENSE (default) + placeholder → [PLACEHOLDER]
-        expenses_line = [l for l in lines if l == "Expenses [PLACEHOLDER]"]
-        assert len(expenses_line) == 1
+        assert "Expenses [PLACEHOLDER]" in paths
 
     def test_verbose_mode(self, test_book: Path):
         """compact=False should return list of dicts (old behavior)."""
@@ -2737,11 +2751,11 @@ class TestListAccounts:
         """root parameter should filter to a subtree."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts(root="Expenses")
-        lines = result.strip().split("\n")
+        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")]
 
-        for line in lines:
-            assert line.startswith("Expenses")
-        assert any("Expenses:Groceries" in l for l in lines)
+        for path in paths:
+            assert path.startswith("Expenses")
+        assert any("Expenses:Groceries" in p for p in paths)
 
     def test_root_filter_verbose(self, test_book: Path):
         """root + compact=False should return filtered dicts."""
@@ -2768,9 +2782,13 @@ class TestListAccounts:
         """root account itself should be included in results."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts(root="Expenses")
-        lines = result.strip().split("\n")
-        assert any(l.startswith("Expenses") and ":" not in l.split(" [")[0]
-                   for l in lines)
+        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")]
+        # The root itself appears as 'Expenses [PLACEHOLDER]' (or similar)
+        # — i.e., a path-portion with no ':' separator before any annotation.
+        assert any(
+            p.startswith("Expenses") and ":" not in p.split(" [")[0]
+            for p in paths
+        )
 
 
 class TestGetAccount:
@@ -2792,6 +2810,312 @@ class TestGetAccount:
         account = gc_book.get_account("Nonexistent:Account")
 
         assert account is None
+
+
+class TestShortAccountGuids:
+    """Tests for the short-guid format ('%XXXXXXX') and the helpers
+    that generate / resolve it. The short form replaces verbose
+    account paths in tool I/O — e.g., the LLM reads 'Assets:Current
+    Assets:Savings Account' once from list_accounts output and
+    re-references it as '%abcdef0' on every subsequent call.
+    """
+
+    def test_short_guid_format(self, test_book: Path):
+        """Short GUIDs start with '%' and have 7+ hex chars after."""
+        import re
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, "Assets:Checking")
+            short = gc_book._account_short_guid(book, account)
+        assert short.startswith("%")
+        # 7-char minimum hex after the '%' marker.
+        assert re.fullmatch(r"%[0-9a-f]{7,32}", short)
+
+    def test_short_guid_matches_full_guid_prefix(self, test_book: Path):
+        """The hex after '%' is a true prefix of the full GUID."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, "Assets:Checking")
+            full_guid = account.guid
+            short = gc_book._account_short_guid(book, account)
+        suffix = short[1:]  # strip '%'
+        assert full_guid.startswith(suffix)
+
+    def test_short_guid_map_covers_all_accounts(self, test_book: Path):
+        """The batch map maps every account.guid to a '%' short form."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account_guids = {a.guid for a in book.accounts}
+            short_map = gc_book._account_short_guid_map(book)
+        assert set(short_map.keys()) == account_guids
+        assert all(v.startswith("%") for v in short_map.values())
+        # Short forms must be unique across the book.
+        assert len(set(short_map.values())) == len(short_map)
+
+    def test_short_guid_unique_within_book(self, test_book: Path):
+        """No two accounts get the same '%shortguid'."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            shorts = []
+            for account in book.accounts:
+                shorts.append(gc_book._account_short_guid(book, account))
+        assert len(set(shorts)) == len(shorts)
+
+
+class TestResolveAccount:
+    """Tests for _resolve_account — the universal handle that takes a
+    path, a '%short' GUID, or a full 32-char GUID and returns the
+    matching Account. This is the chokepoint that lets every tool
+    accept any of the three forms transparently.
+    """
+
+    def test_resolve_by_path(self, test_book: Path):
+        """Path input works the same as _find_account."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._resolve_account(book, "Assets:Checking")
+            assert account is not None
+            assert account.fullname == "Assets:Checking"
+
+    def test_resolve_by_short_guid(self, test_book: Path):
+        """A '%XXXXXXX' short form resolves back to the same account."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            checking = gc_book._find_account(book, "Assets:Checking")
+            short = gc_book._account_short_guid(book, checking)
+            resolved = gc_book._resolve_account(book, short)
+            assert resolved is not None
+            assert resolved.guid == checking.guid
+
+    def test_resolve_by_full_guid(self, test_book: Path):
+        """A 32-char full GUID resolves directly."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            checking = gc_book._find_account(book, "Assets:Checking")
+            resolved = gc_book._resolve_account(book, checking.guid)
+            assert resolved is not None
+            assert resolved.guid == checking.guid
+
+    def test_resolve_unknown_path_returns_none(self, test_book: Path):
+        """Unknown path returns None (not raise)."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            assert gc_book._resolve_account(book, "Nope:Nada") is None
+
+    def test_resolve_unmatched_short_guid_returns_none(
+        self, test_book: Path
+    ):
+        """A well-formed short GUID with no match returns None."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            # 'deadbe0' is well-formed (7 hex) but unlikely to match.
+            assert gc_book._resolve_account(book, "%deadbe0") is None
+
+    def test_resolve_short_guid_too_short_raises(self, test_book: Path):
+        """Short GUIDs with fewer than 7 hex chars raise ValueError."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            with pytest.raises(ValueError, match="too short"):
+                gc_book._resolve_account(book, "%abc")
+
+    def test_resolve_short_guid_non_hex_raises(self, test_book: Path):
+        """Non-hex characters after '%' raise ValueError."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            with pytest.raises(ValueError, match="non-hex"):
+                gc_book._resolve_account(book, "%xyz1234")
+
+    def test_list_accounts_emits_short_guids(self, test_book: Path):
+        """Compact list_accounts output: '%shortguid<TAB>fullname [ANN]'."""
+        import re
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        for line in result.strip().split("\n"):
+            # '%' + 7+ hex + TAB + non-empty path
+            assert re.match(r"^%[0-9a-f]{7,32}\t\S", line), (
+                f"unexpected line shape: {line!r}"
+            )
+
+    def test_list_accounts_short_guids_resolve_back(
+        self, test_book: Path
+    ):
+        """Round-trip: every short GUID emitted by list_accounts must
+        resolve back to the account whose path appears on the same line.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts()
+        with gc_book.open(readonly=True) as book:
+            for line in result.strip().split("\n"):
+                short, rest = line.split("\t", 1)
+                # Path is everything before the optional " [ANN]" suffix.
+                path = rest.split(" [", 1)[0]
+                resolved = gc_book._resolve_account(book, short)
+                assert resolved is not None, (
+                    f"short {short!r} from list_accounts did not resolve"
+                )
+                assert resolved.fullname == path
+
+
+class TestShortGuidEndToEnd:
+    """Each book method that takes an account ref now flows through
+    ``_resolve_account``, so short GUIDs ('%XXXXXXX') and full GUIDs
+    work interchangeably with the original full-path form.
+
+    These tests cover one representative method per mixin to lock in
+    that the wiring is plumbed through end-to-end. Unit-level coverage
+    of the resolver itself lives in ``TestResolveAccount``; this class
+    is the integration sweep.
+    """
+
+    @staticmethod
+    def _short_for(gc_book, fullname: str) -> str:
+        """Resolve a fullname into the '%shortguid' a tool would receive."""
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, fullname)
+            return gc_book._account_short_guid(book, account)
+
+    # --- core ---
+
+    def test_get_balance_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        # Same answer the path-form returns.
+        assert gc_book.get_balance(short) == gc_book.get_balance("Assets:Checking")
+
+    def test_get_account_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_account(short)
+        assert result is not None
+        assert result["fullname"] == "Assets:Checking"
+
+    def test_list_transactions_filter_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.list_transactions(account=short)
+        by_path = gc_book.list_transactions(account="Assets:Checking")
+        assert by_short == by_path
+
+    def test_create_transaction_split_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short_check = self._short_for(gc_book, "Assets:Checking")
+        short_dining = self._short_for(gc_book, "Expenses:Groceries")
+        baseline = gc_book.get_balance("Assets:Checking")
+        gc_book.create_transaction(
+            description="Lunch (split via short GUIDs)",
+            splits=[
+                {"account": short_check, "amount": "-12.50"},
+                {"account": short_dining, "amount": "12.50"},
+            ],
+            check_duplicates=False,
+        )
+        # Posted: balance drops by 12.50 in checking.
+        assert gc_book.get_balance("Assets:Checking") == baseline - Decimal("12.50")
+
+    def test_update_account_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Expenses:Groceries")
+        gc_book.update_account(name=short, description="Renamed via short GUID")
+        # Path lookup confirms the side effect.
+        result = gc_book.get_account("Expenses:Groceries")
+        assert result["description"] == "Renamed via short GUID"
+
+    # --- list_accounts root= ---
+
+    def test_list_accounts_root_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Expenses")
+        by_short = gc_book.list_accounts(root=short)
+        by_path = gc_book.list_accounts(root="Expenses")
+        assert by_short == by_path
+
+    # --- reporting ---
+
+    def test_cash_flow_account_filter_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account=short,
+        )
+        by_path = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account="Assets:Checking",
+        )
+        assert by_short == by_path
+
+    # --- admin (slot CRUD) ---
+
+    def test_set_account_slot_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        gc_book.set_account_slot(short, "color", "blue")
+        # Round-trip through path-form to confirm storage. The book
+        # method returns ``{"account": ..., "slots": {...}}`` — the
+        # nested ``slots`` dict is what we're verifying.
+        result = gc_book.get_account_slots("Assets:Checking")
+        assert result["slots"].get("color") == "blue"
+
+    # --- reconciliation ---
+
+    def test_get_unreconciled_splits_via_short_guid(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        by_short = gc_book.get_unreconciled_splits(short)
+        by_path = gc_book.get_unreconciled_splits("Assets:Checking")
+        assert by_short == by_path
+
+    def test_full_guid_also_works(self, test_book: Path):
+        """The third input form (32-char full GUID) round-trips too."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, "Assets:Checking")
+            full_guid = account.guid
+        assert gc_book.get_balance(full_guid) == gc_book.get_balance("Assets:Checking")
+
+
+class TestCanonicalAccountEcho:
+    """Every tool that echoes an account back in its response must
+    return the canonical full path — not the raw input string. The
+    caller passes ``%2e78c86`` and gets back ``Assets:Current Assets:
+    Savings Account``, which is more informative AND keeps the
+    contract uniform across the tool surface.
+
+    Locks the design so a future refactor can't regress to "echo
+    whatever came in." Bookkeeper-driven: the inconsistency between
+    get_balance (was echoing input) and replace_splits (always
+    canonical) was the trigger for this contract.
+    """
+
+    @staticmethod
+    def _short_for(gc_book, fullname: str) -> str:
+        with gc_book.open(readonly=True) as book:
+            account = gc_book._find_account(book, fullname)
+            return gc_book._account_short_guid(book, account)
+
+    def test_get_account_slots_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_account_slots(account_name=short)
+        assert result["account"] == "Assets:Checking"
+
+    def test_get_unreconciled_splits_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.get_unreconciled_splits(account_name=short, compact=False)
+        assert result["account"] == "Assets:Checking"
+
+    def test_cash_flow_echoes_canonical(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        short = self._short_for(gc_book, "Assets:Checking")
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account=short,
+        )
+        assert result["account"] == "Assets:Checking"
 
 
 class TestTemplateAccountsHidden:

@@ -1307,7 +1307,7 @@ class BusinessMixin:
                     f"Cannot add entries to posted invoices."
                 )
 
-            acct = self._find_account(book, account)
+            acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
@@ -1409,7 +1409,7 @@ class BusinessMixin:
                     f"Cannot add entries to posted bills."
                 )
 
-            acct = self._find_account(book, account)
+            acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
@@ -1639,7 +1639,7 @@ class BusinessMixin:
             # uses the same predicate; using it upstream for the
             # lookup eliminates the collision class entirely.
             if ot is None:
-                pa = self._find_account(book, post_account)
+                pa = self._resolve_account(book, post_account)
                 if pa is not None:
                     if pa.type == "RECEIVABLE":
                         ot = 2
@@ -1673,7 +1673,7 @@ class BusinessMixin:
 
             is_bill = inv.owner_type == 4
 
-            post_acct = self._find_account(book, post_account)
+            post_acct = self._resolve_account(book, post_account)
             if not post_acct:
                 raise ValueError(
                     f"Account not found: {post_account}"
@@ -1906,7 +1906,7 @@ class BusinessMixin:
 
             is_bill = inv.owner_type == 4
 
-            pay_acct = self._find_account(book, payment_account)
+            pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
                 raise ValueError(
                     f"Account not found: {payment_account}"

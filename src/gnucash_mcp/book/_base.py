@@ -694,20 +694,28 @@ class BaseGnuCashBook:
         self._audit_tls.before_state = None
         return state
 
-    def _resolve_guid(self, table: str, partial: str) -> str:
+    def _resolve_guid(
+        self, table: str, partial: str, min_len: int = 8
+    ) -> str:
         """Resolve a partial GUID prefix to a full 32-character GUID.
 
-        Validates the input (length 8..32, hex characters only) before
-        touching the database — malformed inputs raise immediately rather
-        than round-tripping through SQLite to discover they don't match
-        anything. Uppercase hex is accepted and normalized to lowercase.
+        Validates the input (length min_len..32, hex characters only)
+        before touching the database — malformed inputs raise
+        immediately rather than round-tripping through SQLite to
+        discover they don't match anything. Uppercase hex is accepted
+        and normalized to lowercase.
 
         Uses raw SQLite in read-only mode — no piecash session needed.
 
         Args:
             table: Database table name (e.g., "transactions", "splits").
-            partial: Full or partial GUID. 8..32 hex characters
+            partial: Full or partial GUID. ``min_len``..32 hex characters
                      (case-insensitive on input, stored as lowercase).
+            min_len: Minimum acceptable prefix length. Defaults to 8 for
+                     transactions/splits/etc. The accounts table uses
+                     7 (paired with the ``%`` short-guid prefix in tool
+                     I/O) — only ~1k accounts in a typical book, so
+                     birthday collisions at 7 hex chars are below 0.2%.
 
         Returns:
             Full 32-character lowercase-hex GUID.
@@ -721,9 +729,9 @@ class BaseGnuCashBook:
             raise ValueError(f"Invalid table: {table}")
 
         n = len(partial)
-        if n < 8:
+        if n < min_len:
             raise ValueError(
-                f"GUID prefix too short (minimum 8 chars): {partial!r}"
+                f"GUID prefix too short (minimum {min_len} chars): {partial!r}"
             )
         if n > 32:
             raise ValueError(
@@ -816,6 +824,11 @@ class BaseGnuCashBook:
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
         """Find an account by its full name path.
 
+        Path-only lookup. For user-supplied input (which may be a path,
+        ``%short`` GUID, or full GUID), call :meth:`_resolve_account`
+        instead. This method is the path-lookup leaf that
+        ``_resolve_account`` falls through to.
+
         Scheduled-transaction template accounts (under
         ``book.root_template``) are never returned — they're GnuCash
         internals, not part of the user's chart of accounts. Callers
@@ -832,6 +845,108 @@ class BaseGnuCashBook:
             if account.fullname == fullname:
                 return account
         return None
+
+    # ── Short account GUIDs ───────────────────────────────────────────
+    #
+    # A book typically holds ~10²–10³ accounts but ~10⁴–10⁵ transactions.
+    # Account paths like "Assets:Current Assets:Savings Account" are
+    # stable and human-readable but verbose — every tool call repeats
+    # them. The short GUID format is "%XXXXXXX" (a literal "%" followed
+    # by ≥7 hex chars), small enough to be cheap on the wire while still
+    # collision-safe under the birthday problem at typical chart sizes.
+    #
+    # The "%" prefix is significant. It distinguishes short GUIDs from:
+    #   - account paths (which can contain ":", letters, spaces — but
+    #     never start with "%" by convention)
+    #   - transaction GUID prefixes (raw 8+ hex with no marker)
+    #
+    # Tools that accept account references should call _resolve_account,
+    # which understands all three input shapes (path, %short, full GUID)
+    # and returns an Account or None.
+
+    _SHORT_ACCOUNT_GUID_PREFIX = "%"
+    _SHORT_ACCOUNT_GUID_MIN_LEN = 7
+
+    def _account_short_guid(
+        self, book: piecash.Book, account: piecash.Account
+    ) -> str:
+        """Return a collision-safe short GUID for ``account``.
+
+        Format: ``"%" + 7+ hex chars``. The hex suffix is the shortest
+        prefix of ``account.guid`` unique among all account GUIDs in
+        the book (≥ 7). Most accounts get exactly 7; only collisions
+        push out further, per :func:`_unique_prefix`.
+
+        Use this for compact emit. To go the other direction (resolve
+        a short or path back to an Account), call :meth:`_resolve_account`.
+        """
+        siblings = (a.guid for a in book.accounts)
+        suffix = _unique_prefix(
+            account.guid, siblings, min_len=self._SHORT_ACCOUNT_GUID_MIN_LEN
+        )
+        return self._SHORT_ACCOUNT_GUID_PREFIX + suffix
+
+    def _account_short_guid_map(
+        self, book: piecash.Book
+    ) -> dict[str, str]:
+        """Map every account.guid → '%shortguid' for batch rendering.
+
+        Cheaper than calling :meth:`_account_short_guid` once per account
+        when emitting multiple lines (e.g., ``list_accounts``). Single
+        sort + linear pass via :func:`_guid_prefix_map`.
+        """
+        guids = [a.guid for a in book.accounts]
+        raw = _guid_prefix_map(
+            guids, min_len=self._SHORT_ACCOUNT_GUID_MIN_LEN
+        )
+        return {g: self._SHORT_ACCOUNT_GUID_PREFIX + p for g, p in raw.items()}
+
+    def _resolve_account(
+        self, book: piecash.Book, ref: str
+    ) -> piecash.Account | None:
+        """Resolve a path, ``%short``, or full 32-hex GUID to an Account.
+
+        Three input shapes:
+
+        1. ``"%XXXXXXX"`` (or longer) — short GUID. The "%" is stripped
+           and the rest is resolved via :meth:`_resolve_guid` (min 7 chars,
+           hex only). Ambiguous prefixes raise ``ValueError``.
+        2. 32-char hex string — full GUID, looked up directly.
+        3. anything else — treated as an account path (``Account.fullname``)
+           and dispatched to :meth:`_find_account`.
+
+        Returns ``None`` when the ref is well-formed but matches nothing.
+        Raises ``ValueError`` for malformed short GUIDs (non-hex, too
+        short) or ambiguous prefixes — the caller can catch and surface
+        a better error message.
+        """
+        if ref.startswith(self._SHORT_ACCOUNT_GUID_PREFIX):
+            suffix = ref[len(self._SHORT_ACCOUNT_GUID_PREFIX):]
+            try:
+                full_guid = self._resolve_guid(
+                    "accounts",
+                    suffix,
+                    min_len=self._SHORT_ACCOUNT_GUID_MIN_LEN,
+                )
+            except ValueError as e:
+                # No-match on a well-formed prefix degrades to None,
+                # mirroring _find_account's contract. Validation errors
+                # (too short, non-hex, ambiguous) propagate.
+                if "No account" in str(e):
+                    return None
+                raise
+            from piecash.core.account import Account
+            return book.session.query(Account).filter_by(guid=full_guid).first()
+
+        if len(ref) == 32 and _HEX_GUID_RE.fullmatch(ref):
+            from piecash.core.account import Account
+            return (
+                book.session.query(Account)
+                .filter_by(guid=ref.lower())
+                .first()
+            )
+
+        return self._find_account(book, ref)
 
     def _find_transaction(
         self, book: piecash.Book, guid: str
