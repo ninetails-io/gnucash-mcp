@@ -667,6 +667,103 @@ class TestCreateBill:
         with pytest.raises(ValueError, match="Vendor not found"):
             gb.create_bill(vendor_id="999999")
 
+    def test_auto_id_skips_existing_when_counter_drifted(
+        self, business_book,
+    ):
+        """When the book counter has drifted below the actual MAX
+        existing ID for the owner_type (e.g. historical documents
+        imported via raw SQL without bumping the counter), the
+        auto-id generator must scan the table and pick up where
+        the existing IDs leave off — never collide with an extant
+        row.
+
+        Regression for the bookkeeper's report on Alex's synthetic
+        book: 2025 bills sat at IDs 000006 / 000007 with the
+        counter still at zero, so a new 2026 ``create_bill``
+        auto-assigned 000006 — colliding with the 2025 row and
+        breaking every subsequent ``post_invoice`` / lookup."""
+        import uuid
+        from piecash.business.invoice import Invoice
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Old Vendor")
+        gb.create_vendor(name="New Vendor")
+        # Inject historical bills via raw SQL at IDs 000006 and
+        # 000007, leaving the book counter untouched (this
+        # simulates the synthetic-book import path).
+        with gb.open(readonly=False) as book:
+            old_vendor = gb._find_vendor(book, "000001")
+            usd = book.default_currency
+            for inv_id in ("000006", "000007"):
+                book.session.execute(
+                    Invoice.__table__.insert().values(
+                        guid=uuid.uuid4().hex,
+                        id=inv_id,
+                        date_opened=None,
+                        date_posted=None,
+                        notes="historical",
+                        active=1,
+                        currency=usd.guid,
+                        owner_type=4,
+                        owner_guid=old_vendor.guid,
+                        terms=None,
+                        billing_id="",
+                        post_txn=None,
+                        post_lot=None,
+                        post_acc=None,
+                        billto_type=0,
+                        billto_guid=None,
+                        charge_amt_num=0,
+                        charge_amt_denom=1,
+                    )
+                )
+            book.save()
+        # Auto-generated next bill must SKIP past 000006 / 000007.
+        result = gb.create_bill(vendor_id="000002")
+        assert result["id"] == "000008", (
+            f"Expected auto-id 000008 (skipping existing "
+            f"000006/000007), got {result['id']}"
+        )
+
+    def test_auto_id_skips_existing_for_invoices_too(
+        self, business_book,
+    ):
+        """Same scan-MAX behavior applies to customer invoices
+        (owner_type=2), not just bills. Symmetric fix on the
+        same code path."""
+        import uuid
+        from piecash.business.invoice import Invoice
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Old Customer")
+        gb.create_customer(name="New Customer")
+        with gb.open(readonly=False) as book:
+            old_customer = gb._find_customer(book, "000001")
+            usd = book.default_currency
+            book.session.execute(
+                Invoice.__table__.insert().values(
+                    guid=uuid.uuid4().hex,
+                    id="000005",
+                    date_opened=None,
+                    date_posted=None,
+                    notes="historical",
+                    active=1,
+                    currency=usd.guid,
+                    owner_type=2,
+                    owner_guid=old_customer.guid,
+                    terms=None,
+                    billing_id="",
+                    post_txn=None,
+                    post_lot=None,
+                    post_acc=None,
+                    billto_type=0,
+                    billto_guid=None,
+                    charge_amt_num=0,
+                    charge_amt_denom=1,
+                )
+            )
+            book.save()
+        result = gb.create_invoice(customer_id="000002")
+        assert result["id"] == "000006"
+
 
 class TestDeleteInvoice:
     """Tests for delete_invoice."""

@@ -1055,7 +1055,39 @@ class BusinessMixin:
                         f"'{doc_id}' already exists"
                     )
             else:
-                cnt = getattr(book, config["counter_attr"]) + 1
+                # Auto-generate the next document ID. The book
+                # counter (``counter_invoice`` / ``counter_bill``)
+                # SHOULD be the canonical source, but it can drift
+                # below the actual MAX(id) — e.g. when historical
+                # documents are imported via raw SQL without
+                # bumping the counter, or when the file was edited
+                # outside the MCP server's lifecycle. The
+                # bookkeeper hit this on Alex's synthetic book:
+                # 2025 bills sat at IDs 000006 / 000007 but the
+                # counter was lower, so a new 2026 ``create_bill``
+                # auto-assigned 000006 — colliding with the
+                # 2025 row and breaking every subsequent
+                # ``post_invoice`` / ``get_outstanding_invoices``
+                # lookup that resolved to the wrong record.
+                #
+                # Fix: take the max of (book counter, actual max
+                # numeric ID in the table for this owner_type) and
+                # use that + 1. Re-sync the book counter so the
+                # next auto-id picks up where this one left off.
+                # Non-numeric existing IDs (custom strings the
+                # user supplied) are skipped — they're irrelevant
+                # to numeric auto-numbering.
+                book_counter = getattr(book, config["counter_attr"])
+                existing_ids = book.session.query(Invoice.id).filter(
+                    Invoice.owner_type == owner_type
+                ).all()
+                max_numeric = 0
+                for (existing_id,) in existing_ids:
+                    try:
+                        max_numeric = max(max_numeric, int(existing_id))
+                    except (ValueError, TypeError):
+                        continue
+                cnt = max(book_counter, max_numeric) + 1
                 setattr(book, config["counter_attr"], cnt)
                 doc_id = f"{cnt:06d}"
 
