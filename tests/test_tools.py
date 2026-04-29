@@ -992,12 +992,21 @@ class TestSpendingByCategoryTool:
     """Tests for spending_by_category tool."""
 
     def test_spending_by_category(self, setup_book_env):
-        """Should return spending breakdown."""
+        """Compact (default) returns aligned text table."""
         result = server_module.spending_by_category(
             start_date="2024-01-01",
             end_date="2024-12-31",
         )
+        # New default is compact text — has TOTAL line.
+        assert "TOTAL" in result
 
+    def test_spending_by_category_verbose(self, setup_book_env):
+        """Verbose returns the structured dict."""
+        result = server_module.spending_by_category(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            verbose=True,
+        )
         data = json.loads(result)
         assert "total" in data
         assert "categories" in data
@@ -1007,12 +1016,20 @@ class TestIncomeBySourcTool:
     """Tests for income_by_source tool."""
 
     def test_income_by_source(self, setup_book_env):
-        """Should return income breakdown."""
+        """Compact (default) returns aligned text table."""
         result = server_module.income_by_source(
             start_date="2024-01-01",
             end_date="2024-12-31",
         )
+        assert "TOTAL" in result
 
+    def test_income_by_source_verbose(self, setup_book_env):
+        """Verbose returns the structured dict."""
+        result = server_module.income_by_source(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            verbose=True,
+        )
         data = json.loads(result)
         assert "total" in data
         assert "sources" in data

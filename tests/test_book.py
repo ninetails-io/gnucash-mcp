@@ -6585,7 +6585,7 @@ class TestSpendingByCategory:
         """Should return spending breakdown."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
         )
@@ -6599,7 +6599,7 @@ class TestSpendingByCategory:
         """Should return zero for period with no transactions."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2020, 1, 1),
             end_date=date(2020, 1, 31),
         )
@@ -6615,7 +6615,7 @@ class TestIncomeBySource:
         """Should return income breakdown."""
         gc_book = GnuCashBook(str(test_book))
 
-        result = gc_book.income_by_source(
+        result = gc_book.income_by_source(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
         )
@@ -6641,6 +6641,118 @@ class TestBalanceSheet:
         assert "equity" in result
         assert "total" in result["assets"]
         assert "accounts" in result["assets"]
+
+
+class TestBalanceSheetNumericContract:
+    """Phase 4B follow-up: bookkeeper flagged the totals leaking
+    Decimal precision (``"612011.489832"``) and the per-account
+    ``usd_value`` being unrounded for investments / redundant for
+    currency accounts. Lock the contract:
+
+    - All monetary outputs (totals + account values) are 2 decimals.
+    - Currency-default accounts have ``balance`` only, no ``usd_value``.
+    - Non-currency accounts have both, with ``usd_value`` rounded.
+    """
+
+    def test_section_totals_render_at_2_decimals(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        for section in ("assets", "liabilities", "equity"):
+            total = result[section]["total"]
+            # Currency-style: every total ends with exactly two decimal
+            # digits, no scientific notation, no precision noise.
+            assert "." in total, f"{section} total missing decimal: {total!r}"
+            assert len(total.split(".")[-1]) == 2, (
+                f"{section} total wrong precision: {total!r}"
+            )
+
+    def test_currency_accounts_have_no_usd_value_field(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        for row in result["assets"]["accounts"]:
+            # Test fixture is single-currency USD — every asset row
+            # is currency-default. None should carry ``usd_value``.
+            assert "usd_value" not in row, (
+                f"redundant usd_value on currency row: {row}"
+            )
+
+    def test_currency_account_balance_renders_at_2_decimals(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        for row in result["assets"]["accounts"]:
+            balance = row["balance"]
+            # Currency-default rows: pure numeric, 2 decimals always.
+            assert "." in balance
+            assert len(balance.split(".")[-1]) == 2, (
+                f"row {row['account']!r} balance wrong precision: {balance!r}"
+            )
+
+
+class TestCrossToolPriceAgreement:
+    """Bookkeeper-flagged: ``get_book_summary`` was using stale prices
+    (latest <= today) while ``balance_sheet`` used the absolute latest
+    (including the bookkeeper's intentional future-dated forecasts).
+    On Alex's book this produced a ~$5,300 gap across investment
+    valuations between the two surfaces.
+
+    Lock the contract: when the latest price for a commodity is
+    future-dated relative to today, both tools must use it. Past
+    trajectory anchors (1mo / 3mo / 6mo / 12mo ago) keep the
+    historical-reconstruction filter via ``_rates_as_of``.
+    """
+
+    def test_summary_and_balance_sheet_agree_on_latest_price(
+        self, multi_currency_book: Path,
+    ):
+        from datetime import date as date_cls, timedelta
+        import piecash
+
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Write a future-dated EUR/USD rate. Pre-fix, balance_sheet
+        # would use it (no filter) and get_book_summary would skip
+        # it (today filter), producing different EUR-account values.
+        future = date_cls.today() + timedelta(days=2)
+        with gc_book.open(readonly=False) as b:
+            usd = b.default_currency
+            eur = next(c for c in b.commodities if c.mnemonic == "EUR")
+            b.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=future,
+                value="1.50", source="user:test", type="nav",
+            ))
+            b.save()
+
+        # balance_sheet picks the future-dated rate at 1.50.
+        bs = gc_book.balance_sheet(as_of_date=date_cls.today())
+        eur_row = next(
+            a for a in bs["assets"]["accounts"]
+            if a["account"] == "Assets:Euro Savings"
+        )
+        # 1000 EUR × 1.50 = 1500 USD.
+        assert Decimal(eur_row["usd_value"]) == Decimal("1500.00")
+
+        # get_book_summary must agree: use the same future-dated rate
+        # for the per-account display AND for the trajectory "now"
+        # anchor. We verify by checking the rendered summary contains
+        # the future-rate-based number, not 1000 (cost basis) and not
+        # any earlier-rate-based fallback.
+        summary = gc_book.get_book_summary()
+        # Summary uses the future-dated rate of 1.5; resulting USD
+        # value is 1500. (Decimal stringification drops trailing zero
+        # on the rate, comma-formatting varies — assert the value.)
+        assert "USD 1500" in summary, (
+            f"summary did not pick up the future-dated EUR/USD rate; "
+            f"saw:\n{summary}"
+        )
+        assert "EUR @ 1.5" in summary
+        # Trajectory's "now" anchor should reflect the same rate too:
+        # 6700 USD Checking + 1500 USD Euro Savings = 8200.
+        assert "now: USD 8,200" in summary
 
 
 class TestNetWorth:
@@ -6990,16 +7102,25 @@ class TestMultiCurrencyBalances:
         to cost basis (split.value, in transaction currency) for the
         EUR account. The fixture's FX transfer booked value=1100 USD
         on the EUR side, so cost basis = $1,100.
+
+        Phase 4B (comms): currency-default accounts read their value
+        from ``balance``; non-default accounts have a parseable
+        ``usd_value`` alongside the human-readable triplet ``balance``.
+        ``usd_value`` is dropped for currency rows where it would just
+        repeat ``balance``.
         """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
-        asset_accounts = {
-            a["account"]: Decimal(a["balance"])
-            for a in result["assets"]["accounts"]
-        }
-        assert asset_accounts["Assets:Checking"] == Decimal("6700")
-        # Cost-basis fallback in the default currency
-        assert asset_accounts["Assets:Euro Savings"] == Decimal("1100")
+        accounts = {a["account"]: a for a in result["assets"]["accounts"]}
+        # Currency account: numeric in ``balance``, no ``usd_value``.
+        checking = accounts["Assets:Checking"]
+        assert Decimal(checking["balance"]) == Decimal("6700.00")
+        assert "usd_value" not in checking
+        # Non-currency: ``usd_value`` for parsing, ``balance`` for display.
+        eur = accounts["Assets:Euro Savings"]
+        assert Decimal(eur["usd_value"]) == Decimal("1100.00")
+        assert "EUR" in eur["balance"]
+        assert "no price data" in eur["balance"]
 
     def test_balance_sheet_values_foreign_currency_at_market_with_price(
         self, multi_currency_book: Path
@@ -7022,11 +7143,16 @@ class TestMultiCurrencyBalances:
             b.save()
 
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
-        asset_accounts = {
-            a["account"]: Decimal(a["balance"])
-            for a in result["assets"]["accounts"]
-        }
-        assert asset_accounts["Assets:Euro Savings"] == Decimal("1200")
+        eur_row = next(
+            a for a in result["assets"]["accounts"]
+            if a["account"] == "Assets:Euro Savings"
+        )
+        # Non-currency row: ``usd_value`` is parseable + rounded.
+        assert Decimal(eur_row["usd_value"]) == Decimal("1200.00")
+        # Phase 4B: human-readable balance shows shares + rate + USD.
+        assert "EUR" in eur_row["balance"]
+        assert "@" in eur_row["balance"]
+        assert "USD" in eur_row["balance"]
 
     def test_net_worth_converts_foreign_currency(
         self, multi_currency_book: Path
@@ -7064,7 +7190,7 @@ class TestMultiCurrencyBalances:
     def test_spending_by_category_uses_quantity(self, multi_currency_book: Path):
         """Expense reporting should use quantity."""
         gc_book = GnuCashBook(str(multi_currency_book))
-        result = gc_book.spending_by_category(
+        result = gc_book.spending_by_category(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             depth=2,
@@ -7076,7 +7202,7 @@ class TestMultiCurrencyBalances:
     def test_income_by_source_uses_quantity(self, multi_currency_book: Path):
         """Income reporting should use quantity."""
         gc_book = GnuCashBook(str(multi_currency_book))
-        result = gc_book.income_by_source(
+        result = gc_book.income_by_source(compact=False,
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
             depth=2,

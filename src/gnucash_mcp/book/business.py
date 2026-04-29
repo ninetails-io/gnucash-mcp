@@ -61,6 +61,72 @@ def _is_invoice_posted(inv) -> bool:
     return _safe_date_posted(inv) is not None
 
 
+def _format_vendor_spending_compact(
+    vendors_list: list[dict],
+    *,
+    grand_billed: Decimal,
+    grand_paid: Decimal,
+    grand_outstanding: Decimal,
+) -> str:
+    """Render vendor-spending breakdown as a compact aligned text table.
+
+    Format::
+
+        BookkeepingCo  4 bills  $1,800 billed  $1,800 paid  $0 outstanding
+        JetBrains      1 bill     $289 billed    $289 paid  $0 outstanding
+        TOTAL          5 bills  $2,089 billed  $2,089 paid  $0 outstanding
+
+    "1 bill" vs "N bills" pluralization keeps the line natural to read.
+    Width-padded so the four amount columns align across rows.
+    """
+    if not vendors_list:
+        return "No vendor activity in period."
+
+    # Single-pass widths.
+    name_width = max(len(v["vendor_name"]) for v in vendors_list)
+    bills_strs = [
+        f"{v['bill_count']} {'bill' if v['bill_count'] == 1 else 'bills'}"
+        for v in vendors_list
+    ]
+    bills_width = max(len(s) for s in bills_strs)
+
+    def _money(s: str) -> str:
+        d = Decimal(s)
+        if d == d.to_integral_value():
+            return f"${int(d):,}"
+        return f"${d:,.2f}"
+
+    billed_strs = [_money(v["total_billed"]) for v in vendors_list]
+    paid_strs = [_money(v["total_paid"]) for v in vendors_list]
+    out_strs = [_money(v["outstanding"]) for v in vendors_list]
+    billed_w = max(len(s) for s in billed_strs)
+    paid_w = max(len(s) for s in paid_strs)
+    out_w = max(len(s) for s in out_strs)
+
+    lines = []
+    for v, bills, billed, paid, out in zip(
+        vendors_list, bills_strs, billed_strs, paid_strs, out_strs,
+    ):
+        lines.append(
+            f"{v['vendor_name']:<{name_width}}  "
+            f"{bills:<{bills_width}}  "
+            f"{billed:>{billed_w}} billed  "
+            f"{paid:>{paid_w}} paid  "
+            f"{out:>{out_w}} outstanding"
+        )
+
+    total_bill_count = sum(v["bill_count"] for v in vendors_list)
+    total_label = f"{total_bill_count} {'bill' if total_bill_count == 1 else 'bills'}"
+    lines.append(
+        f"{'TOTAL':<{name_width}}  "
+        f"{total_label:<{bills_width}}  "
+        f"{_money(str(grand_billed)):>{billed_w}} billed  "
+        f"{_money(str(grand_paid)):>{paid_w}} paid  "
+        f"{_money(str(grand_outstanding)):>{out_w}} outstanding"
+    )
+    return "\n".join(lines)
+
+
 def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     """Render outstanding invoices/bills as a one-line-per-doc string.
 
@@ -2850,7 +2916,8 @@ class BusinessMixin:
         start_date: str,
         end_date: str,
         vendor_id: str | None = None,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get spending breakdown by vendor for a period.
 
         Analyzes posted vendor bills to show total billed, paid,
@@ -2860,9 +2927,16 @@ class BusinessMixin:
             start_date: Start of period (YYYY-MM-DD).
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to specific vendor.
+            compact: If True (default), return an aligned text table
+                     suitable for direct LLM consumption (Phase 4D).
+                     Verbose mode returns the structured dict.
 
         Returns:
-            Dict with per-vendor breakdown and grand totals.
+            If compact: text table (one line per vendor + TOTAL).
+            If not compact: dict with vendor breakdown and grand totals.
+            The Phase 4D spec dropped the ``period`` echo (it duplicated
+            input the caller already has); verbose mode no longer
+            includes it either.
         """
         from piecash.business.invoice import Invoice
 
@@ -2975,11 +3049,7 @@ class BusinessMixin:
                 reverse=True,
             )
 
-        return {
-            "period": {
-                "start": start_date,
-                "end": end_date,
-            },
+        full = {
             "vendors": vendors_list,
             "totals": {
                 "total_billed": str(grand_billed),
@@ -2991,3 +3061,13 @@ class BusinessMixin:
                 ),
             },
         }
+
+        if not compact:
+            return full
+
+        return _format_vendor_spending_compact(
+            vendors_list,
+            grand_billed=grand_billed,
+            grand_paid=grand_paid,
+            grand_outstanding=grand_outstanding,
+        )
