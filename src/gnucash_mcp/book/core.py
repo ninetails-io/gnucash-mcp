@@ -295,7 +295,17 @@ class CoreMixin:
         of the canonical assets_total − liabilities_total formula.
         """
         template_guids = self._template_account_guids(book)
-        rates = self._rates_as_of(book, as_of, default_currency)
+        # "Now" anchors (as_of >= today) use the absolute latest price
+        # on file — including any future-dated forecasts the bookkeeper
+        # has deliberately written. Past anchors filter to prices
+        # observed by the anchor date (historical reconstruction).
+        # See the comment in get_book_summary's inline price loop for
+        # the rationale; both paths converge on this behavior so the
+        # "now" anchor agrees with balance_sheet by construction.
+        if as_of >= date.today():
+            rates = self._latest_market_rates(book)
+        else:
+            rates = self._rates_as_of(book, as_of, default_currency)
 
         # is_leaf: an account with no children. Compute the parent
         # set once and check membership per account.
@@ -1335,16 +1345,23 @@ class CoreMixin:
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
-            # All balances and price lookups in this summary are
-            # computed as-of-today. Trajectory's "now" anchor uses
-            # the same cutoff (via ``_compute_net_worth_at(today)``
-            # and ``_rates_as_of(today)``), so the displayed Assets
-            # / Liabilities totals agree with trajectory's "now"
-            # by construction. Without this filter, future-dated
-            # transactions or prices in the book would skew the
-            # current snapshot — bookkeeper hit this on Alex's
-            # book where 34 days of data past today produced a
-            # $2,906 gap between Assets-Liabilities and trajectory.
+            # Balances are computed as-of-today: future-dated
+            # transactions are excluded so the displayed Assets /
+            # Liabilities totals agree with trajectory's "now" by
+            # construction. Without this filter, future-dated
+            # transactions in the book would skew the current
+            # snapshot — bookkeeper hit this on Alex's book where
+            # 34 days of data past today produced a $2,906 gap
+            # between Assets-Liabilities and trajectory.
+            #
+            # Prices are NOT today-filtered. The bookkeeper writes
+            # future-dated yfinance close prices intentionally as
+            # forecasts the displays should track; balance_sheet
+            # uses the absolute latest, and this summary now
+            # matches by construction. ``_compute_net_worth_at``
+            # (above) special-cases ``as_of >= today`` to use the
+            # same all-prices lookup so the trajectory "now"
+            # anchor agrees here too.
             today = date.today()
 
             # Identify template accounts (scheduled-transaction scaffolding).
@@ -1361,29 +1378,14 @@ class CoreMixin:
                     parent_guids.add(account.parent.guid)
 
             # --- Latest-price lookup for non-default-currency commodities ---
-            # Precompute once to avoid O(N*M) when many investment accounts
-            # share a small commodity set. Skip piecash's auto-created
-            # type='transaction' prices (they capture the effective rate of
-            # a cross-currency txn; we want user-supplied market prices).
-            latest_prices: dict[str, Decimal] = {}
-            for p in book.prices:
-                if p.currency != default_currency:
-                    continue
-                if p.type == "transaction":
-                    continue
-                p_date = p.date
-                if hasattr(p_date, "date") and callable(p_date.date):
-                    p_date = p_date.date()
-                if p_date > today:
-                    # Future-dated prices excluded so _market_value
-                    # agrees with trajectory's _rates_as_of(today)
-                    # by construction.
-                    continue
-                key = p.commodity.guid
-                existing = latest_prices.get(key + ":date")
-                if existing is None or p_date > existing:
-                    latest_prices[key + ":date"] = p_date
-                    latest_prices[key] = Decimal(str(p.value))
+            # Use the same shared helper balance_sheet uses, so the
+            # two surfaces agree on which price is "current" for
+            # every commodity — including the bookkeeper's
+            # intentional future-dated yfinance forecast entries.
+            # Helper already excludes piecash auto-created
+            # ``type='transaction'`` prices (cross-currency
+            # placeholders, not market quotes).
+            latest_prices: dict[str, Decimal] = self._latest_market_rates(book)
 
             def _market_value(account, quantity: Decimal) -> tuple[Decimal, str | None]:
                 """Return (USD value, note) for an account's quantity.

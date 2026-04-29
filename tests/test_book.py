@@ -6692,6 +6692,69 @@ class TestBalanceSheetNumericContract:
             )
 
 
+class TestCrossToolPriceAgreement:
+    """Bookkeeper-flagged: ``get_book_summary`` was using stale prices
+    (latest <= today) while ``balance_sheet`` used the absolute latest
+    (including the bookkeeper's intentional future-dated forecasts).
+    On Alex's book this produced a ~$5,300 gap across investment
+    valuations between the two surfaces.
+
+    Lock the contract: when the latest price for a commodity is
+    future-dated relative to today, both tools must use it. Past
+    trajectory anchors (1mo / 3mo / 6mo / 12mo ago) keep the
+    historical-reconstruction filter via ``_rates_as_of``.
+    """
+
+    def test_summary_and_balance_sheet_agree_on_latest_price(
+        self, multi_currency_book: Path,
+    ):
+        from datetime import date as date_cls, timedelta
+        import piecash
+
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Write a future-dated EUR/USD rate. Pre-fix, balance_sheet
+        # would use it (no filter) and get_book_summary would skip
+        # it (today filter), producing different EUR-account values.
+        future = date_cls.today() + timedelta(days=2)
+        with gc_book.open(readonly=False) as b:
+            usd = b.default_currency
+            eur = next(c for c in b.commodities if c.mnemonic == "EUR")
+            b.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=future,
+                value="1.50", source="user:test", type="nav",
+            ))
+            b.save()
+
+        # balance_sheet picks the future-dated rate at 1.50.
+        bs = gc_book.balance_sheet(as_of_date=date_cls.today())
+        eur_row = next(
+            a for a in bs["assets"]["accounts"]
+            if a["account"] == "Assets:Euro Savings"
+        )
+        # 1000 EUR × 1.50 = 1500 USD.
+        assert Decimal(eur_row["usd_value"]) == Decimal("1500.00")
+
+        # get_book_summary must agree: use the same future-dated rate
+        # for the per-account display AND for the trajectory "now"
+        # anchor. We verify by checking the rendered summary contains
+        # the future-rate-based number, not 1000 (cost basis) and not
+        # any earlier-rate-based fallback.
+        summary = gc_book.get_book_summary()
+        # Summary uses the future-dated rate of 1.5; resulting USD
+        # value is 1500. (Decimal stringification drops trailing zero
+        # on the rate, comma-formatting varies — assert the value.)
+        assert "USD 1500" in summary, (
+            f"summary did not pick up the future-dated EUR/USD rate; "
+            f"saw:\n{summary}"
+        )
+        assert "EUR @ 1.5" in summary
+        # Trajectory's "now" anchor should reflect the same rate too:
+        # 6700 USD Checking + 1500 USD Euro Savings = 8200.
+        assert "now: USD 8,200" in summary
+
+
 class TestNetWorth:
     """Tests for net_worth method."""
 
