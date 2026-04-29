@@ -6666,16 +6666,18 @@ class TestBalanceSheetNumericContract:
                 f"{section} total wrong precision: {total!r}"
             )
 
-    def test_currency_accounts_have_no_usd_value_field(
+    def test_currency_accounts_have_no_default_currency_value_field(
         self, test_book: Path,
     ):
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
         for row in result["assets"]["accounts"]:
             # Test fixture is single-currency USD — every asset row
-            # is currency-default. None should carry ``usd_value``.
-            assert "usd_value" not in row, (
-                f"redundant usd_value on currency row: {row}"
+            # is currency-default. None should carry the
+            # ``default_currency_value`` field (it would just repeat
+            # ``balance``).
+            assert "default_currency_value" not in row, (
+                f"redundant value field on currency row: {row}"
             )
 
     def test_currency_account_balance_renders_at_2_decimals(
@@ -6734,7 +6736,7 @@ class TestCrossToolPriceAgreement:
             if a["account"] == "Assets:Euro Savings"
         )
         # 1000 EUR × 1.50 = 1500 USD.
-        assert Decimal(eur_row["usd_value"]) == Decimal("1500.00")
+        assert Decimal(eur_row["default_currency_value"]) == Decimal("1500.00")
 
         # get_book_summary must agree: use the same future-dated rate
         # for the per-account display AND for the trajectory "now"
@@ -6753,6 +6755,253 @@ class TestCrossToolPriceAgreement:
         # Trajectory's "now" anchor should reflect the same rate too:
         # 6700 USD Checking + 1500 USD Euro Savings = 8200.
         assert "now: USD 8,200" in summary
+
+
+class TestNonUsdDefaultCurrency:
+    """Bookkeeper-flagged: every compact-mode formatter that emits
+    money-prefixed strings was hardcoding ``$`` / ``USD``. On a
+    non-USD-default book that's a lie at every reporting surface
+    — debt_payoff_plan would render kill-order rows as
+    ``$13,091`` when the book is in CNY (¥), vendor_spending as
+    ``$1,800 billed`` when the book is in EUR, and balance_sheet
+    investment rows would carry ``(USD 39,457.99)`` when they
+    should carry the actual default currency.
+
+    Set up a CNY-default book with the minimum data each affected
+    tool needs, then exercise each one. None of the responses
+    should contain ``$`` or ``USD``; all should reflect ``CNY``.
+    """
+
+    @staticmethod
+    def _cny_book(tmp_path: Path) -> Path:
+        """Build a fresh CNY-default book with enough seed data to
+        exercise every currency-sensitive compact formatter."""
+        import piecash
+        from piecash._common import GnucashException
+
+        book_path = tmp_path / "cny_book.gnucash"
+        book = piecash.create_book(
+            str(book_path),
+            currency="CNY",
+            overwrite=True,
+        )
+
+        cny = book.default_currency
+        root = book.root_account
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=cny,
+        )
+        liab = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        piecash.Account(
+            name="Visa", type="CREDIT", parent=liab, commodity=cny,
+        )
+        income = piecash.Account(
+            name="Income", type="INCOME", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        piecash.Account(
+            name="Salary", type="INCOME", parent=income, commodity=cny,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        piecash.Account(
+            name="Office Supplies", type="EXPENSE",
+            parent=expenses, commodity=cny,
+        )
+        ap = piecash.Account(
+            name="Accounts Payable", type="PAYABLE",
+            parent=liab, commodity=cny,
+        )
+        book.save()
+
+        return book_path
+
+    def test_debt_payoff_plan_emits_default_currency_mnemonic(
+        self, tmp_path: Path,
+    ):
+        from datetime import date as date_cls
+        book_path = self._cny_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        # Set APR on Visa, add a balance, run the plan.
+        gc_book.set_account_slot(
+            account_name="Liabilities:Visa",
+            key="apr",
+            value="18.99",
+        )
+        gc_book.create_transaction(
+            description="Charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-2000.00"},
+                {"account": "Expenses:Office Supplies", "amount": "2000.00"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+        )
+        result = gc_book.debt_payoff_plan(monthly_budget="500")
+        # Compact text must use CNY mnemonic, never $ or USD.
+        assert "$" not in result, (
+            f"hardcoded $ found in debt_payoff_plan output:\n{result}"
+        )
+        assert "USD" not in result, (
+            f"hardcoded USD found in debt_payoff_plan output:\n{result}"
+        )
+        assert "CNY" in result, (
+            f"CNY mnemonic missing from output:\n{result}"
+        )
+
+    def test_debt_payoff_plan_yeti_explanation_uses_default_currency(
+        self, tmp_path: Path,
+    ):
+        from datetime import date as date_cls
+        book_path = self._cny_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        gc_book.set_account_slot(
+            account_name="Liabilities:Visa",
+            key="apr",
+            value="18.99",
+        )
+        gc_book.create_transaction(
+            description="Charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-2000.00"},
+                {"account": "Expenses:Office Supplies", "amount": "2000.00"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+        )
+        # Verbose mode renders the yeti.explanation field directly.
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="500",
+        )
+        explanation = result["yeti"]["explanation"]
+        assert "$" not in explanation, (
+            f"hardcoded $ in yeti explanation: {explanation!r}"
+        )
+        assert "CNY" in explanation, (
+            f"CNY mnemonic missing from yeti explanation: {explanation!r}"
+        )
+
+    def test_vendor_spending_report_emits_default_currency_mnemonic(
+        self, tmp_path: Path,
+    ):
+        book_path = self._cny_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        gc_book.create_vendor(name="Office Depot")
+        gc_book.create_bill(vendor_id="000001")
+        gc_book.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="500.00",
+        )
+        gc_book.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2026-01-01",
+        )
+        result = gc_book.vendor_spending_report(
+            start_date="2026-01-01",
+            end_date="2026-12-31",
+        )
+        assert "$" not in result, (
+            f"hardcoded $ found in vendor_spending output:\n{result}"
+        )
+        assert "USD" not in result, (
+            f"hardcoded USD found in vendor_spending output:\n{result}"
+        )
+        assert "CNY" in result, (
+            f"CNY missing from vendor_spending output:\n{result}"
+        )
+
+    def test_balance_sheet_investment_uses_default_currency_mnemonic(
+        self, tmp_path: Path,
+    ):
+        """Investment accounts (non-default-currency commodity) should
+        render the triplet ``"230.00 STOCK @ 50.00 (CNY 11,500.00)"``
+        on a CNY-default book — not "(USD ...)" as the pre-fix code
+        emitted regardless of book setting.
+        """
+        from datetime import date as date_cls
+        import piecash
+
+        book_path = self._cny_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        # Add a STOCK commodity and account so we hit the
+        # non-default-currency branch of balance_sheet's
+        # format_accounts (where the bug lived).
+        with gc_book.open(readonly=False) as b:
+            cny = b.default_currency
+            mock = piecash.Commodity(
+                namespace="NASDAQ", mnemonic="MOCK",
+                fullname="Mock Stock", fraction=10000,
+                book=b,
+            )
+            inv_parent = next(
+                a for a in b.accounts if a.fullname == "Assets"
+            )
+            # Keep direct references — book.accounts fullname lookups
+            # don't reflect newly-created accounts until flush.
+            stock_acct = piecash.Account(
+                name="Mock Stock", type="STOCK", parent=inv_parent,
+                commodity=mock,
+            )
+            # Buy 100 shares @ 50 CNY → quantity=100, value=5000.
+            checking = next(
+                a for a in b.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            txn = piecash.Transaction(
+                currency=cny,
+                description="Buy MOCK",
+                post_date=date_cls(2026, 1, 1),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-5000"),
+                        quantity=Decimal("-5000"),
+                    ),
+                    piecash.Split(
+                        account=stock_acct, value=Decimal("5000"),
+                        quantity=Decimal("100"),
+                    ),
+                ],
+            )
+            b.session.add(txn)
+            # Mark a price.
+            b.session.add(piecash.Price(
+                commodity=mock, currency=cny,
+                date=date_cls(2026, 1, 5),
+                value="60", source="user:test", type="last",
+            ))
+            b.save()
+
+        result = gc_book.balance_sheet(as_of_date=date_cls(2026, 1, 31))
+        stock_row = next(
+            a for a in result["assets"]["accounts"]
+            if a["account"] == "Assets:Mock Stock"
+        )
+        # The triplet's parenthetical must use CNY, not USD.
+        assert "USD" not in stock_row["balance"], (
+            f"hardcoded USD in balance_sheet investment row: "
+            f"{stock_row['balance']!r}"
+        )
+        assert "CNY" in stock_row["balance"], (
+            f"CNY missing from balance_sheet investment row: "
+            f"{stock_row['balance']!r}"
+        )
 
 
 class TestNetWorth:
@@ -7112,13 +7361,13 @@ class TestMultiCurrencyBalances:
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
         accounts = {a["account"]: a for a in result["assets"]["accounts"]}
-        # Currency account: numeric in ``balance``, no ``usd_value``.
+        # Currency account: numeric in ``balance``, no ``default_currency_value``.
         checking = accounts["Assets:Checking"]
         assert Decimal(checking["balance"]) == Decimal("6700.00")
-        assert "usd_value" not in checking
-        # Non-currency: ``usd_value`` for parsing, ``balance`` for display.
+        assert "default_currency_value" not in checking
+        # Non-currency: ``default_currency_value`` for parsing, ``balance`` for display.
         eur = accounts["Assets:Euro Savings"]
-        assert Decimal(eur["usd_value"]) == Decimal("1100.00")
+        assert Decimal(eur["default_currency_value"]) == Decimal("1100.00")
         assert "EUR" in eur["balance"]
         assert "no price data" in eur["balance"]
 
@@ -7147,9 +7396,11 @@ class TestMultiCurrencyBalances:
             a for a in result["assets"]["accounts"]
             if a["account"] == "Assets:Euro Savings"
         )
-        # Non-currency row: ``usd_value`` is parseable + rounded.
-        assert Decimal(eur_row["usd_value"]) == Decimal("1200.00")
-        # Phase 4B: human-readable balance shows shares + rate + USD.
+        # Non-currency row: ``default_currency_value`` parseable + rounded.
+        assert Decimal(eur_row["default_currency_value"]) == Decimal("1200.00")
+        # Phase 4B: human-readable balance shows shares + rate +
+        # default-currency mnemonic ("USD" on this single-currency
+        # book; would be "CNY" / "EUR" on a non-USD book).
         assert "EUR" in eur_row["balance"]
         assert "@" in eur_row["balance"]
         assert "USD" in eur_row["balance"]

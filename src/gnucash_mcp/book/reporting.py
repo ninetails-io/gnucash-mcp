@@ -86,17 +86,25 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
     return "\n".join(lines)
 
 
-def _money_compact(value: Decimal) -> str:
-    """Format a dollar amount for compact-mode reports.
+def _money_compact(value: Decimal, currency: str = "USD") -> str:
+    """Format a monetary amount for compact-mode reports.
 
-    Whole-dollar values render without decimals (``$13,091``), partial
-    values render with two (``$1,125.50``). Negative values use the
-    leading-minus convention rather than parens.
+    Whole-currency-unit values render without decimals
+    (``"USD 13,091"``), partial values render with two
+    (``"USD 1,125.50"``). Negative values use leading-minus rather
+    than parens.
+
+    The ``currency`` argument carries the book's default currency
+    mnemonic (``"USD"``, ``"CNY"``, ``"EUR"``, etc.) — matches
+    ``get_book_summary``'s ``"USD 6700.00"`` rendering style and
+    works for non-USD books out of the box. Pre-fix this helper
+    hardcoded ``$`` and broke as soon as the bookkeeper pointed it
+    at a CNY-default book.
     """
     quantized = value.quantize(Decimal("0.01"))
     if quantized == quantized.to_integral_value():
-        return f"${int(quantized):,}"
-    return f"${quantized:,.2f}"
+        return f"{currency} {int(quantized):,}"
+    return f"{currency} {quantized:,.2f}"
 
 
 def _format_debt_payoff_compact(
@@ -111,17 +119,19 @@ def _format_debt_payoff_compact(
     yeti_multiplier: Decimal,
     purchase_amount: Decimal,
     true_cost: Decimal,
+    currency: str = "USD",
 ) -> str:
     """Render the avalanche-payoff plan as a compact text table.
 
-    Layout follows the comms-audit Phase 4A spec:
+    Currency prefix flows from the book's default currency — works
+    for USD, CNY, EUR, anything piecash represents. Layout::
 
-        Kill order ($10,000/mo → debt-free Apr 2030, $59,022 interest):
-          1. Business Amex    $13,091  24.49%  payoff: mo 8   interest: $1,125
-          2. Chase Sapphire   $22,127  21.49%  payoff: mo 18  interest: $5,034
+        Kill order (USD 10,000/mo → debt-free Apr 2030, USD 59,022 interest):
+          1. Business Amex    USD 13,091  24.49%  payoff: mo 8   interest: USD 1,125
+          2. Chase Sapphire   USD 22,127  21.49%  payoff: mo 18  interest: USD 5,034
           ...
-        YETI at this budget: 1.59x ($1 spent costs $1.59 in total debt impact)
-        Total interest: $59,022
+        YETI at this budget: 1.59x (USD 1 spent costs USD 1.59 in total debt impact)
+        Total interest: USD 59,022
         Debt-free: April 2030
 
     Replaces the verbose dict (with multi-line YETI ``explanation`` per
@@ -136,12 +146,14 @@ def _format_debt_payoff_compact(
 
     # Balance column width — pad to widest balance for alignment.
     balance_strs = [
-        _money_compact(orig_balances[d["name"]]) for d in results
+        _money_compact(orig_balances[d["name"]], currency) for d in results
     ]
     balance_width = max(len(b) for b in balance_strs) if balance_strs else 0
 
     # Interest column width — same trick.
-    interest_strs = [_money_compact(d["interest_paid"]) for d in results]
+    interest_strs = [
+        _money_compact(d["interest_paid"], currency) for d in results
+    ]
     interest_width = (
         max(len(s) for s in interest_strs) if interest_strs else 0
     )
@@ -149,9 +161,9 @@ def _format_debt_payoff_compact(
     # Header tells the reader the inputs that drove the schedule.
     payoff_month_name = payoff_date.strftime("%b %Y")
     header = (
-        f"Kill order ({_money_compact(monthly_budget)}/mo → "
+        f"Kill order ({_money_compact(monthly_budget, currency)}/mo → "
         f"debt-free {payoff_month_name}, "
-        f"{_money_compact(total_interest)} interest):"
+        f"{_money_compact(total_interest, currency)} interest):"
     )
 
     # Body rows.
@@ -174,10 +186,12 @@ def _format_debt_payoff_compact(
     # more than its sticker because of the interest your debt accrues".
     lines.append(
         f"YETI at this budget: {yeti_multiplier}x "
-        f"({_money_compact(purchase_amount)} spent costs "
-        f"{_money_compact(true_cost)} in total debt impact)"
+        f"({_money_compact(purchase_amount, currency)} spent costs "
+        f"{_money_compact(true_cost, currency)} in total debt impact)"
     )
-    lines.append(f"Total interest: {_money_compact(total_interest)}")
+    lines.append(
+        f"Total interest: {_money_compact(total_interest, currency)}"
+    )
     lines.append(f"Debt-free: {payoff_date.strftime('%B %Y')}")
     return "\n".join(lines)
 
@@ -607,14 +621,20 @@ class ReportingMixin:
                 the per-account values leaked Decimal precision noise
                 (e.g. ``"612011.489832"``) into responses.
                 """
+                # Default-currency mnemonic for the triplet rendering.
+                # Pre-fix this hardcoded "USD"; on a CNY-default book
+                # that lied about the currency on every investment row.
+                ccy_mnemonic = default_currency.mnemonic
                 rows = []
                 for name, info in sorted(accounts_dict.items()):
                     commodity = info["commodity"]
-                    usd_rounded = _format_number(info["usd"], decimals=2)
+                    default_value_rounded = _format_number(
+                        info["usd"], decimals=2
+                    )
                     if commodity == default_currency:
                         rows.append({
                             "account": name,
-                            "balance": usd_rounded,
+                            "balance": default_value_rounded,
                         })
                     else:
                         rate = latest_rates.get(commodity.guid)
@@ -623,19 +643,24 @@ class ReportingMixin:
                         if rate is not None:
                             balance_str = (
                                 f"{qty} {sym} @ {rate} "
-                                f"(USD {info['usd']:,.2f})"
+                                f"({ccy_mnemonic} {info['usd']:,.2f})"
                             )
                         else:
                             # No price on file — fall back to cost basis
                             # already accumulated in ``info['usd']``.
                             balance_str = (
-                                f"{qty} {sym} (USD {info['usd']:,.2f}, "
-                                f"no price data)"
+                                f"{qty} {sym} ({ccy_mnemonic} "
+                                f"{info['usd']:,.2f}, no price data)"
                             )
+                        # ``default_currency_value`` carries the
+                        # parseable amount in the book's default
+                        # currency. Pre-fix this field was named
+                        # ``usd_value`` — a lie on non-USD books.
+                        # Renamed to reflect the actual semantics.
                         rows.append({
                             "account": name,
                             "balance": balance_str,
-                            "usd_value": usd_rounded,
+                            "default_currency_value": default_value_rounded,
                         })
                 return rows
 
@@ -976,6 +1001,12 @@ class ReportingMixin:
             raise ValueError("additional_purchase must be a positive number")
 
         with self.open(readonly=True) as book:
+            # Capture the book's default currency for the compact
+            # formatter — pre-fix this method emitted ``$`` regardless
+            # of book setting, breaking on non-USD books.
+            default_currency_mnemonic = (
+                self._require_default_currency(book).mnemonic
+            )
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
 
@@ -1105,8 +1136,9 @@ class ReportingMixin:
                 "purchase_amount": str(purchase_amount),
                 "true_cost": str(true_cost.quantize(Decimal("0.01"))),
                 "explanation": (
-                    f"A ${purchase_amount} purchase will cost you "
-                    f"${true_cost.quantize(Decimal('0.01'))} by the time your "
+                    f"A {default_currency_mnemonic} {purchase_amount} purchase "
+                    f"will cost you {default_currency_mnemonic} "
+                    f"{true_cost.quantize(Decimal('0.01'))} by the time your "
                     f"debt is paid off"
                 ),
             },
@@ -1126,4 +1158,5 @@ class ReportingMixin:
             yeti_multiplier=yeti_multiplier,
             purchase_amount=purchase_amount,
             true_cost=true_cost,
+            currency=default_currency_mnemonic,
         )
