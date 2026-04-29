@@ -67,17 +67,19 @@ def _format_vendor_spending_compact(
     grand_billed: Decimal,
     grand_paid: Decimal,
     grand_outstanding: Decimal,
+    currency: str = "USD",
 ) -> str:
     """Render vendor-spending breakdown as a compact aligned text table.
 
     Format::
 
-        BookkeepingCo  4 bills  $1,800 billed  $1,800 paid  $0 outstanding
-        JetBrains      1 bill     $289 billed    $289 paid  $0 outstanding
-        TOTAL          5 bills  $2,089 billed  $2,089 paid  $0 outstanding
+        BookkeepingCo  4 bills  USD 1,800 billed  USD 1,800 paid  USD 0 outstanding
+        JetBrains      1 bill     USD 289 billed    USD 289 paid  USD 0 outstanding
+        TOTAL          5 bills  USD 2,089 billed  USD 2,089 paid  USD 0 outstanding
 
-    "1 bill" vs "N bills" pluralization keeps the line natural to read.
-    Width-padded so the four amount columns align across rows.
+    Currency prefix flows from the book's default currency. "1 bill" vs
+    "N bills" pluralization keeps the line natural to read. Width-padded
+    so the four amount columns align across rows.
     """
     if not vendors_list:
         return "No vendor activity in period."
@@ -93,8 +95,8 @@ def _format_vendor_spending_compact(
     def _money(s: str) -> str:
         d = Decimal(s)
         if d == d.to_integral_value():
-            return f"${int(d):,}"
-        return f"${d:,.2f}"
+            return f"{currency} {int(d):,}"
+        return f"{currency} {d:,.2f}"
 
     billed_strs = [_money(v["total_billed"]) for v in vendors_list]
     paid_strs = [_money(v["total_paid"]) for v in vendors_list]
@@ -2944,6 +2946,13 @@ class BusinessMixin:
         parsed_end = date.fromisoformat(end_date)
 
         with self.open() as book:
+            # Capture default currency for the compact formatter —
+            # pre-fix the table emitted ``$`` regardless of book
+            # setting.
+            default_currency_mnemonic = (
+                self._require_default_currency(book).mnemonic
+            )
+
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
                 Invoice.date_posted.isnot(None),
@@ -3070,4 +3079,5 @@ class BusinessMixin:
             grand_billed=grand_billed,
             grand_paid=grand_paid,
             grand_outstanding=grand_outstanding,
+            currency=default_currency_mnemonic,
         )

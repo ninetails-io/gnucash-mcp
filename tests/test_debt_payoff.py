@@ -66,8 +66,10 @@ class TestDebtPayoffPlan:
         true_cost = Decimal(yeti["true_cost"])
         assert true_cost > Decimal("1.00")
 
-        # Explanation should be human-readable
-        assert "$1.00 purchase" in yeti["explanation"]
+        # Explanation should be human-readable. Currency mnemonic
+        # flows from the book's default currency (USD on the test
+        # fixture; would be CNY/EUR/etc. on non-USD books).
+        assert "USD 1.00 purchase" in yeti["explanation"]
         assert "debt is paid off" in yeti["explanation"]
 
     def test_yeti_custom_purchase_amount(self, debt_book: Path):
