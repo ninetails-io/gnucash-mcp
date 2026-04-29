@@ -344,3 +344,206 @@ class TestDebtPayoffCompactFormat:
         # per account in the old shape. Should appear at most once now
         # (or zero times — we use "total debt impact" wording instead).
         assert result.count("by the time your debt is paid off") <= 1
+
+
+class TestAmortizingLoanMinimums:
+    """Bug 3 from the CNY cousin verification: ``debt_payoff_plan``
+    treated every CREDIT/LIABILITY account as a revolving card,
+    computing minimum payment as 2% of balance. That formula
+    over-states the minimum for amortizing loans (mortgages, auto
+    loans) by 4-5×, so a CNY-default book with a real mortgage
+    raised "budget less than minimums" even at ¥30K/mo when
+    actual obligations were ¥17,705.
+
+    New rule: ``CREDIT`` keeps the 2% heuristic; ``LIABILITY``
+    infers from the most recent payment-side split. Slot still
+    wins for either type. Liability with no payment history and
+    no slot raises a clear error.
+    """
+
+    def test_liability_minimum_inferred_from_recent_payment(
+        self, test_book: Path,
+    ):
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+
+        # Mortgage-shaped LIABILITY: 100,000 balance, 3.85% APR, real
+        # monthly payment of 600. Pre-fix the 2% formula would have
+        # said minimum = 2,000 — wrong by 3.3×.
+        gc_book.create_account(
+            name="Mortgage", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc_book.set_account_slot("Liabilities:Mortgage", "apr", "3.85")
+        # Origination: charge balance to the liability.
+        gc_book.create_transaction(
+            description="Mortgage origination",
+            splits=[
+                {"account": "Liabilities:Mortgage", "amount": "-100000"},
+                {"account": "Expenses:Groceries", "amount": "100000"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+            check_duplicates=False,
+        )
+        # Recurring payment: reduces balance by 600/month.
+        gc_book.create_transaction(
+            description="Mortgage payment",
+            splits=[
+                {"account": "Liabilities:Mortgage", "amount": "600"},
+                {"account": "Assets:Checking", "amount": "-600"},
+            ],
+            trans_date=date_cls(2026, 2, 1),
+            check_duplicates=False,
+        )
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="700",
+        )
+        mortgage = next(
+            d for d in result["debts"]
+            if d["account"] == "Liabilities:Mortgage"
+        )
+        # Inferred from the most recent payment of 600, not the
+        # 2% formula's 2,000. (Pre-fix, the budget=700 call would
+        # have raised "less than minimums".)
+        assert Decimal(mortgage["minimum_payment"]) == Decimal("600")
+
+    def test_liability_minimum_uses_slot_when_set(
+        self, test_book: Path,
+    ):
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_account(
+            name="Auto Loan", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc_book.set_account_slot("Liabilities:Auto Loan", "apr", "4.90")
+        gc_book.set_account_slot(
+            "Liabilities:Auto Loan", "minimum_payment", "350",
+        )
+        gc_book.create_transaction(
+            description="Auto loan origination",
+            splits=[
+                {"account": "Liabilities:Auto Loan", "amount": "-20000"},
+                {"account": "Expenses:Groceries", "amount": "20000"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+            check_duplicates=False,
+        )
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="500",
+        )
+        auto = next(
+            d for d in result["debts"]
+            if d["account"] == "Liabilities:Auto Loan"
+        )
+        # Slot wins over inference; no payment history needed.
+        assert Decimal(auto["minimum_payment"]) == Decimal("350")
+
+    def test_liability_without_history_or_slot_raises(
+        self, test_book: Path,
+    ):
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_account(
+            name="HELOC", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc_book.set_account_slot("Liabilities:HELOC", "apr", "6.50")
+        # Balance but no payment history yet.
+        gc_book.create_transaction(
+            description="HELOC draw",
+            splits=[
+                {"account": "Liabilities:HELOC", "amount": "-50000"},
+                {"account": "Expenses:Groceries", "amount": "50000"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+            check_duplicates=False,
+        )
+        with pytest.raises(ValueError, match="no payment history"):
+            gc_book.debt_payoff_plan(
+                compact=False, monthly_budget="2000",
+            )
+
+    def test_credit_keeps_two_percent_heuristic(
+        self, test_book: Path,
+    ):
+        """CREDIT accounts retain the 2% rule — that's the standard
+        revolving-card minimum and it's correct for that account type.
+        """
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_account(
+            name="Visa", account_type="CREDIT",
+            parent="Liabilities",
+        )
+        gc_book.set_account_slot("Liabilities:Visa", "apr", "20")
+        gc_book.create_transaction(
+            description="Visa charge",
+            splits=[
+                {"account": "Liabilities:Visa", "amount": "-5000"},
+                {"account": "Expenses:Groceries", "amount": "5000"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+            check_duplicates=False,
+        )
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="500",
+        )
+        visa = next(
+            d for d in result["debts"]
+            if d["account"] == "Liabilities:Visa"
+        )
+        # 2% of 5000 = 100. Min floor 25 doesn't bind.
+        assert Decimal(visa["minimum_payment"]) == Decimal("100.00")
+
+    def test_mortgage_with_realistic_numbers_does_not_blow_minimums(
+        self, test_book: Path,
+    ):
+        """The bug-report scenario, scaled: a real mortgage in the
+        millions with a real fixed payment. Pre-fix the 2% rule would
+        compute ~57K/mo as the minimum on a 2.7M balance. Post-fix
+        the inference reads the actual ~14.8K payment. The whole
+        plan must run without raising 'budget less than minimums'.
+        """
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+
+        gc_book.create_account(
+            name="Mortgage", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc_book.set_account_slot("Liabilities:Mortgage", "apr", "3.85")
+        gc_book.create_transaction(
+            description="Mortgage origination",
+            splits=[
+                {"account": "Liabilities:Mortgage", "amount": "-2729518"},
+                {"account": "Expenses:Groceries", "amount": "2729518"},
+            ],
+            trans_date=date_cls(2026, 1, 1),
+            check_duplicates=False,
+        )
+        gc_book.create_transaction(
+            description="Mortgage payment",
+            splits=[
+                {"account": "Liabilities:Mortgage", "amount": "14800"},
+                {"account": "Assets:Checking", "amount": "-14800"},
+            ],
+            trans_date=date_cls(2026, 2, 1),
+            check_duplicates=False,
+        )
+        # 30K/mo budget — the bug-report value. Plenty above the
+        # actual 14.8K mortgage payment, but pre-fix the 2% rule
+        # would have computed minimum=54,590 and raised.
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+        mortgage = next(
+            d for d in result["debts"]
+            if d["account"] == "Liabilities:Mortgage"
+        )
+        assert Decimal(mortgage["minimum_payment"]) == Decimal("14800")
+        # And the plan as a whole runs cleanly.
+        assert result["payoff_months"] > 0

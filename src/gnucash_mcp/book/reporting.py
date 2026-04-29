@@ -1035,7 +1035,8 @@ class ReportingMixin:
 
                 min_payment = None
 
-                # 1. Check minimum_payment slot (user override)
+                # 1. Check minimum_payment slot (user override; wins
+                #    for either account type).
                 try:
                     mp_val = account["minimum_payment"]
                     mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
@@ -1043,13 +1044,63 @@ class ReportingMixin:
                 except (KeyError, InvalidOperation):
                     pass
 
-                # 2. Calculate from balance: greater of $25 or 2% of balance
+                # 2. Type-specific defaults when no slot.
+                #    CREDIT (revolving cards) use the 2%-of-balance
+                #    heuristic — that's the standard card-issuer
+                #    minimum. LIABILITY (amortizing loans like
+                #    mortgages, auto loans) need the actual recurring
+                #    payment, which the 2% rule wildly overstates
+                #    on large balances. Infer from the most recent
+                #    payment transaction; require an explicit slot
+                #    when there's no history to read from.
                 if min_payment is None:
-                    two_percent = (balance * Decimal("0.02")).quantize(Decimal("0.01"))
-                    min_payment = max(two_percent, Decimal("25"))
-                    # If balance is below $25, minimum is the full balance
-                    if balance < Decimal("25"):
-                        min_payment = balance
+                    if account.type == "CREDIT":
+                        # Revolving-card minimum: greater of 2% of
+                        # balance or 25 (in default currency units).
+                        # Capped at the balance itself for tiny debts.
+                        two_percent = (
+                            balance * Decimal("0.02")
+                        ).quantize(Decimal("0.01"))
+                        min_payment = max(two_percent, Decimal("25"))
+                        if balance < Decimal("25"):
+                            min_payment = balance
+                    else:
+                        # LIABILITY (amortizing loan). Infer the
+                        # recurring payment from the most recent
+                        # payment-side split — that's the user's
+                        # actual fixed payment for a mortgage / auto
+                        # loan / etc. Liabilities are stored with
+                        # negative balances (the canonical accounting
+                        # sign); positive ``split.quantity`` reduces
+                        # the balance toward zero, i.e. is a payment.
+                        payment_splits = [
+                            s for s in account.splits
+                            if s.quantity > 0
+                            and s.transaction.post_date is not None
+                        ]
+                        if payment_splits:
+                            latest = max(
+                                payment_splits,
+                                key=lambda s: s.transaction.post_date,
+                            )
+                            min_payment = abs(
+                                Decimal(str(latest.quantity))
+                            )
+                        else:
+                            # No payment history to infer from. The
+                            # 2% rule is wrong for amortizing loans
+                            # (would overstate the mortgage payment
+                            # by 4-5×). Better to fail loud and tell
+                            # the user how to fix it.
+                            raise ValueError(
+                                f"LIABILITY account "
+                                f"{account.fullname!r} has no "
+                                f"payment history to infer a minimum "
+                                f"payment from. Set the "
+                                f"'minimum_payment' slot explicitly "
+                                f"via set_account_slot, or record at "
+                                f"least one payment transaction first."
+                            )
 
                 credit_limit = None
                 try:
