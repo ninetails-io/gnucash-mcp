@@ -29,7 +29,7 @@ class TestCreateBudget:
         assert result["guid"]  # non-empty GUID
 
         # Verify via get_budget
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert budget is not None
         assert budget["num_periods"] == 12
         assert budget["period_type"] == "monthly"
@@ -48,7 +48,7 @@ class TestCreateBudget:
 
         assert result["status"] == "created"
 
-        budget = book.get_budget("Q Budget")
+        budget = book.get_budget(compact=False, name="Q Budget")
         assert budget["num_periods"] == 4
         assert budget["period_type"] == "quarterly"
 
@@ -64,7 +64,7 @@ class TestCreateBudget:
 
         assert result["status"] == "created"
 
-        budget = book.get_budget("Weekly Budget")
+        budget = book.get_budget(compact=False, name="Weekly Budget")
         assert budget["num_periods"] == 52
         assert budget["period_type"] == "weekly"
 
@@ -122,7 +122,7 @@ class TestSetBudgetAmount:
         assert len(result["periods_set"]) == 12
 
         # Verify via get_budget
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         grocery_amounts = None
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
@@ -147,7 +147,7 @@ class TestSetBudgetAmount:
 
         assert result["periods_set"] == [0]
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         grocery_amounts = None
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
@@ -186,7 +186,7 @@ class TestSetBudgetAmount:
 
         assert result["periods_set"] == [11]
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         grocery_amounts = None
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
@@ -216,7 +216,7 @@ class TestSetBudgetAmount:
             period=0,
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
                 assert Decimal(acct["periods"][0]) == Decimal("700.00")
@@ -271,7 +271,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,  # January 2026
         )
@@ -312,7 +312,7 @@ class TestGetBudgetReport:
             amount="300.00",
         )
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -332,7 +332,7 @@ class TestGetBudgetReport:
         self._create_budget_with_amounts(book)
 
         # Period 2 = March 2026, no transactions exist
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=2,
         )
@@ -346,7 +346,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=1,  # February 2026
         )
@@ -368,7 +368,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period="all",
         )
@@ -394,7 +394,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
             account="Expenses:Groceries",
@@ -408,7 +408,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -474,7 +474,7 @@ class TestGetBudgetReport:
             period=0,
         )
 
-        report = gc.get_budget_report(
+        report = gc.get_budget_report(compact=False,
             budget_name="Util Budget",
             period=0,
         )
@@ -543,7 +543,7 @@ class TestGetBudgetReport:
             budget_name="Mixed Budget",
             account="Expenses:Utilities:Electric", amount="100", period=0,
         )
-        report = gc.get_budget_report(
+        report = gc.get_budget_report(compact=False,
             budget_name="Mixed Budget", period=0,
         )
         by_acct = {a["account"]: a for a in report["accounts"]}
@@ -555,7 +555,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
 
         with pytest.raises(ValueError, match="Budget not found"):
-            book.get_budget_report(budget_name="Nonexistent", period=0)
+            book.get_budget_report(compact=False,budget_name="Nonexistent", period=0)
 
 
 # ============== TestListAndGetBudget ==============
@@ -567,7 +567,7 @@ class TestListAndGetBudget:
     def test_list_empty(self, budget_book: Path):
         """Listing budgets on a book with no budgets returns empty list."""
         book = GnuCashBook(str(budget_book))
-        result = book.list_budgets()
+        result = book.list_budgets(compact=False)
         assert result == []
 
     def test_list_single_budget(self, budget_book: Path):
@@ -575,7 +575,7 @@ class TestListAndGetBudget:
         book = GnuCashBook(str(budget_book))
         book.create_budget(name="2026 Budget", year=2026, num_periods=12)
 
-        result = book.list_budgets()
+        result = book.list_budgets(compact=False)
         assert len(result) == 1
         assert result[0]["name"] == "2026 Budget"
         assert result[0]["num_periods"] == 12
@@ -598,7 +598,7 @@ class TestListAndGetBudget:
             period=1,
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert budget is not None
         assert len(budget["accounts"]) == 1
         assert budget["accounts"][0]["account"] == "Expenses:Groceries"
@@ -608,7 +608,7 @@ class TestListAndGetBudget:
     def test_get_nonexistent_returns_none(self, budget_book: Path):
         """get_budget returns None for nonexistent budget."""
         book = GnuCashBook(str(budget_book))
-        assert book.get_budget("Nonexistent") is None
+        assert book.get_budget(compact=False, name="Nonexistent") is None
 
 
 # ============== TestDeleteBudget ==============
@@ -627,8 +627,8 @@ class TestDeleteBudget:
         assert result["name"] == "2026 Budget"
 
         # Verify it's gone
-        assert book.get_budget("2026 Budget") is None
-        assert book.list_budgets() == []
+        assert book.get_budget(compact=False, name="2026 Budget") is None
+        assert book.list_budgets(compact=False) == []
 
     def test_delete_with_amounts(self, budget_book: Path):
         """Delete a budget with amounts (cascade delete)."""
@@ -642,7 +642,7 @@ class TestDeleteBudget:
 
         result = book.delete_budget("2026 Budget")
         assert result["status"] == "deleted"
-        assert book.list_budgets() == []
+        assert book.list_budgets(compact=False) == []
 
     def test_delete_nonexistent_raises(self, budget_book: Path):
         """Deleting a nonexistent budget raises ValueError."""
@@ -689,16 +689,16 @@ class TestBudgetIntegration:
         )
 
         # Verify listing
-        budgets = book.list_budgets()
+        budgets = book.list_budgets(compact=False)
         assert len(budgets) == 1
         assert budgets[0]["name"] == "2026 Budget"
 
         # Get full budget details
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert len(budget["accounts"]) == 3
 
         # Get January report
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -736,7 +736,7 @@ class TestBudgetIntegration:
             period="q4",
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
                 # Q1-Q3 (periods 0-8) should be $500

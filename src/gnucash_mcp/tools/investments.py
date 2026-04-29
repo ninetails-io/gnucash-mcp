@@ -115,8 +115,13 @@ def register(mcp, get_book) -> None:
         end_date: str | None = None,
         currency: str | None = None,
         limit: int = 50,
+        verbose: bool = False,
     ) -> str:
         """Get price history for a commodity.
+
+        Returns a compact aligned text table by default. Use
+        verbose=true for the full structured envelope (``prices`` list,
+        ``count``, ``total``, ``notice``).
 
         Args:
             commodity: Symbol of the commodity (e.g., "VTSAX").
@@ -125,13 +130,7 @@ def register(mcp, get_book) -> None:
             end_date: Optional end date filter (YYYY-MM-DD).
             currency: Optional currency filter (e.g., "USD").
             limit: Maximum prices to return. Defaults to 50, capped at 250.
-                   Pre-fix this method dumped every matching price; the
-                   most-recent-first sort means small limits still surface
-                   the freshest data.
-
-        Returns:
-            JSON with ``prices`` (list, possibly truncated), ``count``,
-            ``total``, and ``notice`` (truncation message or None).
+            verbose: If true, return the structured dict.
         """
         book = get_book()
         start = date_type.fromisoformat(start_date) if start_date else None
@@ -144,8 +143,11 @@ def register(mcp, get_book) -> None:
             end_date=end,
             currency=currency,
             limit=limit,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool

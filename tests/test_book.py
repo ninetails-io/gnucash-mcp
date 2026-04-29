@@ -7359,7 +7359,7 @@ class TestPrices:
         assert result["date"] == "2026-02-07"
 
         # Verify via get_prices (now returns dict with prices/count/total/notice)
-        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND", compact=False)
         prices = result["prices"]
         assert result["total"] == 1
         assert len(prices) == 1
@@ -7396,7 +7396,7 @@ class TestPrices:
         assert result["value"] == "128.75"
 
         # Should still be only 1 price, not 2
-        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        result = gc_book.get_prices(commodity="VTSAX", namespace="FUND", compact=False)
         prices = result["prices"]
         assert len(prices) == 1
         assert prices[0]["value"] == "128.75"
@@ -7431,13 +7431,14 @@ class TestPrices:
             namespace="FUND",
             start_date=date(2026, 2, 3),
             end_date=date(2026, 2, 8),
+            compact=False,
         )
         prices = result["prices"]
         assert len(prices) == 1
         assert Decimal(prices[0]["value"]) == Decimal("126.50")
 
         # All prices, should be descending
-        all_result = gc_book.get_prices(commodity="VTSAX", namespace="FUND")
+        all_result = gc_book.get_prices(commodity="VTSAX", namespace="FUND", compact=False)
         all_prices = all_result["prices"]
         assert len(all_prices) == 3
         assert all_prices[0]["date"] == "2026-02-10"  # Most recent first
@@ -7701,3 +7702,122 @@ class TestInvestmentWorkflow:
         assert vtsax["latest_price"]["value"] == "128.75"
         assert vtsax["latest_price"]["date"] == "2026-02-07"
         assert vtsax["latest_price"]["currency"] == "USD"
+
+
+class TestShortGuidRoundTripClosure:
+    """The contract you can build a tool surface on: every short GUID
+    emitted by an output is accepted as input to a tool that takes
+    that entity's GUID. If this contract drifts, the LLM ends up
+    holding identifiers it can't use.
+
+    These tests are the lock — for each entity that has a GUID-based
+    public API (transaction, split, lot, scheduled transaction,
+    account), grab a fresh emission and feed it back in. Round-trip
+    must resolve to the same underlying object.
+    """
+
+    def test_transaction_short_guid_round_trip(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # list_transactions compact emits 8+ hex prefixes.
+        compact = gc_book.list_transactions()
+        line = compact.strip().split("\n")[0]
+        # Format: "YYYY-MM-DD<TAB>SHORTGUID<TAB>amount<TAB>..."
+        short_guid = line.split("\t")[1]
+        assert short_guid and len(short_guid) >= 8
+        # Feed it back into get_transaction.
+        result = gc_book.get_transaction(short_guid)
+        assert result is not None
+        assert result["guid"].startswith(short_guid)
+
+    def test_split_short_guid_round_trip(self, test_book: Path):
+        from datetime import date as date_cls
+        gc_book = GnuCashBook(str(test_book))
+        # Mark a split as cleared so get_unreconciled_splits has
+        # something with a "c" state to emit. Use the compact form
+        # to get the prefix the LLM would actually receive.
+        compact = gc_book.get_unreconciled_splits(
+            account_name="Assets:Checking",
+        )
+        # Format: ``"short_guid<TAB>date<TAB>description<TAB>amount<TAB>state"``
+        # — the short GUID is column 0.
+        line = compact.strip().split("\n")[0]
+        short_split = line.split("\t")[0]
+        assert short_split and len(short_split) >= 8
+        # Feed it back into set_reconcile_state — the canonical split
+        # consumer.
+        result = gc_book.set_reconcile_state(
+            split_guid=short_split,
+            state="c",
+            reconcile_date=date_cls(2024, 1, 31),
+        )
+        assert result["status"] == "updated"
+
+    def test_lot_short_guid_round_trip(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # Set up: create commodity, account, lot.
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Vanguard Total",
+            namespace="FUND",
+        )
+        gc_book.create_account(
+            name="Investments", account_type="ASSET",
+            parent="Assets", placeholder=True,
+        )
+        gc_book.create_account(
+            name="VTSAX", account_type="MUTUAL",
+            parent="Assets:Investments",
+            commodity="VTSAX", commodity_namespace="FUND",
+        )
+        created = gc_book.create_lot(
+            account="Assets:Investments:VTSAX",
+            title="Round-trip lot",
+        )
+        # create_lot's response uses ``_unique_prefix``, so this is
+        # already a short GUID.
+        short_lot = created["guid"]
+        assert short_lot and len(short_lot) >= 8
+        # Feed it back into get_lot — the canonical lot consumer.
+        detail = gc_book.get_lot(guid=short_lot)
+        assert detail["title"] == "Round-trip lot"
+
+    def test_scheduled_short_guid_round_trip(self, scheduled_book: Path):
+        gc_book = GnuCashBook(str(scheduled_book))
+        created = gc_book.create_scheduled_transaction(
+            name="RoundTripSx",
+            description="Round-trip test",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100.00"},
+                {"account": "Assets:Checking", "amount": "-100.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        short_sx = created["guid"]
+        assert short_sx and len(short_sx) >= 8
+        # Feed it back into update_scheduled_transaction — accepts
+        # the same prefix form the create response emitted.
+        result = gc_book.update_scheduled_transaction(
+            guid=short_sx,
+            enabled=False,
+        )
+        # Round-trip success: the short GUID resolved to the same
+        # scheduled transaction we just created. The response echoes
+        # the (possibly extended) short GUID — same prefix shape.
+        assert result["guid"] and len(result["guid"]) >= 8
+        assert result.get("name") == "RoundTripSx"
+
+    def test_account_short_guid_round_trip(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # list_accounts compact emits "%shortguid<TAB>fullname [ANN]".
+        compact = gc_book.list_accounts()
+        line = compact.strip().split("\n")[0]
+        short_acct, _rest = line.split("\t", 1)
+        assert short_acct.startswith("%")
+        # Feed it back into get_account — accepts %short, full path,
+        # or full GUID interchangeably via _resolve_account.
+        result = gc_book.get_account(name=short_acct)
+        assert result is not None
+        # Feed it as a transaction-split account ref too — the
+        # downstream resolver path that powers all write tools.
+        baseline = gc_book.get_balance(short_acct)
+        assert baseline is not None

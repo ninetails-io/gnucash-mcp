@@ -10,34 +10,43 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def list_budgets() -> str:
+    def list_budgets(verbose: bool = False) -> str:
         """List all budgets in the book.
 
-        Returns:
-            JSON list of budgets with guid, name, description,
-            num_periods, and period_type.
+        Returns a compact one-line-per-budget format by default. Use
+        verbose=true for the full JSON list.
+
+        Args:
+            verbose: If true, return the full JSON list.
         """
         book = get_book()
-        result = book.list_budgets()
-        return _json(result)
+        result = book.list_budgets(compact=not verbose)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def get_budget(name: str) -> str:
+    def get_budget(name: str, verbose: bool = False) -> str:
         """Get full details of a budget including all budget amounts.
+
+        Returns a compact text table by default — collapses uniform
+        periods (e.g., ``"250/mo (all periods)"``) so the typical
+        12-cell repeat doesn't dominate the response. Use verbose=true
+        for the full structured ``periods`` dict per account.
 
         Args:
             name: Budget name.
-
-        Returns:
-            JSON with budget info and all account/period amounts.
+            verbose: If true, return the full structured dict.
         """
         book = get_book()
-        result = book.get_budget(name)
+        result = book.get_budget(name=name, compact=not verbose)
         if result is None:
             return _json({"error": f"Budget not found: {name}"})
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
@@ -108,8 +117,13 @@ def register(mcp, get_book) -> None:
         period: int | str | None = None,
         account: str | None = None,
         include_children: bool = True,
+        verbose: bool = False,
     ) -> str:
         """Compare actual spending against budget.
+
+        Returns a compact text table by default with ⚠ markers on
+        categories exceeding budget. Use verbose=true for the full
+        structured dict.
 
         Args:
             budget_name: Name of the budget.
@@ -120,6 +134,7 @@ def register(mcp, get_book) -> None:
                 - "all": All periods
             account: Optional filter to specific account or parent account.
             include_children: If True and account specified, include child accounts.
+            verbose: If true, return the structured dict.
         """
         book = get_book()
         result = book.get_budget_report(
@@ -127,8 +142,11 @@ def register(mcp, get_book) -> None:
             period=period,
             account=account,
             include_children=include_children,
+            compact=not verbose,
         )
-        return _json(result)
+        if verbose:
+            return _json(result)
+        return result
 
     @mcp.tool()
     @safe_tool
