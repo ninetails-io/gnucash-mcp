@@ -164,10 +164,16 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         if days is None:
             days_str = ""
         elif days > 0:
-            anchor = (
-                "30-day default" if r.get("no_terms") else "past due"
-            )
-            days_str = f"  {days} days past {anchor}"
+            # Two phrasings — "X days past due" reads as contractual
+            # (the user agreed to a date and missed it), "X days past
+            # 30-day default" anchors the duration to the assumption
+            # we made when no term was set. Pre-fix the templating
+            # concatenated "days past " with another "past due" so
+            # the contractual case rendered as "days past past due".
+            if r.get("no_terms"):
+                days_str = f"  {days} days past 30-day default"
+            else:
+                days_str = f"  {days} days past due"
         elif days == 0:
             days_str = "  due today"
         else:
@@ -223,8 +229,30 @@ class BusinessMixin:
     # simplicity.
     FX_GAIN_LOSS_PATH = "Income:Foreign Exchange Gain/Loss"
 
+    # Keywords that identify an existing user-named FX gain/loss
+    # account during the fuzzy fallback below. Bookkeepers commonly
+    # name this account "FX Gain Loss", "Forex Gains", "Currency
+    # Adjustment", etc. — the canonical
+    # "Foreign Exchange Gain/Loss" path the auto-create uses is one
+    # convention among many.
+    _FX_NAME_KEYWORDS = ("fx", "forex", "exchange", "currency")
+
     def _get_or_create_fx_account(self, book):
-        """Find or lazily create ``Income:Foreign Exchange Gain/Loss``.
+        """Find or lazily create the FX-gain/loss account.
+
+        Resolution order:
+
+        1. Exact canonical path ``Income:Foreign Exchange Gain/Loss``
+           (the path this method auto-creates when nothing matches).
+        2. Fuzzy match — any INCOME or EXPENSE account whose name
+           contains "fx" / "forex" / "exchange" / "currency"
+           (case-insensitive). Bookkeepers commonly create accounts
+           like "Income:FX Gain Loss" before any cross-currency
+           activity; matching them prevents us from silently
+           creating a parallel canonical account, leaving the user
+           with two FX accounts where one carries the activity and
+           the other is orphaned.
+        3. Auto-create the canonical path under ``Income``.
 
         Created on first cross-currency pay whose post-date rate
         differs from its pay-date rate, so books without foreign-
@@ -235,9 +263,24 @@ class BusinessMixin:
                 Caller must create it first — we won't auto-create a
                 top-level account.
         """
+        # Step 1: exact canonical path.
         fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
         if fx_acct is not None:
             return fx_acct
+
+        # Step 2: fuzzy match against existing income/expense accounts.
+        # Sort by fullname for deterministic selection if multiple
+        # match (rare but possible).
+        candidates = []
+        for account in book.accounts:
+            if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            name_lower = account.name.lower()
+            if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
+                candidates.append(account)
+        if candidates:
+            candidates.sort(key=lambda a: a.fullname)
+            return candidates[0]
 
         income = self._find_account(book, "Income")
         if income is None:

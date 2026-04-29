@@ -1234,3 +1234,47 @@ class TestCreateTransactionMultiCurrencyTool:
 
         data = json.loads(result)
         assert data["status"] == "created"
+
+
+class TestNonAsciiJsonEncoding:
+    """Bug 1 from the CNY cousin verification: ``_json`` (the
+    serializer every tool wrapper uses) was hitting Python's default
+    ``json.dumps(ensure_ascii=True)``, escaping non-ASCII characters
+    like 贵州茅台 as ``\\uXXXX`` in tool responses. Storage was correct
+    (the audit log renders Chinese natively); only the wire format
+    was wrong, breaking human readability and downstream substring
+    matching.
+    """
+
+    def test_chinese_commodity_name_returns_raw_utf8(
+        self, setup_book_env,
+    ):
+        result = server_module.create_commodity(
+            mnemonic="600519",
+            fullname="贵州茅台 (Kweichow Moutai)",
+            namespace="SSE",
+            fraction=100,
+        )
+        # Raw Chinese characters, not \uXXXX escape sequences.
+        assert "贵州茅台" in result, (
+            f"non-ASCII characters were escaped:\n{result}"
+        )
+        # Still valid JSON.
+        data = json.loads(result)
+        assert data["fullname"] == "贵州茅台 (Kweichow Moutai)"
+
+    def test_accented_european_characters_round_trip(
+        self, setup_book_env,
+    ):
+        # Same bug, different alphabet — accented Latin (German
+        # umlauts, French accents) gets escaped without ensure_ascii=False.
+        result = server_module.create_commodity(
+            mnemonic="MÜNCH",
+            fullname="Münchener Rückversicherungs-Gesellschaft",
+            namespace="XETRA",
+            fraction=100,
+        )
+        assert "Münchener" in result
+        assert "Rückversicherungs" in result
+        data = json.loads(result)
+        assert data["fullname"] == "Münchener Rückversicherungs-Gesellschaft"

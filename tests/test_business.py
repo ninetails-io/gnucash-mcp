@@ -2921,3 +2921,132 @@ class TestPhase4CBreakdownCompact:
         )
         assert isinstance(result, str)
         assert "TOTAL" in result
+
+
+class TestCnyBugReportFollowups:
+    """Regression tests for the small-bug findings in the CNY
+    cousin-verification report (separate PR from the substantive
+    Bug 3 work that lives on its own branch)."""
+
+    # ── Bug 4: "days past past due" typo ─────────────────────────
+
+    def test_outstanding_invoices_overdue_no_double_word(
+        self, business_book,
+    ):
+        """The compact-format ``get_outstanding_invoices`` template
+        was concatenating "days past " with " past due" and producing
+        "X days past past due". Should read either "X days past due"
+        (contractual) or "X days past 30-day default" (no terms)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        # Post with explicit due date in the past — exercises the
+        # contractual branch where the typo lived.
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+            due_date="2026-02-01",
+        )
+        compact = gb.get_outstanding_invoices()
+        assert "past past due" not in compact, (
+            f"typo regression — found duplicated word in:\n{compact}"
+        )
+        # And the correct form is present.
+        assert "past due" in compact
+
+    def test_outstanding_invoices_no_terms_renders_30_day_default(
+        self, business_book,
+    ):
+        """No-terms branch should annotate as ``"X days past 30-day
+        default"`` — also doesn't have the duplicated word."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        # No due_date and no billterm — falls to 30-day default.
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+        )
+        compact = gb.get_outstanding_invoices()
+        assert "past past" not in compact
+        assert "30-day default" in compact
+
+    # ── Bug 2: pay_invoice should reuse existing FX accounts ─────
+
+    def test_fx_account_reuse_picks_up_user_named_account(
+        self, business_book,
+    ):
+        """When the user has pre-created a fuzzy-named FX account
+        (``Income:FX Gain Loss``), ``_get_or_create_fx_account``
+        should match it instead of silently creating a parallel
+        ``Income:Foreign Exchange Gain/Loss``."""
+        gb = GnuCashBook(str(business_book))
+        # User pre-creates with a different but recognizable name.
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct = gb._get_or_create_fx_account(book)
+            # Must reuse the user's account rather than create the
+            # canonical-named one.
+            assert fx_acct.fullname == "Income:FX Gain Loss"
+
+    def test_fx_account_reuse_matches_alternate_keywords(
+        self, business_book,
+    ):
+        """Match any of fx / forex / exchange / currency in the
+        account name (case-insensitive)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="Forex Adjustments",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct = gb._get_or_create_fx_account(book)
+            assert fx_acct.fullname == "Income:Forex Adjustments"
+
+    def test_fx_account_canonical_path_still_wins(
+        self, business_book,
+    ):
+        """If both canonical and fuzzy-matchable accounts exist, the
+        canonical exact-path lookup wins (it's the path we'd auto-
+        create — preserving deterministic behavior on books with
+        existing FX activity)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        gb.create_account(
+            name="Foreign Exchange Gain/Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct = gb._get_or_create_fx_account(book)
+            assert fx_acct.fullname == "Income:Foreign Exchange Gain/Loss"
+
+    def test_fx_account_falls_through_to_canonical_create(
+        self, business_book,
+    ):
+        """No fuzzy match available → canonical account auto-created
+        under Income."""
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            fx_acct = gb._get_or_create_fx_account(book)
+            book.save()
+            assert fx_acct.fullname == "Income:Foreign Exchange Gain/Loss"
