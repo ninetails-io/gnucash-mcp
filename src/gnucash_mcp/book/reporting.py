@@ -1035,7 +1035,9 @@ class ReportingMixin:
 
                 min_payment = None
 
-                # 1. Check minimum_payment slot (user override)
+                # 1. Check minimum_payment slot (user override).
+                #    Wins for both CREDIT and LIABILITY — the user has
+                #    declared the contractual amount.
                 try:
                     mp_val = account["minimum_payment"]
                     mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
@@ -1043,13 +1045,46 @@ class ReportingMixin:
                 except (KeyError, InvalidOperation):
                     pass
 
-                # 2. Calculate from balance: greater of $25 or 2% of balance
+                # 2. Type-aware fallback. Credit cards and amortizing
+                #    loans have very different minimum-payment shapes:
+                #    CREDIT cards charge ~2% of balance (revolving,
+                #    no fixed term), while LIABILITY loans are
+                #    contractually fixed payments derived from
+                #    principal × rate × term (mortgage, auto, student).
+                #    Applying the 2% rule to a mortgage produces a
+                #    minimum that's ~3-4× the actual payment, which
+                #    makes the budget-vs-minimums gate trip on any
+                #    realistic household budget.
                 if min_payment is None:
-                    two_percent = (balance * Decimal("0.02")).quantize(Decimal("0.01"))
-                    min_payment = max(two_percent, Decimal("25"))
-                    # If balance is below $25, minimum is the full balance
-                    if balance < Decimal("25"):
-                        min_payment = balance
+                    if account.type == "CREDIT":
+                        two_percent = (
+                            balance * Decimal("0.02")
+                        ).quantize(Decimal("0.01"))
+                        min_payment = max(two_percent, Decimal("25"))
+                        if balance < Decimal("25"):
+                            min_payment = balance
+                    else:
+                        # LIABILITY: standard amortization formula.
+                        # PMT = P × r(1+r)^n / ((1+r)^n − 1)
+                        # Term defaults: 30 years if "mortgage" appears
+                        # anywhere in the account path (Liabilities:
+                        # Mortgage, Loans:Mortgage:Principal, etc.),
+                        # else 5 years (auto, personal, etc.). Users
+                        # with non-standard terms should set the
+                        # minimum_payment slot explicitly.
+                        is_mortgage = "mortgage" in account.fullname.lower()
+                        term_months = 360 if is_mortgage else 60
+                        monthly_rate = (
+                            apr / Decimal("100") / Decimal("12")
+                        )
+                        factor = (Decimal("1") + monthly_rate) ** term_months
+                        min_payment = (
+                            balance * monthly_rate * factor / (factor - Decimal("1"))
+                        ).quantize(Decimal("0.01"))
+                        # Cap at balance for tiny remainders where the
+                        # formula could over-shoot a near-paid-off loan.
+                        if min_payment > balance:
+                            min_payment = balance
 
                 credit_limit = None
                 try:
