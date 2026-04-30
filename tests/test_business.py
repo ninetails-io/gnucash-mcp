@@ -1218,13 +1218,18 @@ class TestInvoiceBillIdCollision:
         gb.create_vendor(name="Office Depot")
         gb.create_invoice(customer_id="000001")  # ID 000001
         gb.create_bill(vendor_id="000001")        # ID 000001
-        # Should target the customer invoice, not the vendor bill
+        # Should target the customer invoice, not the vendor bill —
+        # add_invoice_entry passes owner_type=2 explicitly.
         result = gb.add_invoice_entry(
             invoice_id="000001", account="Income:Sales",
             description="Consulting", quantity="1", price="100",
         )
         assert result["status"] == "created"
-        inv = gb.get_invoice("000001")
+        # get_invoice without owner_type now raises on the same
+        # collision (see TestInvoiceBillIdCollision::test_get_invoice
+        # _on_collision_raises_disambiguation_error). Pass owner_type
+        # to retrieve the customer invoice.
+        inv = gb.get_invoice("000001", owner_type="customer")
         assert inv["type"] == "invoice"
         assert len(inv["entries"]) == 1
 
@@ -1242,16 +1247,32 @@ class TestInvoiceBillIdCollision:
         )
         assert result["status"] == "created"
 
-    def test_get_invoice_with_collision_defaults_to_first(self, business_book):
-        """get_invoice without owner_type returns first match."""
+    def test_get_invoice_on_collision_raises_disambiguation_error(
+        self, business_book,
+    ):
+        """When a customer invoice and vendor bill share the same
+        numeric ID, ``get_invoice`` (called without ``owner_type``)
+        must raise rather than silently return whichever the SQL
+        query happened to surface first. The bookkeeper hit this on
+        a CNY book where ``get_invoice("000003")`` returned a CNY
+        customer invoice instead of the USD vendor bill they were
+        verifying — silent wrong-document reads are worse than a
+        clear error."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         gb.create_vendor(name="Office Depot")
         gb.create_invoice(customer_id="000001")
         gb.create_bill(vendor_id="000001")
-        result = gb.get_invoice("000001")
-        # Returns whichever was created first (invoice)
-        assert result["type"] in ("invoice", "bill")
+
+        with pytest.raises(ValueError) as exc_info:
+            gb.get_invoice("000001")
+        msg = str(exc_info.value)
+        # Error tells the caller exactly what's ambiguous and how to fix.
+        assert "2 documents" in msg
+        assert "'000001'" in msg
+        assert "customer invoice" in msg
+        assert "vendor bill" in msg
+        assert "owner_type" in msg
 
     def test_get_invoice_with_owner_type_filter(self, business_book):
         """get_invoice with owner_type disambiguates colliding IDs."""
@@ -1264,6 +1285,22 @@ class TestInvoiceBillIdCollision:
         assert inv["type"] == "invoice"
         bill = gb.get_invoice("000001", owner_type="vendor")
         assert bill["type"] == "bill"
+
+    def test_get_invoice_unambiguous_id_no_owner_type_works(
+        self, business_book,
+    ):
+        """When an ID is unique (only one document with it), the
+        ambiguity check doesn't fire and ``get_invoice`` returns
+        the matching document without requiring ``owner_type``.
+        This is the common case — the disambiguation is paid for
+        only when actually ambiguous."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        # No vendor bill 000001, so the invoice ID is unambiguous.
+        inv = gb.get_invoice("000001")
+        assert inv["type"] == "invoice"
 
 
 # ============== Post Invoice Tests ==============
