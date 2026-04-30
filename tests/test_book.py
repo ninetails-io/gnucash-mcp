@@ -158,6 +158,59 @@ class TestGetBookSummary:
         result = gc_book.get_book_summary()
         assert f"Book: {test_book}" in result
 
+    def test_data_range_uses_transaction_dates_not_prices(
+        self, test_book: Path,
+    ):
+        """The "Data range" line reflects transactions only, never
+        prices. Prices on dates outside the transaction range are
+        valid signals (forecast rates, NAVs the user pulls in
+        ahead of recording related transactions) and should NOT
+        stretch the displayed range — that misleads the LLM into
+        thinking there's transaction activity in periods where
+        none exists.
+
+        Lin Wei's CNY book hit a misread of this: transactions
+        ended 2025-12-31, test prices extended to 2026-04-30,
+        and the spec author thought the range was being polluted.
+        Locking the correct behavior here so a future refactor
+        can't accidentally union price dates back into the range.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(test_book))
+
+        # Add a transaction in 2025 so the range has a known boundary.
+        # The test_book fixture provides Assets:Checking and
+        # Income:Salary out of the box.
+        gc_book.create_transaction(
+            description="Range anchor",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=date(2025, 6, 15),
+        )
+
+        # Add a price WAY in the future. If the range loop ever
+        # starts scanning prices, this will stretch the upper bound.
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Total Stock", namespace="FUND",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="200.00",
+            currency="USD", price_date=date(2099, 1, 1),
+        )
+
+        summary = gc_book.get_book_summary()
+
+        # Data range should show 2025 only — not 2099.
+        data_range_lines = [
+            line for line in summary.splitlines()
+            if line.startswith("Data range:")
+        ]
+        assert len(data_range_lines) == 1
+        assert "2025" in data_range_lines[0]
+        assert "2099" not in data_range_lines[0]
+
     def test_investment_valued_at_latest_price(
         self, multi_currency_book: Path
     ):
