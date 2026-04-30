@@ -52,13 +52,16 @@ class TestToolModulesMapping:
         assert len(TOOL_MODULES["core"]) == 15
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 84.
+        """Total tools across all modules should be 87.
 
-        84 = 78 pre-Employee + 4 Employee CRUD (1.2.0) +
-        2 from the 1.2.1 patch (``unpost_invoice``, ``delete_price``).
+        87 = 78 pre-Employee + 4 Employee CRUD (1.2.0) +
+        5 from the 1.2.1 patch:
+        - ``unpost_invoice``, ``delete_price`` (cleanup paths);
+        - ``update_customer``, ``update_vendor``, ``update_employee``
+          (so people don't have to open GnuCash to fix a typo).
         """
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 84
+        assert total == 87
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
@@ -168,9 +171,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 84 tools."""
+        """--modules=all should keep all 87 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 84
+        assert len(self._tool_names()) == 87
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to core + backup.
@@ -206,12 +209,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 84
+        assert len(self._tool_names()) == 87
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 84 tools."""
+        """'all' mixed with other modules should keep all 87 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 84
+        assert len(self._tool_names()) == 87
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""

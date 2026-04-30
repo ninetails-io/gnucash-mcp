@@ -624,6 +624,63 @@ def _fmt_person_delete(
     return lines
 
 
+def _fmt_person_update(entry: dict, type_label: str) -> list[str]:
+    """Shared UPDATE renderer for customer / vendor / employee.
+
+    Header line carries the entity id. Each field that actually
+    changed renders as ``before → after``, with ``address``
+    expanded to per-sub-field lines so a phone-number tweak is
+    visible at a glance. Fields that didn't change are omitted —
+    the response from the book layer is already a diff, so the
+    audit log mirrors that shape.
+    """
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    before = entry.get("before_state") or {}
+
+    person_id = params.get("id", "") or after.get("id", "")
+    lines = [f"{time_part}  UPDATE {type_label.upper()}  id:{person_id}"]
+
+    # Top-level field diffs. Skip ``guid``/``id``/``status`` —
+    # those are echo / metadata.
+    SKIP = {"guid", "id", "status"}
+    for key, new_val in after.items():
+        if key in SKIP or key == "address":
+            continue
+        old_val = before.get(key)
+        if old_val == new_val:
+            continue
+        lines.append(
+            f"{_INDENT}{key}: {old_val!r} → {new_val!r}"
+        )
+
+    # Address sub-field diffs.
+    addr_after = after.get("address") or {}
+    addr_before = before.get("address") or {}
+    if addr_after:
+        lines.append(f"{_INDENT}address:")
+        for key, new_val in addr_after.items():
+            old_val = addr_before.get(key, "")
+            lines.append(
+                f"{_INDENT}  {key}: {old_val!r} → {new_val!r}"
+            )
+
+    return lines
+
+
+def _fmt_customer_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "customer")
+
+
+def _fmt_vendor_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "vendor")
+
+
+def _fmt_employee_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "employee")
+
+
 def _fmt_customer_create(entry: dict) -> list[str]:
     return _fmt_person_create(entry, "customer")
 
@@ -814,10 +871,13 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("account_slot", "SET_SLOT"): _fmt_account_slot_set,
     ("account_slot", "DELETE_SLOT"): _fmt_account_slot_delete,
     ("customer", "CREATE"): _fmt_customer_create,
+    ("customer", "UPDATE"): _fmt_customer_update,
     ("customer", "DELETE"): _fmt_customer_delete,
     ("vendor", "CREATE"): _fmt_vendor_create,
+    ("vendor", "UPDATE"): _fmt_vendor_update,
     ("vendor", "DELETE"): _fmt_vendor_delete,
     ("employee", "CREATE"): _fmt_employee_create,
+    ("employee", "UPDATE"): _fmt_employee_update,
     ("employee", "DELETE"): _fmt_employee_delete,
     ("billterm", "CREATE"): _fmt_billterm_create,
     ("invoice", "CREATE"): _fmt_invoice_create,

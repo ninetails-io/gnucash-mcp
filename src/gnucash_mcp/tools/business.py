@@ -204,6 +204,103 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="customer")
+    def update_customer(
+        id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        notes: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> str:
+        """Update an existing customer.
+
+        Mutates only the fields supplied; everything else stays.
+        Existing invoices/bills are not retroactively changed —
+        ``currency`` here is the customer's *default* trading
+        currency for future documents.
+
+        Args:
+            id: Customer ID (e.g., "000001").
+            name: New display name.
+            currency: New default ISO currency code (e.g., "EUR").
+            notes: New notes. Pass "" to clear.
+            active: ``false`` to deactivate (archive without
+                deleting); ``true`` to reactivate.
+            address: Partial address dict — keys ``name``,
+                ``addr1``..``addr4``, ``phone``, ``fax``, ``email``.
+                Merges onto the existing address (creating one if
+                absent). To clear a sub-field, pass an empty
+                string explicitly for that key.
+        """
+        book = get_book()
+        result = book.update_customer(
+            customer_id=id, name=name, currency=currency,
+            notes=notes, active=active, address=address,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="vendor")
+    def update_vendor(
+        id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        notes: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> str:
+        """Update an existing vendor.
+
+        Same semantics as ``update_customer``.
+
+        Args:
+            id: Vendor ID (e.g., "000001").
+            name: New display name.
+            currency: New default ISO currency code.
+            notes: New notes. Pass "" to clear.
+            active: ``false`` to deactivate; ``true`` to reactivate.
+            address: Partial address dict (see ``update_customer``).
+        """
+        book = get_book()
+        result = book.update_vendor(
+            vendor_id=id, name=name, currency=currency,
+            notes=notes, active=active, address=address,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="employee")
+    def update_employee(
+        id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> str:
+        """Update an existing employee.
+
+        Employee has no ``notes`` column — parameter omitted
+        accordingly. Otherwise identical to ``update_customer``.
+
+        Args:
+            id: Employee ID (e.g., "000001").
+            name: New display name.
+            currency: New default ISO currency code.
+            active: ``false`` to deactivate; ``true`` to reactivate.
+            address: Partial address dict (see ``update_customer``).
+        """
+        book = get_book()
+        result = book.update_employee(
+            employee_id=id, name=name, currency=currency,
+            active=active, address=address,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="write", operation="create", entity_type="billterm")
     def create_billterm(
         name: str,

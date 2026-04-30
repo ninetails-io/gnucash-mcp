@@ -347,6 +347,260 @@ class TestDeleteEmployee:
             gb.delete_employee(employee_id="999999")
 
 
+class TestUpdateCustomer:
+    """Tests for ``update_customer``.
+
+    The customer/vendor/employee triple shares a helper, so the
+    Customer tests cover the bulk of the contract; vendor and
+    employee tests check their specific differences (notes column
+    on vendor, lack of notes column on employee).
+    """
+
+    def test_update_name(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.update_customer(
+            customer_id="000001", name="Acme Industries",
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Acme Industries"
+        # Diff-style response: only changed fields show.
+        assert "currency" not in result
+        # Persisted.
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["name"] == "Acme Industries"
+
+    def test_update_notes_clear_with_empty_string(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp", notes="Net 30 terms")
+        result = gb.update_customer(
+            customer_id="000001", notes="",
+        )
+        assert result["notes"] == ""
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["notes"] == ""
+
+    def test_update_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Berlin Digital", currency="USD")
+        result = gb.update_customer(
+            customer_id="000001", currency="EUR",
+        )
+        assert result["currency"] == "EUR"
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["currency"] == "EUR"
+
+    def test_update_unknown_currency_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="Currency not found"):
+            gb.update_customer(customer_id="000001", currency="XYZ")
+
+    def test_update_active_to_false_archives(self, business_book):
+        """Deactivation is the archive path — the customer stays in
+        the book (and on existing invoices) but ``list_customers``
+        with ``active_only=True`` skips them."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Old Customer")
+        gb.update_customer(customer_id="000001", active=False)
+
+        active_only = gb.list_customers(active_only=True, compact=False)
+        assert all(c["id"] != "000001" for c in active_only)
+        all_customers = gb.list_customers(
+            active_only=False, compact=False,
+        )
+        assert any(c["id"] == "000001" for c in all_customers)
+
+    def test_update_address_creates_when_missing(self, business_book):
+        """Customer created without an address gets one on first
+        update."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.update_customer(
+            customer_id="000001",
+            address={
+                "addr1": "123 Main St",
+                "phone": "555-0100",
+                "email": "billing@acme.example",
+            },
+        )
+        assert result["address"]["addr1"] == "123 Main St"
+        assert result["address"]["phone"] == "555-0100"
+
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["address"]["addr1"] == "123 Main St"
+        assert cust["address"]["email"] == "billing@acme.example"
+
+    def test_update_address_merges_with_existing(self, business_book):
+        """A partial address dict updates the supplied sub-fields
+        and leaves the others alone."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(
+            name="Acme Corp",
+            address={
+                "addr1": "123 Main St",
+                "addr2": "Suite 200",
+                "phone": "555-0100",
+                "email": "old@acme.example",
+            },
+        )
+        # Update only email and phone.
+        gb.update_customer(
+            customer_id="000001",
+            address={
+                "phone": "555-9999",
+                "email": "new@acme.example",
+            },
+        )
+        cust = gb.get_customer(customer_id="000001")
+        # Updated.
+        assert cust["address"]["phone"] == "555-9999"
+        assert cust["address"]["email"] == "new@acme.example"
+        # Untouched.
+        assert cust["address"]["addr1"] == "123 Main St"
+        assert cust["address"]["addr2"] == "Suite 200"
+
+    def test_update_address_clear_field_with_empty_string(
+        self, business_book,
+    ):
+        """Empty string clears a sub-field; no key means leave it."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(
+            name="Acme Corp",
+            address={"addr1": "123 Main St", "fax": "555-0101"},
+        )
+        gb.update_customer(
+            customer_id="000001",
+            address={"fax": ""},
+        )
+        cust = gb.get_customer(customer_id="000001")
+        # fax cleared, addr1 untouched.
+        assert cust["address"].get("fax", "") == ""
+        assert cust["address"]["addr1"] == "123 Main St"
+
+    def test_update_address_unknown_key_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(
+            ValueError, match="Unknown address field",
+        ):
+            gb.update_customer(
+                customer_id="000001",
+                address={"addresss": "typo"},  # extra "s"
+            )
+
+    def test_update_no_fields_raises(self, business_book):
+        """Calling update with nothing to change is a programming
+        error — surface it loud."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="No changes supplied"):
+            gb.update_customer(customer_id="000001")
+
+    def test_update_unknown_customer_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Customer not found"):
+            gb.update_customer(customer_id="999999", name="x")
+
+    def test_update_only_changed_fields_in_response(
+        self, business_book,
+    ):
+        """If the caller passes ``name="Acme Corp"`` and that's
+        already the name, no change happens and ``name`` is *not*
+        in the diff response."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp", notes="x")
+        # Pass a "no-op" name plus a real change.
+        result = gb.update_customer(
+            customer_id="000001", name="Acme Corp", notes="y",
+        )
+        assert "name" not in result  # unchanged
+        assert result["notes"] == "y"
+
+    def test_update_after_invoices_exist(self, business_book):
+        """The whole point: an update_customer call should work
+        even after the customer has invoices — the limitation that
+        delete-then-recreate hits doesn't apply here."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        # Now try to fix a typo.
+        result = gb.update_customer(
+            customer_id="000001", name="ACME Corp",
+        )
+        assert result["status"] == "updated"
+
+
+class TestUpdateVendor:
+    """Tests for ``update_vendor``.
+
+    Most behavior is shared with ``update_customer`` via
+    ``_update_business_person``; verify the vendor surface plus a
+    representative happy path.
+    """
+
+    def test_update_name_and_address(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(
+            name="Office Depot",
+            address={"addr1": "Old St"},
+        )
+        result = gb.update_vendor(
+            vendor_id="000001",
+            name="Office Depot Inc",
+            address={"addr1": "New St", "phone": "555-1212"},
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Office Depot Inc"
+        vendor = gb.get_vendor(vendor_id="000001")
+        assert vendor["name"] == "Office Depot Inc"
+        assert vendor["address"]["addr1"] == "New St"
+        assert vendor["address"]["phone"] == "555-1212"
+
+    def test_update_unknown_vendor_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Vendor not found"):
+            gb.update_vendor(vendor_id="999999", name="x")
+
+
+class TestUpdateEmployee:
+    """Tests for ``update_employee``.
+
+    Employee has no ``notes`` column. Verify a happy path and the
+    no-notes-parameter signature.
+    """
+
+    def test_update_name_and_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith", currency="USD")
+        result = gb.update_employee(
+            employee_id="000001",
+            name="Jane Q. Smith",
+            currency="EUR",
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Jane Q. Smith"
+        assert result["currency"] == "EUR"
+        emp = gb.get_employee(employee_id="000001")
+        assert emp["name"] == "Jane Q. Smith"
+        assert emp["currency"] == "EUR"
+
+    def test_update_unknown_employee_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.update_employee(employee_id="999999", name="x")
+
+    def test_update_employee_active_toggle(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Former Employee")
+        gb.update_employee(employee_id="000001", active=False)
+
+        active_only = gb.list_employees(
+            active_only=True, compact=False,
+        )
+        assert all(e["id"] != "000001" for e in active_only)
+
+
 class TestDeleteCustomer:
     """Tests for delete_customer."""
 

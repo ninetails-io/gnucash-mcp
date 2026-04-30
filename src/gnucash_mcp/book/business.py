@@ -1116,6 +1116,172 @@ class BusinessMixin:
             "status": "created",
         }
 
+    # Address sub-fields piecash exposes on the Address record. Used
+    # both to validate caller-supplied dict keys and to iterate during
+    # update.
+    _ADDRESS_FIELDS = (
+        "name", "addr1", "addr2", "addr3", "addr4",
+        "phone", "fax", "email",
+    )
+
+    def _update_business_person(
+        self,
+        *,
+        book,
+        entity,
+        entity_label: str,
+        name: str | None = None,
+        currency: str | None = None,
+        notes: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Shared update path for Customer / Vendor / Employee.
+
+        Mutates only the fields the caller supplies; everything else
+        is left alone. Diff-style response: returns ``{guid, id,
+        status, ...changed_fields}`` so the caller sees exactly what
+        landed without echoing the full entity record.
+
+        Address handling:
+
+        - ``address=None`` → don't touch the address record.
+        - ``address={...}`` → for each provided sub-field, set it on
+          the existing Address record (creating one if the entity
+          has no address yet). Missing sub-keys are left unchanged;
+          to clear a sub-field, pass an empty string explicitly.
+
+        Args:
+            book: Open piecash book session (readonly=False).
+            entity: Resolved Customer / Vendor / Employee instance.
+            entity_label: ``"Customer"`` / ``"Vendor"`` / ``"Employee"``
+                — for error messages.
+            name: New display name. ``None`` means no change.
+            currency: New ISO currency code. ``None`` means no change;
+                pass a new mnemonic to switch (rare — currency on a
+                business person is essentially their default trading
+                currency, changing it doesn't touch existing
+                invoices/bills).
+            notes: New notes text. Customer/Vendor only — Employee
+                will raise via piecash's natural attribute check.
+                Pass empty string to clear.
+            active: New active flag. Use ``False`` to deactivate
+                (archive without deleting).
+            address: Partial address update dict — see above. Keys:
+                ``name``, ``addr1``..``addr4``, ``phone``, ``fax``,
+                ``email``. Unknown keys raise ``ValueError`` so a
+                typo doesn't silently no-op.
+
+        Returns:
+            Dict with the entity GUID, id, ``status: "updated"``, and
+            the diff of changed top-level fields. Address changes
+            render under an ``address`` key showing only the
+            sub-fields that actually changed.
+
+        Raises:
+            ValueError: If currency unknown, address dict contains
+                unknown keys, or no fields were provided to update.
+        """
+        # Validate address keys upfront — a typo like ``"addresss":
+        # "..."`` would silently no-op without this check.
+        if address is not None:
+            unknown = set(address.keys()) - set(self._ADDRESS_FIELDS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown address field(s): {sorted(unknown)}. "
+                    f"Valid keys: {', '.join(self._ADDRESS_FIELDS)}."
+                )
+
+        # Stage pre-update state for the audit log. Mirrors the
+        # update_account precedent — the audit decorator reads
+        # before_state from this thread-local rather than reopening
+        # the book.
+        before = {
+            "id": entity.id,
+            "name": entity.name,
+            "currency": (
+                entity.currency.mnemonic if entity.currency else None
+            ),
+            "active": bool(entity.active),
+        }
+        if hasattr(entity, "notes"):
+            before["notes"] = entity.notes or ""
+        before_addr = self._address_to_dict(entity)
+        if before_addr:
+            before["address"] = before_addr
+        self._stage_audit_before(before)
+
+        changed: dict = {}
+
+        if name is not None and name != entity.name:
+            entity.name = name
+            changed["name"] = name
+
+        if currency is not None:
+            # ``_get_or_create_currency`` auto-loads ISO codes the book
+            # hasn't seen before (matches the ``create_price`` fix
+            # earlier in this release). Users shouldn't have to
+            # pre-load EUR before switching a vendor to EUR.
+            try:
+                new_currency = self._get_or_create_currency(book, currency)
+            except ValueError:
+                raise ValueError(f"Currency not found: {currency}")
+            if new_currency != entity.currency:
+                entity.currency = new_currency
+                changed["currency"] = currency
+
+        if notes is not None:
+            if not hasattr(entity, "notes"):
+                # Employee has no notes column.
+                raise ValueError(
+                    f"{entity_label} has no notes field — drop "
+                    f"``notes=`` from the update call."
+                )
+            current_notes = entity.notes or ""
+            if current_notes != notes:
+                entity.notes = notes
+                changed["notes"] = notes
+
+        if active is not None and bool(active) != bool(entity.active):
+            entity.active = bool(active)
+            changed["active"] = bool(active)
+
+        if address is not None:
+            # piecash's ``Address`` is a composite view over raw
+            # ``addr_*`` columns on the Customer / Vendor / Employee
+            # row. Mutation through the composite (``entity.address
+            # .addr1 = ...``) doesn't flush the underlying column
+            # change — only direct assignment to the raw column
+            # attribute (``entity.addr_addr1 = ...``) persists. The
+            # ``_address_to_dict`` reader already pulls from the raw
+            # columns, so writes go to the same place reads come from.
+            addr_changed: dict = {}
+            for key in self._ADDRESS_FIELDS:
+                if key not in address:
+                    continue
+                new_val = address[key]
+                column = f"addr_{key}"
+                if (getattr(entity, column) or "") != new_val:
+                    setattr(entity, column, new_val)
+                    addr_changed[key] = new_val
+            if addr_changed:
+                changed["address"] = addr_changed
+
+        if not changed:
+            raise ValueError(
+                f"No changes supplied — pass at least one field to "
+                f"update on {entity_label.lower()} {entity.id!r}."
+            )
+
+        book.save()
+
+        return {
+            "guid": entity.guid,
+            "id": entity.id,
+            "status": "updated",
+            **changed,
+        }
+
     def create_customer(
         self,
         name: str,
@@ -1328,6 +1494,130 @@ class BusinessMixin:
             if not employee:
                 raise ValueError(f"Employee not found: {employee_id}")
             return self._employee_to_dict(employee)
+
+    def update_customer(
+        self,
+        customer_id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        notes: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Update an existing customer's mutable fields.
+
+        Mutates only the fields the caller supplies. Existing
+        invoices and bills are unaffected — currency change here
+        only sets the customer's *default* trading currency for
+        future documents, not the currency of historical activity.
+
+        See ``_update_business_person`` for address-merge semantics
+        and full kwarg behavior.
+
+        Args:
+            customer_id: Human-readable ID (e.g., '000001').
+            name: New display name. ``None`` = no change.
+            currency: New default ISO currency code. ``None`` = no change.
+            notes: New notes. Pass empty string to clear. ``None`` = no change.
+            active: ``False`` to deactivate (archive), ``True`` to
+                reactivate. ``None`` = no change.
+            address: Partial address dict. Sub-fields supplied are
+                merged onto the existing address record (or create
+                one if absent).
+
+        Returns:
+            Dict with guid, id, status, and the diff of changed fields.
+
+        Raises:
+            ValueError: If customer not found, currency unknown, or
+                no fields supplied to update.
+        """
+        with self.open(readonly=False) as book:
+            customer = self._find_customer(book, customer_id)
+            if not customer:
+                raise ValueError(f"Customer not found: {customer_id}")
+            return self._update_business_person(
+                book=book, entity=customer, entity_label="Customer",
+                name=name, currency=currency, notes=notes,
+                active=active, address=address,
+            )
+
+    def update_vendor(
+        self,
+        vendor_id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        notes: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Update an existing vendor's mutable fields.
+
+        Same semantics as ``update_customer``. See
+        ``_update_business_person`` for address-merge details.
+
+        Args:
+            vendor_id: Human-readable ID (e.g., '000001').
+            name: New display name. ``None`` = no change.
+            currency: New default ISO currency code. ``None`` = no change.
+            notes: New notes. Pass empty string to clear. ``None`` = no change.
+            active: ``False`` to deactivate, ``True`` to reactivate.
+            address: Partial address dict.
+
+        Returns:
+            Dict with guid, id, status, and changed-field diff.
+
+        Raises:
+            ValueError: If vendor not found, currency unknown, or
+                no fields supplied.
+        """
+        with self.open(readonly=False) as book:
+            vendor = self._find_vendor(book, vendor_id)
+            if not vendor:
+                raise ValueError(f"Vendor not found: {vendor_id}")
+            return self._update_business_person(
+                book=book, entity=vendor, entity_label="Vendor",
+                name=name, currency=currency, notes=notes,
+                active=active, address=address,
+            )
+
+    def update_employee(
+        self,
+        employee_id: str,
+        name: str | None = None,
+        currency: str | None = None,
+        active: bool | None = None,
+        address: dict | None = None,
+    ) -> dict:
+        """Update an existing employee's mutable fields.
+
+        Employee has no ``notes`` column (unlike Customer / Vendor)
+        — the parameter is omitted from the signature accordingly.
+        Otherwise identical to ``update_customer``.
+
+        Args:
+            employee_id: Human-readable ID (e.g., '000001').
+            name: New display name. ``None`` = no change.
+            currency: New default ISO currency code. ``None`` = no change.
+            active: ``False`` to deactivate, ``True`` to reactivate.
+            address: Partial address dict.
+
+        Returns:
+            Dict with guid, id, status, and changed-field diff.
+
+        Raises:
+            ValueError: If employee not found, currency unknown, or
+                no fields supplied.
+        """
+        with self.open(readonly=False) as book:
+            employee = self._find_employee(book, employee_id)
+            if not employee:
+                raise ValueError(f"Employee not found: {employee_id}")
+            return self._update_business_person(
+                book=book, entity=employee, entity_label="Employee",
+                name=name, currency=currency, notes=None,
+                active=active, address=address,
+            )
 
     def create_billterm(
         self,
