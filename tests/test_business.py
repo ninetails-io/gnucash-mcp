@@ -1938,6 +1938,218 @@ class TestPostInvoice:
             assert Decimal(str(expense_split.quantity)) == Decimal("1100.00")
 
 
+# ============== Unpost Invoice Tests ==============
+
+
+class TestUnpostInvoice:
+    """Tests for unpost_invoice — the reverse of post_invoice.
+
+    The bookkeeper hit the orphaned-invoice problem on both Alex's
+    and Lin Wei's books: a posting transaction got deleted via
+    ``delete_transaction``, but the invoice retained its
+    ``date_posted`` / ``post_txn`` / ``post_lot`` / ``post_acc``
+    pointers. The invoice then refused both delete ("already
+    posted") and re-post ("posted"); only SQL surgery escaped.
+    Two-prong fix: ``unpost_invoice`` for clean reversal +
+    ``delete_transaction`` rejection of posting records.
+    """
+
+    def _post_invoice(self, gb, amount="500.00"):
+        """Returns the post_invoice result dict (includes
+        ``transaction_guid`` and ``lot_guid``, which ``get_invoice``
+        doesn't surface)."""
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        return gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+
+    def test_unpost_returns_invoice_to_open_state(self, business_book):
+        """Unposting clears date_posted, post_txn, post_lot,
+        post_account; the invoice is editable again."""
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+
+        result = gb.unpost_invoice(invoice_id=posted["id"])
+
+        assert result["id"] == posted["id"]
+        assert result["type"] == "invoice"
+        assert result["status"] == "unposted"
+
+        # Invoice is open again.
+        inv = gb.get_invoice(posted["id"], owner_type="customer")
+        assert inv["date_posted"] is None
+
+    def test_unpost_deletes_posting_transaction(self, business_book):
+        """The transaction that posting created is removed from
+        the book — not just unlinked from the invoice."""
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+        txn_guid = posted["transaction_guid"]
+
+        gb.unpost_invoice(invoice_id=posted["id"])
+
+        # Transaction is gone.
+        with gb.open(readonly=True) as book:
+            from piecash.core.transaction import Transaction
+            tx = (
+                book.session.query(Transaction)
+                .filter_by(guid=txn_guid)
+                .first()
+            )
+            assert tx is None
+
+    def test_unpost_allows_re_posting(self, business_book):
+        """After unpost, the invoice can be posted again — the
+        canonical lifecycle is post → unpost → edit → post."""
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+        gb.unpost_invoice(invoice_id=posted["id"])
+
+        # Re-post on a different date with a different account.
+        result = gb.post_invoice(
+            invoice_id=posted["id"],
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-05-15",
+        )
+        assert result["status"] == "posted"
+        assert result["post_date"] == "2026-05-15"
+
+    def test_unpost_rejects_invoice_with_payment_applied(
+        self, business_book,
+    ):
+        """Unposting an invoice that has any payment applied would
+        orphan the payment splits. Force the user to void payments
+        first."""
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+        gb.pay_invoice(
+            invoice_id=posted["id"],
+            payment_account="Assets:Checking",
+            amount="100.00",
+        )
+
+        with pytest.raises(ValueError, match="has payments applied"):
+            gb.unpost_invoice(invoice_id=posted["id"])
+
+    def test_unpost_rejects_unposted_invoice(self, business_book):
+        """Open invoices have nothing to unpost."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+
+        with pytest.raises(ValueError, match="is not posted"):
+            gb.unpost_invoice(invoice_id="000001")
+
+    def test_unpost_rejects_unknown_invoice(self, business_book):
+        """Clear error when the ID doesn't match anything."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.unpost_invoice(invoice_id="999999")
+
+    def test_unpost_works_for_vendor_bill(self, business_book):
+        """Symmetry — the bill side reverses cleanly too."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="Paper", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+        )
+
+        result = gb.unpost_invoice(
+            invoice_id="000001", owner_type="vendor",
+        )
+        assert result["type"] == "bill"
+        assert result["status"] == "unposted"
+
+    def test_unpost_disambiguates_via_owner_type(self, business_book):
+        """When customer invoice and vendor bill share an ID,
+        ``owner_type`` selects which side to unpost."""
+        gb = GnuCashBook(str(business_book))
+        # Post both on the same id 000001.
+        gb.create_customer(name="Acme Corp")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")
+        gb.create_bill(vendor_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.add_bill_entry(
+            bill_id="000001", account="Expenses:Office Supplies",
+            description="y", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+
+        # Unpost the customer side; the vendor bill stays posted.
+        gb.unpost_invoice(invoice_id="000001", owner_type="customer")
+
+        inv = gb.get_invoice("000001", owner_type="customer")
+        bill = gb.get_invoice("000001", owner_type="vendor")
+        assert inv["date_posted"] is None
+        assert bill["date_posted"] is not None
+
+    def test_delete_transaction_rejects_posting_record(
+        self, business_book,
+    ):
+        """Direct deletion of a posting transaction is the original
+        defect this whole fix exists to prevent. The check rejects
+        the call with a message pointing at unpost_invoice."""
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+
+        with pytest.raises(ValueError) as exc_info:
+            gb.delete_transaction(guid=posted["transaction_guid"])
+        msg = str(exc_info.value)
+        assert "posting record" in msg
+        assert posted["id"] in msg
+        assert "unpost_invoice" in msg
+
+    def test_delete_transaction_works_for_non_posting_records(
+        self, business_book,
+    ):
+        """Regression: only posting transactions are protected.
+        Plain transactions (e.g., regular bank deposits) still
+        delete cleanly."""
+        gb = GnuCashBook(str(business_book))
+        from datetime import date as _date
+        result = gb.create_transaction(
+            description="Regular deposit",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Sales", "amount": "-100"},
+            ],
+            trans_date=_date(2026, 1, 1),
+        )
+        gb.delete_transaction(guid=result["guid"])  # no error
+
+
 # ============== Pay Invoice Tests ==============
 
 
