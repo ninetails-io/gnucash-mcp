@@ -598,6 +598,21 @@ class InvestmentsMixin:
                 if not include_closed and lot.is_closed:
                     continue
                 summary = self._lot_summary(lot)
+                # Skip lots with no remaining position in the default
+                # (open-positions) view. This catches three cases that
+                # all read the same to a portfolio manager: voided
+                # buys (GnuCash zeros the splits but preserves them
+                # in the lot), never-assigned lots, and lots that
+                # round-tripped to zero without being closed. All
+                # three appear as "0 shares, 0 cost basis" rows that
+                # add noise to a holdings listing. Available via
+                # ``include_closed=True`` for callers who need the
+                # full audit trail.
+                if (
+                    not include_closed
+                    and Decimal(summary["quantity"]) == 0
+                ):
+                    continue
                 results.append({
                     "guid": lot.guid,
                     "title": lot.title,
@@ -755,6 +770,22 @@ class InvestmentsMixin:
             remaining = Decimal(summary["quantity"])
 
             if remaining <= 0:
+                # Distinguish "lot ran to zero through sales" (normal,
+                # closed lot) from "lot has voided splits zeroing its
+                # purchase quantity" (likely an accounting mistake the
+                # caller should know about). GnuCash marks voided
+                # splits with reconcile_state='v'.
+                voided_split_count = sum(
+                    1 for s in lot.splits if s.reconcile_state == "v"
+                )
+                if voided_split_count:
+                    raise ValueError(
+                        f"Lot has no remaining shares — "
+                        f"{voided_split_count} split(s) in this lot "
+                        f"are voided, zeroing the lot's quantity. "
+                        f"Unvoid the underlying transaction(s) or "
+                        f"calculate gain on a different lot."
+                    )
                 raise ValueError("Lot has no remaining shares")
 
             if shares is not None:

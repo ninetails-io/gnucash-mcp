@@ -6541,12 +6541,62 @@ class TestVoidTransaction:
 
         assert result["status"] == "voided"
         assert result["void_reason"] == "Entered in error"
+        # Non-reconciled void: no warning surfaced.
+        assert "warning" not in result
 
         # Verify the transaction is voided (splits have 0 value and 'v' state)
         voided = gc_book.get_transaction(guid)
         for split in voided["splits"]:
             assert split["value"] == "0"
             assert split["reconcile_state"] == "v"
+
+    def test_void_transaction_warns_on_reconciled_splits(
+        self, test_book: Path,
+    ):
+        """Voiding a transaction that contains reconciled splits
+        breaks the reconciled balance for the affected accounts —
+        the bank statement that originally reconciled is no longer
+        accurate. Unlike ``delete_transaction`` (which blocks on
+        reconciled splits), voiding is an audit operation that
+        should never be silently rejected; the result includes a
+        ``warning`` field naming the affected account(s) so the
+        caller knows what they just broke."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions(compact=False)
+        guid = transactions[0]["guid"]
+
+        # Mark one split as reconciled before voiding.
+        txn = gc_book.get_transaction(guid)
+        target_split = txn["splits"][0]
+        target_account = target_split["account"]
+        gc_book.set_reconcile_state(
+            split_guid=target_split["guid"],
+            state="y",
+        )
+
+        result = gc_book.void_transaction(
+            guid, reason="Wrong amount entered",
+        )
+
+        # Void still succeeded.
+        assert result["status"] == "voided"
+        # And surfaced a warning naming the affected account.
+        assert "warning" in result
+        assert "reconciled" in result["warning"].lower()
+        assert target_account in result["warning"]
+
+    def test_void_transaction_no_warning_when_no_reconciled_splits(
+        self, test_book: Path,
+    ):
+        """Belt-and-suspenders: a clean (no reconciled splits)
+        void must not invent a warning."""
+        gc_book = GnuCashBook(str(test_book))
+        transactions = gc_book.list_transactions(compact=False)
+        result = gc_book.void_transaction(
+            transactions[0]["guid"], reason="Test",
+        )
+        assert "warning" not in result
 
     def test_void_transaction_no_reason(self, test_book: Path):
         """Should raise ValueError if no reason provided."""

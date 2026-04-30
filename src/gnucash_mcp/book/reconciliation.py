@@ -320,12 +320,25 @@ class ReconciliationMixin:
         all split values. Original values are stored in slots for potential
         unvoiding.
 
+        When the transaction contains reconciled splits, voiding them
+        breaks the reconciliation balance for the affected accounts —
+        the bank statement that originally reconciled is no longer
+        accurate. The void proceeds (audit trail trumps bookkeeping
+        cleanliness), but the result includes a ``warning`` field
+        listing the affected accounts so the caller can re-reconcile
+        or investigate as needed. Unlike ``delete_transaction`` (which
+        blocks on reconciled splits absent ``force=True``), voiding is
+        an audit operation that should never be silently rejected —
+        the warning is informational, not gating.
+
         Args:
             guid: Transaction GUID to void.
             reason: Reason for voiding (required for audit trail).
 
         Returns:
-            Dict with transaction details and status.
+            Dict with transaction details and status. When reconciled
+            splits were affected, also includes ``warning`` describing
+            the reconciliation impact.
 
         Raises:
             ValueError: If transaction not found or already voided.
@@ -340,6 +353,14 @@ class ReconciliationMixin:
 
             if any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is already voided")
+
+            # Detect reconciled splits BEFORE zeroing — capture the
+            # account names we'll cite in the warning.
+            reconciled_accounts = sorted({
+                s.account.fullname
+                for s in transaction.splits
+                if s.reconcile_state == "y"
+            })
 
             # Stage pre-void state — the VOID formatter renders "Was:
             # description (date)" plus the original splits from it.
@@ -363,12 +384,21 @@ class ReconciliationMixin:
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
             )
-            return {
+            result = {
                 "guid": short_guid,
                 "description": transaction.description,
                 "void_reason": reason,
                 "status": "voided",
             }
+            if reconciled_accounts:
+                result["warning"] = (
+                    f"Voided transaction contained "
+                    f"{len(reconciled_accounts)} reconciled "
+                    f"account(s): {', '.join(reconciled_accounts)}. "
+                    f"The reconciled balance for these accounts no "
+                    f"longer matches the cleared statement."
+                )
+            return result
 
     def unvoid_transaction(self, guid: str) -> dict:
         """Restore a voided transaction.
