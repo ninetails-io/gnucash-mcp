@@ -2763,6 +2763,48 @@ class TestGetBookSummaryLastEntry:
         assert "47 days behind" in last_line
         assert "⚠" in last_line
 
+    def test_last_entry_future_dated_does_not_call_yesterday(
+        self, tmp_path: Path,
+    ):
+        """Bookkeeper-found regression: when the most recent
+        transaction post_date is in the future (e.g. a scheduled-
+        transaction instantiation that posts ahead of time), the
+        line must not render as "(yesterday)" or "(N days
+        behind)". Future-dated transactions are normal — but a
+        date 31 days in the future shouldn't be called "yesterday."
+        """
+        # 31 days in the future = "next month" in the bookkeeper's
+        # repro case.
+        path = self._book_with_last_entry_n_days_ago(tmp_path, -31)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "future-dated" in last_line
+        assert "31 days ahead" in last_line
+        # Future-dated entries are not "behind" — no ⚠.
+        assert "⚠" not in last_line
+        # And specifically NOT mislabeled as recent past.
+        assert "yesterday" not in last_line
+        assert "behind" not in last_line
+
+    def test_last_entry_one_day_in_future_renders_future_dated(
+        self, tmp_path: Path,
+    ):
+        """Boundary: one day ahead is still future-dated, not
+        "today" — the cutoff is strictly ``days_behind >= 0``."""
+        path = self._book_with_last_entry_n_days_ago(tmp_path, -1)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "future-dated" in last_line
+        assert "1 days ahead" in last_line
+
 
 class TestGetBookSummaryUpcomingScheduled:
     """``Scheduled: N recurring, K due in next 7 days (...)`` — the

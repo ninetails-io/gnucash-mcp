@@ -1588,20 +1588,32 @@ class CoreMixin:
             # vs. "let's enter 200 transactions first" — the
             # answer pivots on this number.
             #
-            # ⚠ marker fires past _LAST_ENTRY_WARN_DAYS — 14 days
-            # is "behind" for any reasonable cadence (weekly,
-            # bi-weekly payroll, monthly bills). Beyond that we
-            # assume catch-up is needed.
+            # Four cases keyed on (today − last_date).days:
+            #   < 0  — future-dated. Normal for scheduled-txn
+            #          instantiation that posts ahead of time.
+            #          NOT a "behind" signal; render as
+            #          "(future-dated, N days ahead)".
+            #   = 0  — today.
+            #   = 1  — yesterday.
+            #   > 1  — N days behind. ⚠ past
+            #          _LAST_ENTRY_WARN_DAYS (14) — catch-up is
+            #          usually pending before reconciliation.
             if last_date is not None:
                 today = date.today()
                 days_behind = (today - last_date).days
-                if days_behind <= 1:
-                    rel = (
-                        "today" if days_behind == 0
-                        else "yesterday"
-                    )
+                if days_behind < 0:
+                    days_ahead = -days_behind
                     lines.append(
-                        f"Last entry: {last_date.isoformat()} ({rel})"
+                        f"Last entry: {last_date.isoformat()} "
+                        f"(future-dated, {days_ahead} days ahead)"
+                    )
+                elif days_behind == 0:
+                    lines.append(
+                        f"Last entry: {last_date.isoformat()} (today)"
+                    )
+                elif days_behind == 1:
+                    lines.append(
+                        f"Last entry: {last_date.isoformat()} (yesterday)"
                     )
                 else:
                     warn = (
