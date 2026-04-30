@@ -231,6 +231,147 @@ afterward via `delete_price`.
 
 ---
 
+## Fix 4: void-aware behavior in lot listing and gain calculation
+
+Voided splits are zombie splits — preserved for audit but zeroed.
+Two downstream display surfaces had to learn the same lesson the
+``unpost_invoice`` guard learned in Fix 1: zero-value splits are
+not real positions.
+
+### Setup (Alex's book)
+
+Pick any USD-denominated investment account that has at least one
+buy transaction. Alex's ``Assets:Investments:VTSAX`` works if it
+exists; otherwise ``Assets:Investments:S&P 500 ETF`` or any
+similar.
+
+```
+list_lots(account="<the investment account>", verbose=True)
+```
+
+Note any existing lots and their states. We'll add and void one
+without disturbing the rest.
+
+### Verifications
+
+**A. ``list_lots`` skips empty lots in the default view**
+
+Create a brand-new lot, then list. With nothing assigned, the
+new lot has zero remaining quantity:
+
+```
+create_lot(account="<the investment account>", title="DELETE ME — empty test")
+list_lots(account="<the investment account>")
+```
+
+Expect the new lot to be **absent** from the output. The default
+view is "open positions"; a zero-quantity lot doesn't qualify.
+
+Then:
+
+```
+list_lots(account="<the investment account>", include_closed=true, verbose=true)
+```
+
+Expect the new lot to **appear** with `quantity: 0.0000` and
+`cost_basis: 0.00`. ``include_closed=true`` is the audit-trail
+view that surfaces empty lots.
+
+**B. ``calculate_lot_gain`` calls out voided buys explicitly**
+
+This requires a slightly more involved setup — a lot whose buy
+transaction was voided. Skip if the live test would risk
+disturbing real lots; the unit-test coverage locks the message
+shape.
+
+Optional: against a scratch invoice/lot, post → assign → void
+the buy → call ``calculate_lot_gain``. Expect a
+`validation_error` containing the phrases *"no remaining
+shares"* and *"voided"* — not the generic message.
+
+**Cleanup:** delete the test lot via `close_lot` (close-then-skip
+is fine; lots can't be deleted directly).
+
+**Pass criteria for Fix 4:**
+- A: empty lot absent from default view, present with
+  ``include_closed=true``
+- B: voided-buy error mentions "voided" explicitly (or skip if
+  not exercised live)
+
+---
+
+## Fix 5: ``void_transaction`` warns on reconciled splits
+
+Voiding a transaction whose splits are reconciled breaks the
+reconciled balance for the affected accounts. The void should
+proceed (audit trail trumps bookkeeping cleanliness) but the
+result must include a ``warning`` naming the affected accounts
+so the bookkeeper knows what just got broken.
+
+### Setup (Lin Wei's book)
+
+Find an existing reconciled transaction:
+
+```
+get_unreconciled_splits(account="<some account>")
+```
+
+… or pick any transaction you know contains a reconciled split.
+A transaction Lin Wei voided previously was on her checking
+account; the test book ships with at least a few reconciled
+transactions tied to opening balances.
+
+If you'd rather create a fresh test, post a small transaction,
+mark its checking-side split reconciled via
+``set_reconcile_state(split_guid="...", state="y")``, then void
+that transaction.
+
+### Verifications
+
+**A. Void with reconciled splits → warning surfaced**
+
+```
+void_transaction(guid="<txn guid>", reason="Test cleanup")
+```
+
+Expect:
+- `status: "voided"` (the void went through)
+- `warning` field present, containing:
+  - the word "reconciled"
+  - the account name(s) of the reconciled splits
+  - language about the reconciled balance no longer matching the
+    cleared statement
+
+Example:
+```json
+{
+  "status": "voided",
+  "warning": "Voided transaction contained 1 reconciled account(s): Assets:Current Assets:Checking Account. The reconciled balance for these accounts no longer matches the cleared statement."
+}
+```
+
+**B. Void without reconciled splits → no warning**
+
+Sanity: pick any non-reconciled transaction, void it.
+
+```
+void_transaction(guid="<non-reconciled txn guid>", reason="Test")
+```
+
+Expect `status: "voided"` and **no** `warning` field. (A clean
+void must not invent a warning.)
+
+**Cleanup:** ``unvoid_transaction(guid="...")`` to restore both
+test voids if they affected real data. The reconciliation state
+restores along with the values.
+
+**Pass criteria for Fix 5:**
+- A: warning surfaces with the affected account name(s) and
+  reconciliation language
+- B: clean voids carry no warning
+
+---
+
 ## Cleanup
 
 After the test run, on whichever books you used:
@@ -250,11 +391,13 @@ If anything resists cleanup, that's interesting — flag it.
 
 ## Signoff
 
-Three lines back:
+Five lines back:
 
 - **Fix 1** (`unpost_invoice` + `delete_transaction` guard): ✅ / ❌ + notes
 - **Fix 2** (`delete_price`): ✅ / ❌ + notes
 - **Fix 3** (`get_book_summary` data range): ✅ / ❌ + notes
+- **Fix 4** (`list_lots` / `calculate_lot_gain` void-awareness): ✅ / ❌ + notes
+- **Fix 5** (`void_transaction` reconciled-splits warning): ✅ / ❌ + notes
 
-If all three are green, PR #62 is ready to merge to `develop`,
+If all five are green, PR #62 is ready to merge to `develop`,
 and that closes the 1.2.1 patch scope per the spec.
