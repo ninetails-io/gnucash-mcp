@@ -7847,6 +7847,130 @@ class TestPrices:
             assert stored[0].currency.mnemonic == "USD"
 
 
+class TestDeletePrice:
+    """Tests for delete_price — single-price removal with source
+    disambiguation. Closes a CRUD gap: pre-fix, callers had to use
+    raw SQL to remove a stale or test-injected price."""
+
+    def _setup_commodity(self, gc_book):
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Total Stock", namespace="FUND",
+        )
+
+    def test_delete_existing_price_returns_value_echo(
+        self, test_book: Path,
+    ):
+        """Echoing the deleted value lets the caller confirm they
+        removed the right one."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+        )
+
+        result = gc_book.delete_price(
+            commodity="VTSAX", namespace="FUND",
+            price_date=date(2026, 2, 7),
+        )
+
+        assert result["status"] == "deleted"
+        # piecash strips trailing zeros on Decimal storage, so the
+        # echoed value can be "127.5" even when stored as "127.50".
+        # Compare as Decimal.
+        assert Decimal(result["value"]) == Decimal("127.50")
+        assert result["date"] == "2026-02-07"
+
+        # Verify it's actually gone.
+        prices = gc_book.get_prices(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert prices["total"] == 0
+
+    def test_delete_unknown_commodity_raises(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Commodity not found"):
+            gc_book.delete_price(
+                commodity="NOPE", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+
+    def test_delete_no_match_raises(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        # Commodity exists, but no price on this date.
+        with pytest.raises(ValueError, match="No price found"):
+            gc_book.delete_price(
+                commodity="VTSAX", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+
+    def test_delete_ambiguous_without_source_raises(
+        self, test_book: Path,
+    ):
+        """When two prices on the same date come from different
+        sources, deleting without ``source`` would be destructive
+        in a non-deterministic way. Force the caller to choose."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:price",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.99",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:yfinance",
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            gc_book.delete_price(
+                commodity="VTSAX", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+        msg = str(exc_info.value)
+        # Error lists both sources and their values so the caller
+        # can target the right one on retry. piecash may strip
+        # trailing zeros from stored values; check the integer
+        # part to stay implementation-agnostic.
+        assert "user:price" in msg
+        assert "user:yfinance" in msg
+        assert "127.5" in msg
+        assert "127.99" in msg
+        assert "source=" in msg
+
+    def test_delete_with_source_disambiguates(self, test_book: Path):
+        """Specifying ``source`` selects exactly one of the
+        same-date entries, leaving the other intact."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:price",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.99",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:yfinance",
+        )
+
+        result = gc_book.delete_price(
+            commodity="VTSAX", namespace="FUND",
+            price_date=date(2026, 2, 7), source="user:yfinance",
+        )
+
+        assert Decimal(result["value"]) == Decimal("127.99")
+        # The other price stays put.
+        remaining = gc_book.get_prices(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert remaining["total"] == 1
+        assert Decimal(remaining["prices"][0]["value"]) == Decimal("127.50")
+        assert remaining["prices"][0]["source"] == "user:price"
+
+
 class TestInvestmentWorkflow:
     """Integration tests for the full investment workflow."""
 

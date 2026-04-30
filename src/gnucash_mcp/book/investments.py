@@ -247,6 +247,102 @@ class InvestmentsMixin:
 
             return result
 
+    def delete_price(
+        self,
+        commodity: str,
+        namespace: str,
+        price_date: date,
+        source: str | None = None,
+    ) -> dict:
+        """Delete a single price entry.
+
+        Identifies the price by ``(commodity, namespace, date)``.
+        When the same date has multiple prices for one commodity
+        (different sources, e.g. one user-entered and one fetched
+        from a feed), ``source`` disambiguates. If ``source`` is
+        omitted and multiple matches exist, raises with a list of
+        the matches so the caller can retry with the right source.
+
+        Args:
+            commodity: Symbol (e.g., "VTSAX", "USD", "EUR").
+            namespace: Namespace (e.g., "FUND", "CURRENCY").
+            price_date: Date of the price to delete.
+            source: Optional source tag (e.g., "user:price",
+                "user:yfinance"). Required to disambiguate when
+                multiple prices exist on the same commodity+date.
+
+        Returns:
+            Dict with the deleted price's commodity, date, value,
+            and ``status: "deleted"``. Echoing the value lets the
+            caller confirm they removed the right one.
+
+        Raises:
+            ValueError: If commodity not found, no matching price,
+                or multiple prices match without a ``source``
+                disambiguator.
+        """
+        with self.open(readonly=False) as book:
+            comm = self._find_commodity(book, commodity, namespace)
+            if not comm:
+                raise ValueError(
+                    f"Commodity not found: {namespace}:{commodity}"
+                )
+
+            matches = []
+            for p in book.prices:
+                if p.commodity != comm:
+                    continue
+                if _to_date(p.date) != price_date:
+                    continue
+                if source is not None and p.source != source:
+                    continue
+                matches.append(p)
+
+            if len(matches) == 0:
+                raise ValueError(
+                    f"No price found for {namespace}:{commodity} on "
+                    f"{price_date.isoformat()}"
+                    + (f" (source={source!r})" if source else "")
+                )
+
+            if len(matches) > 1:
+                # source omitted but multiple sources match — the
+                # caller's call would have been destructive without
+                # disambiguation. List what's there so they can retry.
+                summary = ", ".join(
+                    f"{p.source} ({p.value})" for p in matches
+                )
+                raise ValueError(
+                    f"Multiple prices found for {namespace}:{commodity} "
+                    f"on {price_date.isoformat()}: {summary}. "
+                    f"Specify source= to disambiguate."
+                )
+
+            target = matches[0]
+            # Capture before-state for audit log: source + value
+            # tell the human reader exactly what was deleted.
+            result = {
+                "commodity": commodity,
+                "namespace": namespace,
+                "currency": target.currency.mnemonic,
+                "date": price_date.isoformat(),
+                "value": str(target.value),
+                "source": target.source,
+                "status": "deleted",
+            }
+            self._stage_audit_before({
+                "commodity": commodity,
+                "namespace": namespace,
+                "date": price_date.isoformat(),
+                "value": str(target.value),
+                "source": target.source,
+            })
+
+            book.session.delete(target)
+            book.save()
+
+            return result
+
     def get_prices(
         self,
         commodity: str,

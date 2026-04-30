@@ -702,6 +702,25 @@ def _fmt_invoice_post(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_price_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+
+    namespace = params.get("namespace", "")
+    commodity = params.get("commodity", "")
+    head = f"{time_part}  DELETE PRICE  {namespace}:{commodity}"
+    if before:
+        date_str = before.get("date", "")
+        value = before.get("value", "")
+        source = before.get("source", "")
+        return [
+            head,
+            f"{_INDENT}date: {date_str}  value: {value}  source: {source}",
+        ]
+    return [head]
+
+
 def _fmt_invoice_unpost(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -809,6 +828,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("bill", "CREATE"): _fmt_bill_create,
     ("bill", "DELETE"): _fmt_bill_delete,
     ("entry", "CREATE"): _fmt_entry_create,
+    ("price", "DELETE"): _fmt_price_delete,
 }
 
 
