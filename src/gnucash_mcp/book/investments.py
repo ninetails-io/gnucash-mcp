@@ -151,7 +151,7 @@ class InvestmentsMixin:
         commodity: str,
         namespace: str,
         value: str,
-        currency: str = "USD",
+        currency: str | None = None,
         price_date: date | None = None,
         price_type: str = "nav",
         source: str = "user:price",
@@ -162,14 +162,21 @@ class InvestmentsMixin:
             commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
             namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
             value: Price per unit as decimal string (e.g., "250.45").
-            currency: Currency the price is denominated in. Default "USD".
+            currency: Currency the price is denominated in. Defaults to
+                the book's default currency. For non-USD-default books
+                (e.g. CNY) the default makes ``create_price(commodity=
+                "USD", value="7.30")`` mean "1 USD = 7.30 CNY", which
+                matches the bookkeeper's mental model. Pass explicitly
+                to store cross-currency pairs that don't involve the
+                book default.
             price_date: Price date. Defaults to today.
             price_type: Type of price: "nav", "last", "bid", "ask", "unknown".
                         Default "nav".
             source: Source identifier. Default "user:price".
 
         Returns:
-            Dict with commodity, date, value, type, and status.
+            Dict with commodity, date, value, type, currency (the
+            resolved currency mnemonic, not the input), and status.
 
         Raises:
             ValueError: If commodity not found or invalid currency.
@@ -184,14 +191,25 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
-            curr = self._get_or_create_currency(book, currency)
+            # Resolve currency: explicit input wins; otherwise default
+            # to the book's currency. Pre-fix, an unspecified currency
+            # silently became "USD" — which on a non-USD-default book
+            # stored prices like ``commodity=USD currency=USD`` (1 USD
+            # = X USD, nonsense), invisible to ``_find_exchange_rate``
+            # and silently shadowed by older valid prices on lookup.
+            if currency is None:
+                resolved_currency = self._require_default_currency(book)
+            else:
+                resolved_currency = self._get_or_create_currency(
+                    book, currency,
+                )
 
             # Check for existing price (same commodity/currency/date/source)
             existing = None
             for p in book.prices:
                 if (
                     p.commodity == comm
-                    and p.currency == curr
+                    and p.currency == resolved_currency
                     and _to_date(p.date) == price_date
                     and p.source == source
                 ):
@@ -205,7 +223,7 @@ class InvestmentsMixin:
                 # piecash expects datetime.date, not datetime.datetime
                 piecash.Price(
                     commodity=comm,
-                    currency=curr,
+                    currency=resolved_currency,
                     date=price_date,
                     value=_to_decimal(value),
                     type=price_type,
@@ -217,7 +235,10 @@ class InvestmentsMixin:
             result = {
                 "commodity": commodity,
                 "namespace": namespace,
-                "currency": currency,
+                # Echo the resolved mnemonic, not the input — the input
+                # might have been None (book default). This way the
+                # caller sees what was actually stored.
+                "currency": resolved_currency.mnemonic,
                 "date": price_date.isoformat(),
                 "value": value,
                 "type": price_type,

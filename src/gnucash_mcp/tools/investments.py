@@ -71,7 +71,7 @@ def register(mcp, get_book) -> None:
         commodity: str,
         namespace: str,
         value: str,
-        currency: str = "USD",
+        currency: str | None = None,
         date: str | None = None,
         price_type: str = "nav",
         source: str = "user:price",
@@ -85,7 +85,11 @@ def register(mcp, get_book) -> None:
             commodity: Symbol (e.g., "VTSAX").
             namespace: Commodity namespace (e.g., "FUND", "NASDAQ").
             value: Price per unit as decimal string (e.g., "250.45").
-            currency: ISO currency code. Default "USD".
+            currency: ISO currency code. Defaults to the book's default
+                currency — so ``create_price(commodity="USD", value="7.30")``
+                on a CNY-default book stores "1 USD = 7.30 CNY" (the
+                natural reading). Pass explicitly for cross-currency
+                pairs that don't involve the book default.
             date: ISO date (YYYY-MM-DD). Defaults to today.
             price_type: "nav" (default, mutual funds), "last", "bid",
                 "ask", or "unknown".

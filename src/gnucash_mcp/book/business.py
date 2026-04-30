@@ -229,48 +229,77 @@ class BusinessMixin:
     # simplicity.
     FX_GAIN_LOSS_PATH = "Income:Foreign Exchange Gain/Loss"
 
-    # Keywords that identify an existing user-named FX gain/loss
-    # account during the fuzzy fallback below. Bookkeepers commonly
-    # name this account "FX Gain Loss", "Forex Gains", "Currency
-    # Adjustment", etc. — the canonical
-    # "Foreign Exchange Gain/Loss" path the auto-create uses is one
-    # convention among many.
-    _FX_NAME_KEYWORDS = ("fx", "forex", "exchange", "currency")
+    # Substrings that identify a user-named FX gain/loss account on
+    # the leaf-name match below. Books in the wild use a wide range
+    # of names — "FX Gain Loss", "Currency Translation", "Foreign
+    # Exchange Gain/Loss", etc. — and the canonical name above is
+    # only one convention among many. Bare ``currency`` is excluded
+    # deliberately: too many books have accounts like "Foreign
+    # Currency Cash" that aren't gain/loss accounts.
+    _FX_NAME_KEYWORDS = (
+        "fx",
+        "forex",
+        "foreign exchange",
+        "currency gain",
+        "currency loss",
+        "exchange gain",
+        "exchange loss",
+        "currency translation",
+    )
 
-    def _get_or_create_fx_account(self, book):
+    def _get_or_create_fx_account(self, book, fx_account: str | None = None):
         """Find or lazily create the FX-gain/loss account.
+
+        Returns ``(account, notice)`` where ``notice`` is ``None`` in
+        the unambiguous cases and a dict describing the ambiguity
+        when the fuzzy match found multiple candidates and we fell
+        back to the canonical default.
 
         Resolution order:
 
-        1. Exact canonical path ``Income:Foreign Exchange Gain/Loss``
-           (the path this method auto-creates when nothing matches).
-        2. Fuzzy match — any INCOME or EXPENSE account whose name
-           contains "fx" / "forex" / "exchange" / "currency"
-           (case-insensitive). Bookkeepers commonly create accounts
-           like "Income:FX Gain Loss" before any cross-currency
-           activity; matching them prevents us from silently
-           creating a parallel canonical account, leaving the user
-           with two FX accounts where one carries the activity and
-           the other is orphaned.
-        3. Auto-create the canonical path under ``Income``.
+        1. **Explicit ``fx_account``** (path, ``%short``, or full
+           GUID) — caller wants a specific account. Validated for
+           existence and INCOME/EXPENSE type, then used.
+        2. **Fuzzy match**, leaf-name substring against
+           ``_FX_NAME_KEYWORDS`` over INCOME/EXPENSE accounts:
+           - Exactly one match → use it.
+           - Zero matches → fall through to the canonical default
+             (existing path lookup, then auto-create if absent).
+           - More than one match → fall through to the canonical
+             default *and* return a notice asking the caller to
+             pass ``fx_account`` next time. Don't guess between
+             user-created accounts.
+        3. **Canonical default**: existing ``Income:Foreign Exchange
+           Gain/Loss`` if present, else auto-create it under
+           ``Income``.
 
         Created on first cross-currency pay whose post-date rate
         differs from its pay-date rate, so books without foreign-
         currency activity never accumulate an unused account.
 
         Raises:
-            ValueError: If the parent ``Income`` account doesn't exist.
-                Caller must create it first — we won't auto-create a
-                top-level account.
+            ValueError: If ``fx_account`` is supplied but doesn't
+                exist or isn't INCOME/EXPENSE; or if no fuzzy match
+                exists and the parent ``Income`` account is missing.
         """
-        # Step 1: exact canonical path.
-        fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
-        if fx_acct is not None:
-            return fx_acct
+        # Layer 1: caller-supplied account wins.
+        if fx_account is not None:
+            acct = self._resolve_account(book, fx_account)
+            if acct is None:
+                raise ValueError(
+                    f"fx_account not found: {fx_account!r}. Pass a "
+                    f"full path, %short GUID, or full 32-char GUID "
+                    f"of an INCOME or EXPENSE account."
+                )
+            if acct.type not in {"INCOME", "EXPENSE"}:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is type "
+                    f"{acct.type}; must be INCOME or EXPENSE to "
+                    f"receive realized FX gain/loss."
+                )
+            return acct, None
 
-        # Step 2: fuzzy match against existing income/expense accounts.
-        # Sort by fullname for deterministic selection if multiple
-        # match (rare but possible).
+        # Layer 2: fuzzy match by leaf-name substring.
         candidates = []
         for account in book.accounts:
             if account.type not in {"INCOME", "EXPENSE"}:
@@ -278,9 +307,29 @@ class BusinessMixin:
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
                 candidates.append(account)
-        if candidates:
-            candidates.sort(key=lambda a: a.fullname)
-            return candidates[0]
+
+        notice = None
+        if len(candidates) == 1:
+            return candidates[0], None
+        if len(candidates) > 1:
+            sorted_paths = sorted(c.fullname for c in candidates)
+            notice = {
+                "type": "ambiguous_fx_account",
+                "candidates": sorted_paths,
+                "message": (
+                    f"Found {len(candidates)} candidate FX accounts "
+                    f"({', '.join(sorted_paths)}). Routed to "
+                    f"{self.FX_GAIN_LOSS_PATH} as the canonical "
+                    f"default; pass fx_account explicitly to "
+                    f"disambiguate."
+                ),
+            }
+            # Fall through to canonical default below.
+
+        # Layer 3: canonical default (existing or auto-create).
+        fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
+        if fx_acct is not None:
+            return fx_acct, notice
 
         income = self._find_account(book, "Income")
         if income is None:
@@ -308,7 +357,7 @@ class BusinessMixin:
                 "and pay-date). Auto-created on first use."
             ),
         )
-        return fx_acct
+        return fx_acct, notice
 
     @staticmethod
     def _rate_from_post_transaction(post_txn, invoice_currency):
@@ -1386,7 +1435,10 @@ class BusinessMixin:
             owner_id: Customer ID or vendor ID (human-readable '000001').
             date_opened: ISO date; defaults to now.
             notes: Free-text notes.
-            currency: ISO currency code; defaults to book default.
+            currency: ISO currency code; defaults to the owner's
+                currency (set when the customer/vendor was created),
+                falling back to the book's default if the owner has
+                no currency set.
             term: Billterm name; optional.
             doc_id: Custom invoice/bill number; auto-generated from the
                 relevant counter when omitted.
@@ -1425,7 +1477,31 @@ class BusinessMixin:
                     raise ValueError(f"Currency not found: {currency}")
                 currency_guid = currency_obj.guid
             else:
-                currency_guid = self._require_default_currency(book).guid
+                # Resolution order when currency isn't passed explicitly:
+                #   1. Owner's currency (customer/vendor) — every
+                #      business document inherits the trading
+                #      relationship's currency by default. A USD
+                #      vendor's bill should be USD, not the book's
+                #      default. This matches GnuCash desktop UI
+                #      behavior and the bookkeeper's mental model.
+                #   2. Book default — fallback for owners that have
+                #      no currency set (shouldn't happen with piecash
+                #      owners, but defensive).
+                #
+                # Pre-fix this fallback used book default unconditionally,
+                # which broke cross-currency posting for any book with
+                # foreign customers/vendors: bills against a USD vendor
+                # on a CNY book got created in CNY, then ``post_invoice``
+                # saw inv.currency == account.commodity and skipped the
+                # rate-conversion path entirely. $500 was then booked
+                # as ¥500.
+                owner_currency = getattr(owner, "currency", None)
+                if owner_currency is not None:
+                    currency_guid = owner_currency.guid
+                else:
+                    currency_guid = self._require_default_currency(
+                        book,
+                    ).guid
 
             term_guid = None
             if term:
@@ -1539,7 +1615,10 @@ class BusinessMixin:
             customer_id: Customer ID (e.g., '000001').
             date_opened: Date in ISO format. Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to book's default currency.
+            currency: ISO currency code. Defaults to the customer's
+                currency, falling back to the book's default. Pass
+                explicitly to override (rare — most invoices are in
+                the customer's currency).
             term: Billterm name (e.g., 'Net 30'). Optional.
             invoice_id: Custom invoice number. If omitted, auto-generates
                 from the book's invoice counter.
@@ -1572,7 +1651,10 @@ class BusinessMixin:
             vendor_id: Vendor ID (e.g., '000001').
             date_opened: Date in ISO format. Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to book's default currency.
+            currency: ISO currency code. Defaults to the vendor's
+                currency, falling back to the book's default. Pass
+                explicitly to override (rare — most bills are in the
+                vendor's currency).
             term: Billterm name (e.g., 'Net 30'). Optional.
             bill_id: Custom bill number. If omitted, auto-generates
                 from the book's bill counter.
@@ -2225,6 +2307,7 @@ class BusinessMixin:
         payment_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
+        fx_account: str | None = None,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
@@ -2240,6 +2323,24 @@ class BusinessMixin:
         recent price on or before the date, falling back to closest
         after). A clear error is raised if no matching price exists.
 
+        For cross-currency payments where the rate moved between
+        post-date and pay-date, a realized FX gain/loss split is
+        booked to an income/expense account. Routing rules (highest
+        priority first):
+
+        1. ``fx_account`` if supplied — must exist, must be
+           INCOME or EXPENSE.
+        2. Otherwise, the unique INCOME/EXPENSE account whose leaf
+           name matches one of "fx", "forex", "foreign exchange",
+           "currency gain/loss", "exchange gain/loss", "currency
+           translation".
+        3. Otherwise (zero matches OR multiple matches) the canonical
+           ``Income:Foreign Exchange Gain/Loss`` account, auto-
+           created if not present. If there were multiple
+           candidates, the result includes an ``fx_notice`` field
+           listing them so the caller can pass ``fx_account``
+           explicitly next time.
+
         Args:
             invoice_id: Human-readable ID (e.g., '000001').
             payment_account: Bank or cash account path.
@@ -2247,6 +2348,10 @@ class BusinessMixin:
             payment_date: ISO date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction.
             owner_type: 'customer' or 'vendor' for disambiguation.
+            fx_account: Optional account to receive any realized FX
+                gain/loss (cross-currency payments only). Accepts a
+                full path, ``%short`` GUID, or full 32-char GUID.
+                Must be an INCOME or EXPENSE account.
 
         Returns:
             Dict with payment details and remaining balance. For cross-
@@ -2255,7 +2360,8 @@ class BusinessMixin:
 
         Raises:
             ValueError: If invoice not found, not posted, invalid account,
-                or cross-currency payment with no exchange rate available.
+                cross-currency payment with no exchange rate available,
+                or ``fx_account`` is supplied but invalid.
         """
         ot = None
         if owner_type == "customer":
@@ -2403,6 +2509,7 @@ class BusinessMixin:
             fx_gain_loss = None
             fx_diff = Decimal("0")
             fx_acct = None
+            fx_notice = None
             if exchange_rate is not None:
                 rate_at_post = self._rate_from_post_transaction(
                     inv.post_txn, inv.currency
@@ -2413,7 +2520,9 @@ class BusinessMixin:
                     ).quantize(Decimal("0.01"))
                     fx_diff = pay_quantity - expected_at_post
                     if abs(fx_diff) >= Decimal("0.01"):
-                        fx_acct = self._get_or_create_fx_account(book)
+                        fx_acct, fx_notice = self._get_or_create_fx_account(
+                            book, fx_account=fx_account,
+                        )
                         # Customer (is_bill=False): we received MORE
                         # USD than income recorded → gain → credit
                         # income account (quantity = -fx_diff for a
@@ -2485,6 +2594,8 @@ class BusinessMixin:
                         "direction": direction,
                         "account": fx_acct.fullname,
                     }
+                    if fx_notice is not None:
+                        result["fx_notice"] = fx_notice
 
         return result
 

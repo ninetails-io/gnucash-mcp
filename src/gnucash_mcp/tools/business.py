@@ -265,7 +265,9 @@ def register(mcp, get_book) -> None:
             customer_id: Customer ID (e.g., "000001").
             date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to book's default currency.
+            currency: ISO currency code. Defaults to the customer's
+                currency, falling back to the book's default. Pass
+                explicitly to override.
             term: Billterm name (e.g., "Net 30"). Optional.
             invoice_id: Custom invoice number (e.g., "INV-2026-001"). If omitted,
                 auto-generates from the book's invoice counter.
@@ -295,7 +297,9 @@ def register(mcp, get_book) -> None:
             vendor_id: Vendor ID (e.g., "000001").
             date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to book's default currency.
+            currency: ISO currency code. Defaults to the vendor's
+                currency, falling back to the book's default. Pass
+                explicitly to override.
             term: Billterm name (e.g., "Net 30"). Optional.
             bill_id: Custom bill number (e.g., "BILL-2026-001"). If omitted,
                 auto-generates from the book's bill counter.
@@ -468,11 +472,24 @@ def register(mcp, get_book) -> None:
         payment_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
+        fx_account: str | None = None,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction from the specified bank/cash account
         to the invoice's A/R or A/P account. Partial payments are supported.
+
+        For cross-currency payments where the rate moved between
+        post-date and pay-date, a realized FX gain/loss split is
+        booked. Pass ``fx_account`` to control routing; otherwise
+        the server picks the unique INCOME/EXPENSE account whose
+        leaf name matches "fx", "forex", "foreign exchange",
+        "currency gain/loss", "exchange gain/loss", or "currency
+        translation". When zero or multiple match, the canonical
+        ``Income:Foreign Exchange Gain/Loss`` is used (auto-created
+        if absent), and an ``fx_notice`` is returned listing
+        ambiguous candidates so you can pass ``fx_account``
+        explicitly next time.
 
         Args:
             id: Invoice or bill ID (e.g., "000001").
@@ -481,6 +498,9 @@ def register(mcp, get_book) -> None:
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
             owner_type: "customer" or "vendor" for disambiguation.
+            fx_account: Optional INCOME or EXPENSE account to receive
+                realized FX gain/loss (cross-currency payments only).
+                Accepts a full path, %short GUID, or full 32-char GUID.
         """
         book = get_book()
         result = book.pay_invoice(
@@ -490,6 +510,7 @@ def register(mcp, get_book) -> None:
             payment_date=payment_date,
             description=description,
             owner_type=owner_type,
+            fx_account=fx_account,
         )
         return _json(result)
 
