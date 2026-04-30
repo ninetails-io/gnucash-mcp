@@ -158,6 +158,59 @@ class TestGetBookSummary:
         result = gc_book.get_book_summary()
         assert f"Book: {test_book}" in result
 
+    def test_data_range_uses_transaction_dates_not_prices(
+        self, test_book: Path,
+    ):
+        """The "Data range" line reflects transactions only, never
+        prices. Prices on dates outside the transaction range are
+        valid signals (forecast rates, NAVs the user pulls in
+        ahead of recording related transactions) and should NOT
+        stretch the displayed range — that misleads the LLM into
+        thinking there's transaction activity in periods where
+        none exists.
+
+        Lin Wei's CNY book hit a misread of this: transactions
+        ended 2025-12-31, test prices extended to 2026-04-30,
+        and the spec author thought the range was being polluted.
+        Locking the correct behavior here so a future refactor
+        can't accidentally union price dates back into the range.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(test_book))
+
+        # Add a transaction in 2025 so the range has a known boundary.
+        # The test_book fixture provides Assets:Checking and
+        # Income:Salary out of the box.
+        gc_book.create_transaction(
+            description="Range anchor",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=date(2025, 6, 15),
+        )
+
+        # Add a price WAY in the future. If the range loop ever
+        # starts scanning prices, this will stretch the upper bound.
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Total Stock", namespace="FUND",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="200.00",
+            currency="USD", price_date=date(2099, 1, 1),
+        )
+
+        summary = gc_book.get_book_summary()
+
+        # Data range should show 2025 only — not 2099.
+        data_range_lines = [
+            line for line in summary.splitlines()
+            if line.startswith("Data range:")
+        ]
+        assert len(data_range_lines) == 1
+        assert "2025" in data_range_lines[0]
+        assert "2099" not in data_range_lines[0]
+
     def test_investment_valued_at_latest_price(
         self, multi_currency_book: Path
     ):
@@ -6488,12 +6541,62 @@ class TestVoidTransaction:
 
         assert result["status"] == "voided"
         assert result["void_reason"] == "Entered in error"
+        # Non-reconciled void: no warning surfaced.
+        assert "warning" not in result
 
         # Verify the transaction is voided (splits have 0 value and 'v' state)
         voided = gc_book.get_transaction(guid)
         for split in voided["splits"]:
             assert split["value"] == "0"
             assert split["reconcile_state"] == "v"
+
+    def test_void_transaction_warns_on_reconciled_splits(
+        self, test_book: Path,
+    ):
+        """Voiding a transaction that contains reconciled splits
+        breaks the reconciled balance for the affected accounts —
+        the bank statement that originally reconciled is no longer
+        accurate. Unlike ``delete_transaction`` (which blocks on
+        reconciled splits), voiding is an audit operation that
+        should never be silently rejected; the result includes a
+        ``warning`` field naming the affected account(s) so the
+        caller knows what they just broke."""
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.list_transactions(compact=False)
+        guid = transactions[0]["guid"]
+
+        # Mark one split as reconciled before voiding.
+        txn = gc_book.get_transaction(guid)
+        target_split = txn["splits"][0]
+        target_account = target_split["account"]
+        gc_book.set_reconcile_state(
+            split_guid=target_split["guid"],
+            state="y",
+        )
+
+        result = gc_book.void_transaction(
+            guid, reason="Wrong amount entered",
+        )
+
+        # Void still succeeded.
+        assert result["status"] == "voided"
+        # And surfaced a warning naming the affected account.
+        assert "warning" in result
+        assert "reconciled" in result["warning"].lower()
+        assert target_account in result["warning"]
+
+    def test_void_transaction_no_warning_when_no_reconciled_splits(
+        self, test_book: Path,
+    ):
+        """Belt-and-suspenders: a clean (no reconciled splits)
+        void must not invent a warning."""
+        gc_book = GnuCashBook(str(test_book))
+        transactions = gc_book.list_transactions(compact=False)
+        result = gc_book.void_transaction(
+            transactions[0]["guid"], reason="Test",
+        )
+        assert "warning" not in result
 
     def test_void_transaction_no_reason(self, test_book: Path):
         """Should raise ValueError if no reason provided."""
@@ -7846,6 +7949,130 @@ class TestPrices:
             ]
             assert len(stored) == 1
             assert stored[0].currency.mnemonic == "USD"
+
+
+class TestDeletePrice:
+    """Tests for delete_price — single-price removal with source
+    disambiguation. Closes a CRUD gap: pre-fix, callers had to use
+    raw SQL to remove a stale or test-injected price."""
+
+    def _setup_commodity(self, gc_book):
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Total Stock", namespace="FUND",
+        )
+
+    def test_delete_existing_price_returns_value_echo(
+        self, test_book: Path,
+    ):
+        """Echoing the deleted value lets the caller confirm they
+        removed the right one."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+        )
+
+        result = gc_book.delete_price(
+            commodity="VTSAX", namespace="FUND",
+            price_date=date(2026, 2, 7),
+        )
+
+        assert result["status"] == "deleted"
+        # piecash strips trailing zeros on Decimal storage, so the
+        # echoed value can be "127.5" even when stored as "127.50".
+        # Compare as Decimal.
+        assert Decimal(result["value"]) == Decimal("127.50")
+        assert result["date"] == "2026-02-07"
+
+        # Verify it's actually gone.
+        prices = gc_book.get_prices(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert prices["total"] == 0
+
+    def test_delete_unknown_commodity_raises(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Commodity not found"):
+            gc_book.delete_price(
+                commodity="NOPE", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+
+    def test_delete_no_match_raises(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        # Commodity exists, but no price on this date.
+        with pytest.raises(ValueError, match="No price found"):
+            gc_book.delete_price(
+                commodity="VTSAX", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+
+    def test_delete_ambiguous_without_source_raises(
+        self, test_book: Path,
+    ):
+        """When two prices on the same date come from different
+        sources, deleting without ``source`` would be destructive
+        in a non-deterministic way. Force the caller to choose."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:price",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.99",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:yfinance",
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            gc_book.delete_price(
+                commodity="VTSAX", namespace="FUND",
+                price_date=date(2026, 2, 7),
+            )
+        msg = str(exc_info.value)
+        # Error lists both sources and their values so the caller
+        # can target the right one on retry. piecash may strip
+        # trailing zeros from stored values; check the integer
+        # part to stay implementation-agnostic.
+        assert "user:price" in msg
+        assert "user:yfinance" in msg
+        assert "127.5" in msg
+        assert "127.99" in msg
+        assert "source=" in msg
+
+    def test_delete_with_source_disambiguates(self, test_book: Path):
+        """Specifying ``source`` selects exactly one of the
+        same-date entries, leaving the other intact."""
+        gc_book = GnuCashBook(str(test_book))
+        self._setup_commodity(gc_book)
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:price",
+        )
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.99",
+            currency="USD", price_date=date(2026, 2, 7),
+            source="user:yfinance",
+        )
+
+        result = gc_book.delete_price(
+            commodity="VTSAX", namespace="FUND",
+            price_date=date(2026, 2, 7), source="user:yfinance",
+        )
+
+        assert Decimal(result["value"]) == Decimal("127.99")
+        # The other price stays put.
+        remaining = gc_book.get_prices(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert remaining["total"] == 1
+        assert Decimal(remaining["prices"][0]["value"]) == Decimal("127.50")
+        assert remaining["prices"][0]["source"] == "user:price"
 
 
 class TestInvestmentWorkflow:

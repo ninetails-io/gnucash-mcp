@@ -464,6 +464,33 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="unpost", entity_type="invoice")
+    def unpost_invoice(
+        id: str,
+        owner_type: str | None = None,
+    ) -> str:
+        """Reverse a posted invoice or bill.
+
+        Deletes the posting transaction and lot, and clears the
+        invoice's posted-state metadata. The invoice returns to
+        "open" state and can be edited or re-posted. Refuses if
+        the invoice has any payments applied — void payments first,
+        then unpost.
+
+        Args:
+            id: Invoice or bill ID (e.g., "000001").
+            owner_type: "customer" or "vendor" for disambiguation
+                when IDs collide.
+        """
+        book = get_book()
+        result = book.unpost_invoice(
+            invoice_id=id,
+            owner_type=owner_type,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="write", operation="pay", entity_type="invoice")
     def pay_invoice(
         id: str,

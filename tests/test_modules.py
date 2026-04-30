@@ -52,14 +52,13 @@ class TestToolModulesMapping:
         assert len(TOOL_MODULES["core"]) == 15
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 82.
+        """Total tools across all modules should be 84.
 
-        82 = 78 pre-Employee + 4 Employee CRUD tools (create_employee,
-        list_employees, get_employee, delete_employee) added in the
-        feat/employees branch.
+        84 = 78 pre-Employee + 4 Employee CRUD (1.2.0) +
+        2 from the 1.2.1 patch (``unpost_invoice``, ``delete_price``).
         """
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 82
+        assert total == 84
 
     def test_expected_modules_exist(self):
         """All expected module names should be present."""
@@ -73,6 +72,85 @@ class TestToolModulesMapping:
     def test_validate_tool_modules_passes(self):
         """Validation should pass with the current mapping."""
         _validate_tool_modules()  # Should not raise
+
+
+class TestToolFileVsModulesMapping:
+    """Each ``tools/<module>.py`` file's ``@mcp.tool()`` decorations
+    must match the corresponding entry in ``TOOL_MODULES`` exactly.
+
+    Bug class this prevents: a tool added with ``@mcp.tool()`` in
+    ``tools/<module>.py`` but missing from ``TOOL_MODULES`` gets
+    *registered* during lazy-load, then immediately *removed* by
+    ``_apply_module_filter``'s "drop anything not in the keep set"
+    step. The tool is invisible at runtime even though the
+    decorator fired and the function exists. Symptom is "I bounced
+    the server, the new tool still doesn't show up" — and the
+    earlier ``test_registered_tools_are_a_subset_of_mapped`` check
+    silently passes because the unmapped tool was already removed
+    by the filter.
+
+    The reverse — a name in ``TOOL_MODULES`` that no file actually
+    defines — is just as bad: ``_apply_module_filter`` will
+    silently keep the missing tool in its ``keep`` set without
+    error, but ``mcp.remove_tool`` won't be called on a non-
+    existent tool, so the symptom is just "this tool is in the
+    docs but doesn't work."
+
+    Both omissions slipped through PR #62 (``unpost_invoice`` and
+    ``delete_price`` defined but not in ``TOOL_MODULES``) before
+    Claude Chat caught them mid-test. This class locks the
+    contract.
+    """
+
+    @pytest.fixture(autouse=True)
+    def save_and_restore_tools(self):
+        original = dict(mcp._tool_manager._tools)
+        yield
+        mcp._tool_manager._tools.clear()
+        mcp._tool_manager._tools.update(original)
+
+    @pytest.mark.parametrize("module_name", sorted(TOOL_MODULES.keys()))
+    def test_module_file_decorations_match_mapping(
+        self, module_name: str,
+    ):
+        """For each module: load it, capture the tool names that
+        actually got registered, compare to ``TOOL_MODULES[name]``."""
+        from gnucash_mcp.book import extracted_modules
+        from gnucash_mcp.server import _lazy_load_tool_module
+
+        # Skip non-extracted modules (their tools register at server
+        # import time, not via the lazy-load path). Extracted modules
+        # are the ones with a tools/<name>.py file.
+        if module_name not in extracted_modules():
+            pytest.skip(f"{module_name!r} is not an extracted module")
+
+        # Reset to a clean slate so we can attribute new registrations
+        # to this specific module's load.
+        mcp._tool_manager._tools.clear()
+        before = set(mcp._tool_manager._tools.keys())
+        _lazy_load_tool_module(module_name)
+        after = set(mcp._tool_manager._tools.keys())
+        actually_registered = after - before
+
+        mapped = set(TOOL_MODULES[module_name])
+
+        unmapped = actually_registered - mapped
+        assert not unmapped, (
+            f"Module {module_name!r}: tools have @mcp.tool() in "
+            f"tools/{module_name}.py but are missing from "
+            f"TOOL_MODULES[{module_name!r}]: {sorted(unmapped)}. "
+            f"Add them to the mapping or _apply_module_filter will "
+            f"silently remove them after registration."
+        )
+
+        phantom = mapped - actually_registered
+        assert not phantom, (
+            f"Module {module_name!r}: TOOL_MODULES[{module_name!r}] "
+            f"lists tools that aren't defined in "
+            f"tools/{module_name}.py: {sorted(phantom)}. "
+            f"Either add the @mcp.tool() in the file or remove the "
+            f"name from the mapping."
+        )
 
 
 class TestApplyModuleFilter:
@@ -90,9 +168,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 82 tools."""
+        """--modules=all should keep all 84 tools."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 82
+        assert len(self._tool_names()) == 84
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to core + backup.
@@ -128,12 +206,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 82
+        assert len(self._tool_names()) == 84
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 82 tools."""
+        """'all' mixed with other modules should keep all 84 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 82
+        assert len(self._tool_names()) == 84
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""

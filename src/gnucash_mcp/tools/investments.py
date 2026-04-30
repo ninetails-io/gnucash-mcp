@@ -111,6 +111,39 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="price")
+    def delete_price(
+        commodity: str,
+        namespace: str,
+        date: str,
+        source: str | None = None,
+    ) -> str:
+        """Delete a single price entry.
+
+        Identifies the price by ``(commodity, namespace, date)``.
+        Pass ``source`` to disambiguate when multiple prices exist
+        on the same commodity+date (e.g. one user-entered and one
+        fetched from a feed).
+
+        Args:
+            commodity: Symbol (e.g., "VTSAX", "USD", "EUR").
+            namespace: Namespace (e.g., "FUND", "CURRENCY").
+            date: ISO date (YYYY-MM-DD) of the price to delete.
+            source: Optional source tag (e.g., "user:price",
+                "user:yfinance"). Required when multiple prices
+                exist on the same commodity+date.
+        """
+        book = get_book()
+        result = book.delete_price(
+            commodity=commodity,
+            namespace=namespace,
+            price_date=date_type.fromisoformat(date),
+            source=source,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="read")
     def get_prices(
         commodity: str,

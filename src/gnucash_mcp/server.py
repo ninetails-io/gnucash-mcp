@@ -141,6 +141,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "assign_split_to_lot",
         "calculate_lot_gain",
         "close_lot",
+        "delete_price",
     ],
     "admin": [
         "get_account_slots",
@@ -179,6 +180,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_vendor",
         "delete_employee",
         "get_outstanding_invoices",
+        "unpost_invoice",
         "vendor_spending_report",
     ],
 }

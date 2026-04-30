@@ -3214,6 +3214,26 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
+            # Reject if this transaction is the posting record for
+            # an invoice or bill. Deleting it directly orphans the
+            # invoice's posted-state metadata (date_posted, post_txn,
+            # post_lot, post_acc fields all reference objects that
+            # no longer exist) — the invoice then refuses both
+            # delete ("posted") and re-post ("already posted") and
+            # the only escape is SQL surgery. Force the caller
+            # through unpost_invoice, which clears the metadata as
+            # part of removing the transaction.
+            from sqlalchemy import text
+            posting_for = book.session.execute(
+                text("SELECT id FROM invoices WHERE post_txn = :guid"),
+                {"guid": transaction.guid},
+            ).fetchone()
+            if posting_for:
+                raise ValueError(
+                    f"Transaction is the posting record for invoice "
+                    f"{posting_for[0]}. Use unpost_invoice first."
+                )
+
             # Check for reconciled splits
             reconciled = [
                 s for s in transaction.splits if s.reconcile_state == "y"

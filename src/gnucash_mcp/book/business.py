@@ -2334,6 +2334,137 @@ class BusinessMixin:
 
         return result
 
+    def unpost_invoice(
+        self,
+        invoice_id: str,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Unpost a previously-posted invoice or bill.
+
+        Reverses ``post_invoice`` cleanly: deletes the posting
+        transaction and its splits, removes the posting lot, and
+        clears the invoice's posted-state metadata
+        (``date_posted``, ``post_txn``, ``post_lot``,
+        ``post_account``). The invoice returns to "open" state and
+        is editable again — entries can be added/changed and the
+        invoice can be re-posted.
+
+        Refuses if the invoice has any payments applied (the lot
+        contains splits beyond the original A/R posting). Unposting
+        a partially-paid invoice would orphan the payment splits
+        and corrupt the lot's balance accounting; the caller must
+        void payments first.
+
+        Args:
+            invoice_id: Human-readable ID (e.g., '000001').
+            owner_type: 'customer' or 'vendor' for cross-sequence
+                ID disambiguation. Required when the same numeric
+                ID exists for both an invoice and a bill.
+
+        Returns:
+            ``{"id": "000015", "type": "invoice", "status": "unposted"}``.
+
+        Raises:
+            ValueError: If the invoice/bill isn't found, isn't posted,
+                or has payments applied.
+        """
+        ot = None
+        if owner_type == "customer":
+            ot = 2
+        elif owner_type == "vendor":
+            ot = 4
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv:
+                raise ValueError(
+                    f"Invoice/bill not found: {invoice_id}"
+                )
+
+            if not _is_invoice_posted(inv):
+                raise ValueError(
+                    f"Invoice {invoice_id} is not posted"
+                )
+
+            is_bill = inv.owner_type == 4
+            doc_label = "Bill" if is_bill else "Invoice"
+
+            # Capture before-state for the audit log: the user wants
+            # to see what they unposted ("was posted: 2026-04-01,
+            # post_account: Assets:Receivables:..."). Read pre-clear
+            # so the values are still set on the ORM object.
+            prev_post_date = _safe_date_posted(inv)
+            prev_post_account = (
+                inv.post_account.fullname if inv.post_account else None
+            )
+            self._stage_audit_before({
+                "id": inv.id,
+                "type": "bill" if is_bill else "invoice",
+                "date_posted": (
+                    str(prev_post_date.date()) if prev_post_date else None
+                ),
+                "post_account": prev_post_account,
+            })
+
+            txn = inv.post_txn
+            lot = inv.post_lot
+
+            # Reject when there are *live* (non-voided) payment splits
+            # in the lot. The lot starts with one split — the A/R
+            # debit/credit from the posting transaction. Each
+            # ``pay_invoice`` call adds one more split. A voided
+            # transaction in GnuCash preserves its splits with zeroed
+            # values for audit-trail purposes, so a naive
+            # ``len(lot.splits) > 1`` check counts voided payments as
+            # still-applied — which contradicts GnuCash's void
+            # semantics ("voided" means "neutralize the economic
+            # effect, preserve the record"). Filter to splits that
+            # are (a) not part of the posting transaction itself and
+            # (b) carry non-zero value.
+            posting_txn_guid = txn.guid if txn else None
+            real_payment_splits = []
+            if lot is not None:
+                for s in lot.splits:
+                    if (
+                        posting_txn_guid is not None
+                        and s.transaction_guid == posting_txn_guid
+                    ):
+                        continue
+                    if Decimal(str(s.value)) == 0:
+                        continue
+                    real_payment_splits.append(s)
+            if real_payment_splits:
+                raise ValueError(
+                    f"{doc_label} {invoice_id} has payments applied. "
+                    f"Void payments first, then unpost."
+                )
+
+            # Clear the invoice's posted-state pointers BEFORE
+            # deleting the underlying transaction/lot. Otherwise the
+            # ORM cascade may resurrect the references via the
+            # relationships and trip on dangling FKs at flush.
+            inv.date_posted = None
+            inv.post_txn = None
+            inv.post_lot = None
+            inv.post_account = None
+            book.flush()
+
+            # Delete the posting transaction (which cascades its
+            # splits) and the lot (now empty after the inv.post_lot
+            # = None nullified the only split-lot link).
+            if txn is not None:
+                book.session.delete(txn)
+            if lot is not None:
+                book.session.delete(lot)
+
+            book.save()
+
+            return {
+                "id": inv.id,
+                "type": "bill" if is_bill else "invoice",
+                "status": "unposted",
+            }
+
     def pay_invoice(
         self,
         invoice_id: str,
