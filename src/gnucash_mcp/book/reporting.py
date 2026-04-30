@@ -272,11 +272,23 @@ class ReportingMixin:
         should fall back to ``split.value`` (transaction-currency
         amount), which correctly reflects cost basis for USD-
         denominated investment buys.
+
+        Template accounts (under ``book.root_template``) are
+        excluded from the map. Today no caller looks up template
+        GUIDs in the result — they all start from
+        ``_resolve_account``-validated GUIDs that already exclude
+        templates — so this is hygiene rather than a bug fix.
+        Keeps the map honest about what it represents (user
+        chart only) and prevents a future caller from accidentally
+        getting a factor for scaffolding.
         """
         default_currency = self._require_default_currency(book)
         rates = self._latest_market_rates(book)
+        template_guids = self._template_account_guids(book)
         factors: dict[str, Decimal | None] = {}
         for acct in book.accounts:
+            if acct.guid in template_guids:
+                continue
             if acct.commodity == default_currency:
                 factors[acct.guid] = Decimal("1")
             else:
@@ -1010,7 +1022,18 @@ class ReportingMixin:
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
 
+            # Template accounts (scheduled-transaction
+            # scaffolding) inherit type=CREDIT/LIABILITY from
+            # their parent in the user's chart and could
+            # technically carry an ``apr`` slot if anyone managed
+            # to set one — pathological but possible. Filter
+            # upfront so the avalanche schedule never includes
+            # template balances. Defense-in-depth, not a bug fix.
+            template_guids = self._template_account_guids(book)
+
             for account in book.accounts:
+                if account.guid in template_guids:
+                    continue
                 if account.type not in debt_types:
                     continue
 

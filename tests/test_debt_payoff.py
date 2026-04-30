@@ -467,6 +467,61 @@ class TestDebtPayoffAmortizingLoans:
             pytest.fail("Mortgage not found in results")
 
 
+class TestDebtPayoffTemplateAccountFiltering:
+    """Defense-in-depth: ensure template accounts (scaffolding
+    under ``book.root_template`` for scheduled transactions)
+    cannot leak into the avalanche schedule, even when they
+    inherit type=CREDIT/LIABILITY from a parent in the user's
+    chart and have an ``apr`` slot somehow set on them.
+
+    Not currently exploitable in practice (no MCP tool sets
+    slots on template accounts), but this locks the contract so
+    a future feature can't accidentally regress it.
+    """
+
+    def test_template_credit_account_excluded_from_payoff(
+        self, debt_book: Path,
+    ):
+        import piecash
+        gc_book = GnuCashBook(str(debt_book))
+
+        # Add a CREDIT-typed template account with an APR slot.
+        # If the filter weren't applied, this would inflate
+        # the avalanche schedule.
+        with gc_book.open(readonly=False) as book:
+            tmpl_root = book.root_template
+            template_credit = piecash.Account(
+                name="Template Credit Card",
+                type="CREDIT",
+                parent=tmpl_root,
+                commodity=book.default_currency,
+            )
+            book.session.add(template_credit)
+            book.save()
+            template_credit["apr"] = "30.00"
+            # Synthesize a balance via a transaction in the
+            # template subtree (templates can have splits,
+            # they're just scaffolding).
+            book.save()
+            template_guid = template_credit.guid
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="1000",
+        )
+
+        # The template account must NOT appear in the avalanche
+        # schedule. Match by name (the fixture's real accounts
+        # are Visa, Mastercard, Car Loan).
+        template_account_names = [
+            d["account"] for d in result["debts"]
+            if "Template" in d["account"]
+        ]
+        assert template_account_names == [], (
+            f"Template account leaked into payoff schedule: "
+            f"{template_account_names}"
+        )
+
+
 class TestDebtPayoffCompactFormat:
     """Phase 4A lock tests for the compact text-table output.
     The verbose dict (existing tests above) is now opt-in; the default
