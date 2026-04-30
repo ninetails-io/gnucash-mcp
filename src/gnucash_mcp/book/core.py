@@ -107,6 +107,15 @@ class CoreMixin:
     # ~2-week grace period.
     _RECONCILE_WARN_DAYS = 45
 
+    # "Last transaction" staleness threshold for the book-summary
+    # warning. Beyond this many days since the most recent
+    # transaction post_date, the dashboard's "Last entry" line
+    # earns a ⚠. Tuned for typical entry cadences: weekly /
+    # bi-weekly payroll and monthly bills will both stay current
+    # under 14 days; longer gaps usually mean catch-up work is
+    # pending before reconciliation makes sense.
+    _LAST_ENTRY_WARN_DAYS = 14
+
     def _account_reconciliation_status(
         self, book: piecash.Book,
     ) -> list[dict]:
@@ -189,18 +198,37 @@ class CoreMixin:
                     if latest_y_date is None or pd > latest_y_date:
                         latest_y_date = pd
 
+            # Count unreconciled splits past the last 'y' date (or
+            # all of them when never reconciled). This becomes the
+            # "47 splits unreconciled since DATE" payload — the LLM
+            # uses the count to plan the reconciliation pass: 12
+            # splits is a single sitting, 400 is "let's narrow by
+            # month." 'c' (cleared) splits count as unreconciled
+            # for this purpose; they're not finalized.
             if latest_y_date is None:
+                unreconciled_count = sum(
+                    1 for s in account.splits
+                    if s.reconcile_state != "y"
+                )
                 results.append({
                     "account": account.fullname,
                     "status": "never reconciled",
                     "days_behind": None,
+                    "unreconciled_count": unreconciled_count,
                 })
             else:
                 days_behind = (today - latest_y_date).days
+                unreconciled_count = sum(
+                    1 for s in account.splits
+                    if s.reconcile_state != "y"
+                    and s.transaction.post_date > latest_y_date
+                )
                 results.append({
                     "account": account.fullname,
                     "status": f"through {latest_y_date.isoformat()}",
                     "days_behind": days_behind,
+                    "unreconciled_count": unreconciled_count,
+                    "latest_y_date": latest_y_date.isoformat(),
                 })
 
         results.sort(key=lambda r: r["account"])
@@ -1307,6 +1335,7 @@ class CoreMixin:
         """
         return f"{int(net):+,}"
 
+
     @staticmethod
     def _format_reconciliation_lag(days_behind: int) -> str:
         """Render a parenthesized "(N months behind)" / "(N days
@@ -1550,6 +1579,41 @@ class CoreMixin:
             if first_date and last_date:
                 lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
 
+            # Last entry: how stale are the books? The data range
+            # tells the LLM what's covered; this line tells it
+            # whether the books are caught up (entered through
+            # yesterday) or whether there's a backlog of
+            # transactions to enter before reconciliation makes
+            # sense. The bookkeeper's framing: "let's reconcile"
+            # vs. "let's enter 200 transactions first" — the
+            # answer pivots on this number.
+            #
+            # ⚠ marker fires past _LAST_ENTRY_WARN_DAYS — 14 days
+            # is "behind" for any reasonable cadence (weekly,
+            # bi-weekly payroll, monthly bills). Beyond that we
+            # assume catch-up is needed.
+            if last_date is not None:
+                today = date.today()
+                days_behind = (today - last_date).days
+                if days_behind <= 1:
+                    rel = (
+                        "today" if days_behind == 0
+                        else "yesterday"
+                    )
+                    lines.append(
+                        f"Last entry: {last_date.isoformat()} ({rel})"
+                    )
+                else:
+                    warn = (
+                        " ⚠"
+                        if days_behind > self._LAST_ENTRY_WARN_DAYS
+                        else ""
+                    )
+                    lines.append(
+                        f"Last entry: {last_date.isoformat()} "
+                        f"({days_behind} days behind){warn}"
+                    )
+
             # Warnings: scan-first section. Lives near the top of
             # the output (right after book metadata) because if
             # there's data integrity trouble or stale prices
@@ -1664,9 +1728,26 @@ class CoreMixin:
                 for entry in stale:
                     leaf = entry["account"].split(":")[-1]
                     lag = self._format_reconciliation_lag(entry["days_behind"])
-                    lines.append(
-                        f"  {leaf}: {entry['status']} {lag} ⚠"
-                    )
+                    # Sub-line shape: "47 splits unreconciled since
+                    # 2025-12-30 (4 months behind) ⚠". The split
+                    # count tells the LLM the *scope* of the
+                    # reconciliation work — 12 splits is one
+                    # sitting; 400 needs a month-by-month strategy.
+                    # Pre-fix the line was just "through DATE (4
+                    # months behind)" which gave staleness without
+                    # scope.
+                    n = entry["unreconciled_count"]
+                    if n > 0 and "latest_y_date" in entry:
+                        plural = "s" if n != 1 else ""
+                        since = entry["latest_y_date"]
+                        lines.append(
+                            f"  {leaf}: {n} split{plural} "
+                            f"unreconciled since {since} {lag} ⚠"
+                        )
+                    else:
+                        lines.append(
+                            f"  {leaf}: {entry['status']} {lag} ⚠"
+                        )
                 if current_count:
                     plural = "s" if current_count != 1 else ""
                     lines.append(
@@ -1754,7 +1835,37 @@ class CoreMixin:
             lines.append(f"Transactions: {total_txns}")
 
             if enabled_sx > 0:
-                lines.append(f"Scheduled: {enabled_sx} recurring")
+                # Roll the "due in next 7 days" stat into the
+                # Scheduled line so the LLM sees the immediate
+                # to-do list at orientation time, no second tool
+                # call needed. The bookkeeper's framing: the
+                # dashboard answers "what is the state"; this
+                # turns it into "what do I need to do next."
+                #
+                # ``_upcoming_within_days`` lives on
+                # SchedulingMixin; ``hasattr`` lets a book class
+                # built without scheduling skip the upcoming-line
+                # render cleanly. Cross-mixin call avoided in
+                # favor of opportunistic inclusion.
+                line = f"Scheduled: {enabled_sx} recurring"
+                if hasattr(self, "_upcoming_within_days"):
+                    upcoming = self._upcoming_within_days(
+                        book, days=7,
+                    )
+                    if upcoming["count"] > 0:
+                        plural = (
+                            "s" if upcoming["count"] != 1 else ""
+                        )
+                        # Whole-currency-unit total — this is a
+                        # planning number, not an accounting line.
+                        total_int = int(upcoming["total"])
+                        line += (
+                            f", {upcoming['count']} due in next "
+                            f"7 days ({currency} {total_int:,})"
+                        )
+                    else:
+                        line += ", none due in next 7 days"
+                lines.append(line)
 
             # Business + budgets — one line each, only if present
             if n_customers or n_vendors or n_employees:
