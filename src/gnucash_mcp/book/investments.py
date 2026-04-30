@@ -255,7 +255,8 @@ class InvestmentsMixin:
         end_date: date | None = None,
         currency: str | None = None,
         limit: int | None = None,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Get price history for a commodity.
 
         Args:
@@ -314,12 +315,37 @@ class InvestmentsMixin:
                 suggest_narrow=True,
             )
 
-            return {
+            full = {
                 "prices": prices,
                 "count": len(prices),
                 "total": total,
                 "notice": notice,
             }
+            if not compact:
+                return full
+
+            # Compact format: one line per price, columns aligned.
+            # Format::
+            #
+            #     2026-04-30  273.43  USD  last      yfinance
+            #     2026-03-31  253.79  USD  last      yfinance
+            if not prices:
+                return notice or "No prices found."
+            value_w = max(len(p["value"]) for p in prices)
+            type_w = max(len(p.get("type") or "") for p in prices)
+            ccy_w = max(len(p["currency"]) for p in prices)
+            lines = []
+            for p in prices:
+                lines.append(
+                    f"{p['date']}  "
+                    f"{p['value']:>{value_w}}  "
+                    f"{p['currency']:<{ccy_w}}  "
+                    f"{(p.get('type') or ''):<{type_w}}  "
+                    f"{p.get('source') or ''}"
+                )
+            if notice:
+                lines.append(notice)
+            return "\n".join(lines)
 
     def get_latest_price(
         self,
@@ -544,10 +570,19 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {guid}")
 
+            # Build a collision-safe prefix map across every split in
+            # the book — the LLM can paste any short prefix back into
+            # ``set_reconcile_state`` / ``assign_split_to_lot`` etc.
+            # and ``_resolve_guid("splits", ...)`` will resolve it.
+            all_split_guids = (
+                s.guid for txn in book.transactions for s in txn.splits
+            )
+            prefixes = _guid_prefix_map(all_split_guids)
+
             splits = []
             for split in lot.splits:
                 splits.append({
-                    "guid": split.guid,
+                    "guid": prefixes.get(split.guid, split.guid),
                     "date": split.transaction.post_date.isoformat(),
                     "description": split.transaction.description,
                     "quantity": str(split.quantity),
@@ -555,6 +590,10 @@ class InvestmentsMixin:
                 })
 
             summary = self._lot_summary(lot)
+            # Phase 6A: ``is_closed`` already lives at the top level
+            # of this response. Drop it from the nested ``summary``
+            # so callers see the field once, not twice.
+            summary_compact = {k: v for k, v in summary.items() if k != "is_closed"}
 
             return {
                 "guid": lot.guid,
@@ -563,7 +602,7 @@ class InvestmentsMixin:
                 "notes": lot.notes or "",
                 "is_closed": bool(lot.is_closed),
                 "splits": splits,
-                "summary": summary,
+                "summary": summary_compact,
             }
 
     def assign_split_to_lot(
@@ -616,15 +655,22 @@ class InvestmentsMixin:
             summary = self._lot_summary(lot)
 
             # Auto-close if quantity reaches zero; GnuCash uses -1 for boolean true
+            auto_closed = False
             if Decimal(summary["quantity"]) == 0 and len(lot.splits) > 0:
                 lot.is_closed = -1
                 book.save()
-                summary["is_closed"] = True
+                auto_closed = True
 
             # split_guid and lot_guid are echoed inputs — dropped.
-            # Summary (quantity, cost_basis, cost_per_share, is_closed)
-            # is the post-assignment state, the actually-useful info.
-            return {"status": "assigned", **summary}
+            # ``is_closed`` is included on this response (Phase 6A
+            # removed it from ``_lot_summary``, but the auto-close
+            # behavior of this tool is exactly what the caller wants
+            # to know about — keep it surfaced here).
+            return {
+                "status": "assigned",
+                **summary,
+                "is_closed": auto_closed or bool(lot.is_closed),
+            }
 
     def calculate_lot_gain(
         self,

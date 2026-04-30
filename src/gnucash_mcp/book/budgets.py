@@ -22,6 +22,207 @@ from gnucash_mcp.book._base import (
 )
 
 
+def _collapse_period_runs(
+    periods: dict[int, str], num_periods: int,
+) -> str:
+    """Render an account's period amounts as a compact run-string.
+
+    Example outputs:
+      ``"250/mo (all periods)"``
+      ``"300/mo (P0-5,P8-11), 600/mo (P6-7)"``
+      ``"100/mo (P0-10), 800/mo (P11)"``
+
+    Groups consecutive periods that share the same amount into runs.
+    Most monthly budgets are uniform across all periods, so the common
+    case is the simple "all periods" form.
+    """
+    if not periods:
+        return "—"
+
+    # Build a per-period amount list (filling missing periods with "0").
+    per_period = [periods.get(i, "0") for i in range(num_periods)]
+
+    # If every period has the same value, the simple form wins.
+    unique_amounts = set(per_period)
+    if len(unique_amounts) == 1:
+        amt = per_period[0]
+        return f"{amt}/mo (all periods)"
+
+    # Build runs of consecutive periods that share the same amount.
+    runs: list[tuple[str, int, int]] = []
+    run_start = 0
+    run_amount = per_period[0]
+    for i in range(1, num_periods):
+        if per_period[i] != run_amount:
+            runs.append((run_amount, run_start, i - 1))
+            run_start = i
+            run_amount = per_period[i]
+    runs.append((run_amount, run_start, num_periods - 1))
+
+    # Group runs by amount so "P0-5,P8-11" forms naturally for split
+    # patterns (e.g., the same baseline amount in disjoint stretches).
+    by_amount: dict[str, list[tuple[int, int]]] = {}
+    for amt, lo, hi in runs:
+        by_amount.setdefault(amt, []).append((lo, hi))
+
+    # Sort by total span size (largest first) so the dominant amount
+    # appears first in the rendering.
+    sorted_amounts = sorted(
+        by_amount.items(),
+        key=lambda kv: -sum(hi - lo + 1 for lo, hi in kv[1]),
+    )
+
+    parts = []
+    for amt, ranges in sorted_amounts:
+        labels = []
+        for lo, hi in ranges:
+            labels.append(f"P{lo}-{hi}" if lo != hi else f"P{lo}")
+        parts.append(f"{amt}/mo ({','.join(labels)})")
+    return ", ".join(parts)
+
+
+def _format_budget_report_compact(report: dict) -> str:
+    """Render a budget-report dict as a compact text table.
+
+    Layout per Phase 5B::
+
+        2026 Annual Budget — Period 3 (Apr 2026)
+        Account                          Budget   Actual  Remaining  %Used
+        Auto:Fuel                           250   199.61      50.39  79.8%
+        Business:Contractor Payments      6,200 6,128.00      72.00  98.8%
+        Groceries                           450   608.57    -158.57  135.2% ⚠
+        Medical                             200 1,488.03  -1,288.03  744.0% ⚠
+        TOTAL                             7,971 9,022.90  -1,051.90  113.2% ⚠
+
+    ``⚠`` markers fire on rows where ``percent_used > 110%`` — same
+    threshold ``get_book_summary`` uses for the budget headline.
+    Strips a common ``Expenses:`` / ``Income:`` prefix from leaf
+    names to keep the column readable.
+    """
+    accounts = report.get("accounts", [])
+    totals = report.get("totals", {})
+    budget_name = report.get("budget", "?")
+    period_info = report.get("period", "")
+
+    header_line = f"{budget_name} — {period_info}"
+    if not accounts:
+        return f"{header_line}\n(no budgeted accounts)"
+
+    # Strip a common "Expenses:" / "Income:" prefix (same idiom as
+    # spending_by_category / income_by_source).
+    full_names = [r["account"] for r in accounts]
+    common_prefix = ""
+    if full_names and ":" in full_names[0]:
+        candidate = full_names[0].split(":")[0] + ":"
+        if all(n.startswith(candidate) for n in full_names):
+            common_prefix = candidate
+    leaves = [n[len(common_prefix):] for n in full_names]
+
+    name_width = max(
+        max(len(l) for l in leaves), len("Account"), len("TOTAL"),
+    )
+
+    def _fmt(value: str) -> str:
+        d = Decimal(value)
+        # Whole-dollar values render simpler.
+        if d == d.to_integral_value():
+            return f"{int(d):,}"
+        return f"{d:,.2f}"
+
+    budget_strs = [_fmt(r["budgeted"]) for r in accounts]
+    actual_strs = [_fmt(r["actual"]) for r in accounts]
+    remaining_strs = [_fmt(r["remaining"]) for r in accounts]
+    pct_strs = [f"{r['percent_used']}%" for r in accounts]
+
+    total_budget = _fmt(totals.get("budgeted", "0"))
+    total_actual = _fmt(totals.get("actual", "0"))
+    total_remaining = _fmt(totals.get("remaining", "0"))
+    total_pct = f"{totals.get('percent_used', '0')}%"
+
+    budget_w = max(
+        max(len(s) for s in budget_strs), len(total_budget), len("Budget"),
+    )
+    actual_w = max(
+        max(len(s) for s in actual_strs), len(total_actual), len("Actual"),
+    )
+    remaining_w = max(
+        max(len(s) for s in remaining_strs),
+        len(total_remaining),
+        len("Remaining"),
+    )
+    pct_w = max(
+        max(len(s) for s in pct_strs), len(total_pct), len("%Used"),
+    )
+
+    def _pct_marker(pct_str: str) -> str:
+        # Strip "%" then parse; over-110% earns the warning marker.
+        try:
+            v = Decimal(pct_str.rstrip("%"))
+        except Exception:
+            return ""
+        return " ⚠" if v > Decimal("110") else ""
+
+    lines = [header_line]
+    lines.append(
+        f"{'Account':<{name_width}}  "
+        f"{'Budget':>{budget_w}}  "
+        f"{'Actual':>{actual_w}}  "
+        f"{'Remaining':>{remaining_w}}  "
+        f"{'%Used':>{pct_w}}"
+    )
+    for leaf, b, a, rem, pct in zip(
+        leaves, budget_strs, actual_strs, remaining_strs, pct_strs,
+    ):
+        lines.append(
+            f"{leaf:<{name_width}}  "
+            f"{b:>{budget_w}}  "
+            f"{a:>{actual_w}}  "
+            f"{rem:>{remaining_w}}  "
+            f"{pct:>{pct_w}}{_pct_marker(pct)}"
+        )
+    lines.append(
+        f"{'TOTAL':<{name_width}}  "
+        f"{total_budget:>{budget_w}}  "
+        f"{total_actual:>{actual_w}}  "
+        f"{total_remaining:>{remaining_w}}  "
+        f"{total_pct:>{pct_w}}{_pct_marker(total_pct)}"
+    )
+    return "\n".join(lines)
+
+
+def _format_get_budget_compact(
+    info: dict, account_rows: list[dict],
+) -> str:
+    """Render a budget as compact text — header + per-account rows.
+
+    Header carries name, period count, and start date. Per-account
+    rows use ``_collapse_period_runs`` to fold uniform stretches
+    into single labels (the typical 12-cell repeat collapses to one
+    "all periods" form).
+    """
+    num_periods = info.get("num_periods", 12)
+    name = info.get("name", "?")
+    period_type = info.get("period_type", "")
+    start = info.get("start_date", "?")
+    header = (
+        f"{name}  {num_periods} periods"
+        + (f" ({period_type})" if period_type else "")
+        + f"  starts:{start}"
+    )
+
+    if not account_rows:
+        return header + "\n(no account amounts set)"
+
+    name_width = max(len(r["account"]) for r in account_rows)
+    lines = [header]
+    for row in account_rows:
+        acct = row["account"]
+        periods = {int(k): v for k, v in row["periods"].items()}
+        runs = _collapse_period_runs(periods, num_periods)
+        lines.append(f"{acct:<{name_width}}  {runs}")
+    return "\n".join(lines)
+
+
 class BudgetsMixin:
     """Budget CRUD + period-aware variance reporting."""
 
@@ -185,28 +386,58 @@ class BudgetsMixin:
 
     # ── CRUD ──────────────────────────────────────────────────────
 
-    def list_budgets(self) -> list[dict]:
+    def list_budgets(self, compact: bool = True) -> list[dict] | str:
         """List all budgets in the book.
 
+        Args:
+            compact: If True (default), return a compact one-line-per-
+                     budget string. Verbose mode returns the structured
+                     dict list.
+
         Returns:
-            List of budget dicts with guid, name, description,
-            num_periods, period_type, and start_date.
+            If compact: newline-separated lines of the form
+                ``"<name>  <num_periods> periods (<period_type>)  starts:<YYYY-MM-DD>"``.
+            If not compact: list of budget dicts.
         """
         from piecash.budget import Budget
 
         with self.open(readonly=True) as book:
             budgets = book.session.query(Budget).all()
-            return [self._budget_to_dict(b) for b in budgets]
+            dicts = [self._budget_to_dict(b) for b in budgets]
+            if not compact:
+                return dicts
 
-    def get_budget(self, name: str) -> dict | None:
+            if not dicts:
+                return ""
+            name_width = max(len(d["name"]) for d in dicts)
+            lines = []
+            for d in dicts:
+                periods = d.get("num_periods", "?")
+                ptype = d.get("period_type", "")
+                start = d.get("start_date", "?")
+                ptype_str = f" ({ptype})" if ptype else ""
+                lines.append(
+                    f"{d['name']:<{name_width}}  "
+                    f"{periods} periods{ptype_str}  starts:{start}"
+                )
+            return "\n".join(lines)
+
+    def get_budget(
+        self, name: str, compact: bool = True,
+    ) -> dict | str | None:
         """Get full details of a budget including all budget amounts.
 
         Args:
             name: Budget name.
+            compact: If True (default), return a compact text table
+                     that collapses uniform periods (e.g.,
+                     ``"250/mo (all periods)"``). Verbose mode returns
+                     the structured ``periods`` dict per account.
 
         Returns:
-            Dict with budget info and all account/period amounts,
-            or None if not found.
+            If compact: text string with header + one line per account.
+            If not compact: dict with full ``periods`` mapping.
+            ``None`` if budget not found (matches existing contract).
         """
         with self.open(readonly=True) as book:
             budget = self._find_budget(book, name)
@@ -222,15 +453,16 @@ class BudgetsMixin:
                     accounts[acct_name] = {}
                 accounts[acct_name][ba.period_num] = str(ba.amount)
 
-            result["accounts"] = [
-                {
-                    "account": acct_name,
-                    "periods": periods,
-                }
+            account_rows = [
+                {"account": acct_name, "periods": periods}
                 for acct_name, periods in sorted(accounts.items())
             ]
+            result["accounts"] = account_rows
 
-            return result
+            if not compact:
+                return result
+
+            return _format_get_budget_compact(result, account_rows)
 
     def create_budget(
         self,
@@ -417,7 +649,8 @@ class BudgetsMixin:
         period: int | str | None = None,
         account: str | None = None,
         include_children: bool = True,
-    ) -> dict:
+        compact: bool = True,
+    ) -> dict | str:
         """Compare actual spending against budget.
 
         Args:
@@ -598,7 +831,7 @@ class BudgetsMixin:
                     f"({first_start.isoformat()} to {last_end.isoformat()})"
                 )
 
-            return {
+            full = {
                 "budget": budget_name,
                 "period": period_info,
                 "accounts": accounts_result,
@@ -609,6 +842,9 @@ class BudgetsMixin:
                     "percent_used": str(total_pct),
                 },
             }
+            if not compact:
+                return full
+            return _format_budget_report_compact(full)
 
     def delete_budget(self, name: str) -> dict:
         """Delete a budget.
