@@ -7750,6 +7750,102 @@ class TestPrices:
                 value="100.00",
             )
 
+    def test_create_price_currency_defaults_to_book_default_usd(
+        self, test_book: Path,
+    ):
+        """When currency isn't supplied on a USD-default book, the
+        price is stored as USD-denominated. Backwards-compatible
+        with pre-fix behavior on USD books — the only change is that
+        the default is now derived from the book, not hardcoded."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_commodity(
+            mnemonic="VTSAX", fullname="Total Stock", namespace="FUND",
+        )
+
+        result = gc_book.create_price(
+            commodity="VTSAX", namespace="FUND", value="127.50",
+            price_date=date(2026, 2, 7),
+        )
+
+        # Echoed currency is the resolved mnemonic (USD on this book).
+        assert result["currency"] == "USD"
+
+    def test_create_price_currency_defaults_to_book_default_cny(
+        self, tmp_path: Path,
+    ):
+        """The user's reported bug: on a CNY-default book,
+        ``create_price(commodity="USD", value="7.30")`` (no currency
+        arg) was storing ``commodity=USD currency=USD`` (nonsense) and
+        being silently skipped by ``_find_exchange_rate``. With the
+        fix, the default resolves to CNY so the price stores as
+        ``commodity=USD currency=CNY`` (1 USD = 7.30 CNY)."""
+        book_path = tmp_path / "cny_default.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="CNY", overwrite=True,
+        )
+        # Pre-load USD as a known currency so create_price can resolve it.
+        from piecash import factories
+        usd = factories.create_currency_from_ISO("USD")
+        book.session.add(usd)
+        book.save()
+        book.close()
+
+        gc_book = GnuCashBook(str(book_path))
+        result = gc_book.create_price(
+            commodity="USD", namespace="CURRENCY",
+            value="7.30", price_date=date(2026, 4, 1),
+        )
+
+        # Result echoes the resolved mnemonic, not the input.
+        assert result["currency"] == "CNY"
+
+        # Verify storage: the price's currency is CNY (the book
+        # default), not USD (the old hardcoded default).
+        with gc_book.open(readonly=True) as book:
+            stored = [
+                p for p in book.prices
+                if p.type != "transaction"
+                and p.commodity.mnemonic == "USD"
+            ]
+            assert len(stored) == 1
+            assert stored[0].currency.mnemonic == "CNY"
+            assert Decimal(str(stored[0].value)) == Decimal("7.30")
+
+    def test_create_price_explicit_currency_overrides_default(
+        self, tmp_path: Path,
+    ):
+        """An explicit ``currency`` parameter wins over the book
+        default — for callers who want to store a non-default-
+        currency price (e.g. EUR/USD on a CNY-default book)."""
+        book_path = tmp_path / "cny_default.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="CNY", overwrite=True,
+        )
+        from piecash import factories
+        usd = factories.create_currency_from_ISO("USD")
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(usd)
+        book.session.add(eur)
+        book.save()
+        book.close()
+
+        gc_book = GnuCashBook(str(book_path))
+        result = gc_book.create_price(
+            commodity="EUR", namespace="CURRENCY",
+            value="1.08", currency="USD",
+            price_date=date(2026, 4, 1),
+        )
+
+        assert result["currency"] == "USD"
+        with gc_book.open(readonly=True) as book:
+            stored = [
+                p for p in book.prices
+                if p.type != "transaction"
+                and p.commodity.mnemonic == "EUR"
+            ]
+            assert len(stored) == 1
+            assert stored[0].currency.mnemonic == "USD"
+
 
 class TestInvestmentWorkflow:
     """Integration tests for the full investment workflow."""

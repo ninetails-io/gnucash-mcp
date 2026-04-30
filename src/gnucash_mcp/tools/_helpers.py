@@ -157,8 +157,20 @@ def _strip_noise(obj):
 
 
 def _json(obj) -> str:
-    """Serialize to minified JSON, stripping noise values."""
-    return json.dumps(_strip_noise(obj), separators=(",", ":"))
+    """Serialize to minified JSON, stripping noise values.
+
+    ``ensure_ascii=False`` so non-ASCII strings (Chinese commodity
+    names like "贵州茅台", customer names with accented characters,
+    etc.) round-trip as raw UTF-8 instead of being escaped to
+    ``\\uXXXX`` form. The escape behavior is technically valid JSON
+    but makes the wire format unreadable for human reviewers and
+    breaks any downstream substring match on the original text.
+    Bookkeeper-flagged on a CNY-default test book where every
+    SSE/SZSE commodity name came back as escape sequences.
+    """
+    return json.dumps(
+        _strip_noise(obj), separators=(",", ":"), ensure_ascii=False,
+    )
 
 
 def safe_tool(func: Callable) -> Callable:

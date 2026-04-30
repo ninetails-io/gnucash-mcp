@@ -616,6 +616,42 @@ class TestCreateInvoice:
         with pytest.raises(ValueError, match="Billterm not found"):
             gb.create_invoice(customer_id="000001", term="Nonexistent")
 
+    def test_currency_defaults_to_customer_currency(self, business_book):
+        """When ``currency`` is not passed, the invoice inherits the
+        customer's currency — not the book default. A USD customer
+        on a USD-default book happens to look the same either way,
+        so we set the customer's currency to EUR explicitly to
+        prove the inheritance: the resulting invoice should be EUR
+        regardless of book default."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
+            book.save()
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        result = gb.create_invoice(customer_id="000001")
+        # Read back via get_invoice to verify the stored currency.
+        inv = gb.get_invoice(result["id"])
+        assert inv["currency"] == "EUR"
+
+    def test_explicit_currency_overrides_customer_currency(
+        self, business_book,
+    ):
+        """An explicit ``currency`` parameter wins over the
+        customer's currency. Edge case but supported — callers
+        sometimes record cross-currency invoices intentionally."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
+            book.save()
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        result = gb.create_invoice(
+            customer_id="000001", currency="USD",
+        )
+        inv = gb.get_invoice(result["id"])
+        assert inv["currency"] == "USD"
+
 
 class TestCreateBill:
     """Tests for create_bill."""
@@ -869,6 +905,37 @@ class TestCreateBill:
             book.save()
         result = gb.create_invoice(customer_id="000002")
         assert result["id"] == "000006"
+
+    def test_currency_defaults_to_vendor_currency(self, business_book):
+        """The bill bug from the bookkeeper: vendors with foreign
+        currency had their bills created in the book's default
+        currency instead of inheriting the vendor's. ``post_invoice``
+        then saw inv.currency == account.commodity and skipped
+        cross-currency conversion entirely — $500 was booked as
+        ¥500. The fix: bills inherit the vendor's currency when
+        ``currency`` isn't passed, matching customer-invoice
+        behavior and GnuCash desktop UI."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="JetBrains", currency="USD")
+        result = gb.create_bill(vendor_id="000001")
+        bill = gb.get_invoice(result["id"])
+        assert bill["currency"] == "USD"
+
+    def test_explicit_currency_overrides_vendor_currency(
+        self, business_book,
+    ):
+        """Explicit ``currency`` wins over the vendor's currency."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            book.session.add(piecash.factories.create_currency_from_ISO("EUR"))
+            book.save()
+        gb.create_vendor(name="JetBrains", currency="USD")
+        result = gb.create_bill(
+            vendor_id="000001", currency="EUR",
+        )
+        bill = gb.get_invoice(result["id"])
+        assert bill["currency"] == "EUR"
 
 
 class TestDeleteInvoice:
@@ -1740,6 +1807,99 @@ class TestPostInvoice:
             assert Decimal(str(income_split.value)) == Decimal("-1000")
             assert Decimal(str(income_split.quantity)) == Decimal("-1100.00")
 
+    def test_cross_currency_bill_post_uses_vendor_currency(
+        self, business_book,
+    ):
+        """Regression for the vendor-bill FX bug: a EUR vendor on a
+        USD-default book had bills created in USD (book default)
+        instead of EUR (vendor's currency). Posted transactions
+        then skipped cross-currency conversion entirely — €500 was
+        booked as $500. With the fix, ``create_bill`` inherits the
+        vendor's currency and ``post_invoice`` runs the same
+        cross-currency conversion path that customer invoices use.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+
+            assets = next(a for a in book.accounts if a.fullname == "Assets")
+            ap_eur = piecash.Account(
+                name="Accounts Payable EUR",
+                type="PAYABLE",
+                parent=assets,
+                commodity=eur,
+            )
+            book.session.add(ap_eur)
+
+            # USD/EUR rate: 1 EUR = 1.10 USD (i.e. EUR is the more
+            # valuable currency). Stored as commodity=EUR, currency=USD.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10), value="1.10",
+                source="user:test", type="nav",
+            ))
+            book.save()
+
+        # No explicit currency on create_bill — should inherit EUR
+        # from the vendor.
+        gb.create_vendor(name="München GmbH", currency="EUR")
+        result = gb.create_bill(
+            vendor_id="000001", date_opened="2026-03-10",
+        )
+        # Confirm inheritance worked at create time.
+        bill = gb.get_invoice(result["id"])
+        assert bill["currency"] == "EUR"
+
+        # add_bill_entry on a USD expense account; post to EUR A/P.
+        gb.add_bill_entry(
+            bill_id=result["id"],
+            account="Expenses:Office Supplies",  # USD account
+            description="Software license",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id=result["id"],
+            post_account="Assets:Accounts Payable EUR",
+            post_date="2026-03-10",
+        )
+
+        # Inspect splits: expense quantity should be the USD-equivalent
+        # at 1.10 (€1000 × 1.10 = $1100), while value stays at €1000.
+        # A/P EUR matches transaction currency → quantity == value.
+        with gb.open(readonly=True) as book:
+            inv = None
+            for i in book.session.query(piecash.business.Invoice).all():
+                if i.id == result["id"]:
+                    inv = i
+                    break
+            assert inv is not None
+            txn = inv.post_txn
+            assert txn is not None
+            # Bill posted in EUR, not USD.
+            assert txn.currency.mnemonic == "EUR"
+
+            expense_split = next(
+                s for s in txn.splits
+                if s.account.fullname == "Expenses:Office Supplies"
+            )
+            ap_split = next(
+                s for s in txn.splits
+                if s.account.fullname == "Assets:Accounts Payable EUR"
+            )
+
+            # Bill (vendor): A/P credit (negative), expense debit (positive).
+            assert Decimal(str(ap_split.value)) == Decimal("-1000")
+            assert Decimal(str(ap_split.quantity)) == Decimal("-1000")
+            assert Decimal(str(expense_split.value)) == Decimal("1000")
+            # Expense split is USD; quantity converted at rate 1.10.
+            assert Decimal(str(expense_split.quantity)) == Decimal("1100.00")
+
 
 # ============== Pay Invoice Tests ==============
 
@@ -2281,6 +2441,143 @@ class TestPayInvoice:
         assert Decimal(result["remaining_balance"]) == Decimal("0")
         # Same-currency payment: no exchange_rate field in result.
         assert "exchange_rate" not in result
+
+    def test_pay_invoice_fx_account_parameter_routes_explicit(
+        self, business_book,
+    ):
+        """End-to-end: ``pay_invoice(fx_account=...)`` routes the
+        realized FX gain/loss to the user-specified account, not
+        the canonical default. This is the primary fix for the FX
+        account-routing bug — bookkeepers can pin a specific
+        account without depending on naming heuristics."""
+        gb = GnuCashBook(str(business_book))
+        # Pre-create a user-named FX account; route to it explicitly.
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="EUR services", quantity="1", price="4500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+            fx_account="Income:FX Gain Loss",
+        )
+
+        # FX gain routed to the user's account, not the canonical one.
+        assert result["fx_realized"]["account"] == "Income:FX Gain Loss"
+        assert "fx_notice" not in result
+        # Canonical account was never auto-created.
+        assert gb.get_account(
+            name="Income:Foreign Exchange Gain/Loss"
+        ) is None
+        # User's account holds the gain.
+        assert gb.get_balance(account_name="Income:FX Gain Loss") == Decimal("-90")
+
+    def test_pay_invoice_ambiguous_fx_emits_notice(
+        self, business_book,
+    ):
+        """When two candidate FX accounts exist (Lin Wei's situation:
+        ``Income:FX Gain Loss`` user-created, ``Income:Foreign
+        Exchange Gain/Loss`` auto-created by a prior pay_invoice
+        call), routing falls through to canonical with a notice."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        gb.create_account(
+            name="Foreign Exchange Gain/Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="EUR services", quantity="1", price="4500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+
+        # Routed to canonical (the deterministic choice when ambiguous).
+        assert result["fx_realized"]["account"] == "Income:Foreign Exchange Gain/Loss"
+        # Notice surfaces both candidates so the caller can fix it.
+        notice = result["fx_notice"]
+        assert notice["type"] == "ambiguous_fx_account"
+        assert "Income:FX Gain Loss" in notice["candidates"]
+        assert "Income:Foreign Exchange Gain/Loss" in notice["candidates"]
+        # User's untouched account stays at zero.
+        assert gb.get_balance(account_name="Income:FX Gain Loss") == Decimal("0")
+
+    def test_pay_invoice_fx_account_invalid_path_raises(
+        self, business_book,
+    ):
+        """A typo in ``fx_account`` should fail loud, not silently
+        fall back to the canonical default — that masks the typo
+        and routes income to a different account than the caller
+        asked for."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="EUR services", quantity="1", price="4500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+
+        with pytest.raises(ValueError, match="fx_account not found"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="4500.00",
+                payment_date="2026-03-20",
+                fx_account="Income:Typo Account That Does Not Exist",
+            )
 
 
 # ============== Outstanding Invoices Tests ==============
@@ -2921,3 +3218,202 @@ class TestPhase4CBreakdownCompact:
         )
         assert isinstance(result, str)
         assert "TOTAL" in result
+
+
+class TestCnyBugReportFollowups:
+    """Regression tests for the small-bug findings in the CNY
+    cousin-verification report (separate PR from the substantive
+    Bug 3 work that lives on its own branch)."""
+
+    # ── Bug 4: "days past past due" typo ─────────────────────────
+
+    def test_outstanding_invoices_overdue_no_double_word(
+        self, business_book,
+    ):
+        """The compact-format ``get_outstanding_invoices`` template
+        was concatenating "days past " with " past due" and producing
+        "X days past past due". Should read either "X days past due"
+        (contractual) or "X days past 30-day default" (no terms)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        # Post with explicit due date in the past — exercises the
+        # contractual branch where the typo lived.
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+            due_date="2026-02-01",
+        )
+        compact = gb.get_outstanding_invoices()
+        assert "past past due" not in compact, (
+            f"typo regression — found duplicated word in:\n{compact}"
+        )
+        # And the correct form is present.
+        assert "past due" in compact
+
+    def test_outstanding_invoices_no_terms_renders_30_day_default(
+        self, business_book,
+    ):
+        """No-terms branch should annotate as ``"X days past 30-day
+        default"`` — also doesn't have the duplicated word."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Consulting", quantity="1", price="500.00",
+        )
+        # No due_date and no billterm — falls to 30-day default.
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",
+        )
+        compact = gb.get_outstanding_invoices()
+        assert "past past" not in compact
+        assert "30-day default" in compact
+
+    # ── Bug 2: pay_invoice should reuse existing FX accounts ─────
+
+    def test_fx_account_reuse_picks_up_user_named_account(
+        self, business_book,
+    ):
+        """When the user has pre-created a fuzzy-named FX account
+        (``Income:FX Gain Loss``) and *no* canonical account exists,
+        ``_get_or_create_fx_account`` should match it (single
+        candidate) instead of silently creating a parallel
+        ``Income:Foreign Exchange Gain/Loss``."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct, notice = gb._get_or_create_fx_account(book)
+            assert fx_acct.fullname == "Income:FX Gain Loss"
+            assert notice is None
+
+    def test_fx_account_reuse_matches_alternate_keywords(
+        self, business_book,
+    ):
+        """Match any of the FX-name substrings in the leaf account
+        name (case-insensitive). 'Forex Adjustments' contains 'forex'."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="Forex Adjustments",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct, notice = gb._get_or_create_fx_account(book)
+            assert fx_acct.fullname == "Income:Forex Adjustments"
+            assert notice is None
+
+    def test_fx_account_ambiguous_falls_through_with_notice(
+        self, business_book,
+    ):
+        """If multiple candidate FX accounts exist (e.g., the user
+        pre-created one *and* a previous pay_invoice call auto-
+        created the canonical), don't guess between them. Route to
+        canonical and surface a notice listing the candidates so the
+        caller can pass ``fx_account`` explicitly next time."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        gb.create_account(
+            name="Foreign Exchange Gain/Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct, notice = gb._get_or_create_fx_account(book)
+            assert fx_acct.fullname == "Income:Foreign Exchange Gain/Loss"
+            assert notice is not None
+            assert notice["type"] == "ambiguous_fx_account"
+            assert "Income:FX Gain Loss" in notice["candidates"]
+            assert "Income:Foreign Exchange Gain/Loss" in notice["candidates"]
+            assert "fx_account" in notice["message"]
+
+    def test_fx_account_falls_through_to_canonical_create(
+        self, business_book,
+    ):
+        """No fuzzy match available → canonical account auto-created
+        under Income, no notice."""
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            fx_acct, notice = gb._get_or_create_fx_account(book)
+            book.save()
+            assert fx_acct.fullname == "Income:Foreign Exchange Gain/Loss"
+            assert notice is None
+
+    def test_fx_account_explicit_parameter_overrides_heuristic(
+        self, business_book,
+    ):
+        """When the caller passes ``fx_account``, that account is
+        used regardless of what fuzzy matches exist. This is the
+        explicit-control path for callers who want determinism."""
+        gb = GnuCashBook(str(business_book))
+        # Create two candidates that would normally be ambiguous AND
+        # a third unrelated account the caller will pin to.
+        gb.create_account(
+            name="FX Gain Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        gb.create_account(
+            name="Foreign Exchange Gain/Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        gb.create_account(
+            name="Currency Translation Gain/Loss",
+            account_type="INCOME",
+            parent="Income",
+        )
+        with gb.open(readonly=True) as book:
+            fx_acct, notice = gb._get_or_create_fx_account(
+                book,
+                fx_account="Income:Currency Translation Gain/Loss",
+            )
+            # Caller's explicit choice wins; no notice (no ambiguity
+            # to flag when the caller has already disambiguated).
+            assert fx_acct.fullname == "Income:Currency Translation Gain/Loss"
+            assert notice is None
+
+    def test_fx_account_explicit_invalid_path_raises(
+        self, business_book,
+    ):
+        """Passing a non-existent ``fx_account`` is a hard error —
+        the caller asked for a specific account, so silently
+        falling back would mask a typo."""
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=True) as book:
+            with pytest.raises(ValueError, match="fx_account not found"):
+                gb._get_or_create_fx_account(
+                    book, fx_account="Income:Does Not Exist",
+                )
+
+    def test_fx_account_explicit_wrong_type_raises(
+        self, business_book,
+    ):
+        """``fx_account`` must be INCOME or EXPENSE — booking a
+        gain/loss to an asset/liability/equity account would corrupt
+        the financial statements."""
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=True) as book:
+            with pytest.raises(
+                ValueError, match="must be INCOME or EXPENSE"
+            ):
+                # business_book has Assets:Checking (BANK type).
+                gb._get_or_create_fx_account(
+                    book, fx_account="Assets:Checking",
+                )

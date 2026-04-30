@@ -271,6 +271,202 @@ class TestDebtPayoffPlan:
             pytest.fail("Almost Paid not found in results")
 
 
+class TestDebtPayoffAmortizingLoans:
+    """Regression: LIABILITY accounts (mortgage, auto loan) must use
+    the amortization formula, not the credit-card 2%-of-balance rule.
+
+    Pre-fix, a ¥2.7M mortgage at 3.85% APR was assigned a minimum of
+    ¥54,590/month (2% of balance), tripping the budget gate on any
+    realistic household budget. Post-fix, amortization gives
+    ~¥12,800/month, leaving plenty of room for a ¥30K budget.
+    """
+
+    def _liability_book(self, tmp_path: Path) -> Path:
+        """A book with a mortgage + auto loan + credit card, no min slot."""
+        import piecash
+
+        book_path = tmp_path / "amort_test.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="CNY", overwrite=True,
+        )
+        cny = book.default_currency
+        root = book.root_account
+
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        loans = piecash.Account(
+            name="Loans", type="LIABILITY", parent=liabilities,
+            commodity=cny, placeholder=True,
+        )
+        mortgage = piecash.Account(
+            name="Mortgage", type="LIABILITY", parent=loans,
+            commodity=cny,
+        )
+        auto = piecash.Account(
+            name="Auto Loan", type="LIABILITY", parent=loans,
+            commodity=cny,
+        )
+        cc = piecash.Account(
+            name="Credit Card", type="CREDIT", parent=liabilities,
+            commodity=cny,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=cny, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=cny,
+        )
+        book.save()
+
+        mortgage["apr"] = "3.85"
+        auto["apr"] = "4.90"
+        cc["apr"] = "18.25"
+        book.save()
+
+        # Set opening balances. Liabilities are credit-normal (negative
+        # quantity = positive amount owed).
+        for acct, amount in (
+            (mortgage, "-2729518"),
+            (auto, "-96798"),
+            (cc, "-19385"),
+        ):
+            tx = piecash.Transaction(
+                currency=cny,
+                description=f"Opening: {acct.name}",
+                post_date=date(2026, 1, 1),
+                splits=[
+                    piecash.Split(account=acct, value=Decimal(amount)),
+                    piecash.Split(account=opening, value=-Decimal(amount)),
+                ],
+            )
+            book.session.add(tx)
+        book.save()
+        return book_path
+
+    def test_mortgage_uses_amortization_not_two_percent(self, tmp_path: Path):
+        """The mortgage minimum should be ~¥12-13K (amortization on a
+        30-year term), not ¥54K (2% of balance)."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+
+        for d in result["debts"]:
+            if d["account"] == "Liabilities:Loans:Mortgage":
+                mp = Decimal(d["minimum_payment"])
+                # 30-year amortization on ¥2,729,518 at 3.85% =
+                # ~¥12,789. Allow a generous ±¥500 band — the formula
+                # is exact; the band protects against future
+                # refactors choosing nearby term defaults.
+                assert Decimal("12200") < mp < Decimal("13400"), (
+                    f"Mortgage minimum {mp} outside expected range"
+                )
+                # And nowhere near the broken 2% answer (¥54,590).
+                assert mp < Decimal("20000")
+                break
+        else:
+            pytest.fail("Mortgage not found in results")
+
+    def test_auto_loan_uses_amortization_not_two_percent(self, tmp_path: Path):
+        """Auto loan should use 5-year amortization default."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+
+        for d in result["debts"]:
+            if d["account"] == "Liabilities:Loans:Auto Loan":
+                mp = Decimal(d["minimum_payment"])
+                # 5-year amortization on ¥96,798 at 4.9% = ~¥1,824.
+                # Generous ±¥150 band.
+                assert Decimal("1700") < mp < Decimal("2000"), (
+                    f"Auto loan minimum {mp} outside expected range"
+                )
+                # Nowhere near the broken 2% answer (¥1,936) — actually
+                # those are close here, so use the term as the
+                # discriminator instead. Auto with 5y term: ~¥1,824.
+                # Auto with 30y term (mortgage default): ~¥514.
+                assert mp > Decimal("1500"), (
+                    "Auto loan got mortgage's 30-year term — name "
+                    "heuristic should require 'mortgage' in path"
+                )
+                break
+        else:
+            pytest.fail("Auto Loan not found in results")
+
+    def test_credit_card_keeps_two_percent(self, tmp_path: Path):
+        """Credit cards still use the 2% formula post-fix — only
+        LIABILITY accounts switched to amortization."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+
+        for d in result["debts"]:
+            if d["account"] == "Liabilities:Credit Card":
+                # 2% of ¥19,385 = ¥387.70 (above the ¥25 floor).
+                assert d["minimum_payment"] == "387.70"
+                break
+        else:
+            pytest.fail("Credit Card not found in results")
+
+    def test_realistic_budget_no_longer_trips_gate(self, tmp_path: Path):
+        """The original bug: ¥30K budget on a ¥2.85M debt stack
+        rejected as 'less than sum of minimum payments' because the
+        2% rule was demanding ¥57K/month. Post-fix it should clear."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+
+        # No exception → fix works.
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+        assert "debts" in result
+        # Sum of minimums should land in the ~¥15-17K range
+        # (mortgage + auto + 2% of CC), well under ¥30K.
+        total_min = sum(
+            Decimal(d["minimum_payment"]) for d in result["debts"]
+        )
+        assert total_min < Decimal("18000"), (
+            f"Sum of minimums {total_min} too high; "
+            "amortization fix may have regressed"
+        )
+
+    def test_minimum_payment_slot_still_wins_for_liability(
+        self, tmp_path: Path,
+    ):
+        """The user-set minimum_payment slot must still override the
+        amortization formula — explicit user input always wins."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        # Pin mortgage minimum to a specific value via slot.
+        gc_book.set_account_slot(
+            "Liabilities:Loans:Mortgage", "minimum_payment", "14800",
+        )
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+
+        for d in result["debts"]:
+            if d["account"] == "Liabilities:Loans:Mortgage":
+                # Slot value (14800) wins over amortization estimate (~12789).
+                assert d["minimum_payment"] == "14800"
+                break
+        else:
+            pytest.fail("Mortgage not found in results")
+
+
 class TestDebtPayoffCompactFormat:
     """Phase 4A lock tests for the compact text-table output.
     The verbose dict (existing tests above) is now opt-in; the default
