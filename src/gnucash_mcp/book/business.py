@@ -481,7 +481,23 @@ class BusinessMixin:
             book: piecash Book instance.
             invoice_id: Human-readable ID (e.g., '000001').
             owner_type: Filter by owner type (2=customer, 4=vendor).
-                        None returns first match of either type.
+                        None requires the ID to be unambiguous across
+                        types — see Raises.
+
+        Raises:
+            ValueError: When ``owner_type=None`` and the ID matches
+                both a customer invoice *and* a vendor bill. GnuCash
+                runs the two as separate ID sequences sharing one
+                ``invoices`` table, so collisions are normal — both
+                can legitimately be id ``"000003"``. Pre-fix this
+                returned whichever row the query happened to surface
+                first, silently routing reads/writes to the wrong
+                document. The bookkeeper hit this on a CNY book
+                where ``get_invoice("000003")`` returned a customer
+                invoice's CNY currency for what was actually a USD
+                vendor bill. The error lists candidates with their
+                type and currency so the caller can pass
+                ``owner_type`` to disambiguate.
         """
         from piecash.business.invoice import Invoice
         from sqlalchemy import text
@@ -502,8 +518,27 @@ class BusinessMixin:
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
-            query = query.filter(Invoice.owner_type == owner_type)
-        return query.first()
+            return query.filter(Invoice.owner_type == owner_type).first()
+
+        # owner_type=None: caller didn't disambiguate. Pull all
+        # matches and fail loud on collision rather than silently
+        # picking the first one (which depends on row order /
+        # piecash internals — non-deterministic from the caller's
+        # perspective).
+        matches = query.all()
+        if len(matches) <= 1:
+            return matches[0] if matches else None
+
+        candidates = []
+        for m in matches:
+            label = "vendor bill" if m.owner_type == 4 else "customer invoice"
+            currency = m.currency.mnemonic if m.currency else "?"
+            candidates.append(f"{label} (currency={currency})")
+        raise ValueError(
+            f"Found {len(matches)} documents with ID {invoice_id!r}: "
+            f"{', '.join(candidates)}. Pass owner_type='customer' "
+            f"or 'vendor' to disambiguate."
+        )
 
     @staticmethod
     def _address_to_dict(entity) -> dict:
