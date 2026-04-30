@@ -82,6 +82,22 @@ unpost_invoice(id="<second inv id>")
 Expect `validation_error`:
 *"Invoice ⟨id⟩ has payments applied. Void payments first, then unpost."*
 
+**D2. `unpost_invoice` succeeds when payments are voided**
+
+Continuing from D — void the partial payment, then retry the unpost.
+Capture the payment's transaction guid from D's `pay_invoice` response,
+then:
+
+```
+void_transaction(guid="<payment transaction_guid>", reason="Test cleanup")
+unpost_invoice(id="<second inv id>")
+```
+
+Expect `{"status": "unposted"}`. The "has payments applied" guard
+asks an *economic* question; voided payments have zero economic
+effect (they're zombie splits preserved for audit trail), so they
+shouldn't block unpost.
+
 **E. `unpost_invoice` rejects unposted invoice**
 
 On any open (not-yet-posted) invoice:
@@ -100,9 +116,9 @@ unpost_invoice(id="999999")
 
 Expect `validation_error`: *"Invoice/bill not found: 999999"*.
 
-**Pass criteria for Fix 1:** A through F all return their expected
-outcomes. B and C verify the happy path; A, D, E, F verify each
-rejection branch.
+**Pass criteria for Fix 1:** A, B, C, D, D2, E, F all return their
+expected outcomes. B, C, D2 verify happy paths; A, D, E, F verify
+each rejection branch.
 
 ---
 

@@ -2409,13 +2409,31 @@ class BusinessMixin:
             txn = inv.post_txn
             lot = inv.post_lot
 
-            # Reject when there are splits in the lot beyond the
-            # original A/R posting. Each pay_invoice call adds one
-            # split to the lot (the A/R credit reducing the
-            # outstanding balance). The posting transaction itself
-            # contributes exactly one split (the A/R debit). So
-            # ``len(lot.splits) > 1`` ⇔ payments applied.
-            if lot is not None and len(lot.splits) > 1:
+            # Reject when there are *live* (non-voided) payment splits
+            # in the lot. The lot starts with one split — the A/R
+            # debit/credit from the posting transaction. Each
+            # ``pay_invoice`` call adds one more split. A voided
+            # transaction in GnuCash preserves its splits with zeroed
+            # values for audit-trail purposes, so a naive
+            # ``len(lot.splits) > 1`` check counts voided payments as
+            # still-applied — which contradicts GnuCash's void
+            # semantics ("voided" means "neutralize the economic
+            # effect, preserve the record"). Filter to splits that
+            # are (a) not part of the posting transaction itself and
+            # (b) carry non-zero value.
+            posting_txn_guid = txn.guid if txn else None
+            real_payment_splits = []
+            if lot is not None:
+                for s in lot.splits:
+                    if (
+                        posting_txn_guid is not None
+                        and s.transaction_guid == posting_txn_guid
+                    ):
+                        continue
+                    if Decimal(str(s.value)) == 0:
+                        continue
+                    real_payment_splits.append(s)
+            if real_payment_splits:
                 raise ValueError(
                     f"{doc_label} {invoice_id} has payments applied. "
                     f"Void payments first, then unpost."

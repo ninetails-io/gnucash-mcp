@@ -2040,6 +2040,38 @@ class TestUnpostInvoice:
         with pytest.raises(ValueError, match="has payments applied"):
             gb.unpost_invoice(invoice_id=posted["id"])
 
+    def test_unpost_succeeds_when_payment_was_voided(
+        self, business_book,
+    ):
+        """A voided payment has zero economic effect — GnuCash's
+        void operation preserves the split for audit purposes but
+        zeroes the values. The "has payments applied" guard asks
+        an *economic* question ("would unposting orphan real
+        money?"); voided splits answer no.
+
+        The bookkeeper hit this on Alex's book: posted invoice →
+        partial payment → voided the payment → ``unpost_invoice``
+        rejected with "has payments applied" even though zero
+        dollars would have been orphaned. Treating voided
+        payments as still-applied contradicted GnuCash's own
+        void semantics. Regression locks the fix.
+        """
+        gb = GnuCashBook(str(business_book))
+        posted = self._post_invoice(gb)
+        pay = gb.pay_invoice(
+            invoice_id=posted["id"],
+            payment_account="Assets:Checking",
+            amount="100.00",
+        )
+        gb.void_transaction(
+            guid=pay["transaction_guid"],
+            reason="Test cleanup — voiding partial payment",
+        )
+
+        # Voided payment has zero economic effect → unpost allowed.
+        result = gb.unpost_invoice(invoice_id=posted["id"])
+        assert result["status"] == "unposted"
+
     def test_unpost_rejects_unposted_invoice(self, business_book):
         """Open invoices have nothing to unpost."""
         gb = GnuCashBook(str(business_book))
