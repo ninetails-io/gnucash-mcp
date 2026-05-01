@@ -18,8 +18,10 @@ from gnucash_mcp.book import GnuCashBook
 from gnucash_mcp.book.backup import (
     _AUTO_STAGES,
     _FILENAME_RE,
+    _read_attempt_status,
     _read_state,
     _sanitize_label,
+    _write_attempt_status,
     _write_state,
 )
 
@@ -341,6 +343,66 @@ class TestMaybeAutoBackup:
         # All three timestamps equal (same moment)
         timestamps = list(state.values())
         assert timestamps[0] == timestamps[1] == timestamps[2]
+
+    def test_records_success_status(self, test_book: Path):
+        """A successful auto-backup writes ``status=ok`` to
+        ``.last_attempt.json`` so get_book_summary can surface it."""
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+
+        attempt = _read_attempt_status(book._backups_dir())
+        assert attempt is not None
+        assert attempt["status"] == "ok"
+        assert attempt["reason"] is None
+
+    def test_records_failure_status_when_swallowed(
+        self, test_book: Path,
+    ):
+        """A failed auto-backup must not raise (the user's write
+        proceeds) BUT the failure must be persisted so the
+        bookkeeper finds out via get_book_summary's warnings —
+        not via reading debug logs weeks later. Pre-fix, OSError
+        was logged-and-forgotten, leaving the bookkeeper blind."""
+        book = GnuCashBook(str(test_book))
+
+        with patch.object(
+            book, "create_backup",
+            side_effect=OSError("disk full"),
+        ):
+            book._maybe_auto_backup()  # swallows
+
+        attempt = _read_attempt_status(book._backups_dir())
+        assert attempt is not None
+        assert attempt["status"] == "failed"
+        assert "disk full" in (attempt["reason"] or "")
+
+    def test_get_backup_health_reports_failure(self, test_book: Path):
+        """``get_backup_health`` exposes the persisted attempt
+        status, the structure get_book_summary reads."""
+        book = GnuCashBook(str(test_book))
+        with patch.object(
+            book, "create_backup", side_effect=OSError("readonly fs"),
+        ):
+            book._maybe_auto_backup()
+
+        health = book.get_backup_health()
+        assert health["last_attempt"]["status"] == "failed"
+        assert "readonly fs" in health["last_attempt"]["reason"]
+        # No backup file → newest is None.
+        assert health["newest_backup_at"] is None
+        assert health["newest_backup_age_days"] is None
+
+    def test_get_backup_health_reports_success_and_freshness(
+        self, test_book: Path,
+    ):
+        """Healthy state: success status + recent newest-backup age."""
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        health = book.get_backup_health()
+        assert health["last_attempt"]["status"] == "ok"
+        assert health["newest_backup_at"] is not None
+        # Created in this test run → 0 or close.
+        assert health["newest_backup_age_days"] in (0, 1)
 
     def test_promotes_to_highest_due_stage(self, test_book: Path):
         """Session done recently, weekly and monthly overdue → the

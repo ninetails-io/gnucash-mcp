@@ -284,6 +284,28 @@ class TestGetBookSummary:
         result = gc_book.get_book_summary()
         assert "Budgets: 1" in result
 
+    def test_warns_on_failed_auto_backup(self, test_book: Path):
+        """When auto-backup is failing, get_book_summary surfaces it
+        in the Warnings section. Pre-fix, OSError was swallowed and
+        the bookkeeper had no visibility into chain breaks.
+        """
+        from unittest.mock import patch
+
+        gc_book = GnuCashBook(str(test_book))
+
+        # Force the auto-backup attempt to fail and persist that
+        # status to disk.
+        with patch.object(
+            gc_book, "create_backup",
+            side_effect=OSError("disk quota exceeded"),
+        ):
+            gc_book._maybe_auto_backup()
+
+        result = gc_book.get_book_summary()
+        assert "Warnings" in result
+        assert "Auto-backup failing" in result
+        assert "disk quota exceeded" in result
+
 
 class TestGetBookSummaryReconciliation:
     """Reconciliation section in get_book_summary.
