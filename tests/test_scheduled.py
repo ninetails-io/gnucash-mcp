@@ -573,6 +573,55 @@ class TestNextOccurrence:
         )
         assert result == date(2026, 4, 1)
 
+    def test_monthly_31st_does_not_drift_after_february(self, scheduled_book):
+        """A monthly schedule starting Jan 31 must hit Mar 31, Apr 30,
+        May 31, ... — not drift to the 28th forever after Feb.
+
+        Pre-fix, ``occurrence += relativedelta(months=1)`` chained the
+        clamping: Jan 31 → Feb 28 (clamped) → Mar 28 → Apr 28 → ...
+        Anchoring to ``start_date + relativedelta(months=n)`` recovers
+        the original day-of-month intent.
+        """
+        gb = GnuCashBook(str(scheduled_book))
+        # After Feb 1: should be Feb 28 (clamped, no Feb 31).
+        assert gb._next_occurrence(
+            start_date=date(2026, 1, 31), frequency="monthly",
+            after=date(2026, 2, 1),
+        ) == date(2026, 2, 28)
+        # After Feb 28: should be MARCH 31, not March 28.
+        assert gb._next_occurrence(
+            start_date=date(2026, 1, 31), frequency="monthly",
+            after=date(2026, 2, 28),
+        ) == date(2026, 3, 31)
+        # After Mar 31: should be April 30 (April has 30 days).
+        assert gb._next_occurrence(
+            start_date=date(2026, 1, 31), frequency="monthly",
+            after=date(2026, 3, 31),
+        ) == date(2026, 4, 30)
+        # After Apr 30: should be MAY 31, not May 30.
+        assert gb._next_occurrence(
+            start_date=date(2026, 1, 31), frequency="monthly",
+            after=date(2026, 4, 30),
+        ) == date(2026, 5, 31)
+        # 12 months later: should be Jan 31 of the next year.
+        assert gb._next_occurrence(
+            start_date=date(2026, 1, 31), frequency="monthly",
+            after=date(2026, 12, 31),
+        ) == date(2027, 1, 31)
+
+    def test_yearly_leap_day_does_not_drift(self, scheduled_book):
+        """A yearly schedule starting Feb 29 (leap day) must stay on
+        Feb 29 in subsequent leap years, even though intervening
+        non-leap years clamp to Feb 28."""
+        gb = GnuCashBook(str(scheduled_book))
+        # 2024 is a leap year; next yearly from Feb 29, 2024 falls on
+        # Feb 28 in 2025/2026/2027 (clamped) but recovers to Feb 29
+        # in 2028 (next leap year).
+        assert gb._next_occurrence(
+            start_date=date(2024, 2, 29), frequency="yearly",
+            after=date(2027, 6, 1),
+        ) == date(2028, 2, 29)
+
 
 # ── Integration ─────────────────────────────────────────────
 
