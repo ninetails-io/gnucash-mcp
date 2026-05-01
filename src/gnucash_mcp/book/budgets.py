@@ -602,6 +602,25 @@ class BudgetsMixin:
 
             periods = self._resolve_periods(budget, period)
 
+            # Stage prior amounts (per period) so the audit log can
+            # render before/after diffs. Without this, the bookkeeper
+            # sees only the new amount and has no way to verify what
+            # changed.
+            prior_amounts: dict = {}
+            for p in periods:
+                try:
+                    existing = budget.amounts(
+                        account=acct, period_num=p
+                    )
+                    prior_amounts[p] = str(existing.amount)
+                except KeyError:
+                    prior_amounts[p] = None
+            self._stage_audit_before({
+                "budget_name": budget_name,
+                "account": acct.fullname,
+                "prior_amounts": prior_amounts,
+            })
+
             # Convert Decimal to num/denom for direct inserts
             amount_denom = 100
             amount_num = int(amount_decimal * amount_denom)
@@ -864,6 +883,18 @@ class BudgetsMixin:
                 raise ValueError(f"Budget not found: {name}")
 
             from piecash.budget import Budget
+
+            # Stage budget snapshot for the audit log BEFORE delete.
+            # Without this, the audit log shows only "deleted budget X"
+            # — the bookkeeper can't tell what amounts/periods were
+            # lost. Capture the small set of facts that can't be
+            # recovered after the delete: name, num_periods, and how
+            # many account-amount rows existed.
+            self._stage_audit_before({
+                "name": budget.name,
+                "num_periods": budget.num_periods,
+                "amount_count": len(list(budget.amounts)),
+            })
 
             all_budget_guids = [
                 row[0]

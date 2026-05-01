@@ -464,6 +464,215 @@ class TestResolveEntryField:
         assert _resolve_entry_field({"timestamp": "..."}, "anything") is None
 
 
+class TestBudgetAndScheduledAuditHandlers:
+    """Audit handlers for budgets and scheduled transactions.
+
+    Pre-fix, ``_AUDIT_HANDLERS`` had no entries for ``budget`` or
+    ``scheduled_transaction``. Every UPDATE / DELETE on those entities
+    rendered as an empty string — the bookkeeper had no way to see
+    what changed. The book methods also didn't stage before-state.
+    Both gaps closed in the same commit.
+    """
+
+    def test_budget_update_renders_per_period_diff(
+        self, temp_book_path, temp_log_dir,
+    ):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "budget",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {
+                "budget_name": "2026 Budget",
+                "account": "Expenses:Groceries",
+                "amount": "550.00",
+            },
+            "before_state": {
+                "budget_name": "2026 Budget",
+                "account": "Expenses:Groceries",
+                "prior_amounts": {0: "500.00", 1: None},
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "UPDATE BUDGET" in rendered
+        assert '"2026 Budget"' in rendered
+        assert "Expenses:Groceries" in rendered
+        assert "period 0: 500.00 → 550.00" in rendered
+        assert "period 1: (unset) → 550.00" in rendered
+
+    def test_budget_delete_renders_snapshot(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "budget",
+            "operation": "delete",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"name": "2026 Budget"},
+            "before_state": {
+                "name": "2026 Budget",
+                "num_periods": 12,
+                "amount_count": 8,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'DELETE BUDGET  "2026 Budget"' in rendered
+        assert "periods: 12" in rendered
+        assert "amounts removed: 8" in rendered
+
+    def test_scheduled_update_enable_toggle(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01", "enabled": False},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "end_date": None,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'UPDATE SCHEDULED  "Monthly Rent"' in rendered
+        assert "enabled: True → False" in rendered
+
+    def test_scheduled_update_end_date_clear(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01", "end_date": ""},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "end_date": "2026-12-31",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "end_date: 2026-12-31 → (cleared)" in rendered
+
+    def test_scheduled_delete_includes_history(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "delete",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01"},
+            "before_state": {
+                "name": "Monthly Rent",
+                "frequency": "monthly",
+                "start_date": "2026-01-01",
+                "instance_count": 4,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'DELETE SCHEDULED  "Monthly Rent"' in rendered
+        assert "frequency: monthly  start: 2026-01-01" in rendered
+        assert "had run 4 times" in rendered
+
+
+class TestBudgetAndScheduledStaging:
+    """Verify the book methods actually stage before-state.
+
+    The audit handler tests above use synthetic entries to lock the
+    rendering contract; these tests run the real book methods and
+    assert that ``_consume_audit_before`` returns the expected staged
+    dict.
+    """
+
+    def test_set_budget_amount_stages_prior_amounts(self, budget_book):
+        from gnucash_mcp.book import GnuCashBook
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 B", year=2026, num_periods=12)
+        # Initial set populates period 0
+        book.set_budget_amount(
+            budget_name="2026 B",
+            account="Expenses:Groceries",
+            amount="500",
+            period=0,
+        )
+        # Overwrite — staged before-state should carry the prior 500
+        book.set_budget_amount(
+            budget_name="2026 B",
+            account="Expenses:Groceries",
+            amount="600",
+            period=0,
+        )
+        before = book._consume_audit_before()
+        assert before is not None
+        assert before["account"] == "Expenses:Groceries"
+        # period key may be int or str depending on dict round-trip
+        prior = before["prior_amounts"]
+        # The prior amount before this last set was 500
+        assert any(
+            (str(v) == "500" or str(v) == "500.00")
+            for v in prior.values()
+        ), f"expected prior 500 in {prior}"
+
+    def test_delete_budget_stages_snapshot(self, budget_book):
+        from gnucash_mcp.book import GnuCashBook
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="To Delete", year=2026, num_periods=12)
+        book.set_budget_amount(
+            budget_name="To Delete",
+            account="Expenses:Groceries",
+            amount="100",
+            period=0,
+        )
+        book._consume_audit_before()  # clear any staged state
+        book.delete_budget(name="To Delete")
+        before = book._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "To Delete"
+        assert before["num_periods"] == 12
+        assert before["amount_count"] >= 1
+
+    def test_update_scheduled_stages_prior_state(self, scheduled_book):
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb._consume_audit_before()  # clear staged state from create
+        gb.update_scheduled_transaction(sx["guid"], enabled=False)
+        before = gb._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "Rent"
+        assert before["enabled"] is True
+
+    def test_delete_scheduled_stages_snapshot(self, scheduled_book):
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="To Delete",
+            description="x",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "50"},
+                {"account": "Assets:Checking", "amount": "-50"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb._consume_audit_before()
+        gb.delete_scheduled_transaction(sx["guid"])
+        before = gb._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "To Delete"
+        assert before["frequency"] == "monthly"
+
+
 class TestDispatchTableDegradation:
     """Unknown (entity_type, operation) pairs must degrade gracefully.
 

@@ -705,6 +705,17 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
+            # Stage prior state for the audit log so the bookkeeper
+            # can see what changed (enable/disable; end-date set/clear).
+            # Without this, the log only knows the new state.
+            self._stage_audit_before({
+                "name": sx.name,
+                "enabled": bool(sx.enabled),
+                "end_date": (
+                    sx.end_date.isoformat() if sx.end_date else None
+                ),
+            })
+
             if enabled is not None:
                 sx.enabled = 1 if enabled else 0
 
@@ -738,6 +749,16 @@ class SchedulingMixin:
                 raise ValueError(
                     f"Scheduled transaction not found: {guid}"
                 )
+
+            # Stage SX snapshot for the audit log BEFORE delete so the
+            # bookkeeper can recover the schedule's identity from the
+            # log if the delete was a mistake. _sx_to_dict captures
+            # frequency / start_date / end_date / instance_count.
+            try:
+                self._stage_audit_before(self._sx_to_dict(sx))
+            except Exception:
+                # Audit staging must never block the delete.
+                self._stage_audit_before({"name": sx.name})
 
             from piecash.core.transaction import ScheduledTransaction
 
