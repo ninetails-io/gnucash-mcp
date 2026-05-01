@@ -34,6 +34,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
+    _is_market_price,
     _split_to_compact_dict,
     _split_to_dict,
     _to_decimal,
@@ -256,7 +257,7 @@ class CoreMixin:
         for p in book.prices:
             if p.currency != default_currency:
                 continue
-            if p.type == "transaction":
+            if not _is_market_price(p):
                 continue
             p_date = p.date
             if hasattr(p_date, "date") and callable(p_date.date):
@@ -815,7 +816,7 @@ class CoreMixin:
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
             for p in book.prices:
-                if p.type == "transaction":
+                if not _is_market_price(p):
                     continue
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
