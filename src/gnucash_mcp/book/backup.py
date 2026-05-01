@@ -18,7 +18,7 @@ procedure is a filesystem copy with the server stopped — see
 ``docs/RESTORE_FROM_BACKUP.md``. If the server is broken enough to
 need a restore, we can't trust it to do one safely.
 
-Design reference: ``docs/BACKUP_TOOL_SPEC.md``.
+Design reference: ``specs/archive/BACKUP_TOOL_SPEC.md``.
 """
 
 from __future__ import annotations

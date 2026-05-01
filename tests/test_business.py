@@ -247,7 +247,7 @@ class TestCreateEmployee:
     def test_no_notes_field_in_response(self, business_book):
         """Employee dict shape omits the ``notes`` key — Employee has no
         notes column in the schema (unlike Customer and Vendor). See
-        docs/PIECASH_REFERENCE.md."""
+        specs/PIECASH_REFERENCE.md."""
         gb = GnuCashBook(str(business_book))
         gb.create_employee(name="Jane Smith")
         result = gb.get_employee("000001")

@@ -448,8 +448,9 @@ path the test books surfaced.
 two real-shape books — multi-currency reporting, debt-payoff
 amortization for mortgages, voided-payment handling, employee-
 expense-voucher hooks, and many more. See
-[docs/POST_1_2_1_FOLLOWUPS.md](docs/POST_1_2_1_FOLLOWUPS.md)
-for what's deferred to 1.3 (taxtables, jobs, credit notes).
+[specs/NEXT_STEPS_1_3.md](specs/NEXT_STEPS_1_3.md) for the 1.3
+roadmap (taxtables, jobs, credit notes, employee expense
+vouchers).
 
 A condensed changelog of major releases lives in
 [CHANGELOG.md](CHANGELOG.md).

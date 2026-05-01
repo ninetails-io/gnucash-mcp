@@ -638,7 +638,7 @@ class BusinessMixin:
         """Convert a piecash Employee to a serializable dict.
 
         Employee's schema has no ``notes`` column (unlike Customer
-        and Vendor — see docs/PIECASH_REFERENCE.md), so the response
+        and Vendor — see specs/PIECASH_REFERENCE.md), so the response
         shape omits the ``notes`` key. Employee-specific fields
         (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
         scope for the 1.3.0 CRUD surface and are not serialized.
@@ -1094,7 +1094,7 @@ class BusinessMixin:
         Class-specific fields are passed via ``**extra_kwargs`` so the
         helper stays agnostic of what each subclass accepts. Customer
         and Vendor take ``notes=""``; Employee has no ``notes`` column
-        and rejects the kwarg — see docs/PIECASH_REFERENCE.md for the
+        and rejects the kwarg — see specs/PIECASH_REFERENCE.md for the
         full shape divergence. Callers build their own kwargs dict and
         the helper passes it through unexamined.
 
@@ -1474,7 +1474,7 @@ class BusinessMixin:
         Employee has no ``notes`` field (unlike Customer and Vendor).
         Employee-specific fields (``acl`` / ``language`` / ``workday``
         / ``rate``) are out of scope for the 1.3.0 release. See
-        docs/PIECASH_REFERENCE.md for the full schema shape.
+        specs/PIECASH_REFERENCE.md for the full schema shape.
 
         Args:
             name: Employee name.

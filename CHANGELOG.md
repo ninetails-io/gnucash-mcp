@@ -140,9 +140,9 @@ that a USD-only test book never would have:
 test personas built up over the patch cycle now serve as the
 verification harness for any future change.
 
-**Deferred to 1.3:** taxtables, jobs, credit notes, employee
-expense vouchers, plus a few cleanup items captured in
-[docs/POST_1_2_1_FOLLOWUPS.md](docs/POST_1_2_1_FOLLOWUPS.md).
+**1.3 roadmap:** taxtables, jobs, credit notes, employee expense
+vouchers, plus targeted code-hygiene work — see
+[specs/NEXT_STEPS_1_3.md](specs/NEXT_STEPS_1_3.md).
 
 ---
 

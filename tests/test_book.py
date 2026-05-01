@@ -293,7 +293,7 @@ class TestGetBookSummaryReconciliation:
     was operationally useless — with per-account last-reconciled
     state for reconcilable account types. See
     ``CoreMixin._account_reconciliation_status`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §1.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §1.
     """
 
     def _reconcile_split(
@@ -757,7 +757,7 @@ class TestGetBookSummaryNetWorthTrajectory:
     Five anchor points (12mo / 6mo / 3mo / 1mo ago, now) showing
     how net worth has evolved. See
     ``CoreMixin._net_worth_trajectory`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §2.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §2.
     """
 
     @staticmethod
@@ -1157,7 +1157,7 @@ class TestGetBookSummaryMonthlyNet:
     Last 6 calendar months of net income (income − expenses), most
     recent first, with current-month MTD marker. See
     ``CoreMixin._monthly_net_income`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §3.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §3.
     """
 
     def _seed_income(
@@ -1351,7 +1351,7 @@ class TestGetBookSummaryRunway:
 
     Days the household could survive on liquid assets at current
     burn rate if income stopped today. See ``CoreMixin._runway_metrics``
-    and the spec at ``docs/GET_BOOK_SUMMARY_SPEC.md`` §4.
+    and the spec at ``specs/GET_BOOK_SUMMARY_SPEC.md`` §4.
     """
 
     def _seed_recent_expense(
@@ -1765,7 +1765,7 @@ class TestGetBookSummaryBudgetHeadline:
 
     One line per active budget (the one whose period range covers
     today). See ``CoreMixin._budget_headline`` and
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §6.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §6.
     """
 
     def _make_budget_covering_today(
@@ -1942,7 +1942,7 @@ class TestGetBookSummaryWarnings:
     integrity issues, stale prices, and overdue items BEFORE
     reading numbers that depend on them. See
     ``CoreMixin._collect_warnings`` and
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §5.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §5.
     """
 
     def test_section_omitted_when_no_warnings(self, test_book: Path):

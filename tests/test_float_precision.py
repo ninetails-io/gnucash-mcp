@@ -1,9 +1,9 @@
 """Regression tests for the float/Decimal precision bug.
 
-Filed as ``docs/float-precision-bug.md`` — `create_transaction`
-rejected balanced payloads like $94.87 because `0.87` has no exact
-binary representation and the IEEE-754 epsilon leaked from a
-``float`` into ``Decimal(...)`` before the sum-to-zero check.
+``create_transaction`` rejected balanced payloads like $94.87
+because `0.87` has no exact binary representation and the IEEE-754
+epsilon leaked from a ``float`` into ``Decimal(...)`` before the
+sum-to-zero check.
 
 Two protections now guard the boundary:
 

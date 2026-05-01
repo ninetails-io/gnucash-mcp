@@ -290,7 +290,7 @@ pattern rather than trying to use the ORM constructors directly.
   is indexed. Avoid `for x in book.x:` linear scans for finder
   patterns; the `_find_*` helpers use the indexed form. (A handful
   of business.py call sites still use linear scans — see
-  `docs/POST_1_2_1_FOLLOWUPS.md`.)
+  `specs/NEXT_STEPS_1_3.md`.)
 
 ---
 
