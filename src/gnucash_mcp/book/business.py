@@ -20,6 +20,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _is_market_price,
     _to_date,
     _to_decimal,
     _verify_composite_write,
@@ -192,35 +193,33 @@ class BusinessMixin:
 
     @staticmethod
     def _find_customer(book, customer_id: str):
-        """Find a customer by their human-readable ID (e.g., '000001')."""
-        for c in book.customers:
-            if c.id == customer_id:
-                return c
-        return None
+        """Find a customer by their human-readable ID (e.g., '000001').
+
+        Uses an indexed ``filter_by`` query rather than scanning
+        ``book.customers``. The ORM-backed CallableList iteration
+        was a real hot-path cost in business workflows that look up
+        the same customer multiple times per write.
+        """
+        from piecash.business.person import Customer
+        return book.session.query(Customer).filter_by(id=customer_id).first()
 
     @staticmethod
     def _find_vendor(book, vendor_id: str):
         """Find a vendor by their human-readable ID (e.g., '000001')."""
-        for v in book.vendors:
-            if v.id == vendor_id:
-                return v
-        return None
+        from piecash.business.person import Vendor
+        return book.session.query(Vendor).filter_by(id=vendor_id).first()
 
     @staticmethod
     def _find_customer_by_guid(book, guid: str):
-        """Find a customer by GUID."""
-        for c in book.customers:
-            if c.guid == guid:
-                return c
-        return None
+        """Find a customer by GUID (indexed)."""
+        from piecash.business.person import Customer
+        return book.session.query(Customer).filter_by(guid=guid).first()
 
     @staticmethod
     def _find_vendor_by_guid(book, guid: str):
-        """Find a vendor by GUID."""
-        for v in book.vendors:
-            if v.guid == guid:
-                return v
-        return None
+        """Find a vendor by GUID (indexed)."""
+        from piecash.business.person import Vendor
+        return book.session.query(Vendor).filter_by(guid=guid).first()
 
     # Path for the auto-created realized-FX-gain/loss income account.
     # Single credit-natural account: positive balance = net gain, negative
@@ -410,7 +409,7 @@ class BusinessMixin:
 
         for p in book.prices:
             # Skip piecash's auto-created post-invoice default rates.
-            if p.type == "transaction":
+            if not _is_market_price(p):
                 continue
 
             p_date = _to_date(p.date)
@@ -449,10 +448,8 @@ class BusinessMixin:
     @staticmethod
     def _find_employee(book, employee_id: str):
         """Find an employee by their human-readable ID (e.g., '000001')."""
-        for e in book.employees:
-            if e.id == employee_id:
-                return e
-        return None
+        from piecash.business.person import Employee
+        return book.session.query(Employee).filter_by(id=employee_id).first()
 
     @staticmethod
     def _parse_owner_type(owner_type: str | None) -> int | None:
@@ -2580,11 +2577,9 @@ class BusinessMixin:
             piecash_splits.append(ar_ap_split)
 
             for acct_guid, acct_total in acct_totals.items():
-                entry_acct = None
-                for a in book.accounts:
-                    if a.guid == acct_guid:
-                        entry_acct = a
-                        break
+                entry_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=acct_guid).first()
                 if not entry_acct:
                     raise ValueError(
                         f"Entry account not found: {acct_guid}"
@@ -2879,12 +2874,10 @@ class BusinessMixin:
                     f"Account not found: {payment_account}"
                 )
 
-            post_acct = None
             post_acc_guid = inv.post_acc_guid
-            for a in book.accounts:
-                if a.guid == post_acc_guid:
-                    post_acct = a
-                    break
+            post_acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=post_acc_guid).first()
             if not post_acct:
                 raise ValueError(
                     f"Post account not found for invoice {invoice_id}"
@@ -2912,44 +2905,61 @@ class BusinessMixin:
             owner_name = owner.name if owner else ""
             txn_desc = description or owner_name
 
-            # Cross-currency payment: if the payment account's commodity
-            # differs from the invoice currency, find the exchange rate
-            # from book.prices and compute the payment account's quantity.
-            # The transaction currency stays as the invoice currency, so
-            # all split ``value``s remain in invoice currency (the
-            # transaction balances in EUR for an EUR invoice); the pay
-            # account's ``quantity`` reflects the actual USD/GBP/whatever
-            # amount deposited or withdrawn.
-            exchange_rate = None
-            pay_quantity = payment_amount
-            if pay_acct.commodity != inv.currency:
-                exchange_rate = self._find_exchange_rate(
+            # Cross-currency payment: when the payment account's
+            # commodity OR the A/R/A/P account's commodity differs
+            # from the invoice currency, find the exchange rate from
+            # book.prices and convert quantity. The transaction
+            # currency stays as the invoice currency so all split
+            # ``value``s remain in invoice currency (transaction
+            # balances in EUR for an EUR invoice); each account's
+            # ``quantity`` reflects the actual amount in its own
+            # commodity.
+            #
+            # Pre-fix, ``pay_invoice`` only converted the bank-side
+            # quantity. ``post_invoice`` correctly converted the A/R
+            # side via ``_qty_for_split(post_acct, ...)``; the pay
+            # path didn't, so a USD A/R holding a EUR invoice was
+            # liquidated in EUR-as-USD on payment.
+            def _convert(amount, target_commodity):
+                """Convert invoice-currency amount to target commodity."""
+                if target_commodity == inv.currency:
+                    return amount, None
+                rate = self._find_exchange_rate(
                     book,
                     from_commodity=inv.currency,
-                    to_commodity=pay_acct.commodity,
+                    to_commodity=target_commodity,
                     as_of=parsed_date,
                 )
-                if exchange_rate is None:
+                if rate is None:
                     raise ValueError(
-                        f"Cross-currency payment requires an exchange rate: "
-                        f"invoice currency {inv.currency.mnemonic} differs "
-                        f"from payment account commodity "
-                        f"{pay_acct.commodity.mnemonic}, and no matching "
-                        f"price was found in the book for "
-                        f"{inv.currency.mnemonic}/{pay_acct.commodity.mnemonic} "
-                        f"on or near {parsed_date}. Add a price with "
+                        f"Cross-currency payment requires an exchange "
+                        f"rate: invoice currency "
+                        f"{inv.currency.mnemonic} differs from account "
+                        f"commodity {target_commodity.mnemonic}, and "
+                        f"no matching price was found in the book for "
+                        f"{inv.currency.mnemonic}/"
+                        f"{target_commodity.mnemonic} on or near "
+                        f"{parsed_date}. Add a price with "
                         f"create_price, then retry."
                     )
-                pay_quantity = (payment_amount * exchange_rate).quantize(
-                    Decimal("0.01")
+                return (
+                    (amount * rate).quantize(Decimal("0.01")),
+                    rate,
                 )
+
+            pay_quantity, exchange_rate = _convert(
+                payment_amount, pay_acct.commodity,
+            )
+            post_quantity, _post_rate = _convert(
+                payment_amount, post_acct.commodity,
+            )
 
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=payment_amount,
-                    quantity=payment_amount,
+                    quantity=post_quantity,
                     memo="",
                     action="Payment",
                 )
@@ -2964,7 +2974,7 @@ class BusinessMixin:
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=-payment_amount,
-                    quantity=-payment_amount,
+                    quantity=-post_quantity,
                     memo="",
                     action="Payment",
                 )
@@ -3424,11 +3434,7 @@ class BusinessMixin:
                 query = query.filter(Invoice.owner_type == ot)
 
             if customer_id:
-                customer = None
-                for c in book.customers:
-                    if c.id == customer_id:
-                        customer = c
-                        break
+                customer = self._find_customer(book, customer_id)
                 if not customer:
                     raise ValueError(
                         f"Customer not found: {customer_id}"
@@ -3438,11 +3444,7 @@ class BusinessMixin:
                 )
 
             if vendor_id:
-                vendor = None
-                for v in book.vendors:
-                    if v.id == vendor_id:
-                        vendor = v
-                        break
+                vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
@@ -3460,11 +3462,9 @@ class BusinessMixin:
                 is_bill = inv.owner_type == 4
 
                 post_acc_guid = inv.post_acc_guid
-                post_acct = None
-                for a in book.accounts:
-                    if a.guid == post_acc_guid:
-                        post_acct = a
-                        break
+                post_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=post_acc_guid).first()
                 if not post_acct:
                     continue
 
@@ -3592,11 +3592,7 @@ class BusinessMixin:
             )
 
             if vendor_id:
-                vendor = None
-                for v in book.vendors:
-                    if v.id == vendor_id:
-                        vendor = v
-                        break
+                vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
@@ -3647,11 +3643,9 @@ class BusinessMixin:
                     total = Decimal(0)
 
                 balance = Decimal(0)
-                post_acct = None
-                for a in book.accounts:
-                    if a.guid == bill.post_acc_guid:
-                        post_acct = a
-                        break
+                post_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=bill.post_acc_guid).first()
                 if post_acct:
                     for lot in post_acct.lots:
                         if lot.guid == bill.post_lot_guid:

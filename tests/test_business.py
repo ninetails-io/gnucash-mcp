@@ -3001,6 +3001,220 @@ class TestPayInvoice:
         fx_balance = gb.get_balance(account_name="Income:Foreign Exchange Gain/Loss")
         assert fx_balance == Decimal("90")
 
+    def _add_eur_ap_and_price(self, gb, rate_date, rate_value):
+        """Helper for vendor-bill FX tests: EUR A/P + EUR/USD price.
+
+        Mirrors ``_add_eur_ar_and_price`` but creates an A/P account
+        (PAYABLE type) so vendor-bill posting/paying can be exercised
+        in a EUR-denominated workflow.
+        """
+        import piecash
+        from datetime import date as _date
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = None
+            for c in book.commodities:
+                if c.mnemonic == "EUR":
+                    eur = c
+                    break
+            if eur is None:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+            if not any(
+                a.fullname == "Liabilities:Accounts Payable EUR"
+                for a in book.accounts
+            ):
+                liabs = next(
+                    a for a in book.accounts if a.fullname == "Liabilities"
+                )
+                book.session.add(piecash.Account(
+                    name="Accounts Payable EUR", type="PAYABLE",
+                    parent=liabs, commodity=eur,
+                ))
+            parsed = (
+                rate_date if isinstance(rate_date, _date)
+                else _date.fromisoformat(rate_date)
+            )
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=parsed,
+                value=str(rate_value), source="user:test", type="nav",
+            ))
+            book.save()
+
+    def test_cross_currency_fx_gain_on_vendor_bill_payment(
+        self, business_book,
+    ):
+        """Pay-date rate LOWER than post-date rate on a vendor bill →
+        we paid LESS USD than expected → FX gain.
+
+        Post €4500 bill on Mar 10 at rate 1.12 → expense recorded as
+        $5,040. Pay on Mar 20 at rate 1.10 → only $4,950 actually
+        leaves checking. We saved $90 on the spread → gain of $90,
+        booked to Income:Foreign Exchange Gain/Loss as a credit
+        (income increases). Pre-fix, the four-quadrant FX sign
+        convention had no test for the vendor-bill side at all —
+        only customer-invoice gain/loss were covered.
+        """
+        gb = GnuCashBook(str(business_book))
+
+        self._add_eur_ap_and_price(gb, "2026-03-10", "1.12")
+        self._add_eur_ap_and_price(gb, "2026-03-20", "1.10")
+
+        gb.create_vendor(name="Berlin Vendor", currency="EUR")
+        gb.create_bill(vendor_id="000001", currency="EUR",
+                       date_opened="2026-03-10")
+        gb.add_bill_entry(bill_id="000001",
+                          account="Expenses:Office Supplies",
+                          description="EUR purchase",
+                          quantity="1", price="4500.00")
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Liabilities:Accounts Payable EUR",
+                        post_date="2026-03-10")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+
+        # We paid only $4,950 from checking (vs. $5,040 expected at
+        # post-rate) → gain of $90.
+        assert Decimal(result["payment_account_amount"]) == Decimal("4950.00")
+        assert "fx_realized" in result
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("90.00")
+
+        # FX Gain/Loss is credit-natural; a gain credits → stored
+        # negative.
+        fx_balance = gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        )
+        assert fx_balance == Decimal("-90")
+
+    def test_cross_currency_fx_loss_on_vendor_bill_payment(
+        self, business_book,
+    ):
+        """Pay-date rate HIGHER than post-date rate on a vendor bill →
+        we paid MORE USD than expected → FX loss.
+
+        Post €4500 bill on Mar 10 at rate 1.10 → expense recorded as
+        $4,950. Pay on Mar 20 at rate 1.12 → $5,040 actually leaves
+        checking. We overpaid by $90 → loss of $90, booked to
+        Income:Foreign Exchange Gain/Loss as a debit (income
+        reduced).
+        """
+        gb = GnuCashBook(str(business_book))
+
+        self._add_eur_ap_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ap_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_vendor(name="Berlin Vendor", currency="EUR")
+        gb.create_bill(vendor_id="000001", currency="EUR",
+                       date_opened="2026-03-10")
+        gb.add_bill_entry(bill_id="000001",
+                          account="Expenses:Office Supplies",
+                          description="EUR purchase",
+                          quantity="1", price="4500.00")
+        gb.post_invoice(invoice_id="000001",
+                        post_account="Liabilities:Accounts Payable EUR",
+                        post_date="2026-03-10")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+
+        assert Decimal(result["payment_account_amount"]) == Decimal("5040.00")
+        assert result["fx_realized"]["direction"] == "loss"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("90.00")
+
+        # FX loss debits the credit-natural account → stored
+        # positive.
+        fx_balance = gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        )
+        assert fx_balance == Decimal("90")
+
+    def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
+        self, business_book,
+    ):
+        """When the A/R account's commodity differs from the invoice
+        currency, ``pay_invoice`` must convert the A/R-side quantity
+        the same way ``post_invoice`` does. Pre-fix, only the
+        bank-side quantity was converted; the A/R-side stayed in
+        invoice-currency units, leaving a residual balance the bank
+        had already paid for.
+
+        Setup: USD-default book, USD A/R account, EUR invoice,
+        EUR/USD = 1.10. Post a €4,500 invoice → A/R debited 4,950
+        USD. Pay €4,500 from USD checking → A/R must credit 4,950
+        USD (not 4,500), leaving the A/R balance at exactly zero.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        # Add EUR commodity + price + a USD A/R account specifically.
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(
+                    c for c in book.commodities if c.mnemonic == "EUR"
+                )
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="A/R USD", type="RECEIVABLE",
+                parent=assets, commodity=usd,
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10),
+                value="1.10", source="user:test", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="EUR services",
+            quantity="1", price="4500.00",
+        )
+        # Post into the USD A/R account — invoice in EUR, A/R in USD
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:A/R USD",
+            post_date="2026-03-10",
+        )
+
+        ar_after_post = gb.get_balance(account_name="Assets:A/R USD")
+        # Post correctly converts: €4500 × 1.10 = $4,950 USD debited
+        assert ar_after_post == Decimal("4950")
+
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-10",
+        )
+
+        # A/R must be ZERO after payment. Pre-fix, the A/R-side
+        # quantity stayed at -4500 (raw EUR value treated as USD on
+        # the USD-commodity account), leaving $450 floating.
+        ar_after_pay = gb.get_balance(account_name="Assets:A/R USD")
+        assert ar_after_pay == Decimal("0")
+
     def test_cross_currency_same_rate_no_fx_split(self, business_book):
         """Post and pay at the identical rate → no FX split, no FX account."""
         gb = GnuCashBook(str(business_book))

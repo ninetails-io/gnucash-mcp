@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 import piecash
 
-from gnucash_mcp.book._base import _to_decimal
+from gnucash_mcp.book._base import _is_market_price, _to_decimal
 from gnucash_mcp._format import _format_number
 
 # Account-type groups used across the reports. Defined at module level
@@ -250,7 +250,7 @@ class ReportingMixin:
         for p in book.prices:
             if p.currency != default_currency:
                 continue
-            if p.type == "transaction":
+            if not _is_market_price(p):
                 continue
             p_date = p.date
             if hasattr(p_date, "date") and callable(p_date.date):

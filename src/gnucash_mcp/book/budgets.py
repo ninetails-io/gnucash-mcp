@@ -10,7 +10,7 @@ SQLAlchemy Core API paired with _verify_* round-trip checks.
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
 
@@ -602,16 +602,46 @@ class BudgetsMixin:
 
             periods = self._resolve_periods(budget, period)
 
-            # Convert Decimal to num/denom for direct inserts
-            amount_denom = 100
-            amount_num = int(amount_decimal * amount_denom)
+            # Stage prior amounts (per period) so the audit log can
+            # render before/after diffs. Without this, the bookkeeper
+            # sees only the new amount and has no way to verify what
+            # changed.
+            prior_amounts: dict = {}
+            for p in periods:
+                try:
+                    existing = budget.amounts(
+                        account=acct, period_num=p
+                    )
+                    prior_amounts[p] = str(existing.amount)
+                except KeyError:
+                    prior_amounts[p] = None
+            self._stage_audit_before({
+                "budget_name": budget_name,
+                "account": acct.fullname,
+                "prior_amounts": prior_amounts,
+            })
+
+            # Quantize to the account commodity's smallest fraction:
+            # USD (fraction=100) → 2 decimals, JPY (fraction=1) → 0,
+            # BHD (fraction=1000) → 3. Banker's rounding avoids
+            # systematic bias on ties. We must apply the same
+            # quantization on both the insert AND update branches —
+            # piecash's hybrid ``existing.amount`` setter doesn't
+            # quantize, so without this the two paths would store
+            # different values for the same input.
+            amount_denom = acct.commodity.fraction
+            quantum = Decimal(1) / Decimal(amount_denom)
+            quantized = amount_decimal.quantize(
+                quantum, rounding=ROUND_HALF_EVEN,
+            )
+            amount_num = int(quantized * amount_denom)
 
             for p in periods:
                 try:
                     existing = budget.amounts(
                         account=acct, period_num=p
                     )
-                    existing.amount = amount_decimal
+                    existing.amount = quantized
                 except KeyError:
                     # No existing amount — insert via table (BudgetAmount constructor blocked)
                     book.session.execute(
@@ -763,6 +793,23 @@ class BudgetsMixin:
                     if existing is None or len(acct_name) > len(existing):
                         rollup_map[desc.fullname] = acct_name
 
+            # Cross-currency conversion: when a budgeted account
+            # parent has children in non-default-currency commodities
+            # (e.g., USD-default book with a EUR ``Expenses:Travel``
+            # leaf), summing raw ``split.quantity`` would treat 100
+            # EUR + 100 USD as 200 in the parent's row. Use the same
+            # market-rate lookup as the reporting suite, gracefully
+            # falling back to raw quantity when reporting helpers
+            # aren't available (e.g., ``--modules budgets`` without
+            # ``reporting``).
+            factors_fn = getattr(
+                self, "_account_conversion_factors", None,
+            )
+            split_in_default = getattr(
+                self, "_split_in_default_currency", None,
+            )
+            factors = factors_fn(book) if factors_fn else None
+
             # Calculate actuals from transactions
             actuals: dict[str, Decimal] = {}
             for transaction in book.transactions:
@@ -773,7 +820,13 @@ class BudgetsMixin:
                     rollup_target = rollup_map.get(acct_name)
                     if rollup_target is None:
                         continue
-                    amount = split.quantity
+                    if factors is not None and split_in_default is not None:
+                        amount = split_in_default(
+                            split, split.account,
+                            factors.get(split.account.guid),
+                        )
+                    else:
+                        amount = Decimal(str(split.quantity))
                     if split.account.type == "EXPENSE" and amount > 0:
                         actuals[rollup_target] = actuals.get(
                             rollup_target, Decimal("0")
@@ -864,6 +917,18 @@ class BudgetsMixin:
                 raise ValueError(f"Budget not found: {name}")
 
             from piecash.budget import Budget
+
+            # Stage budget snapshot for the audit log BEFORE delete.
+            # Without this, the audit log shows only "deleted budget X"
+            # — the bookkeeper can't tell what amounts/periods were
+            # lost. Capture the small set of facts that can't be
+            # recovered after the delete: name, num_periods, and how
+            # many account-amount rows existed.
+            self._stage_audit_before({
+                "name": budget.name,
+                "num_periods": budget.num_periods,
+                "amount_count": len(list(budget.amounts)),
+            })
 
             all_budget_guids = [
                 row[0]

@@ -849,6 +849,100 @@ def _fmt_entry_create(entry: dict) -> list[str]:
     ]
 
 
+# ── Budget handlers ────────────────────────────────────────────────
+
+
+def _fmt_budget_update(entry: dict) -> list[str]:
+    """``set_budget_amount`` is logged as ``budget UPDATE``. Renders
+    the per-period before/after diff captured by the staged
+    ``prior_amounts`` map."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    budget_name = params.get("budget_name", before.get("budget_name", ""))
+    account = params.get("account", before.get("account", ""))
+    new_amount = params.get("amount", "")
+
+    lines = [
+        f"{time_part}  UPDATE BUDGET",
+        f'{_INDENT}"{budget_name}"  account: {account}',
+    ]
+    prior = before.get("prior_amounts") or {}
+    if prior:
+        # Show before/after per period. ``prior_amounts`` is keyed by
+        # period number; sort numerically so the human reader sees
+        # period 0, 1, 2, … in order.
+        for p in sorted(prior, key=lambda k: int(k) if str(k).isdigit() else 0):
+            old = prior[p]
+            old_str = old if old is not None else "(unset)"
+            lines.append(
+                f"{_INDENT}period {p}: {old_str} → {new_amount}"
+            )
+    else:
+        lines.append(f"{_INDENT}amount: {new_amount}")
+    return lines
+
+
+def _fmt_budget_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = before.get("name", params.get("name", ""))
+    lines = [f'{time_part}  DELETE BUDGET  "{name}"']
+    if before:
+        np = before.get("num_periods")
+        ac = before.get("amount_count")
+        if np is not None:
+            lines.append(
+                f"{_INDENT}periods: {np}  amounts removed: {ac or 0}"
+            )
+    return lines
+
+
+# ── Scheduled-transaction handlers ─────────────────────────────────
+
+
+def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = before.get("name", "")
+    lines = [f'{time_part}  UPDATE SCHEDULED  "{name}"']
+    if "enabled" in params and params["enabled"] is not None:
+        old = before.get("enabled")
+        new = bool(params["enabled"])
+        if old is not None and old != new:
+            lines.append(f"{_INDENT}enabled: {old} → {new}")
+        else:
+            lines.append(f"{_INDENT}enabled: {new}")
+    if "end_date" in params and params["end_date"] is not None:
+        old = before.get("end_date")
+        new = params["end_date"] if params["end_date"] != "" else None
+        old_str = old or "(none)"
+        new_str = new or "(cleared)"
+        if old != new:
+            lines.append(f"{_INDENT}end_date: {old_str} → {new_str}")
+    return lines
+
+
+def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state") or {}
+    name = before.get("name", "")
+    lines = [f'{time_part}  DELETE SCHEDULED  "{name}"']
+    freq = before.get("frequency")
+    start = before.get("start_date")
+    instance_count = before.get("instance_count")
+    if freq:
+        lines.append(f"{_INDENT}frequency: {freq}  start: {start}")
+    if instance_count:
+        lines.append(
+            f"{_INDENT}had run {instance_count} time"
+            f"{'s' if instance_count != 1 else ''}"
+        )
+    return lines
+
+
 # ── Dispatch table ────────────────────────────────────────────────
 #
 # Key shape: (entity_type, operation). Both in their canonical forms —
@@ -889,6 +983,10 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("bill", "DELETE"): _fmt_bill_delete,
     ("entry", "CREATE"): _fmt_entry_create,
     ("price", "DELETE"): _fmt_price_delete,
+    ("budget", "UPDATE"): _fmt_budget_update,
+    ("budget", "DELETE"): _fmt_budget_delete,
+    ("scheduled_transaction", "UPDATE"): _fmt_scheduled_transaction_update,
+    ("scheduled_transaction", "DELETE"): _fmt_scheduled_transaction_delete,
 }
 
 

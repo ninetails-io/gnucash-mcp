@@ -90,19 +90,28 @@ class SchedulingMixin:
         if last_occur is not None and last_occur > after:
             after = last_occur
 
-        delta_map = {
-            "weekly": relativedelta(weeks=1),
-            "biweekly": relativedelta(weeks=2),
-            "monthly": relativedelta(months=1),
-            "bimonthly": relativedelta(months=2),
-            "quarterly": relativedelta(months=3),
-            "yearly": relativedelta(years=1),
-        }
-        delta = delta_map[frequency]
+        # Anchor each occurrence to ``start_date + (n × period)`` rather
+        # than chaining ``occurrence += delta``. ``relativedelta`` clamps
+        # to month-end on day-of-month overflow, so a monthly schedule
+        # starting Jan 31 chained as Jan 31 → Feb 28 → Mar 28 → … (drift
+        # never recovers). Anchored from start_date: Feb 28 → Mar 31 →
+        # Apr 30 → May 31, preserving the bookkeeper's "31st of every
+        # month, falling back to month-end where needed" intent.
+        delta_for = {
+            "weekly": lambda n: relativedelta(weeks=n),
+            "biweekly": lambda n: relativedelta(weeks=2 * n),
+            "monthly": lambda n: relativedelta(months=n),
+            "bimonthly": lambda n: relativedelta(months=2 * n),
+            "quarterly": lambda n: relativedelta(months=3 * n),
+            "yearly": lambda n: relativedelta(years=n),
+        }[frequency]
 
-        occurrence = start_date
-        while occurrence <= after:
-            occurrence += delta
+        n = 0
+        while True:
+            occurrence = start_date + delta_for(n)
+            if occurrence > after:
+                break
+            n += 1
 
         if end_date and occurrence > end_date:
             return None
@@ -705,6 +714,17 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
+            # Stage prior state for the audit log so the bookkeeper
+            # can see what changed (enable/disable; end-date set/clear).
+            # Without this, the log only knows the new state.
+            self._stage_audit_before({
+                "name": sx.name,
+                "enabled": bool(sx.enabled),
+                "end_date": (
+                    sx.end_date.isoformat() if sx.end_date else None
+                ),
+            })
+
             if enabled is not None:
                 sx.enabled = 1 if enabled else 0
 
@@ -738,6 +758,16 @@ class SchedulingMixin:
                 raise ValueError(
                     f"Scheduled transaction not found: {guid}"
                 )
+
+            # Stage SX snapshot for the audit log BEFORE delete so the
+            # bookkeeper can recover the schedule's identity from the
+            # log if the delete was a mistake. _sx_to_dict captures
+            # frequency / start_date / end_date / instance_count.
+            try:
+                self._stage_audit_before(self._sx_to_dict(sx))
+            except Exception:
+                # Audit staging must never block the delete.
+                self._stage_audit_before({"name": sx.name})
 
             from piecash.core.transaction import ScheduledTransaction
 
