@@ -192,35 +192,33 @@ class BusinessMixin:
 
     @staticmethod
     def _find_customer(book, customer_id: str):
-        """Find a customer by their human-readable ID (e.g., '000001')."""
-        for c in book.customers:
-            if c.id == customer_id:
-                return c
-        return None
+        """Find a customer by their human-readable ID (e.g., '000001').
+
+        Uses an indexed ``filter_by`` query rather than scanning
+        ``book.customers``. The ORM-backed CallableList iteration
+        was a real hot-path cost in business workflows that look up
+        the same customer multiple times per write.
+        """
+        from piecash.business.person import Customer
+        return book.session.query(Customer).filter_by(id=customer_id).first()
 
     @staticmethod
     def _find_vendor(book, vendor_id: str):
         """Find a vendor by their human-readable ID (e.g., '000001')."""
-        for v in book.vendors:
-            if v.id == vendor_id:
-                return v
-        return None
+        from piecash.business.person import Vendor
+        return book.session.query(Vendor).filter_by(id=vendor_id).first()
 
     @staticmethod
     def _find_customer_by_guid(book, guid: str):
-        """Find a customer by GUID."""
-        for c in book.customers:
-            if c.guid == guid:
-                return c
-        return None
+        """Find a customer by GUID (indexed)."""
+        from piecash.business.person import Customer
+        return book.session.query(Customer).filter_by(guid=guid).first()
 
     @staticmethod
     def _find_vendor_by_guid(book, guid: str):
-        """Find a vendor by GUID."""
-        for v in book.vendors:
-            if v.guid == guid:
-                return v
-        return None
+        """Find a vendor by GUID (indexed)."""
+        from piecash.business.person import Vendor
+        return book.session.query(Vendor).filter_by(guid=guid).first()
 
     # Path for the auto-created realized-FX-gain/loss income account.
     # Single credit-natural account: positive balance = net gain, negative
@@ -449,10 +447,8 @@ class BusinessMixin:
     @staticmethod
     def _find_employee(book, employee_id: str):
         """Find an employee by their human-readable ID (e.g., '000001')."""
-        for e in book.employees:
-            if e.id == employee_id:
-                return e
-        return None
+        from piecash.business.person import Employee
+        return book.session.query(Employee).filter_by(id=employee_id).first()
 
     @staticmethod
     def _parse_owner_type(owner_type: str | None) -> int | None:
@@ -2580,11 +2576,9 @@ class BusinessMixin:
             piecash_splits.append(ar_ap_split)
 
             for acct_guid, acct_total in acct_totals.items():
-                entry_acct = None
-                for a in book.accounts:
-                    if a.guid == acct_guid:
-                        entry_acct = a
-                        break
+                entry_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=acct_guid).first()
                 if not entry_acct:
                     raise ValueError(
                         f"Entry account not found: {acct_guid}"
@@ -2879,12 +2873,10 @@ class BusinessMixin:
                     f"Account not found: {payment_account}"
                 )
 
-            post_acct = None
             post_acc_guid = inv.post_acc_guid
-            for a in book.accounts:
-                if a.guid == post_acc_guid:
-                    post_acct = a
-                    break
+            post_acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=post_acc_guid).first()
             if not post_acct:
                 raise ValueError(
                     f"Post account not found for invoice {invoice_id}"
@@ -3424,11 +3416,7 @@ class BusinessMixin:
                 query = query.filter(Invoice.owner_type == ot)
 
             if customer_id:
-                customer = None
-                for c in book.customers:
-                    if c.id == customer_id:
-                        customer = c
-                        break
+                customer = self._find_customer(book, customer_id)
                 if not customer:
                     raise ValueError(
                         f"Customer not found: {customer_id}"
@@ -3438,11 +3426,7 @@ class BusinessMixin:
                 )
 
             if vendor_id:
-                vendor = None
-                for v in book.vendors:
-                    if v.id == vendor_id:
-                        vendor = v
-                        break
+                vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
@@ -3460,11 +3444,9 @@ class BusinessMixin:
                 is_bill = inv.owner_type == 4
 
                 post_acc_guid = inv.post_acc_guid
-                post_acct = None
-                for a in book.accounts:
-                    if a.guid == post_acc_guid:
-                        post_acct = a
-                        break
+                post_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=post_acc_guid).first()
                 if not post_acct:
                     continue
 
@@ -3592,11 +3574,7 @@ class BusinessMixin:
             )
 
             if vendor_id:
-                vendor = None
-                for v in book.vendors:
-                    if v.id == vendor_id:
-                        vendor = v
-                        break
+                vendor = self._find_vendor(book, vendor_id)
                 if not vendor:
                     raise ValueError(
                         f"Vendor not found: {vendor_id}"
@@ -3647,11 +3625,9 @@ class BusinessMixin:
                     total = Decimal(0)
 
                 balance = Decimal(0)
-                post_acct = None
-                for a in book.accounts:
-                    if a.guid == bill.post_acc_guid:
-                        post_acct = a
-                        break
+                post_acct = book.session.query(
+                    piecash.Account
+                ).filter_by(guid=bill.post_acc_guid).first()
                 if post_acct:
                     for lot in post_acct.lots:
                         if lot.guid == bill.post_lot_guid:
