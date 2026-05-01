@@ -763,6 +763,23 @@ class BudgetsMixin:
                     if existing is None or len(acct_name) > len(existing):
                         rollup_map[desc.fullname] = acct_name
 
+            # Cross-currency conversion: when a budgeted account
+            # parent has children in non-default-currency commodities
+            # (e.g., USD-default book with a EUR ``Expenses:Travel``
+            # leaf), summing raw ``split.quantity`` would treat 100
+            # EUR + 100 USD as 200 in the parent's row. Use the same
+            # market-rate lookup as the reporting suite, gracefully
+            # falling back to raw quantity when reporting helpers
+            # aren't available (e.g., ``--modules budgets`` without
+            # ``reporting``).
+            factors_fn = getattr(
+                self, "_account_conversion_factors", None,
+            )
+            split_in_default = getattr(
+                self, "_split_in_default_currency", None,
+            )
+            factors = factors_fn(book) if factors_fn else None
+
             # Calculate actuals from transactions
             actuals: dict[str, Decimal] = {}
             for transaction in book.transactions:
@@ -773,7 +790,13 @@ class BudgetsMixin:
                     rollup_target = rollup_map.get(acct_name)
                     if rollup_target is None:
                         continue
-                    amount = split.quantity
+                    if factors is not None and split_in_default is not None:
+                        amount = split_in_default(
+                            split, split.account,
+                            factors.get(split.account.guid),
+                        )
+                    else:
+                        amount = Decimal(str(split.quantity))
                     if split.account.type == "EXPENSE" and amount > 0:
                         actuals[rollup_target] = actuals.get(
                             rollup_target, Decimal("0")
