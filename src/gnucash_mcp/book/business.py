@@ -455,6 +455,47 @@ class BusinessMixin:
         return None
 
     @staticmethod
+    def _parse_owner_type(owner_type: str | None) -> int | None:
+        """Map an owner_type string to its piecash integer code.
+
+        ``None`` → ``None`` (caller wants no filter).
+        ``"customer"`` → 2.
+        ``"vendor"`` → 4.
+
+        Anything else raises ``ValueError`` with a message that
+        names the valid options *and* explicitly calls out
+        ``"employee"`` as not yet supported. Employee expense
+        vouchers (``owner_type=5`` in piecash) are explicitly out
+        of scope for the 1.2.x business module — see the
+        ``delete_employee`` docstring's reference to
+        ``counter_exp_voucher``. Pre-fix, an LLM passing
+        ``owner_type="employee"`` would silently fall through to
+        the unfiltered lookup and discover the limitation only
+        via a confusing downstream error (e.g. a cross-sequence
+        ID-collision message that suggests "customer or vendor"
+        without mentioning employee at all). The upfront
+        rejection saves the LLM a tool call and frames the
+        limitation cleanly.
+        """
+        if owner_type is None:
+            return None
+        if owner_type == "customer":
+            return 2
+        if owner_type == "vendor":
+            return 4
+        if owner_type == "employee":
+            raise ValueError(
+                "owner_type='employee' is not yet supported. "
+                "Employee expense vouchers are out of scope for "
+                "the 1.2.x business module. Use 'customer' or "
+                "'vendor'."
+            )
+        raise ValueError(
+            f"Invalid owner_type {owner_type!r}. "
+            f"Must be 'customer' or 'vendor'."
+        )
+
+    @staticmethod
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
@@ -2224,13 +2265,12 @@ class BusinessMixin:
         """
         from piecash.business.invoice import Invoice
 
+        ot = self._parse_owner_type(owner_type)
         with self.open() as book:
             query = book.session.query(Invoice)
 
-            if owner_type == "customer":
-                query = query.filter(Invoice.owner_type == 2)
-            elif owner_type == "vendor":
-                query = query.filter(Invoice.owner_type == 4)
+            if ot is not None:
+                query = query.filter(Invoice.owner_type == ot)
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
 
@@ -2299,11 +2339,7 @@ class BusinessMixin:
         from piecash.business.invoice import Invoice, Entry
         from sqlalchemy import text
 
-        ot = None
-        if owner_type == "customer":
-            ot = 2
-        elif owner_type == "vendor":
-            ot = 4
+        ot = self._parse_owner_type(owner_type)
 
         with self.open() as book:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
@@ -2395,11 +2431,7 @@ class BusinessMixin:
         from piecash.business.invoice import Invoice
         from piecash.core.transaction import Lot
 
-        ot = None
-        if owner_type == "customer":
-            ot = 2
-        elif owner_type == "vendor":
-            ot = 4
+        ot = self._parse_owner_type(owner_type)
 
         parsed_date = (
             date.fromisoformat(post_date) if post_date
@@ -2658,11 +2690,7 @@ class BusinessMixin:
             ValueError: If the invoice/bill isn't found, isn't posted,
                 or has payments applied.
         """
-        ot = None
-        if owner_type == "customer":
-            ot = 2
-        elif owner_type == "vendor":
-            ot = 4
+        ot = self._parse_owner_type(owner_type)
 
         with self.open(readonly=False) as book:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
@@ -2819,11 +2847,7 @@ class BusinessMixin:
                 cross-currency payment with no exchange rate available,
                 or ``fx_account`` is supplied but invalid.
         """
-        ot = None
-        if owner_type == "customer":
-            ot = 2
-        elif owner_type == "vendor":
-            ot = 4
+        ot = self._parse_owner_type(owner_type)
 
         payment_amount = _to_decimal(amount)
         if payment_amount <= 0:
@@ -3389,16 +3413,15 @@ class BusinessMixin:
         from piecash.business.invoice import Invoice
 
         today = date.today()
+        ot = self._parse_owner_type(owner_type)
 
         with self.open() as book:
             query = book.session.query(Invoice).filter(
                 Invoice.date_posted.isnot(None)
             )
 
-            if owner_type == "customer":
-                query = query.filter(Invoice.owner_type == 2)
-            elif owner_type == "vendor":
-                query = query.filter(Invoice.owner_type == 4)
+            if ot is not None:
+                query = query.filter(Invoice.owner_type == ot)
 
             if customer_id:
                 customer = None

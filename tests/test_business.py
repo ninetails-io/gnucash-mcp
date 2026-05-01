@@ -1624,6 +1624,122 @@ class TestInvoiceBillIdCollision:
         assert inv["type"] == "invoice"
 
 
+class TestOwnerTypeValidation:
+    """Centralized rejection of invalid ``owner_type`` values.
+
+    The bookkeeper hit this on a session where an LLM passed
+    ``owner_type="employee"``. Pre-fix, the value silently fell
+    through to no-filter and the LLM saw a confusing
+    cross-sequence ID-collision error suggesting "customer or
+    vendor" — never explaining that "employee" is the actual
+    problem. Upfront validation saves the LLM a tool call and
+    frames the limitation cleanly.
+    """
+
+    def test_employee_owner_type_rejected_with_clear_message(
+        self, business_book,
+    ):
+        """The headline scenario: ``owner_type="employee"`` is
+        explicitly out of scope for the 1.2.x business module
+        (employee expense vouchers are a 1.3 thing). Reject
+        upfront with a message that says so."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError) as exc_info:
+            gb.get_invoice("000001", owner_type="employee")
+        msg = str(exc_info.value)
+        assert "employee" in msg.lower()
+        assert "not yet supported" in msg
+        # Hint at the valid options so the LLM doesn't have to
+        # call back blindly.
+        assert "customer" in msg
+        assert "vendor" in msg
+
+    def test_typo_owner_type_rejected_with_valid_options(
+        self, business_book,
+    ):
+        """Typos like ``"custmer"`` (missing 'o') get the same
+        upfront rejection. Pre-fix they silently fell through to
+        no-filter."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError) as exc_info:
+            gb.get_invoice("000001", owner_type="custmer")
+        msg = str(exc_info.value)
+        assert "Invalid owner_type" in msg
+        assert "'custmer'" in msg
+        assert "customer" in msg
+        assert "vendor" in msg
+
+    def test_none_owner_type_still_works(self, business_book):
+        """``None`` means "no filter" — the existing semantic
+        must survive the validation refactor."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        # No collision yet — None resolves to a single match.
+        inv = gb.get_invoice("000001", owner_type=None)
+        assert inv["type"] == "invoice"
+
+    def test_post_invoice_rejects_employee_owner_type(
+        self, business_book,
+    ):
+        """All four entrypoints share the same validator; verify
+        ``post_invoice`` specifically since the bookkeeper's
+        report mentioned posting an invoice with employee
+        owner_type."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                owner_type="employee",
+            )
+
+    def test_pay_invoice_rejects_typo_owner_type(
+        self, business_book,
+    ):
+        """Symmetry: ``pay_invoice`` validates too."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="50",
+                owner_type="venddor",  # typo
+            )
+
+    def test_unpost_invoice_rejects_employee(self, business_book):
+        """Symmetry: ``unpost_invoice`` (added in this same
+        patch) validates too."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.unpost_invoice(
+                invoice_id="000001", owner_type="employee",
+            )
+
+    def test_list_invoices_rejects_invalid_owner_type(
+        self, business_book,
+    ):
+        """The reads validate the same way the writes do."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.list_invoices(owner_type="bogus")
+
+    def test_get_outstanding_invoices_rejects_invalid_owner_type(
+        self, business_book,
+    ):
+        """The other read with owner_type also validates."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.get_outstanding_invoices(owner_type="employee")
+
+
 # ============== Post Invoice Tests ==============
 
 
