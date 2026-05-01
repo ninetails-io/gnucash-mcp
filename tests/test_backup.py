@@ -124,6 +124,67 @@ class TestCreateBackup:
         assert "review" in label
         assert "2026" in label
 
+    def test_two_backups_in_same_second_do_not_collide(
+        self, test_book: Path,
+    ):
+        """Pre-fix, ``_format_ts`` had second resolution. Two
+        ``create_backup`` calls within the same second produced the
+        same filename and ``sqlite3.connect(path).backup(...)``
+        truncated the existing file — second snapshot silently
+        overwrote the first.
+
+        Microsecond resolution makes collisions practically
+        impossible. The ``Path.exists()`` precheck is the second line
+        of defense if a clock-resolution collision somehow occurs.
+        """
+        book = GnuCashBook(str(test_book))
+        r1 = book.create_backup(stage="manual", label="rapid-1")
+        r2 = book.create_backup(stage="manual", label="rapid-2")
+        # Different filenames even though wall-clock seconds match
+        assert r1["path"] != r2["path"]
+        # Both files exist on disk
+        assert Path(r1["path"]).exists()
+        assert Path(r2["path"]).exists()
+
+    def test_create_backup_refuses_to_overwrite(self, test_book: Path):
+        """If a backup file with the target name already exists (e.g.,
+        clock-resolution collision or pathological monkeypatched
+        time), ``create_backup`` raises rather than silently
+        truncating the prior snapshot."""
+        book = GnuCashBook(str(test_book))
+        fixed_ts = datetime(2026, 5, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
+        with patch(
+            "gnucash_mcp.book.backup._now_utc", return_value=fixed_ts,
+        ):
+            r1 = book.create_backup(stage="manual", label="first")
+            assert Path(r1["path"]).exists()
+            # Same wall-clock = same filename = refusal.
+            with pytest.raises(RuntimeError, match="refusing to overwrite"):
+                book.create_backup(stage="manual", label="first")
+
+    def test_legacy_second_resolution_filenames_still_parse(
+        self, test_book: Path,
+    ):
+        """Pre-fix backup files (14-digit second-resolution timestamp)
+        must still be readable by ``list_backups`` after the upgrade
+        to microsecond filenames. Otherwise users would lose
+        visibility on their pre-upgrade backups."""
+        backups_dir = test_book.parent / f"{test_book.name}.mcp" / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        # Write a fake legacy-format file. Content doesn't matter for
+        # this listing test (list_backups only stats the file).
+        legacy = backups_dir / f"{test_book.stem}-20260101T120000-manual.gnucash"
+        legacy.write_bytes(b"fake")
+
+        book = GnuCashBook(str(test_book))
+        listed = book.list_backups()
+        legacy_entry = next(
+            (e for e in listed if Path(e["path"]).name == legacy.name),
+            None,
+        )
+        assert legacy_entry is not None, "Legacy filename failed to parse"
+        assert legacy_entry["stage"] == "manual"
+
     def test_label_sanitize_helper_edge_cases(self):
         """Low-level helper: empty / all-unsafe inputs become None."""
         assert _sanitize_label(None) is None
