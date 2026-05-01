@@ -29,6 +29,29 @@ from gnucash_mcp.book._base import (
 from gnucash_mcp._format import _apply_limit
 
 
+def _commodity_quantum(commodity) -> Decimal:
+    """Smallest representable unit of a commodity, as a Decimal quantum.
+
+    Pre-fix, every cross-currency conversion in this module hardcoded
+    ``Decimal("0.01")`` — implicitly assuming 2-decimal currencies
+    (USD, EUR, GBP, CNY). The hardcode silently corrupts:
+
+    - **JPY** (``fraction=1``): a ¥1,234.50 conversion would round to
+      ¥1,234.50 stored, but JPY can't represent half-yen — every
+      cross-currency JPY transaction loses the rounding direction.
+    - **BHD / KWD** (``fraction=1000``, 3 decimals): a 100.123 BHD
+      input is silently rounded to 100.12, losing 3 mils per
+      conversion.
+
+    Now derives the quantum from ``commodity.fraction`` (piecash
+    stores 100 for USD, 1 for JPY, 1000 for BHD, 10000 for shares).
+    """
+    fraction = getattr(commodity, "fraction", 100)
+    if fraction <= 1:
+        return Decimal(1)
+    return Decimal(1) / Decimal(fraction)
+
+
 def _safe_date_posted(inv):
     """Read ``inv.date_posted`` defensively.
 
@@ -47,6 +70,26 @@ def _safe_date_posted(inv):
     try:
         dp = inv.date_posted
         return dp if dp else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_date_opened(inv):
+    """Read ``inv.date_opened`` defensively.
+
+    Same shape as ``_safe_date_posted`` but for the ``date_opened``
+    column. piecash's ``_DateTime`` TypeDecorator has the same
+    regex-parser failure mode on empty-string column values; the
+    bookkeeper's reproduction with ``date_posted`` is exactly
+    replicable on ``date_opened``. ``_invoice_to_dict``,
+    ``_invoice_to_compact_line``, and ``list_invoices`` all access
+    ``inv.date_opened.date()`` and would crash on a malformed row.
+    Wrapping the access lets every caller treat that field as
+    "unknown" gracefully.
+    """
+    try:
+        do = inv.date_opened
+        return do if do else None
     except (ValueError, TypeError):
         return None
 
@@ -359,20 +402,28 @@ class BusinessMixin:
         return fx_acct, notice
 
     @staticmethod
-    def _rate_from_post_transaction(post_txn, invoice_currency):
-        """Derive the exchange rate that was applied at invoice-posting.
+    def _rate_from_post_transaction(post_txn, target_commodity):
+        """Derive the exchange rate from post_txn currency to
+        ``target_commodity`` by inspecting the post transaction's
+        splits for one whose account commodity matches the target.
+        The ratio of |quantity| (account commodity) to |value|
+        (transaction currency) is the rate that was in force at
+        posting.
 
-        Inspects the posting transaction's splits for one whose account
-        commodity differs from the invoice currency (the income, expense,
-        or A/R side that received the rate). The ratio of |quantity|
-        (account commodity) to |value| (transaction currency) is the
-        rate that was in force at posting.
+        Pre-fix this method took just ``(post_txn,
+        invoice_currency)`` and returned the rate of the FIRST
+        non-invoice-currency split — which in a multi-cross-currency
+        post (e.g., EUR invoice with USD income + GBP A/R) would
+        silently pick whichever split happened to come first. Now
+        requires an explicit target so the caller gets the rate they
+        actually want.
 
-        Returns the Decimal rate, or None if no cross-currency split
-        is present (same-currency post, or post predates the rate fix).
+        Returns the Decimal rate, or None if no matching split is
+        present (caller should fall back to the price table at
+        post-date).
         """
         for s in post_txn.splits:
-            if s.account.commodity == invoice_currency:
+            if s.account.commodity != target_commodity:
                 continue
             s_value = abs(Decimal(str(s.value)))
             s_quantity = abs(Decimal(str(s.quantity)))
@@ -417,6 +468,15 @@ class BusinessMixin:
             if p.commodity == from_commodity and p.currency == to_commodity:
                 days = (as_of - p_date).days
                 rate = Decimal(str(p.value))
+                # Skip zero-or-negative direct rates. The inverse
+                # branch already skips zero (would div-by-zero); the
+                # direct branch was missing the same guard, so a
+                # corrupt 0-or-negative price could propagate as the
+                # winning rate. Downstream pay_quantize-to-zero
+                # would then fire the new guard, but flagging at
+                # rate-lookup time gives a clearer signal.
+                if rate <= 0:
+                    continue
                 if days >= 0:
                     if best_before_direct is None or days < best_before_direct[0]:
                         best_before_direct = (days, rate)
@@ -426,7 +486,7 @@ class BusinessMixin:
             # Inverse: p.commodity == to, p.currency == from → rate = 1/p.value
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
-                if Decimal(str(p.value)) == 0:
+                if Decimal(str(p.value)) <= 0:
                     continue
                 rate = Decimal("1") / Decimal(str(p.value))
                 if days >= 0:
@@ -719,7 +779,10 @@ class BusinessMixin:
             "id": invoice.id,
             "type": "bill" if invoice.owner_type == 4 else "invoice",
             "owner_name": owner_name,
-            "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
+            "date_opened": (
+                str(_safe_date_opened(invoice).date())
+                if _safe_date_opened(invoice) else None
+            ),
             "date_posted": (
                 str(_safe_date_posted(invoice).date())
                 if _safe_date_posted(invoice) else None
@@ -746,10 +809,9 @@ class BusinessMixin:
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
         inv_type = "BILL" if invoice.owner_type == 4 else "INV"
+        opened = _safe_date_opened(invoice)
         date_str = (
-            str(invoice.date_opened.date())
-            if invoice.date_opened
-            else "n/a"
+            str(opened.date()) if opened else "n/a"
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
@@ -916,13 +978,27 @@ class BusinessMixin:
 
     @staticmethod
     def _calculate_lot_balance(lot) -> Decimal:
-        """Sum of split values in a lot.
+        """Sum of split values in a lot, skipping voided splits.
 
         For A/R lots: positive = outstanding receivable.
         For A/P lots: negative = outstanding payable.
+
+        Voided splits (``reconcile_state == 'v'``) are GnuCash's
+        zombie audit-trail records — value/quantity zeroed but the
+        row preserved. Filtering them here matches the void-aware
+        treatment ``unpost_invoice`` uses for "are there real
+        payments on this lot?" and the lot-listing helpers use for
+        active-position math. Pre-fix this method summed every
+        split (voided ones contribute zero so the SUM was right by
+        accident), which left the helper out of step with the rest
+        of the codebase's void semantics — a future caller might
+        reasonably check ``len(lot.splits)`` against this balance
+        and get inconsistent answers.
         """
         total = Decimal(0)
         for split in lot.splits:
+            if split.reconcile_state == "v":
+                continue
             total += Decimal(str(split.value))
         return total
 
@@ -2079,6 +2155,24 @@ class BusinessMixin:
             acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
+            # Reject account types that break the posting math
+            # silently. Customer invoices recognize revenue → entry
+            # account must be INCOME (or a related credit-natural
+            # type). Pre-fix any account was accepted: an ASSET on
+            # an invoice entry would post as ``debit asset`` against
+            # ``debit A/R`` — both debits, balance violated, but
+            # piecash builds the transaction anyway because the
+            # split values still sum to zero in the value column.
+            # Reports then show no income but a phantom asset
+            # increase.
+            if acct.type != "INCOME":
+                raise ValueError(
+                    f"Invoice entry account must be INCOME (got "
+                    f"{acct.type} on '{account}'). Customer invoices "
+                    f"recognize revenue; non-INCOME accounts produce "
+                    f"valid-looking transactions with broken "
+                    f"posting math."
+                )
 
             q_num, q_denom = self._decimal_to_num_denom(qty)
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
@@ -2181,6 +2275,19 @@ class BusinessMixin:
             acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
+            # Bill entry accounts must be EXPENSE (typical line
+            # items) or ASSET (inventory purchases that capitalize
+            # rather than expense). LIABILITY/EQUITY/INCOME on a
+            # bill entry produces valid-looking transactions with
+            # broken posting math, same shape as the invoice-entry
+            # validation above.
+            if acct.type not in ("EXPENSE", "ASSET"):
+                raise ValueError(
+                    f"Bill entry account must be EXPENSE or ASSET "
+                    f"(got {acct.type} on '{account}'). EXPENSE for "
+                    f"normal line items, ASSET for inventory "
+                    f"purchases that capitalize."
+                )
 
             q_num, q_denom = self._decimal_to_num_denom(qty)
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
@@ -2554,7 +2661,7 @@ class BusinessMixin:
                         f"create_price, then retry."
                     )
                 return (value_in_invoice_ccy * rate).quantize(
-                    Decimal("0.01")
+                    _commodity_quantum(acct.commodity)
                 )
 
             # Build transaction splits
@@ -2894,6 +3001,29 @@ class BusinessMixin:
                     f"Lot not found for invoice {invoice_id}"
                 )
 
+            # Refuse to pay against a voided posting transaction.
+            # GnuCash's void zeroes split values but preserves rows
+            # with ``reconcile_state='v'``. ``_calculate_lot_balance``
+            # would compute remaining=0 (post-fix it skips voided
+            # splits explicitly), and the lot would auto-close on
+            # save — leaving the new payment split assigned to a
+            # closed lot. Block the operation up front so the user
+            # has to ``unvoid_transaction`` (or unpost + re-post)
+            # first.
+            if inv.post_txn is not None:
+                voided_post = all(
+                    s.reconcile_state == "v"
+                    for s in inv.post_txn.splits
+                )
+                if voided_post:
+                    raise ValueError(
+                        f"Cannot pay invoice {invoice_id}: its "
+                        f"posting transaction has been voided. "
+                        f"Unvoid the posting transaction first "
+                        f"(or unpost the invoice and re-post), "
+                        f"then retry payment."
+                    )
+
             if is_bill:
                 owner = self._find_vendor_by_guid(
                     book, inv.owner_guid
@@ -2921,7 +3051,9 @@ class BusinessMixin:
             # path didn't, so a USD A/R holding a EUR invoice was
             # liquidated in EUR-as-USD on payment.
             def _convert(amount, target_commodity):
-                """Convert invoice-currency amount to target commodity."""
+                """Convert invoice-currency amount to target commodity,
+                quantized to the target's smallest fraction (so JPY
+                stores whole yen, BHD stores 3 decimals, etc.)."""
                 if target_commodity == inv.currency:
                     return amount, None
                 rate = self._find_exchange_rate(
@@ -2943,7 +3075,9 @@ class BusinessMixin:
                         f"create_price, then retry."
                     )
                 return (
-                    (amount * rate).quantize(Decimal("0.01")),
+                    (amount * rate).quantize(
+                        _commodity_quantum(target_commodity)
+                    ),
                     rate,
                 )
 
@@ -2953,6 +3087,25 @@ class BusinessMixin:
             post_quantity, _post_rate = _convert(
                 payment_amount, post_acct.commodity,
             )
+
+            # Guard against extreme-rate-quantize-to-zero. With a
+            # tiny exchange rate (< quantum / payment_amount) the
+            # converted quantity rounds to zero — a "successful"
+            # payment that records nothing on the bank side and
+            # silently fails to clear the lot. Refuse to build a
+            # zero-quantity payment split.
+            if pay_quantity == 0 or post_quantity == 0:
+                raise ValueError(
+                    f"Cross-currency payment quantizes to zero in "
+                    f"the target commodity (payment_amount="
+                    f"{payment_amount} {inv.currency.mnemonic}, "
+                    f"pay_quantity={pay_quantity} "
+                    f"{pay_acct.commodity.mnemonic}, post_quantity="
+                    f"{post_quantity} {post_acct.commodity.mnemonic}). "
+                    f"Likely an extreme exchange rate; check the "
+                    f"price table for {inv.currency.mnemonic}/"
+                    f"{pay_acct.commodity.mnemonic}."
+                )
 
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
@@ -2986,49 +3139,115 @@ class BusinessMixin:
                 )
 
             # Realized FX gain/loss: when cross-currency and the rate
-            # moved between post-date and pay-date, the USD actually
+            # moved between post-date and pay-date, the actual amount
             # received/spent differs from what was originally recorded
             # as income/expense. That delta is taxable FX gain (or
             # loss); book it to an auto-created Income:FX Gain/Loss
             # account. The split has value=0 in the transaction
             # currency (so EUR/GBP/etc. balance is preserved) but
-            # non-zero quantity in the book's default currency. Same
-            # account for both directions; sign determines gain vs
-            # loss.
+            # non-zero quantity in the FX account's commodity (book
+            # default). Same account for both directions; sign
+            # determines gain vs loss.
             splits = [ar_ap_split, bank_split]
             fx_gain_loss = None
-            fx_diff = Decimal("0")
+            fx_diff_default = Decimal("0")
             fx_acct = None
             fx_notice = None
+            default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
+                # Find the rate that was applied at posting from
+                # invoice currency → pay_acct.commodity. First try
+                # the post transaction's own splits (most accurate —
+                # if the price table was re-quoted after posting,
+                # the realized gain should use the original posting
+                # rate). When the post txn has no split in
+                # pay_acct.commodity (third-currency pay account
+                # case: the post used a different non-invoice
+                # commodity for A/R or income), fall back to the
+                # price table at post-date.
                 rate_at_post = self._rate_from_post_transaction(
-                    inv.post_txn, inv.currency
+                    inv.post_txn, pay_acct.commodity,
                 )
+                if rate_at_post is None:
+                    post_date_obj = inv.post_txn.post_date
+                    if hasattr(post_date_obj, "date") and callable(
+                        post_date_obj.date
+                    ):
+                        post_date_obj = post_date_obj.date()
+                    rate_at_post = self._find_exchange_rate(
+                        book,
+                        from_commodity=inv.currency,
+                        to_commodity=pay_acct.commodity,
+                        as_of=post_date_obj,
+                    )
                 if rate_at_post is not None:
+                    # ``expected_at_post`` is in pay-account commodity
+                    # (we'll subtract pay_quantity from it). Quantize
+                    # to that commodity's smallest fraction.
                     expected_at_post = (
                         payment_amount * rate_at_post
-                    ).quantize(Decimal("0.01"))
-                    fx_diff = pay_quantity - expected_at_post
-                    if abs(fx_diff) >= Decimal("0.01"):
+                    ).quantize(_commodity_quantum(pay_acct.commodity))
+                    # ``fx_diff`` is the realized delta in the
+                    # PAYMENT-ACCOUNT commodity (pay_quantity is in
+                    # that commodity). Convert to the book default
+                    # currency before booking — the FX account has
+                    # commodity=default, and a quantity in any other
+                    # commodity would be silently treated as default
+                    # by every report that reads this account.
+                    # Pre-fix triple-currency case (book=USD,
+                    # invoice=EUR, pay=GBP): a £5 GBP gain landed on
+                    # a USD-commodity FX account as quantity=5,
+                    # rendered as "$5 gain" — silently wrong.
+                    fx_diff_pay = pay_quantity - expected_at_post
+                    if pay_acct.commodity != default_currency:
+                        pay_to_default_rate = self._find_exchange_rate(
+                            book,
+                            from_commodity=pay_acct.commodity,
+                            to_commodity=default_currency,
+                            as_of=parsed_date,
+                        )
+                        if pay_to_default_rate is None:
+                            raise ValueError(
+                                f"Realized FX gain/loss needs an "
+                                f"exchange rate from "
+                                f"{pay_acct.commodity.mnemonic} to "
+                                f"{default_currency.mnemonic} on or "
+                                f"near {parsed_date} to convert the "
+                                f"FX delta to the book's default "
+                                f"currency (the FX account's "
+                                f"commodity). Add a price with "
+                                f"create_price, then retry."
+                            )
+                        fx_diff_default = (
+                            fx_diff_pay * pay_to_default_rate
+                        ).quantize(_commodity_quantum(default_currency))
+                    else:
+                        fx_diff_default = fx_diff_pay
+                    # Skip booking the FX split when the realized
+                    # delta is below the smallest representable unit
+                    # in the FX account's commodity (e.g., ¥0 for
+                    # JPY, $0.01 for USD).
+                    if abs(fx_diff_default) >= _commodity_quantum(
+                        default_currency
+                    ):
                         fx_acct, fx_notice = self._get_or_create_fx_account(
                             book, fx_account=fx_account,
                         )
-                        # Customer (is_bill=False): we received MORE
-                        # USD than income recorded → gain → credit
-                        # income account (quantity = -fx_diff for a
-                        # gain, +|fx_diff| for a loss).
-                        # Vendor bill (is_bill=True): we spent MORE
-                        # USD than expense recorded → loss → debit
-                        # income account (quantity = +fx_diff for a
-                        # loss, -|fx_diff| for a gain).
+                        # Customer (is_bill=False): received more →
+                        # gain → credit income (quantity = -fx_diff
+                        # for gain, +|fx_diff| for loss).
+                        # Vendor bill (is_bill=True): spent more →
+                        # loss → debit income (quantity = +fx_diff
+                        # for loss, -|fx_diff| for gain).
                         quantity_sign = 1 if is_bill else -1
-                        is_loss = (is_bill and fx_diff > 0) or (
-                            not is_bill and fx_diff < 0
+                        is_loss = (
+                            (is_bill and fx_diff_default > 0)
+                            or (not is_bill and fx_diff_default < 0)
                         )
                         fx_gain_loss = piecash.Split(
                             account=fx_acct,
                             value=Decimal("0"),
-                            quantity=quantity_sign * fx_diff,
+                            quantity=quantity_sign * fx_diff_default,
                             memo=(
                                 f"FX {'loss' if is_loss else 'gain'} "
                                 f"on invoice {inv.id}: post-rate "
@@ -3075,12 +3294,20 @@ class BusinessMixin:
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
                 if fx_gain_loss is not None:
                     direction = (
-                        "loss" if (is_bill and fx_diff > 0)
-                        or (not is_bill and fx_diff < 0)
+                        "loss" if (is_bill and fx_diff_default > 0)
+                        or (not is_bill and fx_diff_default < 0)
                         else "gain"
                     )
                     result["fx_realized"] = {
-                        "amount": str(abs(fx_diff).quantize(Decimal("0.01"))),
+                        # Amount on the FX account is in the book's
+                        # default currency — that's the account's
+                        # commodity and the unit every report uses.
+                        "amount": str(
+                            abs(fx_diff_default).quantize(
+                                _commodity_quantum(default_currency)
+                            )
+                        ),
+                        "currency": default_currency.mnemonic,
                         "direction": direction,
                         "account": fx_acct.fullname,
                     }
@@ -3633,15 +3860,6 @@ class BusinessMixin:
                         "bill_count": 0,
                     }
 
-                try:
-                    _, _, total = (
-                        self._get_invoice_entries_and_total(
-                            book, bill
-                        )
-                    )
-                except ValueError:
-                    total = Decimal(0)
-
                 balance = Decimal(0)
                 post_acct = book.session.query(
                     piecash.Account
@@ -3653,6 +3871,22 @@ class BusinessMixin:
                                 lot
                             )
                             break
+
+                try:
+                    _, _, total = (
+                        self._get_invoice_entries_and_total(
+                            book, bill
+                        )
+                    )
+                except ValueError:
+                    # Empty/corrupted entries — fall back to the
+                    # lot balance (computed above). Pre-fix this
+                    # silently substituted Decimal(0), which made
+                    # ``total_billed`` understate by the bill's
+                    # full amount on any data-corruption case. The
+                    # lot balance reflects the actual outstanding
+                    # liability so the vendor's row stays sane.
+                    total = abs(balance)
 
                 outstanding = abs(balance)
                 paid = total - outstanding

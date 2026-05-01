@@ -129,6 +129,46 @@ class TestCreateScheduled:
                 frequency="monthly",
             )
 
+    def test_torn_write_cleans_up_template_account(self, scheduled_book):
+        """If the SX-row insert fails after the template account
+        has already been flushed, the template account must be
+        deleted in cleanup. Pre-fix a "ghost" template account
+        with no scheduled-transaction owner persisted forever
+        under ``root_template``."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(scheduled_book))
+
+        # Patch the SX __table__.insert step to raise mid-sequence.
+        # The template account has been flushed at that point but
+        # the SX row hasn't landed.
+        from piecash.core.transaction import ScheduledTransaction
+
+        real_insert = ScheduledTransaction.__table__.insert
+        with patch.object(
+            ScheduledTransaction.__table__, "insert",
+            side_effect=RuntimeError("simulated mid-sequence failure"),
+        ):
+            with pytest.raises(RuntimeError, match="simulated"):
+                gb.create_scheduled_transaction(
+                    name="DoomedSX",
+                    description="Should not survive",
+                    splits=[
+                        {"account": "Expenses:Rent", "amount": "100.00"},
+                        {"account": "Assets:Checking", "amount": "-100.00"},
+                    ],
+                    start_date="2026-01-01",
+                    frequency="monthly",
+                )
+
+        # Template account must NOT be on disk under root_template.
+        with gb.open(readonly=True) as book:
+            template_names = [
+                a.name for a in book.root_template.children
+            ]
+        assert "DoomedSX" not in template_names, (
+            f"Template account survived torn-write: {template_names}"
+        )
+
     def test_invalid_account_error(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
         with pytest.raises(ValueError, match="Account not found"):

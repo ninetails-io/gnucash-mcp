@@ -3343,13 +3343,17 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
 
-            # Capture info before deletion. Short guid computed against
-            # the remaining accounts (the target is still present here).
-            short_guid = _unique_prefix(
-                account.guid, (a.guid for a in book.accounts)
-            )
+            # Capture info before deletion. Pre-fix the response
+            # included a short-prefix GUID computed against
+            # ``book.accounts`` BEFORE the delete — but the LLM
+            # would receive a handle pointing at a row that no
+            # longer exists. ``_resolve_guid`` would then raise
+            # "No account" on any subsequent attempt to use it.
+            # Returning ``fullname`` and ``status="deleted"`` is
+            # enough for the audit-log human reader and the LLM to
+            # confirm what was deleted; the short GUID was always
+            # unaddressable post-delete and just invited misuse.
             result = {
-                "guid": short_guid,
                 "fullname": account.fullname,
                 "status": "deleted",
             }
@@ -3430,6 +3434,123 @@ class CoreMixin:
 
             return result
 
+    def _verify_transaction_state(
+        self,
+        book,
+        transaction,
+        *,
+        expected_description: str | None = None,
+        expected_date: date | None = None,
+        expected_notes: str | None = None,
+        expected_splits: list[dict] | None = None,
+    ) -> None:
+        """Re-load the transaction from disk and verify expected
+        fields landed. Closes the gap CLAUDE.md's "Every write is
+        verified" invariant calls out for ``update_transaction`` and
+        ``replace_splits``.
+
+        Pre-fix, both methods called ``book.save()`` and trusted the
+        result. piecash has historically silently no-op'd setattrs
+        on some slot-backed fields; without this round-trip the
+        thin response could lie about what's stored. Bypasses the
+        ORM identity map via ``session.expire`` so we read what's
+        actually on disk, not what we just put in the cache.
+
+        Raises RuntimeError on any mismatch.
+        """
+        book.session.expire(transaction)
+
+        if expected_description is not None:
+            actual_desc = transaction.description
+            if actual_desc != expected_description:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"description on disk is {actual_desc!r}, "
+                    f"expected {expected_description!r}"
+                )
+
+        if expected_date is not None:
+            actual_date = transaction.post_date
+            if hasattr(actual_date, "date") and callable(actual_date.date):
+                actual_date = actual_date.date()
+            if actual_date != expected_date:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"post_date on disk is {actual_date}, "
+                    f"expected {expected_date}"
+                )
+
+        if expected_notes is not None:
+            actual_notes = transaction.notes or ""
+            wanted = expected_notes if expected_notes else ""
+            if actual_notes != wanted:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"notes on disk is {actual_notes!r}, "
+                    f"expected {wanted!r}"
+                )
+
+        if expected_splits is not None:
+            actual_splits = list(transaction.splits)
+            actual_by_acct = {}
+            for s in actual_splits:
+                actual_by_acct[s.account.fullname] = (
+                    Decimal(str(s.value)),
+                    Decimal(str(s.quantity)),
+                    s.memo or "",
+                )
+            if len(actual_splits) != len(expected_splits):
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"{len(actual_splits)} splits on disk, "
+                    f"expected {len(expected_splits)}"
+                )
+            for expected in expected_splits:
+                # Normalize the input account ref to canonical
+                # fullname before lookup. The book methods accept
+                # full path, ``%short`` GUID, or full 32-char GUID;
+                # post-save splits are keyed by ``Account.fullname``.
+                # Pre-fix this comparison was string-vs-string against
+                # the raw input, so a shortcut input like ``%77b59dd``
+                # raised a false "split not found post-save" RuntimeError
+                # even though the write had landed correctly.
+                # (Bookkeeper finding from PR #75 review.)
+                ref = expected["account"]
+                resolved = self._resolve_account(book, ref)
+                if resolved is None:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"could not resolve split account ref "
+                        f"{ref!r} (resolution returned None — the "
+                        f"account may have been deleted between "
+                        f"save and verify)"
+                    )
+                acct_fullname = resolved.fullname
+                if acct_fullname not in actual_by_acct:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split for {acct_fullname!r} (input "
+                        f"ref {ref!r}) not found post-save"
+                    )
+                actual_value, actual_qty, actual_memo = (
+                    actual_by_acct[acct_fullname]
+                )
+                ev = _to_decimal(expected["amount"])
+                if actual_value != ev:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split {acct_fullname!r} value on disk is "
+                        f"{actual_value}, expected {ev}"
+                    )
+                if "quantity" in expected:
+                    eq = _to_decimal(expected["quantity"])
+                    if actual_qty != eq:
+                        raise RuntimeError(
+                            f"Transaction write verification failed: "
+                            f"split {acct_fullname!r} quantity on "
+                            f"disk is {actual_qty}, expected {eq}"
+                        )
+
     def update_transaction(
         self,
         guid: str,
@@ -3508,8 +3629,23 @@ class CoreMixin:
                 if total != Decimal("0"):
                     raise ValueError(f"Splits do not balance: total is {total}")
 
-                # Build a map of account -> split data
-                split_updates = {s["account"]: s for s in splits}
+                # Build a map of canonical-fullname → split data.
+                # Resolve any input refs (path, ``%short``, full GUID)
+                # to the canonical Account so the lookup against
+                # existing splits' ``account.fullname`` works for all
+                # three input shapes. Pre-fix this dict was keyed by
+                # the raw input string, so a shortcut input like
+                # ``%77b59dd`` produced "Account not found in
+                # transaction" even though the ref resolved cleanly.
+                split_updates = {}
+                for s in splits:
+                    ref = s["account"]
+                    resolved = self._resolve_account(book, ref)
+                    if resolved is None:
+                        raise ValueError(
+                            f"Account not found: {ref}"
+                        )
+                    split_updates[resolved.fullname] = s
 
                 trans_currency = transaction.currency
 
@@ -3553,6 +3689,20 @@ class CoreMixin:
                     raise ValueError(f"Account not found in transaction: {missing}")
 
             book.save()
+
+            # Verify the write landed — re-read the transaction from
+            # disk and compare each field we tried to set. Honors the
+            # ``Every write is verified`` invariant CLAUDE.md spells
+            # out; pre-fix, ``update_transaction`` skipped this and a
+            # piecash silent setattr no-op would have shipped a thin
+            # response that lied about what was stored.
+            self._verify_transaction_state(
+                book, transaction,
+                expected_description=description,
+                expected_date=trans_date,
+                expected_notes=notes,
+                expected_splits=splits,
+            )
 
             # Thin response — the LLM submitted the changes, so the only
             # fields worth echoing are enough for a quick sanity check
@@ -3715,6 +3865,12 @@ class CoreMixin:
 
             # 8. Save
             book.save()
+
+            # 8a. Verify the new splits landed — same invariant as
+            # update_transaction, just with the splits-only path.
+            self._verify_transaction_state(
+                book, transaction, expected_splits=splits,
+            )
 
             # 9. Build thin response.
             # - `splits` echo dropped (LLM just submitted them).

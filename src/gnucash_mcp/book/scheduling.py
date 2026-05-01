@@ -279,7 +279,19 @@ class SchedulingMixin:
 
             sx_guid = uuid.uuid4().hex
 
-            # Create template account under root_template
+            # Create template account under root_template. We flush
+            # this immediately because the SX row references its
+            # GUID via ``template_act_guid``. If any of the
+            # subsequent inserts (SX row, Recurrence, Slot) fail,
+            # the template account is already on disk — pre-fix the
+            # caller would retry with the same name and hit the
+            # duplicate-name check fine, but a "ghost" template
+            # account with no scheduled-transaction owner would sit
+            # under ``root_template`` forever.
+            #
+            # Wrap the whole sequence in try/except so partial-
+            # failure cleans up the orphan template account before
+            # propagating the error.
             template_acct = piecash.Account(
                 name=name,
                 type="BANK",
@@ -289,74 +301,87 @@ class SchedulingMixin:
             book.session.add(template_acct)
             book.session.flush()
 
-            # Insert ScheduledTransaction (blocked constructor)
-            book.session.execute(
-                ScheduledTransaction.__table__.insert().values(
-                    guid=sx_guid,
-                    name=name,
-                    enabled=1 if enabled else 0,
-                    start_date=parsed_start,
-                    end_date=parsed_end,
-                    last_occur=None,
-                    num_occur=0,
-                    rem_occur=0,
-                    auto_create=0,
-                    auto_notify=0,
-                    adv_creation=0,
-                    adv_notify=0,
-                    instance_count=0,
-                    template_act_guid=template_acct.guid,
+            try:
+                # Insert ScheduledTransaction (blocked constructor)
+                book.session.execute(
+                    ScheduledTransaction.__table__.insert().values(
+                        guid=sx_guid,
+                        name=name,
+                        enabled=1 if enabled else 0,
+                        start_date=parsed_start,
+                        end_date=parsed_end,
+                        last_occur=None,
+                        num_occur=0,
+                        rem_occur=0,
+                        auto_create=0,
+                        auto_notify=0,
+                        adv_creation=0,
+                        adv_notify=0,
+                        instance_count=0,
+                        template_act_guid=template_acct.guid,
+                    )
                 )
-            )
-            _verify_write(
-                book.session, ScheduledTransaction.__table__, sx_guid,
-                f"ScheduledTransaction '{name}'",
-            )
-
-            book.session.execute(
-                Recurrence.__table__.insert().values(
-                    obj_guid=sx_guid,
-                    recurrence_mult=rec_mult,
-                    recurrence_period_type=rec_period_type,
-                    recurrence_period_start=parsed_start,
-                    recurrence_weekend_adjust="none",
+                _verify_write(
+                    book.session, ScheduledTransaction.__table__, sx_guid,
+                    f"ScheduledTransaction '{name}'",
                 )
-            )
-            _verify_composite_write(
-                book.session, Recurrence.__table__,
-                {"obj_guid": sx_guid},
-                f"Recurrence for scheduled transaction '{name}'",
-            )
 
-            # Store split templates as JSON in a slot. Normalize `amount`
-            # through _to_decimal → str so the persisted JSON is always a
-            # clean decimal string, even if the caller handed us a float.
-            # Otherwise a float would survive json.dumps as a numeric
-            # literal, and every future instantiation would replay the
-            # IEEE-754 epsilon.
-            splits_json = json.dumps([
-                {
-                    "account": s["account"],
-                    "amount": str(_to_decimal(s["amount"])),
-                    "memo": s.get("memo", ""),
-                }
-                for s in splits
-            ])
-            book.session.execute(
-                Slot.__table__.insert().values(
-                    obj_guid=sx_guid,
-                    name="splits-json",
-                    slot_type=KVP_Type.KVP_TYPE_STRING,
-                    string_val=splits_json,
+                book.session.execute(
+                    Recurrence.__table__.insert().values(
+                        obj_guid=sx_guid,
+                        recurrence_mult=rec_mult,
+                        recurrence_period_type=rec_period_type,
+                        recurrence_period_start=parsed_start,
+                        recurrence_weekend_adjust="none",
+                    )
                 )
-            )
-            _verify_composite_write(
-                book.session, Slot.__table__,
-                {"obj_guid": sx_guid, "name": "splits-json"},
-                f"Splits slot for scheduled transaction '{name}'",
-            )
+                _verify_composite_write(
+                    book.session, Recurrence.__table__,
+                    {"obj_guid": sx_guid},
+                    f"Recurrence for scheduled transaction '{name}'",
+                )
 
-            book.save()
+                # Store split templates as JSON in a slot. Normalize
+                # `amount` through _to_decimal → str so the persisted
+                # JSON is always a clean decimal string, even if the
+                # caller handed us a float. Otherwise a float would
+                # survive json.dumps as a numeric literal, and every
+                # future instantiation would replay the IEEE-754
+                # epsilon.
+                splits_json = json.dumps([
+                    {
+                        "account": s["account"],
+                        "amount": str(_to_decimal(s["amount"])),
+                        "memo": s.get("memo", ""),
+                    }
+                    for s in splits
+                ])
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=sx_guid,
+                        name="splits-json",
+                        slot_type=KVP_Type.KVP_TYPE_STRING,
+                        string_val=splits_json,
+                    )
+                )
+                _verify_composite_write(
+                    book.session, Slot.__table__,
+                    {"obj_guid": sx_guid, "name": "splits-json"},
+                    f"Splits slot for scheduled transaction '{name}'",
+                )
+
+                book.save()
+            except Exception:
+                # Cleanup the orphan template account so a retry
+                # doesn't accumulate unowned template scaffolding.
+                # Swallow cleanup failures — the original error is
+                # what the caller needs to see.
+                try:
+                    book.session.delete(template_acct)
+                    book.save()
+                except Exception:
+                    pass
+                raise
 
             next_occ = self._next_occurrence(
                 parsed_start, frequency,

@@ -18,20 +18,45 @@ from gnucash_mcp.logging_config import (
 
 
 class _StagedBook:
-    """Fake GnuCashBook that yields a pre-set before-state once.
+    """Fake GnuCashBook that simulates the real staging contract.
 
-    Used by tests that need to inject before_state into `@audit_log`
-    without opening a real book. Mirrors the contract of
-    `BaseGnuCashBook._consume_audit_before`: returns the staged dict
-    on first call, clears itself so subsequent calls return None.
+    Mirrors ``BaseGnuCashBook._stage_audit_before`` /
+    ``_consume_audit_before``: a write book method calls
+    ``_stage_audit_before(state)`` while its session is open, and
+    ``_consume_audit_before()`` returns and clears the staged state.
+
+    The constructor accepts a ``state`` arg as a convenience —
+    callers that don't want to wire up a custom staging callback
+    can pass it in and have it auto-stage on the first
+    ``_consume_audit_before`` AFTER the wrapper's pre-clear has
+    run. The audit decorator pre-clears at wrapper entry to defend
+    against leaks from prior calls; that pre-clear must NOT eat
+    the test fixture's intended state. We track whether the
+    pre-clear has fired so the test's intended state surfaces on
+    the post-call consume only.
     """
 
     def __init__(self, state: dict | None):
-        self._state = state
+        self._initial_state = state
+        self._staged: dict | None = None
+        self._pre_clear_done = False
+
+    def _stage_audit_before(self, state: dict | None) -> None:
+        self._staged = state
 
     def _consume_audit_before(self) -> dict | None:
-        state = self._state
-        self._state = None
+        if not self._pre_clear_done:
+            # Simulate the wrapper's pre-clear: returns whatever's
+            # currently staged. After this fires, the constructor's
+            # ``initial_state`` becomes available as the test's
+            # "staged-during-func" state.
+            self._pre_clear_done = True
+            stale = self._staged
+            self._staged = self._initial_state
+            return stale
+        # Subsequent consume: yield then clear (real staging contract).
+        state = self._staged
+        self._staged = None
         return state
 
 
@@ -723,6 +748,118 @@ class TestDispatchTableDegradation:
             "timestamp": "2026-04-21T12:34:56",
         }
         assert _format_audit_entry_text(entry) == ""
+
+
+class TestAuditEntityTypeBillSwap:
+    """``post_invoice`` / ``unpost_invoice`` / ``pay_invoice`` carry
+    ``entity_type="invoice"`` on the decorator but accept either
+    invoices or vendor bills. The audit log must render BILL when
+    the call operated on a bill — pre-fix every bill operation
+    showed up as "POST INVOICE" / "PAY INVOICE" in the log,
+    mis-categorizing the entry.
+    """
+
+    def test_bill_post_renders_as_post_bill(self):
+        """The dispatcher swaps entity_type to ``bill`` based on
+        the response's ``type`` field; the bill handler then
+        renders ``POST BILL`` instead of ``POST INVOICE``."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",  # post-swap
+            "operation": "post",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "post_account": "Liabilities:A/P"},
+            "after_state": {
+                "type": "bill", "total": "500.00",
+                "post_date": "2026-03-10",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "POST BILL" in rendered
+        assert "POST INVOICE" not in rendered
+
+    def test_bill_pay_renders_as_pay_bill(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",
+            "operation": "pay",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "payment_account": "Assets:Checking"},
+            "after_state": {
+                "type": "bill", "amount_paid": "500.00",
+                "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY BILL" in rendered
+        assert "PAY INVOICE" not in rendered
+
+
+class TestAuditBeforeStateLeak:
+    """Defense-in-depth: a previous call's staged before-state must
+    never leak into the next call's audit entry, regardless of how
+    the previous call exited.
+
+    Pre-fix, the wrapper consumed before-state on the success path
+    (post-func) and tried to consume on the exception path. If
+    either consume itself raised (e.g., book wrapper transiently
+    unavailable), the threading-local kept the staged state, and
+    the next decorated call would render an unrelated diff. The
+    fix adds a pre-clear at the TOP of the wrapper so every tool
+    starts with a clean slot.
+    """
+
+    def test_pre_clear_drops_leaked_before_state(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """A second tool call must not see before-state staged by a
+        previous call that failed to consume it."""
+
+        class _RetainingBook:
+            def __init__(self):
+                self._staged = None
+
+            def _stage_audit_before(self, state):
+                self._staged = state
+
+            def _consume_audit_before(self):
+                state = self._staged
+                self._staged = None
+                return state
+
+        book = _RetainingBook()
+        # Pre-stage state as if a previous call had left it behind.
+        book._stage_audit_before({"description": "leaked from prior call"})
+        assert book._staged is not None
+
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="transaction",
+        )
+        def fresh_call(description: str) -> str:
+            return json.dumps({"guid": "abcd1234", "description": description})
+
+        fresh_call(description="this call's own description")
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        # The leaked before-state's "description" must NOT appear in
+        # this call's audit entry.
+        assert "leaked from prior call" not in content
+        # Sanity: this call's own description still rendered.
+        assert "this call's own description" in content
 
 
 class TestAuditLogIntegration:

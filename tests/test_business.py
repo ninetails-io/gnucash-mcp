@@ -1298,6 +1298,22 @@ class TestDeleteBill:
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
+    def test_rejects_non_income_account(self, business_book):
+        """Invoice entries must post to INCOME accounts. Pre-fix any
+        account type was accepted, producing transactions with
+        broken posting math (e.g., debit-asset against debit-A/R)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="must be INCOME"):
+            gb.add_invoice_entry(
+                invoice_id="000001",
+                account="Assets:Checking",  # ASSET — silently accepted pre-fix
+                description="Bad entry",
+                quantity="1",
+                price="500.00",
+            )
+
     def test_basic_entry(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
@@ -1373,6 +1389,23 @@ class TestAddInvoiceEntry:
 
 class TestAddBillEntry:
     """Tests for add_bill_entry."""
+
+    def test_rejects_non_expense_or_asset_account(self, business_book):
+        """Bill entries must post to EXPENSE (line items) or ASSET
+        (inventory). LIABILITY/EQUITY/INCOME silently broke posting
+        math pre-fix."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        with pytest.raises(ValueError, match="must be EXPENSE or ASSET"):
+            gb.add_bill_entry(
+                bill_id="000001",
+                # PAYABLE — non-EXPENSE, non-ASSET, exists in fixture
+                account="Liabilities:Accounts Payable",
+                description="Bad entry",
+                quantity="1",
+                price="50.00",
+            )
 
     def test_basic_entry(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -3135,6 +3168,415 @@ class TestPayInvoice:
             account_name="Income:Foreign Exchange Gain/Loss"
         )
         assert fx_balance == Decimal("90")
+
+    def test_commodity_quantum_helper(self):
+        """``_commodity_quantum`` returns the right Decimal quantum
+        for each commodity fraction. Pre-fix every cross-currency
+        conversion in business.py hardcoded ``Decimal("0.01")``,
+        which silently corrupts JPY (whole-yen) and BHD/KWD
+        (3-decimal) currencies.
+        """
+        from gnucash_mcp.book.business import _commodity_quantum
+        from decimal import Decimal as D
+
+        class _Commodity:
+            def __init__(self, fraction):
+                self.fraction = fraction
+
+        # USD-class (2 decimals)
+        assert _commodity_quantum(_Commodity(100)) == D("0.01")
+        # JPY (0 decimals — whole yen)
+        assert _commodity_quantum(_Commodity(1)) == D(1)
+        # BHD/KWD (3 decimals)
+        assert _commodity_quantum(_Commodity(1000)) == D("0.001")
+        # Stocks/crypto (4 decimals)
+        assert _commodity_quantum(_Commodity(10000)) == D("0.0001")
+        # Defensive: no fraction attr → assume 2 decimals
+        class _NoFraction:
+            pass
+        assert _commodity_quantum(_NoFraction()) == D("0.01")
+
+    def test_jpy_payment_quantizes_to_whole_yen(
+        self, business_book,
+    ):
+        """A USD invoice paid from a JPY-denominated bank account
+        must quantize the JPY-side quantity to whole yen — JPY's
+        ``commodity.fraction`` is 1, no sub-yen units exist.
+
+        Pre-fix the hardcoded ``Decimal("0.01")`` quantize stored
+        ``¥1234.56``-shaped non-integer quantities on JPY accounts,
+        which is meaningless (and invalid GnuCash data — fraction=1
+        should reject sub-unit values).
+
+        Setup: USD-default book, $100 USD invoice paid from JPY
+        checking at rate 150.5 JPY/USD → expected ¥15,050 received
+        (quantized to 0 decimals).
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                jpy = piecash.factories.create_currency_from_ISO("JPY")
+                book.session.add(jpy)
+                book.flush()
+            except Exception:
+                jpy = next(
+                    c for c in book.commodities if c.mnemonic == "JPY"
+                )
+
+            # Verify our assumption about JPY's fraction.
+            assert jpy.fraction == 1, (
+                f"JPY should have fraction=1 (no sub-yen units); "
+                f"got {jpy.fraction}"
+            )
+
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="JPY Checking", type="BANK",
+                parent=assets, commodity=jpy,
+            ))
+            book.session.add(piecash.Price(
+                commodity=usd, currency=jpy,
+                date=_date(2026, 3, 10),
+                value="150.5", source="user:price", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="Tokyo Co", currency="USD")
+        gb.create_invoice(
+            customer_id="000001", currency="USD",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="USD services",
+            quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:JPY Checking",
+            amount="100.00",
+            payment_date="2026-03-10",
+        )
+
+        # JPY checking received $100 × 150.5 = ¥15,050 — but more
+        # importantly, the stored quantity must be whole-yen
+        # (no sub-unit fractional part). Pre-fix the hardcoded
+        # 0.01 quantize would have left a 0-decimal-padded
+        # ``¥15050.00``-shaped value on a fraction=1 commodity.
+        pay_qty = Decimal(result["payment_account_amount"])
+        assert pay_qty == Decimal("15050"), (
+            f"Expected ¥15050, got {pay_qty}"
+        )
+        # And the quantum exponent must be ≥ 0 (no fractional part).
+        assert pay_qty.as_tuple().exponent >= 0
+
+    def test_rate_from_post_transaction_picks_target_commodity(self):
+        """``_rate_from_post_transaction`` must inspect splits for one
+        whose account commodity matches the target — not the first
+        non-invoice-currency split it sees.
+
+        Pre-fix the helper took ``(post_txn, invoice_currency)`` and
+        returned the rate of the first cross-currency split, so a
+        post with EUR invoice + USD income + GBP A/R would return
+        the USD rate when the pay path needed the GBP rate.
+
+        Builds a fake post-txn with three splits (EUR/USD/GBP) and
+        asserts the helper returns the rate matching whichever target
+        is requested.
+        """
+        from gnucash_mcp.book.business import BusinessMixin
+        from decimal import Decimal as D
+
+        # Stand-in objects with the small surface the helper uses.
+        class _Commodity:
+            def __init__(self, mnemonic):
+                self.mnemonic = mnemonic
+
+        class _Account:
+            def __init__(self, commodity):
+                self.commodity = commodity
+
+        class _Split:
+            def __init__(self, account, value, quantity):
+                self.account = account
+                self.value = value
+                self.quantity = quantity
+
+        class _PostTxn:
+            def __init__(self, splits):
+                self.splits = splits
+
+        eur = _Commodity("EUR")
+        usd = _Commodity("USD")
+        gbp = _Commodity("GBP")
+        post = _PostTxn([
+            _Split(_Account(eur), D("100"), D("100")),    # invoice side, rate 1
+            _Split(_Account(usd), D("-100"), D("-110")),  # USD rate 1.10
+            _Split(_Account(gbp), D("-100"), D("-80")),   # GBP rate 0.80
+        ])
+
+        # Asking for USD must yield 1.10 (not 0.80, not the "first
+        # cross-currency split" semantics).
+        assert BusinessMixin._rate_from_post_transaction(
+            post, usd
+        ) == D("110") / D("100")
+        # Asking for GBP must yield 0.80.
+        assert BusinessMixin._rate_from_post_transaction(
+            post, gbp
+        ) == D("80") / D("100")
+        # Asking for a commodity the post doesn't reference returns
+        # None — caller falls back to the price table.
+        chf = _Commodity("CHF")
+        assert BusinessMixin._rate_from_post_transaction(
+            post, chf
+        ) is None
+
+    def test_fx_split_converts_to_default_when_pay_account_third_currency(
+        self, business_book,
+    ):
+        """When the payment account's commodity is neither the
+        invoice currency nor the book default — the truly tri-
+        currency case — the realized FX delta computed in
+        pay-account commodity must be converted to book default
+        before landing on the FX account.
+
+        Pre-fix, ``fx_diff`` lived in pay-account commodity and was
+        booked as the FX split's quantity, but the FX account's
+        commodity was book default. Reports aggregating the FX
+        account read GBP-as-USD silently.
+
+        Setup: USD-default book, EUR invoice, GBP checking.
+        Post Mar 10 at EUR→GBP=0.80 (€100 → £80 expected).
+        Pay Mar 20 at EUR→GBP=0.85 (£85 actually received) → £5
+        gain in GBP. With GBP→USD = 1.30 at pay-date, that's a
+        $6.50 gain that must land on the USD-commodity FX account.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(
+                    c for c in book.commodities if c.mnemonic == "EUR"
+                )
+            try:
+                gbp = piecash.factories.create_currency_from_ISO("GBP")
+                book.session.add(gbp)
+                book.flush()
+            except Exception:
+                gbp = next(
+                    c for c in book.commodities if c.mnemonic == "GBP"
+                )
+
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="GBP Checking", type="BANK",
+                parent=assets, commodity=gbp,
+            ))
+            book.session.add(piecash.Account(
+                name="A/R EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
+            # Two EUR/GBP rates — post-date and pay-date.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=gbp,
+                date=_date(2026, 3, 10),
+                value="0.80", source="user:price", type="nav",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=gbp,
+                date=_date(2026, 3, 20),
+                value="0.85", source="user:price", type="nav",
+            ))
+            # EUR → USD rate so post_invoice can convert the income
+            # split's quantity to its USD-denominated commodity.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10),
+                value="1.10", source="user:price", type="nav",
+            ))
+            # GBP → USD rate so the FX delta converts to default.
+            book.session.add(piecash.Price(
+                commodity=gbp, currency=usd,
+                date=_date(2026, 3, 20),
+                value="1.30", source="user:price", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="London Client", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="EUR services",
+            quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:A/R EUR",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:GBP Checking",
+            amount="100.00",
+            payment_date="2026-03-20",
+        )
+
+        # GBP delta: £85 received vs £80 expected = £5 gain in GBP.
+        # Converted at GBP→USD=1.30 → $6.50 gain on the USD-commodity
+        # FX account.
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("6.50")
+        assert result["fx_realized"]["currency"] == "USD"
+
+        # FX account balance: $6.50 credit (negative on credit-natural
+        # income) — measured in book default currency.
+        fx_balance = gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        )
+        assert fx_balance == Decimal("-6.50")
+
+    def test_pay_invoice_refuses_voided_posting_transaction(self, business_book):
+        """If the posting transaction was voided in GnuCash, paying
+        the invoice would compute remaining=0 against a zero'd lot,
+        auto-close the lot, and assign the new payment to a closed
+        lot. Now refused up front with a clear error pointing at
+        unvoid_transaction."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Services",
+            quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        # Void the posting transaction.
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            post_txn_guid = inv.post_txn.guid
+        gb.void_transaction(guid=post_txn_guid, reason="test")
+
+        with pytest.raises(ValueError, match="posting transaction has been voided"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="500.00",
+                payment_date="2026-03-15",
+            )
+
+    def test_calculate_lot_balance_skips_voided_splits(self, business_book):
+        """``_calculate_lot_balance`` filters voided splits so the
+        helper agrees with the rest of the void-aware codebase."""
+        from gnucash_mcp.book.business import BusinessMixin
+        from decimal import Decimal as D
+
+        class _Split:
+            def __init__(self, value, reconcile_state):
+                self.value = value
+                self.reconcile_state = reconcile_state
+
+        class _Lot:
+            def __init__(self, splits):
+                self.splits = splits
+
+        # Mix of live and voided splits.
+        lot = _Lot([
+            _Split(D("100"), "n"),
+            _Split(D("0"), "v"),  # voided — must be skipped
+            _Split(D("-30"), "n"),
+        ])
+        assert BusinessMixin._calculate_lot_balance(lot) == D("70")
+
+    def test_safe_date_opened_handles_empty_string(self):
+        """``_safe_date_opened`` matches ``_safe_date_posted``'s
+        defensive contract — empty/malformed values surface as
+        None rather than crashing the regex parser."""
+        from gnucash_mcp.book.business import _safe_date_opened
+
+        class _EmptyInv:
+            @property
+            def date_opened(self):
+                # Mimic piecash's _DateTime regex parser raising
+                # on a malformed empty string.
+                raise ValueError("Couldn't parse datetime string")
+
+        class _NoneInv:
+            date_opened = None
+
+        class _ValidInv:
+            from datetime import datetime as _dt
+            date_opened = _dt(2026, 3, 10, 12, 0)
+
+        assert _safe_date_opened(_EmptyInv()) is None
+        assert _safe_date_opened(_NoneInv()) is None
+        # Valid datetime passes through unchanged
+        result = _safe_date_opened(_ValidInv())
+        assert result is not None
+        assert result.year == 2026
+
+    def test_find_exchange_rate_skips_zero_direct_price(self, business_book):
+        """Direct branch must skip rate=0 (and negative) prices —
+        previously only the inverse branch had this guard, leaving
+        a corrupt zero-direct price as a propagatable rate."""
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # Insert a corrupt zero-rate direct price.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=_date(2026, 3, 10),
+                value="0", source="user:price", type="nav",
+            ))
+            book.save()
+
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # No usable price → returns None (zero-rate skipped, no fallback).
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 3, 10),
+            )
+            assert rate is None
 
     def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
         self, business_book,
