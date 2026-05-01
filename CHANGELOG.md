@@ -136,9 +136,80 @@ that a USD-only test book never would have:
   (USD-default) and `samples/lin-wei.gnucash` (CNY-default) — try
   the server before you point it at your real books.
 
-**Tests:** 1,044 passing (was 540 at v1.2.0). The two synthetic
-test personas built up over the patch cycle now serve as the
-verification harness for any future change.
+**Self-conducted code review.**
+
+Before declaring v1.2.1 ready to ship, the codebase got a full
+fresh-eyes review against the architecture documented in
+`CLAUDE.md`. Three parallel deep-read passes produced
+[specs/CODE_REVIEW.md](specs/CODE_REVIEW.md) — 3 critical, 12
+high, 26 medium, 18 low findings, each tagged with file:line and
+a suggested fix. The bookkeeper then validated each round of fix
+PRs against Lin Wei's CNY-default book before they landed.
+
+Closed in this release:
+
+- **All 3 criticals.** Silent budget-amount truncation on insert
+  (sub-cent input rounded to cents inconsistently between insert
+  and update paths). Backup filename collision + auto-backup gate
+  race (microsecond-resolution filenames, threading lock). Auto-
+  backup failures swallowed silently — `get_book_summary` now
+  surfaces the chain status so the bookkeeper finds out the day
+  it breaks instead of weeks later.
+
+- **All 12 highs.** Investment cost-basis precision (a $100 / 3
+  share lot now reports a tax-correct cost basis on the all-
+  shares case, not $99.99). Scheduling month-end drift (a Jan-31
+  monthly schedule no longer locks at the 28th forever after
+  February). Tri-currency FX gain/loss correctness — when book,
+  invoice, and payment-account are all different commodities, the
+  realized FX delta now converts to book default before booking
+  to the FX account. Pay-invoice A/R-side currency conversion.
+  Hardcoded 2-decimal quantize replaced with per-commodity
+  precision (JPY whole-yen, BHD/KWD 3-decimals). Audit log
+  before-state staging in scheduling and budget mutators.
+  `update_transaction` and `replace_splits` now satisfy the
+  "every write is verified" invariant. `delete_account` no
+  longer returns a dangling short-GUID handle. Audit
+  before-state pre-clear at wrapper entry to defend against
+  cross-call leaks. `prune_backups(keep_last_n=0, manual)` now
+  refuses to wipe every human-marked snapshot.
+
+- **All 12 real-bug mediums** plus 5 polish-mediums and 11 of
+  18 lows. Vendor bills render as `POST BILL` / `PAY BILL`
+  in the audit log instead of mis-categorizing as INVOICE.
+  Invoice/bill entries reject wrong account types upfront.
+  Statement-balance comparison quantizes to commodity fraction
+  (no more perpetual 0.001 mismatches). `unvoid_transaction`
+  validates void-former slot completeness before mutating.
+  Audit log files are written `0o600`. `_resolve_guid` uses a
+  per-table dispatch dict and covers `prices` and `entries`.
+  `safe_tool` routes write-verification failures to their own
+  `error_type` bucket. ``set_account_slot`` rejects keys with
+  embedded slashes that would silently create hierarchical
+  sub-slots. ``_describe_age`` rounds to nearest unit instead
+  of flooring.
+
+The bookkeeper-loop pattern earned its keep twice during the
+review itself: a careful cross-tool sanity check ("`get_prices`
+finds the price but `get_latest_price` returns null") surfaced
+the same `currency="USD"` default bug v1.2.1 had fixed for
+`create_price` but missed for `get_latest_price`; and a
+shortcut-verifier false-positive on `replace_splits` exposed a
+gap in the new write-verifier where it compared raw input refs
+against canonical fullnames. Both got caught and fixed during
+the review window.
+
+The full review document ships at
+[specs/CODE_REVIEW.md](specs/CODE_REVIEW.md) as historical
+record — including the items deferred for the v1.2.2 cycle (the
+~14 perf and code-quality refactors, plus 7 cosmetic lows).
+
+**Tests:** 1,114 passing (was 540 at v1.2.0). ~70 new regression
+tests across the review work itself, each one specifically
+exercising the failing scenario its fix addresses. The two
+synthetic test personas (Alex, Lin Wei) plus the bookkeeper's
+real-book validation form the verification harness for any
+future change.
 
 **1.3 roadmap:** taxtables, jobs, credit notes, employee expense
 vouchers, plus targeted code-hygiene work — see

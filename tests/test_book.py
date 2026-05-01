@@ -8664,9 +8664,10 @@ class TestDeletePrice:
         assert Decimal(result["value"]) == Decimal("127.50")
         assert result["date"] == "2026-02-07"
 
-        # Verify it's actually gone.
+        # Verify it's actually gone. ``compact=False`` so we get the
+        # structured dict; default mode returns a formatted string.
         prices = gc_book.get_prices(
-            commodity="VTSAX", namespace="FUND",
+            commodity="VTSAX", namespace="FUND", compact=False,
         )
         assert prices["total"] == 0
 
@@ -8745,9 +8746,10 @@ class TestDeletePrice:
         )
 
         assert Decimal(result["value"]) == Decimal("127.99")
-        # The other price stays put.
+        # The other price stays put. ``compact=False`` returns the
+        # structured dict (default mode is the compact string).
         remaining = gc_book.get_prices(
-            commodity="VTSAX", namespace="FUND",
+            commodity="VTSAX", namespace="FUND", compact=False,
         )
         assert remaining["total"] == 1
         assert Decimal(remaining["prices"][0]["value"]) == Decimal("127.50")
