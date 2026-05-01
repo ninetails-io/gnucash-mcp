@@ -65,6 +65,71 @@ along for free.
 
 ---
 
+## Architecture
+
+### Split the `business` module into sub-modules
+
+The original modularization (PR #32, v1.1 era) carved the tool
+surface into focused groups when the total reached ~54 tools. At
+v1.2.1 we're at 87 tools, of which ~30 live in the `business`
+module — a third of the entire surface in a single flag. The 1.3
+work adds another 5–10 tools (taxtables, jobs, credit notes,
+employee expense vouchers), pushing it past 35.
+
+That's enough to justify the same reasoning that drove the
+original modularization: tool descriptions cost system-prompt
+tokens, and a user who only needs a subset shouldn't pay for
+the rest.
+
+**The wrinkle that makes the split non-obvious**: shared
+operations. ``post_invoice`` / ``unpost_invoice`` /
+``pay_invoice`` / ``list_invoices`` / ``get_invoice`` all
+handle both customer invoices and vendor bills via
+``owner_type``. A naive entity-based split (``customers`` /
+``vendors``) duplicates these registrations or requires a
+shared third module — both make the architecture more complex
+without much win.
+
+**Proposed shape (subject to refinement during 1.3 work):**
+
+- ``business-people`` — Customer / Vendor / Employee CRUD plus
+  billterms. ~17 tools. Useful as a standalone module for the
+  read-only persona (looking up customers without invoicing
+  them) and as a base for ``business-docs``.
+- ``business-docs`` — Invoice / Bill lifecycle (create, add
+  entry, post, unpost, pay, delete) plus the document-level
+  reports (`get_outstanding_invoices`, `vendor_spending_report`).
+  ~13 tools today, +5–10 from 1.3 features. Hard depends on
+  ``business-people`` (entities must exist before docs can
+  reference them).
+
+**Real-world wins**:
+
+- The freelancer persona who issues invoices but doesn't track
+  separate vendor bills (expenses recorded as plain transactions)
+  saves the bill-side tooling.
+- The "I just need to see outstanding invoices" read-only
+  persona saves all CRUD + billterms.
+- Personal-finance users who don't use the business module at
+  all are unaffected.
+
+**Why defer to 1.3**: doing the split alongside the new
+business features (taxtables, jobs, credit notes, vouchers)
+means the carve-out call gets made once with full information
+about what 1.3 actually adds, not twice (once now on guesses,
+again when the new entities arrive). The release notes for 1.3
+can frame the reshuffle coherently as part of the business-
+module growth.
+
+**Estimated scope**: the mechanical split is small —
+``TOOL_MODULES`` entries reorganized, the tools' module
+routing updated, the ``--modules`` flag documentation revised.
+Maybe 50 lines of code change. The careful work is in
+deciding the carve-out, especially after taxtables and jobs
+land and might suggest a different cut.
+
+---
+
 ## Code hygiene
 
 ### Indexed account-by-GUID lookups in the business module
