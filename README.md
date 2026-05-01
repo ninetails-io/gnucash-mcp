@@ -1,70 +1,178 @@
 # gnucash-mcp
 
-Talk to your GnuCash data through Claude.
+**Free, open-source accounting software that works with the LLM.**
+
+Talk to your GnuCash books through Claude (or any AI assistant
+that supports MCP). Ask "how am I doing this month," dictate
+your transactions out loud, hand over the books for the AI to
+keep up while you focus on running your life or your business.
+
+Your data stays on your machine. Your audit log stays on your
+machine. Nothing is uploaded anywhere — the AI reads and writes
+your local GnuCash file, and that's it.
+
+Two real, populated sample books ship in this repo so you can
+try it before you commit anything. They're realistic — full
+years of activity, mixed currencies, customers, invoices,
+budgets, the works. Walk through one in five minutes; if it
+clicks, point the server at your own book and you're done.
+
+---
+
+## What does it look like?
+
+This is what your AI assistant sees when it opens one of the
+sample books — a complete financial dashboard in a single call:
 
 ```
-You: What did I spend on groceries last month?
-
-Claude: You spent $692.10 on groceries in January, across 12 transactions.
-        The largest was $127.43 at Whole Foods on Jan 15.
+Book: samples/alex-chen-morales.gnucash
+Currency: USD
+Data range: 2025-01-01 to 2026-05-31
+Last entry: 2026-05-31 (future-dated, 31 days ahead)
+Warnings:
+  ⚠ Past due invoice: Berlin Digital GmbH 58 days past 30-day default, EUR 4,200 (no term set)
+  ⚠ Stale price: GBP last updated 150 days ago
+Accounts: 108 total
+Assets: 12 accounts, USD 602680.49
+  Condo: USD 473250.00
+  VTSAX: 230.7620 VTSAX @ 170.99 (USD 39457.99)
+  Vehicle: USD 27845.00
+  401k: USD 13404.62
+  Checking Account: USD 12393.11
+  ...
+Liabilities: 4 accounts, USD 418457.79
+  Credit cards (2): USD 38044.26
+  Loans (2): USD 380413.53
+  Top 3: Mortgage USD 372199.55, Chase Sapphire USD 22383.23, Business Amex USD 15661.03
+Receivables: 3 accounts, USD 10246.46
+  Accounts Receivable EUR: USD 4908.96
+  Accounts Receivable: USD 3500.00
+  Accounts Receivable CAD: USD 1837.50
+Reconciliation:
+  Checking Account: 174 splits unreconciled since 2025-12-30 (4 months behind) ⚠
+  7 accounts never reconciled ⚠
+Net worth trajectory:
+  12mo ago: USD 187,925
+   6mo ago: USD 180,614
+   3mo ago: USD 191,350
+   1mo ago: USD 185,444
+       now: USD 184,223
+Monthly net (last 6 months):
+  Apr 2026 (MTD): -9,056
+  Mar 2026: +3,092
+  Feb 2026: +5,202
+  Jan 2026: +1,086
+  Dec 2025: +4,853
+  Nov 2025: -1,494
+Runway: 121 days (USD 84,579 liquid / USD 694/day burn)
+Budget (2026 Annual Budget): 41% used / 33% elapsed (+8% over pace)
+Transactions: 2473
+Scheduled: 13 recurring, none due in next 7 days
+Business: 4 customers, 2 vendors, 1 employee
 ```
 
-```
-You: How am I doing on my budget?
+That's not a screenshot — that's the AI's actual orientation
+view. Net worth trajectory, runway, budget pacing, who owes you
+money, what's overdue, what hasn't been reconciled. One call,
+and your assistant has the full picture before you've even
+finished saying hello.
 
-Claude: February budget status:
-        • Groceries: $327 of $500 (65%) — $173 remaining
-        • Dining: $245 of $200 (122%) — $45 over budget ⚠️
-        • Entertainment: $45 of $100 (45%) — on track
-```
+---
 
-```
-You: What bills are coming up?
+## Who is this for?
 
-Claude: Next 14 days:
-        • Feb 10: Electric (~$85)
-        • Feb 15: Car Insurance ($156)
-        • Feb 28: Internet ($75)
-        Total: $316
-```
+- **Personal finance people** who keep their books in GnuCash
+  and want to dictate transactions, ask their assistant where
+  the money's going, get reconciliation help, plan budgets.
+- **Small business owners** who run their books in GnuCash and
+  want to issue invoices, track receivables, see vendor
+  spending, manage cash flow without leaving the conversation.
+- **People who care that their data stays local.** No cloud
+  sync. No SaaS. Your `.gnucash` file is the system of record;
+  this just gives your AI a way to read and write it the way
+  GnuCash itself does.
+
+You don't need to be a developer. You need:
+
+- A computer (Mac, Windows, or Linux)
+- GnuCash itself, or willingness to install it (free at
+  [gnucash.org](https://www.gnucash.org/))
+- An AI assistant that supports MCP (Claude Desktop is the
+  most common; Claude Code, Continue.dev, and others work too)
+- 10 minutes to get the sample books running, then another 10
+  to point at your own
+
+---
+
+## Try it without risking anything
+
+The repo ships two sample books — fully-populated synthetic
+ledgers you can talk to without touching your real data. Pick
+one, point the server at it, and start asking questions.
+
+### `samples/alex-chen-morales.gnucash` — Personal + freelance
+
+A Seattle-based independent software contractor with a US LLC.
+USD-default. ~141 accounts, ~2,475 transactions across 2025–
+2026. Has a mortgage, a brokerage with VTSAX/VBTLX/AAPL/MSFT/ETH
+holdings, a 401(k), four customers spanning USD/EUR/GBP/CAD with
+foreign-currency invoices, scheduled bills, a budget — pretty
+much everything the server can do, all in one book.
+
+### `samples/lin-wei.gnucash` — Cross-border small business
+
+A Shenzhen-based small-business owner running a cross-border
+e-commerce operation. CNY-default. ~105 accounts, ~1,960
+transactions. Chinese-named customers paying in CNY, USD/EUR
+customers paying in foreign currency with realized FX gain/loss
+on rate moves, domestic Chinese investments (茅台, 宁德时代,
+ETFs), an LPR-based mortgage, mixed payment rails (checking +
+Alipay + WeChat Pay).
+
+Both books are fictional. See [samples/README.md](samples/README.md)
+for the full breakdown of what's in each.
+
+---
 
 ## Quick Start (5 minutes)
 
-### Step 1: Convert your GnuCash book to SQLite
-
-**This is required.** The server only works with SQLite format, not XML.
-
-In GnuCash:
-1. File → Save As
-2. Change "Data Format" to **SQLite3**
-3. Save with a new filename (e.g., `mybook-sqlite.gnucash`)
-
-Keep your original XML file as a backup.
-
-### Step 2: Install
+### 1. Install
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
 cd gnucash-mcp
 ```
 
-**With uv (recommended):**
+Then either:
+
 ```bash
-uv sync
+uv sync                # if you have uv (recommended)
+# or
+pip install -e .       # if you have pip
 ```
 
-**With pip:**
+> If you don't have `uv`, install it with one line:
+> `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+### 2. Make a working copy of a sample book
+
+The server writes audit logs and auto-backups alongside the
+book file. You don't want either of those committed back to the
+repo, so copy the book somewhere outside the repo first:
+
 ```bash
-pip install -e .
+mkdir -p ~/gnucash-mcp-scratch
+cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
-### Step 3: Configure Claude Desktop
+### 3. Tell Claude Desktop about the server
 
-Find your config file:
+Find your Claude Desktop config:
+
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this (replace the paths with your actual paths):
+Add this (replace the two paths with your actual paths):
 
 ```json
 {
@@ -77,561 +185,353 @@ Add this (replace the paths with your actual paths):
         "/path/to/gnucash-mcp",
         "python",
         "-m",
-        "gnucash_mcp"
+        "gnucash_mcp",
+        "--modules=all"
       ],
       "env": {
-        "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash"
+        "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
     }
   }
 }
 ```
 
-If you used pip instead of uv:
-```json
-{
-  "mcpServers": {
-    "gnucash": {
-      "command": "gnucash-mcp",
-      "env": {
-        "GNUCASH_BOOK_PATH": "/path/to/your/book.gnucash"
-      }
-    }
-  }
-}
+Quit Claude Desktop completely (not just close the window —
+quit) and reopen it. Look for the hammer 🔨 icon next to the
+text input. That means the server's connected.
+
+### 4. Try it
+
+Ask Claude:
+
+- "Summarize the book."
+- "What's my net worth been doing?"
+- "Show me anyone who owes me money."
+- "What did I spend on dining last month?"
+- "Set a $500 monthly grocery budget."
+
+The first response usually starts with the dashboard from
+above. Everything after that is conversational.
+
+When you're ready to point at your own book, replace the
+`GNUCASH_BOOK_PATH` value with the path to your real `.gnucash`
+file (more on that next), restart Claude Desktop, and ask away.
+
+---
+
+## Connecting to your own book
+
+### One-time conversion: GnuCash file format
+
+The server only reads the **SQLite** form of GnuCash files, not
+the older XML form. To convert:
+
+1. Open your book in GnuCash itself
+2. **File → Save As**
+3. Change "Data Format" to **SQLite3**
+4. Save with a new filename (e.g. `mybook-sqlite.gnucash`)
+5. **Keep the XML original as a backup.**
+
+You only do this once. From then on, GnuCash and the MCP server
+both work against the same SQLite file.
+
+### Set the path
+
+Update `GNUCASH_BOOK_PATH` in your Claude Desktop config to
+point at your own SQLite-format book. Restart Claude Desktop.
+
+> **Use absolute paths**, not `~` or relative paths. On
+> Mac/Linux: `/Users/yourname/Documents/mybook.gnucash`. On
+> Windows: `C:\\Users\\yourname\\Documents\\mybook.gnucash`
+> (note the doubled backslashes — that's a JSON requirement).
+
+### Other AI clients
+
+This is an [MCP](https://modelcontextprotocol.io/) server, so
+it works with any client that speaks MCP. Notes for non–Claude
+Desktop clients:
+
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+  Add `--scope user` for all projects, `--scope project` for
+  this one only.
+- **Anything else**: set `GNUCASH_BOOK_PATH` and run
+  `uv run gnucash-mcp` (or `gnucash-mcp` if installed via pip).
+
+---
+
+## What you can ask it to do
+
+A non-exhaustive tour. Phrase any of these naturally — the
+assistant translates.
+
+### Recording activity
+
+> "I spent \$47.50 at Safeway today on groceries, paid with my
+> Visa."
+>
+> Recorded: \$47.50 from Credit Card:Visa to
+> Expenses:Groceries on Apr 30, 2026. Description: "Safeway".
+
+### Setting up recurring bills
+
+> "Set up my rent as a recurring bill. \$1,850 on the 1st of
+> every month from checking."
+>
+> Created scheduled transaction "Monthly Rent": \$1,850
+> monthly, from Assets:Checking to Expenses:Rent. Next due:
+> May 1, 2026.
+
+### Investment tracking
+
+> "I bought \$1,000 of VTSAX at \$170.99/share in my 401(k)."
+>
+> Recorded VTSAX purchase: 5.85 shares at \$170.99/share. Cost
+> basis: \$1,000.00. Lot created for capital-gains tracking
+> when you eventually sell.
+
+### Invoicing customers
+
+> "Create a customer called Acme Corp and invoice them \$1,500
+> for consulting."
+>
+> Created customer Acme Corp (id 000005) and invoice 000019:
+> 1× Consulting at \$1,500.00 = \$1,500.00. Open. Tell me when
+> you're ready to post it.
+
+### Foreign-currency invoicing
+
+> "Invoice Berlin Digital €4,200 for Q1 retainer, due in 30 days."
+>
+> Created EUR invoice 000020 for Berlin Digital GmbH:
+> 1× Q1 Retainer at EUR 4,200 = EUR 4,200. Net 30. When they
+> pay, I'll book the realized exchange-rate gain/loss to your
+> FX account automatically.
+
+### Asking questions
+
+> "How much did I spend with each vendor this year?"
+>
+> Office Depot: \$2,340 (4 bills, \$0 outstanding)
+> CloudHost Inc: \$1,200 (2 bills, \$600 outstanding)
+> Legal Associates: \$3,500 (1 bill, \$3,500 outstanding)
+> Total billed \$7,040 / paid \$2,940 / outstanding \$4,100.
+
+### Reconciliation
+
+> "Help me reconcile checking against the April statement."
+>
+> [Walks you through it: pulls unreconciled splits, asks you
+> to confirm cleared transactions, computes the running
+> balance, marks the matched ones reconciled, leaves the
+> mismatches for you to investigate.]
+
+---
+
+## Privacy and safety
+
+**Your data does not leave your machine.** This server is a
+local process that reads and writes a local file. The AI
+assistant you're talking to (Claude Desktop, etc.) sees the
+results of your tool calls — the same content you'd see on
+screen — but the file itself stays where it always was.
+
+**Every write is logged.** A human-readable audit trail lives
+alongside your book file at `<your-book>.gnucash.mcp/audit/`,
+one log file per day. You can read it at any time to see
+exactly what changed and when. Sample entry:
+
+```
+2026-04-30 14:32  POST INVOICE  id:000019
+    total: 1500.00  date: 2026-04-30
+    account: Assets:Accounts Receivable  txn:a1b2c3d4
 ```
 
-#### Choosing modules (important)
+**Automatic backups.** Before the very first write of each
+session, the server snapshots your book to
+`<your-book>.gnucash.mcp/backups/` — so if something goes
+wrong, you can roll back to a known-good state without
+relying on Time Machine or your own habit. Backups are
+verified with `PRAGMA integrity_check` before being declared
+valid. See [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
+for the rollback procedure.
 
-**Only load the modules you actually use.** The server has 75 tools across 8 modules, but every loaded tool gets described in the system prompt — eating tokens and context on every single message. Most users only need 2-3 modules.
+**Reconciled splits are protected.** The server refuses to
+delete or modify reconciled splits without an explicit
+override, so a careless prompt can't quietly invalidate your
+last bank reconciliation.
 
-Add `--modules=` after `"gnucash_mcp"` in the args array with a comma-separated list:
+**Voiding ≠ deleting.** When you tell the AI to "void this
+transaction," it uses GnuCash's proper accounting void —
+preserving the transaction for the audit trail with values
+zeroed. Deletion is the destructive option; the AI will tell
+you which one it's doing.
+
+> **Disclaimer:** This software is provided "as is" under the
+> [MIT License](LICENSE), without warranty of any kind. The
+> authors are not liable for any data loss, corruption, or
+> financial discrepancy arising from its use. You are solely
+> responsible for maintaining your own backups and verifying
+> the accuracy of your books.
+
+---
+
+## Limiting what the AI can see
+
+By default the server exposes its full toolset (87 tools as
+of v1.2.1). Each tool's description lives in the AI's system
+prompt, which costs context on every message. If you only use
+some features — say, no investments and no business module —
+you can tell the server to load only those modules:
 
 ```json
 "args": [
   "run", "--directory", "/path/to/gnucash-mcp",
   "python", "-m", "gnucash_mcp",
-  "--modules=core,reporting,budgets"
+  "--modules=core,reporting,budgets,scheduling"
 ]
 ```
 
-| Module | Tools | What it does |
-|--------|-------|--------------|
-| `core` | 15 | Accounts, transactions, book summary (always loaded) |
-| `reconciliation` | 5 | Bank reconciliation, void/unvoid |
-| `reporting` | 5 | Spending, income, balance sheet, net worth, cash flow |
-| `budgets` | 6 | Budget creation, targets, variance reports |
-| `scheduling` | 6 | Recurring transactions, upcoming bills |
-| `investments` | 11 | Commodities, prices, lots, cost basis tracking |
-| `business` | 22 | Customers, vendors, invoices, bills, payments |
-| `admin` | 4 | Account metadata slots, audit log |
-| `debug` | 1 | `get_server_config` — loaded when `--debug` is set |
+| Module | What it gives you |
+|---|---|
+| `core` | Accounts, transactions, the dashboard. Always loaded. |
+| `reconciliation` | Bank reconciliation, void/unvoid |
+| `reporting` | Spending, income, balance sheet, net worth, cash flow, debt payoff |
+| `budgets` | Create budgets, set targets, track variance |
+| `scheduling` | Recurring transactions, upcoming bills |
+| `investments` | Stocks, mutual funds, lots, capital-gain tracking |
+| `business` | Customers, vendors, employees, invoices, bills, payments |
+| `admin` | Account-level metadata (APR, credit limit, etc.) |
+| `backup` | Manual snapshot tools |
 
-Use `--modules=all` to load everything (75 tools), but only if you need it. You can also set `GNUCASH_MCP_MODULES=core,reporting` as an environment variable instead of using the CLI flag.
-
-Other optional flags: `"--debug"` enables debug logging, `"--noaudit"` disables the audit log.
-
-### Step 4: Restart Claude Desktop
-
-Quit Claude Desktop completely and reopen it. Look for the hammer 🔨 icon — that means MCP tools are available.
-
-### Step 5: Try it
-
-Ask Claude:
-- "List my accounts"
-- "What's my checking account balance?"
-- "What did I spend on dining this month?"
+Use `--modules=all` to load everything (the default for the
+sample-book quickstart above), or list a subset to keep your
+context light. You can also set
+`GNUCASH_MCP_MODULES=core,reporting` as an environment
+variable instead.
 
 ---
 
-## What can it do?
+## What's in v1.2.1
 
-**75 tools** across eleven categories:
+This release is the long-tail completion of the v1.2 business-
+module promise — what v1.2 should have been at first ship,
+plus a generous correctness sweep on every non-USD-default
+path the test books surfaced.
 
-| Category | What you can ask |
-|----------|------------------|
-| **Overview** | "Summarize the book", "What's the financial picture?", "Orient me" |
-| **Accounts** | "List my accounts", "What's my checking balance?", "Create a new expense category for subscriptions" |
-| **Transactions** | "Show recent transactions", "Record a $50 grocery purchase", "Find all Amazon transactions" |
-| **Budgets** | "Create a monthly budget", "Set grocery budget to $500", "How am I doing on my budget?" |
-| **Scheduled** | "Set up rent as a monthly bill", "What bills are coming up?", "Pay this month's electric bill" |
-| **Investments** | "Track my VTSAX shares", "What's my cost basis?", "Calculate my capital gains" |
-| **Reports** | "Spending by category last month", "What's my net worth?", "Show cash flow this year" |
-| **Business** | "Create a customer", "Invoice Acme Corp for consulting", "Record payment on invoice", "How much did we spend with each vendor?" |
-| **Multi-currency** | "Record a €50 purchase", "What's my EUR account balance?" |
-| **Reconciliation** | "Show unreconciled transactions", "Mark these as cleared" |
-| **Account Metadata** | "Set my credit card APR", "What metadata is on this account?" |
+**Major:**
 
----
+- **Multi-currency, end-to-end.** Foreign-currency invoices
+  post and pay against the right exchange rates from your
+  price table; rate drift between post-date and pay-date is
+  recognized as realized FX gain/loss in a dedicated income
+  account (or one you specify).
+- **A complete first-call dashboard.** `get_book_summary` now
+  shows net-worth trajectory, runway, monthly net income,
+  budget pacing, reconciliation backlog with split counts,
+  upcoming bills, and warnings — turning the LLM's first call
+  from "what is the state of the books" into "what do I need
+  to do next."
+- **Customer / vendor / employee CRUD complete.** Create,
+  list, get, update (new in 1.2.1), and delete. No more
+  needing to open GnuCash itself just to fix a typo on an
+  address.
+- **Posting workflow lifecycle complete.** `post_invoice` and
+  `pay_invoice` joined by `unpost_invoice` (new) so a posted
+  invoice can be reversed cleanly without SQL surgery.
+  `delete_transaction` refuses to break the lifecycle by
+  removing posting records directly.
+- **Automatic backups.** First write of each session snapshots
+  the book; staged retention (7 session / 4 weekly / 6
+  monthly) keeps you covered without filling your disk.
 
-## Example Conversations
+**Plus a thousand smaller fixes** from intensive testing on
+two real-shape books — multi-currency reporting, debt-payoff
+amortization for mortgages, voided-payment handling, employee-
+expense-voucher hooks, and many more. See
+[docs/POST_1_2_1_FOLLOWUPS.md](docs/POST_1_2_1_FOLLOWUPS.md)
+for what's deferred to 1.3 (taxtables, jobs, credit notes).
 
-### Tracking expenses
-```
-You: I spent $47.50 at Safeway today on groceries, paid with my Visa.
-
-Claude: Recorded: $47.50 from Credit Card:Visa to Expenses:Groceries
-        on Feb 7, 2026. Description: "Safeway"
-```
-
-### Setting up recurring bills
-```
-You: Set up my rent as a recurring bill. $1,850 on the 1st of every month
-     from checking.
-
-Claude: Created scheduled transaction "Monthly Rent":
-        • $1,850 monthly
-        • From: Assets:Checking
-        • To: Expenses:Rent  
-        • Next due: March 1, 2026
-```
-
-### Investment tracking
-```
-You: I bought $1,000 of VTSAX at $125/share in my 401k.
-
-Claude: Recorded VTSAX purchase:
-        • 8 shares at $125.00/share
-        • Cost basis: $1,000.00
-        • Account: Assets:Investments:401k:VTSAX
-        
-        I've created a lot to track this purchase for capital gains.
-```
-
-### Invoicing a customer
-```
-You: Create a customer called "Acme Corp" and invoice them $1,500 for consulting.
-
-Claude: Created customer "Acme Corp" (ID: 000001)
-        Created invoice 000001:
-        • 1x Consulting at $1,500.00
-        • Total: $1,500.00
-
-        Ready to post when you want to make it official.
-```
-
-### Tracking vendor spending
-```
-You: How much did we spend with each vendor this year?
-
-Claude: Vendor spending (Jan–Feb 2026):
-        • Office Depot: $2,340 (4 bills, $0 outstanding)
-        • CloudHost Inc: $1,200 (2 bills, $600 outstanding)
-        • Legal Associates: $3,500 (1 bill, $3,500 outstanding)
-        Total billed: $7,040 | Paid: $2,940 | Outstanding: $4,100
-```
-
-### Month-end review
-```
-You: Give me a financial summary for January.
-
-Claude: January 2026 Summary:
-        
-        Income: $7,149
-        • Salary: $5,200
-        • Spouse Salary: $1,749
-        • VA Benefits: $200
-        
-        Expenses: $9,014
-        • Rent: $1,850
-        • Groceries: $692
-        • Dining: $351
-        • Credit Card Interest: $247
-        ...
-        
-        Net: -$1,865 (spent more than earned)
-        
-        Credit card debt: $14,345
-```
-
----
-
-## Important: Back Up Your Data
-
-This server **reads and writes your GnuCash book directly**. Your GnuCash file may contain your entire financial history — treat it accordingly.
-
-1. **Back up your `.gnucash` file before first use** and keep regular backups
-2. **Test with a copy first**, not your real book
-3. All write operations are logged to an audit file (see Audit Logging below)
-
-> **Disclaimer:** This software is provided "as is" under the [MIT License](LICENSE), without warranty of any kind. The authors are not liable for any data loss, corruption, or financial discrepancy arising from its use. You are solely responsible for maintaining backups and verifying the accuracy of your financial data.
+A condensed changelog of major releases lives in
+[CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## Troubleshooting
 
-### "Tool not found" or no hammer icon
-- Restart Claude Desktop completely (Quit, not just close)
-- Check that your paths in the config file are correct
-- Make sure the config file is valid JSON (no trailing commas)
+### No 🔨 hammer icon, or "tool not found"
 
-### "Book not found" or path errors
-- Use absolute paths, not `~` or relative paths
-- On Mac/Linux: `/Users/yourname/Documents/book.gnucash`
-- On Windows: `C:\\Users\\yourname\\Documents\\book.gnucash` (double backslashes in JSON)
+- Quit Claude Desktop completely, then reopen it. (Closing the
+  window isn't enough — you have to quit the application.)
+- Verify the paths in your config are absolute and correct.
+- Check the JSON for trailing commas — they break the config
+  silently.
 
-### "Cannot open book" or piecash errors
-- Make sure your book is SQLite format, not XML
-- Check that GnuCash isn't currently open with the same book
-- Try opening the book in GnuCash to verify it's not corrupted
+### "Book not found"
+
+- Use absolute paths, not `~` or relative paths.
+- Mac/Linux: `/Users/yourname/Documents/book.gnucash`
+- Windows: `C:\\Users\\yourname\\Documents\\book.gnucash`
+  (doubled backslashes — JSON requirement)
+
+### "Cannot open book" / piecash errors
+
+- Confirm your book is in **SQLite** format, not XML.
+- Make sure GnuCash isn't open with the same book — file lock.
+- Try opening the book in GnuCash itself to verify it isn't
+  corrupted.
 
 ### "Account not found"
-- Use full account paths: `Expenses:Groceries`, not just `Groceries`
-- Run "list my accounts" to see exact account names
 
-### Something went wrong with my data
-- Check the audit log in `[your-book].gnucash.mcp/audit/`
-- Every write operation is logged with before/after states
-- You can restore from your backup
+- Use full account paths: `Expenses:Groceries`, not just
+  `Groceries`.
+- Or ask the assistant to list accounts: "List my accounts."
 
----
+### Something went wrong
 
-## Configuration Reference
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `GNUCASH_BOOK_PATH` | Path to your GnuCash SQLite book (required) |
-| `GNUCASH_MCP_MODULES` | Tool modules to load (e.g., `core,reporting`). Default: `core` |
-| `GNUCASH_MCP_DEBUG` | Set to `1` for debug logging |
-| `GNUCASH_MCP_NOAUDIT` | Set to `1` to disable audit logging |
-
-### Tool Modules
-
-See [Choosing modules](#choosing-modules-important) in the Quick Start for the full module table. From the command line:
-
-```bash
-# Default: core only (15 tools)
-gnucash-mcp
-
-# Load specific modules
-gnucash-mcp --modules=core,reporting,business
-
-# Everything (75 tools — not recommended unless you need it all)
-gnucash-mcp --modules=all
-```
-
-When `--debug` is set, an additional `get_server_config` diagnostic tool is registered. It reports loaded modules, tool count, book path, debug mode, and version — useful for verifying what the server actually loaded.
-
-### Claude Code
-
-Run this command to add the server (use `--scope user` for all projects, or `--scope project` for the current project only):
-
-```bash
-claude mcp add-json gnucash \
-  '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'
-```
-
-Replace both paths with your actual paths. Add `"--modules=core,reporting"` (or whichever modules you need), `"--debug"`, or `"--noaudit"` to the args array.
-
-### Other MCP Clients
-
-```bash
-# Set the book path
-export GNUCASH_BOOK_PATH="/path/to/your/book.gnucash"
-
-# Run directly
-uv run gnucash-mcp
-
-# Or with pip install
-gnucash-mcp
-
-# Development mode (with MCP inspector)
-uv run mcp dev src/gnucash_mcp/server.py
-```
+- Open the audit log at `<your-book>.gnucash.mcp/audit/` —
+  every write since the server first ran is there with
+  before/after detail.
+- If you need to roll back, [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
+  walks through it.
 
 ---
 
-## Audit Logging
+## Support the project
 
-All write operations are logged automatically:
-
-```
-/path/to/book.gnucash.mcp/
-  audit/YYYY-MM-DD.txt    # What changed and when
-  debug/YYYY-MM-DD.log    # Debug info (when enabled)
-```
-
-Example audit entry:
-```
-2026-02-07 14:32:15 | create_transaction | WRITE
-  description: Safeway
-  date: 2026-02-07
-  splits: Expenses:Groceries $47.50, Liabilities:Credit Card:Visa -$47.50
-  guid: a1b2c3d4...
-```
+If gnucash-mcp is useful to you, consider
+[buying me a coffee](https://ko-fi.com/gomezfox). It helps
+keep development going.
 
 ---
 
-## All 82 Tools
+## For developers
 
-<details>
-<summary>Click to expand full tool list</summary>
-
-| Category | Tools |
-|----------|-------|
-| Overview | `get_book_summary` |
-| Accounts | `list_accounts`, `get_account`, `get_balance`, `create_account`, `update_account`, `move_account`, `delete_account` |
-| Commodities & Prices | `list_commodities`, `create_commodity`, `create_price`, `get_prices`, `get_latest_price` |
-| Transactions | `list_transactions`, `get_transaction`, `create_transaction`, `update_transaction`, `replace_splits`, `delete_transaction`, `search_transactions`, `void_transaction`, `unvoid_transaction` |
-| Reconciliation | `set_reconcile_state`, `get_unreconciled_splits`, `reconcile_account` |
-| Reporting | `spending_by_category`, `income_by_source`, `balance_sheet`, `net_worth`, `cash_flow`, `debt_payoff_plan` |
-| Budgets | `create_budget`, `list_budgets`, `get_budget`, `set_budget_amount`, `get_budget_report`, `delete_budget` |
-| Scheduled Transactions | `create_scheduled_transaction`, `list_scheduled_transactions`, `get_upcoming_transactions`, `create_transaction_from_scheduled`, `update_scheduled_transaction`, `delete_scheduled_transaction` |
-| Lots | `create_lot`, `list_lots`, `get_lot`, `assign_split_to_lot`, `calculate_lot_gain`, `close_lot` |
-| Business | `create_customer`, `list_customers`, `get_customer`, `delete_customer`, `create_vendor`, `list_vendors`, `get_vendor`, `delete_vendor`, `create_employee`, `list_employees`, `get_employee`, `delete_employee`, `create_billterm`, `list_billterms`, `create_invoice`, `create_bill`, `add_invoice_entry`, `add_bill_entry`, `list_invoices`, `get_invoice`, `post_invoice`, `pay_invoice`, `delete_invoice`, `delete_bill`, `get_outstanding_invoices`, `vendor_spending_report` |
-| Account Metadata | `get_account_slots`, `set_account_slot`, `delete_account_slot` |
-| Backups | `create_backup`, `list_backups`, `prune_backups` |
-| Audit | `get_audit_log` |
-| Debug | `get_server_config` (loaded when `--debug` is set) |
-
-</details>
-
----
-
-## Development
+Contributor guide and design notes live in
+[CLAUDE.md](CLAUDE.md). Quick orientation:
 
 ```bash
-git clone https://github.com/ninetails-io/gnucash-mcp.git
-cd gnucash-mcp
 uv sync --extra dev
-uv run pytest           # Run tests
-uv run pytest -x -v     # Stop on first failure, verbose
-uv run ruff check src/ tests/     # Lint
-uv run black --check src/ tests/  # Formatter check (no reformat)
+uv run pytest                       # 1,044 tests as of v1.2.1
+uv run ruff check src/ tests/
+uv run black --check src/ tests/
 ```
 
-### Project Structure
-
-```
-gnucash-mcp/
-├── src/gnucash_mcp/
-│   ├── server.py            # MCP server and tool definitions
-│   ├── book.py              # GnuCash operations (piecash wrapper)
-│   └── logging_config.py    # Audit logging
-├── tests/
-├── docs/                    # Design specs
-└── README.md
-```
-
----
-
-## Changelog
-
-### v1.2.1 — Backups, Employees, Efficiency
-
-Protection, the third business entity, and the biggest efficiency pass
-since v1.0.2. The server now snapshots the book before the first write
-of every session, Employees join Customers and Vendors as a first-class
-entity, and most read and write paths were measured and optimized.
-
-- **Automatic backups**: The first write of each server process
-  triggers an SQLite online-backup snapshot with grandfather-father-son
-  retention (7 session / 4 weekly / 6 monthly automatic, unbounded
-  manual). Every snapshot is verified with `PRAGMA integrity_check`
-  before being declared valid. Data loss is now recoverable from
-  within the server's own directory — no OS-level backup required.
-- **Manual backup tools**: `create_backup(label)`, `list_backups`,
-  `prune_backups(dry_run=true)`. Restore is deliberately *not* a tool
-  — it's a documented filesystem procedure (see
-  [RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)) performed
-  with the server stopped.
-- **Employees**: Third business-person entity alongside Customer and
-  Vendor. `create_employee`, `list_employees`, `get_employee`,
-  `delete_employee`. Expense vouchers are out of scope for this release.
-- **Cross-currency invoicing**: `post_invoice` and `pay_invoice` now
-  apply exchange rates from `book.prices` when the invoice currency
-  differs from the A/R, A/P, or payment account commodity. Splits are
-  written with `value` in invoice currency and `quantity` in the
-  account's commodity, so the transaction balances correctly while
-  real USD flows reflect the actual conversion. Skips piecash's
-  auto-created `type='transaction'` 1:1 rates so a transaction-derived
-  placeholder can't mask a missing user-supplied market price. Clear
-  error when no usable rate is on file, pointing at `create_price`.
-- **Register-form compact output**: `list_transactions(account=X)`
-  now renders in bank-register form — `DATE  guid  ±amount  desc
-  other-splits` — with the signed impact on the filtered account in
-  column 3. Fixes a reported confusion where the earlier format made
-  the description look like it blended into the remaining split.
-- **Split-list collapse**: Transactions with more than 4 splits in
-  the rendered column render the top 3 by |value| plus `+N more`.
-  A 17-split paycheck now fits on one legible line; call
-  `get_transaction(guid)` for the full breakdown when needed.
-- **Short collision-safe GUIDs in write responses**: Write tools now
-  return an 8-character GUID prefix (extended only when the birthday
-  problem actually bites at scale) instead of the full 32-char hex.
-  Tools that accept GUIDs accept the prefix seamlessly via
-  `_resolve_guid`. Large savings on every follow-up call.
-- **Thin write responses**: `update_transaction`, `replace_splits`,
-  and many other write tools now return only the new information the
-  caller couldn't already know. The audit log pulls missing fields
-  from tool parameters to preserve full before/after diff detail in
-  the human-readable trail.
-- **Single book-open per write**: The audit decorator used to open
-  the book twice per write (once to capture before-state, once for
-  the actual write). Now write methods stage their before-state
-  inside the same session they already have open, halving write
-  latency.
-- **SQL-pushed reporting**: `spending_by_category`, `income_by_source`,
-  `balance_sheet`, `net_worth`, and `cash_flow` now push date, account
-  type, and account GUID filters into SQLite rather than scanning
-  `book.transactions` in Python. Aggregation stays in Python to
-  preserve exact `Decimal` arithmetic.
-- **Cumulative-sum `net_worth` series**: A 60-month net-worth
-  time series used to be O(intervals × splits); now it's O(splits
-  + intervals) via a single sorted sweep.
-- **Business module DRY refactor**: Create and delete paths for
-  Customer, Vendor, and Employee share a single implementation each
-  — parameterized on the piecash class and small config / callback
-  parameters. Identical behavior, substantially less duplication.
-- **Audit log dispatcher**: The text-format audit log's 380-line
-  if/elif chain was flattened into a dispatch table keyed on
-  `(entity_type, operation)`. New entity types are now a dict entry,
-  not another elif branch.
-- **Structured deletes**: Every raw `text("DELETE FROM ...")` site in
-  the codebase was replaced with SQLAlchemy Core
-  (`Table.__table__.delete().where(...)`) with post-delete
-  verification. Future GnuCash schema changes surface as loud import
-  errors rather than silent runtime failures.
-- **Linter & formatter config**: `ruff` and `black` sections added
-  to `pyproject.toml`. No bulk reformat in this release — style
-  drift gets fixed on the next touch to each file, when it's cheapest.
-- **Synthetic-book generation scripts**: `scripts/synthetic_book/`
-  now ships with an 8-phase pipeline that builds the Alex
-  Chen-Morales test persona book end-to-end — 1,797 transactions
-  covering scheduled-instantiation, daily/weekly patterns, LLC
-  business flows (including EUR-denominated invoices), investment
-  activity with lots, credit-card lifecycle, reconciliation, edge
-  cases, and a 1,000-transaction volume stress. Each phase is
-  self-contained, deterministically seeded, and re-runnable from
-  its own `.pre-phaseN.gnucash` backup.
-- **Pre-release correctness sweep**: Five issues surfaced while
-  stress-testing against the synthetic book.
-  - `get_book_summary` now values investment accounts at
-    `shares × latest_price` from the price table instead of summing
-    raw quantities as the default currency — Alex's net worth was
-    understated by ~\$57K before the fix. Falls back to cost basis
-    with a "no price data" tag when no user-supplied price exists.
-  - Same summary gained Receivables, Payables, Business entity
-    counts (`3 customers, 2 vendors, 1 employee`), and Budget count
-    sections, each rendered only when non-empty.
-  - `list_transactions` and `search_transactions` now append
-    `[Showing N of M — …]` to compact output when the result set
-    exceeds the limit. Silent truncation was a trust issue for
-    accountants who'd filter a month and see 50 of 93 without
-    knowing. Limits above 250 are clamped server-side with a note.
-  - `search_transactions` gained a `limit` parameter (it didn't
-    have one; results were unbounded).
-  - `create_customer` / `create_vendor` / `create_employee` now
-    include the resolved currency in their return dicts so the
-    audit log renders `currency: USD` instead of an empty field
-    when the caller relied on the book's default.
-  - Budget tool `period` parameter now coerces numeric-string
-    values to int. XML-routed MCP calls pass `"11"` as a string;
-    the handler previously rejected it despite the schema allowing
-    strings alongside integers.
-- **Version**: 1.2.1 (718 tests)
-
-### v1.2.0 — Business Module
-
-Full accounts receivable and accounts payable workflow. Create customers and vendors, generate invoices and bills, post them to A/R or A/P, and record payments — all through natural language.
-
-- **Customers & vendors**: Create, list, and query customers and vendors with addresses
-- **Billing terms**: Define payment terms (e.g., Net 30 with early payment discounts)
-- **Invoices & bills**: Create invoices for customers and bills from vendors, add line items, post to A/R or A/P accounts, record full or partial payments
-- **Reporting**: List outstanding invoices/bills, vendor spending breakdown by period
-- **GnuCash UI compatibility**: Posted invoices include metadata slots (`gncInvoice`, `trans-date-due`, `date-posted`) so they display correctly in the native GnuCash interface
-- **Write verification**: All raw SQL operations (those bypassing the piecash ORM) are now verified with a read-back check before commit, with automatic rollback on failure
-- **`business` tool module**: 22 tools, loaded via `--modules=business` or `--modules=all`
-- **Server-level MCP instructions**: The server now sends structured accounting guidance (double-entry basics, workflow conventions, safety rules) to clients at connection time via the MCP `instructions` field — helping non-Claude models use the tools correctly without bloating individual tool descriptions
-- **Version**: 1.2.0 (540 tests)
-
-### v1.1.0 — Modular Tool Loading
-
-The context-efficiency release. Previous versions advertised all tools to every client, consuming system prompt tokens whether you needed investments or not.
-
-- **Tool modules** (`--modules=`): Load only the tool categories you need. Seven modules (core, reconciliation, reporting, budgets, scheduling, investments, admin) let you go from 52 tools down to as few as 15. Core is always loaded; `all` loads everything.
-- **`get_server_config` debug tool**: When `--debug` is set, a diagnostic tool reports loaded modules, tool count, book path, and version. Clients can verify their own inventory instead of guessing.
-- **`GNUCASH_MCP_MODULES` env var**: Configure modules without CLI flags — useful for Claude Desktop configs.
-- **Version**: 1.1.0 (424 tests)
-
-### v1.0.2 — Compact Output
-
-Reduced token usage on the *response* side. Every read tool that returned verbose JSON by default now returns compact one-line-per-item text instead.
-
-- **Compact default output** for list_transactions, list_commodities, list_scheduled_transactions, get_unreconciled_splits, list_lots — verbose JSON available via `verbose=true`
-- **`get_book_summary`**: Single-call financial snapshot — book path, account structure, key balances, net worth, commodities, and scheduled transactions in one text response
-- **Minified JSON**: Stripped null/empty values and whitespace from all JSON responses
-- **Partial GUID support**: 8+ character prefixes accepted for transactions, splits, lots, and scheduled transactions
-- **Version**: 1.0.2 (399 tests)
-
-### v1.0.0 — Stable Release
-
-Feature-complete with write safety and audit trail.
-
-- **`replace_splits`**: Wholesale split replacement on existing transactions (recategorization without void/recreate)
-- **Transaction pipeline**: Duplicate detection, dry run mode, auto-fill from prior transactions, date sanity checks, placeholder account warnings
-- **`list_accounts` compact mode**: One-line-per-account default with `root` filter
-- **Account metadata slots**: Custom key-value pairs on accounts (APR, credit limits, reward rates)
-- **Audit log text format**: Human-readable audit trail alongside JSON option
-- **Version**: 1.0.0 (394 tests)
-
-### v0.9.0 — Feature Build-out
-
-From basic CRUD to a full accounting toolkit.
-
-- **Investments**: Commodities, prices, lot-based cost basis tracking, capital gain calculation
-- **Scheduled transactions**: Recurring templates, upcoming bills, one-click instantiation
-- **Budgets**: Create budgets, set targets by period/quarter, variance reporting
-- **Multi-currency**: Cross-currency transactions with quantity/value split handling
-- **Reporting**: Spending by category, income by source, balance sheet, net worth, cash flow
-- **Reconciliation**: Statement reconciliation, void/unvoid with audit trail
-- **Audit logging**: Automatic write-operation logging alongside the book file
-- **Version**: 0.9.0 (187 tests)
-
-### v0.1.0 — Initial Release
-
-- Account listing, balances, transaction CRUD, search
-- MCP server with FastMCP, Claude Desktop integration
-- piecash SQLite interface with error handling
-
----
-
-## Roadmap
-
-- [x] Full account management
-- [x] Transaction CRUD with search
-- [x] Multi-currency support
-- [x] Investment tracking with cost basis
-- [x] Budgets with variance reporting
-- [x] Scheduled transactions
-- [x] Audit logging
-- [x] Split recategorization (`replace_splits`)
-- [x] Compact output for reduced token usage
-- [x] Partial GUID support (8+ character prefixes)
-- [x] Duplicate detection (built into `create_transaction`)
-- [x] Modular tool loading (`--modules=`)
-- [x] Business: customers, vendors, invoices, bills, payments
-- [x] Write verification for raw SQL operations
-- [x] Server-level MCP instructions for non-Claude clients
-- [ ] Business: employees
-- [ ] CSV export
-- [ ] CSV/OFX import
-
----
-
-## Support the Project
-
-If gnucash-mcp is useful to you, consider [buying me a coffee](https://ko-fi.com/gomezfox). It helps keep development going.
-
----
+The server is built on
+[piecash](https://github.com/sdementen/piecash) (Python
+interface to GnuCash's SQLite books) and the
+[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
+Roughly 18,000 lines of Python source, 20,000 lines of tests,
+modularized so disabled modules cost nothing at runtime.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE).
 
 ## Acknowledgments
 
-- [piecash](https://github.com/sdementen/piecash) — Python interface to GnuCash
-- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) — Model Context Protocol 
+- [GnuCash](https://www.gnucash.org/) — the free, open-source
+  accounting software this server makes conversational.
+- [piecash](https://github.com/sdementen/piecash) — Python
+  interface to GnuCash SQLite books.
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) —
+  the Model Context Protocol implementation.
