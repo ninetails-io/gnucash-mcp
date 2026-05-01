@@ -909,11 +909,51 @@ class CoreMixin:
             except Exception:
                 pass
 
+        # ── 6. Backup health ──
+        # Surface auto-backup chain breaks. The single failure mode
+        # this server most fears is data loss; an auto-backup that has
+        # been silently failing for weeks turns into "you have no
+        # recovery option" the day the book corrupts. Pre-fix, the
+        # debug log was the only place this surfaced — and the
+        # bookkeeper doesn't read debug logs. We render the warning
+        # right next to integrity issues because backup health is
+        # itself a data-safety concern.
+        backup_health: list[str] = []
+        get_health = getattr(self, "get_backup_health", None)
+        if get_health is not None:
+            try:
+                health = get_health()
+                attempt = health.get("last_attempt")
+                if attempt and attempt.get("status") == "failed":
+                    age = today - attempt["at"].date()
+                    age_str = (
+                        f"{age.days} day{'s' if age.days != 1 else ''} ago"
+                        if age.days >= 1 else "today"
+                    )
+                    reason = attempt.get("reason") or "unknown"
+                    backup_health.append(
+                        f"Auto-backup failing: {reason} "
+                        f"(last attempt {age_str})"
+                    )
+                # No backup file in 30+ days: chain is stale even if
+                # the attempt status is fine. Could be that nothing
+                # has been due (well-spaced backups + recent prune)
+                # or the directory was emptied externally.
+                newest_age = health.get("newest_backup_age_days")
+                if newest_age is not None and newest_age >= 30:
+                    backup_health.append(
+                        f"No backup in {newest_age} days (most recent "
+                        f"snapshot is older than 1 month)"
+                    )
+            except Exception:
+                pass
+
         # Integrity tier (imbalance/orphan) leads — actual data
         # corruption that calls every other number into question.
         # The remaining categories follow in operational urgency.
         return (
             integrity
+            + backup_health
             + low_cash
             + overdue_invoices
             + overdue_scheduled

@@ -200,6 +200,72 @@ def _write_state(backups_dir: Path, state: dict[str, datetime]) -> None:
     tmp.replace(path)
 
 
+# ── Auto-backup attempt status (separate file) ───────────────────────
+#
+# Decoupled from .state.json on purpose: the per-stage timestamp file
+# advances only on successful backup, so it can't tell us "we tried
+# 6 hours ago and it failed." A separate ``.last_attempt.json``
+# captures every attempt — success or failure — so get_book_summary
+# can surface backup-chain breaks the bookkeeper would otherwise
+# discover only by reading debug logs.
+
+
+def _attempt_path(backups_dir: Path) -> Path:
+    return backups_dir / ".last_attempt.json"
+
+
+def _read_attempt_status(backups_dir: Path) -> dict | None:
+    """Return ``{status, reason, at}`` for the most recent auto-backup
+    attempt, or None if no attempt has ever been recorded.
+
+    ``status`` is ``"ok"`` or ``"failed"``. ``reason`` is the
+    exception string for failures (None on success). ``at`` is a
+    tz-aware UTC datetime.
+    """
+    path = _attempt_path(backups_dir)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    try:
+        at = datetime.fromisoformat(data["at"])
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return None
+    status = data.get("status")
+    if status not in ("ok", "failed"):
+        return None
+    return {
+        "status": status,
+        "reason": data.get("reason"),
+        "at": at,
+    }
+
+
+def _write_attempt_status(
+    backups_dir: Path,
+    status: str,
+    reason: str | None,
+    at: datetime,
+) -> None:
+    """Persist the most recent auto-backup attempt result. Atomic
+    temp+rename, same pattern as ``_write_state``.
+    """
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status,
+        "reason": reason,
+        "at": at.astimezone(timezone.utc).isoformat(),
+    }
+    path = _attempt_path(backups_dir)
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
 # ── Filename inspection ──────────────────────────────────────────────
 
 
@@ -523,10 +589,10 @@ class BackupMixin:
             # process.
             self._backup_checked_in_process = True
 
+        backups_dir = self._backups_dir()
+        now = _now_utc()
         try:
-            backups_dir = self._backups_dir()
             state = _read_state(backups_dir)
-            now = _now_utc()
 
             # Identify due stages. Process in priority order (monthly
             # > weekly > session) so the first "due" stage becomes the
@@ -538,6 +604,9 @@ class BackupMixin:
                     due_stages.append(s)
 
             if not due_stages:
+                # Nothing was due, so this isn't an "attempt" we need
+                # to record — skipping is the expected outcome when
+                # the chain is healthy and recent.
                 return
 
             # Take ONE backup tagged with the highest-priority due
@@ -552,8 +621,68 @@ class BackupMixin:
 
             # Prune each auto stage to its keep_last_n.
             self._prune_auto_stages()
+
+            # Record success so get_book_summary can surface a green
+            # "auto-backup ran N minutes ago" signal — and so a later
+            # failure becomes visible against the prior baseline.
+            try:
+                _write_attempt_status(backups_dir, "ok", None, now)
+            except Exception as e:
+                debug_logger.warning(
+                    f"Could not record auto-backup success status: {e}"
+                )
         except Exception as e:
+            # Failure path: the user's write is still allowed to
+            # proceed, but the bookkeeper needs to find out — pre-fix,
+            # OSError-on-disk-full was silently swallowed for weeks.
+            # We persist the failure so get_book_summary's Warnings
+            # section can surface it on the next read.
             debug_logger.warning(f"Auto-backup skipped: {e}")
+            try:
+                _write_attempt_status(
+                    backups_dir, "failed", str(e), now,
+                )
+            except Exception as write_err:
+                debug_logger.warning(
+                    f"Could not record auto-backup failure status: "
+                    f"{write_err}"
+                )
+
+    def get_backup_health(self) -> dict:
+        """Return a small dict describing the auto-backup chain's
+        recent state. Read from disk on demand — does not require an
+        open book session.
+
+        Returns:
+            ``{
+                "last_attempt": {"status", "reason", "at"} | None,
+                "newest_backup_at": datetime | None,
+                "newest_backup_age_days": int | None,
+            }``
+        """
+        backups_dir = self._backups_dir()
+        attempt = _read_attempt_status(backups_dir)
+        try:
+            entries = self.list_backups()
+        except Exception:
+            entries = []
+        newest_at: datetime | None = None
+        newest_age_days: int | None = None
+        if entries:
+            # ``list_backups`` returns newest-first.
+            try:
+                ts_iso = entries[0]["timestamp"]
+                newest_at = datetime.fromisoformat(ts_iso)
+                if newest_at.tzinfo is None:
+                    newest_at = newest_at.replace(tzinfo=timezone.utc)
+                newest_age_days = (_now_utc() - newest_at).days
+            except (KeyError, TypeError, ValueError):
+                pass
+        return {
+            "last_attempt": attempt,
+            "newest_backup_at": newest_at,
+            "newest_backup_age_days": newest_age_days,
+        }
 
     def _prune_auto_stages(self) -> None:
         """Internal: prune every auto stage to its configured
