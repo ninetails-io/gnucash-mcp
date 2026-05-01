@@ -5955,6 +5955,45 @@ class TestDeleteTransaction:
 class TestUpdateTransaction:
     """Tests for update_transaction method."""
 
+    def test_verify_transaction_state_catches_description_mismatch(
+        self, test_book: Path,
+    ):
+        """``_verify_transaction_state`` raises when on-disk state
+        diverges from expected. Pre-fix, ``update_transaction`` and
+        ``replace_splits`` skipped this round-trip — a piecash
+        silent setattr no-op (it has done so historically for
+        slot-backed fields) would have shipped a thin response that
+        lied about what landed.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=False) as book:
+            txn = list(book.transactions)[0]
+            # Verifier raises when expected != on-disk state.
+            with pytest.raises(RuntimeError, match="description on disk"):
+                gc_book._verify_transaction_state(
+                    book, txn,
+                    expected_description="this is not the actual description",
+                )
+
+    def test_verify_transaction_state_catches_split_count_mismatch(
+        self, test_book: Path,
+    ):
+        """Verification catches the case where the on-disk split
+        count differs from what was supposed to land."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=False) as book:
+            txn = list(book.transactions)[0]
+            # Real txn has 2 splits; pass an "expected" with 3.
+            with pytest.raises(RuntimeError, match="splits on disk"):
+                gc_book._verify_transaction_state(
+                    book, txn,
+                    expected_splits=[
+                        {"account": "Assets:Checking", "amount": "0"},
+                        {"account": "Expenses:Groceries", "amount": "0"},
+                        {"account": "Expenses:Dining", "amount": "0"},
+                    ],
+                )
+
     def test_update_description_only(self, test_book: Path):
         """Should update only the description."""
         gc_book = GnuCashBook(str(test_book))

@@ -3430,6 +3430,101 @@ class CoreMixin:
 
             return result
 
+    def _verify_transaction_state(
+        self,
+        book,
+        transaction,
+        *,
+        expected_description: str | None = None,
+        expected_date: date | None = None,
+        expected_notes: str | None = None,
+        expected_splits: list[dict] | None = None,
+    ) -> None:
+        """Re-load the transaction from disk and verify expected
+        fields landed. Closes the gap CLAUDE.md's "Every write is
+        verified" invariant calls out for ``update_transaction`` and
+        ``replace_splits``.
+
+        Pre-fix, both methods called ``book.save()`` and trusted the
+        result. piecash has historically silently no-op'd setattrs
+        on some slot-backed fields; without this round-trip the
+        thin response could lie about what's stored. Bypasses the
+        ORM identity map via ``session.expire`` so we read what's
+        actually on disk, not what we just put in the cache.
+
+        Raises RuntimeError on any mismatch.
+        """
+        book.session.expire(transaction)
+
+        if expected_description is not None:
+            actual_desc = transaction.description
+            if actual_desc != expected_description:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"description on disk is {actual_desc!r}, "
+                    f"expected {expected_description!r}"
+                )
+
+        if expected_date is not None:
+            actual_date = transaction.post_date
+            if hasattr(actual_date, "date") and callable(actual_date.date):
+                actual_date = actual_date.date()
+            if actual_date != expected_date:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"post_date on disk is {actual_date}, "
+                    f"expected {expected_date}"
+                )
+
+        if expected_notes is not None:
+            actual_notes = transaction.notes or ""
+            wanted = expected_notes if expected_notes else ""
+            if actual_notes != wanted:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"notes on disk is {actual_notes!r}, "
+                    f"expected {wanted!r}"
+                )
+
+        if expected_splits is not None:
+            actual_splits = list(transaction.splits)
+            actual_by_acct = {}
+            for s in actual_splits:
+                actual_by_acct[s.account.fullname] = (
+                    Decimal(str(s.value)),
+                    Decimal(str(s.quantity)),
+                    s.memo or "",
+                )
+            if len(actual_splits) != len(expected_splits):
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"{len(actual_splits)} splits on disk, "
+                    f"expected {len(expected_splits)}"
+                )
+            for expected in expected_splits:
+                acct = expected["account"]
+                if acct not in actual_by_acct:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split for {acct!r} not found post-save"
+                    )
+                actual_value, actual_qty, actual_memo = actual_by_acct[acct]
+                ev = _to_decimal(expected["amount"])
+                if actual_value != ev:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split {acct!r} value on disk is "
+                        f"{actual_value}, expected {ev}"
+                    )
+                if "quantity" in expected:
+                    eq = _to_decimal(expected["quantity"])
+                    if actual_qty != eq:
+                        raise RuntimeError(
+                            f"Transaction write verification failed: "
+                            f"split {acct!r} quantity on disk is "
+                            f"{actual_qty}, expected {eq}"
+                        )
+
     def update_transaction(
         self,
         guid: str,
@@ -3553,6 +3648,20 @@ class CoreMixin:
                     raise ValueError(f"Account not found in transaction: {missing}")
 
             book.save()
+
+            # Verify the write landed — re-read the transaction from
+            # disk and compare each field we tried to set. Honors the
+            # ``Every write is verified`` invariant CLAUDE.md spells
+            # out; pre-fix, ``update_transaction`` skipped this and a
+            # piecash silent setattr no-op would have shipped a thin
+            # response that lied about what was stored.
+            self._verify_transaction_state(
+                book, transaction,
+                expected_description=description,
+                expected_date=trans_date,
+                expected_notes=notes,
+                expected_splits=splits,
+            )
 
             # Thin response — the LLM submitted the changes, so the only
             # fields worth echoing are enough for a quick sanity check
@@ -3715,6 +3824,12 @@ class CoreMixin:
 
             # 8. Save
             book.save()
+
+            # 8a. Verify the new splits landed — same invariant as
+            # update_transaction, just with the splits-only path.
+            self._verify_transaction_state(
+                book, transaction, expected_splits=splits,
+            )
 
             # 9. Build thin response.
             # - `splits` echo dropped (LLM just submitted them).
