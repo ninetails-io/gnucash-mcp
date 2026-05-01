@@ -506,11 +506,20 @@ class InvestmentsMixin:
             raise
         return book.session.query(Lot).filter_by(guid=full_guid).first()
 
-    def _lot_summary(self, lot) -> dict:
-        """Compute current state of a lot from its splits.
+    def _lot_decimals(self, lot) -> dict:
+        """Raw-Decimal source of truth for a lot's current state.
+
+        Keeps full precision; ``_lot_summary`` formats the egress.
+        Math (cost basis, gain) consumes this directly so we never
+        round-trip a number through a formatted string for further
+        computation. The classic precision-loss path: $100 / 3 shares
+        formatted to 4 decimals as 33.3333, multiplied back by 3
+        shares becomes $99.99 — but the actual cost was $100.
 
         Returns:
-            Dict with quantity, cost_basis, cost_per_share as strings.
+            Dict of Decimals: purchase_quantity, purchase_value,
+            sale_quantity, remaining, cost_per_share,
+            remaining_cost_basis.
         """
         purchase_quantity = Decimal(0)
         purchase_value = Decimal(0)
@@ -527,19 +536,42 @@ class InvestmentsMixin:
 
         if purchase_quantity > 0:
             cost_per_share = purchase_value / purchase_quantity
-            remaining_cost_basis = cost_per_share * remaining
+            # Prorate cost basis on shares remaining, not
+            # ``cost_per_share * remaining`` — for a lot bought at
+            # $100/3 shares, the latter gives $99.999... while the
+            # prorated form gives exactly $100 when ``remaining ==
+            # purchase_quantity``.
+            remaining_cost_basis = (
+                purchase_value * remaining / purchase_quantity
+            )
         else:
             cost_per_share = Decimal(0)
             remaining_cost_basis = Decimal(0)
 
         return {
+            "purchase_quantity": purchase_quantity,
+            "purchase_value": purchase_value,
+            "sale_quantity": sale_quantity,
+            "remaining": remaining,
+            "cost_per_share": cost_per_share,
+            "remaining_cost_basis": remaining_cost_basis,
+        }
+
+    def _lot_summary(self, lot) -> dict:
+        """Compute current state of a lot from its splits.
+
+        Returns:
+            Dict with quantity, cost_basis, cost_per_share as strings.
+        """
+        raw = self._lot_decimals(lot)
+        return {
             # Quantity is shares (or other commodity units): 4 decimals
             # is a good default for funds and stocks. Crypto callers
             # who need finer granularity get the same _format_number
             # logic at decimals=6 in their own paths.
-            "quantity": _format_number(remaining, decimals=4),
-            "cost_basis": _format_number(remaining_cost_basis, decimals=2),
-            "cost_per_share": _format_number(cost_per_share, decimals=4),
+            "quantity": _format_number(raw["remaining"], decimals=4),
+            "cost_basis": _format_number(raw["remaining_cost_basis"], decimals=2),
+            "cost_per_share": _format_number(raw["cost_per_share"], decimals=4),
             "is_closed": bool(lot.is_closed),
         }
 
@@ -812,8 +844,8 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
 
-            summary = self._lot_summary(lot)
-            remaining = Decimal(summary["quantity"])
+            raw = self._lot_decimals(lot)
+            remaining = raw["remaining"]
 
             if remaining <= 0:
                 # Distinguish "lot ran to zero through sales" (normal,
@@ -864,8 +896,15 @@ class InvestmentsMixin:
                     )
                 price = Decimal(str(latest_price.value))
 
-            cost_per_share = Decimal(summary["cost_per_share"])
-            cost_basis = cost_per_share * shares_to_sell
+            # Prorate cost basis on shares-to-sell. Avoids the precision
+            # loss of ``cost_per_share * shares`` for non-round
+            # per-share costs (e.g., $100 / 3 shares: prorate gives
+            # exactly $100 for selling all 3, while the divide-then-
+            # multiply path gives $99.99...). Tax-relevant.
+            cost_basis = (
+                raw["purchase_value"] * shares_to_sell
+                / raw["purchase_quantity"]
+            )
             proceeds = price * shares_to_sell
             gain = proceeds - cost_basis
             gain_pct = (gain / cost_basis * 100) if cost_basis else Decimal(0)
