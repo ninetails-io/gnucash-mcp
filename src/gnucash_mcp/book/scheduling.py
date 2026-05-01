@@ -719,7 +719,16 @@ class SchedulingMixin:
         Args:
             guid: Scheduled transaction GUID.
             enabled: Enable or disable.
-            end_date: Set end date (YYYY-MM-DD), or empty string to clear.
+            end_date: Set end date (YYYY-MM-DD), or empty string
+                (``""``) to clear an existing end date back to None.
+                The empty-string sentinel is unusual — Python's
+                idiomatic ``None`` would mean "no change" here, so
+                we needed a second sentinel for "clear it." MCP
+                tool schemas don't easily express tagged unions or
+                three-state strings, so the empty-string convention
+                is the path of least friction. Pass ``"YYYY-MM-DD"``
+                to set, ``""`` to clear, omit / pass ``None`` to
+                leave unchanged.
 
         Returns:
             Dict with updated scheduled transaction details.

@@ -131,6 +131,13 @@ class ReconciliationMixin:
         so the summary footer still tells you how far behind the
         reconciliation is even when individual lines are clipped.
 
+        **Currency unit:** ``cleared_total`` and ``uncleared_total``
+        are in the **account's commodity** (sum of ``split.quantity``,
+        not ``split.value``). For a USD account on a USD-default
+        book they're indistinguishable; for a EUR-denominated A/R
+        account on a USD book the totals are in EUR. Compare to
+        the bank statement in the same currency the account holds.
+
         Args:
             account_name: Full account path.
             as_of_date: Only include splits on or before this date.
