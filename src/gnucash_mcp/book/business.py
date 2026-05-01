@@ -29,6 +29,29 @@ from gnucash_mcp.book._base import (
 from gnucash_mcp._format import _apply_limit
 
 
+def _commodity_quantum(commodity) -> Decimal:
+    """Smallest representable unit of a commodity, as a Decimal quantum.
+
+    Pre-fix, every cross-currency conversion in this module hardcoded
+    ``Decimal("0.01")`` — implicitly assuming 2-decimal currencies
+    (USD, EUR, GBP, CNY). The hardcode silently corrupts:
+
+    - **JPY** (``fraction=1``): a ¥1,234.50 conversion would round to
+      ¥1,234.50 stored, but JPY can't represent half-yen — every
+      cross-currency JPY transaction loses the rounding direction.
+    - **BHD / KWD** (``fraction=1000``, 3 decimals): a 100.123 BHD
+      input is silently rounded to 100.12, losing 3 mils per
+      conversion.
+
+    Now derives the quantum from ``commodity.fraction`` (piecash
+    stores 100 for USD, 1 for JPY, 1000 for BHD, 10000 for shares).
+    """
+    fraction = getattr(commodity, "fraction", 100)
+    if fraction <= 1:
+        return Decimal(1)
+    return Decimal(1) / Decimal(fraction)
+
+
 def _safe_date_posted(inv):
     """Read ``inv.date_posted`` defensively.
 
@@ -2562,7 +2585,7 @@ class BusinessMixin:
                         f"create_price, then retry."
                     )
                 return (value_in_invoice_ccy * rate).quantize(
-                    Decimal("0.01")
+                    _commodity_quantum(acct.commodity)
                 )
 
             # Build transaction splits
@@ -2929,7 +2952,9 @@ class BusinessMixin:
             # path didn't, so a USD A/R holding a EUR invoice was
             # liquidated in EUR-as-USD on payment.
             def _convert(amount, target_commodity):
-                """Convert invoice-currency amount to target commodity."""
+                """Convert invoice-currency amount to target commodity,
+                quantized to the target's smallest fraction (so JPY
+                stores whole yen, BHD stores 3 decimals, etc.)."""
                 if target_commodity == inv.currency:
                     return amount, None
                 rate = self._find_exchange_rate(
@@ -2951,7 +2976,9 @@ class BusinessMixin:
                         f"create_price, then retry."
                     )
                 return (
-                    (amount * rate).quantize(Decimal("0.01")),
+                    (amount * rate).quantize(
+                        _commodity_quantum(target_commodity)
+                    ),
                     rate,
                 )
 
@@ -3036,9 +3063,12 @@ class BusinessMixin:
                         as_of=post_date_obj,
                     )
                 if rate_at_post is not None:
+                    # ``expected_at_post`` is in pay-account commodity
+                    # (we'll subtract pay_quantity from it). Quantize
+                    # to that commodity's smallest fraction.
                     expected_at_post = (
                         payment_amount * rate_at_post
-                    ).quantize(Decimal("0.01"))
+                    ).quantize(_commodity_quantum(pay_acct.commodity))
                     # ``fx_diff`` is the realized delta in the
                     # PAYMENT-ACCOUNT commodity (pay_quantity is in
                     # that commodity). Convert to the book default
@@ -3072,10 +3102,16 @@ class BusinessMixin:
                             )
                         fx_diff_default = (
                             fx_diff_pay * pay_to_default_rate
-                        ).quantize(Decimal("0.01"))
+                        ).quantize(_commodity_quantum(default_currency))
                     else:
                         fx_diff_default = fx_diff_pay
-                    if abs(fx_diff_default) >= Decimal("0.01"):
+                    # Skip booking the FX split when the realized
+                    # delta is below the smallest representable unit
+                    # in the FX account's commodity (e.g., ¥0 for
+                    # JPY, $0.01 for USD).
+                    if abs(fx_diff_default) >= _commodity_quantum(
+                        default_currency
+                    ):
                         fx_acct, fx_notice = self._get_or_create_fx_account(
                             book, fx_account=fx_account,
                         )
@@ -3149,7 +3185,9 @@ class BusinessMixin:
                         # default currency — that's the account's
                         # commodity and the unit every report uses.
                         "amount": str(
-                            abs(fx_diff_default).quantize(Decimal("0.01"))
+                            abs(fx_diff_default).quantize(
+                                _commodity_quantum(default_currency)
+                            )
                         ),
                         "currency": default_currency.mnemonic,
                         "direction": direction,

@@ -3136,6 +3136,119 @@ class TestPayInvoice:
         )
         assert fx_balance == Decimal("90")
 
+    def test_commodity_quantum_helper(self):
+        """``_commodity_quantum`` returns the right Decimal quantum
+        for each commodity fraction. Pre-fix every cross-currency
+        conversion in business.py hardcoded ``Decimal("0.01")``,
+        which silently corrupts JPY (whole-yen) and BHD/KWD
+        (3-decimal) currencies.
+        """
+        from gnucash_mcp.book.business import _commodity_quantum
+        from decimal import Decimal as D
+
+        class _Commodity:
+            def __init__(self, fraction):
+                self.fraction = fraction
+
+        # USD-class (2 decimals)
+        assert _commodity_quantum(_Commodity(100)) == D("0.01")
+        # JPY (0 decimals — whole yen)
+        assert _commodity_quantum(_Commodity(1)) == D(1)
+        # BHD/KWD (3 decimals)
+        assert _commodity_quantum(_Commodity(1000)) == D("0.001")
+        # Stocks/crypto (4 decimals)
+        assert _commodity_quantum(_Commodity(10000)) == D("0.0001")
+        # Defensive: no fraction attr → assume 2 decimals
+        class _NoFraction:
+            pass
+        assert _commodity_quantum(_NoFraction()) == D("0.01")
+
+    def test_jpy_payment_quantizes_to_whole_yen(
+        self, business_book,
+    ):
+        """A USD invoice paid from a JPY-denominated bank account
+        must quantize the JPY-side quantity to whole yen — JPY's
+        ``commodity.fraction`` is 1, no sub-yen units exist.
+
+        Pre-fix the hardcoded ``Decimal("0.01")`` quantize stored
+        ``¥1234.56``-shaped non-integer quantities on JPY accounts,
+        which is meaningless (and invalid GnuCash data — fraction=1
+        should reject sub-unit values).
+
+        Setup: USD-default book, $100 USD invoice paid from JPY
+        checking at rate 150.5 JPY/USD → expected ¥15,050 received
+        (quantized to 0 decimals).
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                jpy = piecash.factories.create_currency_from_ISO("JPY")
+                book.session.add(jpy)
+                book.flush()
+            except Exception:
+                jpy = next(
+                    c for c in book.commodities if c.mnemonic == "JPY"
+                )
+
+            # Verify our assumption about JPY's fraction.
+            assert jpy.fraction == 1, (
+                f"JPY should have fraction=1 (no sub-yen units); "
+                f"got {jpy.fraction}"
+            )
+
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="JPY Checking", type="BANK",
+                parent=assets, commodity=jpy,
+            ))
+            book.session.add(piecash.Price(
+                commodity=usd, currency=jpy,
+                date=_date(2026, 3, 10),
+                value="150.5", source="user:price", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="Tokyo Co", currency="USD")
+        gb.create_invoice(
+            customer_id="000001", currency="USD",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="USD services",
+            quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:JPY Checking",
+            amount="100.00",
+            payment_date="2026-03-10",
+        )
+
+        # JPY checking received $100 × 150.5 = ¥15,050 — but more
+        # importantly, the stored quantity must be whole-yen
+        # (no sub-unit fractional part). Pre-fix the hardcoded
+        # 0.01 quantize would have left a 0-decimal-padded
+        # ``¥15050.00``-shaped value on a fraction=1 commodity.
+        pay_qty = Decimal(result["payment_account_amount"])
+        assert pay_qty == Decimal("15050"), (
+            f"Expected ¥15050, got {pay_qty}"
+        )
+        # And the quantum exponent must be ≥ 0 (no fractional part).
+        assert pay_qty.as_tuple().exponent >= 0
+
     def test_rate_from_post_transaction_picks_target_commodity(self):
         """``_rate_from_post_transaction`` must inspect splits for one
         whose account commodity matches the target — not the first
