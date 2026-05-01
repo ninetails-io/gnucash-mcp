@@ -366,9 +366,18 @@ class ReconciliationMixin:
             # description (date)" plus the original splits from it.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # GnuCash slot keys for void info
+            # GnuCash slot keys for void info. Use a tz-aware
+            # local time (mirroring the audit-log convention) so a
+            # later reader can reconstruct "when was this voided"
+            # unambiguously across DST transitions and timezone
+            # changes. Pre-fix this stored a naive ``datetime.now()``
+            # whose interpretation depended on the host's current
+            # zone — same string would mean different absolute times
+            # before/after a DST shift.
             transaction["void-reason"] = reason
-            transaction["void-time"] = datetime.now().isoformat()
+            transaction["void-time"] = (
+                datetime.now().astimezone().isoformat()
+            )
 
             for split in transaction.splits:
                 split["void-former-value"] = str(split.value)

@@ -399,7 +399,26 @@ class BackupMixin:
             dest_conn = sqlite3.connect(str(backup_path))
             try:
                 source_conn.backup(dest_conn)
+            except Exception:
+                # Disk-full (or any other) failure mid-copy leaves
+                # a partial/empty file at backup_path. Pre-fix the
+                # try/finally only closed the connection — the
+                # truncated file stayed on disk and would surface
+                # in ``list_backups`` as a "valid backup" until the
+                # next ``PRAGMA integrity_check`` (which only runs
+                # in the success path). Best to fail loud: close
+                # the connection, unlink the partial file, and
+                # propagate the original exception.
+                dest_conn.close()
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+                raise
             finally:
+                # Idempotent: safe to call after the explicit close
+                # in the except branch — sqlite3.connection.close()
+                # is no-op on a closed connection.
                 dest_conn.close()
 
         # Verify the backup with PRAGMA integrity_check before

@@ -74,6 +74,26 @@ def _safe_date_posted(inv):
         return None
 
 
+def _safe_date_opened(inv):
+    """Read ``inv.date_opened`` defensively.
+
+    Same shape as ``_safe_date_posted`` but for the ``date_opened``
+    column. piecash's ``_DateTime`` TypeDecorator has the same
+    regex-parser failure mode on empty-string column values; the
+    bookkeeper's reproduction with ``date_posted`` is exactly
+    replicable on ``date_opened``. ``_invoice_to_dict``,
+    ``_invoice_to_compact_line``, and ``list_invoices`` all access
+    ``inv.date_opened.date()`` and would crash on a malformed row.
+    Wrapping the access lets every caller treat that field as
+    "unknown" gracefully.
+    """
+    try:
+        do = inv.date_opened
+        return do if do else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _is_invoice_posted(inv) -> bool:
     """True iff ``inv`` has a real datetime in ``date_posted``.
 
@@ -448,6 +468,15 @@ class BusinessMixin:
             if p.commodity == from_commodity and p.currency == to_commodity:
                 days = (as_of - p_date).days
                 rate = Decimal(str(p.value))
+                # Skip zero-or-negative direct rates. The inverse
+                # branch already skips zero (would div-by-zero); the
+                # direct branch was missing the same guard, so a
+                # corrupt 0-or-negative price could propagate as the
+                # winning rate. Downstream pay_quantize-to-zero
+                # would then fire the new guard, but flagging at
+                # rate-lookup time gives a clearer signal.
+                if rate <= 0:
+                    continue
                 if days >= 0:
                     if best_before_direct is None or days < best_before_direct[0]:
                         best_before_direct = (days, rate)
@@ -457,7 +486,7 @@ class BusinessMixin:
             # Inverse: p.commodity == to, p.currency == from → rate = 1/p.value
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
-                if Decimal(str(p.value)) == 0:
+                if Decimal(str(p.value)) <= 0:
                     continue
                 rate = Decimal("1") / Decimal(str(p.value))
                 if days >= 0:
@@ -750,7 +779,10 @@ class BusinessMixin:
             "id": invoice.id,
             "type": "bill" if invoice.owner_type == 4 else "invoice",
             "owner_name": owner_name,
-            "date_opened": str(invoice.date_opened.date()) if invoice.date_opened else None,
+            "date_opened": (
+                str(_safe_date_opened(invoice).date())
+                if _safe_date_opened(invoice) else None
+            ),
             "date_posted": (
                 str(_safe_date_posted(invoice).date())
                 if _safe_date_posted(invoice) else None
@@ -777,10 +809,9 @@ class BusinessMixin:
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
         inv_type = "BILL" if invoice.owner_type == 4 else "INV"
+        opened = _safe_date_opened(invoice)
         date_str = (
-            str(invoice.date_opened.date())
-            if invoice.date_opened
-            else "n/a"
+            str(opened.date()) if opened else "n/a"
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
@@ -947,13 +978,27 @@ class BusinessMixin:
 
     @staticmethod
     def _calculate_lot_balance(lot) -> Decimal:
-        """Sum of split values in a lot.
+        """Sum of split values in a lot, skipping voided splits.
 
         For A/R lots: positive = outstanding receivable.
         For A/P lots: negative = outstanding payable.
+
+        Voided splits (``reconcile_state == 'v'``) are GnuCash's
+        zombie audit-trail records — value/quantity zeroed but the
+        row preserved. Filtering them here matches the void-aware
+        treatment ``unpost_invoice`` uses for "are there real
+        payments on this lot?" and the lot-listing helpers use for
+        active-position math. Pre-fix this method summed every
+        split (voided ones contribute zero so the SUM was right by
+        accident), which left the helper out of step with the rest
+        of the codebase's void semantics — a future caller might
+        reasonably check ``len(lot.splits)`` against this balance
+        and get inconsistent answers.
         """
         total = Decimal(0)
         for split in lot.splits:
+            if split.reconcile_state == "v":
+                continue
             total += Decimal(str(split.value))
         return total
 
@@ -2110,6 +2155,24 @@ class BusinessMixin:
             acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
+            # Reject account types that break the posting math
+            # silently. Customer invoices recognize revenue → entry
+            # account must be INCOME (or a related credit-natural
+            # type). Pre-fix any account was accepted: an ASSET on
+            # an invoice entry would post as ``debit asset`` against
+            # ``debit A/R`` — both debits, balance violated, but
+            # piecash builds the transaction anyway because the
+            # split values still sum to zero in the value column.
+            # Reports then show no income but a phantom asset
+            # increase.
+            if acct.type != "INCOME":
+                raise ValueError(
+                    f"Invoice entry account must be INCOME (got "
+                    f"{acct.type} on '{account}'). Customer invoices "
+                    f"recognize revenue; non-INCOME accounts produce "
+                    f"valid-looking transactions with broken "
+                    f"posting math."
+                )
 
             q_num, q_denom = self._decimal_to_num_denom(qty)
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
@@ -2212,6 +2275,19 @@ class BusinessMixin:
             acct = self._resolve_account(book, account)
             if not acct:
                 raise ValueError(f"Account not found: {account}")
+            # Bill entry accounts must be EXPENSE (typical line
+            # items) or ASSET (inventory purchases that capitalize
+            # rather than expense). LIABILITY/EQUITY/INCOME on a
+            # bill entry produces valid-looking transactions with
+            # broken posting math, same shape as the invoice-entry
+            # validation above.
+            if acct.type not in ("EXPENSE", "ASSET"):
+                raise ValueError(
+                    f"Bill entry account must be EXPENSE or ASSET "
+                    f"(got {acct.type} on '{account}'). EXPENSE for "
+                    f"normal line items, ASSET for inventory "
+                    f"purchases that capitalize."
+                )
 
             q_num, q_denom = self._decimal_to_num_denom(qty)
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
@@ -2925,6 +3001,29 @@ class BusinessMixin:
                     f"Lot not found for invoice {invoice_id}"
                 )
 
+            # Refuse to pay against a voided posting transaction.
+            # GnuCash's void zeroes split values but preserves rows
+            # with ``reconcile_state='v'``. ``_calculate_lot_balance``
+            # would compute remaining=0 (post-fix it skips voided
+            # splits explicitly), and the lot would auto-close on
+            # save — leaving the new payment split assigned to a
+            # closed lot. Block the operation up front so the user
+            # has to ``unvoid_transaction`` (or unpost + re-post)
+            # first.
+            if inv.post_txn is not None:
+                voided_post = all(
+                    s.reconcile_state == "v"
+                    for s in inv.post_txn.splits
+                )
+                if voided_post:
+                    raise ValueError(
+                        f"Cannot pay invoice {invoice_id}: its "
+                        f"posting transaction has been voided. "
+                        f"Unvoid the posting transaction first "
+                        f"(or unpost the invoice and re-post), "
+                        f"then retry payment."
+                    )
+
             if is_bill:
                 owner = self._find_vendor_by_guid(
                     book, inv.owner_guid
@@ -2988,6 +3087,25 @@ class BusinessMixin:
             post_quantity, _post_rate = _convert(
                 payment_amount, post_acct.commodity,
             )
+
+            # Guard against extreme-rate-quantize-to-zero. With a
+            # tiny exchange rate (< quantum / payment_amount) the
+            # converted quantity rounds to zero — a "successful"
+            # payment that records nothing on the bank side and
+            # silently fails to clear the lot. Refuse to build a
+            # zero-quantity payment split.
+            if pay_quantity == 0 or post_quantity == 0:
+                raise ValueError(
+                    f"Cross-currency payment quantizes to zero in "
+                    f"the target commodity (payment_amount="
+                    f"{payment_amount} {inv.currency.mnemonic}, "
+                    f"pay_quantity={pay_quantity} "
+                    f"{pay_acct.commodity.mnemonic}, post_quantity="
+                    f"{post_quantity} {post_acct.commodity.mnemonic}). "
+                    f"Likely an extreme exchange rate; check the "
+                    f"price table for {inv.currency.mnemonic}/"
+                    f"{pay_acct.commodity.mnemonic}."
+                )
 
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
@@ -3742,15 +3860,6 @@ class BusinessMixin:
                         "bill_count": 0,
                     }
 
-                try:
-                    _, _, total = (
-                        self._get_invoice_entries_and_total(
-                            book, bill
-                        )
-                    )
-                except ValueError:
-                    total = Decimal(0)
-
                 balance = Decimal(0)
                 post_acct = book.session.query(
                     piecash.Account
@@ -3762,6 +3871,22 @@ class BusinessMixin:
                                 lot
                             )
                             break
+
+                try:
+                    _, _, total = (
+                        self._get_invoice_entries_and_total(
+                            book, bill
+                        )
+                    )
+                except ValueError:
+                    # Empty/corrupted entries — fall back to the
+                    # lot balance (computed above). Pre-fix this
+                    # silently substituted Decimal(0), which made
+                    # ``total_billed`` understate by the bill's
+                    # full amount on any data-corruption case. The
+                    # lot balance reflects the actual outstanding
+                    # liability so the vendor's row stays sane.
+                    total = abs(balance)
 
                 outstanding = abs(balance)
                 paid = total - outstanding

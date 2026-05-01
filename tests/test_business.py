@@ -1298,6 +1298,22 @@ class TestDeleteBill:
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
+    def test_rejects_non_income_account(self, business_book):
+        """Invoice entries must post to INCOME accounts. Pre-fix any
+        account type was accepted, producing transactions with
+        broken posting math (e.g., debit-asset against debit-A/R)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="must be INCOME"):
+            gb.add_invoice_entry(
+                invoice_id="000001",
+                account="Assets:Checking",  # ASSET — silently accepted pre-fix
+                description="Bad entry",
+                quantity="1",
+                price="500.00",
+            )
+
     def test_basic_entry(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
@@ -1373,6 +1389,23 @@ class TestAddInvoiceEntry:
 
 class TestAddBillEntry:
     """Tests for add_bill_entry."""
+
+    def test_rejects_non_expense_or_asset_account(self, business_book):
+        """Bill entries must post to EXPENSE (line items) or ASSET
+        (inventory). LIABILITY/EQUITY/INCOME silently broke posting
+        math pre-fix."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        with pytest.raises(ValueError, match="must be EXPENSE or ASSET"):
+            gb.add_bill_entry(
+                bill_id="000001",
+                # PAYABLE — non-EXPENSE, non-ASSET, exists in fixture
+                account="Liabilities:Accounts Payable",
+                description="Bad entry",
+                quantity="1",
+                price="50.00",
+            )
 
     def test_basic_entry(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -3426,6 +3459,124 @@ class TestPayInvoice:
             account_name="Income:Foreign Exchange Gain/Loss"
         )
         assert fx_balance == Decimal("-6.50")
+
+    def test_pay_invoice_refuses_voided_posting_transaction(self, business_book):
+        """If the posting transaction was voided in GnuCash, paying
+        the invoice would compute remaining=0 against a zero'd lot,
+        auto-close the lot, and assign the new payment to a closed
+        lot. Now refused up front with a clear error pointing at
+        unvoid_transaction."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Services",
+            quantity="1", price="500.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        # Void the posting transaction.
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            post_txn_guid = inv.post_txn.guid
+        gb.void_transaction(guid=post_txn_guid, reason="test")
+
+        with pytest.raises(ValueError, match="posting transaction has been voided"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="500.00",
+                payment_date="2026-03-15",
+            )
+
+    def test_calculate_lot_balance_skips_voided_splits(self, business_book):
+        """``_calculate_lot_balance`` filters voided splits so the
+        helper agrees with the rest of the void-aware codebase."""
+        from gnucash_mcp.book.business import BusinessMixin
+        from decimal import Decimal as D
+
+        class _Split:
+            def __init__(self, value, reconcile_state):
+                self.value = value
+                self.reconcile_state = reconcile_state
+
+        class _Lot:
+            def __init__(self, splits):
+                self.splits = splits
+
+        # Mix of live and voided splits.
+        lot = _Lot([
+            _Split(D("100"), "n"),
+            _Split(D("0"), "v"),  # voided — must be skipped
+            _Split(D("-30"), "n"),
+        ])
+        assert BusinessMixin._calculate_lot_balance(lot) == D("70")
+
+    def test_safe_date_opened_handles_empty_string(self):
+        """``_safe_date_opened`` matches ``_safe_date_posted``'s
+        defensive contract — empty/malformed values surface as
+        None rather than crashing the regex parser."""
+        from gnucash_mcp.book.business import _safe_date_opened
+
+        class _EmptyInv:
+            @property
+            def date_opened(self):
+                # Mimic piecash's _DateTime regex parser raising
+                # on a malformed empty string.
+                raise ValueError("Couldn't parse datetime string")
+
+        class _NoneInv:
+            date_opened = None
+
+        class _ValidInv:
+            from datetime import datetime as _dt
+            date_opened = _dt(2026, 3, 10, 12, 0)
+
+        assert _safe_date_opened(_EmptyInv()) is None
+        assert _safe_date_opened(_NoneInv()) is None
+        # Valid datetime passes through unchanged
+        result = _safe_date_opened(_ValidInv())
+        assert result is not None
+        assert result.year == 2026
+
+    def test_find_exchange_rate_skips_zero_direct_price(self, business_book):
+        """Direct branch must skip rate=0 (and negative) prices —
+        previously only the inverse branch had this guard, leaving
+        a corrupt zero-direct price as a propagatable rate."""
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # Insert a corrupt zero-rate direct price.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=_date(2026, 3, 10),
+                value="0", source="user:price", type="nav",
+            ))
+            book.save()
+
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # No usable price → returns None (zero-rate skipped, no fallback).
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 3, 10),
+            )
+            assert rate is None
 
     def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
         self, business_book,

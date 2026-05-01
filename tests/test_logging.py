@@ -750,6 +750,55 @@ class TestDispatchTableDegradation:
         assert _format_audit_entry_text(entry) == ""
 
 
+class TestAuditEntityTypeBillSwap:
+    """``post_invoice`` / ``unpost_invoice`` / ``pay_invoice`` carry
+    ``entity_type="invoice"`` on the decorator but accept either
+    invoices or vendor bills. The audit log must render BILL when
+    the call operated on a bill — pre-fix every bill operation
+    showed up as "POST INVOICE" / "PAY INVOICE" in the log,
+    mis-categorizing the entry.
+    """
+
+    def test_bill_post_renders_as_post_bill(self):
+        """The dispatcher swaps entity_type to ``bill`` based on
+        the response's ``type`` field; the bill handler then
+        renders ``POST BILL`` instead of ``POST INVOICE``."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",  # post-swap
+            "operation": "post",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "post_account": "Liabilities:A/P"},
+            "after_state": {
+                "type": "bill", "total": "500.00",
+                "post_date": "2026-03-10",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "POST BILL" in rendered
+        assert "POST INVOICE" not in rendered
+
+    def test_bill_pay_renders_as_pay_bill(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",
+            "operation": "pay",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "payment_account": "Assets:Checking"},
+            "after_state": {
+                "type": "bill", "amount_paid": "500.00",
+                "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY BILL" in rendered
+        assert "PAY INVOICE" not in rendered
+
+
 class TestAuditBeforeStateLeak:
     """Defense-in-depth: a previous call's staged before-state must
     never leak into the next call's audit entry, regardless of how

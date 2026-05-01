@@ -6991,6 +6991,43 @@ class TestReconcileAccount:
 class TestVoidTransaction:
     """Tests for void_transaction method."""
 
+    def test_void_time_slot_is_timezone_aware(self, test_book: Path):
+        """The ``void-time`` slot must store a tz-aware ISO string
+        so a later reader can reconstruct the absolute void instant
+        across DST transitions and timezone changes. Pre-fix this
+        was naive ``datetime.now().isoformat()`` whose
+        interpretation depended on the host's current zone."""
+        from datetime import datetime as _dt
+        gc_book = GnuCashBook(str(test_book))
+        transactions = gc_book.list_transactions(compact=False)
+        guid = transactions[0]["guid"]
+
+        gc_book.void_transaction(guid=guid, reason="test")
+
+        # Read the raw value out of the slots table — the
+        # SlotString wrapper's repr contains the value but isn't
+        # itself directly parseable. Going through SQL gives us
+        # the stored ISO string verbatim.
+        from sqlalchemy import text
+        with gc_book.open(readonly=True) as book:
+            txn = next(
+                t for t in book.transactions if t.guid.startswith(guid[:8])
+            )
+            row = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots "
+                    "WHERE obj_guid = :guid AND name = :name"
+                ),
+                {"guid": txn.guid, "name": "void-time"},
+            ).first()
+        void_time_str = row[0]
+        parsed = _dt.fromisoformat(void_time_str)
+        # Pre-fix the slot stored a NAIVE ``datetime.now()`` whose
+        # absolute meaning depended on the host's current zone.
+        assert parsed.tzinfo is not None, (
+            f"void-time must be tz-aware, got naive: {void_time_str!r}"
+        )
+
     def test_void_transaction_success(self, test_book: Path):
         """Should void a transaction."""
         gc_book = GnuCashBook(str(test_book))

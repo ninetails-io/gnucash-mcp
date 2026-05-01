@@ -126,6 +126,64 @@ class TestCreateBackup:
         assert "review" in label
         assert "2026" in label
 
+    def test_backup_partial_file_unlinked_on_copy_failure(
+        self, test_book: Path,
+    ):
+        """If the SQLite ``backup()`` call raises mid-copy, the
+        partial/empty destination file must be unlinked rather
+        than left on disk where ``list_backups`` would surface it
+        as a "valid" backup entry.
+
+        Forces the failure by patching the source connection's
+        ``backup`` method to raise — that's where the fix's new
+        ``except`` branch fires (closing dest_conn and unlinking
+        the partial file).
+        """
+        backups_dir = test_book.parent / f"{test_book.name}.mcp" / "backups"
+        book = GnuCashBook(str(test_book))
+
+        # Wrap piecash's source connection so .backup raises.
+        original_open = book.open
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def patched_open(*args, **kwargs):
+            with original_open(*args, **kwargs) as b:
+                real_connection = b.session.connection
+                real_conn_obj = real_connection().connection
+
+                # Replace source_conn.backup with a raiser via a
+                # proxy object.
+                class _RaisingSource:
+                    def __init__(self, real):
+                        self._real = real
+
+                    def backup(self, *a, **kw):
+                        raise OSError("simulated disk I/O error")
+
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+
+                class _ConnWrapper:
+                    @property
+                    def connection(self):
+                        return _RaisingSource(real_conn_obj)
+
+                b.session.connection = lambda: _ConnWrapper()
+                yield b
+
+        with patch.object(book, "open", side_effect=patched_open):
+            with pytest.raises(OSError, match="simulated disk I/O error"):
+                book.create_backup(stage="manual", label="doomed")
+
+        # No partial file left behind.
+        if backups_dir.exists():
+            assert list(backups_dir.glob("*.gnucash")) == [], (
+                f"Partial backup file persisted: "
+                f"{list(backups_dir.glob('*.gnucash'))}"
+            )
+
     def test_two_backups_in_same_second_do_not_collide(
         self, test_book: Path,
     ):
