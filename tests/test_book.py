@@ -8140,6 +8140,129 @@ class TestPrices:
         assert result["value"] == "128.75"
         assert result["date"] == "2026-02-10"
 
+    def test_get_latest_price_defaults_to_book_currency(
+        self, test_book: Path,
+    ):
+        """When ``currency`` isn't passed, ``get_latest_price`` must
+        resolve to the book's default currency. Pre-fix, the default
+        was hardcoded ``"USD"`` — silently returning None for every
+        price on a non-USD-default book (CNY, EUR, etc.).
+
+        Discovered by the bookkeeper on Lin Wei's CNY-default book:
+        ``get_prices`` and ``list_commodities`` returned the prices
+        fine, but ``get_latest_price`` returned null for every
+        commodity because the implicit ``currency="USD"`` filter
+        excluded every CNY-quoted price.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+        # Price stored in book default currency (USD here, but the
+        # principle is the same for CNY-default books with CNY-quoted
+        # prices).
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="128.75", price_date=date(2026, 2, 10),
+        )
+
+        # No currency arg → must find the price (was None pre-fix on
+        # non-USD-default books; works incidentally on USD-default
+        # books because that's also the default).
+        result = gc_book.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert result is not None
+        assert result["value"] == "128.75"
+        assert result["currency"] == "USD"
+
+    def test_get_latest_price_on_non_usd_default_book(
+        self, multi_currency_book: Path,
+    ):
+        """Lin Wei's exact case: non-USD-default book, prices
+        quoted in the book's default currency, ``get_latest_price``
+        with no ``currency`` arg must find them.
+
+        Uses the multi_currency_book fixture (USD-default with EUR
+        also present). Stores a EUR-quoted price for a fake
+        commodity, then asks for the latest in EUR explicitly. Then
+        creates a parallel scenario where the book-default
+        resolution path is the only way to reach the price.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Add a stock commodity priced in EUR.
+        with gc_book.open(readonly=False) as book:
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            stock = piecash.Commodity(
+                namespace="EXCHANGE", mnemonic="ACME",
+                fullname="ACME Corp", fraction=10000, book=book,
+            )
+            book.session.add(piecash.Price(
+                commodity=stock, currency=eur, date=date(2026, 3, 1),
+                value="42.50", source="user:price", type="nav",
+            ))
+            book.save()
+
+        # Explicit currency works (was the only way pre-fix).
+        result = gc_book.get_latest_price(
+            commodity="ACME", namespace="EXCHANGE", currency="EUR",
+        )
+        assert result is not None
+        assert Decimal(result["value"]) == Decimal("42.50")
+        assert result["currency"] == "EUR"
+
+    def test_get_latest_price_skips_transaction_placeholder_prices(
+        self, test_book: Path,
+    ):
+        """``get_latest_price`` must skip piecash's auto-created
+        ``type='transaction'`` placeholder rows so its answer agrees
+        with ``get_book_summary``, ``_find_exchange_rate``, and
+        every other valuation path.
+
+        On the bookkeeper's CNY book this surfaced as Moutai
+        returning a ``user:split-register`` rate of 33.333333 CNY
+        (the effective rate of a cross-currency transaction)
+        instead of the user's nav quote of 1810 CNY/share.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_commodity(
+            mnemonic="ZZZP", fullname="Test Stock",
+            namespace="EXCHANGE",
+        )
+        # User-quoted nav price (the "real" answer).
+        gc_book.create_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+            value="100.00", price_date=date(2026, 2, 1),
+            price_type="nav",
+        )
+        # Auto-created placeholder rows (newer date — would win on
+        # any "latest by date" sort if not filtered out).
+        with gc_book.open(readonly=False) as book:
+            usd = book.default_currency
+            zzzp = next(
+                c for c in book.commodities if c.mnemonic == "ZZZP"
+            )
+            book.session.add(piecash.Price(
+                commodity=zzzp, currency=usd,
+                date=date(2026, 3, 15),
+                value="33.333333", source="user:split-register",
+                type="transaction",
+            ))
+            book.save()
+
+        result = gc_book.get_latest_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+        )
+        # Must surface the user's nav quote, NOT the newer auto-
+        # created transaction artifact.
+        assert result is not None
+        assert Decimal(result["value"]) == Decimal("100.00")
+        assert result["type"] == "nav"
+
     def test_get_latest_price_no_prices(self, test_book: Path):
         """Should return None when no prices exist."""
         gc_book = GnuCashBook(str(test_book))

@@ -20,6 +20,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
     _guid_prefix_map,
+    _is_market_price,
     _lot_to_compact_line,
     _to_date,
     _to_decimal,
@@ -447,14 +448,22 @@ class InvestmentsMixin:
         self,
         commodity: str,
         namespace: str,
-        currency: str = "USD",
+        currency: str | None = None,
     ) -> dict | None:
         """Get the most recent price for a commodity.
 
         Args:
             commodity: Symbol of the commodity (e.g., "VTSAX").
             namespace: Namespace of the commodity (e.g., "FUND").
-            currency: Currency for the price. Default "USD".
+            currency: Currency for the price. Defaults to the book's
+                default currency. Pre-fix the default was hardcoded
+                ``"USD"``, which silently returned None for every
+                price on a non-USD-default book (CNY, EUR, etc.) —
+                same USD-default-everywhere assumption the v1.2.1
+                multi-currency hardening pass fixed for
+                ``create_price`` but missed here. Pass explicitly
+                to get a non-default-currency price (e.g., the USD
+                price of a stock on a CNY-default book).
 
         Returns:
             Price dict with date, value, type, and source, or None if no price exists.
@@ -469,12 +478,27 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
+            if currency is None:
+                currency = self._require_default_currency(book).mnemonic
+
             latest = None
             latest_date = None
             for p in book.prices:
                 if p.commodity != comm:
                     continue
                 if p.currency.mnemonic != currency:
+                    continue
+                # Skip piecash's auto-created ``type='transaction'``
+                # placeholder rows (effective rate of one cross-
+                # currency transaction, source=``user:split-register``).
+                # Every other valuation path in the codebase
+                # (``get_book_summary``, ``_rates_as_of``,
+                # ``_find_exchange_rate``, ``_latest_market_rates``,
+                # stale-price warnings) excludes them; this single-
+                # answer "what's the latest price" tool was the one
+                # exception, returning a transaction artifact when
+                # the user expected their nav quote.
+                if not _is_market_price(p):
                     continue
                 p_date = _to_date(p.date)
                 if latest_date is None or p_date > latest_date:
