@@ -3136,6 +3136,184 @@ class TestPayInvoice:
         )
         assert fx_balance == Decimal("90")
 
+    def test_rate_from_post_transaction_picks_target_commodity(self):
+        """``_rate_from_post_transaction`` must inspect splits for one
+        whose account commodity matches the target — not the first
+        non-invoice-currency split it sees.
+
+        Pre-fix the helper took ``(post_txn, invoice_currency)`` and
+        returned the rate of the first cross-currency split, so a
+        post with EUR invoice + USD income + GBP A/R would return
+        the USD rate when the pay path needed the GBP rate.
+
+        Builds a fake post-txn with three splits (EUR/USD/GBP) and
+        asserts the helper returns the rate matching whichever target
+        is requested.
+        """
+        from gnucash_mcp.book.business import BusinessMixin
+        from decimal import Decimal as D
+
+        # Stand-in objects with the small surface the helper uses.
+        class _Commodity:
+            def __init__(self, mnemonic):
+                self.mnemonic = mnemonic
+
+        class _Account:
+            def __init__(self, commodity):
+                self.commodity = commodity
+
+        class _Split:
+            def __init__(self, account, value, quantity):
+                self.account = account
+                self.value = value
+                self.quantity = quantity
+
+        class _PostTxn:
+            def __init__(self, splits):
+                self.splits = splits
+
+        eur = _Commodity("EUR")
+        usd = _Commodity("USD")
+        gbp = _Commodity("GBP")
+        post = _PostTxn([
+            _Split(_Account(eur), D("100"), D("100")),    # invoice side, rate 1
+            _Split(_Account(usd), D("-100"), D("-110")),  # USD rate 1.10
+            _Split(_Account(gbp), D("-100"), D("-80")),   # GBP rate 0.80
+        ])
+
+        # Asking for USD must yield 1.10 (not 0.80, not the "first
+        # cross-currency split" semantics).
+        assert BusinessMixin._rate_from_post_transaction(
+            post, usd
+        ) == D("110") / D("100")
+        # Asking for GBP must yield 0.80.
+        assert BusinessMixin._rate_from_post_transaction(
+            post, gbp
+        ) == D("80") / D("100")
+        # Asking for a commodity the post doesn't reference returns
+        # None — caller falls back to the price table.
+        chf = _Commodity("CHF")
+        assert BusinessMixin._rate_from_post_transaction(
+            post, chf
+        ) is None
+
+    def test_fx_split_converts_to_default_when_pay_account_third_currency(
+        self, business_book,
+    ):
+        """When the payment account's commodity is neither the
+        invoice currency nor the book default — the truly tri-
+        currency case — the realized FX delta computed in
+        pay-account commodity must be converted to book default
+        before landing on the FX account.
+
+        Pre-fix, ``fx_diff`` lived in pay-account commodity and was
+        booked as the FX split's quantity, but the FX account's
+        commodity was book default. Reports aggregating the FX
+        account read GBP-as-USD silently.
+
+        Setup: USD-default book, EUR invoice, GBP checking.
+        Post Mar 10 at EUR→GBP=0.80 (€100 → £80 expected).
+        Pay Mar 20 at EUR→GBP=0.85 (£85 actually received) → £5
+        gain in GBP. With GBP→USD = 1.30 at pay-date, that's a
+        $6.50 gain that must land on the USD-commodity FX account.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(
+                    c for c in book.commodities if c.mnemonic == "EUR"
+                )
+            try:
+                gbp = piecash.factories.create_currency_from_ISO("GBP")
+                book.session.add(gbp)
+                book.flush()
+            except Exception:
+                gbp = next(
+                    c for c in book.commodities if c.mnemonic == "GBP"
+                )
+
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="GBP Checking", type="BANK",
+                parent=assets, commodity=gbp,
+            ))
+            book.session.add(piecash.Account(
+                name="A/R EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
+            # Two EUR/GBP rates — post-date and pay-date.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=gbp,
+                date=_date(2026, 3, 10),
+                value="0.80", source="user:price", type="nav",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=gbp,
+                date=_date(2026, 3, 20),
+                value="0.85", source="user:price", type="nav",
+            ))
+            # EUR → USD rate so post_invoice can convert the income
+            # split's quantity to its USD-denominated commodity.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 3, 10),
+                value="1.10", source="user:price", type="nav",
+            ))
+            # GBP → USD rate so the FX delta converts to default.
+            book.session.add(piecash.Price(
+                commodity=gbp, currency=usd,
+                date=_date(2026, 3, 20),
+                value="1.30", source="user:price", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="London Client", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="EUR services",
+            quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:A/R EUR",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:GBP Checking",
+            amount="100.00",
+            payment_date="2026-03-20",
+        )
+
+        # GBP delta: £85 received vs £80 expected = £5 gain in GBP.
+        # Converted at GBP→USD=1.30 → $6.50 gain on the USD-commodity
+        # FX account.
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("6.50")
+        assert result["fx_realized"]["currency"] == "USD"
+
+        # FX account balance: $6.50 credit (negative on credit-natural
+        # income) — measured in book default currency.
+        fx_balance = gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        )
+        assert fx_balance == Decimal("-6.50")
+
     def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
         self, business_book,
     ):

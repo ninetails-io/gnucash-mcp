@@ -359,20 +359,28 @@ class BusinessMixin:
         return fx_acct, notice
 
     @staticmethod
-    def _rate_from_post_transaction(post_txn, invoice_currency):
-        """Derive the exchange rate that was applied at invoice-posting.
+    def _rate_from_post_transaction(post_txn, target_commodity):
+        """Derive the exchange rate from post_txn currency to
+        ``target_commodity`` by inspecting the post transaction's
+        splits for one whose account commodity matches the target.
+        The ratio of |quantity| (account commodity) to |value|
+        (transaction currency) is the rate that was in force at
+        posting.
 
-        Inspects the posting transaction's splits for one whose account
-        commodity differs from the invoice currency (the income, expense,
-        or A/R side that received the rate). The ratio of |quantity|
-        (account commodity) to |value| (transaction currency) is the
-        rate that was in force at posting.
+        Pre-fix this method took just ``(post_txn,
+        invoice_currency)`` and returned the rate of the FIRST
+        non-invoice-currency split — which in a multi-cross-currency
+        post (e.g., EUR invoice with USD income + GBP A/R) would
+        silently pick whichever split happened to come first. Now
+        requires an explicit target so the caller gets the rate they
+        actually want.
 
-        Returns the Decimal rate, or None if no cross-currency split
-        is present (same-currency post, or post predates the rate fix).
+        Returns the Decimal rate, or None if no matching split is
+        present (caller should fall back to the price table at
+        post-date).
         """
         for s in post_txn.splits:
-            if s.account.commodity == invoice_currency:
+            if s.account.commodity != target_commodity:
                 continue
             s_value = abs(Decimal(str(s.value)))
             s_quantity = abs(Decimal(str(s.quantity)))
@@ -2986,49 +2994,106 @@ class BusinessMixin:
                 )
 
             # Realized FX gain/loss: when cross-currency and the rate
-            # moved between post-date and pay-date, the USD actually
+            # moved between post-date and pay-date, the actual amount
             # received/spent differs from what was originally recorded
             # as income/expense. That delta is taxable FX gain (or
             # loss); book it to an auto-created Income:FX Gain/Loss
             # account. The split has value=0 in the transaction
             # currency (so EUR/GBP/etc. balance is preserved) but
-            # non-zero quantity in the book's default currency. Same
-            # account for both directions; sign determines gain vs
-            # loss.
+            # non-zero quantity in the FX account's commodity (book
+            # default). Same account for both directions; sign
+            # determines gain vs loss.
             splits = [ar_ap_split, bank_split]
             fx_gain_loss = None
-            fx_diff = Decimal("0")
+            fx_diff_default = Decimal("0")
             fx_acct = None
             fx_notice = None
+            default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
+                # Find the rate that was applied at posting from
+                # invoice currency → pay_acct.commodity. First try
+                # the post transaction's own splits (most accurate —
+                # if the price table was re-quoted after posting,
+                # the realized gain should use the original posting
+                # rate). When the post txn has no split in
+                # pay_acct.commodity (third-currency pay account
+                # case: the post used a different non-invoice
+                # commodity for A/R or income), fall back to the
+                # price table at post-date.
                 rate_at_post = self._rate_from_post_transaction(
-                    inv.post_txn, inv.currency
+                    inv.post_txn, pay_acct.commodity,
                 )
+                if rate_at_post is None:
+                    post_date_obj = inv.post_txn.post_date
+                    if hasattr(post_date_obj, "date") and callable(
+                        post_date_obj.date
+                    ):
+                        post_date_obj = post_date_obj.date()
+                    rate_at_post = self._find_exchange_rate(
+                        book,
+                        from_commodity=inv.currency,
+                        to_commodity=pay_acct.commodity,
+                        as_of=post_date_obj,
+                    )
                 if rate_at_post is not None:
                     expected_at_post = (
                         payment_amount * rate_at_post
                     ).quantize(Decimal("0.01"))
-                    fx_diff = pay_quantity - expected_at_post
-                    if abs(fx_diff) >= Decimal("0.01"):
+                    # ``fx_diff`` is the realized delta in the
+                    # PAYMENT-ACCOUNT commodity (pay_quantity is in
+                    # that commodity). Convert to the book default
+                    # currency before booking — the FX account has
+                    # commodity=default, and a quantity in any other
+                    # commodity would be silently treated as default
+                    # by every report that reads this account.
+                    # Pre-fix triple-currency case (book=USD,
+                    # invoice=EUR, pay=GBP): a £5 GBP gain landed on
+                    # a USD-commodity FX account as quantity=5,
+                    # rendered as "$5 gain" — silently wrong.
+                    fx_diff_pay = pay_quantity - expected_at_post
+                    if pay_acct.commodity != default_currency:
+                        pay_to_default_rate = self._find_exchange_rate(
+                            book,
+                            from_commodity=pay_acct.commodity,
+                            to_commodity=default_currency,
+                            as_of=parsed_date,
+                        )
+                        if pay_to_default_rate is None:
+                            raise ValueError(
+                                f"Realized FX gain/loss needs an "
+                                f"exchange rate from "
+                                f"{pay_acct.commodity.mnemonic} to "
+                                f"{default_currency.mnemonic} on or "
+                                f"near {parsed_date} to convert the "
+                                f"FX delta to the book's default "
+                                f"currency (the FX account's "
+                                f"commodity). Add a price with "
+                                f"create_price, then retry."
+                            )
+                        fx_diff_default = (
+                            fx_diff_pay * pay_to_default_rate
+                        ).quantize(Decimal("0.01"))
+                    else:
+                        fx_diff_default = fx_diff_pay
+                    if abs(fx_diff_default) >= Decimal("0.01"):
                         fx_acct, fx_notice = self._get_or_create_fx_account(
                             book, fx_account=fx_account,
                         )
-                        # Customer (is_bill=False): we received MORE
-                        # USD than income recorded → gain → credit
-                        # income account (quantity = -fx_diff for a
-                        # gain, +|fx_diff| for a loss).
-                        # Vendor bill (is_bill=True): we spent MORE
-                        # USD than expense recorded → loss → debit
-                        # income account (quantity = +fx_diff for a
-                        # loss, -|fx_diff| for a gain).
+                        # Customer (is_bill=False): received more →
+                        # gain → credit income (quantity = -fx_diff
+                        # for gain, +|fx_diff| for loss).
+                        # Vendor bill (is_bill=True): spent more →
+                        # loss → debit income (quantity = +fx_diff
+                        # for loss, -|fx_diff| for gain).
                         quantity_sign = 1 if is_bill else -1
-                        is_loss = (is_bill and fx_diff > 0) or (
-                            not is_bill and fx_diff < 0
+                        is_loss = (
+                            (is_bill and fx_diff_default > 0)
+                            or (not is_bill and fx_diff_default < 0)
                         )
                         fx_gain_loss = piecash.Split(
                             account=fx_acct,
                             value=Decimal("0"),
-                            quantity=quantity_sign * fx_diff,
+                            quantity=quantity_sign * fx_diff_default,
                             memo=(
                                 f"FX {'loss' if is_loss else 'gain'} "
                                 f"on invoice {inv.id}: post-rate "
@@ -3075,12 +3140,18 @@ class BusinessMixin:
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
                 if fx_gain_loss is not None:
                     direction = (
-                        "loss" if (is_bill and fx_diff > 0)
-                        or (not is_bill and fx_diff < 0)
+                        "loss" if (is_bill and fx_diff_default > 0)
+                        or (not is_bill and fx_diff_default < 0)
                         else "gain"
                     )
                     result["fx_realized"] = {
-                        "amount": str(abs(fx_diff).quantize(Decimal("0.01"))),
+                        # Amount on the FX account is in the book's
+                        # default currency — that's the account's
+                        # commodity and the unit every report uses.
+                        "amount": str(
+                            abs(fx_diff_default).quantize(Decimal("0.01"))
+                        ),
+                        "currency": default_currency.mnemonic,
                         "direction": direction,
                         "account": fx_acct.fullname,
                     }
