@@ -626,6 +626,115 @@ class TestGetBudgetReport:
         assert Decimal(by_acct["Expenses:Utilities"]["actual"]) == Decimal("65")
         assert Decimal(by_acct["Expenses:Utilities:Electric"]["actual"]) == Decimal("95")
 
+    def test_parent_rollup_converts_foreign_currency_children(
+        self, budget_book: Path,
+    ):
+        """When a budgeted parent has foreign-currency descendants,
+        the rollup must convert their actuals to the book default
+        currency via the latest market rate. Pre-fix, raw
+        ``split.quantity`` was summed — 100 EUR + 100 USD became 200
+        in the parent's row.
+
+        Reuses the budget_book fixture (USD-default), adds a EUR
+        commodity, a EUR-denominated ``Expenses:Travel:Europe`` leaf,
+        a USD-default-currency ``Expenses:Travel:US`` sibling, plus
+        a price for EUR (1 EUR = 1.10 USD). Then a 100 EUR Europe
+        spend + 100 USD US spend should roll up as 110 + 100 = 210
+        USD on the ``Travel`` parent — not 200.
+        """
+        import piecash
+        from datetime import date as _date
+        from piecash._common import GnucashException
+        from piecash import factories
+
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            try:
+                eur = factories.create_currency_from_ISO("EUR")
+                b.session.add(eur)
+                b.flush()
+            except (GnucashException, Exception):
+                eur = next(
+                    (c for c in b.commodities if c.mnemonic == "EUR"), None,
+                )
+                if eur is None:
+                    raise
+
+            expenses = next(
+                a for a in b.accounts if a.fullname == "Expenses"
+            )
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+
+            travel = piecash.Account(
+                name="Travel", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            europe = piecash.Account(
+                name="Europe", type="EXPENSE", parent=travel,
+                commodity=eur,
+            )
+            us = piecash.Account(
+                name="US", type="EXPENSE", parent=travel, commodity=usd,
+            )
+            # Price: 1 EUR = 1.10 USD (commodity=EUR, currency=USD)
+            piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 1, 1),
+                value=Decimal("1.10"),
+                source="user:price", type="last",
+            )
+            b.save()
+
+            # 100 EUR Europe spend (transaction is in USD currency for
+            # the Checking side; cross-currency split has value=110 USD,
+            # quantity=100 EUR on the Europe leg)
+            piecash.Transaction(
+                currency=usd, description="Hotel in Berlin",
+                post_date=_date(2026, 1, 10),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-110"),
+                        quantity=Decimal("-110"),
+                    ),
+                    piecash.Split(
+                        account=europe, value=Decimal("110"),
+                        quantity=Decimal("100"),  # 100 EUR
+                    ),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Hotel in Boston",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-100"),
+                    ),
+                    piecash.Split(
+                        account=us, value=Decimal("100"),
+                    ),
+                ],
+            )
+            b.save()
+
+        gc.create_budget(
+            name="Travel Budget", year=2026, num_periods=12,
+        )
+        gc.set_budget_amount(
+            budget_name="Travel Budget",
+            account="Expenses:Travel", amount="500", period=0,
+        )
+        report = gc.get_budget_report(
+            compact=False,
+            budget_name="Travel Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        # Parent rollup: 100 USD + (100 EUR × 1.10) = 210 USD.
+        # Pre-fix, raw quantity sum produced 200.
+        assert Decimal(by_acct["Expenses:Travel"]["actual"]) == Decimal("210")
+
     def test_report_nonexistent_budget_raises(self, budget_book: Path):
         """Reporting on nonexistent budget raises ValueError."""
         book = GnuCashBook(str(budget_book))
