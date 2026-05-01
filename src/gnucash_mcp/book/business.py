@@ -2905,44 +2905,61 @@ class BusinessMixin:
             owner_name = owner.name if owner else ""
             txn_desc = description or owner_name
 
-            # Cross-currency payment: if the payment account's commodity
-            # differs from the invoice currency, find the exchange rate
-            # from book.prices and compute the payment account's quantity.
-            # The transaction currency stays as the invoice currency, so
-            # all split ``value``s remain in invoice currency (the
-            # transaction balances in EUR for an EUR invoice); the pay
-            # account's ``quantity`` reflects the actual USD/GBP/whatever
-            # amount deposited or withdrawn.
-            exchange_rate = None
-            pay_quantity = payment_amount
-            if pay_acct.commodity != inv.currency:
-                exchange_rate = self._find_exchange_rate(
+            # Cross-currency payment: when the payment account's
+            # commodity OR the A/R/A/P account's commodity differs
+            # from the invoice currency, find the exchange rate from
+            # book.prices and convert quantity. The transaction
+            # currency stays as the invoice currency so all split
+            # ``value``s remain in invoice currency (transaction
+            # balances in EUR for an EUR invoice); each account's
+            # ``quantity`` reflects the actual amount in its own
+            # commodity.
+            #
+            # Pre-fix, ``pay_invoice`` only converted the bank-side
+            # quantity. ``post_invoice`` correctly converted the A/R
+            # side via ``_qty_for_split(post_acct, ...)``; the pay
+            # path didn't, so a USD A/R holding a EUR invoice was
+            # liquidated in EUR-as-USD on payment.
+            def _convert(amount, target_commodity):
+                """Convert invoice-currency amount to target commodity."""
+                if target_commodity == inv.currency:
+                    return amount, None
+                rate = self._find_exchange_rate(
                     book,
                     from_commodity=inv.currency,
-                    to_commodity=pay_acct.commodity,
+                    to_commodity=target_commodity,
                     as_of=parsed_date,
                 )
-                if exchange_rate is None:
+                if rate is None:
                     raise ValueError(
-                        f"Cross-currency payment requires an exchange rate: "
-                        f"invoice currency {inv.currency.mnemonic} differs "
-                        f"from payment account commodity "
-                        f"{pay_acct.commodity.mnemonic}, and no matching "
-                        f"price was found in the book for "
-                        f"{inv.currency.mnemonic}/{pay_acct.commodity.mnemonic} "
-                        f"on or near {parsed_date}. Add a price with "
+                        f"Cross-currency payment requires an exchange "
+                        f"rate: invoice currency "
+                        f"{inv.currency.mnemonic} differs from account "
+                        f"commodity {target_commodity.mnemonic}, and "
+                        f"no matching price was found in the book for "
+                        f"{inv.currency.mnemonic}/"
+                        f"{target_commodity.mnemonic} on or near "
+                        f"{parsed_date}. Add a price with "
                         f"create_price, then retry."
                     )
-                pay_quantity = (payment_amount * exchange_rate).quantize(
-                    Decimal("0.01")
+                return (
+                    (amount * rate).quantize(Decimal("0.01")),
+                    rate,
                 )
+
+            pay_quantity, exchange_rate = _convert(
+                payment_amount, pay_acct.commodity,
+            )
+            post_quantity, _post_rate = _convert(
+                payment_amount, post_acct.commodity,
+            )
 
             if is_bill:
                 # Pay vendor bill: debit A/P (positive), credit bank (negative)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=payment_amount,
-                    quantity=payment_amount,
+                    quantity=post_quantity,
                     memo="",
                     action="Payment",
                 )
@@ -2957,7 +2974,7 @@ class BusinessMixin:
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=-payment_amount,
-                    quantity=-payment_amount,
+                    quantity=-post_quantity,
                     memo="",
                     action="Payment",
                 )
