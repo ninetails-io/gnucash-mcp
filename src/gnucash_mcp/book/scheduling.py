@@ -18,6 +18,9 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import piecash
+from piecash._common import Recurrence
+from piecash.core.transaction import ScheduledTransaction
+from piecash.kvp import KVP_Type, Slot
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
@@ -185,7 +188,6 @@ class SchedulingMixin:
 
     def _find_scheduled_transaction(self, book, guid: str):
         """Find a scheduled transaction by GUID (supports partial GUIDs, 8+ chars)."""
-        from piecash.core.transaction import ScheduledTransaction
 
         try:
             full_guid = self._resolve_guid("schedxactions", guid)
@@ -230,9 +232,6 @@ class SchedulingMixin:
         import json
         import uuid
 
-        from piecash._common import Recurrence
-        from piecash.core.transaction import ScheduledTransaction
-        from piecash.kvp import KVP_Type, Slot
 
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
@@ -389,7 +388,6 @@ class SchedulingMixin:
                 end_date=parsed_end,
             )
 
-            from piecash.core.transaction import ScheduledTransaction
 
             all_sx_guids = [
                 row[0]
@@ -422,7 +420,6 @@ class SchedulingMixin:
             If compact: newline-separated string of scheduled transaction lines.
             If not compact: list of scheduled transaction dicts.
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
             all_sx = book.session.query(
@@ -468,7 +465,6 @@ class SchedulingMixin:
         ``get_book_summary`` skips the upcoming-line render via
         ``hasattr`` (no cross-mixin tight coupling).
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         today = date.today()
         window_end = today + timedelta(days=days)
@@ -523,7 +519,6 @@ class SchedulingMixin:
             days: Look ahead window in days. Default 14.
             compact: If True, return compact one-line format.
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         today = date.today()
         window_end = today + timedelta(days=days)
@@ -761,7 +756,6 @@ class SchedulingMixin:
 
             book.save()
 
-            from piecash.core.transaction import ScheduledTransaction
 
             all_sx_guids = [
                 row[0]
@@ -775,7 +769,6 @@ class SchedulingMixin:
 
         Does not affect transactions already created from this schedule.
         """
-        from piecash.kvp import Slot
 
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
@@ -794,7 +787,6 @@ class SchedulingMixin:
                 # Audit staging must never block the delete.
                 self._stage_audit_before({"name": sx.name})
 
-            from piecash.core.transaction import ScheduledTransaction
 
             all_sx_guids = [
                 row[0]

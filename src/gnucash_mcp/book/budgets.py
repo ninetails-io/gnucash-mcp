@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
+from piecash._common import Recurrence
+from piecash.budget import Budget, BudgetAmount
 
 from gnucash_mcp.book._base import (
     _to_decimal,
@@ -232,7 +234,6 @@ class BudgetsMixin:
 
     def _find_budget(self, book: piecash.Book, name: str):
         """Find a budget by name."""
-        from piecash.budget import Budget
 
         for budget in book.session.query(Budget).all():
             if budget.name == name:
@@ -399,7 +400,6 @@ class BudgetsMixin:
                 ``"<name>  <num_periods> periods (<period_type>)  starts:<YYYY-MM-DD>"``.
             If not compact: list of budget dicts.
         """
-        from piecash.budget import Budget
 
         with self.open(readonly=True) as book:
             budgets = book.session.query(Budget).all()
@@ -490,8 +490,6 @@ class BudgetsMixin:
         """
         import uuid
 
-        from piecash._common import Recurrence
-        from piecash.budget import Budget
 
         if period_type not in self.VALID_BUDGET_PERIOD_TYPES:
             raise ValueError(
@@ -549,7 +547,6 @@ class BudgetsMixin:
 
             book.save()
 
-            from piecash.budget import Budget
 
             all_budget_guids = [
                 row[0]
@@ -587,7 +584,6 @@ class BudgetsMixin:
             ValueError: If budget not found, account not found,
                        or invalid period.
         """
-        from piecash.budget import BudgetAmount
 
         amount_decimal = _to_decimal(amount)
 
@@ -916,7 +912,6 @@ class BudgetsMixin:
             if not budget:
                 raise ValueError(f"Budget not found: {name}")
 
-            from piecash.budget import Budget
 
             # Stage budget snapshot for the audit log BEFORE delete.
             # Without this, the audit log shows only "deleted budget X"

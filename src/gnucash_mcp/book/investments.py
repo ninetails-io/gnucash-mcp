@@ -16,6 +16,7 @@ from datetime import date
 from decimal import Decimal
 
 import piecash
+from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
@@ -520,7 +521,6 @@ class InvestmentsMixin:
 
     def _find_lot(self, book: piecash.Book, guid: str):
         """Find a lot by GUID (supports partial GUIDs, 8+ chars)."""
-        from piecash.core.transaction import Lot
 
         try:
             full_guid = self._resolve_guid("lots", guid)
@@ -621,7 +621,6 @@ class InvestmentsMixin:
         Raises:
             ValueError: If account not found.
         """
-        from piecash.core.transaction import Lot
 
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
@@ -706,8 +705,6 @@ class InvestmentsMixin:
                 # _resolve_guid("lots", ...) searches the whole lots table,
                 # so the prefix map has to span every lot in the book — not
                 # just lots on this account.
-                from piecash.core.transaction import Lot
-
                 all_lot_guids = [
                     row[0]
                     for row in book.session.query(Lot.guid).all()
@@ -972,7 +969,6 @@ class InvestmentsMixin:
             lot.is_closed = -1
             book.save()
 
-            from piecash.core.transaction import Lot
 
             all_lot_guids = [
                 row[0] for row in book.session.query(Lot.guid).all()

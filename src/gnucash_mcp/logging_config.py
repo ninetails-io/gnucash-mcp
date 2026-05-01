@@ -1123,13 +1123,26 @@ def _normalize_account_refs_for_audit(
                             account = book_wrapper._resolve_account(book, ref)
                             if account is not None:
                                 resolved[ref] = account.fullname
-                        except Exception:
+                        except Exception as e:
                             # Stale, ambiguous, malformed — leave the raw
                             # ref in place; the log line is still useful.
+                            # Surface in debug log so a post-hoc audit-log
+                            # reader who notices a raw ``%xxxxxxx`` instead
+                            # of a fullname can find the underlying cause.
+                            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
+                            debug_logger.warning(
+                                f"Audit log: could not resolve account "
+                                f"ref {ref!r} for canonical rendering "
+                                f"({type(e).__name__}: {e})"
+                            )
                             continue
-        except Exception:
+        except Exception as e:
             # Book unavailable: fall back to raw refs everywhere.
-            pass
+            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
+            debug_logger.warning(
+                f"Audit log: book wrapper unavailable for ref "
+                f"normalization ({type(e).__name__}: {e})"
+            )
 
     if not resolved:
         return params

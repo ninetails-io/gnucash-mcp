@@ -147,7 +147,20 @@ def _splits_to_dicts(
 
 
 def _strip_noise(obj):
-    """Recursively remove keys with None or empty-string values from dicts."""
+    """Recursively remove keys with None or empty-string values from dicts.
+
+    Empty strings are treated as absent — the convention across the
+    book layer is that an empty memo / description / notes field
+    means "no value", not "value=empty". A future caller that needs
+    to preserve a deliberately-empty string (e.g. to override an
+    inherited default) should use a sentinel value or set the field
+    on the after-state explicitly via the audit log's params trail
+    rather than relying on this serializer to retain ``""``.
+
+    Lists are passed through (their elements are recursed into);
+    dict values that recurse to empty dicts/lists are kept (only
+    the explicit None / "" cases are stripped).
+    """
     if isinstance(obj, dict):
         return {k: _strip_noise(v) for k, v in obj.items()
                 if v is not None and v != ""}

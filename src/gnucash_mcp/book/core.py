@@ -803,7 +803,7 @@ class CoreMixin:
             except Exception:
                 pass
 
-        # ── 5. Stale prices ──
+        # ── 4. Stale prices ──
         stale_prices: list[str] = []
         try:
             in_use: set = set()
@@ -856,7 +856,7 @@ class CoreMixin:
             # Per spec: skip failed checks, emit the rest.
             pass
 
-        # ── 4. Overdue scheduled transactions ──
+        # ── 5. Overdue scheduled transactions ──
         # Requires SchedulingMixin's helpers (_next_occurrence,
         # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
         # the attribute lookup degrades gracefully via getattr.
@@ -1226,9 +1226,18 @@ class CoreMixin:
                     # typical buys of foreign-commodity holdings).
                     # Same fallback the assets section uses, and
                     # the same one _compute_net_worth_at uses for
-                    # consistency.
+                    # consistency. Filter by ``post_date <= today``
+                    # so a future-dated entry doesn't inflate
+                    # runway's liquid count today (today's API only
+                    # asks "as of now"; the filter is defensive in
+                    # case a future caller passes an ``as_of``).
                     cost_basis = Decimal("0")
                     for split in account.splits:
+                        post_date = split.transaction.post_date
+                        if hasattr(post_date, "date") and callable(post_date.date):
+                            post_date = post_date.date()
+                        if post_date > today:
+                            continue
                         cost_basis += Decimal(str(split.value))
                     liquid += cost_basis
 
@@ -1387,9 +1396,16 @@ class CoreMixin:
         more naturally than "67 days behind." Below 60 days we stay
         in days for precision; the warning threshold itself is 45
         days, so the days-form covers the 45–59 window.
+
+        The month-count uses 30.44 days as the average month length
+        (365.25 / 12, accounting for leap years) so 91 days reads
+        as "3 months" and 60 days reads as "2 months" without the
+        off-by-one nudge that ``// 30`` produced (90 → 3 vs 91 → 3,
+        but 30 → 1 vs 60 → 2 was sharp; reasonable enough most of
+        the time but humans round to nearest unit, not floor).
         """
         if days_behind >= 60:
-            months = days_behind // 30
+            months = round(days_behind / 30.44)
             return f"({months} months behind)"
         return f"({days_behind} days behind)"
 
