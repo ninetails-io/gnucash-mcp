@@ -10,7 +10,7 @@ SQLAlchemy Core API paired with _verify_* round-trip checks.
 """
 
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
 
@@ -602,16 +602,27 @@ class BudgetsMixin:
 
             periods = self._resolve_periods(budget, period)
 
-            # Convert Decimal to num/denom for direct inserts
-            amount_denom = 100
-            amount_num = int(amount_decimal * amount_denom)
+            # Quantize to the account commodity's smallest fraction:
+            # USD (fraction=100) → 2 decimals, JPY (fraction=1) → 0,
+            # BHD (fraction=1000) → 3. Banker's rounding avoids
+            # systematic bias on ties. We must apply the same
+            # quantization on both the insert AND update branches —
+            # piecash's hybrid ``existing.amount`` setter doesn't
+            # quantize, so without this the two paths would store
+            # different values for the same input.
+            amount_denom = acct.commodity.fraction
+            quantum = Decimal(1) / Decimal(amount_denom)
+            quantized = amount_decimal.quantize(
+                quantum, rounding=ROUND_HALF_EVEN,
+            )
+            amount_num = int(quantized * amount_denom)
 
             for p in periods:
                 try:
                     existing = budget.amounts(
                         account=acct, period_num=p
                     )
-                    existing.amount = amount_decimal
+                    existing.amount = quantized
                 except KeyError:
                     # No existing amount — insert via table (BudgetAmount constructor blocked)
                     book.session.execute(
