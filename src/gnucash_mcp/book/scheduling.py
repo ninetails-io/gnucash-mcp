@@ -414,6 +414,70 @@ class SchedulingMixin:
             else:
                 return results
 
+    def _upcoming_within_days(
+        self, book, days: int = 7,
+    ) -> dict:
+        """Summary stats for scheduled transactions due within
+        ``days`` days from today.
+
+        Returns ``{"count": int, "total": Decimal}``. The total is
+        the sum of positive split amounts across each upcoming
+        occurrence — same convention ``get_upcoming_transactions``
+        uses for its per-row ``amount`` field.
+
+        Designed for the ``get_book_summary`` orientation line
+        ("Scheduled: 13 recurring, 3 due in next 7 days (CNY
+        15,650)"). Single pass over scheduled transactions; cheap
+        enough to compute on every summary call. Lives in
+        SchedulingMixin so a book class built without the
+        scheduling module simply doesn't have the method, and
+        ``get_book_summary`` skips the upcoming-line render via
+        ``hasattr`` (no cross-mixin tight coupling).
+        """
+        from piecash.core.transaction import ScheduledTransaction
+
+        today = date.today()
+        window_end = today + timedelta(days=days)
+
+        count = 0
+        total = Decimal("0")
+        for sx in book.session.query(ScheduledTransaction).all():
+            if not sx.enabled:
+                continue
+
+            rec = sx.recurrence
+            if rec is None:
+                continue
+            key = (rec.recurrence_period_type, rec.recurrence_mult)
+            frequency = self.RECURRENCE_TO_FREQUENCY.get(key)
+            if not frequency:
+                continue
+
+            start = sx.start_date
+            if isinstance(start, datetime):
+                start = start.date()
+            end = sx.end_date
+            if isinstance(end, datetime):
+                end = end.date()
+            last = sx.last_occur
+            if isinstance(last, datetime):
+                last = last.date()
+
+            next_occ = self._next_occurrence(
+                start, frequency,
+                after=today - timedelta(days=1),
+                end_date=end, last_occur=last,
+            )
+            if not next_occ or next_occ > window_end:
+                continue
+
+            count += 1
+            for s in self._get_sx_splits(book, sx):
+                amt = _to_decimal(s["amount"])
+                if amt > 0:
+                    total += amt
+        return {"count": count, "total": total}
+
     def get_upcoming_transactions(
         self,
         days: int = 14,

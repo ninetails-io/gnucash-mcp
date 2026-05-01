@@ -247,7 +247,7 @@ class TestCreateEmployee:
     def test_no_notes_field_in_response(self, business_book):
         """Employee dict shape omits the ``notes`` key — Employee has no
         notes column in the schema (unlike Customer and Vendor). See
-        docs/PIECASH_REFERENCE.md."""
+        specs/PIECASH_REFERENCE.md."""
         gb = GnuCashBook(str(business_book))
         gb.create_employee(name="Jane Smith")
         result = gb.get_employee("000001")
@@ -345,6 +345,260 @@ class TestDeleteEmployee:
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError, match="Employee not found"):
             gb.delete_employee(employee_id="999999")
+
+
+class TestUpdateCustomer:
+    """Tests for ``update_customer``.
+
+    The customer/vendor/employee triple shares a helper, so the
+    Customer tests cover the bulk of the contract; vendor and
+    employee tests check their specific differences (notes column
+    on vendor, lack of notes column on employee).
+    """
+
+    def test_update_name(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.update_customer(
+            customer_id="000001", name="Acme Industries",
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Acme Industries"
+        # Diff-style response: only changed fields show.
+        assert "currency" not in result
+        # Persisted.
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["name"] == "Acme Industries"
+
+    def test_update_notes_clear_with_empty_string(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp", notes="Net 30 terms")
+        result = gb.update_customer(
+            customer_id="000001", notes="",
+        )
+        assert result["notes"] == ""
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["notes"] == ""
+
+    def test_update_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Berlin Digital", currency="USD")
+        result = gb.update_customer(
+            customer_id="000001", currency="EUR",
+        )
+        assert result["currency"] == "EUR"
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["currency"] == "EUR"
+
+    def test_update_unknown_currency_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="Currency not found"):
+            gb.update_customer(customer_id="000001", currency="XYZ")
+
+    def test_update_active_to_false_archives(self, business_book):
+        """Deactivation is the archive path — the customer stays in
+        the book (and on existing invoices) but ``list_customers``
+        with ``active_only=True`` skips them."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Old Customer")
+        gb.update_customer(customer_id="000001", active=False)
+
+        active_only = gb.list_customers(active_only=True, compact=False)
+        assert all(c["id"] != "000001" for c in active_only)
+        all_customers = gb.list_customers(
+            active_only=False, compact=False,
+        )
+        assert any(c["id"] == "000001" for c in all_customers)
+
+    def test_update_address_creates_when_missing(self, business_book):
+        """Customer created without an address gets one on first
+        update."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        result = gb.update_customer(
+            customer_id="000001",
+            address={
+                "addr1": "123 Main St",
+                "phone": "555-0100",
+                "email": "billing@acme.example",
+            },
+        )
+        assert result["address"]["addr1"] == "123 Main St"
+        assert result["address"]["phone"] == "555-0100"
+
+        cust = gb.get_customer(customer_id="000001")
+        assert cust["address"]["addr1"] == "123 Main St"
+        assert cust["address"]["email"] == "billing@acme.example"
+
+    def test_update_address_merges_with_existing(self, business_book):
+        """A partial address dict updates the supplied sub-fields
+        and leaves the others alone."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(
+            name="Acme Corp",
+            address={
+                "addr1": "123 Main St",
+                "addr2": "Suite 200",
+                "phone": "555-0100",
+                "email": "old@acme.example",
+            },
+        )
+        # Update only email and phone.
+        gb.update_customer(
+            customer_id="000001",
+            address={
+                "phone": "555-9999",
+                "email": "new@acme.example",
+            },
+        )
+        cust = gb.get_customer(customer_id="000001")
+        # Updated.
+        assert cust["address"]["phone"] == "555-9999"
+        assert cust["address"]["email"] == "new@acme.example"
+        # Untouched.
+        assert cust["address"]["addr1"] == "123 Main St"
+        assert cust["address"]["addr2"] == "Suite 200"
+
+    def test_update_address_clear_field_with_empty_string(
+        self, business_book,
+    ):
+        """Empty string clears a sub-field; no key means leave it."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(
+            name="Acme Corp",
+            address={"addr1": "123 Main St", "fax": "555-0101"},
+        )
+        gb.update_customer(
+            customer_id="000001",
+            address={"fax": ""},
+        )
+        cust = gb.get_customer(customer_id="000001")
+        # fax cleared, addr1 untouched.
+        assert cust["address"].get("fax", "") == ""
+        assert cust["address"]["addr1"] == "123 Main St"
+
+    def test_update_address_unknown_key_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(
+            ValueError, match="Unknown address field",
+        ):
+            gb.update_customer(
+                customer_id="000001",
+                address={"addresss": "typo"},  # extra "s"
+            )
+
+    def test_update_no_fields_raises(self, business_book):
+        """Calling update with nothing to change is a programming
+        error — surface it loud."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="No changes supplied"):
+            gb.update_customer(customer_id="000001")
+
+    def test_update_unknown_customer_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Customer not found"):
+            gb.update_customer(customer_id="999999", name="x")
+
+    def test_update_only_changed_fields_in_response(
+        self, business_book,
+    ):
+        """If the caller passes ``name="Acme Corp"`` and that's
+        already the name, no change happens and ``name`` is *not*
+        in the diff response."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp", notes="x")
+        # Pass a "no-op" name plus a real change.
+        result = gb.update_customer(
+            customer_id="000001", name="Acme Corp", notes="y",
+        )
+        assert "name" not in result  # unchanged
+        assert result["notes"] == "y"
+
+    def test_update_after_invoices_exist(self, business_book):
+        """The whole point: an update_customer call should work
+        even after the customer has invoices — the limitation that
+        delete-then-recreate hits doesn't apply here."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        # Now try to fix a typo.
+        result = gb.update_customer(
+            customer_id="000001", name="ACME Corp",
+        )
+        assert result["status"] == "updated"
+
+
+class TestUpdateVendor:
+    """Tests for ``update_vendor``.
+
+    Most behavior is shared with ``update_customer`` via
+    ``_update_business_person``; verify the vendor surface plus a
+    representative happy path.
+    """
+
+    def test_update_name_and_address(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(
+            name="Office Depot",
+            address={"addr1": "Old St"},
+        )
+        result = gb.update_vendor(
+            vendor_id="000001",
+            name="Office Depot Inc",
+            address={"addr1": "New St", "phone": "555-1212"},
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Office Depot Inc"
+        vendor = gb.get_vendor(vendor_id="000001")
+        assert vendor["name"] == "Office Depot Inc"
+        assert vendor["address"]["addr1"] == "New St"
+        assert vendor["address"]["phone"] == "555-1212"
+
+    def test_update_unknown_vendor_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Vendor not found"):
+            gb.update_vendor(vendor_id="999999", name="x")
+
+
+class TestUpdateEmployee:
+    """Tests for ``update_employee``.
+
+    Employee has no ``notes`` column. Verify a happy path and the
+    no-notes-parameter signature.
+    """
+
+    def test_update_name_and_currency(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith", currency="USD")
+        result = gb.update_employee(
+            employee_id="000001",
+            name="Jane Q. Smith",
+            currency="EUR",
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Jane Q. Smith"
+        assert result["currency"] == "EUR"
+        emp = gb.get_employee(employee_id="000001")
+        assert emp["name"] == "Jane Q. Smith"
+        assert emp["currency"] == "EUR"
+
+    def test_update_unknown_employee_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.update_employee(employee_id="999999", name="x")
+
+    def test_update_employee_active_toggle(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Former Employee")
+        gb.update_employee(employee_id="000001", active=False)
+
+        active_only = gb.list_employees(
+            active_only=True, compact=False,
+        )
+        assert all(e["id"] != "000001" for e in active_only)
 
 
 class TestDeleteCustomer:
@@ -1368,6 +1622,122 @@ class TestInvoiceBillIdCollision:
         # No vendor bill 000001, so the invoice ID is unambiguous.
         inv = gb.get_invoice("000001")
         assert inv["type"] == "invoice"
+
+
+class TestOwnerTypeValidation:
+    """Centralized rejection of invalid ``owner_type`` values.
+
+    The bookkeeper hit this on a session where an LLM passed
+    ``owner_type="employee"``. Pre-fix, the value silently fell
+    through to no-filter and the LLM saw a confusing
+    cross-sequence ID-collision error suggesting "customer or
+    vendor" — never explaining that "employee" is the actual
+    problem. Upfront validation saves the LLM a tool call and
+    frames the limitation cleanly.
+    """
+
+    def test_employee_owner_type_rejected_with_clear_message(
+        self, business_book,
+    ):
+        """The headline scenario: ``owner_type="employee"`` is
+        explicitly out of scope for the 1.2.x business module
+        (employee expense vouchers are a 1.3 thing). Reject
+        upfront with a message that says so."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError) as exc_info:
+            gb.get_invoice("000001", owner_type="employee")
+        msg = str(exc_info.value)
+        assert "employee" in msg.lower()
+        assert "not yet supported" in msg
+        # Hint at the valid options so the LLM doesn't have to
+        # call back blindly.
+        assert "customer" in msg
+        assert "vendor" in msg
+
+    def test_typo_owner_type_rejected_with_valid_options(
+        self, business_book,
+    ):
+        """Typos like ``"custmer"`` (missing 'o') get the same
+        upfront rejection. Pre-fix they silently fell through to
+        no-filter."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError) as exc_info:
+            gb.get_invoice("000001", owner_type="custmer")
+        msg = str(exc_info.value)
+        assert "Invalid owner_type" in msg
+        assert "'custmer'" in msg
+        assert "customer" in msg
+        assert "vendor" in msg
+
+    def test_none_owner_type_still_works(self, business_book):
+        """``None`` means "no filter" — the existing semantic
+        must survive the validation refactor."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        # No collision yet — None resolves to a single match.
+        inv = gb.get_invoice("000001", owner_type=None)
+        assert inv["type"] == "invoice"
+
+    def test_post_invoice_rejects_employee_owner_type(
+        self, business_book,
+    ):
+        """All four entrypoints share the same validator; verify
+        ``post_invoice`` specifically since the bookkeeper's
+        report mentioned posting an invoice with employee
+        owner_type."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                owner_type="employee",
+            )
+
+    def test_pay_invoice_rejects_typo_owner_type(
+        self, business_book,
+    ):
+        """Symmetry: ``pay_invoice`` validates too."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="50",
+                owner_type="venddor",  # typo
+            )
+
+    def test_unpost_invoice_rejects_employee(self, business_book):
+        """Symmetry: ``unpost_invoice`` (added in this same
+        patch) validates too."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.unpost_invoice(
+                invoice_id="000001", owner_type="employee",
+            )
+
+    def test_list_invoices_rejects_invalid_owner_type(
+        self, business_book,
+    ):
+        """The reads validate the same way the writes do."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.list_invoices(owner_type="bogus")
+
+    def test_get_outstanding_invoices_rejects_invalid_owner_type(
+        self, business_book,
+    ):
+        """The other read with owner_type also validates."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not yet supported"):
+            gb.get_outstanding_invoices(owner_type="employee")
 
 
 # ============== Post Invoice Tests ==============

@@ -1,6 +1,6 @@
 """Tests for the BackupMixin and auto-backup hook.
 
-Design reference: ``docs/BACKUP_TOOL_SPEC.md``. The tests mirror the
+Design reference: ``specs/archive/BACKUP_TOOL_SPEC.md``. The tests mirror the
 "Testing Strategy" section of that spec one-for-one so a reviewer
 can cross-reference what's asserted against what was designed.
 """

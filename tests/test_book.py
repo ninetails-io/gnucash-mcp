@@ -293,7 +293,7 @@ class TestGetBookSummaryReconciliation:
     was operationally useless — with per-account last-reconciled
     state for reconcilable account types. See
     ``CoreMixin._account_reconciliation_status`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §1.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §1.
     """
 
     def _reconcile_split(
@@ -757,7 +757,7 @@ class TestGetBookSummaryNetWorthTrajectory:
     Five anchor points (12mo / 6mo / 3mo / 1mo ago, now) showing
     how net worth has evolved. See
     ``CoreMixin._net_worth_trajectory`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §2.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §2.
     """
 
     @staticmethod
@@ -1157,7 +1157,7 @@ class TestGetBookSummaryMonthlyNet:
     Last 6 calendar months of net income (income − expenses), most
     recent first, with current-month MTD marker. See
     ``CoreMixin._monthly_net_income`` and the spec at
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §3.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §3.
     """
 
     def _seed_income(
@@ -1351,7 +1351,7 @@ class TestGetBookSummaryRunway:
 
     Days the household could survive on liquid assets at current
     burn rate if income stopped today. See ``CoreMixin._runway_metrics``
-    and the spec at ``docs/GET_BOOK_SUMMARY_SPEC.md`` §4.
+    and the spec at ``specs/GET_BOOK_SUMMARY_SPEC.md`` §4.
     """
 
     def _seed_recent_expense(
@@ -1765,7 +1765,7 @@ class TestGetBookSummaryBudgetHeadline:
 
     One line per active budget (the one whose period range covers
     today). See ``CoreMixin._budget_headline`` and
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §6.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §6.
     """
 
     def _make_budget_covering_today(
@@ -1942,7 +1942,7 @@ class TestGetBookSummaryWarnings:
     integrity issues, stale prices, and overdue items BEFORE
     reading numbers that depend on them. See
     ``CoreMixin._collect_warnings`` and
-    ``docs/GET_BOOK_SUMMARY_SPEC.md`` §5.
+    ``specs/GET_BOOK_SUMMARY_SPEC.md`` §5.
     """
 
     def test_section_omitted_when_no_warnings(self, test_book: Path):
@@ -2653,6 +2653,296 @@ class TestGetBookSummaryWarnings:
         warnings_idx = result.index("Warnings:")
         accounts_idx = result.index("Accounts:")
         assert warnings_idx < accounts_idx
+
+
+class TestGetBookSummaryLastEntry:
+    """``Last entry`` line — distinguishes "books are caught up"
+    from "200 transactions of catch-up first." The bookkeeper's
+    framing: dashboard answers "what is the state"; this turns it
+    into "what do I need to do next."
+    """
+
+    def _book_with_last_entry_n_days_ago(
+        self, tmp_path: Path, days_ago: int,
+    ) -> Path:
+        """Build a fresh book whose only transaction is dated
+        ``days_ago`` days before today."""
+        import piecash
+        from datetime import date as _date, timedelta
+        path = tmp_path / "last_entry.gnucash"
+        b = piecash.create_book(
+            str(path), currency="USD", overwrite=True,
+        )
+        usd = b.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=b.root_account,
+            commodity=usd, placeholder=True,
+        )
+        chk = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        income = piecash.Account(
+            name="Income", type="INCOME", parent=b.root_account,
+            commodity=usd, placeholder=True,
+        )
+        salary = piecash.Account(
+            name="Salary", type="INCOME", parent=income, commodity=usd,
+        )
+        b.save()
+        gc = GnuCashBook(str(path))
+        gc.create_transaction(
+            description="Last entry",
+            splits=[
+                {"account": "Assets:Checking", "amount": "100"},
+                {"account": "Income:Salary", "amount": "-100"},
+            ],
+            trans_date=_date.today() - timedelta(days=days_ago),
+        )
+        return path
+
+    def test_last_entry_today_renders_today(self, tmp_path: Path):
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 0)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "(today)" in last_line
+        assert "⚠" not in last_line
+
+    def test_last_entry_yesterday_renders_yesterday(
+        self, tmp_path: Path,
+    ):
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 1)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "(yesterday)" in last_line
+        assert "⚠" not in last_line
+
+    def test_last_entry_under_warn_threshold_no_warning(
+        self, tmp_path: Path,
+    ):
+        """At the warn threshold (14 days), still no warning."""
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 14)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "14 days behind" in last_line
+        assert "⚠" not in last_line
+
+    def test_last_entry_over_warn_threshold_warns(
+        self, tmp_path: Path,
+    ):
+        """One day past the threshold → warning marker."""
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 15)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "15 days behind" in last_line
+        assert "⚠" in last_line
+
+    def test_last_entry_well_behind_warns(self, tmp_path: Path):
+        path = self._book_with_last_entry_n_days_ago(tmp_path, 47)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "47 days behind" in last_line
+        assert "⚠" in last_line
+
+    def test_last_entry_future_dated_does_not_call_yesterday(
+        self, tmp_path: Path,
+    ):
+        """Bookkeeper-found regression: when the most recent
+        transaction post_date is in the future (e.g. a scheduled-
+        transaction instantiation that posts ahead of time), the
+        line must not render as "(yesterday)" or "(N days
+        behind)". Future-dated transactions are normal — but a
+        date 31 days in the future shouldn't be called "yesterday."
+        """
+        # 31 days in the future = "next month" in the bookkeeper's
+        # repro case.
+        path = self._book_with_last_entry_n_days_ago(tmp_path, -31)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "future-dated" in last_line
+        assert "31 days ahead" in last_line
+        # Future-dated entries are not "behind" — no ⚠.
+        assert "⚠" not in last_line
+        # And specifically NOT mislabeled as recent past.
+        assert "yesterday" not in last_line
+        assert "behind" not in last_line
+
+    def test_last_entry_one_day_in_future_renders_future_dated(
+        self, tmp_path: Path,
+    ):
+        """Boundary: one day ahead is still future-dated, not
+        "today" — the cutoff is strictly ``days_behind >= 0``."""
+        path = self._book_with_last_entry_n_days_ago(tmp_path, -1)
+        gc = GnuCashBook(str(path))
+        result = gc.get_book_summary()
+        last_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Last entry:")
+        )
+        assert "future-dated" in last_line
+        assert "1 days ahead" in last_line
+
+
+class TestGetBookSummaryUpcomingScheduled:
+    """``Scheduled: N recurring, K due in next 7 days (...)`` — the
+    LLM's immediate to-do list. Pre-fix the line said only "13
+    recurring" without surfacing whether anything was due *now*.
+    """
+
+    def test_no_scheduled_omits_section(self, test_book: Path):
+        """Books with no scheduled transactions should not get a
+        Scheduled line at all (absence-as-signal)."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        assert "Scheduled:" not in result
+
+    def test_scheduled_due_in_window(self, scheduled_book: Path):
+        """When some scheduled transactions are due in the next 7
+        days, the line carries the count and total."""
+        from datetime import date as _date
+        gc = GnuCashBook(str(scheduled_book))
+        # Add a fresh weekly scheduled txn starting today so it
+        # definitely fires in the next 7 days.
+        gc.create_scheduled_transaction(
+            name="Weekly Rent",
+            description="Rent",
+            start_date=_date.today().isoformat(),
+            frequency="weekly",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1500"},
+                {"account": "Expenses:Rent", "amount": "1500"},
+            ],
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        assert "due in next 7 days" in sched_line
+        # Currency mnemonic appears in the total amount clause.
+        assert "USD" in sched_line
+
+    def test_scheduled_line_carries_upcoming_clause(
+        self, scheduled_book: Path,
+    ):
+        """Whenever the Scheduled line appears, it must carry an
+        upcoming clause — "K due in next 7 days (...)" *or* "none
+        due in next 7 days". The LLM shouldn't have to guess from
+        absence whether anything's due."""
+        from datetime import date as _date, timedelta
+        gc = GnuCashBook(str(scheduled_book))
+        # Create an enabled SX with a future start so a Scheduled
+        # line definitely renders, regardless of the fixture's
+        # default contents.
+        gc.create_scheduled_transaction(
+            name="Far Future Yearly",
+            description="Yearly",
+            start_date=(
+                _date.today() + timedelta(days=180)
+            ).isoformat(),
+            frequency="yearly",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Rent", "amount": "100"},
+            ],
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        assert (
+            "due in next 7 days" in sched_line
+            or "none due in next 7 days" in sched_line
+        )
+
+
+class TestGetBookSummaryReconciliationSplitCount:
+    """Stale reconciliation lines now carry "47 splits unreconciled
+    since DATE" instead of just "through DATE". The split count
+    tells the LLM the *scope* of the work — 12 splits is one
+    sitting; 400 is "let's narrow by month."
+    """
+
+    def test_stale_account_shows_split_count(
+        self, multi_currency_book: Path,
+    ):
+        """Reconcile a checking-account split partway, then add new
+        unreconciled activity in the future. The summary should
+        show the count of unreconciled splits."""
+        from datetime import date as _date, timedelta
+        gc = GnuCashBook(str(multi_currency_book))
+
+        # The fixture seeds checking with several transactions.
+        # Mark one of them reconciled at an old date; then add new
+        # activity past that point.
+        with gc.open(readonly=False) as book:
+            chk = next(
+                a for a in book.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            # Pick the earliest split and reconcile it back-dated
+            # well past the warn threshold.
+            old_split = sorted(
+                chk.splits,
+                key=lambda s: s.transaction.post_date,
+            )[0]
+            old_split.reconcile_state = "y"
+            from datetime import datetime as _dt
+            old_split.reconcile_date = _dt(2025, 1, 1)
+            book.save()
+
+        # Add 3 fresh transactions to create unreconciled activity.
+        for i in range(3):
+            gc.create_transaction(
+                description=f"Fresh deposit {i}",
+                splits=[
+                    {"account": "Assets:Checking", "amount": "50"},
+                    {"account": "Income:Salary", "amount": "-50"},
+                ],
+                trans_date=_date.today() - timedelta(days=10),
+            )
+
+        result = gc.get_book_summary()
+        # Find the Reconciliation section's Checking line.
+        recon_line = next(
+            (
+                l for l in result.splitlines()
+                if "Checking" in l and "unreconciled since" in l
+            ),
+            None,
+        )
+        assert recon_line is not None, (
+            f"Expected 'unreconciled since' line for Checking; "
+            f"got summary:\n{result}"
+        )
+        # Count appears in the line.
+        assert "splits unreconciled since" in recon_line
+        # Warning marker still fires.
+        assert "⚠" in recon_line
 
 
 class TestMissingDefaultCurrency:
