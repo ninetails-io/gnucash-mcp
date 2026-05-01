@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,12 +73,15 @@ _AUTO_STAGE_NAMES: frozenset[str] = frozenset(s.name for s in _AUTO_STAGES)
 _ALL_STAGE_NAMES: frozenset[str] = _AUTO_STAGE_NAMES | {_MANUAL_STAGE_NAME}
 
 # Filename schema:
-#   {book_stem}-{YYYYmmddTHHMMSS}-{stage}[-{label}].gnucash
-# Timestamp is UTC, colons stripped for filesystem safety. Label is
-# sanitized to [A-Za-z0-9_-].
+#   {book_stem}-{YYYYmmddTHHMMSSffffff}-{stage}[-{label}].gnucash
+# Timestamp is UTC, colons stripped for filesystem safety. The
+# microsecond suffix (``ffffff``) is optional in the regex so legacy
+# second-resolution backups continue to parse — files written by
+# v1.2.1 and earlier had no microseconds. New writes always emit the
+# 20-digit form. Label is sanitized to [A-Za-z0-9_-].
 _FILENAME_RE = re.compile(
     r"^(?P<stem>.+)"
-    r"-(?P<ts>\d{8}T\d{6})"
+    r"-(?P<ts>\d{8}T\d{6}(?:\d{6})?)"
     r"-(?P<stage>[a-z]+)"
     r"(?:-(?P<label>[A-Za-z0-9_-]+))?"
     r"\.gnucash$"
@@ -102,15 +106,26 @@ def _now_utc() -> datetime:
 
 
 def _format_ts(ts: datetime) -> str:
-    """Format a UTC timestamp for filenames (colons stripped)."""
-    return ts.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    """Format a UTC timestamp for filenames (colons stripped).
+
+    Includes microseconds. Pre-fix, second-resolution timestamps meant
+    two ``create_backup`` calls within the same second produced the
+    same filename — and SQLite's ``connection.backup(dest_conn)``
+    truncates an existing dest, so the second snapshot silently
+    overwrote the first. Microsecond resolution makes collisions
+    practically impossible; the explicit ``Path.exists()`` check in
+    ``create_backup`` is the second line of defense.
+    """
+    return ts.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
 
 def _parse_ts(ts_str: str) -> datetime:
-    """Inverse of ``_format_ts``. Returns tz-aware UTC datetime."""
-    return datetime.strptime(ts_str, "%Y%m%dT%H%M%S").replace(
-        tzinfo=timezone.utc
-    )
+    """Inverse of ``_format_ts``. Accepts both new (microsecond) and
+    legacy (second) resolution so v1.2.1-and-earlier backup files
+    continue to parse. Returns tz-aware UTC datetime.
+    """
+    fmt = "%Y%m%dT%H%M%S%f" if len(ts_str) > 15 else "%Y%m%dT%H%M%S"
+    return datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
 
 
 def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
@@ -224,6 +239,15 @@ class BackupMixin:
     # decided this process is up-to-date.
     _backup_checked_in_process: bool = False
 
+    # Serialize the read+write of ``_backup_checked_in_process`` across
+    # threads. Without this, two simultaneous "first writes" of the
+    # session both pass the gate and both call ``create_backup`` —
+    # second-resolution filenames could collide, and the second backup
+    # would silently overwrite the first. The standard MCP deployment
+    # is single-threaded, so this is defense-in-depth for any future
+    # multi-worker deployment.
+    _backup_check_lock: threading.Lock = threading.Lock()
+
     # ── Paths ────────────────────────────────────────────────────
 
     def _backups_dir(self) -> Path:
@@ -287,6 +311,18 @@ class BackupMixin:
             filename += f"-{safe_label}"
         filename += ".gnucash"
         backup_path = backups_dir / filename
+
+        # Defense in depth against filename collisions. The microsecond
+        # resolution in ``_format_ts`` makes this practically
+        # impossible, but ``sqlite3.connect(path)`` would happily
+        # truncate an existing file — so refuse to overwrite explicitly
+        # rather than silently destroy a prior snapshot.
+        if backup_path.exists():
+            raise RuntimeError(
+                f"Backup path already exists, refusing to overwrite: "
+                f"{backup_path}. This indicates a clock-resolution "
+                f"collision; retry."
+            )
 
         # Perform the SQLite online backup. We open the source via
         # piecash's readonly context (no write lock on the live book)
@@ -474,11 +510,18 @@ class BackupMixin:
         ``_backup_checked_in_process`` gates it — but the audit
         decorator already enforces that contract at its layer.
         """
-        if self._backup_checked_in_process:
-            return
-        # Flag BEFORE running so a raise here won't cause the audit
-        # hook to retry on every subsequent write of the process.
-        self._backup_checked_in_process = True
+        # Serialize the gate so concurrent first-writes can't both
+        # pass the check before either flips the flag. Without the
+        # lock, two threads racing on the very first write would each
+        # call ``create_backup`` — and with file-level naming they'd
+        # collide on the same path.
+        with self._backup_check_lock:
+            if self._backup_checked_in_process:
+                return
+            # Flag BEFORE running so a raise here won't cause the
+            # audit hook to retry on every subsequent write of the
+            # process.
+            self._backup_checked_in_process = True
 
         try:
             backups_dir = self._backups_dir()
