@@ -108,6 +108,19 @@ def setup_logging(
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
+        # Restrict the audit file to owner read/write. Audit logs
+        # contain transaction descriptions, account paths, dollar
+        # amounts — not appropriate for the host's default umask
+        # (which would commonly leave the file group/other
+        # readable on multi-user systems). os.chmod is best-effort:
+        # platforms without POSIX permission bits (Windows) silently
+        # no-op, which is fine — the host's own ACLs apply there.
+        try:
+            import os as _os
+            _os.chmod(audit_file, 0o600)
+        except OSError:
+            pass
+
         # Write header if needed
         if write_header:
             header = _format_text_header(today, book_path, tz_name)

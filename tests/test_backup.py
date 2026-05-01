@@ -126,6 +126,55 @@ class TestCreateBackup:
         assert "review" in label
         assert "2026" in label
 
+    def test_describe_age_rounds_to_nearest_unit(self):
+        """``_describe_age`` rounds rather than floors. Pre-fix
+        59.9 minutes displayed as "59 minutes ago" (one unit short
+        of the next boundary); now displays as "1 hour ago".
+        """
+        from gnucash_mcp.book.backup import _describe_age
+        from datetime import datetime, timezone, timedelta
+
+        ref = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # 59m30s ago — rounds up to 60 min → promoted to 1 hour.
+        ts = ref - timedelta(minutes=59, seconds=30)
+        assert _describe_age(ts, ref) == "1 hour ago"
+        # 89m30s ago — rounds to 90 min → 2 hours? actually 1.5h
+        # which rounds to either. Python's banker's rounding on
+        # 1.5 → 2. Let's test 100 min (clearly 2 hours).
+        ts = ref - timedelta(minutes=100)
+        assert _describe_age(ts, ref) == "2 hours ago"
+        # 23h59m ago — rounds to 24 hours → promoted to 1 day.
+        ts = ref - timedelta(hours=23, minutes=59)
+        assert _describe_age(ts, ref) == "1 day ago"
+
+    def test_list_backups_logs_warning_on_unstattable_file(
+        self, test_book: Path, caplog,
+    ):
+        """A broken symlink (target deleted) produces an OSError on
+        ``stat()``. Pre-fix this was silently dropped from
+        ``list_backups`` — N-1 entries shown, broken file invisible.
+        Now logs a debug warning so the issue surfaces in
+        post-hoc inspection."""
+        import logging
+        book = GnuCashBook(str(test_book))
+        # Make a real backup, then replace it with a broken symlink.
+        result = book.create_backup(stage="manual", label="will-break")
+        backup_path = Path(result["path"])
+        backup_path.unlink()
+        # Create a symlink whose target doesn't exist.
+        backup_path.symlink_to("/nonexistent/target/path")
+
+        with caplog.at_level(logging.WARNING, logger="gnucash_mcp.debug"):
+            entries = book.list_backups()
+
+        # Broken symlink is dropped from the listing.
+        names = [Path(e["path"]).name for e in entries]
+        assert backup_path.name not in names
+        # But a warning was logged.
+        assert any(
+            "unstattable" in r.message.lower() for r in caplog.records
+        )
+
     def test_backup_partial_file_unlinked_on_copy_failure(
         self, test_book: Path,
     ):

@@ -58,6 +58,32 @@ class TestGetAccountSlots:
 class TestSetAccountSlot:
     """Tests for set_account_slot method."""
 
+    def test_rejects_key_with_slash(self, test_book: Path):
+        """Slot keys with embedded ``/`` create hierarchical
+        sub-slots in GnuCash's KVP store rather than flat keys
+        — silently invisible to subsequent ``get_account_slots``
+        keyed lookups. Now rejected up front."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Invalid slot key"):
+            gc_book.set_account_slot(
+                "Assets:Checking", "credit/limit", "5000",
+            )
+
+    def test_rejects_key_with_spaces(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Invalid slot key"):
+            gc_book.set_account_slot(
+                "Assets:Checking", "credit limit", "5000",
+            )
+
+    def test_accepts_underscore_dot_dash(self, test_book: Path):
+        """Safe alphabet — underscores, dots, dashes — passes."""
+        gc_book = GnuCashBook(str(test_book))
+        # Should not raise.
+        gc_book.set_account_slot("Assets:Checking", "apr_2026", "24.99")
+        gc_book.set_account_slot("Assets:Checking", "rate.last", "5.5")
+        gc_book.set_account_slot("Assets:Checking", "tag-archived", "yes")
+
     def test_set_new_slot(self, test_book: Path):
         """Should create a new slot and return status 'created'.
 
