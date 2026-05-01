@@ -18,6 +18,9 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import piecash
+from piecash._common import Recurrence
+from piecash.core.transaction import ScheduledTransaction
+from piecash.kvp import KVP_Type, Slot
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
@@ -90,19 +93,28 @@ class SchedulingMixin:
         if last_occur is not None and last_occur > after:
             after = last_occur
 
-        delta_map = {
-            "weekly": relativedelta(weeks=1),
-            "biweekly": relativedelta(weeks=2),
-            "monthly": relativedelta(months=1),
-            "bimonthly": relativedelta(months=2),
-            "quarterly": relativedelta(months=3),
-            "yearly": relativedelta(years=1),
-        }
-        delta = delta_map[frequency]
+        # Anchor each occurrence to ``start_date + (n × period)`` rather
+        # than chaining ``occurrence += delta``. ``relativedelta`` clamps
+        # to month-end on day-of-month overflow, so a monthly schedule
+        # starting Jan 31 chained as Jan 31 → Feb 28 → Mar 28 → … (drift
+        # never recovers). Anchored from start_date: Feb 28 → Mar 31 →
+        # Apr 30 → May 31, preserving the bookkeeper's "31st of every
+        # month, falling back to month-end where needed" intent.
+        delta_for = {
+            "weekly": lambda n: relativedelta(weeks=n),
+            "biweekly": lambda n: relativedelta(weeks=2 * n),
+            "monthly": lambda n: relativedelta(months=n),
+            "bimonthly": lambda n: relativedelta(months=2 * n),
+            "quarterly": lambda n: relativedelta(months=3 * n),
+            "yearly": lambda n: relativedelta(years=n),
+        }[frequency]
 
-        occurrence = start_date
-        while occurrence <= after:
-            occurrence += delta
+        n = 0
+        while True:
+            occurrence = start_date + delta_for(n)
+            if occurrence > after:
+                break
+            n += 1
 
         if end_date and occurrence > end_date:
             return None
@@ -176,7 +188,6 @@ class SchedulingMixin:
 
     def _find_scheduled_transaction(self, book, guid: str):
         """Find a scheduled transaction by GUID (supports partial GUIDs, 8+ chars)."""
-        from piecash.core.transaction import ScheduledTransaction
 
         try:
             full_guid = self._resolve_guid("schedxactions", guid)
@@ -221,9 +232,6 @@ class SchedulingMixin:
         import json
         import uuid
 
-        from piecash._common import Recurrence
-        from piecash.core.transaction import ScheduledTransaction
-        from piecash.kvp import KVP_Type, Slot
 
         if frequency not in self.VALID_FREQUENCIES:
             raise ValueError(
@@ -270,7 +278,19 @@ class SchedulingMixin:
 
             sx_guid = uuid.uuid4().hex
 
-            # Create template account under root_template
+            # Create template account under root_template. We flush
+            # this immediately because the SX row references its
+            # GUID via ``template_act_guid``. If any of the
+            # subsequent inserts (SX row, Recurrence, Slot) fail,
+            # the template account is already on disk — pre-fix the
+            # caller would retry with the same name and hit the
+            # duplicate-name check fine, but a "ghost" template
+            # account with no scheduled-transaction owner would sit
+            # under ``root_template`` forever.
+            #
+            # Wrap the whole sequence in try/except so partial-
+            # failure cleans up the orphan template account before
+            # propagating the error.
             template_acct = piecash.Account(
                 name=name,
                 type="BANK",
@@ -280,74 +300,87 @@ class SchedulingMixin:
             book.session.add(template_acct)
             book.session.flush()
 
-            # Insert ScheduledTransaction (blocked constructor)
-            book.session.execute(
-                ScheduledTransaction.__table__.insert().values(
-                    guid=sx_guid,
-                    name=name,
-                    enabled=1 if enabled else 0,
-                    start_date=parsed_start,
-                    end_date=parsed_end,
-                    last_occur=None,
-                    num_occur=0,
-                    rem_occur=0,
-                    auto_create=0,
-                    auto_notify=0,
-                    adv_creation=0,
-                    adv_notify=0,
-                    instance_count=0,
-                    template_act_guid=template_acct.guid,
+            try:
+                # Insert ScheduledTransaction (blocked constructor)
+                book.session.execute(
+                    ScheduledTransaction.__table__.insert().values(
+                        guid=sx_guid,
+                        name=name,
+                        enabled=1 if enabled else 0,
+                        start_date=parsed_start,
+                        end_date=parsed_end,
+                        last_occur=None,
+                        num_occur=0,
+                        rem_occur=0,
+                        auto_create=0,
+                        auto_notify=0,
+                        adv_creation=0,
+                        adv_notify=0,
+                        instance_count=0,
+                        template_act_guid=template_acct.guid,
+                    )
                 )
-            )
-            _verify_write(
-                book.session, ScheduledTransaction.__table__, sx_guid,
-                f"ScheduledTransaction '{name}'",
-            )
-
-            book.session.execute(
-                Recurrence.__table__.insert().values(
-                    obj_guid=sx_guid,
-                    recurrence_mult=rec_mult,
-                    recurrence_period_type=rec_period_type,
-                    recurrence_period_start=parsed_start,
-                    recurrence_weekend_adjust="none",
+                _verify_write(
+                    book.session, ScheduledTransaction.__table__, sx_guid,
+                    f"ScheduledTransaction '{name}'",
                 )
-            )
-            _verify_composite_write(
-                book.session, Recurrence.__table__,
-                {"obj_guid": sx_guid},
-                f"Recurrence for scheduled transaction '{name}'",
-            )
 
-            # Store split templates as JSON in a slot. Normalize `amount`
-            # through _to_decimal → str so the persisted JSON is always a
-            # clean decimal string, even if the caller handed us a float.
-            # Otherwise a float would survive json.dumps as a numeric
-            # literal, and every future instantiation would replay the
-            # IEEE-754 epsilon.
-            splits_json = json.dumps([
-                {
-                    "account": s["account"],
-                    "amount": str(_to_decimal(s["amount"])),
-                    "memo": s.get("memo", ""),
-                }
-                for s in splits
-            ])
-            book.session.execute(
-                Slot.__table__.insert().values(
-                    obj_guid=sx_guid,
-                    name="splits-json",
-                    slot_type=KVP_Type.KVP_TYPE_STRING,
-                    string_val=splits_json,
+                book.session.execute(
+                    Recurrence.__table__.insert().values(
+                        obj_guid=sx_guid,
+                        recurrence_mult=rec_mult,
+                        recurrence_period_type=rec_period_type,
+                        recurrence_period_start=parsed_start,
+                        recurrence_weekend_adjust="none",
+                    )
                 )
-            )
-            _verify_composite_write(
-                book.session, Slot.__table__,
-                {"obj_guid": sx_guid, "name": "splits-json"},
-                f"Splits slot for scheduled transaction '{name}'",
-            )
+                _verify_composite_write(
+                    book.session, Recurrence.__table__,
+                    {"obj_guid": sx_guid},
+                    f"Recurrence for scheduled transaction '{name}'",
+                )
 
-            book.save()
+                # Store split templates as JSON in a slot. Normalize
+                # `amount` through _to_decimal → str so the persisted
+                # JSON is always a clean decimal string, even if the
+                # caller handed us a float. Otherwise a float would
+                # survive json.dumps as a numeric literal, and every
+                # future instantiation would replay the IEEE-754
+                # epsilon.
+                splits_json = json.dumps([
+                    {
+                        "account": s["account"],
+                        "amount": str(_to_decimal(s["amount"])),
+                        "memo": s.get("memo", ""),
+                    }
+                    for s in splits
+                ])
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=sx_guid,
+                        name="splits-json",
+                        slot_type=KVP_Type.KVP_TYPE_STRING,
+                        string_val=splits_json,
+                    )
+                )
+                _verify_composite_write(
+                    book.session, Slot.__table__,
+                    {"obj_guid": sx_guid, "name": "splits-json"},
+                    f"Splits slot for scheduled transaction '{name}'",
+                )
+
+                book.save()
+            except Exception:
+                # Cleanup the orphan template account so a retry
+                # doesn't accumulate unowned template scaffolding.
+                # Swallow cleanup failures — the original error is
+                # what the caller needs to see.
+                try:
+                    book.session.delete(template_acct)
+                    book.save()
+                except Exception:
+                    pass
+                raise
 
             next_occ = self._next_occurrence(
                 parsed_start, frequency,
@@ -355,7 +388,6 @@ class SchedulingMixin:
                 end_date=parsed_end,
             )
 
-            from piecash.core.transaction import ScheduledTransaction
 
             all_sx_guids = [
                 row[0]
@@ -388,7 +420,6 @@ class SchedulingMixin:
             If compact: newline-separated string of scheduled transaction lines.
             If not compact: list of scheduled transaction dicts.
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
             all_sx = book.session.query(
@@ -434,7 +465,6 @@ class SchedulingMixin:
         ``get_book_summary`` skips the upcoming-line render via
         ``hasattr`` (no cross-mixin tight coupling).
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         today = date.today()
         window_end = today + timedelta(days=days)
@@ -489,7 +519,6 @@ class SchedulingMixin:
             days: Look ahead window in days. Default 14.
             compact: If True, return compact one-line format.
         """
-        from piecash.core.transaction import ScheduledTransaction
 
         today = date.today()
         window_end = today + timedelta(days=days)
@@ -690,7 +719,16 @@ class SchedulingMixin:
         Args:
             guid: Scheduled transaction GUID.
             enabled: Enable or disable.
-            end_date: Set end date (YYYY-MM-DD), or empty string to clear.
+            end_date: Set end date (YYYY-MM-DD), or empty string
+                (``""``) to clear an existing end date back to None.
+                The empty-string sentinel is unusual — Python's
+                idiomatic ``None`` would mean "no change" here, so
+                we needed a second sentinel for "clear it." MCP
+                tool schemas don't easily express tagged unions or
+                three-state strings, so the empty-string convention
+                is the path of least friction. Pass ``"YYYY-MM-DD"``
+                to set, ``""`` to clear, omit / pass ``None`` to
+                leave unchanged.
 
         Returns:
             Dict with updated scheduled transaction details.
@@ -705,6 +743,17 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
+            # Stage prior state for the audit log so the bookkeeper
+            # can see what changed (enable/disable; end-date set/clear).
+            # Without this, the log only knows the new state.
+            self._stage_audit_before({
+                "name": sx.name,
+                "enabled": bool(sx.enabled),
+                "end_date": (
+                    sx.end_date.isoformat() if sx.end_date else None
+                ),
+            })
+
             if enabled is not None:
                 sx.enabled = 1 if enabled else 0
 
@@ -716,7 +765,6 @@ class SchedulingMixin:
 
             book.save()
 
-            from piecash.core.transaction import ScheduledTransaction
 
             all_sx_guids = [
                 row[0]
@@ -730,7 +778,6 @@ class SchedulingMixin:
 
         Does not affect transactions already created from this schedule.
         """
-        from piecash.kvp import Slot
 
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
@@ -739,7 +786,16 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
-            from piecash.core.transaction import ScheduledTransaction
+            # Stage SX snapshot for the audit log BEFORE delete so the
+            # bookkeeper can recover the schedule's identity from the
+            # log if the delete was a mistake. _sx_to_dict captures
+            # frequency / start_date / end_date / instance_count.
+            try:
+                self._stage_audit_before(self._sx_to_dict(sx))
+            except Exception:
+                # Audit staging must never block the delete.
+                self._stage_audit_before({"name": sx.name})
+
 
             all_sx_guids = [
                 row[0]

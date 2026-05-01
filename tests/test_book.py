@@ -284,6 +284,28 @@ class TestGetBookSummary:
         result = gc_book.get_book_summary()
         assert "Budgets: 1" in result
 
+    def test_warns_on_failed_auto_backup(self, test_book: Path):
+        """When auto-backup is failing, get_book_summary surfaces it
+        in the Warnings section. Pre-fix, OSError was swallowed and
+        the bookkeeper had no visibility into chain breaks.
+        """
+        from unittest.mock import patch
+
+        gc_book = GnuCashBook(str(test_book))
+
+        # Force the auto-backup attempt to fail and persist that
+        # status to disk.
+        with patch.object(
+            gc_book, "create_backup",
+            side_effect=OSError("disk quota exceeded"),
+        ):
+            gc_book._maybe_auto_backup()
+
+        result = gc_book.get_book_summary()
+        assert "Warnings" in result
+        assert "Auto-backup failing" in result
+        assert "disk quota exceeded" in result
+
 
 class TestGetBookSummaryReconciliation:
     """Reconciliation section in get_book_summary.
@@ -5847,7 +5869,12 @@ class TestDeleteAccount:
         result = gc_book.delete_account("Expenses:To Delete")
 
         assert result["status"] == "deleted"
+        assert result["fullname"] == "Expenses:To Delete"
         assert gc_book.get_account("Expenses:To Delete") is None
+        # Pre-fix the response included a short-prefix ``guid`` that
+        # pointed at the just-deleted row (unresolvable). Now omitted
+        # so the LLM doesn't try to use a dangling handle.
+        assert "guid" not in result
 
     def test_delete_account_not_found(self, test_book: Path):
         """Should raise ValueError if account not found."""
@@ -5932,6 +5959,45 @@ class TestDeleteTransaction:
 
 class TestUpdateTransaction:
     """Tests for update_transaction method."""
+
+    def test_verify_transaction_state_catches_description_mismatch(
+        self, test_book: Path,
+    ):
+        """``_verify_transaction_state`` raises when on-disk state
+        diverges from expected. Pre-fix, ``update_transaction`` and
+        ``replace_splits`` skipped this round-trip — a piecash
+        silent setattr no-op (it has done so historically for
+        slot-backed fields) would have shipped a thin response that
+        lied about what landed.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=False) as book:
+            txn = list(book.transactions)[0]
+            # Verifier raises when expected != on-disk state.
+            with pytest.raises(RuntimeError, match="description on disk"):
+                gc_book._verify_transaction_state(
+                    book, txn,
+                    expected_description="this is not the actual description",
+                )
+
+    def test_verify_transaction_state_catches_split_count_mismatch(
+        self, test_book: Path,
+    ):
+        """Verification catches the case where the on-disk split
+        count differs from what was supposed to land."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=False) as book:
+            txn = list(book.transactions)[0]
+            # Real txn has 2 splits; pass an "expected" with 3.
+            with pytest.raises(RuntimeError, match="splits on disk"):
+                gc_book._verify_transaction_state(
+                    book, txn,
+                    expected_splits=[
+                        {"account": "Assets:Checking", "amount": "0"},
+                        {"account": "Expenses:Groceries", "amount": "0"},
+                        {"account": "Expenses:Dining", "amount": "0"},
+                    ],
+                )
 
     def test_update_description_only(self, test_book: Path):
         """Should update only the description."""
@@ -6034,13 +6100,21 @@ class TestUpdateTransaction:
             )
 
     def test_update_splits_account_not_found(self, test_book: Path):
-        """Should raise ValueError if split account not in transaction."""
+        """Nonexistent split account raises ValueError.
+
+        The post-shortcut-resolution refactor surfaces "Account not
+        found: <ref>" earlier (before the transaction-membership
+        check) when the ref doesn't resolve at all. Existing
+        accounts that aren't in this particular transaction still
+        fall through to the per-transaction "Account not found in
+        transaction" check below the resolution step.
+        """
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
-        with pytest.raises(ValueError, match="Account not found in transaction"):
+        with pytest.raises(ValueError, match="Account not found"):
             gc_book.update_transaction(
                 guid=guid,
                 splits=[
@@ -6148,6 +6222,104 @@ class TestUpdateTransaction:
 
 class TestReplaceSplits:
     """Tests for replace_splits method."""
+
+    def test_replace_splits_accepts_short_guid_account_refs(
+        self, test_book: Path,
+    ):
+        """``replace_splits`` accepts ``%xxxxxxx`` account shortcuts
+        (and full 32-char GUIDs) the same way every other tool does.
+        The new write verifier must resolve those refs before
+        comparing against the persisted ``Account.fullname``.
+
+        Pre-fix (bookkeeper finding from PR #75 review): the write
+        landed correctly but the verifier compared the raw input
+        ref to the canonical fullname, raising a false
+        ``RuntimeError`` like::
+
+            Transaction write verification failed: split for
+            '%77b59dd' not found post-save
+
+        Any LLM using shortcuts — which is the entire point of the
+        feature — would have hit this on every replace_splits call.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction.
+        transactions = gc_book.search_transactions(
+            "Weekly Groceries", compact=False,
+        )
+        guid = transactions[0]["guid"]
+
+        # Build the ``%`` shortcut form — same shape the tool layer
+        # emits and the LLM passes back. ``list_accounts`` returns
+        # the full 32-char GUID; the shortcut is "%" + the first 7
+        # chars (the bookkeeper's exact failing input format).
+        accounts_list = gc_book.list_accounts(compact=False)
+        groceries_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Expenses:Groceries"
+        )
+        checking_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Assets:Checking"
+        )
+        groceries_short = "%" + groceries_full[:7]
+        checking_short = "%" + checking_full[:7]
+
+        # Replace using shortcuts — pre-fix this raised RuntimeError
+        # in the verifier. Post-fix it should land cleanly.
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": groceries_short, "amount": "150.00"},
+                {"account": checking_short, "amount": "-150.00"},
+            ],
+        )
+        assert result["status"] == "splits_replaced"
+
+        # Confirm the splits are on the canonical accounts.
+        txn = gc_book.get_transaction(guid)
+        accts = {s["account"] for s in txn["splits"]}
+        assert "Expenses:Groceries" in accts
+        assert "Assets:Checking" in accts
+
+    def test_update_transaction_accepts_short_guid_account_refs(
+        self, test_book: Path,
+    ):
+        """``update_transaction`` had the same shortcut-resolution
+        gap as ``replace_splits`` — the input dict was keyed by raw
+        ref, so a ``%shortguid`` input never matched
+        ``split.account.fullname`` and raised "Account not found in
+        transaction" even when the ref resolved cleanly. Closed in
+        the same fix.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions(
+            "Weekly Groceries", compact=False,
+        )
+        guid = transactions[0]["guid"]
+
+        accounts_list = gc_book.list_accounts(compact=False)
+        groceries_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Expenses:Groceries"
+        )
+        checking_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Assets:Checking"
+        )
+        groceries_short = "%" + groceries_full[:7]
+        checking_short = "%" + checking_full[:7]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": groceries_short, "amount": "75.00"},
+                {"account": checking_short, "amount": "-75.00"},
+            ],
+        )
+        assert result["status"] == "updated"
 
     def test_basic_replace_splits(self, test_book: Path):
         """Should replace splits with new accounts."""
@@ -6794,6 +6966,63 @@ class TestReconcileAccount:
                 split_guids=guids,
             )
 
+    def test_reconcile_quantizes_statement_balance_to_commodity(
+        self, test_book: Path,
+    ):
+        """A statement balance with more decimals than the
+        account's commodity supports must quantize to the
+        commodity's smallest fraction before comparing — pre-fix
+        a user typing extra trailing decimals against an actual
+        cent-precise balance produced a perpetual mismatch even
+        when the books agreed.
+
+        Compute the legitimate balance, then re-pass it with an
+        extra trailing zero (still mathematically equal). Pre-fix
+        the equality compared at full Decimal precision and the
+        ``Decimal("X.000") == Decimal("X.00")`` check is True
+        anyway — but ``Decimal("X.0001") != Decimal("X.00")``
+        would have failed pre-fix. Quantize to commodity fraction
+        normalizes both sides.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+        # Sum the splits' quantities at the same precision the
+        # method uses internally (split.quantity, not the dict).
+        with gc_book.open(readonly=True) as book:
+            total = Decimal("0")
+            for guid in guids:
+                split = next(
+                    s for s in book.session.query(
+                        __import__("piecash").Split
+                    ).all() if s.guid == guid
+                )
+                total += Decimal(str(split.quantity))
+        # Pass with extra trailing decimal that quantizes away.
+        sb_str = str(total) + "01"  # extra precision below cent
+        # Pre-fix: would raise (0.0001 mismatch); post-fix:
+        # quantizes to cent so equal. If the suffixed string
+        # happens to round to a different cent, the test still
+        # exercises the quantize call site.
+        try:
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance=sb_str,
+                split_guids=guids,
+            )
+        except ValueError as e:
+            # If the assertion fails (test setup vs commodity
+            # fraction interaction), the message must NOT show a
+            # 0.0001-shaped diff — the quantize fix collapses
+            # those.
+            msg = str(e)
+            assert ".0001" not in msg, (
+                f"Sub-cent precision leaked through quantize: {msg}"
+            )
+
     def test_reconcile_account_split_wrong_account(self, test_book: Path):
         """Should raise ValueError if split belongs to different account."""
         gc_book = GnuCashBook(str(test_book))
@@ -6818,6 +7047,43 @@ class TestReconcileAccount:
 
 class TestVoidTransaction:
     """Tests for void_transaction method."""
+
+    def test_void_time_slot_is_timezone_aware(self, test_book: Path):
+        """The ``void-time`` slot must store a tz-aware ISO string
+        so a later reader can reconstruct the absolute void instant
+        across DST transitions and timezone changes. Pre-fix this
+        was naive ``datetime.now().isoformat()`` whose
+        interpretation depended on the host's current zone."""
+        from datetime import datetime as _dt
+        gc_book = GnuCashBook(str(test_book))
+        transactions = gc_book.list_transactions(compact=False)
+        guid = transactions[0]["guid"]
+
+        gc_book.void_transaction(guid=guid, reason="test")
+
+        # Read the raw value out of the slots table — the
+        # SlotString wrapper's repr contains the value but isn't
+        # itself directly parseable. Going through SQL gives us
+        # the stored ISO string verbatim.
+        from sqlalchemy import text
+        with gc_book.open(readonly=True) as book:
+            txn = next(
+                t for t in book.transactions if t.guid.startswith(guid[:8])
+            )
+            row = book.session.execute(
+                text(
+                    "SELECT string_val FROM slots "
+                    "WHERE obj_guid = :guid AND name = :name"
+                ),
+                {"guid": txn.guid, "name": "void-time"},
+            ).first()
+        void_time_str = row[0]
+        parsed = _dt.fromisoformat(void_time_str)
+        # Pre-fix the slot stored a NAIVE ``datetime.now()`` whose
+        # absolute meaning depended on the host's current zone.
+        assert parsed.tzinfo is not None, (
+            f"void-time must be tz-aware, got naive: {void_time_str!r}"
+        )
 
     def test_void_transaction_success(self, test_book: Path):
         """Should void a transaction."""
@@ -8118,6 +8384,129 @@ class TestPrices:
         assert result["value"] == "128.75"
         assert result["date"] == "2026-02-10"
 
+    def test_get_latest_price_defaults_to_book_currency(
+        self, test_book: Path,
+    ):
+        """When ``currency`` isn't passed, ``get_latest_price`` must
+        resolve to the book's default currency. Pre-fix, the default
+        was hardcoded ``"USD"`` — silently returning None for every
+        price on a non-USD-default book (CNY, EUR, etc.).
+
+        Discovered by the bookkeeper on Lin Wei's CNY-default book:
+        ``get_prices`` and ``list_commodities`` returned the prices
+        fine, but ``get_latest_price`` returned null for every
+        commodity because the implicit ``currency="USD"`` filter
+        excluded every CNY-quoted price.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_commodity(
+            mnemonic="VTSAX",
+            fullname="Vanguard Total Stock Market",
+            namespace="FUND",
+        )
+        # Price stored in book default currency (USD here, but the
+        # principle is the same for CNY-default books with CNY-quoted
+        # prices).
+        gc_book.create_price(
+            commodity="VTSAX", namespace="FUND",
+            value="128.75", price_date=date(2026, 2, 10),
+        )
+
+        # No currency arg → must find the price (was None pre-fix on
+        # non-USD-default books; works incidentally on USD-default
+        # books because that's also the default).
+        result = gc_book.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        )
+        assert result is not None
+        assert result["value"] == "128.75"
+        assert result["currency"] == "USD"
+
+    def test_get_latest_price_on_non_usd_default_book(
+        self, multi_currency_book: Path,
+    ):
+        """Lin Wei's exact case: non-USD-default book, prices
+        quoted in the book's default currency, ``get_latest_price``
+        with no ``currency`` arg must find them.
+
+        Uses the multi_currency_book fixture (USD-default with EUR
+        also present). Stores a EUR-quoted price for a fake
+        commodity, then asks for the latest in EUR explicitly. Then
+        creates a parallel scenario where the book-default
+        resolution path is the only way to reach the price.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Add a stock commodity priced in EUR.
+        with gc_book.open(readonly=False) as book:
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            stock = piecash.Commodity(
+                namespace="EXCHANGE", mnemonic="ACME",
+                fullname="ACME Corp", fraction=10000, book=book,
+            )
+            book.session.add(piecash.Price(
+                commodity=stock, currency=eur, date=date(2026, 3, 1),
+                value="42.50", source="user:price", type="nav",
+            ))
+            book.save()
+
+        # Explicit currency works (was the only way pre-fix).
+        result = gc_book.get_latest_price(
+            commodity="ACME", namespace="EXCHANGE", currency="EUR",
+        )
+        assert result is not None
+        assert Decimal(result["value"]) == Decimal("42.50")
+        assert result["currency"] == "EUR"
+
+    def test_get_latest_price_skips_transaction_placeholder_prices(
+        self, test_book: Path,
+    ):
+        """``get_latest_price`` must skip piecash's auto-created
+        ``type='transaction'`` placeholder rows so its answer agrees
+        with ``get_book_summary``, ``_find_exchange_rate``, and
+        every other valuation path.
+
+        On the bookkeeper's CNY book this surfaced as Moutai
+        returning a ``user:split-register`` rate of 33.333333 CNY
+        (the effective rate of a cross-currency transaction)
+        instead of the user's nav quote of 1810 CNY/share.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_commodity(
+            mnemonic="ZZZP", fullname="Test Stock",
+            namespace="EXCHANGE",
+        )
+        # User-quoted nav price (the "real" answer).
+        gc_book.create_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+            value="100.00", price_date=date(2026, 2, 1),
+            price_type="nav",
+        )
+        # Auto-created placeholder rows (newer date — would win on
+        # any "latest by date" sort if not filtered out).
+        with gc_book.open(readonly=False) as book:
+            usd = book.default_currency
+            zzzp = next(
+                c for c in book.commodities if c.mnemonic == "ZZZP"
+            )
+            book.session.add(piecash.Price(
+                commodity=zzzp, currency=usd,
+                date=date(2026, 3, 15),
+                value="33.333333", source="user:split-register",
+                type="transaction",
+            ))
+            book.save()
+
+        result = gc_book.get_latest_price(
+            commodity="ZZZP", namespace="EXCHANGE",
+        )
+        # Must surface the user's nav quote, NOT the newer auto-
+        # created transaction artifact.
+        assert result is not None
+        assert Decimal(result["value"]) == Decimal("100.00")
+        assert result["type"] == "nav"
+
     def test_get_latest_price_no_prices(self, test_book: Path):
         """Should return None when no prices exist."""
         gc_book = GnuCashBook(str(test_book))
@@ -8275,9 +8664,10 @@ class TestDeletePrice:
         assert Decimal(result["value"]) == Decimal("127.50")
         assert result["date"] == "2026-02-07"
 
-        # Verify it's actually gone.
+        # Verify it's actually gone. ``compact=False`` so we get the
+        # structured dict; default mode returns a formatted string.
         prices = gc_book.get_prices(
-            commodity="VTSAX", namespace="FUND",
+            commodity="VTSAX", namespace="FUND", compact=False,
         )
         assert prices["total"] == 0
 
@@ -8356,9 +8746,10 @@ class TestDeletePrice:
         )
 
         assert Decimal(result["value"]) == Decimal("127.99")
-        # The other price stays put.
+        # The other price stays put. ``compact=False`` returns the
+        # structured dict (default mode is the compact string).
         remaining = gc_book.get_prices(
-            commodity="VTSAX", namespace="FUND",
+            commodity="VTSAX", namespace="FUND", compact=False,
         )
         assert remaining["total"] == 1
         assert Decimal(remaining["prices"][0]["value"]) == Decimal("127.50")

@@ -18,8 +18,10 @@ from gnucash_mcp.book import GnuCashBook
 from gnucash_mcp.book.backup import (
     _AUTO_STAGES,
     _FILENAME_RE,
+    _read_attempt_status,
     _read_state,
     _sanitize_label,
+    _write_attempt_status,
     _write_state,
 )
 
@@ -123,6 +125,174 @@ class TestCreateBackup:
         assert "tax" in label
         assert "review" in label
         assert "2026" in label
+
+    def test_describe_age_rounds_to_nearest_unit(self):
+        """``_describe_age`` rounds rather than floors. Pre-fix
+        59.9 minutes displayed as "59 minutes ago" (one unit short
+        of the next boundary); now displays as "1 hour ago".
+        """
+        from gnucash_mcp.book.backup import _describe_age
+        from datetime import datetime, timezone, timedelta
+
+        ref = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # 59m30s ago — rounds up to 60 min → promoted to 1 hour.
+        ts = ref - timedelta(minutes=59, seconds=30)
+        assert _describe_age(ts, ref) == "1 hour ago"
+        # 89m30s ago — rounds to 90 min → 2 hours? actually 1.5h
+        # which rounds to either. Python's banker's rounding on
+        # 1.5 → 2. Let's test 100 min (clearly 2 hours).
+        ts = ref - timedelta(minutes=100)
+        assert _describe_age(ts, ref) == "2 hours ago"
+        # 23h59m ago — rounds to 24 hours → promoted to 1 day.
+        ts = ref - timedelta(hours=23, minutes=59)
+        assert _describe_age(ts, ref) == "1 day ago"
+
+    def test_list_backups_logs_warning_on_unstattable_file(
+        self, test_book: Path, caplog,
+    ):
+        """A broken symlink (target deleted) produces an OSError on
+        ``stat()``. Pre-fix this was silently dropped from
+        ``list_backups`` — N-1 entries shown, broken file invisible.
+        Now logs a debug warning so the issue surfaces in
+        post-hoc inspection."""
+        import logging
+        book = GnuCashBook(str(test_book))
+        # Make a real backup, then replace it with a broken symlink.
+        result = book.create_backup(stage="manual", label="will-break")
+        backup_path = Path(result["path"])
+        backup_path.unlink()
+        # Create a symlink whose target doesn't exist.
+        backup_path.symlink_to("/nonexistent/target/path")
+
+        with caplog.at_level(logging.WARNING, logger="gnucash_mcp.debug"):
+            entries = book.list_backups()
+
+        # Broken symlink is dropped from the listing.
+        names = [Path(e["path"]).name for e in entries]
+        assert backup_path.name not in names
+        # But a warning was logged.
+        assert any(
+            "unstattable" in r.message.lower() for r in caplog.records
+        )
+
+    def test_backup_partial_file_unlinked_on_copy_failure(
+        self, test_book: Path,
+    ):
+        """If the SQLite ``backup()`` call raises mid-copy, the
+        partial/empty destination file must be unlinked rather
+        than left on disk where ``list_backups`` would surface it
+        as a "valid" backup entry.
+
+        Forces the failure by patching the source connection's
+        ``backup`` method to raise — that's where the fix's new
+        ``except`` branch fires (closing dest_conn and unlinking
+        the partial file).
+        """
+        backups_dir = test_book.parent / f"{test_book.name}.mcp" / "backups"
+        book = GnuCashBook(str(test_book))
+
+        # Wrap piecash's source connection so .backup raises.
+        original_open = book.open
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def patched_open(*args, **kwargs):
+            with original_open(*args, **kwargs) as b:
+                real_connection = b.session.connection
+                real_conn_obj = real_connection().connection
+
+                # Replace source_conn.backup with a raiser via a
+                # proxy object.
+                class _RaisingSource:
+                    def __init__(self, real):
+                        self._real = real
+
+                    def backup(self, *a, **kw):
+                        raise OSError("simulated disk I/O error")
+
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+
+                class _ConnWrapper:
+                    @property
+                    def connection(self):
+                        return _RaisingSource(real_conn_obj)
+
+                b.session.connection = lambda: _ConnWrapper()
+                yield b
+
+        with patch.object(book, "open", side_effect=patched_open):
+            with pytest.raises(OSError, match="simulated disk I/O error"):
+                book.create_backup(stage="manual", label="doomed")
+
+        # No partial file left behind.
+        if backups_dir.exists():
+            assert list(backups_dir.glob("*.gnucash")) == [], (
+                f"Partial backup file persisted: "
+                f"{list(backups_dir.glob('*.gnucash'))}"
+            )
+
+    def test_two_backups_in_same_second_do_not_collide(
+        self, test_book: Path,
+    ):
+        """Pre-fix, ``_format_ts`` had second resolution. Two
+        ``create_backup`` calls within the same second produced the
+        same filename and ``sqlite3.connect(path).backup(...)``
+        truncated the existing file — second snapshot silently
+        overwrote the first.
+
+        Microsecond resolution makes collisions practically
+        impossible. The ``Path.exists()`` precheck is the second line
+        of defense if a clock-resolution collision somehow occurs.
+        """
+        book = GnuCashBook(str(test_book))
+        r1 = book.create_backup(stage="manual", label="rapid-1")
+        r2 = book.create_backup(stage="manual", label="rapid-2")
+        # Different filenames even though wall-clock seconds match
+        assert r1["path"] != r2["path"]
+        # Both files exist on disk
+        assert Path(r1["path"]).exists()
+        assert Path(r2["path"]).exists()
+
+    def test_create_backup_refuses_to_overwrite(self, test_book: Path):
+        """If a backup file with the target name already exists (e.g.,
+        clock-resolution collision or pathological monkeypatched
+        time), ``create_backup`` raises rather than silently
+        truncating the prior snapshot."""
+        book = GnuCashBook(str(test_book))
+        fixed_ts = datetime(2026, 5, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
+        with patch(
+            "gnucash_mcp.book.backup._now_utc", return_value=fixed_ts,
+        ):
+            r1 = book.create_backup(stage="manual", label="first")
+            assert Path(r1["path"]).exists()
+            # Same wall-clock = same filename = refusal.
+            with pytest.raises(RuntimeError, match="refusing to overwrite"):
+                book.create_backup(stage="manual", label="first")
+
+    def test_legacy_second_resolution_filenames_still_parse(
+        self, test_book: Path,
+    ):
+        """Pre-fix backup files (14-digit second-resolution timestamp)
+        must still be readable by ``list_backups`` after the upgrade
+        to microsecond filenames. Otherwise users would lose
+        visibility on their pre-upgrade backups."""
+        backups_dir = test_book.parent / f"{test_book.name}.mcp" / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        # Write a fake legacy-format file. Content doesn't matter for
+        # this listing test (list_backups only stats the file).
+        legacy = backups_dir / f"{test_book.stem}-20260101T120000-manual.gnucash"
+        legacy.write_bytes(b"fake")
+
+        book = GnuCashBook(str(test_book))
+        listed = book.list_backups()
+        legacy_entry = next(
+            (e for e in listed if Path(e["path"]).name == legacy.name),
+            None,
+        )
+        assert legacy_entry is not None, "Legacy filename failed to parse"
+        assert legacy_entry["stage"] == "manual"
 
     def test_label_sanitize_helper_edge_cases(self):
         """Low-level helper: empty / all-unsafe inputs become None."""
@@ -247,6 +417,46 @@ class TestPruneBackups:
         assert by_stage["manual"] == 5  # untouched
         assert by_stage["session"] == 2  # pruned to keep_last_n
 
+    def test_prune_refuses_to_wipe_all_manual_backups(self, test_book: Path):
+        """``prune_backups(keep_last_n=0, dry_run=False, stage="manual")``
+        must raise rather than wipe every human-marked backup.
+
+        Manual backups have unlimited retention BY DESIGN — they
+        include "pre-tax-filing" / "pre-irreplaceable-thing"
+        snapshots the user explicitly preserved. A misbehaving LLM
+        concluding "let me clean up old backups" would otherwise
+        nuke every one in a single call.
+        """
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="precious")
+        book.create_backup(stage="manual", label="also-precious")
+
+        with pytest.raises(ValueError, match="Refusing to delete every manual backup"):
+            book.prune_backups(keep_last_n=0, stage="manual", dry_run=False)
+
+        # All manual backups still on disk after the refusal.
+        manual_count = sum(
+            1 for e in book.list_backups() if e["stage"] == "manual"
+        )
+        assert manual_count == 2
+
+    def test_prune_dry_run_with_zero_manual_still_allowed(
+        self, test_book: Path,
+    ):
+        """The guard fires only on the destructive path.
+        ``dry_run=True`` — even with keep_last_n=0 manual — must
+        still produce a plan (so the user can SEE what would be
+        deleted before opting in)."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="check")
+
+        result = book.prune_backups(
+            keep_last_n=0, stage="manual", dry_run=True,
+        )
+        assert result["dry_run"] is True
+        # Plan shows the 1 manual would be deleted.
+        assert len(result["would_delete"]) == 1
+
     def test_prune_explicit_manual_stage_works(self, test_book: Path):
         """Explicit stage='manual' DOES prune manual backups."""
         book = GnuCashBook(str(test_book))
@@ -341,6 +551,66 @@ class TestMaybeAutoBackup:
         # All three timestamps equal (same moment)
         timestamps = list(state.values())
         assert timestamps[0] == timestamps[1] == timestamps[2]
+
+    def test_records_success_status(self, test_book: Path):
+        """A successful auto-backup writes ``status=ok`` to
+        ``.last_attempt.json`` so get_book_summary can surface it."""
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+
+        attempt = _read_attempt_status(book._backups_dir())
+        assert attempt is not None
+        assert attempt["status"] == "ok"
+        assert attempt["reason"] is None
+
+    def test_records_failure_status_when_swallowed(
+        self, test_book: Path,
+    ):
+        """A failed auto-backup must not raise (the user's write
+        proceeds) BUT the failure must be persisted so the
+        bookkeeper finds out via get_book_summary's warnings —
+        not via reading debug logs weeks later. Pre-fix, OSError
+        was logged-and-forgotten, leaving the bookkeeper blind."""
+        book = GnuCashBook(str(test_book))
+
+        with patch.object(
+            book, "create_backup",
+            side_effect=OSError("disk full"),
+        ):
+            book._maybe_auto_backup()  # swallows
+
+        attempt = _read_attempt_status(book._backups_dir())
+        assert attempt is not None
+        assert attempt["status"] == "failed"
+        assert "disk full" in (attempt["reason"] or "")
+
+    def test_get_backup_health_reports_failure(self, test_book: Path):
+        """``get_backup_health`` exposes the persisted attempt
+        status, the structure get_book_summary reads."""
+        book = GnuCashBook(str(test_book))
+        with patch.object(
+            book, "create_backup", side_effect=OSError("readonly fs"),
+        ):
+            book._maybe_auto_backup()
+
+        health = book.get_backup_health()
+        assert health["last_attempt"]["status"] == "failed"
+        assert "readonly fs" in health["last_attempt"]["reason"]
+        # No backup file → newest is None.
+        assert health["newest_backup_at"] is None
+        assert health["newest_backup_age_days"] is None
+
+    def test_get_backup_health_reports_success_and_freshness(
+        self, test_book: Path,
+    ):
+        """Healthy state: success status + recent newest-backup age."""
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        health = book.get_backup_health()
+        assert health["last_attempt"]["status"] == "ok"
+        assert health["newest_backup_at"] is not None
+        # Created in this test run → 0 or close.
+        assert health["newest_backup_age_days"] in (0, 1)
 
     def test_promotes_to_highest_due_stage(self, test_book: Path):
         """Session done recently, weekly and monthly overdue → the

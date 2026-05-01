@@ -147,7 +147,20 @@ def _splits_to_dicts(
 
 
 def _strip_noise(obj):
-    """Recursively remove keys with None or empty-string values from dicts."""
+    """Recursively remove keys with None or empty-string values from dicts.
+
+    Empty strings are treated as absent — the convention across the
+    book layer is that an empty memo / description / notes field
+    means "no value", not "value=empty". A future caller that needs
+    to preserve a deliberately-empty string (e.g. to override an
+    inherited default) should use a sentinel value or set the field
+    on the after-state explicitly via the audit log's params trail
+    rather than relying on this serializer to retain ``""``.
+
+    Lists are passed through (their elements are recursed into);
+    dict values that recurse to empty dicts/lists are kept (only
+    the explicit None / "" cases are stripped).
+    """
     if isinstance(obj, dict):
         return {k: _strip_noise(v) for k, v in obj.items()
                 if v is not None and v != ""}
@@ -205,6 +218,40 @@ def safe_tool(func: Callable) -> Callable:
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
             return _json({"error": str(e), "error_type": "validation_error"})
+        except RuntimeError as e:
+            # ``_verify_write`` / ``_verify_composite_write`` /
+            # ``_verify_delete`` and the per-method
+            # ``_verify_transaction_state`` raise ``RuntimeError``
+            # specifically for "the write didn't land" — a critical
+            # correctness signal that should NOT collapse into the
+            # generic "unexpected_error" bucket. Pre-fix this
+            # masked write-verification failures behind the same
+            # error_type as e.g. ``KeyError`` lookup failures, so
+            # callers couldn't tell "the write failed" from "we
+            # tried to read a missing key."
+            msg = str(e)
+            if "verification failed" in msg.lower():
+                logger.error(
+                    f"Write verification failed in {func.__name__}: "
+                    f"{e}\n{traceback.format_exc()}"
+                )
+                return _json(
+                    {
+                        "error": f"Write verification failed: {e}",
+                        "error_type": "write_verification_failed",
+                    }
+                )
+            # Other RuntimeErrors fall through to the generic
+            # handler below.
+            logger.error(
+                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
+            )
+            return _json(
+                {
+                    "error": f"Unexpected error: {type(e).__name__}: {e}",
+                    "error_type": "unexpected_error",
+                }
+            )
         except Exception as e:
             logger.error(
                 f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"

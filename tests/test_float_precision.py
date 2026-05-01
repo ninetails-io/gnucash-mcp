@@ -471,3 +471,39 @@ class TestScalarAmountsAcceptFloat:
             price_date=date(2026, 3, 15),
         )
         assert result["status"] in ("created", "updated")
+
+
+class TestIsMarketPriceHelper:
+    """Contract tests for the ``_is_market_price`` predicate.
+
+    Centralizing the ``type='transaction'`` check used to live as
+    inline conditionals in four places (core's ``_rates_as_of`` and
+    ``_collect_warnings``, reporting's ``_latest_market_rates``,
+    business's ``_find_exchange_rate``). All four now route through
+    this single predicate so adding any future placeholder type
+    (e.g., the auto-fx-account work later in this branch) only needs
+    one change.
+    """
+
+    def test_user_quote_is_market(self):
+        from gnucash_mcp.book._base import _is_market_price
+
+        class _Price:
+            type = "nav"
+        assert _is_market_price(_Price()) is True
+
+    def test_transaction_placeholder_is_not_market(self):
+        from gnucash_mcp.book._base import _is_market_price
+
+        class _Price:
+            type = "transaction"
+        assert _is_market_price(_Price()) is False
+
+    def test_missing_type_attr_treated_as_market(self):
+        """Defensive: an ORM row without ``type`` shouldn't be
+        silently skipped — better to value it than to under-count."""
+        from gnucash_mcp.book._base import _is_market_price
+
+        class _Price:
+            pass
+        assert _is_market_price(_Price()) is True

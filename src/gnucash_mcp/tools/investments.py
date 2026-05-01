@@ -192,14 +192,16 @@ def register(mcp, get_book) -> None:
     def get_latest_price(
         commodity: str,
         namespace: str,
-        currency: str = "USD",
+        currency: str | None = None,
     ) -> str:
         """Get the most recent price for a commodity.
 
         Args:
             commodity: Symbol of the commodity (e.g., "VTSAX").
             namespace: Namespace of the commodity (e.g., "FUND").
-            currency: Currency for the price. Default "USD".
+            currency: Currency for the price. Defaults to the book's
+                default currency. Pass explicitly to get a price
+                quoted in a non-default currency.
 
         Returns:
             JSON with date, value, type, and source of most recent price.

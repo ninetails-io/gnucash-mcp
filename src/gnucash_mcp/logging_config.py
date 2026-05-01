@@ -108,6 +108,19 @@ def setup_logging(
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
+        # Restrict the audit file to owner read/write. Audit logs
+        # contain transaction descriptions, account paths, dollar
+        # amounts — not appropriate for the host's default umask
+        # (which would commonly leave the file group/other
+        # readable on multi-user systems). os.chmod is best-effort:
+        # platforms without POSIX permission bits (Windows) silently
+        # no-op, which is fine — the host's own ACLs apply there.
+        try:
+            import os as _os
+            _os.chmod(audit_file, 0o600)
+        except OSError:
+            pass
+
         # Write header if needed
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
@@ -811,6 +824,34 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_bill_post(entry: dict) -> list[str]:
+    """Bill POST — same shape as invoice POST but with the right
+    label so the audit log doesn't mis-categorize a vendor bill
+    as a customer invoice. Pre-fix the (invoice, POST) handler
+    fired for both because ``post_invoice`` accepts either."""
+    lines = _fmt_invoice_post(entry)
+    if lines:
+        lines[0] = lines[0].replace("POST INVOICE", "POST BILL")
+    return lines
+
+
+def _fmt_bill_unpost(entry: dict) -> list[str]:
+    """Bill UNPOST — same shape as invoice UNPOST with the right
+    label."""
+    lines = _fmt_invoice_unpost(entry)
+    if lines:
+        lines[0] = lines[0].replace("UNPOST INVOICE", "UNPOST BILL")
+    return lines
+
+
+def _fmt_bill_pay(entry: dict) -> list[str]:
+    """Bill PAY — same shape as invoice PAY with the right label."""
+    lines = _fmt_invoice_pay(entry)
+    if lines:
+        lines[0] = lines[0].replace("PAY INVOICE", "PAY BILL")
+    return lines
+
+
 def _fmt_bill_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -847,6 +888,100 @@ def _fmt_entry_create(entry: dict) -> list[str]:
         f"{time_part}  CREATE ENTRY",
         f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
     ]
+
+
+# ── Budget handlers ────────────────────────────────────────────────
+
+
+def _fmt_budget_update(entry: dict) -> list[str]:
+    """``set_budget_amount`` is logged as ``budget UPDATE``. Renders
+    the per-period before/after diff captured by the staged
+    ``prior_amounts`` map."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    budget_name = params.get("budget_name", before.get("budget_name", ""))
+    account = params.get("account", before.get("account", ""))
+    new_amount = params.get("amount", "")
+
+    lines = [
+        f"{time_part}  UPDATE BUDGET",
+        f'{_INDENT}"{budget_name}"  account: {account}',
+    ]
+    prior = before.get("prior_amounts") or {}
+    if prior:
+        # Show before/after per period. ``prior_amounts`` is keyed by
+        # period number; sort numerically so the human reader sees
+        # period 0, 1, 2, … in order.
+        for p in sorted(prior, key=lambda k: int(k) if str(k).isdigit() else 0):
+            old = prior[p]
+            old_str = old if old is not None else "(unset)"
+            lines.append(
+                f"{_INDENT}period {p}: {old_str} → {new_amount}"
+            )
+    else:
+        lines.append(f"{_INDENT}amount: {new_amount}")
+    return lines
+
+
+def _fmt_budget_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = before.get("name", params.get("name", ""))
+    lines = [f'{time_part}  DELETE BUDGET  "{name}"']
+    if before:
+        np = before.get("num_periods")
+        ac = before.get("amount_count")
+        if np is not None:
+            lines.append(
+                f"{_INDENT}periods: {np}  amounts removed: {ac or 0}"
+            )
+    return lines
+
+
+# ── Scheduled-transaction handlers ─────────────────────────────────
+
+
+def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = before.get("name", "")
+    lines = [f'{time_part}  UPDATE SCHEDULED  "{name}"']
+    if "enabled" in params and params["enabled"] is not None:
+        old = before.get("enabled")
+        new = bool(params["enabled"])
+        if old is not None and old != new:
+            lines.append(f"{_INDENT}enabled: {old} → {new}")
+        else:
+            lines.append(f"{_INDENT}enabled: {new}")
+    if "end_date" in params and params["end_date"] is not None:
+        old = before.get("end_date")
+        new = params["end_date"] if params["end_date"] != "" else None
+        old_str = old or "(none)"
+        new_str = new or "(cleared)"
+        if old != new:
+            lines.append(f"{_INDENT}end_date: {old_str} → {new_str}")
+    return lines
+
+
+def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state") or {}
+    name = before.get("name", "")
+    lines = [f'{time_part}  DELETE SCHEDULED  "{name}"']
+    freq = before.get("frequency")
+    start = before.get("start_date")
+    instance_count = before.get("instance_count")
+    if freq:
+        lines.append(f"{_INDENT}frequency: {freq}  start: {start}")
+    if instance_count:
+        lines.append(
+            f"{_INDENT}had run {instance_count} time"
+            f"{'s' if instance_count != 1 else ''}"
+        )
+    return lines
 
 
 # ── Dispatch table ────────────────────────────────────────────────
@@ -887,8 +1022,15 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("invoice", "PAY"): _fmt_invoice_pay,
     ("bill", "CREATE"): _fmt_bill_create,
     ("bill", "DELETE"): _fmt_bill_delete,
+    ("bill", "POST"): _fmt_bill_post,
+    ("bill", "UNPOST"): _fmt_bill_unpost,
+    ("bill", "PAY"): _fmt_bill_pay,
     ("entry", "CREATE"): _fmt_entry_create,
     ("price", "DELETE"): _fmt_price_delete,
+    ("budget", "UPDATE"): _fmt_budget_update,
+    ("budget", "DELETE"): _fmt_budget_delete,
+    ("scheduled_transaction", "UPDATE"): _fmt_scheduled_transaction_update,
+    ("scheduled_transaction", "DELETE"): _fmt_scheduled_transaction_delete,
 }
 
 
@@ -981,13 +1123,26 @@ def _normalize_account_refs_for_audit(
                             account = book_wrapper._resolve_account(book, ref)
                             if account is not None:
                                 resolved[ref] = account.fullname
-                        except Exception:
+                        except Exception as e:
                             # Stale, ambiguous, malformed — leave the raw
                             # ref in place; the log line is still useful.
+                            # Surface in debug log so a post-hoc audit-log
+                            # reader who notices a raw ``%xxxxxxx`` instead
+                            # of a fullname can find the underlying cause.
+                            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
+                            debug_logger.warning(
+                                f"Audit log: could not resolve account "
+                                f"ref {ref!r} for canonical rendering "
+                                f"({type(e).__name__}: {e})"
+                            )
                             continue
-        except Exception:
+        except Exception as e:
             # Book unavailable: fall back to raw refs everywhere.
-            pass
+            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
+            debug_logger.warning(
+                f"Audit log: book wrapper unavailable for ref "
+                f"normalization ({type(e).__name__}: {e})"
+            )
 
     if not resolved:
         return params
@@ -1143,6 +1298,25 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
+            # Defense-in-depth: clear any previously-staged audit
+            # before-state at the TOP of the wrapper. The post-call
+            # consume (success branch) and the exception-path clear
+            # below are the primary cleanup paths, but if either one
+            # itself errors out (e.g., the book wrapper transiently
+            # unavailable), threading-local state can carry the
+            # previous tool's before-state into this one — and that
+            # tool would render an unrelated diff in its audit entry.
+            # Pre-clearing here means every tool starts with a clean
+            # threading-local slot regardless of what the previous
+            # call did.
+            if _get_book_func is not None:
+                try:
+                    pre_book = _get_book_func()
+                    if pre_book is not None:
+                        pre_book._consume_audit_before()
+                except Exception:
+                    pass
+
             # Normalize up front so pydantic models (e.g. list[SplitInput]
             # from the transaction-creating tools) become plain dicts before
             # they hit json.dumps in the debug line or the text-audit
@@ -1211,7 +1385,22 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            after = _extract_after_state(result, entity_type)
+                            # Invoice/bill polymorphism: post_invoice
+                            # / unpost_invoice / pay_invoice all carry
+                            # entity_type="invoice" on the decorator
+                            # but accept either kind. The response's
+                            # ``type`` field is the truth — swap
+                            # entity_type to ``bill`` when the call
+                            # operated on a vendor bill so the audit
+                            # log doesn't mis-categorize the entry.
+                            if (
+                                entity_type == "invoice"
+                                and result_data.get("type") == "bill"
+                            ):
+                                entry["entity_type"] = "bill"
+                            after = _extract_after_state(
+                                result, entry["entity_type"]
+                            )
                             if after:
                                 entry["entity_guid"] = after.get("guid")
                                 entry["after_state"] = after

@@ -48,6 +48,26 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+def _is_market_price(price) -> bool:
+    """True iff ``price`` is a real market quote, not a piecash auto-
+    placeholder.
+
+    On any cross-currency transaction, piecash auto-creates a Price
+    row with ``type='transaction'`` capturing the effective rate of
+    that one transaction. These are bookkeeping artifacts, NOT
+    user-supplied market quotes — every helper that walks
+    ``book.prices`` to value holdings or pick exchange rates must
+    skip them, or they shadow real quotes the user has on file.
+
+    Centralized here so the four call sites (core's ``_rates_as_of``
+    and ``_collect_warnings``, reporting's ``_latest_market_rates``,
+    and business's ``_find_exchange_rate``) all answer the question
+    the same way. Adding ``"transaction-currency"`` or any future
+    placeholder type only needs one change.
+    """
+    return getattr(price, "type", None) != "transaction"
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
@@ -289,6 +309,20 @@ def _account_to_dict(account: piecash.Account) -> dict:
 
 
 # Mapping of top-level parent to "obvious" account types that need no annotation
+# Top-level account names paired with their default types — used by
+# ``_account_to_compact_line`` to suppress ``[TYPE]`` annotations
+# when the type is implied by the conventional GnuCash hierarchy
+# (``Assets:Checking [ASSET]`` reads as redundant noise; the
+# annotation only fires when the type DEPARTS from the convention,
+# e.g. ``Assets:Old Loan [LIABILITY]``).
+#
+# **Localization note:** keys are GnuCash's English defaults. Books
+# created with non-English chart-of-accounts templates ("Activos",
+# "Activités", "資産", etc.) won't match — every account in those
+# books gets the redundant ``[ASSET]`` annotation. Acceptable for
+# now (the bookkeeper's testing covers the English-default case);
+# a future localization pass would add lookup-by-account-type
+# instead of by-name.
 _DEFAULT_TYPES = {
     "Assets": {"ASSET"},
     "Liabilities": {"LIABILITY"},
@@ -644,12 +678,36 @@ class BaseGnuCashBook:
     base via `build_book_class` in gnucash_mcp.book.__init__.
     """
 
-    # Tables that support GUID resolution
-    _GUID_TABLES = frozenset({
-        "transactions", "splits", "accounts", "lots",
-        "schedxactions", "commodities", "budgets",
-        "customers", "vendors", "invoices",
-    })
+    # Tables that support GUID resolution. Each entry maps table
+    # name → its prefix-lookup SQL. The dispatch dict eliminates
+    # the f-string interpolation in ``_resolve_guid`` — pre-fix
+    # the query was built as ``f"SELECT guid FROM {table} ..."``,
+    # safe via the ``_GUID_TABLES`` allowlist but a fragile pattern
+    # if a future contributor added a table without re-validating.
+    # Storing the full statement per-table makes the validation
+    # implicit (no entry → no lookup) and gives each table room to
+    # diverge if its schema warrants it.
+    #
+    # Coverage extended to ``prices`` and ``entries`` (both have
+    # ``guid`` columns and may surface as short prefixes from any
+    # tool that emits them). ``slots`` is intentionally absent —
+    # slots have no primary GUID; they're keyed by ``obj_guid``
+    # (the parent entity) plus name.
+    _GUID_TABLE_QUERIES: dict[str, str] = {
+        "transactions": "SELECT guid FROM transactions WHERE guid LIKE ?",
+        "splits": "SELECT guid FROM splits WHERE guid LIKE ?",
+        "accounts": "SELECT guid FROM accounts WHERE guid LIKE ?",
+        "lots": "SELECT guid FROM lots WHERE guid LIKE ?",
+        "schedxactions": "SELECT guid FROM schedxactions WHERE guid LIKE ?",
+        "commodities": "SELECT guid FROM commodities WHERE guid LIKE ?",
+        "budgets": "SELECT guid FROM budgets WHERE guid LIKE ?",
+        "customers": "SELECT guid FROM customers WHERE guid LIKE ?",
+        "vendors": "SELECT guid FROM vendors WHERE guid LIKE ?",
+        "invoices": "SELECT guid FROM invoices WHERE guid LIKE ?",
+        "prices": "SELECT guid FROM prices WHERE guid LIKE ?",
+        "entries": "SELECT guid FROM entries WHERE guid LIKE ?",
+    }
+    _GUID_TABLES = frozenset(_GUID_TABLE_QUERIES.keys())
 
     def __init__(self, book_path: str):
         """Initialize with path to GnuCash SQLite book.
@@ -660,9 +718,21 @@ class BaseGnuCashBook:
         Raises:
             FileNotFoundError: If the book path doesn't exist.
         """
-        self.book_path = Path(book_path)
-        if not self.book_path.exists():
+        # Resolve to an absolute path with ``..`` segments collapsed.
+        # The audit / debug / backups directories are derived from
+        # ``book_path.parent``; without resolution a path containing
+        # ``..`` would write logs and snapshots outside the
+        # bookkeeper's intended directory. ``Path.resolve(strict=True)``
+        # raises FileNotFoundError if the path doesn't exist, which
+        # subsumes the explicit existence check below.
+        try:
+            self.book_path = Path(book_path).resolve(strict=True)
+        except FileNotFoundError:
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
+        if not self.book_path.is_file():
+            raise FileNotFoundError(
+                f"GnuCash book path is not a regular file: {book_path}"
+            )
         # Thread-local staging buffer for audit-log before_state.
         # Write book methods call `_stage_audit_before(...)` while their
         # session is open; `@audit_log` reads it back via
@@ -754,7 +824,7 @@ class BaseGnuCashBook:
         conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)
         try:
             rows = conn.execute(
-                f"SELECT guid FROM {table} WHERE guid LIKE ?",
+                self._GUID_TABLE_QUERIES[table],
                 (partial + "%",),
             ).fetchall()
         finally:

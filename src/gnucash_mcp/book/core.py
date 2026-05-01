@@ -34,6 +34,7 @@ from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
+    _is_market_price,
     _split_to_compact_dict,
     _split_to_dict,
     _to_decimal,
@@ -169,34 +170,44 @@ class CoreMixin:
             if account.placeholder:
                 continue
 
-            # Type gate. ASSET passes only when it has reconcilable
-            # history; the more common ASSET use cases (investment
-            # positions, real estate, vehicles) carry no 'y' or 'c'
-            # splits and rightly skip.
-            if account.type in self._RECONCILABLE_TYPES:
-                pass
-            elif account.type == "ASSET":
-                if not any(
-                    s.reconcile_state in ("y", "c")
-                    for s in account.splits
-                ):
-                    continue
-            else:
+            if account.type not in self._RECONCILABLE_TYPES \
+                    and account.type != "ASSET":
                 continue
 
-            if not account.splits:
-                # No activity at all — not "behind," just unused.
-                continue
-
-            # Most recent 'y' split's post_date wins the "through"
-            # date. 'c' (cleared) doesn't count — that's a partial
-            # state that hasn't been finalized to a statement.
+            # Single pass over splits — derive everything we need:
+            #   - latest_y_date (most recent reconciled split)
+            #   - has_yc (any 'y' or 'c' for the ASSET gate)
+            #   - any_splits (used vs. unused account)
+            # Pre-fix this method walked ``account.splits`` twice:
+            # once for the ASSET-passes-only-with-yc check, once
+            # for the latest-y_date scan, and (in some branches)
+            # a third time for the unreconciled count. One sweep
+            # collects everything; the count itself can't be
+            # computed up front because it depends on
+            # latest_y_date, but we capture all the inputs in the
+            # single pass and run the count after.
             latest_y_date = None
+            has_yc = False
+            any_splits = False
             for s in account.splits:
-                if s.reconcile_state == "y":
+                any_splits = True
+                rstate = s.reconcile_state
+                if rstate in ("y", "c"):
+                    has_yc = True
+                if rstate == "y":
                     pd = s.transaction.post_date
                     if latest_y_date is None or pd > latest_y_date:
                         latest_y_date = pd
+
+            # ASSET passes only when it has reconcilable history.
+            # Investment positions / real estate / vehicles carry
+            # no 'y' or 'c' splits and rightly skip.
+            if account.type == "ASSET" and not has_yc:
+                continue
+
+            if not any_splits:
+                # No activity at all — not "behind," just unused.
+                continue
 
             # Count unreconciled splits past the last 'y' date (or
             # all of them when never reconciled). This becomes the
@@ -256,7 +267,7 @@ class CoreMixin:
         for p in book.prices:
             if p.currency != default_currency:
                 continue
-            if p.type == "transaction":
+            if not _is_market_price(p):
                 continue
             p_date = p.date
             if hasattr(p_date, "date") and callable(p_date.date):
@@ -802,20 +813,26 @@ class CoreMixin:
             except Exception:
                 pass
 
-        # ── 5. Stale prices ──
+        # ── 4. Stale prices ──
         stale_prices: list[str] = []
         try:
             in_use: set = set()
             for a in book.accounts:
                 if a.type != "ROOT":
                     in_use.add(a.commodity.guid)
-            for p in book.prices:
-                in_use.add(p.commodity.guid)
 
+            # Single pass over book.prices builds both signals we
+            # need: in-use commodities (every priced commodity is
+            # in-use even if no account holds it) and the latest
+            # market-price date per commodity. Pre-fix the method
+            # iterated ``book.prices`` twice — once for ``in_use``,
+            # once for ``by_commodity_latest`` — paying the ORM
+            # hydration cost twice on a book with hundreds of prices.
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
             for p in book.prices:
-                if p.type == "transaction":
+                in_use.add(p.commodity.guid)
+                if not _is_market_price(p):
                     continue
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
@@ -855,7 +872,7 @@ class CoreMixin:
             # Per spec: skip failed checks, emit the rest.
             pass
 
-        # ── 4. Overdue scheduled transactions ──
+        # ── 5. Overdue scheduled transactions ──
         # Requires SchedulingMixin's helpers (_next_occurrence,
         # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
         # the attribute lookup degrades gracefully via getattr.
@@ -909,11 +926,51 @@ class CoreMixin:
             except Exception:
                 pass
 
+        # ── 6. Backup health ──
+        # Surface auto-backup chain breaks. The single failure mode
+        # this server most fears is data loss; an auto-backup that has
+        # been silently failing for weeks turns into "you have no
+        # recovery option" the day the book corrupts. Pre-fix, the
+        # debug log was the only place this surfaced — and the
+        # bookkeeper doesn't read debug logs. We render the warning
+        # right next to integrity issues because backup health is
+        # itself a data-safety concern.
+        backup_health: list[str] = []
+        get_health = getattr(self, "get_backup_health", None)
+        if get_health is not None:
+            try:
+                health = get_health()
+                attempt = health.get("last_attempt")
+                if attempt and attempt.get("status") == "failed":
+                    age = today - attempt["at"].date()
+                    age_str = (
+                        f"{age.days} day{'s' if age.days != 1 else ''} ago"
+                        if age.days >= 1 else "today"
+                    )
+                    reason = attempt.get("reason") or "unknown"
+                    backup_health.append(
+                        f"Auto-backup failing: {reason} "
+                        f"(last attempt {age_str})"
+                    )
+                # No backup file in 30+ days: chain is stale even if
+                # the attempt status is fine. Could be that nothing
+                # has been due (well-spaced backups + recent prune)
+                # or the directory was emptied externally.
+                newest_age = health.get("newest_backup_age_days")
+                if newest_age is not None and newest_age >= 30:
+                    backup_health.append(
+                        f"No backup in {newest_age} days (most recent "
+                        f"snapshot is older than 1 month)"
+                    )
+            except Exception:
+                pass
+
         # Integrity tier (imbalance/orphan) leads — actual data
         # corruption that calls every other number into question.
         # The remaining categories follow in operational urgency.
         return (
             integrity
+            + backup_health
             + low_cash
             + overdue_invoices
             + overdue_scheduled
@@ -1185,9 +1242,18 @@ class CoreMixin:
                     # typical buys of foreign-commodity holdings).
                     # Same fallback the assets section uses, and
                     # the same one _compute_net_worth_at uses for
-                    # consistency.
+                    # consistency. Filter by ``post_date <= today``
+                    # so a future-dated entry doesn't inflate
+                    # runway's liquid count today (today's API only
+                    # asks "as of now"; the filter is defensive in
+                    # case a future caller passes an ``as_of``).
                     cost_basis = Decimal("0")
                     for split in account.splits:
+                        post_date = split.transaction.post_date
+                        if hasattr(post_date, "date") and callable(post_date.date):
+                            post_date = post_date.date()
+                        if post_date > today:
+                            continue
                         cost_basis += Decimal(str(split.value))
                     liquid += cost_basis
 
@@ -1346,9 +1412,16 @@ class CoreMixin:
         more naturally than "67 days behind." Below 60 days we stay
         in days for precision; the warning threshold itself is 45
         days, so the days-form covers the 45–59 window.
+
+        The month-count uses 30.44 days as the average month length
+        (365.25 / 12, accounting for leap years) so 91 days reads
+        as "3 months" and 60 days reads as "2 months" without the
+        off-by-one nudge that ``// 30`` produced (90 → 3 vs 91 → 3,
+        but 30 → 1 vs 60 → 2 was sharp; reasonable enough most of
+        the time but humans round to nearest unit, not floor).
         """
         if days_behind >= 60:
-            months = days_behind // 30
+            months = round(days_behind / 30.44)
             return f"({months} months behind)"
         return f"({days_behind} days behind)"
 
@@ -3302,13 +3375,17 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
 
-            # Capture info before deletion. Short guid computed against
-            # the remaining accounts (the target is still present here).
-            short_guid = _unique_prefix(
-                account.guid, (a.guid for a in book.accounts)
-            )
+            # Capture info before deletion. Pre-fix the response
+            # included a short-prefix GUID computed against
+            # ``book.accounts`` BEFORE the delete — but the LLM
+            # would receive a handle pointing at a row that no
+            # longer exists. ``_resolve_guid`` would then raise
+            # "No account" on any subsequent attempt to use it.
+            # Returning ``fullname`` and ``status="deleted"`` is
+            # enough for the audit-log human reader and the LLM to
+            # confirm what was deleted; the short GUID was always
+            # unaddressable post-delete and just invited misuse.
             result = {
-                "guid": short_guid,
                 "fullname": account.fullname,
                 "status": "deleted",
             }
@@ -3389,6 +3466,123 @@ class CoreMixin:
 
             return result
 
+    def _verify_transaction_state(
+        self,
+        book,
+        transaction,
+        *,
+        expected_description: str | None = None,
+        expected_date: date | None = None,
+        expected_notes: str | None = None,
+        expected_splits: list[dict] | None = None,
+    ) -> None:
+        """Re-load the transaction from disk and verify expected
+        fields landed. Closes the gap CLAUDE.md's "Every write is
+        verified" invariant calls out for ``update_transaction`` and
+        ``replace_splits``.
+
+        Pre-fix, both methods called ``book.save()`` and trusted the
+        result. piecash has historically silently no-op'd setattrs
+        on some slot-backed fields; without this round-trip the
+        thin response could lie about what's stored. Bypasses the
+        ORM identity map via ``session.expire`` so we read what's
+        actually on disk, not what we just put in the cache.
+
+        Raises RuntimeError on any mismatch.
+        """
+        book.session.expire(transaction)
+
+        if expected_description is not None:
+            actual_desc = transaction.description
+            if actual_desc != expected_description:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"description on disk is {actual_desc!r}, "
+                    f"expected {expected_description!r}"
+                )
+
+        if expected_date is not None:
+            actual_date = transaction.post_date
+            if hasattr(actual_date, "date") and callable(actual_date.date):
+                actual_date = actual_date.date()
+            if actual_date != expected_date:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"post_date on disk is {actual_date}, "
+                    f"expected {expected_date}"
+                )
+
+        if expected_notes is not None:
+            actual_notes = transaction.notes or ""
+            wanted = expected_notes if expected_notes else ""
+            if actual_notes != wanted:
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"notes on disk is {actual_notes!r}, "
+                    f"expected {wanted!r}"
+                )
+
+        if expected_splits is not None:
+            actual_splits = list(transaction.splits)
+            actual_by_acct = {}
+            for s in actual_splits:
+                actual_by_acct[s.account.fullname] = (
+                    Decimal(str(s.value)),
+                    Decimal(str(s.quantity)),
+                    s.memo or "",
+                )
+            if len(actual_splits) != len(expected_splits):
+                raise RuntimeError(
+                    f"Transaction write verification failed: "
+                    f"{len(actual_splits)} splits on disk, "
+                    f"expected {len(expected_splits)}"
+                )
+            for expected in expected_splits:
+                # Normalize the input account ref to canonical
+                # fullname before lookup. The book methods accept
+                # full path, ``%short`` GUID, or full 32-char GUID;
+                # post-save splits are keyed by ``Account.fullname``.
+                # Pre-fix this comparison was string-vs-string against
+                # the raw input, so a shortcut input like ``%77b59dd``
+                # raised a false "split not found post-save" RuntimeError
+                # even though the write had landed correctly.
+                # (Bookkeeper finding from PR #75 review.)
+                ref = expected["account"]
+                resolved = self._resolve_account(book, ref)
+                if resolved is None:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"could not resolve split account ref "
+                        f"{ref!r} (resolution returned None — the "
+                        f"account may have been deleted between "
+                        f"save and verify)"
+                    )
+                acct_fullname = resolved.fullname
+                if acct_fullname not in actual_by_acct:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split for {acct_fullname!r} (input "
+                        f"ref {ref!r}) not found post-save"
+                    )
+                actual_value, actual_qty, actual_memo = (
+                    actual_by_acct[acct_fullname]
+                )
+                ev = _to_decimal(expected["amount"])
+                if actual_value != ev:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split {acct_fullname!r} value on disk is "
+                        f"{actual_value}, expected {ev}"
+                    )
+                if "quantity" in expected:
+                    eq = _to_decimal(expected["quantity"])
+                    if actual_qty != eq:
+                        raise RuntimeError(
+                            f"Transaction write verification failed: "
+                            f"split {acct_fullname!r} quantity on "
+                            f"disk is {actual_qty}, expected {eq}"
+                        )
+
     def update_transaction(
         self,
         guid: str,
@@ -3467,8 +3661,23 @@ class CoreMixin:
                 if total != Decimal("0"):
                     raise ValueError(f"Splits do not balance: total is {total}")
 
-                # Build a map of account -> split data
-                split_updates = {s["account"]: s for s in splits}
+                # Build a map of canonical-fullname → split data.
+                # Resolve any input refs (path, ``%short``, full GUID)
+                # to the canonical Account so the lookup against
+                # existing splits' ``account.fullname`` works for all
+                # three input shapes. Pre-fix this dict was keyed by
+                # the raw input string, so a shortcut input like
+                # ``%77b59dd`` produced "Account not found in
+                # transaction" even though the ref resolved cleanly.
+                split_updates = {}
+                for s in splits:
+                    ref = s["account"]
+                    resolved = self._resolve_account(book, ref)
+                    if resolved is None:
+                        raise ValueError(
+                            f"Account not found: {ref}"
+                        )
+                    split_updates[resolved.fullname] = s
 
                 trans_currency = transaction.currency
 
@@ -3512,6 +3721,20 @@ class CoreMixin:
                     raise ValueError(f"Account not found in transaction: {missing}")
 
             book.save()
+
+            # Verify the write landed — re-read the transaction from
+            # disk and compare each field we tried to set. Honors the
+            # ``Every write is verified`` invariant CLAUDE.md spells
+            # out; pre-fix, ``update_transaction`` skipped this and a
+            # piecash silent setattr no-op would have shipped a thin
+            # response that lied about what was stored.
+            self._verify_transaction_state(
+                book, transaction,
+                expected_description=description,
+                expected_date=trans_date,
+                expected_notes=notes,
+                expected_splits=splits,
+            )
 
             # Thin response — the LLM submitted the changes, so the only
             # fields worth echoing are enough for a quick sanity check
@@ -3674,6 +3897,12 @@ class CoreMixin:
 
             # 8. Save
             book.save()
+
+            # 8a. Verify the new splits landed — same invariant as
+            # update_transaction, just with the splits-only path.
+            self._verify_transaction_state(
+                book, transaction, expected_splits=splits,
+            )
 
             # 9. Build thin response.
             # - `splits` echo dropped (LLM just submitted them).

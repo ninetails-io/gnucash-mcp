@@ -115,7 +115,33 @@ def register(mcp, get_book) -> None:
         if not log_file.exists():
             return f"No audit log for {target_date}"
 
-        content = log_file.read_text().strip()
+        # Cap the size we'll read in one shot. A long-lived
+        # deployment with daily growth could produce multi-MB
+        # files; reading one in full to slice the last ``limit``
+        # blocks is wasteful (and on truly huge files would chew
+        # memory). 2 MB covers ~10k typical audit entries — well
+        # past any reasonable ``limit`` request. Files larger
+        # than the cap get tail-only treatment.
+        _AUDIT_READ_CAP_BYTES = 2 * 1024 * 1024
+        try:
+            file_size = log_file.stat().st_size
+        except OSError:
+            return f"No audit log for {target_date}"
+        if file_size > _AUDIT_READ_CAP_BYTES:
+            with log_file.open("rb") as f:
+                f.seek(-_AUDIT_READ_CAP_BYTES, 2)
+                # Drop a possibly-truncated leading block before
+                # decoding so we don't render a half-entry.
+                raw = f.read()
+            try:
+                content = raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                content = ""
+            # Skip the first (likely partial) entry boundary.
+            if "\n\n" in content:
+                content = content.split("\n\n", 1)[1]
+        else:
+            content = log_file.read_text().strip()
         if not content:
             return f"No audit log for {target_date}"
 

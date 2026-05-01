@@ -18,20 +18,45 @@ from gnucash_mcp.logging_config import (
 
 
 class _StagedBook:
-    """Fake GnuCashBook that yields a pre-set before-state once.
+    """Fake GnuCashBook that simulates the real staging contract.
 
-    Used by tests that need to inject before_state into `@audit_log`
-    without opening a real book. Mirrors the contract of
-    `BaseGnuCashBook._consume_audit_before`: returns the staged dict
-    on first call, clears itself so subsequent calls return None.
+    Mirrors ``BaseGnuCashBook._stage_audit_before`` /
+    ``_consume_audit_before``: a write book method calls
+    ``_stage_audit_before(state)`` while its session is open, and
+    ``_consume_audit_before()`` returns and clears the staged state.
+
+    The constructor accepts a ``state`` arg as a convenience —
+    callers that don't want to wire up a custom staging callback
+    can pass it in and have it auto-stage on the first
+    ``_consume_audit_before`` AFTER the wrapper's pre-clear has
+    run. The audit decorator pre-clears at wrapper entry to defend
+    against leaks from prior calls; that pre-clear must NOT eat
+    the test fixture's intended state. We track whether the
+    pre-clear has fired so the test's intended state surfaces on
+    the post-call consume only.
     """
 
     def __init__(self, state: dict | None):
-        self._state = state
+        self._initial_state = state
+        self._staged: dict | None = None
+        self._pre_clear_done = False
+
+    def _stage_audit_before(self, state: dict | None) -> None:
+        self._staged = state
 
     def _consume_audit_before(self) -> dict | None:
-        state = self._state
-        self._state = None
+        if not self._pre_clear_done:
+            # Simulate the wrapper's pre-clear: returns whatever's
+            # currently staged. After this fires, the constructor's
+            # ``initial_state`` becomes available as the test's
+            # "staged-during-func" state.
+            self._pre_clear_done = True
+            stale = self._staged
+            self._staged = self._initial_state
+            return stale
+        # Subsequent consume: yield then clear (real staging contract).
+        state = self._staged
+        self._staged = None
         return state
 
 
@@ -464,6 +489,215 @@ class TestResolveEntryField:
         assert _resolve_entry_field({"timestamp": "..."}, "anything") is None
 
 
+class TestBudgetAndScheduledAuditHandlers:
+    """Audit handlers for budgets and scheduled transactions.
+
+    Pre-fix, ``_AUDIT_HANDLERS`` had no entries for ``budget`` or
+    ``scheduled_transaction``. Every UPDATE / DELETE on those entities
+    rendered as an empty string — the bookkeeper had no way to see
+    what changed. The book methods also didn't stage before-state.
+    Both gaps closed in the same commit.
+    """
+
+    def test_budget_update_renders_per_period_diff(
+        self, temp_book_path, temp_log_dir,
+    ):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "budget",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {
+                "budget_name": "2026 Budget",
+                "account": "Expenses:Groceries",
+                "amount": "550.00",
+            },
+            "before_state": {
+                "budget_name": "2026 Budget",
+                "account": "Expenses:Groceries",
+                "prior_amounts": {0: "500.00", 1: None},
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "UPDATE BUDGET" in rendered
+        assert '"2026 Budget"' in rendered
+        assert "Expenses:Groceries" in rendered
+        assert "period 0: 500.00 → 550.00" in rendered
+        assert "period 1: (unset) → 550.00" in rendered
+
+    def test_budget_delete_renders_snapshot(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "budget",
+            "operation": "delete",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"name": "2026 Budget"},
+            "before_state": {
+                "name": "2026 Budget",
+                "num_periods": 12,
+                "amount_count": 8,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'DELETE BUDGET  "2026 Budget"' in rendered
+        assert "periods: 12" in rendered
+        assert "amounts removed: 8" in rendered
+
+    def test_scheduled_update_enable_toggle(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01", "enabled": False},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "end_date": None,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'UPDATE SCHEDULED  "Monthly Rent"' in rendered
+        assert "enabled: True → False" in rendered
+
+    def test_scheduled_update_end_date_clear(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "update",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01", "end_date": ""},
+            "before_state": {
+                "name": "Monthly Rent",
+                "enabled": True,
+                "end_date": "2026-12-31",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "end_date: 2026-12-31 → (cleared)" in rendered
+
+    def test_scheduled_delete_includes_history(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "delete",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"guid": "abcdef01"},
+            "before_state": {
+                "name": "Monthly Rent",
+                "frequency": "monthly",
+                "start_date": "2026-01-01",
+                "instance_count": 4,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'DELETE SCHEDULED  "Monthly Rent"' in rendered
+        assert "frequency: monthly  start: 2026-01-01" in rendered
+        assert "had run 4 times" in rendered
+
+
+class TestBudgetAndScheduledStaging:
+    """Verify the book methods actually stage before-state.
+
+    The audit handler tests above use synthetic entries to lock the
+    rendering contract; these tests run the real book methods and
+    assert that ``_consume_audit_before`` returns the expected staged
+    dict.
+    """
+
+    def test_set_budget_amount_stages_prior_amounts(self, budget_book):
+        from gnucash_mcp.book import GnuCashBook
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 B", year=2026, num_periods=12)
+        # Initial set populates period 0
+        book.set_budget_amount(
+            budget_name="2026 B",
+            account="Expenses:Groceries",
+            amount="500",
+            period=0,
+        )
+        # Overwrite — staged before-state should carry the prior 500
+        book.set_budget_amount(
+            budget_name="2026 B",
+            account="Expenses:Groceries",
+            amount="600",
+            period=0,
+        )
+        before = book._consume_audit_before()
+        assert before is not None
+        assert before["account"] == "Expenses:Groceries"
+        # period key may be int or str depending on dict round-trip
+        prior = before["prior_amounts"]
+        # The prior amount before this last set was 500
+        assert any(
+            (str(v) == "500" or str(v) == "500.00")
+            for v in prior.values()
+        ), f"expected prior 500 in {prior}"
+
+    def test_delete_budget_stages_snapshot(self, budget_book):
+        from gnucash_mcp.book import GnuCashBook
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="To Delete", year=2026, num_periods=12)
+        book.set_budget_amount(
+            budget_name="To Delete",
+            account="Expenses:Groceries",
+            amount="100",
+            period=0,
+        )
+        book._consume_audit_before()  # clear any staged state
+        book.delete_budget(name="To Delete")
+        before = book._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "To Delete"
+        assert before["num_periods"] == 12
+        assert before["amount_count"] >= 1
+
+    def test_update_scheduled_stages_prior_state(self, scheduled_book):
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb._consume_audit_before()  # clear staged state from create
+        gb.update_scheduled_transaction(sx["guid"], enabled=False)
+        before = gb._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "Rent"
+        assert before["enabled"] is True
+
+    def test_delete_scheduled_stages_snapshot(self, scheduled_book):
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="To Delete",
+            description="x",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "50"},
+                {"account": "Assets:Checking", "amount": "-50"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        gb._consume_audit_before()
+        gb.delete_scheduled_transaction(sx["guid"])
+        before = gb._consume_audit_before()
+        assert before is not None
+        assert before["name"] == "To Delete"
+        assert before["frequency"] == "monthly"
+
+
 class TestDispatchTableDegradation:
     """Unknown (entity_type, operation) pairs must degrade gracefully.
 
@@ -514,6 +748,118 @@ class TestDispatchTableDegradation:
             "timestamp": "2026-04-21T12:34:56",
         }
         assert _format_audit_entry_text(entry) == ""
+
+
+class TestAuditEntityTypeBillSwap:
+    """``post_invoice`` / ``unpost_invoice`` / ``pay_invoice`` carry
+    ``entity_type="invoice"`` on the decorator but accept either
+    invoices or vendor bills. The audit log must render BILL when
+    the call operated on a bill — pre-fix every bill operation
+    showed up as "POST INVOICE" / "PAY INVOICE" in the log,
+    mis-categorizing the entry.
+    """
+
+    def test_bill_post_renders_as_post_bill(self):
+        """The dispatcher swaps entity_type to ``bill`` based on
+        the response's ``type`` field; the bill handler then
+        renders ``POST BILL`` instead of ``POST INVOICE``."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",  # post-swap
+            "operation": "post",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "post_account": "Liabilities:A/P"},
+            "after_state": {
+                "type": "bill", "total": "500.00",
+                "post_date": "2026-03-10",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "POST BILL" in rendered
+        assert "POST INVOICE" not in rendered
+
+    def test_bill_pay_renders_as_pay_bill(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "bill",
+            "operation": "pay",
+            "timestamp": "2026-04-30T18:00:00",
+            "params": {"id": "B-001", "payment_account": "Assets:Checking"},
+            "after_state": {
+                "type": "bill", "amount_paid": "500.00",
+                "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY BILL" in rendered
+        assert "PAY INVOICE" not in rendered
+
+
+class TestAuditBeforeStateLeak:
+    """Defense-in-depth: a previous call's staged before-state must
+    never leak into the next call's audit entry, regardless of how
+    the previous call exited.
+
+    Pre-fix, the wrapper consumed before-state on the success path
+    (post-func) and tried to consume on the exception path. If
+    either consume itself raised (e.g., book wrapper transiently
+    unavailable), the threading-local kept the staged state, and
+    the next decorated call would render an unrelated diff. The
+    fix adds a pre-clear at the TOP of the wrapper so every tool
+    starts with a clean slot.
+    """
+
+    def test_pre_clear_drops_leaked_before_state(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """A second tool call must not see before-state staged by a
+        previous call that failed to consume it."""
+
+        class _RetainingBook:
+            def __init__(self):
+                self._staged = None
+
+            def _stage_audit_before(self, state):
+                self._staged = state
+
+            def _consume_audit_before(self):
+                state = self._staged
+                self._staged = None
+                return state
+
+        book = _RetainingBook()
+        # Pre-stage state as if a previous call had left it behind.
+        book._stage_audit_before({"description": "leaked from prior call"})
+        assert book._staged is not None
+
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="transaction",
+        )
+        def fresh_call(description: str) -> str:
+            return json.dumps({"guid": "abcd1234", "description": description})
+
+        fresh_call(description="this call's own description")
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        # The leaked before-state's "description" must NOT appear in
+        # this call's audit entry.
+        assert "leaked from prior call" not in content
+        # Sanity: this call's own description still rendered.
+        assert "this call's own description" in content
 
 
 class TestAuditLogIntegration:
