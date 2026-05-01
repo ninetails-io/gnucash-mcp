@@ -323,6 +323,57 @@ class TestCalculateLotGain:
         assert Decimal(result["sale_proceeds"]) == Decimal("520")
         assert Decimal(result["capital_gain"]) == Decimal("20")
 
+    def test_cost_basis_recovers_exactness_for_indivisible_per_share_cost(
+        self, investment_book: Path,
+    ):
+        """A lot bought at a non-round per-share cost should recover
+        the exact total cost basis when all shares are sold.
+
+        Pre-fix, ``cost_per_share`` was formatted to 4 decimals via
+        ``_lot_summary``, then re-parsed in ``calculate_lot_gain``
+        and multiplied by shares — losing precision. A $100 / 3 share
+        lot showed cost_basis $99.99 on a 3-share sale instead of
+        $100.
+
+        The prorate formula
+        ``cost_basis = purchase_value * shares / purchase_quantity``
+        recovers exactness for the all-shares case. Tax-relevant.
+        """
+        book = GnuCashBook(str(investment_book))
+        lot = book.create_lot(
+            account="Assets:Investments:VTSAX", title="Indivisible cost",
+        )
+        # Buy 3 shares at $33.3333.../share (total $100)
+        result = book.create_transaction(
+            description="Buy 3 VTSAX with non-round per-share cost",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "100",
+                    "quantity": "3",
+                },
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            trans_date=date(2026, 1, 15),
+        )
+        txn = book.get_transaction(result["guid"])
+        buy_guid = next(
+            s["guid"] for s in txn["splits"]
+            if s["account"] == "Assets:Investments:VTSAX"
+        )
+        book.assign_split_to_lot(
+            split_guid=buy_guid, lot_guid=lot["guid"],
+        )
+
+        # Sell all 3 shares at $50/share. Cost basis MUST be exactly
+        # $100, gain MUST be exactly $50 — not $99.99 / $50.01.
+        gain = book.calculate_lot_gain(
+            lot_guid=lot["guid"], sale_price="50",
+        )
+        assert Decimal(gain["cost_basis"]) == Decimal("100.00")
+        assert Decimal(gain["sale_proceeds"]) == Decimal("150.00")
+        assert Decimal(gain["capital_gain"]) == Decimal("50.00")
+
     def test_gain_no_remaining_shares(self, investment_book: Path):
         """Empty lot raises error."""
         book = GnuCashBook(str(investment_book))
