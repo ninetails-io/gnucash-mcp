@@ -20,6 +20,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _is_market_price,
     _to_date,
     _to_decimal,
     _verify_composite_write,
@@ -410,7 +411,7 @@ class BusinessMixin:
 
         for p in book.prices:
             # Skip piecash's auto-created post-invoice default rates.
-            if p.type == "transaction":
+            if not _is_market_price(p):
                 continue
 
             p_date = _to_date(p.date)

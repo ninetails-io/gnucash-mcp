@@ -48,6 +48,26 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+def _is_market_price(price) -> bool:
+    """True iff ``price`` is a real market quote, not a piecash auto-
+    placeholder.
+
+    On any cross-currency transaction, piecash auto-creates a Price
+    row with ``type='transaction'`` capturing the effective rate of
+    that one transaction. These are bookkeeping artifacts, NOT
+    user-supplied market quotes — every helper that walks
+    ``book.prices`` to value holdings or pick exchange rates must
+    skip them, or they shadow real quotes the user has on file.
+
+    Centralized here so the four call sites (core's ``_rates_as_of``
+    and ``_collect_warnings``, reporting's ``_latest_market_rates``,
+    and business's ``_find_exchange_rate``) all answer the question
+    the same way. Adding ``"transaction-currency"`` or any future
+    placeholder type only needs one change.
+    """
+    return getattr(price, "type", None) != "transaction"
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
