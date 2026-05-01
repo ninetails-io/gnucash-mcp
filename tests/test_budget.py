@@ -222,6 +222,82 @@ class TestSetBudgetAmount:
                 assert Decimal(acct["periods"][0]) == Decimal("700.00")
                 break
 
+    def test_subcent_amount_quantizes_consistently_on_insert_and_update(
+        self, budget_book: Path,
+    ):
+        """Sub-cent input quantizes to commodity precision and produces
+        identical stored values via the insert and update paths.
+
+        Pre-fix, the insert path did ``int(amount * 100)`` which
+        truncated; the update path used piecash's hybrid setter which
+        did not. Same input produced different stored values depending
+        on whether a row already existed.
+        """
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+
+        # Insert path (no existing row) — period 0
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="499.995",
+            period=0,
+        )
+
+        # Update path — set period 0 again with same input
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="499.995",
+            period=0,
+        )
+
+        # And on a fresh period — also insert path
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="499.995",
+            period=1,
+        )
+
+        budget = book.get_budget(compact=False, name="2026 Budget")
+        groceries = next(
+            a for a in budget["accounts"]
+            if a["account"] == "Expenses:Groceries"
+        )
+        # Banker's rounding: 499.995 → 500.00 (round half to even,
+        # 9 is odd → up to 10 → carry → 500.00).
+        expected = Decimal("500.00")
+        assert Decimal(groceries["periods"][0]) == expected
+        assert Decimal(groceries["periods"][1]) == expected
+        # Insert and update paths produce the same stored value.
+        assert groceries["periods"][0] == groceries["periods"][1]
+
+    def test_subcent_amount_truncation_does_not_silently_drop_digits(
+        self, budget_book: Path,
+    ):
+        """Larger sub-cent input rounds, doesn't truncate.
+
+        Pre-fix, ``int(Decimal('1234.567') * 100)`` truncated to
+        123456 → stored 1234.56 instead of rounding to 1234.57.
+        """
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="1234.567",
+            period=0,
+        )
+
+        budget = book.get_budget(compact=False, name="2026 Budget")
+        groceries = next(
+            a for a in budget["accounts"]
+            if a["account"] == "Expenses:Groceries"
+        )
+        assert Decimal(groceries["periods"][0]) == Decimal("1234.57")
+
     def test_set_nonexistent_budget_raises(self, budget_book: Path):
         """Setting amount on nonexistent budget raises ValueError."""
         book = GnuCashBook(str(budget_book))
