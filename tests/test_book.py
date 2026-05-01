@@ -5869,7 +5869,12 @@ class TestDeleteAccount:
         result = gc_book.delete_account("Expenses:To Delete")
 
         assert result["status"] == "deleted"
+        assert result["fullname"] == "Expenses:To Delete"
         assert gc_book.get_account("Expenses:To Delete") is None
+        # Pre-fix the response included a short-prefix ``guid`` that
+        # pointed at the just-deleted row (unresolvable). Now omitted
+        # so the LLM doesn't try to use a dangling handle.
+        assert "guid" not in result
 
     def test_delete_account_not_found(self, test_book: Path):
         """Should raise ValueError if account not found."""

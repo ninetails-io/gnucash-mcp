@@ -3343,13 +3343,17 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
 
-            # Capture info before deletion. Short guid computed against
-            # the remaining accounts (the target is still present here).
-            short_guid = _unique_prefix(
-                account.guid, (a.guid for a in book.accounts)
-            )
+            # Capture info before deletion. Pre-fix the response
+            # included a short-prefix GUID computed against
+            # ``book.accounts`` BEFORE the delete — but the LLM
+            # would receive a handle pointing at a row that no
+            # longer exists. ``_resolve_guid`` would then raise
+            # "No account" on any subsequent attempt to use it.
+            # Returning ``fullname`` and ``status="deleted"`` is
+            # enough for the audit-log human reader and the LLM to
+            # confirm what was deleted; the short GUID was always
+            # unaddressable post-delete and just invited misuse.
             result = {
-                "guid": short_guid,
                 "fullname": account.fullname,
                 "status": "deleted",
             }

@@ -1241,6 +1241,25 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
+            # Defense-in-depth: clear any previously-staged audit
+            # before-state at the TOP of the wrapper. The post-call
+            # consume (success branch) and the exception-path clear
+            # below are the primary cleanup paths, but if either one
+            # itself errors out (e.g., the book wrapper transiently
+            # unavailable), threading-local state can carry the
+            # previous tool's before-state into this one — and that
+            # tool would render an unrelated diff in its audit entry.
+            # Pre-clearing here means every tool starts with a clean
+            # threading-local slot regardless of what the previous
+            # call did.
+            if _get_book_func is not None:
+                try:
+                    pre_book = _get_book_func()
+                    if pre_book is not None:
+                        pre_book._consume_audit_before()
+                except Exception:
+                    pass
+
             # Normalize up front so pydantic models (e.g. list[SplitInput]
             # from the transaction-creating tools) become plain dicts before
             # they hit json.dumps in the debug line or the text-audit
