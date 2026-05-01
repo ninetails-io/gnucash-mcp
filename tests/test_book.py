@@ -6100,13 +6100,21 @@ class TestUpdateTransaction:
             )
 
     def test_update_splits_account_not_found(self, test_book: Path):
-        """Should raise ValueError if split account not in transaction."""
+        """Nonexistent split account raises ValueError.
+
+        The post-shortcut-resolution refactor surfaces "Account not
+        found: <ref>" earlier (before the transaction-membership
+        check) when the ref doesn't resolve at all. Existing
+        accounts that aren't in this particular transaction still
+        fall through to the per-transaction "Account not found in
+        transaction" check below the resolution step.
+        """
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.search_transactions("Groceries", compact=False)
         guid = transactions[0]["guid"]
 
-        with pytest.raises(ValueError, match="Account not found in transaction"):
+        with pytest.raises(ValueError, match="Account not found"):
             gc_book.update_transaction(
                 guid=guid,
                 splits=[
@@ -6214,6 +6222,104 @@ class TestUpdateTransaction:
 
 class TestReplaceSplits:
     """Tests for replace_splits method."""
+
+    def test_replace_splits_accepts_short_guid_account_refs(
+        self, test_book: Path,
+    ):
+        """``replace_splits`` accepts ``%xxxxxxx`` account shortcuts
+        (and full 32-char GUIDs) the same way every other tool does.
+        The new write verifier must resolve those refs before
+        comparing against the persisted ``Account.fullname``.
+
+        Pre-fix (bookkeeper finding from PR #75 review): the write
+        landed correctly but the verifier compared the raw input
+        ref to the canonical fullname, raising a false
+        ``RuntimeError`` like::
+
+            Transaction write verification failed: split for
+            '%77b59dd' not found post-save
+
+        Any LLM using shortcuts — which is the entire point of the
+        feature — would have hit this on every replace_splits call.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # Find the grocery transaction.
+        transactions = gc_book.search_transactions(
+            "Weekly Groceries", compact=False,
+        )
+        guid = transactions[0]["guid"]
+
+        # Build the ``%`` shortcut form — same shape the tool layer
+        # emits and the LLM passes back. ``list_accounts`` returns
+        # the full 32-char GUID; the shortcut is "%" + the first 7
+        # chars (the bookkeeper's exact failing input format).
+        accounts_list = gc_book.list_accounts(compact=False)
+        groceries_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Expenses:Groceries"
+        )
+        checking_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Assets:Checking"
+        )
+        groceries_short = "%" + groceries_full[:7]
+        checking_short = "%" + checking_full[:7]
+
+        # Replace using shortcuts — pre-fix this raised RuntimeError
+        # in the verifier. Post-fix it should land cleanly.
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": groceries_short, "amount": "150.00"},
+                {"account": checking_short, "amount": "-150.00"},
+            ],
+        )
+        assert result["status"] == "splits_replaced"
+
+        # Confirm the splits are on the canonical accounts.
+        txn = gc_book.get_transaction(guid)
+        accts = {s["account"] for s in txn["splits"]}
+        assert "Expenses:Groceries" in accts
+        assert "Assets:Checking" in accts
+
+    def test_update_transaction_accepts_short_guid_account_refs(
+        self, test_book: Path,
+    ):
+        """``update_transaction`` had the same shortcut-resolution
+        gap as ``replace_splits`` — the input dict was keyed by raw
+        ref, so a ``%shortguid`` input never matched
+        ``split.account.fullname`` and raised "Account not found in
+        transaction" even when the ref resolved cleanly. Closed in
+        the same fix.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        transactions = gc_book.search_transactions(
+            "Weekly Groceries", compact=False,
+        )
+        guid = transactions[0]["guid"]
+
+        accounts_list = gc_book.list_accounts(compact=False)
+        groceries_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Expenses:Groceries"
+        )
+        checking_full = next(
+            a["guid"] for a in accounts_list
+            if a["fullname"] == "Assets:Checking"
+        )
+        groceries_short = "%" + groceries_full[:7]
+        checking_short = "%" + checking_full[:7]
+
+        result = gc_book.update_transaction(
+            guid=guid,
+            splits=[
+                {"account": groceries_short, "amount": "75.00"},
+                {"account": checking_short, "amount": "-75.00"},
+            ],
+        )
+        assert result["status"] == "updated"
 
     def test_basic_replace_splits(self, test_book: Path):
         """Should replace splits with new accounts."""

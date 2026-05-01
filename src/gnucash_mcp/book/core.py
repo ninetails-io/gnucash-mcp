@@ -3506,18 +3506,40 @@ class CoreMixin:
                     f"expected {len(expected_splits)}"
                 )
             for expected in expected_splits:
-                acct = expected["account"]
-                if acct not in actual_by_acct:
+                # Normalize the input account ref to canonical
+                # fullname before lookup. The book methods accept
+                # full path, ``%short`` GUID, or full 32-char GUID;
+                # post-save splits are keyed by ``Account.fullname``.
+                # Pre-fix this comparison was string-vs-string against
+                # the raw input, so a shortcut input like ``%77b59dd``
+                # raised a false "split not found post-save" RuntimeError
+                # even though the write had landed correctly.
+                # (Bookkeeper finding from PR #75 review.)
+                ref = expected["account"]
+                resolved = self._resolve_account(book, ref)
+                if resolved is None:
                     raise RuntimeError(
                         f"Transaction write verification failed: "
-                        f"split for {acct!r} not found post-save"
+                        f"could not resolve split account ref "
+                        f"{ref!r} (resolution returned None — the "
+                        f"account may have been deleted between "
+                        f"save and verify)"
                     )
-                actual_value, actual_qty, actual_memo = actual_by_acct[acct]
+                acct_fullname = resolved.fullname
+                if acct_fullname not in actual_by_acct:
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split for {acct_fullname!r} (input "
+                        f"ref {ref!r}) not found post-save"
+                    )
+                actual_value, actual_qty, actual_memo = (
+                    actual_by_acct[acct_fullname]
+                )
                 ev = _to_decimal(expected["amount"])
                 if actual_value != ev:
                     raise RuntimeError(
                         f"Transaction write verification failed: "
-                        f"split {acct!r} value on disk is "
+                        f"split {acct_fullname!r} value on disk is "
                         f"{actual_value}, expected {ev}"
                     )
                 if "quantity" in expected:
@@ -3525,8 +3547,8 @@ class CoreMixin:
                     if actual_qty != eq:
                         raise RuntimeError(
                             f"Transaction write verification failed: "
-                            f"split {acct!r} quantity on disk is "
-                            f"{actual_qty}, expected {eq}"
+                            f"split {acct_fullname!r} quantity on "
+                            f"disk is {actual_qty}, expected {eq}"
                         )
 
     def update_transaction(
@@ -3607,8 +3629,23 @@ class CoreMixin:
                 if total != Decimal("0"):
                     raise ValueError(f"Splits do not balance: total is {total}")
 
-                # Build a map of account -> split data
-                split_updates = {s["account"]: s for s in splits}
+                # Build a map of canonical-fullname → split data.
+                # Resolve any input refs (path, ``%short``, full GUID)
+                # to the canonical Account so the lookup against
+                # existing splits' ``account.fullname`` works for all
+                # three input shapes. Pre-fix this dict was keyed by
+                # the raw input string, so a shortcut input like
+                # ``%77b59dd`` produced "Account not found in
+                # transaction" even though the ref resolved cleanly.
+                split_updates = {}
+                for s in splits:
+                    ref = s["account"]
+                    resolved = self._resolve_account(book, ref)
+                    if resolved is None:
+                        raise ValueError(
+                            f"Account not found: {ref}"
+                        )
+                    split_updates[resolved.fullname] = s
 
                 trans_currency = transaction.currency
 
