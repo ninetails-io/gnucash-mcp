@@ -40,6 +40,10 @@ htmlcov/
 *.gnucash
 *.gnucash.LCK
 *.gnucash.log
+# Sample books ship with the repo — exempt them from the global
+# ``*.gnucash`` ignore so they're tracked. Personal books outside
+# ``samples/`` remain ignored.
+!samples/*.gnucash
 
 # OS
 .DS_Store
