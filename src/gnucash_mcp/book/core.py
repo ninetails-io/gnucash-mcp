@@ -170,34 +170,44 @@ class CoreMixin:
             if account.placeholder:
                 continue
 
-            # Type gate. ASSET passes only when it has reconcilable
-            # history; the more common ASSET use cases (investment
-            # positions, real estate, vehicles) carry no 'y' or 'c'
-            # splits and rightly skip.
-            if account.type in self._RECONCILABLE_TYPES:
-                pass
-            elif account.type == "ASSET":
-                if not any(
-                    s.reconcile_state in ("y", "c")
-                    for s in account.splits
-                ):
-                    continue
-            else:
+            if account.type not in self._RECONCILABLE_TYPES \
+                    and account.type != "ASSET":
                 continue
 
-            if not account.splits:
-                # No activity at all — not "behind," just unused.
-                continue
-
-            # Most recent 'y' split's post_date wins the "through"
-            # date. 'c' (cleared) doesn't count — that's a partial
-            # state that hasn't been finalized to a statement.
+            # Single pass over splits — derive everything we need:
+            #   - latest_y_date (most recent reconciled split)
+            #   - has_yc (any 'y' or 'c' for the ASSET gate)
+            #   - any_splits (used vs. unused account)
+            # Pre-fix this method walked ``account.splits`` twice:
+            # once for the ASSET-passes-only-with-yc check, once
+            # for the latest-y_date scan, and (in some branches)
+            # a third time for the unreconciled count. One sweep
+            # collects everything; the count itself can't be
+            # computed up front because it depends on
+            # latest_y_date, but we capture all the inputs in the
+            # single pass and run the count after.
             latest_y_date = None
+            has_yc = False
+            any_splits = False
             for s in account.splits:
-                if s.reconcile_state == "y":
+                any_splits = True
+                rstate = s.reconcile_state
+                if rstate in ("y", "c"):
+                    has_yc = True
+                if rstate == "y":
                     pd = s.transaction.post_date
                     if latest_y_date is None or pd > latest_y_date:
                         latest_y_date = pd
+
+            # ASSET passes only when it has reconcilable history.
+            # Investment positions / real estate / vehicles carry
+            # no 'y' or 'c' splits and rightly skip.
+            if account.type == "ASSET" and not has_yc:
+                continue
+
+            if not any_splits:
+                # No activity at all — not "behind," just unused.
+                continue
 
             # Count unreconciled splits past the last 'y' date (or
             # all of them when never reconciled). This becomes the
@@ -803,19 +813,25 @@ class CoreMixin:
             except Exception:
                 pass
 
-        # ── 5. Stale prices ──
+        # ── 4. Stale prices ──
         stale_prices: list[str] = []
         try:
             in_use: set = set()
             for a in book.accounts:
                 if a.type != "ROOT":
                     in_use.add(a.commodity.guid)
-            for p in book.prices:
-                in_use.add(p.commodity.guid)
 
+            # Single pass over book.prices builds both signals we
+            # need: in-use commodities (every priced commodity is
+            # in-use even if no account holds it) and the latest
+            # market-price date per commodity. Pre-fix the method
+            # iterated ``book.prices`` twice — once for ``in_use``,
+            # once for ``by_commodity_latest`` — paying the ORM
+            # hydration cost twice on a book with hundreds of prices.
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
             for p in book.prices:
+                in_use.add(p.commodity.guid)
                 if not _is_market_price(p):
                     continue
                 p_date = p.date
@@ -856,7 +872,7 @@ class CoreMixin:
             # Per spec: skip failed checks, emit the rest.
             pass
 
-        # ── 4. Overdue scheduled transactions ──
+        # ── 5. Overdue scheduled transactions ──
         # Requires SchedulingMixin's helpers (_next_occurrence,
         # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
         # the attribute lookup degrades gracefully via getattr.
@@ -1226,9 +1242,18 @@ class CoreMixin:
                     # typical buys of foreign-commodity holdings).
                     # Same fallback the assets section uses, and
                     # the same one _compute_net_worth_at uses for
-                    # consistency.
+                    # consistency. Filter by ``post_date <= today``
+                    # so a future-dated entry doesn't inflate
+                    # runway's liquid count today (today's API only
+                    # asks "as of now"; the filter is defensive in
+                    # case a future caller passes an ``as_of``).
                     cost_basis = Decimal("0")
                     for split in account.splits:
+                        post_date = split.transaction.post_date
+                        if hasattr(post_date, "date") and callable(post_date.date):
+                            post_date = post_date.date()
+                        if post_date > today:
+                            continue
                         cost_basis += Decimal(str(split.value))
                     liquid += cost_basis
 
@@ -1387,9 +1412,16 @@ class CoreMixin:
         more naturally than "67 days behind." Below 60 days we stay
         in days for precision; the warning threshold itself is 45
         days, so the days-form covers the 45–59 window.
+
+        The month-count uses 30.44 days as the average month length
+        (365.25 / 12, accounting for leap years) so 91 days reads
+        as "3 months" and 60 days reads as "2 months" without the
+        off-by-one nudge that ``// 30`` produced (90 → 3 vs 91 → 3,
+        but 30 → 1 vs 60 → 2 was sharp; reasonable enough most of
+        the time but humans round to nearest unit, not floor).
         """
         if days_behind >= 60:
-            months = days_behind // 30
+            months = round(days_behind / 30.44)
             return f"({months} months behind)"
         return f"({days_behind} days behind)"
 

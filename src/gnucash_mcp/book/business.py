@@ -646,6 +646,16 @@ class BusinessMixin:
         Returns {} when no address data is set — caller should drop the
         whole "address" key rather than emit an empty dict, since
         _strip_noise leaves empty dicts in place.
+
+        **Note on round-trips:** if a caller passes ``fax`` to
+        ``create_customer`` / ``update_customer`` (and the symmetric
+        vendor / employee paths) the value is accepted by piecash
+        and stored on disk, but it does NOT round-trip back through
+        this serializer. ``get_customer`` / ``list_customers`` won't
+        return it. Intentional — fax exists in piecash's schema for
+        compatibility with old GnuCash books but isn't a field
+        modern bookkeepers use. If a real workflow needs fax
+        readback, this serializer would gain a ``fax`` line.
         """
         fields = {
             "name": entity.addr_name,
@@ -745,8 +755,21 @@ class BusinessMixin:
         """Convert a Decimal to numerator/denominator pair.
 
         Uses the decimal's exponent to determine appropriate denominator.
-        E.g., Decimal("25.50") -> (2550, 100)
+        E.g., ``Decimal("25.50")`` → ``(2550, 100)``.
+
+        Defensive normalization through ``Decimal(str(value))`` guards
+        against scientific-notation Decimals
+        (``Decimal("1.5E-3")``) where ``as_tuple().exp`` reports the
+        scientific exponent rather than the printed decimal places.
+        Practically unreachable from current call sites — entry
+        quantities and prices come through ``_to_decimal(str(...))``
+        which produces clean fixed-point Decimals — but the
+        normalization makes the helper safe in isolation if a
+        future caller hands in a sci-notation value.
         """
+        # Normalize: Decimal(str(value)) re-parses through the
+        # printed form, so 1.5E-3 becomes 0.0015 with exp=-4.
+        value = Decimal(str(value))
         sign, digits, exp = value.as_tuple()
         if exp < 0:
             denom = 10 ** (-exp)
@@ -2119,6 +2142,164 @@ class BusinessMixin:
             doc_id=bill_id,
         )
 
+    # owner_type → per-document config table for ``_add_entry``.
+    # Same dispatch idiom as ``_BUSINESS_DOC_CONFIG`` for create —
+    # one row per document kind, the helper below stays generic.
+    _ENTRY_CONFIG: dict[int, dict] = {
+        2: {  # customer invoice
+            "label": "Invoice",
+            "id_param": "invoice_id",
+            "twin_method": "add_bill_entry",
+            "twin_label": "vendor bill",
+            "allowed_types": frozenset({"INCOME"}),
+            "type_error_msg": (
+                "Invoice entry account must be INCOME (got {got} on "
+                "'{path}'). Customer invoices recognize revenue; "
+                "non-INCOME accounts produce valid-looking "
+                "transactions with broken posting math."
+            ),
+        },
+        4: {  # vendor bill
+            "label": "Bill",
+            "id_param": "bill_id",
+            "twin_method": "add_invoice_entry",
+            "twin_label": "customer invoice",
+            "allowed_types": frozenset({"EXPENSE", "ASSET"}),
+            "type_error_msg": (
+                "Bill entry account must be EXPENSE or ASSET (got "
+                "{got} on '{path}'). EXPENSE for normal line items, "
+                "ASSET for inventory purchases that capitalize."
+            ),
+        },
+    }
+
+    def _add_entry(
+        self,
+        owner_type: int,
+        doc_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+    ) -> dict:
+        """Shared implementation behind ``add_invoice_entry`` and
+        ``add_bill_entry``. The two methods were 90% duplicated
+        (the only differences: which side of the entries-table
+        column pair gets the price/account, the owner_type code,
+        the allowed account types, and the response id key). This
+        helper takes ``owner_type`` (2=customer invoice, 4=vendor
+        bill), looks up the per-doc config in ``_ENTRY_CONFIG``,
+        and writes the entry.
+        """
+        import uuid
+        from piecash.business.invoice import Entry
+
+        cfg = self._ENTRY_CONFIG[owner_type]
+        is_bill = owner_type == 4
+        qty = _to_decimal(quantity)
+        unit_price = _to_decimal(price)
+
+        with self.open(readonly=False) as book:
+            inv = self._find_invoice(
+                book, doc_id, owner_type=owner_type,
+            )
+            if not inv:
+                raise ValueError(
+                    f"{cfg['label']} not found: {doc_id}"
+                )
+            if inv.owner_type != owner_type:
+                raise ValueError(
+                    f"'{doc_id}' is a {cfg['twin_label']}, not a "
+                    f"{cfg['label'].lower()}. Use "
+                    f"{cfg['twin_method']} instead."
+                )
+            if _is_invoice_posted(inv):
+                raise ValueError(
+                    f"{cfg['label']} '{doc_id}' is already posted. "
+                    f"Cannot add entries to posted "
+                    f"{cfg['label'].lower()}s."
+                )
+
+            acct = self._resolve_account(book, account)
+            if not acct:
+                raise ValueError(f"Account not found: {account}")
+            if acct.type not in cfg["allowed_types"]:
+                raise ValueError(
+                    cfg["type_error_msg"].format(
+                        got=acct.type, path=account,
+                    )
+                )
+
+            q_num, q_denom = self._decimal_to_num_denom(qty)
+            p_num, p_denom = self._decimal_to_num_denom(unit_price)
+            entry_guid = uuid.uuid4().hex
+
+            # The Entries table has parallel ``i_*`` (invoice side)
+            # and ``b_*`` (bill side) column groups. Exactly one
+            # group carries values for any given entry; the other
+            # is zeroed/NULL.
+            if is_bill:
+                values = dict(
+                    i_acct=None, i_price_num=0, i_price_denom=1,
+                    invoice=None,
+                    b_acct=acct.guid, b_price_num=p_num,
+                    b_price_denom=p_denom, bill=inv.guid,
+                )
+            else:
+                values = dict(
+                    i_acct=acct.guid, i_price_num=p_num,
+                    i_price_denom=p_denom, invoice=inv.guid,
+                    b_acct=None, b_price_num=0, b_price_denom=1,
+                    bill=None,
+                )
+
+            book.session.execute(
+                Entry.__table__.insert().values(
+                    guid=entry_guid,
+                    date=datetime.now(),
+                    date_entered=datetime.now(),
+                    description=description,
+                    action="",
+                    notes="",
+                    quantity_num=q_num,
+                    quantity_denom=q_denom,
+                    i_discount_num=0,
+                    i_discount_denom=1,
+                    i_disc_type="",
+                    i_disc_how="",
+                    i_taxable=0,
+                    i_taxincluded=0,
+                    i_taxtable=None,
+                    b_taxable=0,
+                    b_taxincluded=0,
+                    b_taxtable=None,
+                    b_paytype=0,
+                    billable=0,
+                    billto_type=0,
+                    billto_guid=None,
+                    order_guid=None,
+                    **values,
+                )
+            )
+            _verify_write(
+                book.session, Entry.__table__, entry_guid,
+                f"{cfg['label']} entry '{description}' on "
+                f"{cfg['label'].lower()} {doc_id}",
+            )
+
+            book.save()
+
+            total = qty * unit_price
+            return {
+                "guid": entry_guid,
+                cfg["id_param"]: doc_id,
+                "description": description,
+                "quantity": str(qty),
+                "price": str(unit_price),
+                "total": str(total),
+                "status": "created",
+            }
+
     def add_invoice_entry(
         self,
         invoice_id: str,
@@ -2139,105 +2320,14 @@ class BusinessMixin:
         Returns:
             Dict with guid, invoice_id, total, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Entry
-
-        qty = _to_decimal(quantity)
-        unit_price = _to_decimal(price)
-
-        with self.open(readonly=False) as book:
-            inv = self._find_invoice(book, invoice_id, owner_type=2)
-            if not inv:
-                raise ValueError(f"Invoice not found: {invoice_id}")
-            if inv.owner_type != 2:
-                raise ValueError(
-                    f"'{invoice_id}' is a vendor bill, not a customer invoice. "
-                    f"Use add_bill_entry instead."
-                )
-            if _is_invoice_posted(inv):
-                raise ValueError(
-                    f"Invoice '{invoice_id}' is already posted. "
-                    f"Cannot add entries to posted invoices."
-                )
-
-            acct = self._resolve_account(book, account)
-            if not acct:
-                raise ValueError(f"Account not found: {account}")
-            # Reject account types that break the posting math
-            # silently. Customer invoices recognize revenue → entry
-            # account must be INCOME (or a related credit-natural
-            # type). Pre-fix any account was accepted: an ASSET on
-            # an invoice entry would post as ``debit asset`` against
-            # ``debit A/R`` — both debits, balance violated, but
-            # piecash builds the transaction anyway because the
-            # split values still sum to zero in the value column.
-            # Reports then show no income but a phantom asset
-            # increase.
-            if acct.type != "INCOME":
-                raise ValueError(
-                    f"Invoice entry account must be INCOME (got "
-                    f"{acct.type} on '{account}'). Customer invoices "
-                    f"recognize revenue; non-INCOME accounts produce "
-                    f"valid-looking transactions with broken "
-                    f"posting math."
-                )
-
-            q_num, q_denom = self._decimal_to_num_denom(qty)
-            p_num, p_denom = self._decimal_to_num_denom(unit_price)
-            entry_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Entry.__table__.insert().values(
-                    guid=entry_guid,
-                    date=datetime.now(),
-                    date_entered=datetime.now(),
-                    description=description,
-                    action="",
-                    notes="",
-                    quantity_num=q_num,
-                    quantity_denom=q_denom,
-                    i_acct=acct.guid,
-                    i_price_num=p_num,
-                    i_price_denom=p_denom,
-                    i_discount_num=0,
-                    i_discount_denom=1,
-                    invoice=inv.guid,
-                    i_disc_type="",
-                    i_disc_how="",
-                    i_taxable=0,
-                    i_taxincluded=0,
-                    i_taxtable=None,
-                    b_acct=None,
-                    b_price_num=0,
-                    b_price_denom=1,
-                    bill=None,
-                    b_taxable=0,
-                    b_taxincluded=0,
-                    b_taxtable=None,
-                    b_paytype=0,
-                    billable=0,
-                    billto_type=0,
-                    billto_guid=None,
-                    order_guid=None,
-                )
-            )
-            _verify_write(
-                book.session, Entry.__table__, entry_guid,
-                f"Invoice entry '{description}' on invoice {invoice_id}",
-            )
-
-            book.save()
-
-            total = qty * unit_price
-            return {
-                "guid": entry_guid,
-                "invoice_id": invoice_id,
-                "description": description,
-                "quantity": str(qty),
-                "price": str(unit_price),
-                "total": str(total),
-                "status": "created",
-            }
+        return self._add_entry(
+            owner_type=2,
+            doc_id=invoice_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+        )
 
     def add_bill_entry(
         self,
@@ -2259,100 +2349,14 @@ class BusinessMixin:
         Returns:
             Dict with guid, bill_id, total, status.
         """
-        import uuid
-        from piecash.business.invoice import Invoice, Entry
-
-        qty = _to_decimal(quantity)
-        unit_price = _to_decimal(price)
-
-        with self.open(readonly=False) as book:
-            inv = self._find_invoice(book, bill_id, owner_type=4)
-            if not inv:
-                raise ValueError(f"Bill not found: {bill_id}")
-            if inv.owner_type != 4:
-                raise ValueError(
-                    f"'{bill_id}' is a customer invoice, not a vendor bill. "
-                    f"Use add_invoice_entry instead."
-                )
-            if _is_invoice_posted(inv):
-                raise ValueError(
-                    f"Bill '{bill_id}' is already posted. "
-                    f"Cannot add entries to posted bills."
-                )
-
-            acct = self._resolve_account(book, account)
-            if not acct:
-                raise ValueError(f"Account not found: {account}")
-            # Bill entry accounts must be EXPENSE (typical line
-            # items) or ASSET (inventory purchases that capitalize
-            # rather than expense). LIABILITY/EQUITY/INCOME on a
-            # bill entry produces valid-looking transactions with
-            # broken posting math, same shape as the invoice-entry
-            # validation above.
-            if acct.type not in ("EXPENSE", "ASSET"):
-                raise ValueError(
-                    f"Bill entry account must be EXPENSE or ASSET "
-                    f"(got {acct.type} on '{account}'). EXPENSE for "
-                    f"normal line items, ASSET for inventory "
-                    f"purchases that capitalize."
-                )
-
-            q_num, q_denom = self._decimal_to_num_denom(qty)
-            p_num, p_denom = self._decimal_to_num_denom(unit_price)
-            entry_guid = uuid.uuid4().hex
-
-            book.session.execute(
-                Entry.__table__.insert().values(
-                    guid=entry_guid,
-                    date=datetime.now(),
-                    date_entered=datetime.now(),
-                    description=description,
-                    action="",
-                    notes="",
-                    quantity_num=q_num,
-                    quantity_denom=q_denom,
-                    i_acct=None,
-                    i_price_num=0,
-                    i_price_denom=1,
-                    i_discount_num=0,
-                    i_discount_denom=1,
-                    invoice=None,
-                    i_disc_type="",
-                    i_disc_how="",
-                    i_taxable=0,
-                    i_taxincluded=0,
-                    i_taxtable=None,
-                    b_acct=acct.guid,
-                    b_price_num=p_num,
-                    b_price_denom=p_denom,
-                    bill=inv.guid,
-                    b_taxable=0,
-                    b_taxincluded=0,
-                    b_taxtable=None,
-                    b_paytype=0,
-                    billable=0,
-                    billto_type=0,
-                    billto_guid=None,
-                    order_guid=None,
-                )
-            )
-            _verify_write(
-                book.session, Entry.__table__, entry_guid,
-                f"Bill entry '{description}' on bill {bill_id}",
-            )
-
-            book.save()
-
-            total = qty * unit_price
-            return {
-                "guid": entry_guid,
-                "bill_id": bill_id,
-                "description": description,
-                "quantity": str(qty),
-                "price": str(unit_price),
-                "total": str(total),
-                "status": "created",
-            }
+        return self._add_entry(
+            owner_type=4,
+            doc_id=bill_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+        )
 
     def list_invoices(
         self,

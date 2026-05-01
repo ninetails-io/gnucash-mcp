@@ -309,6 +309,20 @@ def _account_to_dict(account: piecash.Account) -> dict:
 
 
 # Mapping of top-level parent to "obvious" account types that need no annotation
+# Top-level account names paired with their default types — used by
+# ``_account_to_compact_line`` to suppress ``[TYPE]`` annotations
+# when the type is implied by the conventional GnuCash hierarchy
+# (``Assets:Checking [ASSET]`` reads as redundant noise; the
+# annotation only fires when the type DEPARTS from the convention,
+# e.g. ``Assets:Old Loan [LIABILITY]``).
+#
+# **Localization note:** keys are GnuCash's English defaults. Books
+# created with non-English chart-of-accounts templates ("Activos",
+# "Activités", "資産", etc.) won't match — every account in those
+# books gets the redundant ``[ASSET]`` annotation. Acceptable for
+# now (the bookkeeper's testing covers the English-default case);
+# a future localization pass would add lookup-by-account-type
+# instead of by-name.
 _DEFAULT_TYPES = {
     "Assets": {"ASSET"},
     "Liabilities": {"LIABILITY"},
@@ -704,9 +718,21 @@ class BaseGnuCashBook:
         Raises:
             FileNotFoundError: If the book path doesn't exist.
         """
-        self.book_path = Path(book_path)
-        if not self.book_path.exists():
+        # Resolve to an absolute path with ``..`` segments collapsed.
+        # The audit / debug / backups directories are derived from
+        # ``book_path.parent``; without resolution a path containing
+        # ``..`` would write logs and snapshots outside the
+        # bookkeeper's intended directory. ``Path.resolve(strict=True)``
+        # raises FileNotFoundError if the path doesn't exist, which
+        # subsumes the explicit existence check below.
+        try:
+            self.book_path = Path(book_path).resolve(strict=True)
+        except FileNotFoundError:
             raise FileNotFoundError(f"GnuCash book not found: {book_path}")
+        if not self.book_path.is_file():
+            raise FileNotFoundError(
+                f"GnuCash book path is not a regular file: {book_path}"
+            )
         # Thread-local staging buffer for audit-log before_state.
         # Write book methods call `_stage_audit_before(...)` while their
         # session is open; `@audit_log` reads it back via

@@ -16,6 +16,7 @@ from datetime import date
 from decimal import Decimal
 
 import piecash
+from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
@@ -205,15 +206,19 @@ class InvestmentsMixin:
                     book, currency,
                 )
 
-            # Check for existing price (same commodity/currency/date/source)
+            # Check for existing price (same commodity/currency/date/source).
+            # Indexed query — pre-fix this walked every price in the book
+            # for every create_price call. On a book with thousands of
+            # historical prices that's a measurable hot path.
+            from piecash.core.commodity import Price
+            candidates = book.session.query(Price).filter_by(
+                commodity_guid=comm.guid,
+                currency_guid=resolved_currency.guid,
+                source=source,
+            ).all()
             existing = None
-            for p in book.prices:
-                if (
-                    p.commodity == comm
-                    and p.currency == resolved_currency
-                    and _to_date(p.date) == price_date
-                    and p.source == source
-                ):
+            for p in candidates:
+                if _to_date(p.date) == price_date:
                     existing = p
                     break
 
@@ -289,15 +294,20 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
-            matches = []
-            for p in book.prices:
-                if p.commodity != comm:
-                    continue
-                if _to_date(p.date) != price_date:
-                    continue
-                if source is not None and p.source != source:
-                    continue
-                matches.append(p)
+            # Indexed query keyed on commodity (and source when set).
+            # The date filter stays in Python because piecash's date
+            # column is a DateTime under the hood; comparing on the
+            # date portion is awkward in raw SQLAlchemy.
+            from piecash.core.commodity import Price
+            filters = {"commodity_guid": comm.guid}
+            if source is not None:
+                filters["source"] = source
+            candidates = book.session.query(Price).filter_by(
+                **filters,
+            ).all()
+            matches = [
+                p for p in candidates if _to_date(p.date) == price_date
+            ]
 
             if len(matches) == 0:
                 raise ValueError(
@@ -383,10 +393,15 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
+            # Indexed query: filter by commodity_guid up front so we
+            # don't iterate every price in the book. Currency filter
+            # stays in Python because it's optional.
+            from piecash.core.commodity import Price
+            candidates = book.session.query(Price).filter_by(
+                commodity_guid=comm.guid,
+            ).all()
             prices = []
-            for p in book.prices:
-                if p.commodity != comm:
-                    continue
+            for p in candidates:
                 if currency and p.currency.mnemonic != currency:
                     continue
                 p_date = _to_date(p.date)
@@ -481,11 +496,14 @@ class InvestmentsMixin:
             if currency is None:
                 currency = self._require_default_currency(book).mnemonic
 
+            # Indexed query — only iterate prices for this commodity.
+            from piecash.core.commodity import Price
+            candidates = book.session.query(Price).filter_by(
+                commodity_guid=comm.guid,
+            ).all()
             latest = None
             latest_date = None
-            for p in book.prices:
-                if p.commodity != comm:
-                    continue
+            for p in candidates:
                 if p.currency.mnemonic != currency:
                     continue
                 # Skip piecash's auto-created ``type='transaction'``
@@ -520,7 +538,6 @@ class InvestmentsMixin:
 
     def _find_lot(self, book: piecash.Book, guid: str):
         """Find a lot by GUID (supports partial GUIDs, 8+ chars)."""
-        from piecash.core.transaction import Lot
 
         try:
             full_guid = self._resolve_guid("lots", guid)
@@ -585,16 +602,37 @@ class InvestmentsMixin:
         """Compute current state of a lot from its splits.
 
         Returns:
-            Dict with quantity, cost_basis, cost_per_share as strings.
+            Dict with quantity, cost_basis (alias for
+            remaining_cost_basis — kept for backward compat),
+            remaining_cost_basis, original_cost_basis,
+            cost_per_share, and is_closed.
+
+        Pre-fix the field name was just ``cost_basis`` (the
+        post-sale residual). After a partial sale the reading
+        ``cost_basis: $50`` on a lot bought for $100 was
+        ambiguous — was the lot bought for $50, or is $50 what's
+        left of the original cost? Now both fields ship; the
+        legacy ``cost_basis`` key keeps existing callers working.
         """
         raw = self._lot_decimals(lot)
+        remaining_cb = _format_number(
+            raw["remaining_cost_basis"], decimals=2,
+        )
+        original_cb = _format_number(
+            raw["purchase_value"], decimals=2,
+        )
         return {
             # Quantity is shares (or other commodity units): 4 decimals
             # is a good default for funds and stocks. Crypto callers
             # who need finer granularity get the same _format_number
             # logic at decimals=6 in their own paths.
             "quantity": _format_number(raw["remaining"], decimals=4),
-            "cost_basis": _format_number(raw["remaining_cost_basis"], decimals=2),
+            # Legacy: ``cost_basis`` returns the remaining (post-sale)
+            # value, same as before the rename. New callers should
+            # use ``remaining_cost_basis`` for clarity.
+            "cost_basis": remaining_cb,
+            "remaining_cost_basis": remaining_cb,
+            "original_cost_basis": original_cb,
             "cost_per_share": _format_number(raw["cost_per_share"], decimals=4),
             "is_closed": bool(lot.is_closed),
         }
@@ -621,7 +659,6 @@ class InvestmentsMixin:
         Raises:
             ValueError: If account not found.
         """
-        from piecash.core.transaction import Lot
 
         with self.open(readonly=False) as book:
             acct = self._resolve_account(book, account)
@@ -706,8 +743,6 @@ class InvestmentsMixin:
                 # _resolve_guid("lots", ...) searches the whole lots table,
                 # so the prefix map has to span every lot in the book — not
                 # just lots on this account.
-                from piecash.core.transaction import Lot
-
                 all_lot_guids = [
                     row[0]
                     for row in book.session.query(Lot.guid).all()
@@ -902,13 +937,17 @@ class InvestmentsMixin:
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
-                # Look up latest price inline (we're inside an open session)
+                # Look up latest price inline (we're inside an open
+                # session). Indexed by commodity so we don't iterate
+                # every price in the book.
                 commodity = lot.account.commodity
+                from piecash.core.commodity import Price
+                candidates = book.session.query(Price).filter_by(
+                    commodity_guid=commodity.guid,
+                ).all()
                 latest_price = None
                 latest_date = None
-                for p in book.prices:
-                    if p.commodity != commodity:
-                        continue
+                for p in candidates:
                     p_date = _to_date(p.date)
                     if latest_date is None or p_date > latest_date:
                         latest_date = p_date
@@ -972,7 +1011,6 @@ class InvestmentsMixin:
             lot.is_closed = -1
             book.save()
 
-            from piecash.core.transaction import Lot
 
             all_lot_guids = [
                 row[0] for row in book.session.query(Lot.guid).all()

@@ -597,7 +597,16 @@ class BackupMixin:
             would_keep.extend(keep)
             would_delete.extend(drop)
 
+        # Sort would_keep by stage-then-timestamp-desc so a multi-
+        # stage prune groups sessions/weeklies/monthlies together
+        # (newest-first within each stage). Pre-fix it was just
+        # timestamp-desc, which interleaved stages — readable for
+        # single-stage prunes, awkward for the ``stage=None`` (all
+        # auto stages) case. Two-pass stable sort: timestamp-desc
+        # first so the within-stage order is newest-first, then
+        # by stage to group.
         would_keep.sort(key=lambda e: e["timestamp"], reverse=True)
+        would_keep.sort(key=lambda e: e["stage"])
         would_delete.sort(key=lambda e: e["timestamp"], reverse=True)
 
         if dry_run:

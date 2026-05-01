@@ -1298,6 +1298,46 @@ class TestDeleteBill:
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
+    def test_invoice_and_bill_entry_share_helper(self, business_book):
+        """``add_invoice_entry`` and ``add_bill_entry`` are thin
+        wrappers over ``_add_entry``. Pre-fix they were ~110-line
+        duplicates; the dedup keeps the public surface and reduces
+        the duplication to a per-doc-config table.
+
+        Regression check: both methods still succeed end-to-end
+        with the same response shape they had before the dedup.
+        """
+        gb = GnuCashBook(str(business_book))
+
+        gb.create_customer(name="Customer One")
+        gb.create_invoice(customer_id="000001")
+        inv_result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Service",
+            quantity="1", price="100.00",
+        )
+        assert inv_result["status"] == "created"
+        assert inv_result["invoice_id"] == "000001"
+        assert Decimal(inv_result["total"]) == Decimal("100.00")
+
+        gb.create_vendor(name="Vendor One")
+        gb.create_bill(vendor_id="000001")
+        bill_result = gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="2", price="25.00",
+        )
+        assert bill_result["status"] == "created"
+        assert bill_result["bill_id"] == "000001"
+        assert Decimal(bill_result["total"]) == Decimal("50.00")
+
+        # Both responses carry the SAME shape (just different
+        # id-key name) — that's the dedup contract.
+        assert set(inv_result.keys()) - {"invoice_id"} == \
+            set(bill_result.keys()) - {"bill_id"}
+
     def test_rejects_non_income_account(self, business_book):
         """Invoice entries must post to INCOME accounts. Pre-fix any
         account type was accepted, producing transactions with
