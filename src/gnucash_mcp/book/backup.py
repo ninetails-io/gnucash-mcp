@@ -504,6 +504,33 @@ class BackupMixin:
                 f"Must be one of: {', '.join(sorted(_ALL_STAGE_NAMES))}"
             )
 
+        # Catastrophic-footgun guard. ``keep_last_n=0`` on the
+        # manual stage with ``dry_run=False`` deletes every
+        # human-marked backup the user has ever made, including
+        # "pre-tax-filing" / "pre-irreplaceable-thing" labels they
+        # explicitly preserved. Manual backups have unlimited
+        # retention BY DESIGN — this is the project's seatbelt
+        # against data loss. Refuse to wipe them all in one call;
+        # require the caller to step through deliberately (small
+        # keep_last_n + a label filter, or use ``dry_run=True`` to
+        # see the plan first). Auto-stage zero-retention is still
+        # allowed because those have policy-driven retention and
+        # the user can always rebuild them.
+        if (
+            stage == _MANUAL_STAGE_NAME
+            and keep_last_n == 0
+            and not dry_run
+        ):
+            raise ValueError(
+                "Refusing to delete every manual backup. Manual "
+                "backups have unlimited retention by design — they "
+                "include human-marked snapshots like "
+                "'pre-tax-filing' the user explicitly preserved. "
+                "Use dry_run=True to review the plan, or pass a "
+                "non-zero keep_last_n (e.g. keep_last_n=5 to keep "
+                "the 5 most recent manual backups)."
+            )
+
         all_backups = self.list_backups()
         by_stage: dict[str, list[dict]] = {}
         for entry in all_backups:

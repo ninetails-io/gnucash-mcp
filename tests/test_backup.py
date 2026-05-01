@@ -310,6 +310,46 @@ class TestPruneBackups:
         assert by_stage["manual"] == 5  # untouched
         assert by_stage["session"] == 2  # pruned to keep_last_n
 
+    def test_prune_refuses_to_wipe_all_manual_backups(self, test_book: Path):
+        """``prune_backups(keep_last_n=0, dry_run=False, stage="manual")``
+        must raise rather than wipe every human-marked backup.
+
+        Manual backups have unlimited retention BY DESIGN — they
+        include "pre-tax-filing" / "pre-irreplaceable-thing"
+        snapshots the user explicitly preserved. A misbehaving LLM
+        concluding "let me clean up old backups" would otherwise
+        nuke every one in a single call.
+        """
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="precious")
+        book.create_backup(stage="manual", label="also-precious")
+
+        with pytest.raises(ValueError, match="Refusing to delete every manual backup"):
+            book.prune_backups(keep_last_n=0, stage="manual", dry_run=False)
+
+        # All manual backups still on disk after the refusal.
+        manual_count = sum(
+            1 for e in book.list_backups() if e["stage"] == "manual"
+        )
+        assert manual_count == 2
+
+    def test_prune_dry_run_with_zero_manual_still_allowed(
+        self, test_book: Path,
+    ):
+        """The guard fires only on the destructive path.
+        ``dry_run=True`` — even with keep_last_n=0 manual — must
+        still produce a plan (so the user can SEE what would be
+        deleted before opting in)."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="check")
+
+        result = book.prune_backups(
+            keep_last_n=0, stage="manual", dry_run=True,
+        )
+        assert result["dry_run"] is True
+        # Plan shows the 1 manual would be deleted.
+        assert len(result["would_delete"]) == 1
+
     def test_prune_explicit_manual_stage_works(self, test_book: Path):
         """Explicit stage='manual' DOES prune manual backups."""
         book = GnuCashBook(str(test_book))
