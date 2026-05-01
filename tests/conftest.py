@@ -727,3 +727,278 @@ def investment_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+@pytest.fixture
+def business_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book with business-ready accounts.
+
+    Creates a USD-default book with:
+    - Assets:Checking (BANK, USD)
+    - Assets:Accounts Receivable (RECEIVABLE, USD)
+    - Liabilities:Accounts Payable (PAYABLE, USD)
+    - Income:Sales, Income:Consulting (INCOME, USD)
+    - Expenses:Office Supplies, Expenses:Services (EXPENSE, USD)
+    - Equity:Opening Balance (EQUITY, USD)
+    - Opening balance: $10000 in checking
+
+    No pre-existing customers/vendors — tests create their own.
+    """
+    book_path = tmp_path / "business_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    ar = piecash.Account(
+        name="Accounts Receivable", type="RECEIVABLE", parent=assets,
+        commodity=usd,
+    )
+    book.session.add(ar)
+
+    liabilities = piecash.Account(
+        name="Liabilities", type="LIABILITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(liabilities)
+
+    ap = piecash.Account(
+        name="Accounts Payable", type="PAYABLE", parent=liabilities,
+        commodity=usd,
+    )
+    book.session.add(ap)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    sales = piecash.Account(
+        name="Sales", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(sales)
+
+    consulting = piecash.Account(
+        name="Consulting", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(consulting)
+
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(expenses)
+
+    office_supplies = piecash.Account(
+        name="Office Supplies", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(office_supplies)
+
+    services = piecash.Account(
+        name="Services", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(services)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity, commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    t0 = piecash.Transaction(
+        currency=usd,
+        description="Opening Balance",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("10000")),
+            piecash.Split(account=opening, value=Decimal("-10000")),
+        ],
+    )
+    book.session.add(t0)
+
+    book.save()
+    book.close()
+
+    return book_path
+
+
+@pytest.fixture
+def debt_book(tmp_path: Path) -> Path:
+    """Create a GnuCash book with credit card and loan accounts for debt payoff testing.
+
+    Creates a USD-default book with:
+    - Assets:Checking (BANK, $10000)
+    - Liabilities:Visa (CREDIT, $4800 balance after $200 payment, APR 23.49%)
+    - Liabilities:Mastercard (CREDIT, $3000 balance, APR 18.99%)
+    - Liabilities:Car Loan (LIABILITY, $15000 balance, APR 6.5%)
+    - Expenses:Groceries (EXPENSE)
+    - Income:Salary (INCOME)
+    - Equity:Opening Balance (EQUITY)
+    - A payment transaction on Visa ($200 payment on 2026-02-15)
+
+    APR slots are set on debt accounts. minimum_payment slot set on Car Loan only.
+    credit_limit slot set on Visa only.
+    """
+    book_path = tmp_path / "debt_test.gnucash"
+
+    book = piecash.create_book(
+        str(book_path),
+        currency="USD",
+        overwrite=True,
+    )
+
+    root = book.root_account
+    usd = book.default_currency
+
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(assets)
+
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    book.session.add(checking)
+
+    liabilities = piecash.Account(
+        name="Liabilities", type="LIABILITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(liabilities)
+
+    visa = piecash.Account(
+        name="Visa", type="CREDIT", parent=liabilities, commodity=usd,
+    )
+    book.session.add(visa)
+
+    mastercard = piecash.Account(
+        name="Mastercard", type="CREDIT", parent=liabilities, commodity=usd,
+    )
+    book.session.add(mastercard)
+
+    car_loan = piecash.Account(
+        name="Car Loan", type="LIABILITY", parent=liabilities, commodity=usd,
+    )
+    book.session.add(car_loan)
+
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(income)
+
+    salary = piecash.Account(
+        name="Salary", type="INCOME", parent=income, commodity=usd,
+    )
+    book.session.add(salary)
+
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(expenses)
+
+    groceries = piecash.Account(
+        name="Groceries", type="EXPENSE", parent=expenses, commodity=usd,
+    )
+    book.session.add(groceries)
+
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    book.session.add(equity)
+
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity, commodity=usd,
+    )
+    book.session.add(opening)
+
+    book.save()
+
+    # Set APR slots on debt accounts
+    visa["apr"] = "23.49"
+    visa["credit_limit"] = "10000"
+    mastercard["apr"] = "18.99"
+    car_loan["apr"] = "6.50"
+    car_loan["minimum_payment"] = "350"
+
+    book.save()
+
+    # Visa: $5000 in charges
+    t1 = piecash.Transaction(
+        currency=usd,
+        description="Visa Charges",
+        post_date=date(2026, 1, 1),
+        splits=[
+            piecash.Split(account=visa, value=Decimal("-5000")),
+            piecash.Split(account=groceries, value=Decimal("5000")),
+        ],
+    )
+    book.session.add(t1)
+
+    # Mastercard: $3000 in charges
+    t2 = piecash.Transaction(
+        currency=usd,
+        description="Mastercard Charges",
+        post_date=date(2026, 1, 1),
+        splits=[
+            piecash.Split(account=mastercard, value=Decimal("-3000")),
+            piecash.Split(account=groceries, value=Decimal("3000")),
+        ],
+    )
+    book.session.add(t2)
+
+    # Car Loan: $15000 balance
+    t3 = piecash.Transaction(
+        currency=usd,
+        description="Car Loan",
+        post_date=date(2026, 1, 1),
+        splits=[
+            piecash.Split(account=car_loan, value=Decimal("-15000")),
+            piecash.Split(account=opening, value=Decimal("15000")),
+        ],
+    )
+    book.session.add(t3)
+
+    # Payment on Visa: $200 (reduces debt)
+    t4 = piecash.Transaction(
+        currency=usd,
+        description="Visa Payment",
+        post_date=date(2026, 2, 15),
+        splits=[
+            piecash.Split(account=visa, value=Decimal("200")),
+            piecash.Split(account=checking, value=Decimal("-200")),
+        ],
+    )
+    book.session.add(t4)
+
+    book.save()
+    book.close()
+
+    return book_path

@@ -10,6 +10,35 @@ import pytest
 from gnucash_mcp import server as server_module
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _load_all_extracted_tool_modules():
+    """Force-load all extracted tool modules and bind their tools to the server module.
+
+    After the modularization refactor, most tool wrappers live inside
+    register() closures in gnucash_mcp/tools/<module>.py and only appear
+    in the FastMCP registry when --modules enables them. Tests in this
+    file call tools directly via ``server_module.<tool_name>(...)``, so
+    we force-load all modules and bind each registered tool's underlying
+    function back onto the server module namespace.
+
+    Teardown removes the tools we added from the FastMCP registry so
+    later test modules (notably test_modules.py) see a clean state where
+    extracted tools are absent at import — preserving the lazy-loading
+    assertions.
+    """
+    pre_tools = dict(server_module.mcp._tool_manager._tools)
+    server_module._apply_module_filter("all")
+    for name, tool in server_module.mcp._tool_manager._tools.items():
+        if not hasattr(server_module, name):
+            setattr(server_module, name, tool.fn)
+    yield
+    # Restore registry to the pre-fixture state (setattr bindings stay;
+    # they're harmless module attributes no other test inspects)
+    added = set(server_module.mcp._tool_manager._tools.keys()) - set(pre_tools.keys())
+    for name in added:
+        del server_module.mcp._tool_manager._tools[name]
+
+
 @pytest.fixture
 def setup_book_env(test_book: Path, monkeypatch):
     """Set up environment with test book path."""
@@ -30,7 +59,10 @@ class TestGetBookSummaryTool:
         assert "Book:" in result
         assert "Currency: USD" in result
         assert "Accounts:" in result
-        assert "Net worth:" in result
+        # The bottom-line "Net worth:" line was retired in favor of
+        # the trajectory section's "now" anchor — single source of
+        # truth for the net-worth number.
+        assert "Net worth trajectory:" in result
 
 
 class TestListAccountsTool:
@@ -61,7 +93,10 @@ class TestListAccountsTool:
         result = server_module.list_accounts(root="Expenses")
         lines = result.strip().split("\n")
         for line in lines:
-            assert line.startswith("Expenses")
+            # Compact line format: '%shortguid<TAB>fullname [ANNOTATION]'.
+            # Pull the path portion off before checking the prefix.
+            path = line.split("\t", 1)[1] if "\t" in line else line
+            assert path.startswith("Expenses")
 
     def test_list_accounts_root_with_verbose(self, setup_book_env):
         """root + verbose should return filtered JSON."""
@@ -95,13 +130,17 @@ class TestGetBalanceTool:
     """Tests for get_balance tool."""
 
     def test_get_balance_current(self, setup_book_env):
-        """Should return current balance."""
+        """Should return current balance with today's date as the resolved cutoff."""
+        from datetime import date as date_cls
+
         result = server_module.get_balance("Assets:Checking")
 
         data = json.loads(result)
         assert data["account"] == "Assets:Checking"
         assert data["balance"] == "2850"
-        assert data["as_of_date"] == "current"
+        # Resolved date is today's ISO string — future-dated transactions
+        # would be excluded from the cutoff.
+        assert data["as_of_date"] == date_cls.today().isoformat()
 
     def test_get_balance_as_of_date(self, setup_book_env):
         """Should return balance as of date."""
@@ -110,6 +149,34 @@ class TestGetBalanceTool:
         data = json.loads(result)
         assert data["balance"] == "1000"
         assert data["as_of_date"] == "2024-01-10"
+
+    def test_get_balance_short_guid_input_echoes_canonical(
+        self, setup_book_env
+    ):
+        """When called with a %short GUID, the response echoes the
+        canonical full path — not the input string.
+
+        Locks the bookkeeper-flagged inconsistency: prior to this fix,
+        get_balance echoed whatever came in (so %xxxxxxx flowed back
+        into the response), making it the odd one out among the tools
+        that always returned the readable path.
+        """
+        # Find Checking's short GUID by pulling list_accounts and
+        # picking the line with our path.
+        listing = server_module.list_accounts()
+        checking_line = next(
+            line for line in listing.split("\n")
+            if "Assets:Checking" in line and "[BANK]" in line
+        )
+        short = checking_line.split("\t", 1)[0]
+        assert short.startswith("%")
+
+        result = server_module.get_balance(short)
+        data = json.loads(result)
+        assert data["account"] == "Assets:Checking", (
+            f"expected canonical fullname echo, got {data['account']!r}"
+        )
+        assert data["balance"] == "2850"
 
 
 class TestListTransactionsTool:
@@ -147,7 +214,7 @@ class TestGetTransactionTool:
 
     def test_get_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
-        result = server_module.get_transaction("nonexistent_guid")
+        result = server_module.get_transaction("deadbeef00000000")
 
         data = json.loads(result)
         assert "error" in data
@@ -170,7 +237,8 @@ class TestCreateTransactionTool:
         data = json.loads(result)
         assert "guid" in data
         assert data["status"] == "created"
-        assert len(data["guid"]) == 32
+        # Response guid is now a short collision-safe prefix (>=8 chars).
+        assert len(data["guid"]) >= 8
 
     def test_create_unbalanced_transaction(self, setup_book_env):
         """Should return error for unbalanced splits."""
@@ -244,9 +312,12 @@ class TestCreateTransactionTool:
         )
 
         data = json.loads(result)
+        # dry_run responses no longer echo the proposal back — the caller
+        # knows what they submitted; response carries only new info
+        # (warnings, duplicates, auto_filled_from).
         assert data["dry_run"] is True
-        assert data["proposed_transaction"]["description"] == "Dry Run Server Test"
-        assert "guid" not in data
+        assert "proposed_transaction" not in data
+        assert "guid" not in data  # no transaction was written
 
     def test_create_transaction_auto_fill(self, setup_book_env):
         """Should auto-fill splits from matching transaction."""
@@ -407,7 +478,8 @@ class TestDeleteTransactionTool:
 
         data = json.loads(result)
         assert data["status"] == "deleted"
-        assert data["guid"] == guid
+        # Response is a short collision-safe prefix of the full guid.
+        assert guid.startswith(data["guid"])
 
         # Verify it's gone
         get_result = server_module.get_transaction(guid)
@@ -441,7 +513,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
-        result = server_module.delete_transaction("nonexistent_guid_12345")
+        result = server_module.delete_transaction("deadbeef00000000")
 
         data = json.loads(result)
         assert "error" in data
@@ -502,7 +574,7 @@ class TestUpdateTransactionTool:
     def test_update_nonexistent_transaction(self, setup_book_env):
         """Should return error for missing transaction."""
         result = server_module.update_transaction(
-            guid="nonexistent_guid_12345",
+            guid="deadbeef00000000",
             description="New Description",
         )
 
@@ -601,8 +673,10 @@ class TestReplaceSplitsTool:
         )
 
         data = json.loads(result)
+        # Thin response — no splits echo. Verify via get_transaction.
         assert data["status"] == "splits_replaced"
-        accounts = {s["account"] for s in data["splits"]}
+        refreshed = json.loads(server_module.get_transaction(guid))
+        accounts = {s["account"] for s in refreshed["splits"]}
         assert "Expenses:Dining" in accounts
         assert "Expenses:Groceries" not in accounts
 
@@ -672,8 +746,13 @@ class TestSetReconcileStateTool:
         result = server_module.set_reconcile_state(split_guid, "c")
 
         data = json.loads(result)
+        # `reconcile_state` echo dropped — verified through read-back.
         assert data["status"] == "updated"
-        assert data["reconcile_state"] == "c"
+        refreshed = json.loads(server_module.list_transactions(verbose=True))
+        updated_split = next(
+            s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
+        )
+        assert updated_split["reconcile_state"] == "c"
 
     def test_set_reconcile_state_invalid(self, setup_book_env):
         """Should return error for invalid state."""
@@ -885,11 +964,20 @@ class TestErrorHandling:
         assert "Close GnuCash" in data["suggestion"]
 
     def test_unexpected_error_handling(self, setup_book_env):
-        """Should handle unexpected errors gracefully."""
-        # Patch to raise an unexpected error
+        """Should handle unexpected errors gracefully.
+
+        Patches the underlying GnuCashBook.list_accounts method rather
+        than server_module.get_book — after the modularization refactor,
+        tool wrappers are closures in gnucash_mcp/tools/core.py and the
+        ``get_book`` they call was captured at register time, so
+        ``patch.object(server_module, "get_book", ...)`` no longer
+        intercepts it. Patching the book method achieves the same end:
+        the tool raises unexpectedly, safe_tool catches it.
+        """
+        book = server_module.get_book()
         with patch.object(
-            server_module,
-            "get_book",
+            type(book),
+            "list_accounts",
             side_effect=RuntimeError("Unexpected error"),
         ):
             result = server_module.list_accounts()
@@ -904,12 +992,21 @@ class TestSpendingByCategoryTool:
     """Tests for spending_by_category tool."""
 
     def test_spending_by_category(self, setup_book_env):
-        """Should return spending breakdown."""
+        """Compact (default) returns aligned text table."""
         result = server_module.spending_by_category(
             start_date="2024-01-01",
             end_date="2024-12-31",
         )
+        # New default is compact text — has TOTAL line.
+        assert "TOTAL" in result
 
+    def test_spending_by_category_verbose(self, setup_book_env):
+        """Verbose returns the structured dict."""
+        result = server_module.spending_by_category(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            verbose=True,
+        )
         data = json.loads(result)
         assert "total" in data
         assert "categories" in data
@@ -919,12 +1016,20 @@ class TestIncomeBySourcTool:
     """Tests for income_by_source tool."""
 
     def test_income_by_source(self, setup_book_env):
-        """Should return income breakdown."""
+        """Compact (default) returns aligned text table."""
         result = server_module.income_by_source(
             start_date="2024-01-01",
             end_date="2024-12-31",
         )
+        assert "TOTAL" in result
 
+    def test_income_by_source_verbose(self, setup_book_env):
+        """Verbose returns the structured dict."""
+        result = server_module.income_by_source(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            verbose=True,
+        )
         data = json.loads(result)
         assert "total" in data
         assert "sources" in data
@@ -976,9 +1081,9 @@ class TestCashFlowTool:
         )
 
         data = json.loads(result)
+        # `net` dropped — derivable (inflows - outflows).
         assert "inflows" in data
         assert "outflows" in data
-        assert "net" in data
 
 
 class TestListCommoditiesTool:
@@ -1129,3 +1234,47 @@ class TestCreateTransactionMultiCurrencyTool:
 
         data = json.loads(result)
         assert data["status"] == "created"
+
+
+class TestNonAsciiJsonEncoding:
+    """Bug 1 from the CNY cousin verification: ``_json`` (the
+    serializer every tool wrapper uses) was hitting Python's default
+    ``json.dumps(ensure_ascii=True)``, escaping non-ASCII characters
+    like 贵州茅台 as ``\\uXXXX`` in tool responses. Storage was correct
+    (the audit log renders Chinese natively); only the wire format
+    was wrong, breaking human readability and downstream substring
+    matching.
+    """
+
+    def test_chinese_commodity_name_returns_raw_utf8(
+        self, setup_book_env,
+    ):
+        result = server_module.create_commodity(
+            mnemonic="600519",
+            fullname="贵州茅台 (Kweichow Moutai)",
+            namespace="SSE",
+            fraction=100,
+        )
+        # Raw Chinese characters, not \uXXXX escape sequences.
+        assert "贵州茅台" in result, (
+            f"non-ASCII characters were escaped:\n{result}"
+        )
+        # Still valid JSON.
+        data = json.loads(result)
+        assert data["fullname"] == "贵州茅台 (Kweichow Moutai)"
+
+    def test_accented_european_characters_round_trip(
+        self, setup_book_env,
+    ):
+        # Same bug, different alphabet — accented Latin (German
+        # umlauts, French accents) gets escaped without ensure_ascii=False.
+        result = server_module.create_commodity(
+            mnemonic="MÜNCH",
+            fullname="Münchener Rückversicherungs-Gesellschaft",
+            namespace="XETRA",
+            fraction=100,
+        )
+        assert "Münchener" in result
+        assert "Rückversicherungs" in result
+        data = json.loads(result)
+        assert data["fullname"] == "Münchener Rückversicherungs-Gesellschaft"

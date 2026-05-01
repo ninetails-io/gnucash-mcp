@@ -29,7 +29,7 @@ class TestCreateBudget:
         assert result["guid"]  # non-empty GUID
 
         # Verify via get_budget
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert budget is not None
         assert budget["num_periods"] == 12
         assert budget["period_type"] == "monthly"
@@ -48,7 +48,7 @@ class TestCreateBudget:
 
         assert result["status"] == "created"
 
-        budget = book.get_budget("Q Budget")
+        budget = book.get_budget(compact=False, name="Q Budget")
         assert budget["num_periods"] == 4
         assert budget["period_type"] == "quarterly"
 
@@ -64,7 +64,7 @@ class TestCreateBudget:
 
         assert result["status"] == "created"
 
-        budget = book.get_budget("Weekly Budget")
+        budget = book.get_budget(compact=False, name="Weekly Budget")
         assert budget["num_periods"] == 52
         assert budget["period_type"] == "weekly"
 
@@ -116,13 +116,13 @@ class TestSetBudgetAmount:
             amount="500.00",
         )
 
+        # Response is thin — only the computed periods_set and status.
+        # Inputs (budget, account, amount) come from tool params.
         assert result["status"] == "updated"
-        assert result["account"] == "Expenses:Groceries"
-        assert result["amount"] == "500.00"
         assert len(result["periods_set"]) == 12
 
         # Verify via get_budget
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         grocery_amounts = None
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
@@ -147,7 +147,7 @@ class TestSetBudgetAmount:
 
         assert result["periods_set"] == [0]
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         grocery_amounts = None
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
@@ -171,6 +171,30 @@ class TestSetBudgetAmount:
 
         assert result["periods_set"] == [0, 1, 2]
 
+    def test_set_single_period_numeric_string(self, budget_book: Path):
+        """Numeric-string periods coerce to int (MCP XML param layer passes strings)."""
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+
+        # "11" should behave identically to 11.
+        result = book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="800.00",
+            period="11",
+        )
+
+        assert result["periods_set"] == [11]
+
+        budget = book.get_budget(compact=False, name="2026 Budget")
+        grocery_amounts = None
+        for acct in budget["accounts"]:
+            if acct["account"] == "Expenses:Groceries":
+                grocery_amounts = acct["periods"]
+                break
+        assert grocery_amounts is not None
+        assert Decimal(grocery_amounts[11]) == Decimal("800.00")
+
     def test_overwrite_existing_amount(self, budget_book: Path):
         """Overwriting an existing budget amount works."""
         book = GnuCashBook(str(budget_book))
@@ -192,7 +216,7 @@ class TestSetBudgetAmount:
             period=0,
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
                 assert Decimal(acct["periods"][0]) == Decimal("700.00")
@@ -247,7 +271,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,  # January 2026
         )
@@ -288,7 +312,7 @@ class TestGetBudgetReport:
             amount="300.00",
         )
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -308,7 +332,7 @@ class TestGetBudgetReport:
         self._create_budget_with_amounts(book)
 
         # Period 2 = March 2026, no transactions exist
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=2,
         )
@@ -322,7 +346,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=1,  # February 2026
         )
@@ -344,7 +368,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period="all",
         )
@@ -370,7 +394,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
             account="Expenses:Groceries",
@@ -384,7 +408,7 @@ class TestGetBudgetReport:
         book = GnuCashBook(str(budget_book))
         self._create_budget_with_amounts(book)
 
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -394,12 +418,144 @@ class TestGetBudgetReport:
         assert Decimal(report["totals"]["actual"]) == Decimal("650")
         assert Decimal(report["totals"]["remaining"]) == Decimal("150")
 
+    def test_parent_placeholder_rolls_up_children_actuals(
+        self, budget_book: Path
+    ):
+        """Budget set on a parent placeholder sums children's actuals.
+
+        Adds `Expenses:Utilities` (placeholder) with children
+        `Electric` + `Gas`. Budget $450 on the parent only. Post a
+        $95 charge to Electric and $65 to Gas. Report should show
+        `Expenses:Utilities` actual = $160 — not $0.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            expenses = next(a for a in b.accounts if a.fullname == "Expenses")
+            checking = next(a for a in b.accounts if a.fullname == "Assets:Checking")
+            utilities = piecash.Account(
+                name="Utilities", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            electric = piecash.Account(
+                name="Electric", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            gas = piecash.Account(
+                name="Gas", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            piecash.Transaction(
+                currency=usd, description="Electric bill",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-95")),
+                    piecash.Split(account=electric, value=Decimal("95")),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Gas bill",
+                post_date=_date(2026, 1, 20),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-65")),
+                    piecash.Split(account=gas, value=Decimal("65")),
+                ],
+            )
+            b.save()
+
+        gc.create_budget(name="Util Budget", year=2026, num_periods=12)
+        gc.set_budget_amount(
+            budget_name="Util Budget",
+            account="Expenses:Utilities",
+            amount="450.00",
+            period=0,
+        )
+
+        report = gc.get_budget_report(compact=False,
+            budget_name="Util Budget",
+            period=0,
+        )
+        util_line = next(
+            a for a in report["accounts"]
+            if a["account"] == "Expenses:Utilities"
+        )
+        assert Decimal(util_line["budgeted"]) == Decimal("450")
+        assert Decimal(util_line["actual"]) == Decimal("160")
+        assert Decimal(util_line["remaining"]) == Decimal("290")
+
+    def test_separately_budgeted_child_does_not_double_count(
+        self, budget_book: Path
+    ):
+        """When both a parent and a child are budgeted, the child's
+        actuals stay on its own line — the parent only collects
+        actuals from its *non-budgeted* descendants.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            expenses = next(a for a in b.accounts if a.fullname == "Expenses")
+            checking = next(a for a in b.accounts if a.fullname == "Assets:Checking")
+            utilities = piecash.Account(
+                name="Utilities", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            electric = piecash.Account(
+                name="Electric", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            gas = piecash.Account(
+                name="Gas", type="EXPENSE", parent=utilities,
+                commodity=usd,
+            )
+            piecash.Transaction(
+                currency=usd, description="Electric",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-95")),
+                    piecash.Split(account=electric, value=Decimal("95")),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Gas",
+                post_date=_date(2026, 1, 20),
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("-65")),
+                    piecash.Split(account=gas, value=Decimal("65")),
+                ],
+            )
+            b.save()
+
+        gc.create_budget(name="Mixed Budget", year=2026, num_periods=12)
+        # Parent budget of $450 + child Electric explicitly budgeted $100.
+        # Electric's $95 actual should stay on Electric, not roll up.
+        # Only Gas's $65 should roll up to the parent.
+        gc.set_budget_amount(
+            budget_name="Mixed Budget",
+            account="Expenses:Utilities", amount="450", period=0,
+        )
+        gc.set_budget_amount(
+            budget_name="Mixed Budget",
+            account="Expenses:Utilities:Electric", amount="100", period=0,
+        )
+        report = gc.get_budget_report(compact=False,
+            budget_name="Mixed Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        assert Decimal(by_acct["Expenses:Utilities"]["actual"]) == Decimal("65")
+        assert Decimal(by_acct["Expenses:Utilities:Electric"]["actual"]) == Decimal("95")
+
     def test_report_nonexistent_budget_raises(self, budget_book: Path):
         """Reporting on nonexistent budget raises ValueError."""
         book = GnuCashBook(str(budget_book))
 
         with pytest.raises(ValueError, match="Budget not found"):
-            book.get_budget_report(budget_name="Nonexistent", period=0)
+            book.get_budget_report(compact=False,budget_name="Nonexistent", period=0)
 
 
 # ============== TestListAndGetBudget ==============
@@ -411,7 +567,7 @@ class TestListAndGetBudget:
     def test_list_empty(self, budget_book: Path):
         """Listing budgets on a book with no budgets returns empty list."""
         book = GnuCashBook(str(budget_book))
-        result = book.list_budgets()
+        result = book.list_budgets(compact=False)
         assert result == []
 
     def test_list_single_budget(self, budget_book: Path):
@@ -419,7 +575,7 @@ class TestListAndGetBudget:
         book = GnuCashBook(str(budget_book))
         book.create_budget(name="2026 Budget", year=2026, num_periods=12)
 
-        result = book.list_budgets()
+        result = book.list_budgets(compact=False)
         assert len(result) == 1
         assert result[0]["name"] == "2026 Budget"
         assert result[0]["num_periods"] == 12
@@ -442,7 +598,7 @@ class TestListAndGetBudget:
             period=1,
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert budget is not None
         assert len(budget["accounts"]) == 1
         assert budget["accounts"][0]["account"] == "Expenses:Groceries"
@@ -452,7 +608,7 @@ class TestListAndGetBudget:
     def test_get_nonexistent_returns_none(self, budget_book: Path):
         """get_budget returns None for nonexistent budget."""
         book = GnuCashBook(str(budget_book))
-        assert book.get_budget("Nonexistent") is None
+        assert book.get_budget(compact=False, name="Nonexistent") is None
 
 
 # ============== TestDeleteBudget ==============
@@ -471,8 +627,8 @@ class TestDeleteBudget:
         assert result["name"] == "2026 Budget"
 
         # Verify it's gone
-        assert book.get_budget("2026 Budget") is None
-        assert book.list_budgets() == []
+        assert book.get_budget(compact=False, name="2026 Budget") is None
+        assert book.list_budgets(compact=False) == []
 
     def test_delete_with_amounts(self, budget_book: Path):
         """Delete a budget with amounts (cascade delete)."""
@@ -486,7 +642,7 @@ class TestDeleteBudget:
 
         result = book.delete_budget("2026 Budget")
         assert result["status"] == "deleted"
-        assert book.list_budgets() == []
+        assert book.list_budgets(compact=False) == []
 
     def test_delete_nonexistent_raises(self, budget_book: Path):
         """Deleting a nonexistent budget raises ValueError."""
@@ -533,16 +689,16 @@ class TestBudgetIntegration:
         )
 
         # Verify listing
-        budgets = book.list_budgets()
+        budgets = book.list_budgets(compact=False)
         assert len(budgets) == 1
         assert budgets[0]["name"] == "2026 Budget"
 
         # Get full budget details
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         assert len(budget["accounts"]) == 3
 
         # Get January report
-        report = book.get_budget_report(
+        report = book.get_budget_report(compact=False,
             budget_name="2026 Budget",
             period=0,
         )
@@ -580,7 +736,7 @@ class TestBudgetIntegration:
             period="q4",
         )
 
-        budget = book.get_budget("2026 Budget")
+        budget = book.get_budget(compact=False, name="2026 Budget")
         for acct in budget["accounts"]:
             if acct["account"] == "Expenses:Groceries":
                 # Q1-Q3 (periods 0-8) should be $500

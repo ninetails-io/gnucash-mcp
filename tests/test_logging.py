@@ -5,16 +5,34 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from gnucash_mcp.logging_config import (
     AUDIT_LOGGER_NAME,
     DEBUG_LOGGER_NAME,
+    _resolve_entry_field,
     audit_log,
     setup_logging,
 )
+
+
+class _StagedBook:
+    """Fake GnuCashBook that yields a pre-set before-state once.
+
+    Used by tests that need to inject before_state into `@audit_log`
+    without opening a real book. Mirrors the contract of
+    `BaseGnuCashBook._consume_audit_before`: returns the staged dict
+    on first call, clears itself so subsequent calls return None.
+    """
+
+    def __init__(self, state: dict | None):
+        self._state = state
+
+    def _consume_audit_before(self) -> dict | None:
+        state = self._state
+        self._state = None
+        return state
 
 
 @pytest.fixture
@@ -77,93 +95,42 @@ class TestSetupLogging:
 
 
 class TestAuditLogDecorator:
-    """Tests for the audit_log decorator (JSON format)."""
+    """Tests for the audit_log decorator's error and write handling."""
 
-    def test_read_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify read tool calls are logged with params (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
-
-        @audit_log(classification="read")
-        def test_read_tool(account_name: str) -> str:
-            return json.dumps({"balance": "100.00"})
-
-        result = test_read_tool(account_name="Assets:Checking")
-
-        # Read the log file
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        assert log_file.exists()
-
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
-        assert len(entries) >= 1
-
-        entry = entries[-1]
-        assert entry["tool"] == "test_read_tool"
-        assert entry["classification"] == "read"
-        assert entry["params"] == {"account_name": "Assets:Checking"}
-        assert entry["result"] == "success"
-        assert "before_state" not in entry
-        assert "after_state" not in entry
-
-    def test_write_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify write tool calls are logged with operation and entity_type (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+    def test_raising_tool_logged_as_error(self, temp_book_path, temp_log_dir):
+        """A tool raising an exception writes an ERROR line to the text audit log."""
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="create", entity_type="transaction")
-        def test_create_tool(description: str) -> str:
-            return json.dumps({"guid": "abc123", "status": "created"})
-
-        result = test_create_tool(description="Test transaction")
-
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
-
-        entry = entries[-1]
-        assert entry["tool"] == "test_create_tool"
-        assert entry["classification"] == "write"
-        assert entry["operation"] == "create"
-        assert entry["entity_type"] == "transaction"
-        assert entry["result"] == "success"
-        assert entry["entity_guid"] == "abc123"
-
-    def test_failed_tool_logged(self, temp_book_path, temp_log_dir):
-        """Verify failed tool calls are logged with error (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
-
-        @audit_log(classification="read")
-        def test_failing_tool(name: str) -> str:
+        def test_failing_tool(description: str) -> str:
             raise ValueError("Account not found")
 
         with pytest.raises(ValueError):
-            test_failing_tool(name="Nonexistent")
+            test_failing_tool(description="bad")
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        entry = entries[-1]
-        assert entry["tool"] == "test_failing_tool"
-        assert entry["result"] == "error"
-        assert entry["error"] == "Account not found"
+        assert "ERROR  test_failing_tool: Account not found" in content
 
-    def test_error_json_response_logged_as_error(self, temp_book_path, temp_log_dir):
-        """Verify tools returning JSON with 'error' key are logged as errors (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+    def test_write_tool_logged(self, temp_book_path, temp_log_dir):
+        """Successful write tools emit a CREATE/UPDATE/etc. header line."""
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
-        @audit_log(classification="read")
-        def test_error_response(name: str) -> str:
-            return json.dumps({"error": "Not found", "error_type": "not_found"})
+        @audit_log(classification="write", operation="create", entity_type="transaction")
+        def test_create_tool(description: str) -> str:
+            return json.dumps({"guid": "abc123", "description": description})
 
-        result = test_error_response(name="Bad")
+        test_create_tool(description="Test transaction")
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        entry = entries[-1]
-        assert entry["result"] == "error"
-        assert entry["error"] == "Not found"
+        assert "CREATE TRANSACTION" in content
+        assert "guid:abc123" in content
+        assert "Test transaction" in content
 
 
 class TestDebugLogging:
@@ -209,20 +176,9 @@ class TestDebugLogging:
 class TestTextFormat:
     """Tests for text format audit logging."""
 
-    def test_text_format_creates_txt_file(self, temp_book_path, temp_log_dir):
-        """Verify text format creates .txt file, not .jsonl."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
-
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        txt_file = temp_log_dir / "audit" / f"{today}.txt"
-        jsonl_file = temp_log_dir / "audit" / f"{today}.jsonl"
-
-        assert txt_file.exists()
-        assert not jsonl_file.exists()
-
     def test_text_format_has_header(self, temp_book_path, temp_log_dir):
         """Verify text format file has proper header."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         txt_file = temp_log_dir / "audit" / f"{today}.txt"
@@ -233,7 +189,7 @@ class TestTextFormat:
 
     def test_text_format_logs_write_operations(self, temp_book_path, temp_log_dir):
         """Verify text format logs write operations in human-readable form."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="create", entity_type="transaction")
         def test_create(description: str) -> str:
@@ -250,7 +206,7 @@ class TestTextFormat:
 
     def test_text_format_skips_read_operations(self, temp_book_path, temp_log_dir):
         """Verify text format does not log read operations."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="read")
         def test_read(name: str) -> str:
@@ -266,9 +222,141 @@ class TestTextFormat:
         assert "test_read" not in content
         assert "balance" not in content
 
+    def test_text_format_update_falls_back_to_params_for_splits(
+        self, temp_book_path, temp_log_dir
+    ):
+        """UPDATE audit entry still shows new splits when response trims them.
+
+        `update_transaction`'s response is thin
+        (``{guid, date, description, status}`` — no splits). When
+        ``after_state`` omits ``splits``, ``description``, or ``date``,
+        the audit log should pull them from tool params instead so the
+        text view keeps the before/after diff detail human reviewers
+        rely on.
+        """
+        # Inject before_state via a fake book the decorator can consume
+        # from — mirrors what `update_transaction` would stage in
+        # production using `_stage_audit_before` from its open session.
+        staged = _StagedBook({
+            "description": "Old description",
+            "date": "2026-01-01",
+            "splits": [
+                {"account": "Expenses:Old", "value": "10.00"},
+                {"account": "Assets:Checking", "value": "-10.00"},
+            ],
+        })
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: staged,
+        )
+
+        @audit_log(
+            classification="write",
+            operation="update",
+            entity_type="transaction",
+        )
+        def test_update(
+            guid: str,
+            description: str,
+            transaction_date: str,
+            splits: list,
+        ) -> str:
+            # Simulated thin response: no description, date, or splits.
+            return json.dumps({"guid": guid, "status": "updated"})
+
+        test_update(
+            guid="abcdef01",
+            description="New description",
+            transaction_date="2026-02-15",
+            splits=[
+                {"account": "Expenses:New", "value": "20.00"},
+                {"account": "Assets:Checking", "value": "-20.00"},
+            ],
+        )
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        # Header present
+        assert "UPDATE TRANSACTION" in content
+        # Description diff rendered from params, not response
+        assert 'Description: "Old description" → "New description"' in content
+        # Date diff rendered from params (transaction_date -> date mapping)
+        assert "Date: 2026-01-01 → 2026-02-15" in content
+        # Splits diff rendered from params (response had none)
+        assert "Splits (before):" in content
+        assert "Splits (after):" in content
+        assert "Old" in content  # old split account leaf
+        assert "New" in content  # new split account leaf
+
+    def test_text_format_replace_splits_falls_back_to_params(
+        self, temp_book_path, temp_log_dir
+    ):
+        """REPLACE_SPLITS audit entry uses params for new splits when
+        response drops the ``splits`` echo.
+
+        ``replace_splits`` returns only
+        ``{guid, status, previous_splits, warnings}`` — the new splits
+        must come from tool params in the audit log. Description and
+        date come from before_state (they don't change on this op but
+        the formatter still renders them).
+        """
+        # Before-state gives description/date; in production this is
+        # staged by the book method from its own open session.
+        staged = _StagedBook({
+            "description": "Recategorize",
+            "date": "2026-02-10",
+        })
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: staged,
+        )
+
+        @audit_log(
+            classification="write",
+            operation="replace_splits",
+            entity_type="transaction",
+        )
+        def test_replace_splits(guid: str, splits: list) -> str:
+            # Simulated thin response: no splits echo, just previous_splits.
+            return json.dumps({
+                "guid": guid,
+                "status": "splits_replaced",
+                "previous_splits": [
+                    {"account": "Expenses:Groceries", "value": "50.00"},
+                    {"account": "Assets:Checking", "value": "-50.00"},
+                ],
+            })
+
+        test_replace_splits(
+            guid="abcdef02",
+            splits=[
+                {"account": "Expenses:Dining", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        )
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
+
+        assert "REPLACE SPLITS" in content
+        # Description/date from before_state
+        assert "Recategorize" in content
+        assert "2026-02-10" in content
+        # Before splits from response (previous_splits is preserved)
+        assert "Splits (before):" in content
+        assert "Groceries" in content
+        # After splits from params (response no longer echoes them)
+        assert "Splits (after):" in content
+        assert "Dining" in content
+
     def test_text_format_logs_replace_splits(self, temp_book_path, temp_log_dir):
         """Verify text format logs replace_splits with before and after splits."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="text")
+        setup_logging(book_path=str(temp_book_path), debug=False)
 
         @audit_log(classification="write", operation="replace_splits", entity_type="transaction")
         def test_replace_splits(guid: str, splits: list) -> str:
@@ -306,24 +394,149 @@ class TestTextFormat:
         assert "Dining" in content  # New split (formatted as leaf name)
 
 
+class TestResolveEntryField:
+    """Unit tests for the ``_resolve_entry_field`` fallback helper.
+
+    The helper unifies the lookup order across audit entry sources so
+    trimmed responses still render richly in the human-readable log:
+    after_state → params → before_state → None.
+    """
+
+    def test_after_state_wins_when_present(self):
+        entry = {
+            "after_state": {"description": "from after"},
+            "params": {"description": "from params"},
+            "before_state": {"description": "from before"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from after"
+
+    def test_falls_through_to_params_when_after_empty(self):
+        entry = {
+            "after_state": {},
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_falls_through_to_before_state(self):
+        entry = {
+            "after_state": None,
+            "params": {},
+            "before_state": {"description": "from before"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from before"
+
+    def test_returns_none_when_missing_everywhere(self):
+        assert _resolve_entry_field({}, "description") is None
+
+    def test_alternate_params_key(self):
+        """Response ``date`` maps to params ``transaction_date``."""
+        entry = {"params": {"transaction_date": "2026-01-15"}}
+        assert _resolve_entry_field(
+            entry, "date", params_key="transaction_date"
+        ) == "2026-01-15"
+
+    def test_empty_string_is_not_present(self):
+        """Falsy values fall through — after's empty desc yields to params."""
+        entry = {
+            "after_state": {"description": ""},
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_empty_list_is_not_present(self):
+        """Empty splits list falls through to a populated params list."""
+        entry = {
+            "after_state": {"splits": []},
+            "params": {"splits": [{"account": "Assets:Checking"}]},
+        }
+        assert _resolve_entry_field(entry, "splits") == [{"account": "Assets:Checking"}]
+
+    def test_none_after_state_handled(self):
+        """after_state being None (not just empty) is safe."""
+        entry = {
+            "after_state": None,
+            "params": {"description": "from params"},
+        }
+        assert _resolve_entry_field(entry, "description") == "from params"
+
+    def test_missing_sources_handled(self):
+        """Entries without any source keys don't crash."""
+        assert _resolve_entry_field({"timestamp": "..."}, "anything") is None
+
+
+class TestDispatchTableDegradation:
+    """Unknown (entity_type, operation) pairs must degrade gracefully.
+
+    The audit text formatter was flattened from a 380-line if/elif
+    chain into a dispatch table in the prerelease-2 polish cycle.
+    The chain's default behavior was to silently skip unmapped combos
+    (falling off the bottom of the if/elif); the dispatcher preserves
+    that semantic — a new classification wired in book code but not
+    yet wired to a handler returns empty string, not a crash.
+
+    Lets Employee handlers land before Employee write tools without
+    failing rendering of any write the user happens to make in the
+    interim.
+    """
+
+    def test_unknown_entity_type_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "write",
+            "operation": "create",
+            "entity_type": "hologram",  # fictional entity, never in the dispatcher
+            "timestamp": "2026-04-21T12:34:56",
+            "params": {"name": "Test"},
+            "after_state": {"id": "000001", "name": "Test"},
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+    def test_unknown_operation_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "write",
+            "operation": "hypnotize",  # fictional op on a real entity
+            "entity_type": "transaction",
+            "timestamp": "2026-04-21T12:34:56",
+            "params": {},
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+    def test_read_classification_returns_empty_string(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+
+        entry = {
+            "classification": "read",
+            "operation": "create",
+            "entity_type": "transaction",
+            "timestamp": "2026-04-21T12:34:56",
+        }
+        assert _format_audit_entry_text(entry) == ""
+
+
 class TestAuditLogIntegration:
     """Integration tests for the complete audit trail."""
 
     def test_write_operation_lifecycle(self, temp_book_path, temp_log_dir):
-        """Test a complete write operation lifecycle captures correct states (JSON format)."""
-        setup_logging(book_path=str(temp_book_path), debug=False, audit_format="json")
+        """A create-transaction lifecycle renders as a readable audit entry.
 
-        # Simulate a create operation
+        The entry should carry the header (operation + short GUID), the
+        description, date, and the full split list — sourced from
+        ``after_state`` or (trimmed-response fallback) from ``params``.
+        """
+        setup_logging(book_path=str(temp_book_path), debug=False)
+
         @audit_log(classification="write", operation="create", entity_type="transaction")
-        def create_txn(description: str, splits: list) -> str:
-            return json.dumps({
-                "guid": "txn123",
-                "description": description,
-                "splits": splits,
-            })
+        def create_txn(description: str, splits: list, transaction_date: str) -> str:
+            # Simulate a thin response: just guid + status. The formatter
+            # must reach into params for description / date / splits.
+            return json.dumps({"guid": "txn12345", "status": "created"})
 
         create_txn(
             description="Grocery shopping",
+            transaction_date="2026-02-15",
             splits=[
                 {"account": "Expenses:Groceries", "amount": "50.00"},
                 {"account": "Assets:Checking", "amount": "-50.00"},
@@ -331,9 +544,412 @@ class TestAuditLogIntegration:
         )
 
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        log_file = temp_log_dir / "audit" / f"{today}.jsonl"
-        entries = [json.loads(line) for line in log_file.read_text().strip().split("\n")]
+        txt_file = temp_log_dir / "audit" / f"{today}.txt"
+        content = txt_file.read_text()
 
-        create_entry = [e for e in entries if e.get("operation") == "create"][-1]
-        assert create_entry["entity_guid"] == "txn123"
-        assert create_entry["after_state"]["description"] == "Grocery shopping"
+        assert "CREATE TRANSACTION" in content
+        assert "guid:txn12345" in content
+        assert "Grocery shopping" in content
+        assert "2026-02-15" in content
+        # Split leaf names appear in the rendered splits block
+        assert "Groceries" in content
+        assert "Checking" in content
+
+
+class TestAuditLogResolvesAccountRefs:
+    """The audit log is the one human-readable surface in the app.
+    Short GUIDs ``%xxxxxxx`` and full 32-char GUIDs are convenient on
+    the wire but noise to a reviewer scanning the log. The formatter
+    resolves them back to canonical full paths via book lookup before
+    handing the entry to the per-operation formatter.
+
+    Path inputs are unchanged. Resolution failures degrade gracefully
+    (raw value stays in place) so logging never crashes a tool.
+    """
+
+    def test_short_guid_in_top_level_account_param_resolved(
+        self, test_book
+    ):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        # Discover Checking's short GUID the same way the LLM would —
+        # off the list_accounts compact line.
+        with book.open(readonly=True) as b:
+            account = book._find_account(b, "Assets:Checking")
+            short = book._account_short_guid(b, account)
+
+        # Build a synthetic RECONCILE entry with the short GUID where
+        # the LLM would normally pass it.
+        entry = {
+            "classification": "write",
+            "operation": "reconcile",
+            "entity_type": "split",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": short,
+                "statement_date": "2026-04-27",
+                "statement_balance": "2850.00",
+                "split_guids": [],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered, (
+            f"audit log should resolve {short!r} to the full path; "
+            f"got:\n{rendered}"
+        )
+        assert short not in rendered, (
+            f"audit log still contains the raw short GUID {short!r}:\n{rendered}"
+        )
+
+    def test_short_guid_in_split_list_resolved(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        with book.open(readonly=True) as b:
+            checking = book._find_account(b, "Assets:Checking")
+            groceries = book._find_account(b, "Expenses:Groceries")
+            short_check = book._account_short_guid(b, checking)
+            short_grocery = book._account_short_guid(b, groceries)
+
+        # Synthetic CREATE TRANSACTION entry with shorts in both splits.
+        entry = {
+            "classification": "write",
+            "operation": "create",
+            "entity_type": "transaction",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "description": "Lunch",
+                "transaction_date": "2026-04-27",
+                "splits": [
+                    {"account": short_check, "amount": "-12.50"},
+                    {"account": short_grocery, "amount": "12.50"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        # Transaction-split rendering deliberately uses leaf names for
+        # compactness (``_format_splits_text``). Pre-normalization the
+        # leaf would be the raw short GUID itself (no colons → leaf == ref).
+        # After normalization we get the human leaf names. Both branches
+        # of that contract:
+        assert "Checking" in rendered
+        assert "Groceries" in rendered
+        assert short_check not in rendered
+        assert short_grocery not in rendered
+
+    def test_full_guid_resolved_too(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+        with book.open(readonly=True) as b:
+            account = book._find_account(b, "Assets:Checking")
+            full_guid = account.guid
+
+        entry = {
+            "classification": "write",
+            "operation": "set_slot",
+            "entity_type": "account_slot",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": full_guid,
+                "key": "color",
+                "value": "blue",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered
+        assert full_guid not in rendered
+
+    def test_path_input_unchanged(self, test_book):
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        entry = {
+            "classification": "write",
+            "operation": "set_slot",
+            "entity_type": "account_slot",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": "Assets:Checking",
+                "key": "color",
+                "value": "blue",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "Assets:Checking" in rendered
+
+    def test_unresolvable_short_guid_left_in_place(self, test_book):
+        """Resolution failure (well-formed prefix that matches nothing)
+        must NOT crash the formatter — it falls through to the raw value.
+        Better to log ``%deadbe0`` than to drop the entry."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+            setup_logging,
+        )
+
+        book = GnuCashBook(str(test_book))
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        entry = {
+            "classification": "write",
+            "operation": "reconcile",
+            "entity_type": "split",
+            "timestamp": "2026-04-27T12:00:00-07:00",
+            "params": {
+                "account": "%deadbe0",
+                "statement_date": "2026-04-27",
+                "statement_balance": "0.00",
+                "split_guids": [],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        # Raw value preserved when resolution fails.
+        assert "%deadbe0" in rendered
+
+
+class TestBookOpenAccounting:
+    """Regression guard: each write should open the book exactly once.
+
+    Before this work, the @audit_log decorator called
+    _capture_before_state → book.get_transaction(...) → opened the book
+    read-only; the tool then opened it again read-write. Every write
+    paid the double-open tax. Now write book methods stage their own
+    before-state via _stage_audit_before / _consume_audit_before on the
+    BaseGnuCashBook wrapper, and the decorator reads it back without
+    opening anything.
+
+    This test patches `piecash.open_book` with a counter and asserts
+    exactly one open per `update_transaction` call. If it ever starts
+    failing with count=2, someone added a read-only pre-capture back.
+    """
+
+    def test_update_transaction_opens_book_once(
+        self, test_book, monkeypatch
+    ):
+        import piecash
+
+        from gnucash_mcp.book import GnuCashBook
+
+        book_wrapper = GnuCashBook(str(test_book))
+        # Register the wrapper so audit_log's consume path has access.
+        setup_logging(
+            book_path=str(test_book),
+            debug=False,
+            get_book=lambda: book_wrapper,
+        )
+
+        # Find an existing transaction GUID (one read-only open here —
+        # we reset the counter after).
+        with book_wrapper.open(readonly=True) as pb:
+            txn_guid = pb.transactions[0].guid
+
+        # Defeat the auto-backup hook for this test. The hook is a
+        # separate mechanism (tested by TestBackup* below) that legitimately
+        # adds one open to the first write of each process. We want to
+        # measure the WRITE path's opens in isolation.
+        book_wrapper._backup_checked_in_process = True
+
+        open_count = [0]
+        original = piecash.open_book
+
+        def counting_open(*args, **kwargs):
+            open_count[0] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(piecash, "open_book", counting_open)
+
+        @audit_log(
+            classification="write",
+            operation="update",
+            entity_type="transaction",
+        )
+        def update_tool(guid: str, description: str) -> str:
+            return json.dumps(
+                book_wrapper.update_transaction(
+                    guid=guid, description=description
+                )
+            )
+
+        update_tool(guid=txn_guid, description="renamed by book-open test")
+
+        assert open_count[0] == 1, (
+            f"Expected exactly 1 book open for one update_transaction "
+            f"call, got {open_count[0]}. The @audit_log decorator may "
+            f"have regained a pre-capture step that opens the book "
+            f"read-only before the write."
+        )
+
+    def test_create_transaction_opens_book_once(
+        self, test_book, monkeypatch
+    ):
+        """A full create_transaction call (auto-fill + duplicate check
+        + write + post-write consistency warning) opens the book
+        exactly once.
+
+        Pre-consolidation this path opened the book four times — once
+        per helper: ``_auto_fill_splits``, ``_check_auto_fill_stability``,
+        ``_find_duplicates``, and the write stage. After the single-pass
+        collector refactor, every stage shares one session.
+        """
+        import piecash
+
+        from gnucash_mcp.book import GnuCashBook
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        # Seed a transaction we can auto-fill from (test_book's fixture
+        # has a "Weekly Groceries" txn — we'll reuse that description to
+        # exercise the auto-fill path).
+        open_count = [0]
+        original = piecash.open_book
+
+        def counting_open(*args, **kwargs):
+            open_count[0] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(piecash, "open_book", counting_open)
+
+        # Provide explicit splits so this is a pure write + preflight
+        # (no auto-fill second pass) — still exercises the duplicate
+        # scan and post-write consistency warning. This is the common
+        # path; auto-fill is tested separately.
+        book_wrapper.create_transaction(
+            description="Single-open regression guard",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "42.00"},
+                {"account": "Assets:Checking", "amount": "-42.00"},
+            ],
+            check_duplicates=True,
+        )
+
+        assert open_count[0] == 1, (
+            f"Expected exactly 1 book open for a full create_transaction "
+            f"call, got {open_count[0]}. Pre-consolidation this path "
+            f"opened the book 4 times (auto-fill, stability, duplicates, "
+            f"write). If this test fails with count > 1, a helper has "
+            f"regained its own `with self.open(...)` instead of reusing "
+            f"the caller's session."
+        )
+
+
+class TestCreateSignalsCollector:
+    """The single-pass ``_collect_create_signals`` consolidates four
+    independent O(N) scans into one (or two, for the auto-fill path).
+
+    These tests assert the contract directly by counting collector
+    invocations per create_transaction call. They're an architecture
+    regression guard: if a future change reintroduces a helper that
+    does its own book walk, the counts shift and these tests fail.
+    """
+
+    def test_single_pass_when_splits_provided(self, test_book, monkeypatch):
+        """With explicit splits, the collector runs exactly once — one
+        sort, one traversal, all four signal types bundled."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.core import CoreMixin
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        original = CoreMixin._collect_create_signals
+        call_count = [0]
+
+        def counting(self, *args, **kwargs):
+            call_count[0] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            CoreMixin, "_collect_create_signals", counting
+        )
+
+        book_wrapper.create_transaction(
+            description="Collector call-count test",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "15.00"},
+                {"account": "Assets:Checking", "amount": "-15.00"},
+            ],
+            check_duplicates=True,
+        )
+
+        assert call_count[0] == 1, (
+            f"Expected 1 collector pass when splits are provided; got "
+            f"{call_count[0]}."
+        )
+
+    def test_two_passes_when_auto_filling(self, test_book, monkeypatch):
+        """Auto-fill legitimately needs two passes: the first finds the
+        source transaction (needed to derive proposed_amounts for the
+        duplicate scan); the second runs duplicates + recent-matches
+        with those amounts. This is the best we can do in a single
+        book-open without speculative buffering."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.core import CoreMixin
+
+        book_wrapper = GnuCashBook(str(test_book))
+
+        original = CoreMixin._collect_create_signals
+        call_count = [0]
+
+        def counting(self, *args, **kwargs):
+            call_count[0] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            CoreMixin, "_collect_create_signals", counting
+        )
+
+        # test_book's fixture has "Weekly Groceries" — auto-fill from it.
+        book_wrapper.create_transaction(
+            description="Weekly Groceries",
+            splits=None,  # trigger auto-fill
+        )
+
+        assert call_count[0] == 2, (
+            f"Expected 2 collector passes when auto-filling (one to "
+            f"find the source, one to run duplicates/recent against "
+            f"the resulting amounts); got {call_count[0]}."
+        )

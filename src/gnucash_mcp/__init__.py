@@ -3,5 +3,5 @@
 from gnucash_mcp.book import GnuCashLockError
 from gnucash_mcp.server import main
 
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 __all__ = ["main", "GnuCashLockError"]

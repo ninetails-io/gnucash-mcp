@@ -67,7 +67,8 @@ class TestCreateLot:
         assert result["status"] == "created"
         assert result["title"] == "VTSAX 2026-01-15"
         assert result["account"] == "Assets:Investments:VTSAX"
-        assert len(result["guid"]) == 32
+        # Response now emits a short collision-safe prefix (>=8 chars).
+        assert len(result["guid"]) >= 8
 
     def test_create_lot_with_notes(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
@@ -94,27 +95,81 @@ class TestListLots:
         assert result == []
 
     def test_list_lots_with_lots(self, investment_book: Path):
+        """The default view shows lots with active positions. Empty
+        lots (no splits assigned, or all splits voided) are filtered
+        out — see ``test_list_lots_skips_empty_lots_in_default_view``."""
         book = GnuCashBook(str(investment_book))
         book.create_lot(account="Assets:Investments:VTSAX", title="Lot A")
         book.create_lot(account="Assets:Investments:VTSAX", title="Lot B")
-        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
+        # Empty lots have zero remaining position, so the default
+        # (open-positions) view skips them. ``include_closed=True``
+        # surfaces them for callers who need the audit-trail view.
+        result = book.list_lots(
+            account="Assets:Investments:VTSAX",
+            include_closed=True, compact=False,
+        )
         assert len(result) == 2
         titles = {r["title"] for r in result}
         assert titles == {"Lot A", "Lot B"}
 
-    def test_list_lots_exclude_closed(self, investment_book: Path):
+    def test_list_lots_skips_empty_lots_in_default_view(
+        self, investment_book: Path,
+    ):
+        """Empty lots (no splits, or all splits zeroed by void) appear
+        as "0 shares, 0 cost basis" rows that add noise to a
+        portfolio listing. The bookkeeper flagged this as confusing
+        when managing a real portfolio. The default ``include_closed
+        =False`` view skips them; ``include_closed=True`` surfaces
+        them."""
         book = GnuCashBook(str(investment_book))
-        lot_a = book.create_lot(account="Assets:Investments:VTSAX", title="Open Lot")
-        lot_b = book.create_lot(account="Assets:Investments:VTSAX", title="Closed Lot")
+        book.create_lot(account="Assets:Investments:VTSAX", title="Empty A")
+        book.create_lot(account="Assets:Investments:VTSAX", title="Empty B")
+
+        # Default view: zero empty lots show up.
+        result = book.list_lots(
+            account="Assets:Investments:VTSAX", compact=False,
+        )
+        assert result == []
+
+        # Audit view: both surface.
+        result = book.list_lots(
+            account="Assets:Investments:VTSAX",
+            include_closed=True, compact=False,
+        )
+        assert len(result) == 2
+
+    def test_list_lots_exclude_closed(self, investment_book: Path):
+        """Closed lots are filtered out by default; ``include_closed
+        =True`` surfaces them. With the empty-lot filter, an "Open"
+        lot needs an actual position to appear in the default view —
+        so assign a non-zero buy split to it."""
+        book = GnuCashBook(str(investment_book))
+        lot_a = book.create_lot(
+            account="Assets:Investments:VTSAX", title="Open Lot",
+        )
+        lot_b = book.create_lot(
+            account="Assets:Investments:VTSAX", title="Closed Lot",
+        )
+        # Give Open Lot a real position so it survives the empty
+        # filter — buy 10 shares and assign the buy split to lot_a.
+        buy_guid = _buy_shares(book, 10, Decimal("125"), date(2026, 1, 15))
+        book.assign_split_to_lot(
+            split_guid=buy_guid, lot_guid=lot_a["guid"],
+        )
         book.close_lot(guid=lot_b["guid"])
 
-        # Default: exclude closed
-        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
+        # Default: exclude closed AND empty.
+        result = book.list_lots(
+            account="Assets:Investments:VTSAX", compact=False,
+        )
         assert len(result) == 1
         assert result[0]["title"] == "Open Lot"
 
-        # Include closed
-        result = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True, compact=False)
+        # Include closed → all lots surface, even empty/closed ones.
+        result = book.list_lots(
+            account="Assets:Investments:VTSAX",
+            include_closed=True, compact=False,
+        )
         assert len(result) == 2
 
 
@@ -133,8 +188,10 @@ class TestGetLot:
         result = book.get_lot(guid=lot["guid"])
         assert result["title"] == "Empty Lot"
         assert result["splits"] == []
-        assert result["summary"]["quantity"] == "0"
-        assert result["summary"]["cost_basis"] == "0"
+        # _format_number renders quantities at 4 decimals (share-style)
+        # and currency at 2 — empty lot is zero either way.
+        assert result["summary"]["quantity"] == "0.0000"
+        assert result["summary"]["cost_basis"] == "0.00"
 
     def test_get_lot_with_splits(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
@@ -273,6 +330,40 @@ class TestCalculateLotGain:
         with pytest.raises(ValueError, match="no remaining shares"):
             book.calculate_lot_gain(lot_guid=lot["guid"], sale_price="130")
 
+    def test_gain_no_remaining_shares_due_to_voided_buy(
+        self, investment_book: Path,
+    ):
+        """When the lot's purchase was voided, the generic "no
+        remaining shares" message hides the *cause*. The error
+        should call out the voided splits explicitly so the caller
+        knows to unvoid the underlying transaction (or pick a
+        different lot) instead of staring at a vague error."""
+        book = GnuCashBook(str(investment_book))
+        lot = book.create_lot(
+            account="Assets:Investments:VTSAX", title="Voided Buy Lot",
+        )
+        buy_guid = _buy_shares(book, 10, Decimal("125"), date(2026, 1, 15))
+        book.assign_split_to_lot(
+            split_guid=buy_guid, lot_guid=lot["guid"],
+        )
+        # Find and void the buy transaction.
+        with book.open(readonly=True) as b:
+            from piecash.core.transaction import Split
+            split = b.session.query(Split).filter_by(guid=buy_guid).first()
+            buy_txn_guid = split.transaction.guid
+        book.void_transaction(
+            guid=buy_txn_guid, reason="Mistaken purchase",
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            book.calculate_lot_gain(
+                lot_guid=lot["guid"], sale_price="130",
+            )
+        msg = str(exc_info.value)
+        assert "no remaining shares" in msg
+        # The improved error explicitly points at voided splits.
+        assert "voided" in msg.lower()
+
 
 # ── TestCloseLot ─────────────────────────────────────────────
 
@@ -379,4 +470,8 @@ class TestSplitToDictLotGuid:
 
         for s in txn["splits"]:
             if s["account"] == "Assets:Investments:VTSAX":
-                assert s["lot_guid"] == lot["guid"]
+                # Split's lot_guid is the full 32-char guid (read-side
+                # serializer); the create_lot response has emitted a
+                # short collision-safe prefix. The full guid must start
+                # with that prefix.
+                assert s["lot_guid"].startswith(lot["guid"])

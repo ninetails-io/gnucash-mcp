@@ -23,9 +23,6 @@ _get_book_func: Callable | None = None
 # Module-level reference to log directory, set during setup
 _log_dir: Path | None = None
 
-# Module-level reference to audit format ("text" or "json")
-_audit_format: str = "text"
-
 # Module-level reference to book path for text header
 _book_path_str: str | None = None
 
@@ -35,16 +32,10 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
-def get_audit_format() -> str:
-    """Get the configured audit log format ('text' or 'json')."""
-    return _audit_format
-
-
 def setup_logging(
     book_path: str | None = None,
     debug: bool = False,
     audit: bool = True,
-    audit_format: str = "text",
     get_book: Callable | None = None,
 ) -> None:
     """Configure audit and debug logging.
@@ -59,20 +50,14 @@ def setup_logging(
                    {book_path}.mcp/ directory alongside the book.
         debug: Enable debug-level MCP protocol logging.
         audit: Enable audit logging. Default True. Use --noaudit to disable.
-        audit_format: Format for audit log: "text" (default, human-readable) or "json" (JSONL).
         get_book: Function to get the GnuCashBook instance (for state capture).
 
     Raises:
         ValueError: If book_path is not provided and either audit or debug is enabled.
-        ValueError: If audit_format is not "text" or "json".
     """
-    global _get_book_func, _log_dir, _audit_format, _book_path_str
+    global _get_book_func, _log_dir, _book_path_str
     _get_book_func = get_book
-    _audit_format = audit_format
     _book_path_str = book_path
-
-    if audit_format not in ("text", "json"):
-        raise ValueError(f"audit_format must be 'text' or 'json', got: {audit_format}")
 
     # If both audit and debug are disabled, no logging setup needed
     if not audit and not debug:
@@ -113,19 +98,17 @@ def setup_logging(
         audit_logger.setLevel(logging.INFO)
         audit_logger.propagate = False
 
-        # Choose file extension based on format
-        file_ext = "jsonl" if audit_format == "json" else "txt"
-        audit_file = audit_dir / f"{today}.{file_ext}"
+        audit_file = audit_dir / f"{today}.txt"
 
-        # Write header for text format if file is new
-        write_header = audit_format == "text" and not audit_file.exists()
+        # Write header if file is new
+        write_header = not audit_file.exists()
 
         audit_handler = logging.FileHandler(audit_file)
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
-        # Write text header if needed
+        # Write header if needed
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
             audit_logger.info(header)
@@ -156,107 +139,6 @@ def setup_logging(
     else:
         # Set to a level that effectively disables it
         debug_logger.setLevel(logging.CRITICAL + 1)
-
-
-def _capture_before_state(
-    entity_type: str | None, operation: str | None, params: dict
-) -> dict | None:
-    """Capture entity state before mutation.
-
-    Args:
-        entity_type: "transaction", "account", or "split"
-        operation: "create", "update", "delete", "void", "unvoid", "reconcile", "set_state"
-        params: Tool parameters
-
-    Returns:
-        State dict or None if not applicable.
-    """
-    if _get_book_func is None:
-        return None
-
-    # Creates don't have before state
-    if operation == "create":
-        return None
-
-    try:
-        book = _get_book_func()
-
-        if entity_type == "transaction":
-            guid = params.get("guid")
-            if guid:
-                return book.get_transaction(guid)
-
-        elif entity_type == "account":
-            name = params.get("name")
-            if name:
-                return book.get_account(name)
-
-        elif entity_type == "split":
-            # For set_reconcile_state
-            split_guid = params.get("split_guid")
-            if split_guid:
-                return _get_split_states_batch(book, [split_guid]).get(split_guid)
-
-            # For reconcile_account (multiple splits)
-            split_guids = params.get("split_guids")
-            if split_guids:
-                states = _get_split_states_batch(book, split_guids)
-                return {"splits": [states.get(g) for g in split_guids]}
-
-    except Exception:
-        # Don't let state capture failures break the tool
-        return None
-
-    return None
-
-
-def _get_split_states_batch(book, split_guids: list[str]) -> dict[str, dict | None]:
-    """Get the current state of multiple splits by GUID in a single book open.
-
-    This is much more efficient than calling _get_split_state for each GUID,
-    as it opens the book only once and iterates through transactions once.
-
-    Args:
-        book: GnuCashBook wrapper instance
-        split_guids: List of split GUIDs to find
-
-    Returns:
-        Dict mapping split GUID to state dict (or None if not found).
-    """
-    if not split_guids:
-        return {}
-
-    # Convert to set for O(1) lookup
-    guids_to_find = set(split_guids)
-    results: dict[str, dict | None] = {g: None for g in split_guids}
-
-    # Open book once and iterate through all transactions
-    with book.open(readonly=True) as piecash_book:
-        for transaction in piecash_book.transactions:
-            # Check each split in this transaction
-            for split in transaction.splits:
-                if split.guid in guids_to_find:
-                    results[split.guid] = {
-                        "guid": split.guid,
-                        "account": split.account.fullname,
-                        "amount": str(split.quantity),
-                        "reconcile_state": split.reconcile_state,
-                        "reconcile_date": (
-                            split.reconcile_date.isoformat()
-                            if split.reconcile_date
-                            else None
-                        ),
-                        # Include transaction context for human-readable logs
-                        "transaction_description": transaction.description,
-                        "transaction_date": transaction.post_date.isoformat(),
-                    }
-                    guids_to_find.discard(split.guid)
-
-                    # Early exit if we found all splits
-                    if not guids_to_find:
-                        return results
-
-    return results
 
 
 def _format_text_header(date_str: str, book_path: str, tz_name: str = "") -> str:
@@ -305,226 +187,908 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
     return "\n".join(lines)
 
 
-def _format_audit_entry_text(entry: dict) -> str:
-    """Format an audit entry as human-readable text.
+def _resolve_entry_field(
+    entry: dict, field: str, params_key: str | None = None
+):
+    """Look up a field in an audit entry, falling back through sources.
 
-    Only formats write operations (mutations). Read operations return empty string.
+    Write tool responses are trimmed for LLM token efficiency — several
+    fields the human-readable audit log wants to display (splits,
+    description, date) may not appear in ``after_state``. This helper
+    unifies the lookup order:
+
+    1. ``after_state`` — the tool's response, richest when present
+    2. ``params`` — the tool's inputs; for most write ops this is the
+       same information the LLM would have put in the response
+    3. ``before_state`` — the pre-write snapshot captured by the
+       audit decorator (useful for REPLACE_SPLITS where description /
+       date aren't in response OR params)
+
+    A falsy value ("", [], {}, None) in any source is treated as "not
+    present" and falls through to the next. Callers that need to
+    distinguish "really empty" from "missing" should consult the
+    individual sources directly.
+
+    Args:
+        entry: The audit entry dict.
+        field: Key to look up in ``after_state`` and ``before_state``.
+        params_key: Alternate key in ``params`` when the response and
+                    params use different names (e.g. response: "date",
+                    params: "transaction_date"). Defaults to ``field``.
+
+    Returns:
+        The resolved value, or None if not found in any source.
     """
-    if entry.get("classification") != "write":
-        return ""  # Don't log read operations in text format
+    sources = (
+        (entry.get("after_state") or {}, field),
+        (entry.get("params") or {}, params_key or field),
+        (entry.get("before_state") or {}, field),
+    )
+    for src, key in sources:
+        value = src.get(key)
+        if value:
+            return value
+    return None
 
+
+# ── Audit text-format dispatcher ───────────────────────────────────
+#
+# Write operations render to the human-readable audit log as short
+# multi-line blocks. Each (entity_type, operation) pair has its own
+# tiny handler that pulls what it needs from the entry (params,
+# before_state, after_state) and returns a list of lines.
+#
+# Adding a new entity type is a dict entry, not another ``elif`` in a
+# 380-line chain. Unknown keys degrade to empty output so new audit
+# classifications added in book code don't crash log rendering before
+# a handler lands.
+
+_INDENT = "          "  # 10 spaces; every handler indents its detail lines here
+_INDENT_SPLITS = _INDENT + "  "  # nested indent for split blocks
+
+
+def _extract_time(entry: dict) -> str:
+    """Pull HH:MM:SS from an ISO-ish timestamp, defensively."""
     timestamp = entry.get("timestamp", "")
-    # Extract just the time portion (HH:MM:SS)
     if "T" in timestamp:
-        time_part = timestamp.split("T")[1][:8]
-    else:
-        time_part = timestamp[:8] if len(timestamp) >= 8 else timestamp
+        return timestamp.split("T")[1][:8]
+    return timestamp[:8] if len(timestamp) >= 8 else timestamp
 
-    operation = entry.get("operation", "").upper()
-    entity_type = entry.get("entity_type", "")
-    params = entry.get("params", {})
+
+def _transaction_guid(entry: dict) -> str:
+    """GUID for a transaction log line — short prefix if upstream supplied one.
+
+    Book methods emit collision-safe prefixes via ``_unique_prefix`` on
+    write responses. We display whatever was provided — re-truncating
+    here would undo any birthday-problem extension (e.g., collapse a
+    9-char safe prefix back to a colliding 8).
+    """
+    params = entry.get("params") or {}
+    return entry.get("entity_guid") or params.get("guid", "")
+
+
+# ── Transaction handlers ──────────────────────────────────────────
+
+
+def _fmt_transaction_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
+    desc = after.get("description") or params.get("description", "")
+    date_str = after.get("date") or params.get("transaction_date", "")
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    # after_state preferred; fall back to params (thin-response case)
+    splits = after.get("splits") or params.get("splits") or []
+    if splits:
+        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
+    if not before:
+        return lines
+
+    # update_transaction's response is thin (no description/date/splits
+    # echo). Resolve through after_state → params → before_state so
+    # the text log keeps the full diff readable.
+    old_desc = before.get("description", "")
+    new_desc = _resolve_entry_field(entry, "description") or old_desc
+    old_date = before.get("date", "")
+    new_date = (
+        _resolve_entry_field(entry, "date", params_key="transaction_date")
+        or old_date
+    )
+    old_splits = before.get("splits") or []
+    new_splits = _resolve_entry_field(entry, "splits") or old_splits
+
+    if old_desc != new_desc:
+        lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+    else:
+        lines.append(f'{_INDENT}Description: "{old_desc}"')
+
+    if old_date != new_date:
+        lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
+    else:
+        lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    if old_splits != new_splits:
+        lines.append(f"{_INDENT}Splits (before):")
+        lines.append(_format_splits_text(old_splits, _INDENT_SPLITS))
+        lines.append(f"{_INDENT}Splits (after):")
+        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_void(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [
+        f"{time_part}  VOID TRANSACTION  guid:{guid}",
+        f'{_INDENT}Reason: "{params.get("reason", "")}"',
+    ]
+    if before:
+        desc = before.get("description", "")
+        date_str = before.get("date", "")
+        lines.append(f'{_INDENT}Was: "{desc}" ({date_str})')
+        if before.get("splits"):
+            lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_unvoid(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    after = entry.get("after_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  UNVOID TRANSACTION  guid:{guid}"]
+    if after:
+        desc = after.get("description", "")
+        date_str = after.get("date", "")
+        lines.append(f'{_INDENT}Restored: "{desc}" ({date_str})')
+        if after.get("splits"):
+            lines.append(_format_splits_text(after["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  DELETE TRANSACTION  guid:{guid}"]
+    if before:
+        desc = before.get("description", "")
+        date_str = before.get("date", "")
+        lines.append(f'{_INDENT}Was: "{desc}" ({date_str})')
+        if before.get("splits"):
+            lines.append(_format_splits_text(before["splits"], _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_replace_splits(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  REPLACE SPLITS  guid:{guid}"]
+
+    # description / date don't change on this op, but show them from
+    # before_state so a reviewer has context for which transaction.
+    desc = _resolve_entry_field(entry, "description") or ""
+    date_str = _resolve_entry_field(entry, "date") or ""
+    if desc or date_str:
+        lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    # previous_splits is the piece the LLM doesn't already know.
+    prev_splits = after.get("previous_splits", [])
+    if prev_splits:
+        lines.append(f"{_INDENT}Splits (before):")
+        lines.append(_format_splits_text(prev_splits, _INDENT_SPLITS))
+
+    # New splits fall through after_state → params (the LLM's input).
+    new_splits = _resolve_entry_field(entry, "splits")
+    if new_splits:
+        lines.append(f"{_INDENT}Splits (after):")
+        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+
+    for w in after.get("warnings", []) or []:
+        lines.append(f"{_INDENT}Warning: {w}")
+    return lines
+
+
+# ── Account handlers ──────────────────────────────────────────────
+
+
+def _fmt_account_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  CREATE ACCOUNT"]
+    if after:
+        lines.append(f"{_INDENT}{after.get('fullname', params.get('name', ''))}")
+        lines.append(
+            f"{_INDENT}Type: {after.get('type', params.get('account_type', ''))}"
+        )
+        desc = after.get("description", params.get("description", ""))
+        if desc:
+            lines.append(f'{_INDENT}Description: "{desc}"')
+    return lines
+
+
+def _fmt_account_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
     before = entry.get("before_state")
     after = entry.get("after_state")
 
-    lines = []
-    indent = "          "
+    lines = [
+        f"{time_part}  UPDATE ACCOUNT",
+        f"{_INDENT}{params.get('name', '')}",
+    ]
+    if before and after:
+        old_name = before.get("name", "")
+        new_name = after.get("name", "")
+        if old_name != new_name:
+            lines.append(f'{_INDENT}Name: "{old_name}" → "{new_name}"')
+        old_desc = before.get("description", "")
+        new_desc = after.get("description", "")
+        if old_desc != new_desc:
+            lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+    return lines
 
-    if entity_type == "transaction":
-        guid = entry.get("entity_guid") or params.get("guid", "")[:8]
-        guid_short = guid[:8] if guid else ""
 
-        if operation == "CREATE":
-            lines.append(f"{time_part}  CREATE TRANSACTION  guid:{guid_short}")
-            desc = params.get("description", "")
-            date_str = params.get("transaction_date", "")
-            if after:
-                desc = after.get("description", desc)
-                date_str = after.get("date", date_str)
-            lines.append(f'{indent}"{desc}" ({date_str})')
-            # Get splits from after_state or params
-            splits = after.get("splits") if after else None
-            if not splits:
-                splits = params.get("splits", [])
-            if splits:
-                lines.append(_format_splits_text(splits, indent + "  "))
+def _fmt_account_move(entry: dict) -> list[str]:
+    """MOVE is logged as UPDATE with ``new_parent`` in params — the
+    dispatcher remaps the operation key before lookup so this handler
+    fires cleanly."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
 
-        elif operation == "UPDATE":
-            lines.append(f"{time_part}  UPDATE TRANSACTION  guid:{guid_short}")
-            if before and after:
-                # Description change
-                old_desc = before.get("description", "")
-                new_desc = after.get("description", "")
-                if old_desc != new_desc:
-                    lines.append(f'{indent}Description: "{old_desc}" → "{new_desc}"')
+    lines = [
+        f"{time_part}  MOVE ACCOUNT",
+        f"{_INDENT}{params.get('name', '')}",
+    ]
+    if before:
+        old_parent = (
+            ":".join(before.get("fullname", "").split(":")[:-1]) or "(root)"
+        )
+        lines.append(f"{_INDENT}From: {old_parent}")
+    lines.append(f"{_INDENT}To: {params.get('new_parent', '')}")
+    return lines
+
+
+def _fmt_account_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+
+    lines = [f"{time_part}  DELETE ACCOUNT"]
+    if before:
+        lines.append(
+            f"{_INDENT}Was: {before.get('fullname', params.get('name', ''))}"
+        )
+        lines.append(f"{_INDENT}Type: {before.get('type', '')}")
+        desc = before.get("description", "")
+        if desc:
+            lines.append(f'{_INDENT}Description: "{desc}"')
+    return lines
+
+
+# ── Split handlers ────────────────────────────────────────────────
+
+
+def _fmt_split_reconcile(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+    split_details = (before or {}).get("splits", []) if before else []
+    split_guids = params.get("split_guids", []) or []
+
+    lines = [
+        f"{time_part}  RECONCILE  {params.get('account', '')}",
+        f"{_INDENT}Statement date: {params.get('statement_date', '')}",
+        f"{_INDENT}Statement balance: {_format_amount(params.get('statement_balance'))}",
+        f"{_INDENT}Splits reconciled ({len(split_guids)}):",
+    ]
+
+    # Show first 10 reconciled splits with description + amount if the
+    # before_state carried the per-split context. Prefix/full GUID
+    # tolerance: params may be an 8+-char prefix, before_state carries
+    # full GUIDs from the book method's staged snapshot. Match either way.
+    for guid in split_guids[:10]:
+        split_info = next(
+            (
+                s for s in split_details
+                if s and (
+                    s.get("guid") == guid
+                    or s.get("guid", "").startswith(guid)
+                    or guid.startswith(s.get("guid", ""))
+                )
+            ),
+            None,
+        )
+        if split_info:
+            desc = split_info.get("transaction_description", "")
+            amount = _format_amount(split_info.get("amount"))
+            lines.append(f'{_INDENT}  guid:{guid}  "{desc}"  {amount:>10}')
+        else:
+            lines.append(f"{_INDENT}  guid:{guid}")
+    if len(split_guids) > 10:
+        lines.append(f"{_INDENT}  ... and {len(split_guids) - 10} more")
+    return lines
+
+
+def _fmt_split_set_state(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state")
+
+    split_guid = params.get("split_guid", "")
+    state = params.get("state", "")
+    old_state = (before or {}).get("reconcile_state", "n") if before else "n"
+
+    lines = [
+        f"{time_part}  SET RECONCILE STATE",
+        f"{_INDENT}guid:{split_guid} (split)",
+    ]
+    if before:
+        account = before.get("account", "").split(":")[-1]
+        lines.append(f"{_INDENT}Account: {account}")
+        desc = before.get("transaction_description", "")
+        amount = _format_amount(before.get("amount"))
+        if desc:
+            lines.append(f'{_INDENT}"{desc}"  {amount}')
+    lines.append(f"{_INDENT}State: {old_state} → {state}")
+    return lines
+
+
+# ── Account-slot handlers ─────────────────────────────────────────
+
+
+def _fmt_account_slot_set(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    account = params.get("account", "")
+    key = params.get("key", "")
+    value = params.get("value", "")
+    status = (after or {}).get("status", "") if after else ""
+
+    return [
+        f"{time_part}  SET ACCOUNT SLOT  account:{account}",
+        f'{_INDENT}key: "{key}"  value: "{value}"  ({status})',
+    ]
+
+
+def _fmt_account_slot_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    return [
+        f"{time_part}  DELETE ACCOUNT SLOT  account:{params.get('account', '')}",
+        f'{_INDENT}key: "{params.get("key", "")}"',
+    ]
+
+
+# ── Business handlers ─────────────────────────────────────────────
+
+
+def _fmt_person_create(entry: dict, type_label: str) -> list[str]:
+    """Shared CREATE renderer for customer / vendor / employee.
+
+    The three entity types share CRUD shape (see
+    _create_business_person in business.py). Their audit rendering is
+    the same shape too; only the label differs.
+    """
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+
+    person_id = after.get("id", "")
+    person_name = after.get("name", params.get("name", ""))
+    currency = after.get("currency") or params.get("currency", "") or ""
+
+    return [
+        f"{time_part}  CREATE {type_label.upper()}  id:{person_id}",
+        f'{_INDENT}name: "{person_name}"  currency: {currency}',
+    ]
+
+
+def _fmt_person_delete(
+    entry: dict, type_label: str, id_param: str,
+) -> list[str]:
+    """Shared DELETE renderer for customer / vendor / employee."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+
+    person_id = params.get(id_param, "")
+    lines = [f"{time_part}  DELETE {type_label.upper()}  id:{person_id}"]
+    person_name = after.get("name", "") if after else ""
+    if person_name:
+        lines.append(f'{_INDENT}name: "{person_name}"')
+    return lines
+
+
+def _fmt_person_update(entry: dict, type_label: str) -> list[str]:
+    """Shared UPDATE renderer for customer / vendor / employee.
+
+    Header line carries the entity id. Each field that actually
+    changed renders as ``before → after``, with ``address``
+    expanded to per-sub-field lines so a phone-number tweak is
+    visible at a glance. Fields that didn't change are omitted —
+    the response from the book layer is already a diff, so the
+    audit log mirrors that shape.
+    """
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    before = entry.get("before_state") or {}
+
+    person_id = params.get("id", "") or after.get("id", "")
+    lines = [f"{time_part}  UPDATE {type_label.upper()}  id:{person_id}"]
+
+    # Top-level field diffs. Skip ``guid``/``id``/``status`` —
+    # those are echo / metadata.
+    SKIP = {"guid", "id", "status"}
+    for key, new_val in after.items():
+        if key in SKIP or key == "address":
+            continue
+        old_val = before.get(key)
+        if old_val == new_val:
+            continue
+        lines.append(
+            f"{_INDENT}{key}: {old_val!r} → {new_val!r}"
+        )
+
+    # Address sub-field diffs.
+    addr_after = after.get("address") or {}
+    addr_before = before.get("address") or {}
+    if addr_after:
+        lines.append(f"{_INDENT}address:")
+        for key, new_val in addr_after.items():
+            old_val = addr_before.get(key, "")
+            lines.append(
+                f"{_INDENT}  {key}: {old_val!r} → {new_val!r}"
+            )
+
+    return lines
+
+
+def _fmt_customer_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "customer")
+
+
+def _fmt_vendor_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "vendor")
+
+
+def _fmt_employee_update(entry: dict) -> list[str]:
+    return _fmt_person_update(entry, "employee")
+
+
+def _fmt_customer_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "customer")
+
+
+def _fmt_customer_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "customer", "customer_id")
+
+
+def _fmt_vendor_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "vendor")
+
+
+def _fmt_vendor_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "vendor", "vendor_id")
+
+
+def _fmt_employee_create(entry: dict) -> list[str]:
+    return _fmt_person_create(entry, "employee")
+
+
+def _fmt_employee_delete(entry: dict) -> list[str]:
+    return _fmt_person_delete(entry, "employee", "employee_id")
+
+
+def _fmt_billterm_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    due_days = after.get("due_days", params.get("due_days", ""))
+    return [
+        f"{time_part}  CREATE BILLTERM",
+        f'{_INDENT}name: "{name}"  due: {due_days} days',
+    ]
+
+
+def _fmt_invoice_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    inv_id = after.get("id", "")
+    customer_id = after.get("customer_id", params.get("customer_id", ""))
+    return [
+        f"{time_part}  CREATE INVOICE  id:{inv_id}",
+        f"{_INDENT}customer: {customer_id}",
+    ]
+
+
+def _fmt_invoice_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  DELETE INVOICE  id:{params.get('invoice_id', '')}"]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+def _fmt_invoice_post(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  POST INVOICE  id:{params.get('id', '')}"]
+    if after:
+        total = after.get("total", "")
+        post_date = after.get("post_date", "")
+        txn_guid = after.get("transaction_guid") or ""
+        lines.append(f"{_INDENT}total: {total}  date: {post_date}")
+        lines.append(
+            f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
+        )
+    return lines
+
+
+def _fmt_price_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+
+    namespace = params.get("namespace", "")
+    commodity = params.get("commodity", "")
+    head = f"{time_part}  DELETE PRICE  {namespace}:{commodity}"
+    if before:
+        date_str = before.get("date", "")
+        value = before.get("value", "")
+        source = before.get("source", "")
+        return [
+            head,
+            f"{_INDENT}date: {date_str}  value: {value}  source: {source}",
+        ]
+    return [head]
+
+
+def _fmt_invoice_unpost(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+
+    lines = [f"{time_part}  UNPOST INVOICE  id:{params.get('id', '')}"]
+    if before:
+        was_posted = before.get("date_posted", "") or ""
+        was_account = before.get("post_account", "") or ""
+        lines.append(
+            f"{_INDENT}was posted:{was_posted}  "
+            f"post_account:{was_account}"
+        )
+    return lines
+
+
+def _fmt_invoice_pay(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
+    if after:
+        amount = after.get("amount_paid", "")
+        remaining = after.get("remaining_balance", "")
+        txn_guid = after.get("transaction_guid") or ""
+        lines.append(f"{_INDENT}paid: {amount}  remaining: {remaining}")
+        lines.append(
+            f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
+        )
+    return lines
+
+
+def _fmt_bill_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    bill_id = after.get("id", "")
+    vendor_id = after.get("vendor_id", params.get("vendor_id", ""))
+    return [
+        f"{time_part}  CREATE BILL  id:{bill_id}",
+        f"{_INDENT}vendor: {vendor_id}",
+    ]
+
+
+def _fmt_bill_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [f"{time_part}  DELETE BILL  id:{params.get('bill_id', '')}"]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+def _fmt_entry_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    desc = after.get("description", params.get("description", ""))
+    total = after.get("total", "")
+    inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
+    return [
+        f"{time_part}  CREATE ENTRY",
+        f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
+    ]
+
+
+# ── Dispatch table ────────────────────────────────────────────────
+#
+# Key shape: (entity_type, operation). Both in their canonical forms —
+# entity_type lowercase, operation UPPERCASE. Adding a new entity type
+# is one row here plus one handler function above.
+
+_AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
+    ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "UPDATE"): _fmt_transaction_update,
+    ("transaction", "VOID"): _fmt_transaction_void,
+    ("transaction", "UNVOID"): _fmt_transaction_unvoid,
+    ("transaction", "DELETE"): _fmt_transaction_delete,
+    ("transaction", "REPLACE_SPLITS"): _fmt_transaction_replace_splits,
+    ("account", "CREATE"): _fmt_account_create,
+    ("account", "UPDATE"): _fmt_account_update,
+    ("account", "MOVE"): _fmt_account_move,
+    ("account", "DELETE"): _fmt_account_delete,
+    ("split", "RECONCILE"): _fmt_split_reconcile,
+    ("split", "SET_STATE"): _fmt_split_set_state,
+    ("account_slot", "SET_SLOT"): _fmt_account_slot_set,
+    ("account_slot", "DELETE_SLOT"): _fmt_account_slot_delete,
+    ("customer", "CREATE"): _fmt_customer_create,
+    ("customer", "UPDATE"): _fmt_customer_update,
+    ("customer", "DELETE"): _fmt_customer_delete,
+    ("vendor", "CREATE"): _fmt_vendor_create,
+    ("vendor", "UPDATE"): _fmt_vendor_update,
+    ("vendor", "DELETE"): _fmt_vendor_delete,
+    ("employee", "CREATE"): _fmt_employee_create,
+    ("employee", "UPDATE"): _fmt_employee_update,
+    ("employee", "DELETE"): _fmt_employee_delete,
+    ("billterm", "CREATE"): _fmt_billterm_create,
+    ("invoice", "CREATE"): _fmt_invoice_create,
+    ("invoice", "DELETE"): _fmt_invoice_delete,
+    ("invoice", "POST"): _fmt_invoice_post,
+    ("invoice", "UNPOST"): _fmt_invoice_unpost,
+    ("invoice", "PAY"): _fmt_invoice_pay,
+    ("bill", "CREATE"): _fmt_bill_create,
+    ("bill", "DELETE"): _fmt_bill_delete,
+    ("entry", "CREATE"): _fmt_entry_create,
+    ("price", "DELETE"): _fmt_price_delete,
+}
+
+
+_ACCOUNT_REF_KEYS_ALWAYS = frozenset({
+    "account",
+    "account_name",
+    "post_account",
+    "payment_account",
+    "new_parent",
+    "parent",
+})
+
+# Keys whose values are account refs ONLY for specific (entity_type,
+# operation) pairs. ``name`` is the canonical example: it's the leaf
+# name on CREATE ACCOUNT (e.g. ``"Groceries"``) but the full ref on
+# UPDATE / MOVE / DELETE.
+_ACCOUNT_REF_KEYS_CONDITIONAL: dict[tuple[str, str], frozenset[str]] = {
+    ("account", "UPDATE"): frozenset({"name"}),
+    ("account", "MOVE"): frozenset({"name"}),
+    ("account", "DELETE"): frozenset({"name"}),
+}
+
+
+def _looks_like_guid_ref(value) -> bool:
+    """True iff ``value`` is a string worth resolving — short GUID
+    (``%xxxxxxx``) or 32-char hex full GUID. Path strings are already
+    canonical and skipped."""
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("%"):
+        return True
+    if len(value) == 32:
+        try:
+            int(value, 16)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _normalize_account_refs_for_audit(
+    params: dict, entity_type: str, operation: str
+) -> dict:
+    """Resolve any short / full-GUID account refs in ``params`` to
+    canonical full paths for audit-log rendering.
+
+    The audit log is the one human-facing surface in the app — the LLM
+    can read short GUIDs fine, but a human reviewing the log shouldn't
+    have to look up ``%2e78c86`` to know what got reconciled. This
+    function walks ``params`` once and rewrites every known account-ref
+    key (and split-list ``account`` values) to the matching
+    ``Account.fullname``.
+
+    One book open per entry, regardless of how many refs are resolved.
+    Resolution failures degrade gracefully — we leave the original
+    string in place rather than crashing log rendering.
+    """
+    if not params:
+        return params
+
+    keys_to_normalize = set(_ACCOUNT_REF_KEYS_ALWAYS) | (
+        _ACCOUNT_REF_KEYS_CONDITIONAL.get((entity_type, operation)) or set()
+    )
+
+    # Pass 1: collect every unique ref string that's worth a lookup.
+    refs: set[str] = set()
+    for key, value in params.items():
+        if key in keys_to_normalize and _looks_like_guid_ref(value):
+            refs.add(value)
+        elif key == "splits" and isinstance(value, list):
+            for split in value:
+                if isinstance(split, dict):
+                    acct_ref = split.get("account")
+                    if _looks_like_guid_ref(acct_ref):
+                        refs.add(acct_ref)
+
+    if not refs:
+        # All values are paths already (or nothing to normalize).
+        return params
+
+    # Pass 2: one book open, resolve everything.
+    resolved: dict[str, str] = {}
+    if _get_book_func is not None:
+        try:
+            book_wrapper = _get_book_func()
+            if book_wrapper is not None:
+                with book_wrapper.open(readonly=True) as book:
+                    for ref in refs:
+                        try:
+                            account = book_wrapper._resolve_account(book, ref)
+                            if account is not None:
+                                resolved[ref] = account.fullname
+                        except Exception:
+                            # Stale, ambiguous, malformed — leave the raw
+                            # ref in place; the log line is still useful.
+                            continue
+        except Exception:
+            # Book unavailable: fall back to raw refs everywhere.
+            pass
+
+    if not resolved:
+        return params
+
+    def _replace(s):
+        return resolved.get(s, s) if isinstance(s, str) else s
+
+    # Pass 3: rewrite. Non-destructive — return a new dict so the
+    # debug-log line that already captured the original params is
+    # unaffected.
+    out: dict = {}
+    for key, value in params.items():
+        if key in keys_to_normalize:
+            out[key] = _replace(value)
+        elif key == "splits" and isinstance(value, list):
+            new_splits = []
+            for split in value:
+                if isinstance(split, dict) and "account" in split:
+                    new_splits.append({**split, "account": _replace(split["account"])})
                 else:
-                    lines.append(f'{indent}Description: "{old_desc}"')
+                    new_splits.append(split)
+            out[key] = new_splits
+        else:
+            out[key] = value
+    return out
 
-                # Date change
-                old_date = before.get("date", "")
-                new_date = after.get("date", "")
-                if old_date != new_date:
-                    lines.append(f"{indent}Date: {old_date} → {new_date}")
-                else:
-                    lines.append(f"{indent}Date: {old_date} (unchanged)")
 
-                # Splits change
-                if before.get("splits") != after.get("splits"):
-                    lines.append(f"{indent}Splits (before):")
-                    lines.append(_format_splits_text(before.get("splits", []), indent + "  "))
-                    lines.append(f"{indent}Splits (after):")
-                    lines.append(_format_splits_text(after.get("splits", []), indent + "  "))
+def _format_audit_entry_text(entry: dict) -> str:
+    """Format an audit entry as human-readable text.
 
-        elif operation == "VOID":
-            lines.append(f"{time_part}  VOID TRANSACTION  guid:{guid_short}")
-            reason = params.get("reason", "")
-            lines.append(f'{indent}Reason: "{reason}"')
-            if before:
-                desc = before.get("description", "")
-                date_str = before.get("date", "")
-                lines.append(f'{indent}Was: "{desc}" ({date_str})')
-                if before.get("splits"):
-                    lines.append(_format_splits_text(before["splits"], indent + "  "))
+    Only formats write operations (mutations). Reads and unmapped
+    (entity_type, operation) combos return the empty string so a new
+    classification added in book code but not yet wired to a handler
+    degrades silently rather than crashing log rendering.
 
-        elif operation == "UNVOID":
-            lines.append(f"{time_part}  UNVOID TRANSACTION  guid:{guid_short}")
-            if after:
-                desc = after.get("description", "")
-                date_str = after.get("date", "")
-                lines.append(f'{indent}Restored: "{desc}" ({date_str})')
-                if after.get("splits"):
-                    lines.append(_format_splits_text(after["splits"], indent + "  "))
+    The account ``MOVE`` operation is logged upstream as ``UPDATE``
+    with ``new_parent`` in params — we remap the key here before
+    lookup so the dedicated move handler fires instead of the update
+    one.
 
-        elif operation == "DELETE":
-            lines.append(f"{time_part}  DELETE TRANSACTION  guid:{guid_short}")
-            if before:
-                desc = before.get("description", "")
-                date_str = before.get("date", "")
-                lines.append(f'{indent}Was: "{desc}" ({date_str})')
-                if before.get("splits"):
-                    lines.append(_format_splits_text(before["splits"], indent + "  "))
+    Account refs in ``params`` (``%shortguid`` or full 32-char GUIDs)
+    are resolved to canonical full paths before handlers see them.
+    Audit logs are read by humans; short GUIDs are convenient on the
+    wire but would force a manual lookup at review time.
+    """
+    if entry.get("classification") != "write":
+        return ""
 
-        elif operation == "REPLACE_SPLITS":
-            lines.append(f"{time_part}  REPLACE SPLITS  guid:{guid_short}")
-            if after:
-                desc = after.get("description", "")
-                date_str = after.get("date", "")
-                lines.append(f'{indent}"{desc}" ({date_str})')
-                # Show before splits (from previous_splits in the response)
-                prev_splits = after.get("previous_splits", [])
-                if prev_splits:
-                    lines.append(f"{indent}Splits (before):")
-                    lines.append(_format_splits_text(prev_splits, indent + "  "))
-                # Show after splits
-                new_splits = after.get("splits", [])
-                if new_splits:
-                    lines.append(f"{indent}Splits (after):")
-                    lines.append(_format_splits_text(new_splits, indent + "  "))
-                # Show warnings if any
-                warnings = after.get("warnings", [])
-                if warnings:
-                    for w in warnings:
-                        lines.append(f"{indent}Warning: {w}")
+    entity_type = entry.get("entity_type") or ""
+    operation = (entry.get("operation") or "").upper()
 
-    elif entity_type == "account":
-        if operation == "CREATE":
-            lines.append(f"{time_part}  CREATE ACCOUNT")
-            if after:
-                lines.append(f"{indent}{after.get('fullname', params.get('name', ''))}")
-                lines.append(f"{indent}Type: {after.get('type', params.get('account_type', ''))}")
-                desc = after.get("description", params.get("description", ""))
-                if desc:
-                    lines.append(f'{indent}Description: "{desc}"')
+    # Account update with new_parent → MOVE
+    if (
+        entity_type == "account"
+        and operation == "UPDATE"
+        and "new_parent" in (entry.get("params") or {})
+    ):
+        operation = "MOVE"
 
-        elif operation == "UPDATE":
-            lines.append(f"{time_part}  UPDATE ACCOUNT")
-            account_name = params.get("name", "")
-            lines.append(f"{indent}{account_name}")
-            if before and after:
-                old_name = before.get("name", "")
-                new_name = after.get("name", "")
-                if old_name != new_name:
-                    lines.append(f'{indent}Name: "{old_name}" → "{new_name}"')
-                old_desc = before.get("description", "")
-                new_desc = after.get("description", "")
-                if old_desc != new_desc:
-                    lines.append(f'{indent}Description: "{old_desc}" → "{new_desc}"')
+    handler = _AUDIT_HANDLERS.get((entity_type, operation))
+    if handler is None:
+        return ""
 
-        elif operation == "DELETE":
-            lines.append(f"{time_part}  DELETE ACCOUNT")
-            if before:
-                lines.append(f"{indent}Was: {before.get('fullname', params.get('name', ''))}")
-                lines.append(f"{indent}Type: {before.get('type', '')}")
-                desc = before.get("description", "")
-                if desc:
-                    lines.append(f'{indent}Description: "{desc}"')
+    # Substitute canonical fullnames in for any %short / full-GUID
+    # account refs the LLM passed. Non-destructive: the source entry
+    # (and the debug log already written from it) keeps the raw values.
+    normalized_params = _normalize_account_refs_for_audit(
+        entry.get("params") or {}, entity_type, operation
+    )
+    if normalized_params is not (entry.get("params") or {}):
+        entry = {**entry, "params": normalized_params}
 
-    elif entity_type == "split":
-        if operation == "RECONCILE":
-            account = params.get("account", "")
-            lines.append(f"{time_part}  RECONCILE  {account}")
-            lines.append(f"{indent}Statement date: {params.get('statement_date', '')}")
-            lines.append(f"{indent}Statement balance: {_format_amount(params.get('statement_balance'))}")
-            # Get split details from before_state if available
-            split_details = before.get("splits", []) if before else []
-            split_guids = params.get("split_guids", [])
-            lines.append(f"{indent}Splits reconciled ({len(split_guids)}):")
-            for i, guid in enumerate(split_guids[:10]):  # Limit to first 10
-                guid_short = guid[:8]
-                # Try to find details for this split
-                split_info = next((s for s in split_details if s and s.get("guid") == guid), None)
-                if split_info:
-                    desc = split_info.get("transaction_description", "")
-                    amount = _format_amount(split_info.get("amount"))
-                    lines.append(f'{indent}  guid:{guid_short}  "{desc}"  {amount:>10}')
-                else:
-                    lines.append(f"{indent}  guid:{guid_short}")
-            if len(split_guids) > 10:
-                lines.append(f"{indent}  ... and {len(split_guids) - 10} more")
-
-        elif operation == "SET_STATE":
-            split_guid = params.get("split_guid", "")[:8]
-            lines.append(f"{time_part}  SET RECONCILE STATE")
-            lines.append(f"{indent}guid:{split_guid} (split)")
-            if before:
-                account = before.get("account", "").split(":")[-1]  # Short name
-                lines.append(f"{indent}Account: {account}")
-                desc = before.get("transaction_description", "")
-                amount = _format_amount(before.get("amount"))
-                if desc:
-                    lines.append(f'{indent}"{desc}"  {amount}')
-            state = params.get("state", "")
-            old_state = before.get("reconcile_state", "n") if before else "n"
-            lines.append(f"{indent}State: {old_state} → {state}")
-
-    elif entity_type == "account_slot":
-        account = params.get("account", "")
-        key = params.get("key", "")
-
-        if operation == "SET_SLOT":
-            value = params.get("value", "")
-            status = ""
-            if after:
-                status = after.get("status", "")
-            lines.append(f"{time_part}  SET ACCOUNT SLOT  account:{account}")
-            lines.append(f'{indent}key: "{key}"  value: "{value}"  ({status})')
-
-        elif operation == "DELETE_SLOT":
-            lines.append(f"{time_part}  DELETE ACCOUNT SLOT  account:{account}")
-            lines.append(f'{indent}key: "{key}"')
-
-    # Handle move_account specially (it's logged as "update" but is conceptually a move)
-    if entity_type == "account" and "new_parent" in params:
-        # This is actually a MOVE operation
-        lines = [f"{time_part}  MOVE ACCOUNT"]
-        account_name = params.get("name", "")
-        new_parent = params.get("new_parent", "")
-        lines.append(f"{indent}{account_name}")
-        if before:
-            old_parent = ":".join(before.get("fullname", "").split(":")[:-1]) or "(root)"
-            lines.append(f"{indent}From: {old_parent}")
-        lines.append(f"{indent}To: {new_parent}")
-
+    lines = handler(entry)
     return "\n".join(lines) if lines else ""
+
+
+def _normalize_for_audit(value):
+    """Recursively convert pydantic models to plain dicts/primitives.
+
+    The audit decorator captures the tool's ``kwargs`` into
+    ``entry["params"]`` and also stringifies them into the debug log
+    via ``json.dumps``. When a tool declares a pydantic model in its
+    signature (e.g. ``splits: list[SplitInput]`` on
+    ``create_transaction``), FastMCP hands us live model instances —
+    not JSON-serializable, and the audit text formatters expect the
+    raw dict shape (``split.get("account")``, etc.).
+
+    This normalizer walks the kwargs once and produces an equivalent
+    value with every pydantic model replaced by ``model_dump
+    (exclude_none=True)``. Plain dicts, lists, and scalars pass
+    through untouched (``exclude_none`` preserves the
+    "key present iff value set" contract the book methods depend
+    on — ``"quantity" in split`` keeps working).
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_normalize_for_audit(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_for_audit(v) for k, v in value.items()}
+    return value
 
 
 def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
@@ -579,29 +1143,64 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
+            # Normalize up front so pydantic models (e.g. list[SplitInput]
+            # from the transaction-creating tools) become plain dicts before
+            # they hit json.dumps in the debug line or the text-audit
+            # formatters that read from entry["params"].
+            normalized_kwargs = _normalize_for_audit(kwargs)
+
             entry = {
                 "timestamp": timestamp,
                 "tool": func.__name__,
                 "classification": classification,
-                "params": kwargs,
+                "params": normalized_kwargs,
             }
 
             if classification == "write":
                 entry["operation"] = operation
                 entry["entity_type"] = entity_type
-                # Capture before_state for updates/deletes/voids
-                before = _capture_before_state(entity_type, operation, kwargs)
-                if before:
-                    entry["before_state"] = before
 
             debug_logger.debug(
-                f"MCP request: tool={func.__name__} params={json.dumps(kwargs)}"
+                f"MCP request: tool={func.__name__} "
+                f"params={json.dumps(normalized_kwargs)}"
             )
+
+            # Before the first write of each process, give the backup
+            # system a chance to snapshot. BackupMixin's own flag makes
+            # subsequent calls no-op, so the cost is negligible after
+            # the first hit. Silent on failure — auto-backup must
+            # never break a user's write. Reads never trigger.
+            if classification == "write" and _get_book_func is not None:
+                try:
+                    book = _get_book_func()
+                    if book is not None and hasattr(
+                        book, "_maybe_auto_backup"
+                    ):
+                        book._maybe_auto_backup()
+                except Exception as e:  # noqa: BLE001 — must swallow
+                    debug_logger.warning(f"Auto-backup check failed: {e}")
+
             start_time = time.time()
 
             try:
                 result = func(*args, **kwargs)
                 elapsed_ms = (time.time() - start_time) * 1000
+
+                # Consume any before-state the book method staged while
+                # its session was open. Always consume (even on read /
+                # create) to clear any stray value; helper returns None
+                # when nothing staged.
+                before = None
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            before = book._consume_audit_before()
+                    except Exception:
+                        # Never let consumption failures break a tool.
+                        before = None
+                if classification == "write" and before:
+                    entry["before_state"] = before
 
                 # Check if result indicates an error (JSON with "error" key)
                 try:
@@ -624,15 +1223,11 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms size={len(result)}bytes"
                 )
 
-                # Log in appropriate format
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # Text format - only log write operations
-                    text_entry = _format_audit_entry_text(entry)
-                    if text_entry:
-                        logger.info(text_entry)
-                        logger.info("")  # Blank line between entries
+                # Only log write operations; reads are noise in the audit trail.
+                text_entry = _format_audit_entry_text(entry)
+                if text_entry:
+                    logger.info(text_entry)
+                    logger.info("")  # Blank line between entries
                 _flush_logger(logger)
                 return result
 
@@ -641,20 +1236,27 @@ def audit_log(
                 entry["result"] = "error"
                 entry["error"] = str(e)
 
+                # Drop any staged before-state so it can't leak into the
+                # next call. Failed writes don't render before_state in
+                # the error line anyway.
+                if _get_book_func is not None:
+                    try:
+                        book = _get_book_func()
+                        if book is not None:
+                            book._consume_audit_before()
+                    except Exception:
+                        pass
+
                 debug_logger.debug(
                     f"MCP response: tool={func.__name__} status=error "
                     f"elapsed={elapsed_ms:.0f}ms error={e}"
                 )
 
-                # Log errors in both formats
-                if _audit_format == "json":
-                    logger.info(json.dumps(entry))
-                else:
-                    # For errors in text format, log a simple error line
-                    time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                    error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
-                    logger.info(error_text)
-                    logger.info("")
+                # Log a simple error line
+                time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
+                error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
+                logger.info(error_text)
+                logger.info("")
                 _flush_logger(logger)
                 raise
 

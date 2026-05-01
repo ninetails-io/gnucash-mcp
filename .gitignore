@@ -40,8 +40,22 @@ htmlcov/
 *.gnucash
 *.gnucash.LCK
 *.gnucash.log
+# Sample books ship with the repo — exempt them from the global
+# ``*.gnucash`` ignore so they're tracked. Personal books outside
+# ``samples/`` remain ignored.
+!samples/*.gnucash
 
 # OS
 .DS_Store
 Thumbs.db
-CLAUDE.md
+
+# Claude Code local-only notes (cross-session handoffs, personal context).
+# The committed CLAUDE.md is the public contributor guide.
+CLAUDE.local.md
+
+# Local-only working files — IDE / client state, scratch notes,
+# local test scripts that shouldn't pollute the shared repo.
+.claude/
+.mcp.json
+ERROR_TESTING.md
+test.sh
