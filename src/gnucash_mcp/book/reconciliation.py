@@ -60,8 +60,10 @@ class ReconciliationMixin:
         Args:
             split_guid: GUID of the split to update.
             state: New reconcile state ('n'=new, 'c'=cleared, 'y'=reconciled).
-            reconcile_date: Date of reconciliation. Required if state is 'y',
-                           defaults to today if not provided.
+            reconcile_date: Date of reconciliation. Optional even
+                for state ``'y'`` — defaults to today's date when
+                not provided. Pass explicitly to record a
+                reconciliation as of a specific statement date.
 
         Returns:
             Dict with split details and status.
@@ -280,12 +282,28 @@ class ReconciliationMixin:
                 splits_to_reconcile.append(split)
                 reconciling_total += split.quantity
 
-            new_balance = reconciled_balance + reconciling_total
-            if new_balance != expected_balance:
+            # Quantize both sides to the account commodity's
+            # smallest fraction before comparing. Pre-fix a user
+            # typing ``"1234.567"`` against a 2-decimal book
+            # produced a perpetual 0.007 mismatch with no clear
+            # error — every reconciliation attempt failed even
+            # when the books agreed at the cent. Now the
+            # statement balance and computed balance are both
+            # normalized to the commodity's smallest unit (USD ->
+            # 2 decimals, JPY -> 0, BHD -> 3) before equality.
+            fraction = getattr(account.commodity, "fraction", 100)
+            quantum = (
+                Decimal(1) / Decimal(fraction) if fraction > 1 else Decimal(1)
+            )
+            expected_q = expected_balance.quantize(quantum)
+            new_balance = (
+                reconciled_balance + reconciling_total
+            ).quantize(quantum)
+            if new_balance != expected_q:
                 raise ValueError(
                     f"Balance mismatch: reconciled balance would be {new_balance}, "
-                    f"but statement balance is {expected_balance}. "
-                    f"Difference: {expected_balance - new_balance}"
+                    f"but statement balance is {expected_q}. "
+                    f"Difference: {expected_q - new_balance}"
                 )
 
             # Stage pre-reconcile state for the audit log. Shape mirrors
@@ -430,6 +448,34 @@ class ReconciliationMixin:
 
             if not any(s.reconcile_state == "v" for s in transaction.splits):
                 raise ValueError(f"Transaction {guid} is not voided")
+
+            # Validate up-front that EVERY voided split has its
+            # void-former slots present. Pre-fix partial corruption
+            # (e.g., a split missing its void-former-value but with
+            # void-former-quantity present) silently produced a
+            # partial unvoid — the value-missing split would stay
+            # at zero while its sibling was restored. Better to
+            # refuse and surface the corruption explicitly.
+            missing_slots = []
+            for split in transaction.splits:
+                if split.reconcile_state != "v":
+                    continue
+                has_value = split.get("void-former-value") is not None
+                has_qty = split.get("void-former-quantity") is not None
+                if not (has_value and has_qty):
+                    missing_slots.append(
+                        f"{split.account.fullname} (value={has_value}, "
+                        f"quantity={has_qty})"
+                    )
+            if missing_slots:
+                raise ValueError(
+                    f"Cannot unvoid transaction {guid}: voided splits "
+                    f"are missing their void-former slots, indicating "
+                    f"partial corruption. Affected splits: "
+                    f"{'; '.join(missing_slots)}. Restore the slots "
+                    f"manually (or void/recreate the transaction) "
+                    f"before retrying."
+                )
 
             for split in transaction.splits:
                 former_value = split.get("void-former-value")

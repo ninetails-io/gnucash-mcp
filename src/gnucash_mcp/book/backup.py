@@ -129,19 +129,30 @@ def _parse_ts(ts_str: str) -> datetime:
 
 
 def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
-    """Human-readable age string for listings — 'just now', '3 days ago', etc."""
+    """Human-readable age string for listings — 'just now', '3 days ago', etc.
+
+    Rounds to nearest unit rather than floor — pre-fix a 59.9-minute
+    age displayed as "59 minutes ago" (one unit short of the next
+    boundary). Round-half-up makes the boundary cases honest:
+    59m30s reads as "60 minutes ago" → which then promotes to "1
+    hour ago" via the next-bucket check.
+    """
     now = reference or _now_utc()
     delta = now - ts
     seconds = delta.total_seconds()
     if seconds < 60:
         return "just now"
     if seconds < 3600:
-        minutes = int(seconds // 60)
+        minutes = round(seconds / 60)
+        if minutes >= 60:
+            return "1 hour ago"
         return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
     if seconds < 86400:
-        hours = int(seconds // 3600)
+        hours = round(seconds / 3600)
+        if hours >= 24:
+            return "1 day ago"
         return f"{hours} hour{'s' if hours != 1 else ''} ago"
-    days = int(seconds // 86400)
+    days = round(seconds / 86400)
     return f"{days} day{'s' if days != 1 else ''} ago"
 
 
@@ -476,7 +487,16 @@ class BackupMixin:
             ts, stage, label = parsed
             try:
                 size = path.stat().st_size
-            except OSError:
+            except OSError as e:
+                # Most common case: a broken symlink (target moved
+                # or deleted). Pre-fix this was silently dropped —
+                # ``list_backups`` showed N-1 entries and
+                # ``prune_backups`` would never clean the broken
+                # link. Logging surfaces the issue at the next
+                # debug-log inspection without breaking the listing.
+                debug_logger.warning(
+                    f"Backup file unstattable, skipping: {path} ({e})"
+                )
                 continue
             entries.append({
                 "stage": stage,

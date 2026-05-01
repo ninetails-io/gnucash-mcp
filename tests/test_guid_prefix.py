@@ -267,6 +267,38 @@ class TestResolveGuidValidation:
 
     # ── Length ──────────────────────────────────────────────────
 
+    def test_table_dispatch_uses_parameterized_query(
+        self, book: GnuCashBook,
+    ):
+        """``_resolve_guid`` looks up its SQL via the
+        ``_GUID_TABLE_QUERIES`` dispatch dict rather than f-string-
+        interpolating the table name. Pre-fix the query was built as
+        ``f"SELECT guid FROM {table} ..."`` — safe via the
+        ``_GUID_TABLES`` allowlist but a fragile pattern if a future
+        contributor added a table without re-validating.
+        """
+        # Every entry in _GUID_TABLES has a matching query.
+        assert set(book._GUID_TABLES) == set(book._GUID_TABLE_QUERIES.keys())
+        # Each query string targets the right table and parameterizes
+        # the prefix (no f-string-of-user-input hidden in there).
+        for table, sql in book._GUID_TABLE_QUERIES.items():
+            assert "?" in sql, f"{table} query lost its parameter binding"
+            assert f"FROM {table}" in sql, (
+                f"{table} query doesn't target the right table: {sql}"
+            )
+
+    def test_extended_table_coverage(self, book: GnuCashBook):
+        """Coverage extended to ``prices`` and ``entries`` tables —
+        both have ``guid`` columns and may surface as short prefixes
+        from any tool that emits them. Pre-fix only the original 10
+        tables resolved; a price-GUID prefix would raise
+        "Invalid table"."""
+        assert "prices" in book._GUID_TABLES
+        assert "entries" in book._GUID_TABLES
+        # Slots is intentionally absent — slots have no primary
+        # GUID; they're keyed by (obj_guid, name).
+        assert "slots" not in book._GUID_TABLES
+
     def test_rejects_under_8_chars(self, book: GnuCashBook):
         with pytest.raises(ValueError, match="too short"):
             book._resolve_guid("transactions", "abc")

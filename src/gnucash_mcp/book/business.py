@@ -840,7 +840,15 @@ class BusinessMixin:
                 amount_str = f"{ccy} {int(grand_total):,}".strip()
             else:
                 amount_str = f"{ccy} {grand_total:,.2f}".strip()
-        except Exception:
+        except (ValueError, AttributeError, TypeError):
+            # Empty entries (ValueError from
+            # ``_get_invoice_entries_and_total``), missing currency
+            # attr, or arithmetic on a None — render "?" so the
+            # listing line still produces a row. Pre-fix the bare
+            # ``except Exception`` would have swallowed programming
+            # errors (KeyError / NameError / etc.) silently too;
+            # tightened to the predictable shapes that "? amount"
+            # is the right rendering for.
             amount_str = "?"
 
         return (
@@ -3033,7 +3041,15 @@ class BusinessMixin:
                     book, inv.owner_guid
                 )
             owner_name = owner.name if owner else ""
-            txn_desc = description or owner_name
+            # ``description if not None`` (vs. ``description or
+            # owner_name``) lets the caller pass an empty string
+            # explicitly when they want a blank transaction
+            # description — e.g., to avoid leaking the customer
+            # name into a memo. ``description=None`` (the default)
+            # falls back to the owner's name, preserving the
+            # historical default. Pre-fix ``""`` was indistinguish-
+            # able from ``None``.
+            txn_desc = description if description is not None else owner_name
 
             # Cross-currency payment: when the payment account's
             # commodity OR the A/R/A/P account's commodity differs

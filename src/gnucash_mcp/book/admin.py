@@ -5,6 +5,33 @@ Slots are used to store per-account data like APR, credit limit,
 statement close day, etc. Values are stored as strings.
 """
 
+import re
+
+# Slot keys with embedded ``/`` create hierarchical sub-slots in
+# GnuCash's KVP store rather than flat keys. The MCP-facing tools
+# only manage flat keys (``apr``, ``credit_limit``, ``minimum_payment``,
+# etc.), so we restrict input to a safe alphabet up-front. Pre-fix
+# a key like ``credit/limit`` silently created a sub-slot under
+# ``credit`` — invisible to ``get_account_slots`` keyed lookups.
+_SLOT_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _slot_value_str(value) -> str:
+    """Stringify a piecash slot value to a stable str.
+
+    piecash returns either a typed wrapper with a ``.value``
+    attribute or the raw value depending on slot type. The
+    single-key path and the all-keys path of ``get_account_slots``
+    used to handle these differently — single-key fell back to
+    ``str(value)`` when ``.value`` was missing, all-keys assumed
+    ``.value`` always present and would AttributeError on the
+    first row that didn't have it. Centralizing the access
+    makes both paths agree.
+    """
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
 
 class AdminMixin:
     """Account slot operations.
@@ -36,14 +63,13 @@ class AdminMixin:
 
             if key is not None:
                 try:
-                    value = account[key]
-                    slots = {key: str(value.value) if hasattr(value, 'value') else str(value)}
+                    slots = {key: _slot_value_str(account[key])}
                 except KeyError:
                     slots = {}
             else:
                 slots = {}
                 for k, v in account.iteritems():
-                    slots[k] = str(v.value)
+                    slots[k] = _slot_value_str(v)
 
             return {
                 "account": account.fullname,
@@ -57,7 +83,12 @@ class AdminMixin:
 
         Args:
             account_name: Full account path.
-            key: Slot key (e.g., "apr", "credit_limit").
+            key: Slot key (e.g., "apr", "credit_limit"). Restricted
+                to ``[A-Za-z0-9_.-]``; embedded ``/`` would create
+                hierarchical sub-slots in GnuCash's KVP store
+                rather than a flat key (the slot would be
+                invisible to keyed lookups). Reject up front
+                rather than create silently-wrong storage.
             value: Slot value. Stored as string.
 
         Returns:
@@ -65,8 +96,15 @@ class AdminMixin:
             not echoed — the audit log captures them from tool params.
 
         Raises:
-            ValueError: If account not found.
+            ValueError: If account not found or key contains
+                disallowed characters.
         """
+        if not _SLOT_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"Invalid slot key {key!r}: must match [A-Za-z0-9_.-]+. "
+                f"Embedded '/' would create hierarchical sub-slots; "
+                f"use flat keys."
+            )
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
             if not account:

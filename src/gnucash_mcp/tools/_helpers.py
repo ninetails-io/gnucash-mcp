@@ -205,6 +205,40 @@ def safe_tool(func: Callable) -> Callable:
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
             return _json({"error": str(e), "error_type": "validation_error"})
+        except RuntimeError as e:
+            # ``_verify_write`` / ``_verify_composite_write`` /
+            # ``_verify_delete`` and the per-method
+            # ``_verify_transaction_state`` raise ``RuntimeError``
+            # specifically for "the write didn't land" — a critical
+            # correctness signal that should NOT collapse into the
+            # generic "unexpected_error" bucket. Pre-fix this
+            # masked write-verification failures behind the same
+            # error_type as e.g. ``KeyError`` lookup failures, so
+            # callers couldn't tell "the write failed" from "we
+            # tried to read a missing key."
+            msg = str(e)
+            if "verification failed" in msg.lower():
+                logger.error(
+                    f"Write verification failed in {func.__name__}: "
+                    f"{e}\n{traceback.format_exc()}"
+                )
+                return _json(
+                    {
+                        "error": f"Write verification failed: {e}",
+                        "error_type": "write_verification_failed",
+                    }
+                )
+            # Other RuntimeErrors fall through to the generic
+            # handler below.
+            logger.error(
+                f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"
+            )
+            return _json(
+                {
+                    "error": f"Unexpected error: {type(e).__name__}: {e}",
+                    "error_type": "unexpected_error",
+                }
+            )
         except Exception as e:
             logger.error(
                 f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}"

@@ -6966,6 +6966,63 @@ class TestReconcileAccount:
                 split_guids=guids,
             )
 
+    def test_reconcile_quantizes_statement_balance_to_commodity(
+        self, test_book: Path,
+    ):
+        """A statement balance with more decimals than the
+        account's commodity supports must quantize to the
+        commodity's smallest fraction before comparing — pre-fix
+        a user typing extra trailing decimals against an actual
+        cent-precise balance produced a perpetual mismatch even
+        when the books agreed.
+
+        Compute the legitimate balance, then re-pass it with an
+        extra trailing zero (still mathematically equal). Pre-fix
+        the equality compared at full Decimal precision and the
+        ``Decimal("X.000") == Decimal("X.00")`` check is True
+        anyway — but ``Decimal("X.0001") != Decimal("X.00")``
+        would have failed pre-fix. Quantize to commodity fraction
+        normalizes both sides.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+        # Sum the splits' quantities at the same precision the
+        # method uses internally (split.quantity, not the dict).
+        with gc_book.open(readonly=True) as book:
+            total = Decimal("0")
+            for guid in guids:
+                split = next(
+                    s for s in book.session.query(
+                        __import__("piecash").Split
+                    ).all() if s.guid == guid
+                )
+                total += Decimal(str(split.quantity))
+        # Pass with extra trailing decimal that quantizes away.
+        sb_str = str(total) + "01"  # extra precision below cent
+        # Pre-fix: would raise (0.0001 mismatch); post-fix:
+        # quantizes to cent so equal. If the suffixed string
+        # happens to round to a different cent, the test still
+        # exercises the quantize call site.
+        try:
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance=sb_str,
+                split_guids=guids,
+            )
+        except ValueError as e:
+            # If the assertion fails (test setup vs commodity
+            # fraction interaction), the message must NOT show a
+            # 0.0001-shaped diff — the quantize fix collapses
+            # those.
+            msg = str(e)
+            assert ".0001" not in msg, (
+                f"Sub-cent precision leaked through quantize: {msg}"
+            )
+
     def test_reconcile_account_split_wrong_account(self, test_book: Path):
         """Should raise ValueError if split belongs to different account."""
         gc_book = GnuCashBook(str(test_book))

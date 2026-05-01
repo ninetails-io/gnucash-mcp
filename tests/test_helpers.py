@@ -204,3 +204,49 @@ class TestApplyLimit:
         # Truncation preserves input order (just ``items[:n]``).
         items, _ = _apply_limit(list(range(20)), limit=3)
         assert items == [0, 1, 2]
+
+
+class TestSafeToolWriteVerificationRouting:
+    """``safe_tool`` distinguishes write-verification failures from
+    generic unexpected errors.
+
+    Pre-fix, every ``RuntimeError`` (including ``_verify_write`` /
+    ``_verify_transaction_state`` ones — the architectural "every
+    write is verified" invariant the codebase upholds) collapsed
+    into ``error_type=unexpected_error``. Callers couldn't tell
+    "the write didn't land" from "we tried to read a missing key."
+    """
+
+    def test_verification_failure_routed_to_dedicated_error_type(self):
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        @safe_tool
+        def fake_tool() -> str:
+            raise RuntimeError("Transaction write verification failed: ...")
+
+        result = json.loads(fake_tool())
+        assert result["error_type"] == "write_verification_failed"
+        assert "verification failed" in result["error"].lower()
+
+    def test_other_runtime_errors_still_unexpected(self):
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        @safe_tool
+        def fake_tool() -> str:
+            raise RuntimeError("some unrelated runtime issue")
+
+        result = json.loads(fake_tool())
+        assert result["error_type"] == "unexpected_error"
+
+    def test_value_errors_unchanged(self):
+        import json
+        from gnucash_mcp.tools._helpers import safe_tool
+
+        @safe_tool
+        def fake_tool() -> str:
+            raise ValueError("Account not found: Bogus")
+
+        result = json.loads(fake_tool())
+        assert result["error_type"] == "validation_error"

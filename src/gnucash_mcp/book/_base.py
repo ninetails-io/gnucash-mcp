@@ -664,12 +664,36 @@ class BaseGnuCashBook:
     base via `build_book_class` in gnucash_mcp.book.__init__.
     """
 
-    # Tables that support GUID resolution
-    _GUID_TABLES = frozenset({
-        "transactions", "splits", "accounts", "lots",
-        "schedxactions", "commodities", "budgets",
-        "customers", "vendors", "invoices",
-    })
+    # Tables that support GUID resolution. Each entry maps table
+    # name → its prefix-lookup SQL. The dispatch dict eliminates
+    # the f-string interpolation in ``_resolve_guid`` — pre-fix
+    # the query was built as ``f"SELECT guid FROM {table} ..."``,
+    # safe via the ``_GUID_TABLES`` allowlist but a fragile pattern
+    # if a future contributor added a table without re-validating.
+    # Storing the full statement per-table makes the validation
+    # implicit (no entry → no lookup) and gives each table room to
+    # diverge if its schema warrants it.
+    #
+    # Coverage extended to ``prices`` and ``entries`` (both have
+    # ``guid`` columns and may surface as short prefixes from any
+    # tool that emits them). ``slots`` is intentionally absent —
+    # slots have no primary GUID; they're keyed by ``obj_guid``
+    # (the parent entity) plus name.
+    _GUID_TABLE_QUERIES: dict[str, str] = {
+        "transactions": "SELECT guid FROM transactions WHERE guid LIKE ?",
+        "splits": "SELECT guid FROM splits WHERE guid LIKE ?",
+        "accounts": "SELECT guid FROM accounts WHERE guid LIKE ?",
+        "lots": "SELECT guid FROM lots WHERE guid LIKE ?",
+        "schedxactions": "SELECT guid FROM schedxactions WHERE guid LIKE ?",
+        "commodities": "SELECT guid FROM commodities WHERE guid LIKE ?",
+        "budgets": "SELECT guid FROM budgets WHERE guid LIKE ?",
+        "customers": "SELECT guid FROM customers WHERE guid LIKE ?",
+        "vendors": "SELECT guid FROM vendors WHERE guid LIKE ?",
+        "invoices": "SELECT guid FROM invoices WHERE guid LIKE ?",
+        "prices": "SELECT guid FROM prices WHERE guid LIKE ?",
+        "entries": "SELECT guid FROM entries WHERE guid LIKE ?",
+    }
+    _GUID_TABLES = frozenset(_GUID_TABLE_QUERIES.keys())
 
     def __init__(self, book_path: str):
         """Initialize with path to GnuCash SQLite book.
@@ -774,7 +798,7 @@ class BaseGnuCashBook:
         conn = sqlite3.connect(f"file:{self.book_path}?mode=ro", uri=True)
         try:
             rows = conn.execute(
-                f"SELECT guid FROM {table} WHERE guid LIKE ?",
+                self._GUID_TABLE_QUERIES[table],
                 (partial + "%",),
             ).fetchall()
         finally:
