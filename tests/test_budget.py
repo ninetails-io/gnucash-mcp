@@ -4,7 +4,7 @@ import pytest
 from decimal import Decimal
 from pathlib import Path
 
-from gnucash_mcp.book import GnuCashBook
+from gnucash_mcp.book import GnuCashBook, build_book_class
 
 
 # ============== TestCreateBudget ==============
@@ -733,6 +733,122 @@ class TestGetBudgetReport:
         by_acct = {a["account"]: a for a in report["accounts"]}
         # Parent rollup: 100 USD + (100 EUR × 1.10) = 210 USD.
         # Pre-fix, raw quantity sum produced 200.
+        assert Decimal(by_acct["Expenses:Travel"]["actual"]) == Decimal("210")
+
+    def test_cross_currency_rollup_without_reporting_module(
+        self, budget_book: Path,
+    ):
+        """Cross-currency budget rollup must work on a ``--modules
+        core,budgets`` build with no reporting mixin loaded.
+
+        Pre-fix, the conversion helpers
+        (``_account_conversion_factors`` / ``_split_in_default_currency``)
+        lived on ReportingMixin; budgets reached them via
+        ``getattr(self, ..., None)`` and silently degraded to raw
+        ``split.quantity`` sums when reporting was disabled — the
+        same bug class v1.2.1 fixed for the reports themselves, now
+        hiding behind a feature flag.
+
+        After the v1.3 Stage 1 work, currency helpers live on
+        :class:`CurrencyMixin` composed into :class:`BaseGnuCashBook`
+        unconditionally. This test exercises the
+        ``{"core","budgets"}`` build path explicitly to confirm a
+        100 EUR + 100 USD spend rolls up as 210 USD on a budgeted
+        USD parent (not 200).
+        """
+        import piecash
+        from datetime import date as _date
+        from piecash._common import GnucashException
+        from piecash import factories
+
+        # Use the default-build GnuCashBook to seed the data — write
+        # path needs the full toolkit. The currency-mixin assertion
+        # is on the *read* path (`get_budget_report`) using the
+        # restricted-module build below.
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            try:
+                eur = factories.create_currency_from_ISO("EUR")
+                b.session.add(eur)
+                b.flush()
+            except (GnucashException, Exception):
+                eur = next(
+                    (c for c in b.commodities if c.mnemonic == "EUR"), None,
+                )
+                if eur is None:
+                    raise
+
+            expenses = next(
+                a for a in b.accounts if a.fullname == "Expenses"
+            )
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            travel = piecash.Account(
+                name="Travel", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            europe = piecash.Account(
+                name="Europe", type="EXPENSE", parent=travel,
+                commodity=eur,
+            )
+            us = piecash.Account(
+                name="US", type="EXPENSE", parent=travel, commodity=usd,
+            )
+            piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 1, 1),
+                value=Decimal("1.10"),
+                source="user:price", type="last",
+            )
+            piecash.Transaction(
+                currency=usd, description="Hotel in Berlin",
+                post_date=_date(2026, 1, 10),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-110"),
+                        quantity=Decimal("-110"),
+                    ),
+                    piecash.Split(
+                        account=europe, value=Decimal("110"),
+                        quantity=Decimal("100"),
+                    ),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Hotel in Boston",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-100"),
+                    ),
+                    piecash.Split(
+                        account=us, value=Decimal("100"),
+                    ),
+                ],
+            )
+            b.save()
+        gc.create_budget(name="Travel Budget", year=2026, num_periods=12)
+        gc.set_budget_amount(
+            budget_name="Travel Budget",
+            account="Expenses:Travel", amount="500", period=0,
+        )
+
+        # ── The actual assertion: query via the restricted build ──
+        BookClass = build_book_class({"core", "budgets"})
+        # Sanity: this build must NOT carry ReportingMixin's namespace.
+        assert "ReportingMixin" not in {
+            base.__name__ for base in BookClass.__mro__
+        }, "Test setup: build_book_class leaked ReportingMixin"
+
+        restricted = BookClass(str(budget_book))
+        report = restricted.get_budget_report(
+            compact=False,
+            budget_name="Travel Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        # 100 USD + (100 EUR × 1.10) = 210 USD. Raw quantity sum = 200.
         assert Decimal(by_acct["Expenses:Travel"]["actual"]) == Decimal("210")
 
     def test_report_nonexistent_budget_raises(self, budget_book: Path):

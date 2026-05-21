@@ -24,6 +24,16 @@ from typing import Generator, Iterable
 
 import piecash
 
+# Re-exported for callers that still import these from ``_base``.
+# Canonical definitions live in ``_currency`` alongside the
+# CurrencyMixin that uses them; keeping the import path stable avoids
+# churn across the codebase.
+from gnucash_mcp.book._currency import (  # noqa: F401
+    CurrencyMixin,
+    _is_market_price,
+    _to_date,
+)
+
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
 # cases on input for ergonomics — users pasting from external tools may
 # have uppercase — and normalize to lowercase before hitting SQLite
@@ -35,37 +45,6 @@ debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
 # ── Module-level helpers ───────────────────────────────────────────
-
-
-def _to_date(dt: date | datetime) -> date:
-    """Convert a datetime or date to a date object.
-
-    piecash may return either datetime or date for price dates depending
-    on how the price was created. This normalizes to date.
-    """
-    if isinstance(dt, datetime):
-        return dt.date()
-    return dt
-
-
-def _is_market_price(price) -> bool:
-    """True iff ``price`` is a real market quote, not a piecash auto-
-    placeholder.
-
-    On any cross-currency transaction, piecash auto-creates a Price
-    row with ``type='transaction'`` capturing the effective rate of
-    that one transaction. These are bookkeeping artifacts, NOT
-    user-supplied market quotes — every helper that walks
-    ``book.prices`` to value holdings or pick exchange rates must
-    skip them, or they shadow real quotes the user has on file.
-
-    Centralized here so the four call sites (core's ``_rates_as_of``
-    and ``_collect_warnings``, reporting's ``_latest_market_rates``,
-    and business's ``_find_exchange_rate``) all answer the question
-    the same way. Adding ``"transaction-currency"`` or any future
-    placeholder type only needs one change.
-    """
-    return getattr(price, "type", None) != "transaction"
 
 
 def _to_decimal(value) -> Decimal:
@@ -670,12 +649,20 @@ def _upcoming_to_compact_line(
 # ── Base class ─────────────────────────────────────────────────────
 
 
-class BaseGnuCashBook:
+class BaseGnuCashBook(CurrencyMixin):
     """Thread-safe wrapper for piecash book operations.
 
     Holds the universal helpers used by every mixin. Module-specific
     mixins (AdminMixin, ReportingMixin, etc.) are combined with this
     base via `build_book_class` in gnucash_mcp.book.__init__.
+
+    Inherits from :class:`CurrencyMixin` so cross-commodity helpers
+    (``_rates_as_of``, ``_account_conversion_factors``,
+    ``_split_in_default_currency``, ``_market_value``,
+    ``_find_exchange_rate``) are available on every constructed
+    ``GnuCashBook`` regardless of which ``--modules`` are enabled.
+    Currency conversion is cross-cutting infrastructure, not a
+    feature flag.
     """
 
     # Tables that support GUID resolution. Each entry maps table

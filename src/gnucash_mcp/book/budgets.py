@@ -793,18 +793,11 @@ class BudgetsMixin:
             # parent has children in non-default-currency commodities
             # (e.g., USD-default book with a EUR ``Expenses:Travel``
             # leaf), summing raw ``split.quantity`` would treat 100
-            # EUR + 100 USD as 200 in the parent's row. Use the same
-            # market-rate lookup as the reporting suite, gracefully
-            # falling back to raw quantity when reporting helpers
-            # aren't available (e.g., ``--modules budgets`` without
-            # ``reporting``).
-            factors_fn = getattr(
-                self, "_account_conversion_factors", None,
-            )
-            split_in_default = getattr(
-                self, "_split_in_default_currency", None,
-            )
-            factors = factors_fn(book) if factors_fn else None
+            # EUR + 100 USD as 200 in the parent's row. The conversion
+            # helpers live on the unconditionally-composed
+            # :class:`CurrencyMixin`, so they're available regardless
+            # of which ``--modules`` are enabled.
+            factors = self._account_conversion_factors(book)
 
             # Calculate actuals from transactions
             actuals: dict[str, Decimal] = {}
@@ -816,13 +809,10 @@ class BudgetsMixin:
                     rollup_target = rollup_map.get(acct_name)
                     if rollup_target is None:
                         continue
-                    if factors is not None and split_in_default is not None:
-                        amount = split_in_default(
-                            split, split.account,
-                            factors.get(split.account.guid),
-                        )
-                    else:
-                        amount = Decimal(str(split.quantity))
+                    amount = self._split_in_default_currency(
+                        split, split.account,
+                        factors.get(split.account.guid),
+                    )
                     if split.account.type == "EXPENSE" and amount > 0:
                         actuals[rollup_target] = actuals.get(
                             rollup_target, Decimal("0")
