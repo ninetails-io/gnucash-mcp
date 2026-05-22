@@ -2661,6 +2661,98 @@ class CoreMixin:
 
         return warnings
 
+    def _validate_transaction_splits(
+        self,
+        book: piecash.Book,
+        splits: list[dict],
+        trans_currency: piecash.Commodity,
+    ) -> list[dict]:
+        """Validate splits and pre-resolve accounts — before any mutation.
+
+        Single chokepoint for the input-shape rules that both
+        ``create_transaction`` and ``update_transaction`` enforce:
+
+        - Splits sum to zero (in transaction currency).
+        - Every ``account`` reference resolves to a real Account
+          (accepts path, ``%short``, or full GUID).
+        - For each split, the ``quantity`` is either implicit
+          (account commodity == transaction currency, in which case
+          ``quantity == value``) or explicit (cross-currency, caller
+          must supply ``quantity`` with the same sign as ``value``).
+
+        Pre-extraction, ``update_transaction`` interleaved these
+        checks with the mutation loop — the first split would have
+        ``split.value`` reassigned BEFORE the sibling split's
+        cross-currency quantity was validated, so a bad-input
+        update could leave the transaction in a partial state if
+        the session didn't rollback cleanly. Validating everything
+        up-front makes the subsequent mutation pass effectively
+        infallible.
+
+        Args:
+            book: Open piecash book.
+            splits: Input splits (each with ``account``, ``amount``,
+                optionally ``quantity`` and ``memo``).
+            trans_currency: piecash Commodity to validate sign-and-
+                quantity rules against. For create this is the
+                user-supplied or default currency; for update this
+                is the existing transaction's currency (update does
+                not allow changing currency).
+
+        Returns:
+            List of dicts (same order as input) with keys
+            ``account`` (resolved piecash Account), ``value``
+            (Decimal), ``quantity`` (Decimal), ``memo`` (string or
+            ``None``), ``original_ref`` (raw input ref — preserved
+            for error messages downstream).
+
+        Raises:
+            ValueError on imbalance, account not found, cross-
+            currency split missing ``quantity``, or value/quantity
+            sign mismatch.
+        """
+        total = Decimal("0")
+        for split in splits:
+            total += _to_decimal(split["amount"])
+        if total != Decimal("0"):
+            raise ValueError(f"Splits do not balance: total is {total}")
+
+        resolved: list[dict] = []
+        for split in splits:
+            ref = split["account"]
+            account = self._resolve_account(book, ref)
+            if not account:
+                raise ValueError(f"Account not found: {ref}")
+
+            value = _to_decimal(split["amount"])
+            if account.commodity == trans_currency:
+                quantity = value
+            elif "quantity" in split:
+                quantity = _to_decimal(split["quantity"])
+                if quantity * value < 0:
+                    raise ValueError(
+                        f"Split for '{ref}': quantity and value "
+                        f"must have same sign "
+                        f"(got value={value}, quantity={quantity})"
+                    )
+            else:
+                raise ValueError(
+                    f"Split for '{ref}' requires 'quantity' "
+                    f"because account commodity "
+                    f"({account.commodity.mnemonic}) differs from "
+                    f"transaction currency ({trans_currency.mnemonic})"
+                )
+
+            resolved.append({
+                "account": account,
+                "value": value,
+                "quantity": quantity,
+                "memo": split.get("memo"),
+                "original_ref": ref,
+            })
+
+        return resolved
+
     def create_transaction(
         self,
         description: str,
@@ -2755,15 +2847,17 @@ class CoreMixin:
             if len(splits) < 2:
                 raise ValueError("Transaction must have at least 2 splits")
 
-            # Validate balance (using "amount" as transaction-currency value).
-            # _to_decimal routes through str() so a float that slipped past
-            # the pydantic boundary decimalizes via shortest-repr instead of
-            # embedding IEEE-754 epsilon in the sum.
-            total = Decimal("0")
-            for split in splits:
-                total += _to_decimal(split["amount"])
-            if total != Decimal("0"):
-                raise ValueError(f"Splits do not balance: total is {total}")
+            # Sum-to-zero / account-resolution / cross-currency
+            # sign-and-quantity checks live in the shared validator
+            # paired with update_transaction. Splits sum is computed
+            # with ``_to_decimal`` (str-routed) so a float that slipped
+            # past the pydantic boundary decimalizes via shortest-repr
+            # rather than embedding IEEE-754 epsilon in the sum.
+            #
+            # Currency resolution still happens here (create accepts
+            # ``currency=`` user input; update reuses the existing
+            # transaction's currency) so the validator gets the right
+            # ``trans_currency`` to compare account commodities against.
 
             proposed_amounts = [abs(_to_decimal(s["amount"])) for s in splits]
 
@@ -2810,13 +2904,19 @@ class CoreMixin:
             else:
                 trans_currency = self._get_or_create_currency(book, currency)
 
+            # Shared validator: sum-to-zero, account resolution,
+            # cross-currency quantity/sign. Returns pre-resolved
+            # piecash Accounts + Decimal value/quantity per split,
+            # so the placeholder check and Split construction below
+            # are pure motion against validated data.
+            validated = self._validate_transaction_splits(
+                book, splits, trans_currency,
+            )
+
             piecash_splits = []
             resolved_accounts = []
-            for split in splits:
-                account = self._resolve_account(book, split["account"])
-                if not account:
-                    raise ValueError(f"Account not found: {split['account']}")
-
+            for v in validated:
+                account = v["account"]
                 if account.placeholder:
                     children_hint = ", ".join(
                         c.fullname for c in account.children
@@ -2828,27 +2928,6 @@ class CoreMixin:
                     )
 
                 resolved_accounts.append(account)
-                value = _to_decimal(split["amount"])
-
-                # Determine quantity (same-currency: equals value;
-                # cross-currency: caller must provide and sign-match).
-                if account.commodity == trans_currency:
-                    quantity = value
-                elif "quantity" in split:
-                    quantity = _to_decimal(split["quantity"])
-                    if quantity * value < 0:
-                        raise ValueError(
-                            f"Split for '{split['account']}': quantity and value "
-                            f"must have same sign "
-                            f"(got value={value}, quantity={quantity})"
-                        )
-                else:
-                    raise ValueError(
-                        f"Split for '{split['account']}' requires 'quantity' "
-                        f"because account commodity "
-                        f"({account.commodity.mnemonic}) differs from "
-                        f"transaction currency ({trans_currency.mnemonic})"
-                    )
 
                 # Don't construct piecash.Split objects during dry_run —
                 # adding to the session would stage a write even if we
@@ -2857,9 +2936,9 @@ class CoreMixin:
                     piecash_splits.append(
                         piecash.Split(
                             account=account,
-                            value=value,
-                            quantity=quantity,
-                            memo=split.get("memo", ""),
+                            value=v["value"],
+                            quantity=v["quantity"],
+                            memo=v["memo"] or "",
                         )
                     )
 
@@ -3654,68 +3733,46 @@ class CoreMixin:
 
             # Update splits if provided
             if splits is not None:
-                # Validate splits balance to zero
-                total = Decimal("0")
-                for split in splits:
-                    total += _to_decimal(split["amount"])
-                if total != Decimal("0"):
-                    raise ValueError(f"Splits do not balance: total is {total}")
-
-                # Build a map of canonical-fullname → split data.
-                # Resolve any input refs (path, ``%short``, full GUID)
-                # to the canonical Account so the lookup against
-                # existing splits' ``account.fullname`` works for all
-                # three input shapes. Pre-fix this dict was keyed by
-                # the raw input string, so a shortcut input like
-                # ``%77b59dd`` produced "Account not found in
-                # transaction" even though the ref resolved cleanly.
-                split_updates = {}
-                for s in splits:
-                    ref = s["account"]
-                    resolved = self._resolve_account(book, ref)
-                    if resolved is None:
-                        raise ValueError(
-                            f"Account not found: {ref}"
-                        )
-                    split_updates[resolved.fullname] = s
-
                 trans_currency = transaction.currency
 
-                # Update existing splits
+                # Validate everything up-front via the shared validator:
+                # sum-to-zero, account resolution (path / %short / full
+                # GUID), cross-currency quantity/sign. Pre-extraction
+                # the validation interleaved with mutation — the first
+                # split's ``value`` was reassigned before the sibling's
+                # cross-currency quantity was checked, so a bad-input
+                # update could leave the transaction in a partial state
+                # if the session didn't rollback cleanly. Now the
+                # mutation pass below is effectively infallible.
+                validated = self._validate_transaction_splits(
+                    book, splits, trans_currency,
+                )
+
+                # Build a map keyed by resolved-account-fullname so we
+                # can match against existing splits' ``account.fullname``.
+                split_updates = {
+                    v["account"].fullname: v for v in validated
+                }
+                # Preserve raw input dicts so ``memo`` updates (which
+                # the validator doesn't carry) still apply.
+                raw_by_fullname = {
+                    v["account"].fullname: raw
+                    for v, raw in zip(validated, splits)
+                }
+
+                # Update existing splits — pure mutation, validated above.
                 for split in transaction.splits:
                     account_name = split.account.fullname
                     if account_name in split_updates:
-                        update = split_updates[account_name]
-                        new_value = _to_decimal(update["amount"])
-                        split.value = new_value
-
-                        # Determine quantity
-                        if split.account.commodity == trans_currency:
-                            split.quantity = new_value
-                        elif "quantity" in update:
-                            new_quantity = _to_decimal(update["quantity"])
-                            if new_quantity * new_value < 0:
-                                raise ValueError(
-                                    f"Split for '{account_name}': quantity and value "
-                                    f"must have same sign "
-                                    f"(got value={new_value}, quantity={new_quantity})"
-                                )
-                            split.quantity = new_quantity
-                        else:
-                            raise ValueError(
-                                f"Split for '{account_name}' requires 'quantity' "
-                                f"because account commodity "
-                                f"({split.account.commodity.mnemonic}) differs from "
-                                f"transaction currency ({trans_currency.mnemonic})"
-                            )
-
-                        # Update memo if provided
-                        if "memo" in update:
-                            split.memo = update["memo"]
-
+                        v = split_updates[account_name]
+                        split.value = v["value"]
+                        split.quantity = v["quantity"]
+                        raw = raw_by_fullname[account_name]
+                        if "memo" in raw:
+                            split.memo = raw["memo"]
                         del split_updates[account_name]
 
-                # Check if all provided accounts were found
+                # Check if all provided accounts were found in the txn.
                 if split_updates:
                     missing = list(split_updates.keys())[0]
                     raise ValueError(f"Account not found in transaction: {missing}")

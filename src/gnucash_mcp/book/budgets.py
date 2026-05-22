@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
+from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
 
@@ -279,8 +280,6 @@ class BudgetsMixin:
         Raises:
             ValueError: If period_num is out of range.
         """
-        from dateutil.relativedelta import relativedelta
-
         if period_num < 0 or period_num >= budget.num_periods:
             raise ValueError(
                 f"Period {period_num} out of range "

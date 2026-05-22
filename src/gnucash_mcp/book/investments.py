@@ -16,6 +16,7 @@ from datetime import date
 from decimal import Decimal
 
 import piecash
+from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._base import (
@@ -210,7 +211,6 @@ class InvestmentsMixin:
             # Indexed query — pre-fix this walked every price in the book
             # for every create_price call. On a book with thousands of
             # historical prices that's a measurable hot path.
-            from piecash.core.commodity import Price
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
                 currency_guid=resolved_currency.guid,
@@ -298,7 +298,6 @@ class InvestmentsMixin:
             # The date filter stays in Python because piecash's date
             # column is a DateTime under the hood; comparing on the
             # date portion is awkward in raw SQLAlchemy.
-            from piecash.core.commodity import Price
             filters = {"commodity_guid": comm.guid}
             if source is not None:
                 filters["source"] = source
@@ -396,7 +395,6 @@ class InvestmentsMixin:
             # Indexed query: filter by commodity_guid up front so we
             # don't iterate every price in the book. Currency filter
             # stays in Python because it's optional.
-            from piecash.core.commodity import Price
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
             ).all()
@@ -497,7 +495,6 @@ class InvestmentsMixin:
                 currency = self._require_default_currency(book).mnemonic
 
             # Indexed query — only iterate prices for this commodity.
-            from piecash.core.commodity import Price
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
             ).all()
@@ -941,7 +938,6 @@ class InvestmentsMixin:
                 # session). Indexed by commodity so we don't iterate
                 # every price in the book.
                 commodity = lot.account.commodity
-                from piecash.core.commodity import Price
                 candidates = book.session.query(Price).filter_by(
                     commodity_guid=commodity.guid,
                 ).all()
