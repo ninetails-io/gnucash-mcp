@@ -20,8 +20,6 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
-    _is_market_price,
-    _to_date,
     _to_decimal,
     _verify_composite_write,
     _verify_write,
@@ -429,80 +427,6 @@ class BusinessMixin:
             s_quantity = abs(Decimal(str(s.quantity)))
             if s_value > 0:
                 return s_quantity / s_value
-        return None
-
-    @staticmethod
-    def _find_exchange_rate(book, from_commodity, to_commodity, as_of: date):
-        """Look up an exchange rate from book.prices for a cross-currency
-        payment: 1 unit of ``from_commodity`` equals how many of
-        ``to_commodity`` on or near ``as_of``.
-
-        Prefers prices on or before ``as_of`` (most recent). Falls back to
-        the earliest price after ``as_of`` if none exist before. Accepts
-        inverse prices (e.g., a USD→EUR price can resolve EUR→USD by
-        inversion).
-
-        Skips prices with ``type='transaction'`` — those are auto-
-        created at 1.0 by piecash when a cross-currency invoice is
-        posted without an explicit rate, and would mask the absence of
-        a real user-supplied rate.
-
-        Returns a Decimal rate, or None if no usable (non-transaction)
-        price exists in either direction.
-        """
-        if from_commodity == to_commodity:
-            return Decimal("1")
-
-        best_before_direct = None   # (days_before, Decimal rate)
-        best_after_direct = None    # (days_after, Decimal rate)
-        best_before_inverse = None
-        best_after_inverse = None
-
-        for p in book.prices:
-            # Skip piecash's auto-created post-invoice default rates.
-            if not _is_market_price(p):
-                continue
-
-            p_date = _to_date(p.date)
-            # Direct: p.commodity == from, p.currency == to → rate = p.value
-            if p.commodity == from_commodity and p.currency == to_commodity:
-                days = (as_of - p_date).days
-                rate = Decimal(str(p.value))
-                # Skip zero-or-negative direct rates. The inverse
-                # branch already skips zero (would div-by-zero); the
-                # direct branch was missing the same guard, so a
-                # corrupt 0-or-negative price could propagate as the
-                # winning rate. Downstream pay_quantize-to-zero
-                # would then fire the new guard, but flagging at
-                # rate-lookup time gives a clearer signal.
-                if rate <= 0:
-                    continue
-                if days >= 0:
-                    if best_before_direct is None or days < best_before_direct[0]:
-                        best_before_direct = (days, rate)
-                else:
-                    if best_after_direct is None or -days < best_after_direct[0]:
-                        best_after_direct = (-days, rate)
-            # Inverse: p.commodity == to, p.currency == from → rate = 1/p.value
-            elif p.commodity == to_commodity and p.currency == from_commodity:
-                days = (as_of - p_date).days
-                if Decimal(str(p.value)) <= 0:
-                    continue
-                rate = Decimal("1") / Decimal(str(p.value))
-                if days >= 0:
-                    if best_before_inverse is None or days < best_before_inverse[0]:
-                        best_before_inverse = (days, rate)
-                else:
-                    if best_after_inverse is None or -days < best_after_inverse[0]:
-                        best_after_inverse = (-days, rate)
-
-        # Priority: before-direct > before-inverse > after-direct > after-inverse
-        for candidate in (
-            best_before_direct, best_before_inverse,
-            best_after_direct, best_after_inverse,
-        ):
-            if candidate is not None:
-                return candidate[1]
         return None
 
     @staticmethod

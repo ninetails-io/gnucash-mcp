@@ -245,41 +245,6 @@ class CoreMixin:
         results.sort(key=lambda r: r["account"])
         return results
 
-    def _rates_as_of(
-        self,
-        book: piecash.Book,
-        as_of: date,
-        default_currency: piecash.Commodity,
-    ) -> dict[str, Decimal]:
-        """For each non-default-currency commodity, return the most
-        recent user-supplied price (in default currency) on or before
-        ``as_of``. Skips piecash's auto-created
-        ``type='transaction'`` placeholder prices the same way the
-        rest of the codebase does — those are post-invoice
-        bookkeeping artifacts, not market quotes.
-
-        Returns ``{commodity_guid: rate}``. Commodities without a
-        price <= as_of don't appear; callers should fall back to
-        skipping that account for trajectory purposes (or use cost
-        basis, depending on the caller's contract).
-        """
-        latest: dict[str, tuple[date, Decimal]] = {}
-        for p in book.prices:
-            if p.currency != default_currency:
-                continue
-            if not _is_market_price(p):
-                continue
-            p_date = p.date
-            if hasattr(p_date, "date") and callable(p_date.date):
-                p_date = p_date.date()
-            if p_date > as_of:
-                continue
-            cguid = p.commodity.guid
-            prev = latest.get(cguid)
-            if prev is None or p_date > prev[0]:
-                latest[cguid] = (p_date, Decimal(str(p.value)))
-        return {k: v[1] for k, v in latest.items()}
-
     # Asset-side and liability-side type sets used by the net-worth
     # computation. Mirrors the existing in-summary breakdown — the
     # asset section iterates these types into per-leaf rows; the
@@ -342,7 +307,7 @@ class CoreMixin:
         # the rationale; both paths converge on this behavior so the
         # "now" anchor agrees with balance_sheet by construction.
         if as_of >= date.today():
-            rates = self._latest_market_rates(book)
+            rates = self._rates_as_of(book)
         else:
             rates = self._rates_as_of(book, as_of, default_currency)
 
@@ -1484,33 +1449,10 @@ class CoreMixin:
             # two surfaces agree on which price is "current" for
             # every commodity — including the bookkeeper's
             # intentional future-dated yfinance forecast entries.
-            # Helper already excludes piecash auto-created
-            # ``type='transaction'`` prices (cross-currency
-            # placeholders, not market quotes).
-            latest_prices: dict[str, Decimal] = self._latest_market_rates(book)
-
-            def _market_value(account, quantity: Decimal) -> tuple[Decimal, str | None]:
-                """Return (USD value, note) for an account's quantity.
-
-                ``note`` is None for default-currency accounts, a formatted
-                "N.NNN SYM @ $X.XX" string for priced foreign-currency
-                accounts, and a "no price data" marker otherwise.
-                """
-                if account.commodity == default_currency:
-                    return quantity, None
-                sym = account.commodity.mnemonic
-                rate = latest_prices.get(account.commodity.guid)
-                if rate is not None:
-                    return (quantity * rate), f"{quantity} {sym} @ {rate}"
-                # Fallback: cost basis from split values (transaction currency).
-                # Same today filter as the balance computation —
-                # without it, future-dated buys would inflate cost
-                # basis past the as-of-today snapshot.
-                cost_basis = Decimal("0")
-                for s in account.splits:
-                    if s.transaction.post_date <= today:
-                        cost_basis += Decimal(str(s.value))
-                return cost_basis, f"{quantity} {sym} — no price data"
+            # ``_rates_as_of(book)`` (no upper bound) already excludes
+            # piecash auto-created ``type='transaction'`` prices
+            # (cross-currency placeholders, not market quotes).
+            latest_prices: dict[str, Decimal] = self._rates_as_of(book)
 
             # --- Account stats ---
             asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
@@ -1554,7 +1496,12 @@ class CoreMixin:
 
                 if account.type in asset_types:
                     if is_leaf and balance != 0:
-                        usd_value, note = _market_value(account, balance)
+                        usd_value, note = self._market_value(
+                            account, balance,
+                            rates=latest_prices,
+                            default_currency=default_currency,
+                            today=today,
+                        )
                         asset_leaves.append((leaf, usd_value, note))
                 elif account.type == "CREDIT":
                     if is_leaf:
@@ -1569,12 +1516,22 @@ class CoreMixin:
                 elif account.type == "RECEIVABLE":
                     if is_leaf and balance != 0:
                         # A/R is debit-natural: positive balance = owed to us.
-                        usd_value, _ = _market_value(account, balance)
+                        usd_value, _ = self._market_value(
+                            account, balance,
+                            rates=latest_prices,
+                            default_currency=default_currency,
+                            today=today,
+                        )
                         receivable_accts.append((leaf, usd_value))
                 elif account.type == "PAYABLE":
                     if is_leaf and balance != 0:
                         # A/P is credit-natural: negate for "what we owe".
-                        usd_value, _ = _market_value(account, -balance)
+                        usd_value, _ = self._market_value(
+                            account, -balance,
+                            rates=latest_prices,
+                            default_currency=default_currency,
+                            today=today,
+                        )
                         payable_accts.append((leaf, usd_value))
                 elif account.type == "INCOME":
                     income_total += 1

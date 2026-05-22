@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 import piecash
 
-from gnucash_mcp.book._base import _is_market_price, _to_decimal
+from gnucash_mcp.book._base import _to_decimal
 from gnucash_mcp._format import _format_number
 
 # Account-type groups used across the reports. Defined at module level
@@ -222,95 +222,6 @@ class ReportingMixin:
         if target_depth >= len(path):
             return account
         return path[target_depth]
-
-    # ── Cross-commodity conversion helpers ────────────────────────────
-    #
-    # For reports that aggregate asset balances across accounts with
-    # different commodities (e.g. USD Checking + VTSAX shares + EUR
-    # Savings), split.quantity lives in each account's own commodity
-    # and can't be summed directly. Convert each account's quantity
-    # to the book's default currency at the latest user-supplied
-    # market price before aggregating. Fallback: split.value (which
-    # is in the transaction currency, generally the book default for
-    # USD-denominated investment buys) is used when no price is on
-    # file — that yields cost basis, which is a reasonable default
-    # when no market price has been loaded.
-
-    def _latest_market_rates(
-        self, book: piecash.Book
-    ) -> dict[str, Decimal]:
-        """Return {commodity_guid: Decimal} — latest user-supplied
-        price for each non-default-currency commodity in the book
-        currency. Skips piecash's auto-created ``type='transaction'``
-        prices (they capture the effective rate of a cross-currency
-        txn; we want explicit market prices).
-        """
-        default_currency = self._require_default_currency(book)
-        latest: dict[str, tuple] = {}  # guid → (date, Decimal rate)
-        for p in book.prices:
-            if p.currency != default_currency:
-                continue
-            if not _is_market_price(p):
-                continue
-            p_date = p.date
-            if hasattr(p_date, "date") and callable(p_date.date):
-                p_date = p_date.date()
-            key = p.commodity.guid
-            existing = latest.get(key)
-            if existing is None or p_date > existing[0]:
-                latest[key] = (p_date, Decimal(str(p.value)))
-        return {guid: rate for guid, (_date, rate) in latest.items()}
-
-    def _account_conversion_factors(
-        self, book: piecash.Book
-    ) -> dict[str, Decimal | None]:
-        """Return {account_guid: Decimal factor or None}.
-
-        ``factor * split.quantity = amount in default currency``.
-        A factor of 1 means the account is already in the default
-        currency. ``None`` means no rate is available — callers
-        should fall back to ``split.value`` (transaction-currency
-        amount), which correctly reflects cost basis for USD-
-        denominated investment buys.
-
-        Template accounts (under ``book.root_template``) are
-        excluded from the map. Today no caller looks up template
-        GUIDs in the result — they all start from
-        ``_resolve_account``-validated GUIDs that already exclude
-        templates — so this is hygiene rather than a bug fix.
-        Keeps the map honest about what it represents (user
-        chart only) and prevents a future caller from accidentally
-        getting a factor for scaffolding.
-        """
-        default_currency = self._require_default_currency(book)
-        rates = self._latest_market_rates(book)
-        template_guids = self._template_account_guids(book)
-        factors: dict[str, Decimal | None] = {}
-        for acct in book.accounts:
-            if acct.guid in template_guids:
-                continue
-            if acct.commodity == default_currency:
-                factors[acct.guid] = Decimal("1")
-            else:
-                factors[acct.guid] = rates.get(acct.commodity.guid)
-        return factors
-
-    @staticmethod
-    def _split_in_default_currency(
-        split,
-        account,
-        factor: Decimal | None,
-    ) -> Decimal:
-        """Value a single split in the book's default currency.
-
-        Uses ``factor * quantity`` when a factor is available. Falls
-        back to ``split.value`` otherwise — correct for STOCK/MUTUAL
-        splits whose transaction currency is the book default, and a
-        reasonable cost-basis approximation for other cases.
-        """
-        if factor is not None:
-            return Decimal(str(split.quantity)) * factor
-        return Decimal(str(split.value))
 
     # ── SQL-filtered split iterator ───────────────────────────────────
 
@@ -579,9 +490,10 @@ class ReportingMixin:
             default_currency = self._require_default_currency(book)
             # Latest market rates keyed by commodity guid — same data
             # ``_market_value`` in get_book_summary uses for the per-
-            # account display. ``_latest_market_rates`` already excludes
-            # piecash auto-created ``type='transaction'`` prices.
-            latest_rates = self._latest_market_rates(book)
+            # account display. ``_rates_as_of(book)`` (no date filter)
+            # already excludes piecash auto-created ``type='transaction'``
+            # prices.
+            latest_rates = self._rates_as_of(book)
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
