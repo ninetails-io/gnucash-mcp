@@ -3558,11 +3558,16 @@ class TestPayInvoice:
         ])
         assert BusinessMixin._calculate_lot_balance(lot) == D("70")
 
-    def test_safe_date_opened_handles_empty_string(self):
-        """``_safe_date_opened`` matches ``_safe_date_posted``'s
-        defensive contract — empty/malformed values surface as
-        None rather than crashing the regex parser."""
-        from gnucash_mcp.book.business import _safe_date_opened
+    def test_safe_invoice_date_handles_empty_string(self):
+        """``_safe_invoice_date`` covers both date_opened and
+        date_posted with one parameterized helper — empty/malformed
+        values surface as None rather than crashing the regex
+        parser. Generalized in v1.3 from the two separate
+        ``_safe_date_opened`` / ``_safe_date_posted`` helpers; one
+        helper, one set of semantics, parameterized on the
+        attribute name.
+        """
+        from gnucash_mcp.book.business import _safe_invoice_date
 
         class _EmptyInv:
             @property
@@ -3571,19 +3576,26 @@ class TestPayInvoice:
                 # on a malformed empty string.
                 raise ValueError("Couldn't parse datetime string")
 
+            @property
+            def date_posted(self):
+                raise ValueError("Couldn't parse datetime string")
+
         class _NoneInv:
             date_opened = None
+            date_posted = None
 
         class _ValidInv:
             from datetime import datetime as _dt
             date_opened = _dt(2026, 3, 10, 12, 0)
+            date_posted = _dt(2026, 3, 15, 9, 30)
 
-        assert _safe_date_opened(_EmptyInv()) is None
-        assert _safe_date_opened(_NoneInv()) is None
-        # Valid datetime passes through unchanged
-        result = _safe_date_opened(_ValidInv())
-        assert result is not None
-        assert result.year == 2026
+        # Both attribute paths behave identically.
+        for attr in ("date_opened", "date_posted"):
+            assert _safe_invoice_date(_EmptyInv(), attr) is None
+            assert _safe_invoice_date(_NoneInv(), attr) is None
+            result = _safe_invoice_date(_ValidInv(), attr)
+            assert result is not None
+            assert result.year == 2026
 
     def test_find_exchange_rate_skips_zero_direct_price(self, business_book):
         """Direct branch must skip rate=0 (and negative) prices —

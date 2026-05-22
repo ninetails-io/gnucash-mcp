@@ -50,44 +50,35 @@ def _commodity_quantum(commodity) -> Decimal:
     return Decimal(1) / Decimal(fraction)
 
 
-def _safe_date_posted(inv):
-    """Read ``inv.date_posted`` defensively.
+def _safe_invoice_date(inv, attr: str):
+    """Read an invoice datetime column defensively.
 
-    Returns the datetime (or whatever the ORM gives back) when
-    the column holds a real value, or ``None`` when the column
-    is NULL, empty, or malformed enough that piecash's
-    ``_DateTime`` TypeDecorator raises ``ValueError`` on access.
+    Returns the datetime when the named column holds a real value,
+    or ``None`` when it's NULL, empty, or malformed enough that
+    piecash's ``_DateTime`` TypeDecorator raises ``ValueError`` on
+    access.
 
-    The bookkeeper hit this on Alex Chen-Morales's book: a
-    freshly auto-id'd bill's ``date_posted`` came back as ``''``
-    in SQL. SQLAlchemy's regex-based DATETIME parser raises
-    "Couldn't parse datetime string" when reading that — a hard
-    crash on a never-posted document. Wrapping the access lets
-    every caller treat the document as not-posted gracefully.
+    The bookkeeper hit the underlying piecash bug on Alex
+    Chen-Morales's book: a freshly auto-id'd bill's
+    ``date_posted`` came back as ``''`` in SQL. SQLAlchemy's
+    regex-based DATETIME parser raises "Couldn't parse datetime
+    string" when reading that — a hard crash on a never-posted
+    document. Same failure mode applies verbatim to
+    ``date_opened`` (and any future ``_DateTime``-typed column on
+    invoices). One helper, parameterized on the attribute name,
+    covers every caller.
+
+    Args:
+        inv: piecash Invoice / Bill ORM object.
+        attr: Attribute name — typically ``"date_posted"`` or
+            ``"date_opened"``.
+
+    Returns:
+        Datetime when populated and parseable, ``None`` otherwise.
     """
     try:
-        dp = inv.date_posted
-        return dp if dp else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _safe_date_opened(inv):
-    """Read ``inv.date_opened`` defensively.
-
-    Same shape as ``_safe_date_posted`` but for the ``date_opened``
-    column. piecash's ``_DateTime`` TypeDecorator has the same
-    regex-parser failure mode on empty-string column values; the
-    bookkeeper's reproduction with ``date_posted`` is exactly
-    replicable on ``date_opened``. ``_invoice_to_dict``,
-    ``_invoice_to_compact_line``, and ``list_invoices`` all access
-    ``inv.date_opened.date()`` and would crash on a malformed row.
-    Wrapping the access lets every caller treat that field as
-    "unknown" gracefully.
-    """
-    try:
-        do = inv.date_opened
-        return do if do else None
+        value = getattr(inv, attr)
+        return value if value else None
     except (ValueError, TypeError):
         return None
 
@@ -96,11 +87,11 @@ def _is_invoice_posted(inv) -> bool:
     """True iff ``inv`` has a real datetime in ``date_posted``.
 
     Single chokepoint for "is this document posted?" across the
-    business module. Built on ``_safe_date_posted`` so the
+    business module. Built on ``_safe_invoice_date`` so the
     tolerant semantics (None / "" / unparseable values all read
     as not-posted) apply uniformly.
     """
-    return _safe_date_posted(inv) is not None
+    return _safe_invoice_date(inv, "date_posted") is not None
 
 
 def _format_vendor_spending_compact(
@@ -727,12 +718,12 @@ class BusinessMixin:
             "type": "bill" if invoice.owner_type == 4 else "invoice",
             "owner_name": owner_name,
             "date_opened": (
-                str(_safe_date_opened(invoice).date())
-                if _safe_date_opened(invoice) else None
+                str(_safe_invoice_date(invoice, "date_opened").date())
+                if _safe_invoice_date(invoice, "date_opened") else None
             ),
             "date_posted": (
-                str(_safe_date_posted(invoice).date())
-                if _safe_date_posted(invoice) else None
+                str(_safe_invoice_date(invoice, "date_posted").date())
+                if _safe_invoice_date(invoice, "date_posted") else None
             ),
             "notes": invoice.notes or "",
             "active": bool(invoice.active),
@@ -756,7 +747,7 @@ class BusinessMixin:
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
         inv_type = "BILL" if invoice.owner_type == 4 else "INV"
-        opened = _safe_date_opened(invoice)
+        opened = _safe_invoice_date(invoice, "date_opened")
         date_str = (
             str(opened.date()) if opened else "n/a"
         )
@@ -2749,7 +2740,7 @@ class BusinessMixin:
             # to see what they unposted ("was posted: 2026-04-01,
             # post_account: Assets:Receivables:..."). Read pre-clear
             # so the values are still set on the ORM object.
-            prev_post_date = _safe_date_posted(inv)
+            prev_post_date = _safe_invoice_date(inv, "date_posted")
             prev_post_account = (
                 inv.post_account.fullname if inv.post_account else None
             )
@@ -3674,7 +3665,7 @@ class BusinessMixin:
                     if c:
                         owner_name = c.name
 
-                posted_dt = _safe_date_posted(inv)
+                posted_dt = _safe_invoice_date(inv, "date_posted")
                 # Resolve the due date through the same three-step
                 # chain the warnings collector uses, so the bookkeeper
                 # sees identical numbers in both places.
@@ -3774,12 +3765,12 @@ class BusinessMixin:
 
             bills = query.all()
 
-            # Filter by date range. ``_safe_date_posted`` returns
+            # Filter by date range. ``_safe_invoice_date`` returns
             # None for records where date_posted is missing or
             # malformed (empty-string state) — those drop out.
             filtered_bills = []
             for b in bills:
-                posted = _safe_date_posted(b)
+                posted = _safe_invoice_date(b, "date_posted")
                 if posted is None:
                     continue
                 if parsed_start <= posted.date() <= parsed_end:

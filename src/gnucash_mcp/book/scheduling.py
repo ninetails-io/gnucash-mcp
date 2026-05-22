@@ -18,9 +18,11 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import piecash
+from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.core.transaction import ScheduledTransaction
 from piecash.kvp import KVP_Type, Slot
+from sqlalchemy import text
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
@@ -85,8 +87,6 @@ class SchedulingMixin:
         Returns:
             Next occurrence date, or None if past end_date.
         """
-        from dateutil.relativedelta import relativedelta
-
         if after is None:
             after = date.today()
 
@@ -172,8 +172,6 @@ class SchedulingMixin:
         'splits-json' on the ScheduledTransaction.
         """
         import json
-
-        from sqlalchemy import text
 
         row = book.session.execute(
             text(

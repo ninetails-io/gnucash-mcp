@@ -6219,6 +6219,58 @@ class TestUpdateTransaction:
         assert result["status"] == "updated"
         assert result["description"] == "Updated Groceries"
 
+    def test_update_splits_validates_before_mutating(
+        self, multi_currency_book: Path,
+    ):
+        """Bad input on the second split must NOT leave the first
+        split's value already mutated. v1.3 Stage 2: validation is
+        now extracted into ``_validate_transaction_splits`` and runs
+        before any ``split.value`` assignment. Pre-extraction the
+        mutation loop interleaved validation with writes — the first
+        split's value was reassigned before the sibling's
+        cross-currency quantity was checked, so a rejected update
+        could leave partial state if the session didn't roll back.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Find the cross-currency transfer (USD checking → EUR savings).
+        txns = gc_book.search_transactions("Transfer to EUR", compact=False)
+        assert txns, "Test setup: cross-currency transfer not found"
+        tx = txns[0]
+        checking_split = next(
+            s for s in tx["splits"] if s["account"] == "Assets:Checking"
+        )
+        eur_split = next(
+            s for s in tx["splits"] if s["account"] == "Assets:Euro Savings"
+        )
+        original_checking_value = checking_split["value"]
+        original_eur_value = eur_split["value"]
+
+        # Submit an update where the EUR split's quantity is missing —
+        # validator must reject before either split is touched. Pre-fix,
+        # the checking split's value would have been mutated to -2200
+        # already by the time the EUR-split error fired.
+        with pytest.raises(ValueError, match="requires 'quantity'"):
+            gc_book.update_transaction(
+                guid=tx["guid"],
+                splits=[
+                    {"account": "Assets:Checking", "amount": "-2200"},
+                    # No quantity provided for the cross-currency split.
+                    {"account": "Assets:Euro Savings", "amount": "2200"},
+                ],
+            )
+
+        # Re-read and confirm original values are intact.
+        after = gc_book.get_transaction(tx["guid"])
+        after_checking = next(
+            s for s in after["splits"] if s["account"] == "Assets:Checking"
+        )
+        after_eur = next(
+            s for s in after["splits"] if s["account"] == "Assets:Euro Savings"
+        )
+        assert after_checking["value"] == original_checking_value
+        assert after_eur["value"] == original_eur_value
+
 
 class TestReplaceSplits:
     """Tests for replace_splits method."""
@@ -7043,6 +7095,211 @@ class TestReconcileAccount:
                     statement_balance="0",
                     split_guids=[expense_split],
                 )
+
+    def test_reconcile_account_accepts_short_guid_account_ref(
+        self, test_book: Path,
+    ):
+        """``account_name`` must accept ``%shortguid`` form like every
+        other tool. Pre-fix, the per-split membership check compared
+        against the raw input string, so a valid short-GUID reference
+        resolved correctly via ``_resolve_account`` but then rejected
+        every one of its own splits with "belongs to account X, not
+        %xxxxxxx" — flagged three times in production.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # Build a short GUID for Assets:Checking, then reconcile via it.
+        with gc_book.open(readonly=True) as book:
+            checking = next(
+                a for a in book.accounts if a.fullname == "Assets:Checking"
+            )
+            short = gc_book._account_short_guid(book, checking)
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        # The actual assertion: shortcut + targeted mode together.
+        result = gc_book.reconcile_account(
+            account_name=short,
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            split_guids=guids,
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == len(guids)
+
+    def test_reconcile_all_bulk_mode(self, test_book: Path):
+        """``reconcile_all=True`` reconciles every unreconciled split
+        on the account whose post_date is on or before through_date
+        (defaulting to statement_date), in one tool call. Avoids the
+        ~300-token GUID round-trip the bookkeeper hit on every
+        reconciliation in production.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled["splits"])
+
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == expected_count
+
+        # Verify all splits are now in 'y' state.
+        unreconciled_after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert unreconciled_after["splits"] == []
+
+    def test_reconcile_all_no_default_date_filter(self, test_book: Path):
+        """Bulk mode must NOT default to a date filter — the
+        bookkeeper's CareCredit payoff scenario had payment splits
+        dated AFTER the statement_date, and the test fixture's
+        analogue is splits across Jan 1 / 15 / 20 reconciled against
+        a Jan 10 statement. Pre-fix the default ``through_date =
+        statement_date`` excluded Jan 15 and Jan 20 splits silently;
+        post-fix every unreconciled split is included regardless of
+        date when no ``through_date`` is passed.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled_all = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled_all["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled_all["splits"])
+        # The test fixture has at least one split AFTER the early
+        # statement date; if not, this assertion documents the gap.
+        early_cutoff = date(2024, 1, 10)
+        after_cutoff = [
+            s for s in unreconciled_all["splits"]
+            if date.fromisoformat(s["date"]) > early_cutoff
+        ]
+        assert after_cutoff, (
+            "Test setup: expected at least one split after the "
+            "early statement date to exercise the no-default-filter "
+            "behavior."
+        )
+
+        # statement_date is BEFORE some splits, but no through_date
+        # is passed — every unreconciled split must be included.
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=early_cutoff,
+            statement_balance=str(total),
+            reconcile_all=True,
+        )
+        assert result["splits_reconciled"] == expected_count
+
+    def test_reconcile_all_respects_through_date(self, test_book: Path):
+        """When ``through_date`` is set, ``reconcile_all`` only touches
+        splits on or before it. Lets the user reconcile a statement
+        window while leaving post-statement transactions unreconciled.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # The test_book fixture has transactions on 2024-01-01,
+        # 2024-01-15, and 2024-01-20. Reconcile only through Jan 16.
+        cutoff = date(2024, 1, 16)
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False, as_of_date=cutoff,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled["splits"])
+        assert expected_count >= 1, "Test setup: expected at least one split through cutoff"
+
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+            through_date=cutoff,
+        )
+        assert result["splits_reconciled"] == expected_count
+
+        # Post-cutoff splits should still be unreconciled.
+        unreconciled_after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled_after["splits"]) >= 1
+
+    def test_reconcile_all_rejects_combined_with_split_guids(
+        self, test_book: Path,
+    ):
+        """Passing both ``reconcile_all=True`` and a non-empty
+        ``split_guids`` is ambiguous — reject loudly rather than
+        silently picking one.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        with pytest.raises(ValueError, match="Cannot combine reconcile_all"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+                split_guids=guids,
+                reconcile_all=True,
+            )
+
+    def test_reconcile_account_requires_one_of_modes(self, test_book: Path):
+        """Calling with neither ``split_guids`` nor ``reconcile_all=True``
+        must reject with a clear error rather than silently
+        reconciling zero splits.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Must provide split_guids"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+            )
+
+    def test_reconcile_all_bulk_balance_mismatch(self, test_book: Path):
+        """Bulk mode must verify against the statement balance just
+        like targeted mode. A wrong balance rejects with the
+        discrepancy, no mutation.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Balance mismatch"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="9999999.99",
+                reconcile_all=True,
+            )
+        # No mutation occurred.
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled["splits"]) >= 1
 
 
 class TestVoidTransaction:

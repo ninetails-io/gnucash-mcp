@@ -243,23 +243,75 @@ class ReconciliationMixin:
         account_name: str,
         statement_date: date,
         statement_balance: str,
-        split_guids: list[str],
+        split_guids: list[str] | None = None,
+        *,
+        reconcile_all: bool = False,
+        through_date: date | None = None,
     ) -> dict:
         """Reconcile multiple splits against a statement balance.
 
+        Two operating modes:
+
+        - **Targeted** (``split_guids=[...]``, ``reconcile_all=False``):
+          reconcile exactly the listed splits. Use when statement and
+          book disagree and the caller needs to pick a subset.
+        - **Bulk** (``reconcile_all=True``): reconcile every
+          unreconciled split on the account. The common case for
+          OFX-import workflows — one tool call, no GUID round-trip.
+          Pass ``through_date`` to restrict to splits on or before
+          a specific date; by default no date filter is applied
+          (the bookkeeper-validated semantics — pre-fix this
+          defaulted to ``statement_date`` and silently excluded
+          payment splits dated after the statement, which the
+          tester hit on a CareCredit payoff). Reject if
+          ``split_guids`` is also given to avoid ambiguity.
+
+        Both modes verify the resulting reconciled balance ties to
+        ``statement_balance`` before mutating; mismatch raises with
+        the discrepancy amount.
+
         Args:
-            account_name: Full account path.
+            account_name: Account reference (path, ``%short`` GUID,
+                or full 32-char GUID).
             statement_date: Statement ending date.
-            statement_balance: Expected balance from statement (as string).
-            split_guids: List of split GUIDs to mark as reconciled.
+            statement_balance: Expected balance from statement
+                (as string).
+            split_guids: List of split GUIDs to mark reconciled
+                (8+ char prefixes accepted). Required for targeted
+                mode; omit (or pass ``None``) for bulk mode.
+            reconcile_all: When True, reconcile every unreconciled
+                split on the account (optionally bounded by
+                ``through_date``). Mutually exclusive with a
+                non-empty ``split_guids``.
+            through_date: Optional upper-date filter for bulk mode.
+                When set, only splits with
+                ``transaction.post_date <= through_date`` are
+                included. When ``None`` (default), no date filter
+                is applied — every unreconciled split gets
+                reconciled, regardless of date.
 
         Returns:
-            Dict with reconciliation results.
+            Dict with reconciliation results: ``splits_reconciled``,
+            ``new_reconciled_balance``, ``status``.
 
         Raises:
-            ValueError: If account not found, split not found, or balance mismatch.
+            ValueError: If account not found, mode ambiguous, split
+                not found, split on wrong account, or balance
+                mismatch.
         """
         expected_balance = _to_decimal(statement_balance)
+
+        if reconcile_all and split_guids:
+            raise ValueError(
+                "Cannot combine reconcile_all=True with split_guids. "
+                "Use either bulk mode (reconcile_all=True) or targeted "
+                "mode (split_guids=[...]), not both."
+            )
+        if not reconcile_all and not split_guids:
+            raise ValueError(
+                "Must provide split_guids for targeted reconciliation, "
+                "or set reconcile_all=True for bulk mode."
+            )
 
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
@@ -274,20 +326,45 @@ class ReconciliationMixin:
             splits_to_reconcile = []
             reconciling_total = Decimal("0")
 
-            for guid in split_guids:
-                split = self._find_split(book, guid)
-                if not split:
-                    raise ValueError(f"Split not found: {guid}")
-                if split.account.fullname != account_name:
-                    raise ValueError(
-                        f"Split {guid} belongs to account '{split.account.fullname}', "
-                        f"not '{account_name}'"
-                    )
-                if split.reconcile_state == "y":
-                    raise ValueError(f"Split {guid} is already reconciled")
+            if reconcile_all:
+                # Walk the account's own splits — by construction every
+                # entry is on this account, so no membership check
+                # needed. Apply the optional date filter only when the
+                # caller explicitly set ``through_date``; the default
+                # is "every unreconciled split, no date bound" so the
+                # bookkeeper can match a statement balance regardless
+                # of when payments cleared.
+                for split in account.splits:
+                    if split.reconcile_state == "y":
+                        continue
+                    if (
+                        through_date is not None
+                        and split.transaction.post_date > through_date
+                    ):
+                        continue
+                    splits_to_reconcile.append(split)
+                    reconciling_total += split.quantity
+            else:
+                for guid in split_guids:
+                    split = self._find_split(book, guid)
+                    if not split:
+                        raise ValueError(f"Split not found: {guid}")
+                    # Compare by GUID against the resolved account so
+                    # ``account_name`` accepts ``%short`` and full-GUID
+                    # input. Pre-fix the check compared against the raw
+                    # input string, rejecting any shortcut form even
+                    # when it resolved to the right account.
+                    if split.account.guid != account.guid:
+                        raise ValueError(
+                            f"Split {guid} belongs to account "
+                            f"'{split.account.fullname}', not "
+                            f"'{account.fullname}'"
+                        )
+                    if split.reconcile_state == "y":
+                        raise ValueError(f"Split {guid} is already reconciled")
 
-                splits_to_reconcile.append(split)
-                reconciling_total += split.quantity
+                    splits_to_reconcile.append(split)
+                    reconciling_total += split.quantity
 
             # Quantize both sides to the account commodity's
             # smallest fraction before comparing. Pre-fix a user
