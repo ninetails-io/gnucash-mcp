@@ -3939,6 +3939,273 @@ class TestPayInvoice:
             )
 
 
+# ============== _compute_fx_gain_loss Unit Tests ==============
+
+
+class TestComputeFxGainLoss:
+    """Direct unit tests for ``_compute_fx_gain_loss``.
+
+    The four sign quadrants are already covered end-to-end via
+    ``pay_invoice`` in :class:`TestPayInvoice`. This class targets
+    the helper directly to lock its contract — the dict shape (or
+    ``None`` return), the FX delta value, and the split's
+    ``quantity`` sign — independently of the surrounding
+    ``pay_invoice`` plumbing. Pre-extraction this logic was 130
+    lines embedded inside a 441-line method; calling it from a unit
+    test required setting up the full payment pipeline.
+    """
+
+    def _setup_posted_eur_invoice(
+        self, gb, post_rate: str, post_date: str = "2026-03-10",
+        is_bill: bool = False,
+    ):
+        """Set up a posted foreign-currency document at the given
+        rate, returning identifiers the test can use to call
+        ``_compute_fx_gain_loss`` directly.
+
+        ``is_bill=False`` posts a customer invoice (A/R debit-
+        natural); ``is_bill=True`` posts a vendor bill (A/P credit-
+        natural). Both use a EUR commodity and a USD-default book.
+        """
+        import piecash
+        from datetime import date as _date
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = next(
+                (c for c in book.commodities if c.mnemonic == "EUR"),
+                None,
+            )
+            if eur is None:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+            ar_name = (
+                "Liabilities:Accounts Payable EUR" if is_bill
+                else "Assets:Accounts Receivable EUR"
+            )
+            if not any(a.fullname == ar_name for a in book.accounts):
+                parent_name = "Liabilities" if is_bill else "Assets"
+                parent = next(
+                    a for a in book.accounts if a.fullname == parent_name
+                )
+                book.session.add(piecash.Account(
+                    name=ar_name.split(":")[-1],
+                    type=("PAYABLE" if is_bill else "RECEIVABLE"),
+                    parent=parent, commodity=eur,
+                ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date.fromisoformat(post_date),
+                value=post_rate, source="user:test", type="nav",
+            ))
+            book.save()
+
+        if is_bill:
+            gb.create_vendor(name="Berlin Supplier", currency="EUR")
+            gb.create_bill(vendor_id="000001", currency="EUR",
+                           date_opened=post_date)
+            gb.add_bill_entry(bill_id="000001",
+                              account="Expenses:Office Supplies",
+                              description="EUR supplies",
+                              quantity="1", price="4500.00")
+            gb.post_invoice(invoice_id="000001",
+                            post_account=ar_name,
+                            post_date=post_date,
+                            owner_type="vendor")
+        else:
+            gb.create_customer(name="Berlin Digital", currency="EUR")
+            gb.create_invoice(customer_id="000001", currency="EUR",
+                              date_opened=post_date)
+            gb.add_invoice_entry(invoice_id="000001",
+                                 account="Income:Consulting",
+                                 description="EUR services",
+                                 quantity="1", price="4500.00")
+            gb.post_invoice(invoice_id="000001",
+                            post_account=ar_name,
+                            post_date=post_date)
+
+    def _add_pay_date_rate(
+        self, gb, rate_value: str, rate_date: str = "2026-03-20",
+    ):
+        """Add a EUR/USD price on the pay-date so the helper can
+        resolve the pay-date rate the same way pay_invoice does.
+        """
+        import piecash
+        from datetime import date as _date
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date.fromisoformat(rate_date),
+                value=rate_value, source="user:test", type="nav",
+            ))
+            book.save()
+
+    def _call_helper(
+        self, gb, *, is_bill: bool, pay_rate: Decimal,
+        parsed_date_str: str = "2026-03-20",
+    ) -> dict | None:
+        """Open a session, find the posted invoice/bill, call
+        ``_compute_fx_gain_loss`` with crafted inputs, and capture
+        the returned values into plain Python types BEFORE the
+        session closes — piecash ORM objects can't be touched
+        post-close (DetachedInstanceError on any attribute access).
+
+        Returns a serializable summary dict instead of the raw
+        ORM-tied return value::
+
+            {
+                "fx_diff_default": Decimal,
+                "split_quantity": Decimal,
+                "fx_acct_fullname": str,
+                "fx_notice": str | None,
+            }
+
+        or ``None`` when the helper returned ``None`` (no FX split).
+        """
+        from datetime import date as _date
+        ot = 4 if is_bill else 2
+        parsed_date = _date.fromisoformat(parsed_date_str)
+        with gb.open(readonly=False) as book:
+            inv = gb._find_invoice(book, "000001", owner_type=ot)
+            assert inv is not None
+            pay_acct = gb._resolve_account(book, "Assets:Checking")
+            assert pay_acct is not None
+            default_currency = gb._require_default_currency(book)
+            payment_amount = Decimal("4500.00")
+            pay_quantity = (payment_amount * pay_rate).quantize(
+                Decimal("0.01")
+            )
+            result = gb._compute_fx_gain_loss(
+                book,
+                inv=inv,
+                is_bill=is_bill,
+                pay_acct=pay_acct,
+                payment_amount=payment_amount,
+                pay_quantity=pay_quantity,
+                parsed_date=parsed_date,
+                exchange_rate=pay_rate,
+                fx_account=None,
+                default_currency=default_currency,
+            )
+            if result is None:
+                return None
+            # Capture every field as a plain Python value while the
+            # session is still open. ``fullname`` walks the parent
+            # chain via lazy load; ``quantity`` on the Split is
+            # cached on the instance so it survives detach, but
+            # we capture it here for consistency.
+            return {
+                "fx_diff_default": result["fx_diff_default"],
+                "split_quantity": Decimal(str(result["split"].quantity)),
+                "fx_acct_fullname": result["fx_acct"].fullname,
+                "fx_notice": result["fx_notice"],
+            }
+
+    # ── The four sign quadrants ───────────────────────────────────
+
+    def test_customer_invoice_rate_up_books_gain(self, business_book):
+        """Customer invoice: pay-rate > post-rate → received more
+        USD than booked at posting → realized GAIN. Split quantity
+        is negative (credit to credit-natural income account)."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_posted_eur_invoice(gb, post_rate="1.10")
+        self._add_pay_date_rate(gb, rate_value="1.12")
+
+        result = self._call_helper(
+            gb, is_bill=False, pay_rate=Decimal("1.12"),
+        )
+
+        assert result is not None
+        # post: 4500 × 1.10 = 4950 expected USD
+        # pay:  4500 × 1.12 = 5040 actual USD
+        # delta = +90 (received more)
+        assert result["fx_diff_default"] == Decimal("90.00")
+        # Customer gain: quantity = -delta (credit to income).
+        assert result["split_quantity"] == Decimal("-90.00")
+        assert result["fx_acct_fullname"] == "Income:Foreign Exchange Gain/Loss"
+        assert result["fx_notice"] is None
+
+    def test_customer_invoice_rate_down_books_loss(self, business_book):
+        """Customer invoice: pay-rate < post-rate → received less
+        USD than booked at posting → realized LOSS. Split quantity
+        is positive (debit to credit-natural income account =
+        reduces income)."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_posted_eur_invoice(gb, post_rate="1.12")
+        self._add_pay_date_rate(gb, rate_value="1.10")
+
+        result = self._call_helper(
+            gb, is_bill=False, pay_rate=Decimal("1.10"),
+        )
+
+        assert result is not None
+        # post: 4500 × 1.12 = 5040 expected USD
+        # pay:  4500 × 1.10 = 4950 actual USD
+        # delta = -90 (received less)
+        assert result["fx_diff_default"] == Decimal("-90.00")
+        # Customer loss: quantity = -delta = +90 (debit income).
+        assert result["split_quantity"] == Decimal("90.00")
+        assert result["fx_acct_fullname"] == "Income:Foreign Exchange Gain/Loss"
+
+    def test_vendor_bill_rate_down_books_gain(self, business_book):
+        """Vendor bill: pay-rate < post-rate → spent fewer USD than
+        booked at posting → realized GAIN. Split quantity is
+        negative (credit to credit-natural income account)."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_posted_eur_invoice(gb, post_rate="1.12", is_bill=True)
+        self._add_pay_date_rate(gb, rate_value="1.10")
+
+        result = self._call_helper(
+            gb, is_bill=True, pay_rate=Decimal("1.10"),
+        )
+
+        assert result is not None
+        # post: 4500 × 1.12 = 5040 expected USD spent
+        # pay:  4500 × 1.10 = 4950 actual USD spent
+        # delta = -90 (spent less)
+        assert result["fx_diff_default"] == Decimal("-90.00")
+        # Vendor gain: quantity = +delta = -90 (credit income).
+        assert result["split_quantity"] == Decimal("-90.00")
+        assert result["fx_acct_fullname"] == "Income:Foreign Exchange Gain/Loss"
+
+    def test_vendor_bill_rate_up_books_loss(self, business_book):
+        """Vendor bill: pay-rate > post-rate → spent more USD than
+        booked at posting → realized LOSS. Split quantity is
+        positive (debit to credit-natural income account)."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_posted_eur_invoice(gb, post_rate="1.10", is_bill=True)
+        self._add_pay_date_rate(gb, rate_value="1.12")
+
+        result = self._call_helper(
+            gb, is_bill=True, pay_rate=Decimal("1.12"),
+        )
+
+        assert result is not None
+        # post: 4500 × 1.10 = 4950 expected USD spent
+        # pay:  4500 × 1.12 = 5040 actual USD spent
+        # delta = +90 (spent more)
+        assert result["fx_diff_default"] == Decimal("90.00")
+        # Vendor loss: quantity = +delta = +90 (debit income).
+        assert result["split_quantity"] == Decimal("90.00")
+
+    # ── None-return cases ─────────────────────────────────────────
+
+    def test_returns_none_when_post_and_pay_rates_equal(
+        self, business_book,
+    ):
+        """When the rate hasn't moved, no FX split is booked.
+        Returns None so the caller skips appending."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_posted_eur_invoice(gb, post_rate="1.10")
+        # Only one price on file — same rate at both dates.
+        result = self._call_helper(
+            gb, is_bill=False, pay_rate=Decimal("1.10"),
+        )
+        assert result is None
+
+
 # ============== Outstanding Invoices Tests ==============
 
 
