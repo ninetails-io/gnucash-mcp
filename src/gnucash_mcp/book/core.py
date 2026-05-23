@@ -118,7 +118,7 @@ class CoreMixin:
     _LAST_ENTRY_WARN_DAYS = 14
 
     def _account_reconciliation_status(
-        self, book: piecash.Book,
+        self, book: piecash.Book, accounts: list,
     ) -> list[dict]:
         """Per-account reconciliation freshness for the book summary.
 
@@ -162,7 +162,7 @@ class CoreMixin:
         today = date.today()
 
         results: list[dict] = []
-        for account in book.accounts:
+        for account in accounts:
             if account.type == "ROOT":
                 continue
             if account.guid in template_guids:
@@ -260,6 +260,7 @@ class CoreMixin:
         book: piecash.Book,
         as_of: date,
         default_currency: piecash.Commodity,
+        accounts: list,
     ) -> Decimal:
         """Net worth in book-default currency as of ``as_of``.
 
@@ -314,14 +315,14 @@ class CoreMixin:
         # is_leaf: an account with no children. Compute the parent
         # set once and check membership per account.
         parent_guids: set[str] = set()
-        for a in book.accounts:
+        for a in accounts:
             if a.parent and a.parent.type != "ROOT":
                 parent_guids.add(a.parent.guid)
 
         assets_total = Decimal("0")
         liabilities_total = Decimal("0")
 
-        for account in book.accounts:
+        for account in accounts:
             if account.type == "ROOT":
                 continue
             if account.guid in template_guids:
@@ -371,6 +372,7 @@ class CoreMixin:
         self,
         book: piecash.Book,
         first_date: date | None,
+        accounts: list,
     ) -> list[dict]:
         """Five-point net-worth trajectory: 12mo / 6mo / 3mo / 1mo
         ago and now. Implements GET_BOOK_SUMMARY_SPEC §2.
@@ -427,7 +429,7 @@ class CoreMixin:
             {
                 "label": label,
                 "net_worth": self._compute_net_worth_at(
-                    book, anchor_date, default_currency,
+                    book, anchor_date, default_currency, accounts,
                 ).quantize(Decimal("1")),
             }
             for anchor_date, label in anchors
@@ -514,6 +516,7 @@ class CoreMixin:
         self,
         book: piecash.Book,
         transactions: list,
+        accounts: list,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
         Implements GET_BOOK_SUMMARY_SPEC §5.
@@ -585,7 +588,7 @@ class CoreMixin:
 
         # ── 1. Data integrity: Imbalance / Orphan accounts ──
         integrity: list[str] = []
-        for account in book.accounts:
+        for account in accounts:
             if account.type == "ROOT":
                 continue
             name = account.name
@@ -622,7 +625,7 @@ class CoreMixin:
                     book, today, default_currency,
                 )
                 low_cash_entries: list[tuple[Decimal, str]] = []
-                for account in book.accounts:
+                for account in accounts:
                     if account.type not in ("BANK", "CASH"):
                         continue
                     if account.placeholder:
@@ -786,7 +789,7 @@ class CoreMixin:
         stale_prices: list[str] = []
         try:
             in_use: set = set()
-            for a in book.accounts:
+            for a in accounts:
                 if a.type != "ROOT":
                     in_use.add(a.commodity.guid)
 
@@ -1126,6 +1129,7 @@ class CoreMixin:
         book: piecash.Book,
         default_currency: piecash.Commodity,
         transactions: list,
+        accounts: list,
     ) -> dict | None:
         """Compute runway: how many days the household could survive
         on current liquid assets at current burn rate if income
@@ -1180,7 +1184,7 @@ class CoreMixin:
 
         # --- Liquid assets pass over book.accounts ---
         liquid = Decimal("0")
-        for account in book.accounts:
+        for account in accounts:
             if account.type == "ROOT":
                 continue
             if account.guid in template_guids:
@@ -1645,9 +1649,16 @@ class CoreMixin:
             # creates flat templates — but tolerates deeper nesting now.
             template_guids = self._template_account_guids(book)
 
+            # Materialize the account list once. CODE_REVIEW noted 7-10
+            # passes over ``book.accounts`` between this method and the
+            # sub-helpers it calls; threading the in-memory list collapses
+            # each pass from "hydrate the ORM collection then iterate" to
+            # "iterate the already-hydrated Python list."
+            accounts = list(book.accounts)
+
             # --- Collect parent GUIDs (placeholder containers) ---
             parent_guids = set()
-            for account in book.accounts:
+            for account in accounts:
                 if account.parent and account.parent.type != "ROOT":
                     parent_guids.add(account.parent.guid)
 
@@ -1680,7 +1691,7 @@ class CoreMixin:
             expense_total = 0
             total_accounts = 0
 
-            for account in book.accounts:
+            for account in accounts:
                 if account.type == "ROOT":
                     continue
                 if account.guid in template_guids:
@@ -1868,7 +1879,7 @@ class CoreMixin:
             # there's data integrity trouble or stale prices
             # informing the rest of the summary, the LLM should see
             # that BEFORE reading numbers that depend on them.
-            warnings = self._collect_warnings(book, transactions)
+            warnings = self._collect_warnings(book, transactions, accounts)
             lines.extend(self._render_warnings(warnings))
 
             lines.append(f"Accounts: {total_accounts} total")
@@ -1926,10 +1937,14 @@ class CoreMixin:
             # (or returns ``[]`` to omit it — absence-as-signal). See
             # the helpers for the per-section spec and warning
             # thresholds.
-            reconciliation = self._account_reconciliation_status(book)
+            reconciliation = self._account_reconciliation_status(
+                book, accounts,
+            )
             lines.extend(self._render_reconciliation(reconciliation))
 
-            trajectory = self._net_worth_trajectory(book, first_date)
+            trajectory = self._net_worth_trajectory(
+                book, first_date, accounts,
+            )
             lines.extend(
                 self._render_net_worth_trajectory(trajectory, currency)
             )
@@ -1938,7 +1953,7 @@ class CoreMixin:
             lines.extend(self._render_monthly_net(monthly))
 
             runway = self._runway_metrics(
-                book, default_currency, transactions,
+                book, default_currency, transactions, accounts,
             )
             lines.extend(self._render_runway(runway, currency))
 
