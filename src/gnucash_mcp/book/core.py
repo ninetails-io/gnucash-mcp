@@ -1390,6 +1390,195 @@ class CoreMixin:
             return f"({months} months behind)"
         return f"({days_behind} days behind)"
 
+    # ── Section renderers ─────────────────────────────────────────────
+    #
+    # Each ``_render_*`` helper consumes the data produced by its
+    # paired ``_collect_*`` / ``_*_metrics`` / ``_*_headline`` /
+    # ``_*_trajectory`` method and returns a ``list[str]`` of lines
+    # to append to the summary (or ``[]`` to omit the section
+    # entirely — absence-as-signal, per the spec).
+    #
+    # Pre-extraction the render block was one long sequence inside
+    # ``get_book_summary``. Pulling each section into its own helper
+    # mirrors the data layer's decomposition and makes adding or
+    # modifying a section a one-method change instead of surgery
+    # through the render block. Each helper is self-contained — no
+    # cross-section state — so the rendering order in
+    # ``get_book_summary`` becomes a one-glance read.
+
+    @staticmethod
+    def _render_warnings(warnings: list[str]) -> list[str]:
+        """Render the Warnings section.
+
+        Section is omitted when there are no warnings — the spec
+        explicitly calls out not printing "Warnings: none." Empty
+        list signals "section absent" to the caller.
+        """
+        if not warnings:
+            return []
+        out = ["Warnings:"]
+        for msg in warnings:
+            out.append(f"  ⚠ {msg}")
+        return out
+
+    def _render_reconciliation(
+        self, reconciliation: list[dict],
+    ) -> list[str]:
+        """Render the Reconciliation section.
+
+        Three buckets per the data spec:
+
+        1. **STALE** (reconciled but > ``_RECONCILE_WARN_DAYS``
+           behind) — render individually with the through-date and
+           a "(N days/months behind) ⚠" lag suffix. Per-account
+           payload (how stale, scope of work) can't be aggregated.
+        2. **CURRENT** (reconciled within window) — collapse into
+           "<N> accounts current". Identical-across-accounts
+           payload compresses to a count.
+        3. **NEVER RECONCILED** (activity but no 'y' splits) —
+           collapse into "<N> account(s) never reconciled ⚠".
+
+        Each collapse line omitted when its count is zero
+        (absence-as-signal). Section omitted entirely when
+        reconciliation is empty.
+        """
+        if not reconciliation:
+            return []
+        stale: list[dict] = []
+        current_count = 0
+        never_count = 0
+        for entry in reconciliation:
+            if entry["status"] == "never reconciled":
+                never_count += 1
+            elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+                stale.append(entry)
+            else:
+                current_count += 1
+
+        out = ["Reconciliation:"]
+        for entry in stale:
+            leaf = entry["account"].split(":")[-1]
+            lag = self._format_reconciliation_lag(entry["days_behind"])
+            # Sub-line shape: "47 splits unreconciled since
+            # 2025-12-30 (4 months behind) ⚠". The split count
+            # tells the LLM the *scope* of the reconciliation
+            # work — 12 splits is one sitting; 400 needs a
+            # month-by-month strategy.
+            n = entry["unreconciled_count"]
+            if n > 0 and "latest_y_date" in entry:
+                plural = "s" if n != 1 else ""
+                since = entry["latest_y_date"]
+                out.append(
+                    f"  {leaf}: {n} split{plural} "
+                    f"unreconciled since {since} {lag} ⚠"
+                )
+            else:
+                out.append(
+                    f"  {leaf}: {entry['status']} {lag} ⚠"
+                )
+        if current_count:
+            plural = "s" if current_count != 1 else ""
+            out.append(f"  {current_count} account{plural} current")
+        if never_count:
+            plural = "s" if never_count != 1 else ""
+            out.append(
+                f"  {never_count} account{plural} never reconciled ⚠"
+            )
+        return out
+
+    @staticmethod
+    def _render_net_worth_trajectory(
+        trajectory: list[dict], currency: str,
+    ) -> list[str]:
+        """Render the Net worth trajectory section.
+
+        Surfaces acceleration and trend breaks that a single
+        net-worth number can't. Empty trajectory = book has no
+        transactions or every anchor predates the data range →
+        omit the section.
+        """
+        if not trajectory:
+            return []
+        out = ["Net worth trajectory:"]
+        for entry in trajectory:
+            out.append(
+                f"  {entry['label']}: {currency} "
+                f"{int(entry['net_worth']):,}"
+            )
+        return out
+
+    def _render_monthly_net(self, monthly: list[dict]) -> list[str]:
+        """Render the Monthly net (last 6 months) section.
+
+        Surfaces seasonality and recent anomalies. Empty list = no
+        income/expense activity in the window → omit the section.
+        MTD entries get a "(MTD)" suffix on the label.
+        """
+        if not monthly:
+            return []
+        out = ["Monthly net (last 6 months):"]
+        for entry in monthly:
+            label = entry["label"]
+            if entry["is_mtd"]:
+                label += " (MTD)"
+            out.append(
+                f"  {label}: {self._format_monthly_net(entry['net'])}"
+            )
+        return out
+
+    def _render_runway(
+        self, runway: dict | None, currency: str,
+    ) -> list[str]:
+        """Render the Runway line.
+
+        Liquid assets / daily burn → days. The single most
+        actionable personal-finance number that doesn't appear on
+        standard financial statements. ``None`` = no expense data in
+        the burn window → omit section. ``negative_liquid`` flag
+        renders the special 0-days-with-warning line.
+        """
+        if runway is None:
+            return []
+        if runway.get("negative_liquid"):
+            return ["Runway: 0 days — liquid position is negative ⚠"]
+        days = runway["runway_days"]
+        liquid = int(runway["liquid"])
+        burn = int(runway["daily_burn"])
+        warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
+        return [
+            f"Runway: {days} days{warn} "
+            f"({currency} {liquid:,} liquid / "
+            f"{currency} {burn:,}/day burn)"
+        ]
+
+    def _render_budget(self, budget: dict | None) -> list[str]:
+        """Render the Budget headline line.
+
+        One line for the budget covering today. ``None`` = no
+        budget exists or none covers today → omit. Variance
+        over ``_BUDGET_WARN_VARIANCE_PCT`` earns ⚠ (spending
+        ahead of pace).
+        """
+        if budget is None:
+            return []
+        used = int(budget["used_pct"])
+        elapsed = int(budget["elapsed_pct"])
+        variance = int(budget["variance_pct"])
+        if variance > 0:
+            variance_str = f"(+{variance}% over pace)"
+        elif variance < 0:
+            variance_str = f"({-variance}% under pace)"
+        else:
+            variance_str = "(on pace)"
+        warn = (
+            " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT else ""
+        )
+        return [
+            f"Budget ({budget['name']}): "
+            f"{used}% used / {elapsed}% elapsed "
+            f"{variance_str}{warn}"
+        ]
+
     def get_book_summary(self) -> str:
         """Return a compact text summary of the entire book.
 
@@ -1661,14 +1850,8 @@ class CoreMixin:
             # there's data integrity trouble or stale prices
             # informing the rest of the summary, the LLM should see
             # that BEFORE reading numbers that depend on them.
-            # Section omitted entirely when no warnings — absence
-            # is the signal; the spec explicitly calls out not
-            # printing "Warnings: none."
             warnings = self._collect_warnings(book)
-            if warnings:
-                lines.append("Warnings:")
-                for msg in warnings:
-                    lines.append(f"  ⚠ {msg}")
+            lines.extend(self._render_warnings(warnings))
 
             lines.append(f"Accounts: {total_accounts} total")
 
@@ -1719,160 +1902,28 @@ class CoreMixin:
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
 
-            # Reconciliation: per-account state for reconcilable
-            # account types. Section omitted entirely when the book
-            # has no reconcilable activity (no header line either —
-            # absence is the signal, per the spec's principle).
-            #
-            # Render shape splits the per-account list into THREE
-            # buckets, each carrying a distinct payload class:
-            #
-            # 1. STALE (reconciled at some point but >45 days behind)
-            #    — render individually with their through-date and
-            #    a "(N days/months behind) ⚠" lag suffix. The
-            #    information *how stale is each one* is per-account
-            #    and can't be aggregated. These are the lines a
-            #    bookkeeper LLM actually acts on.
-            # 2. CURRENT (reconciled within 45 days) — collapse into
-            #    a single "<N> accounts current" line. Each
-            #    individual through-date carries the same payload
-            #    ("this one's fine"), repeated; the count preserves
-            #    the affirmative signal without paying per-account
-            #    for it.
-            # 3. NEVER RECONCILED (activity but no 'y' splits) —
-            #    collapse into "<N> account(s) never reconciled ⚠".
-            #    Same logic as the current bucket: identical
-            #    per-line content compresses to a count.
-            #
-            # The principle: per-account-distinct information stays
-            # per-account; identical-across-accounts information
-            # collapses. A 50-account power-user book emits ~3-5
-            # lines; an Alex-sized book emits ~3-5 lines. Signal
-            # density is uniform regardless of book size.
-            #
-            # Each collapse line is omitted when its count is zero
-            # (absence-as-signal): a book with no current accounts
-            # never sees "0 accounts current."
+            # Reconciliation, trajectory, monthly net, runway, budget:
+            # each section's data collector lives in its own method;
+            # the matching ``_render_*`` helper renders the section
+            # (or returns ``[]`` to omit it — absence-as-signal). See
+            # the helpers for the per-section spec and warning
+            # thresholds.
             reconciliation = self._account_reconciliation_status(book)
-            if reconciliation:
-                stale: list[dict] = []
-                current_count = 0
-                never_count = 0
-                for entry in reconciliation:
-                    if entry["status"] == "never reconciled":
-                        never_count += 1
-                    elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
-                        stale.append(entry)
-                    else:
-                        current_count += 1
+            lines.extend(self._render_reconciliation(reconciliation))
 
-                lines.append("Reconciliation:")
-                for entry in stale:
-                    leaf = entry["account"].split(":")[-1]
-                    lag = self._format_reconciliation_lag(entry["days_behind"])
-                    # Sub-line shape: "47 splits unreconciled since
-                    # 2025-12-30 (4 months behind) ⚠". The split
-                    # count tells the LLM the *scope* of the
-                    # reconciliation work — 12 splits is one
-                    # sitting; 400 needs a month-by-month strategy.
-                    # Pre-fix the line was just "through DATE (4
-                    # months behind)" which gave staleness without
-                    # scope.
-                    n = entry["unreconciled_count"]
-                    if n > 0 and "latest_y_date" in entry:
-                        plural = "s" if n != 1 else ""
-                        since = entry["latest_y_date"]
-                        lines.append(
-                            f"  {leaf}: {n} split{plural} "
-                            f"unreconciled since {since} {lag} ⚠"
-                        )
-                    else:
-                        lines.append(
-                            f"  {leaf}: {entry['status']} {lag} ⚠"
-                        )
-                if current_count:
-                    plural = "s" if current_count != 1 else ""
-                    lines.append(
-                        f"  {current_count} account{plural} current"
-                    )
-                if never_count:
-                    plural = "s" if never_count != 1 else ""
-                    lines.append(
-                        f"  {never_count} account{plural} never reconciled ⚠"
-                    )
-
-            # Net worth trajectory (12mo / 6mo / 3mo / 1mo ago, now).
-            # Surfaces acceleration and trend breaks that a single
-            # net-worth number can't. Empty list = book has no
-            # transactions or every anchor predates the data range
-            # → omit the section entirely.
             trajectory = self._net_worth_trajectory(book, first_date)
-            if trajectory:
-                lines.append("Net worth trajectory:")
-                for entry in trajectory:
-                    lines.append(
-                        f"  {entry['label']}: {currency} "
-                        f"{int(entry['net_worth']):,}"
-                    )
+            lines.extend(
+                self._render_net_worth_trajectory(trajectory, currency)
+            )
 
-            # Monthly net income (last 6 months). Surfaces seasonality
-            # and recent anomalies. Empty list = no income/expense
-            # activity in the window → omit the section entirely.
             monthly = self._monthly_net_income(book, months=6)
-            if monthly:
-                lines.append("Monthly net (last 6 months):")
-                for entry in monthly:
-                    label = entry["label"]
-                    if entry["is_mtd"]:
-                        label += " (MTD)"
-                    lines.append(
-                        f"  {label}: {self._format_monthly_net(entry['net'])}"
-                    )
+            lines.extend(self._render_monthly_net(monthly))
 
-            # Runway: liquid assets / daily burn → days. The single
-            # most actionable personal-finance number that doesn't
-            # appear on standard financial statements. None = no
-            # expense data in the burn window → omit section.
             runway = self._runway_metrics(book, default_currency)
-            if runway is not None:
-                if runway.get("negative_liquid"):
-                    lines.append(
-                        "Runway: 0 days — liquid position is negative ⚠"
-                    )
-                else:
-                    days = runway["runway_days"]
-                    liquid = int(runway["liquid"])
-                    burn = int(runway["daily_burn"])
-                    warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
-                    lines.append(
-                        f"Runway: {days} days{warn} "
-                        f"({currency} {liquid:,} liquid / "
-                        f"{currency} {burn:,}/day burn)"
-                    )
+            lines.extend(self._render_runway(runway, currency))
 
-            # Budget headline: one line for the budget covering today.
-            # None = no budget exists or none covers today → omit.
-            # Variance > +10% earns ⚠ (spending ahead of pace).
             budget = self._budget_headline(book)
-            if budget is not None:
-                used = int(budget["used_pct"])
-                elapsed = int(budget["elapsed_pct"])
-                variance = int(budget["variance_pct"])
-                if variance > 0:
-                    variance_str = f"(+{variance}% over pace)"
-                elif variance < 0:
-                    variance_str = f"({-variance}% under pace)"
-                else:
-                    variance_str = "(on pace)"
-                warn = (
-                    " ⚠" if variance > self._BUDGET_WARN_VARIANCE_PCT
-                    else ""
-                )
-                lines.append(
-                    f"Budget ({budget['name']}): "
-                    f"{used}% used / {elapsed}% elapsed "
-                    f"{variance_str}{warn}"
-                )
+            lines.extend(self._render_budget(budget))
 
             lines.append(f"Transactions: {total_txns}")
 
