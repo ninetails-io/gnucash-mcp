@@ -510,7 +510,11 @@ class CoreMixin:
     # are likely producing inaccurate net-worth and runway numbers.
     _STALE_PRICE_DAYS = 30
 
-    def _collect_warnings(self, book: piecash.Book) -> list[str]:
+    def _collect_warnings(
+        self,
+        book: piecash.Book,
+        transactions: list,
+    ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
         Implements GET_BOOK_SUMMARY_SPEC §5.
 
@@ -611,7 +615,7 @@ class CoreMixin:
         # activity (no daily-burn signal to compare against).
         low_cash: list[str] = []
         try:
-            daily_burn = self._daily_expense_burn(book)
+            daily_burn = self._daily_expense_burn(book, transactions)
             if daily_burn > 0:
                 template_guids = self._template_account_guids(book)
                 rates = self._rates_as_of(
@@ -942,7 +946,11 @@ class CoreMixin:
             + stale_prices
         )
 
-    def _budget_headline(self, book: piecash.Book) -> dict | None:
+    def _budget_headline(
+        self,
+        book: piecash.Book,
+        transactions: list,
+    ) -> dict | None:
         """One-line headline for the budget covering today, if any.
         Implements GET_BOOK_SUMMARY_SPEC §6.
 
@@ -1048,7 +1056,7 @@ class CoreMixin:
         # stored negative; flip to a positive contribution to match
         # the spend-vs-target framing.
         actuals = Decimal("0")
-        for txn in book.transactions:
+        for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
                 continue
             for s in txn.splits:
@@ -1082,6 +1090,7 @@ class CoreMixin:
     def _daily_expense_burn(
         self,
         book: piecash.Book,
+        transactions: list,
         days: int | None = None,
     ) -> Decimal:
         """Average daily EXPENSE outflow over the last ``days`` days.
@@ -1092,6 +1101,10 @@ class CoreMixin:
         Both want the same number — extracting the helper guarantees
         they agree.
 
+        ``transactions`` is the pre-materialized list ``get_book_summary``
+        builds once and threads through every sub-helper that walks
+        post-date — same list, no per-helper re-fetch.
+
         Returns ``Decimal("0")`` when no expense activity in window
         — caller treats that as "no daily-burn signal."
         """
@@ -1100,7 +1113,7 @@ class CoreMixin:
         today = date.today()
         window_start = today - timedelta(days=days)
         expenses = Decimal("0")
-        for txn in book.transactions:
+        for txn in transactions:
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             for s in txn.splits:
@@ -1112,6 +1125,7 @@ class CoreMixin:
         self,
         book: piecash.Book,
         default_currency: piecash.Commodity,
+        transactions: list,
     ) -> dict | None:
         """Compute runway: how many days the household could survive
         on current liquid assets at current burn rate if income
@@ -1226,7 +1240,7 @@ class CoreMixin:
         # section's "less than 1 day of burn" threshold and runway's
         # divisor-of-liquid agree by construction.
         daily_burn = self._daily_expense_burn(
-            book, days=self._RUNWAY_BURN_DAYS,
+            book, transactions, days=self._RUNWAY_BURN_DAYS,
         )
 
         if daily_burn <= 0:
@@ -1248,7 +1262,10 @@ class CoreMixin:
         }
 
     def _monthly_net_income(
-        self, book: piecash.Book, months: int = 6,
+        self,
+        book: piecash.Book,
+        transactions: list,
+        months: int = 6,
     ) -> list[dict]:
         """Per-month net income for the last ``months`` calendar
         months. Implements GET_BOOK_SUMMARY_SPEC §3.
@@ -1319,11 +1336,12 @@ class CoreMixin:
         window_end = month_ends[-1]
         has_activity = False
 
-        # Single pass over book.transactions. Index math: the bucket
-        # for a transaction is (year_delta * 12 + month_delta) from
-        # the window start. O(transactions); the date-range gate
-        # short-circuits transactions outside the window.
-        for txn in book.transactions:
+        # Single pass over the materialized transactions list. Index
+        # math: the bucket for a transaction is
+        # (year_delta * 12 + month_delta) from the window start.
+        # O(transactions); the date-range gate short-circuits
+        # transactions outside the window.
+        for txn in transactions:
             d = txn.post_date
             if d < window_start or d > window_end:
                 continue
@@ -1850,7 +1868,7 @@ class CoreMixin:
             # there's data integrity trouble or stale prices
             # informing the rest of the summary, the LLM should see
             # that BEFORE reading numbers that depend on them.
-            warnings = self._collect_warnings(book)
+            warnings = self._collect_warnings(book, transactions)
             lines.extend(self._render_warnings(warnings))
 
             lines.append(f"Accounts: {total_accounts} total")
@@ -1916,13 +1934,15 @@ class CoreMixin:
                 self._render_net_worth_trajectory(trajectory, currency)
             )
 
-            monthly = self._monthly_net_income(book, months=6)
+            monthly = self._monthly_net_income(book, transactions, months=6)
             lines.extend(self._render_monthly_net(monthly))
 
-            runway = self._runway_metrics(book, default_currency)
+            runway = self._runway_metrics(
+                book, default_currency, transactions,
+            )
             lines.extend(self._render_runway(runway, currency))
 
-            budget = self._budget_headline(book)
+            budget = self._budget_headline(book, transactions)
             lines.extend(self._render_budget(budget))
 
             lines.append(f"Transactions: {total_txns}")
