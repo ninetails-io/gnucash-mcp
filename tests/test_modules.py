@@ -80,11 +80,12 @@ class TestToolModulesMapping:
         assert len(_core_tool_names()) == 26
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 91 — 88
-        post-module-restructure + 3 voucher tools added in v1.3
-        (create_voucher, add_voucher_entry, delete_voucher)."""
+        """Total tools across all sub-modules should be 94 —
+        88 post-module-restructure + 3 voucher tools + 3 credit-
+        note tools (create_credit_note, add_credit_note_entry,
+        delete_credit_note) added in v1.3."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 91
+        assert total == 94
 
     def test_expected_modules_exist(self):
         """All expected sub-module names should be present after the
@@ -228,9 +229,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 91 tools (88 +3 vouchers)."""
+        """--modules=all should keep all 94 tools (88 + 3 vouchers + 3 credit notes)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 94
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -262,12 +263,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 94
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 91 tools."""
+        """'all' mixed with other modules should keep all 94 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 94
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""

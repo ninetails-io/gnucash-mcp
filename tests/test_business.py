@@ -1799,6 +1799,301 @@ class TestInvoiceToDictCreditNoteKeys:
             assert "applies_to" not in result
 
 
+class TestCreateCreditNote:
+    """Tests for create_credit_note — the user-facing entry
+    point. Validates owner_type gating, applies_to source
+    matching, currency inheritance and currency conflict
+    rejection, and the credit-note flag / applies_to keys in
+    the response.
+    """
+
+    def test_customer_credit_note_basic(self, business_book):
+        """Standalone credit note — no applies_to, customer
+        side. Response surfaces is_credit_note=True and the
+        customer_id key from the underlying create path."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        result = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        assert result["status"] == "created"
+        assert result["customer_id"] == "000001"
+        assert result["is_credit_note"] is True
+        assert "applies_to" not in result
+        # Round-trip via get_invoice confirms the slot was set.
+        full = gb.get_invoice(result["id"], owner_type="customer")
+        assert full["is_credit_note"] is True
+        assert full["type"] == "invoice"  # owner-type-driven; flag is separate
+
+    def test_vendor_credit_note_basic(self, business_book):
+        """Symmetric — vendor side credit note. Response keys
+        use vendor_id."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        result = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        assert result["status"] == "created"
+        assert result["vendor_id"] == "000001"
+        assert result["is_credit_note"] is True
+
+    def test_employee_owner_type_rejected(self, business_book):
+        """Employees explicitly excluded — no GnuCash desktop UI
+        for employee credit notes."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria")
+        with pytest.raises(ValueError, match="not supported for employees"):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="employee",
+            )
+
+    def test_invalid_owner_type_rejected(self, business_book):
+        """Typos / unknown owner types rejected via the standard
+        _parse_owner_type path."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="custmer",
+            )
+
+    def test_applies_to_link_resolved_in_response(self, business_book):
+        """When applies_to_invoice_id is given and valid, the
+        response includes applies_to={id, type} dict."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        source = gb.create_invoice(customer_id="000001")
+        result = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            applies_to_invoice_id=source["id"],
+        )
+        assert result["applies_to"] == {
+            "id": source["id"], "type": "invoice",
+        }
+        # The link also round-trips through get_invoice.
+        full = gb.get_invoice(result["id"], owner_type="customer")
+        assert full["applies_to"]["id"] == source["id"]
+
+    def test_applies_to_source_not_found(self, business_book):
+        """Source ID that doesn't exist is rejected with a clear
+        error rather than silently creating an orphan link."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        with pytest.raises(ValueError, match="Source.*not found"):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id="NOPE",
+            )
+
+    def test_applies_to_cross_owner_rejected(self, business_book):
+        """A credit note for customer A pointing at customer B's
+        invoice is wrong bookkeeping — reject with the
+        mismatched IDs named in the error."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        # Acme is 000001; Beta is 000002.
+        beta_invoice = gb.create_invoice(customer_id="000002")
+        with pytest.raises(
+            ValueError, match="belongs to.*not.*000001",
+        ):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id=beta_invoice["id"],
+            )
+
+    def test_currency_inherited_from_source(self, business_book):
+        """When applies_to is given and currency is omitted, the
+        credit note adopts the source's currency. Important for
+        multi-currency books where issuing a credit note in the
+        wrong currency would create FX confusion."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        # Add EUR to the test book and create a EUR customer.
+        with gb.open(readonly=False) as bk:
+            bk.session.add(
+                piecash.factories.create_currency_from_ISO("EUR")
+            )
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        source = gb.create_invoice(customer_id="000001")
+        # No explicit currency; should inherit EUR from source.
+        cn = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            applies_to_invoice_id=source["id"],
+        )
+        full = gb.get_invoice(cn["id"], owner_type="customer")
+        assert full["currency"] == "EUR"
+
+    def test_currency_mismatch_rejected(self, business_book):
+        """Explicit currency conflicting with source's is rejected
+        — netting across currencies would create FX adjustments
+        outside GnuCash's tracking."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as bk:
+            bk.session.add(
+                piecash.factories.create_currency_from_ISO("EUR")
+            )
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        source = gb.create_invoice(customer_id="000001")
+        with pytest.raises(
+            ValueError, match="doesn't match source.*currency",
+        ):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id=source["id"],
+                currency="USD",
+            )
+
+    def test_custom_credit_note_id_accepted(self, business_book):
+        """Custom IDs (e.g. 'CN-2026-001') override the
+        auto-counter, same as invoices/bills."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        result = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            credit_note_id="CN-2026-001",
+        )
+        assert result["id"] == "CN-2026-001"
+
+
+class TestAddCreditNoteEntry:
+    """Tests for add_credit_note_entry — validates the target
+    is a credit note before delegating to _add_entry. Account
+    type rules mirror the host owner_type."""
+
+    def test_customer_credit_note_accepts_income_entry(self, business_book):
+        """Customer credit note entry → INCOME account
+        (mirrors regular customer invoice)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        result = gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Out-of-scope work credit",
+            quantity="1", price="500.00",
+        )
+        assert result["status"] == "created"
+        assert result["credit_note_id"] == cn["id"]
+        assert result["total"] == "500.00"
+
+    def test_vendor_credit_note_accepts_expense_entry(self, business_book):
+        """Vendor credit note entry → EXPENSE account (mirrors
+        regular vendor bill)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        result = gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Expenses:Office Supplies",
+            description="Defective product return",
+            quantity="1", price="42.00",
+        )
+        assert result["status"] == "created"
+        assert result["credit_note_id"] == cn["id"]
+
+    def test_non_credit_note_rejected_with_helpful_message(self, business_book):
+        """If the caller passes a regular invoice's ID to
+        add_credit_note_entry, fail loud and name the correct
+        tool to use instead. Pre-fix this would silently add
+        an entry to the wrong document type."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")  # regular invoice
+        with pytest.raises(
+            ValueError, match="not a credit note.*add_invoice_entry",
+        ):
+            gb.add_credit_note_entry(
+                credit_note_id="000001",
+                account="Income:Sales",
+                description="Wrong tool",
+                quantity="1", price="100",
+            )
+
+    def test_credit_note_not_found(self, business_book):
+        """Missing ID → 'Credit note not found' (clearer than
+        the generic invoice error)."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Credit note not found"):
+            gb.add_credit_note_entry(
+                credit_note_id="NOPE",
+                account="Income:Sales",
+                description="x", quantity="1", price="1",
+            )
+
+    def test_wrong_account_type_rejected(self, business_book):
+        """Account-type validation flows through to _add_entry;
+        EXPENSE on a customer credit note rejected just as on a
+        customer invoice."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="must be INCOME"):
+            gb.add_credit_note_entry(
+                credit_note_id=cn["id"],
+                account="Expenses:Office Supplies",
+                description="Wrong direction",
+                quantity="1", price="100",
+            )
+
+
+class TestDeleteCreditNote:
+    """Tests for delete_credit_note — validates the target is
+    a credit note, blocks deletion of posted credit notes,
+    cleans up entries."""
+
+    def test_delete_unposted_credit_note(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        result = gb.delete_credit_note(credit_note_id=cn["id"])
+        assert result["status"] == "deleted"
+        # type re-keyed to credit_note (base would say 'invoice')
+        assert result["type"] == "credit_note"
+
+    def test_delete_with_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        result = gb.delete_credit_note(credit_note_id=cn["id"])
+        assert result["status"] == "deleted"
+        assert result["entries_deleted"] == 1
+
+    def test_non_credit_note_rejected(self, business_book):
+        """A regular invoice cannot be deleted via this tool —
+        the validation gate fails loud and names the right tool."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(
+            ValueError, match="not a credit note.*delete_invoice",
+        ):
+            gb.delete_credit_note(credit_note_id="000001")
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 

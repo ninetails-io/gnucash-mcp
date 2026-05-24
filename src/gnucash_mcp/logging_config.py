@@ -935,19 +935,69 @@ def _fmt_voucher_delete(entry: dict) -> list[str]:
     return lines
 
 
+# ── Credit-note formatters ───────────────────────────────────
+# Credit notes can be customer- or vendor-sided (owner_type 2 or
+# 4); the credit-note flag is the differentiator. The formatters
+# surface the side in the audit line because a reviewer scanning
+# the log shouldn't have to cross-reference the source ID to
+# know which kind of credit note was issued. ``applies_to`` is
+# shown when the link is set.
+
+
+def _fmt_credit_note_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    cn_id = after.get("id", "")
+    owner_type = params.get("owner_type", "")
+    # owner_id key is owner-type-dependent: customer credit notes
+    # surface customer_id; vendor credit notes surface vendor_id.
+    # Pull whichever the after-state carries.
+    owner_id = (
+        after.get("customer_id")
+        or after.get("vendor_id")
+        or params.get("owner_id", "")
+    )
+    lines = [f"{time_part}  CREATE CREDIT NOTE  id:{cn_id}"]
+    detail = f"{_INDENT}{owner_type}: {owner_id}"
+    applies_to = after.get("applies_to")
+    if applies_to:
+        detail += f"  applies to: {applies_to.get('id', '')}"
+    lines.append(detail)
+    return lines
+
+
+def _fmt_credit_note_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [
+        f"{time_part}  DELETE CREDIT NOTE  "
+        f"id:{params.get('credit_note_id', '')}"
+    ]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
 def _fmt_entry_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
     desc = after.get("description", params.get("description", ""))
     total = after.get("total", "")
-    # Entry can belong to an invoice / bill / voucher — the params
-    # carry whichever ID key the tool wrapper used. First-match
-    # wins; all three are mutually exclusive in practice.
+    # Entry can belong to an invoice / bill / voucher / credit
+    # note — the params carry whichever ID key the tool wrapper
+    # used. First-match wins; all four are mutually exclusive in
+    # practice.
     inv_id = (
         params.get("invoice_id", "")
         or params.get("bill_id", "")
         or params.get("voucher_id", "")
+        or params.get("credit_note_id", "")
     )
     return [
         f"{time_part}  CREATE ENTRY",
@@ -1095,6 +1145,12 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("voucher", "POST"): _fmt_voucher_post,
     ("voucher", "UNPOST"): _fmt_voucher_unpost,
     ("voucher", "PAY"): _fmt_voucher_pay,
+    # Credit-note CREATE / DELETE land here; POST / UNPOST /
+    # PAY / APPLY are added in the lifecycle commit alongside
+    # the polymorphic-entity-type-swap handler that recognizes
+    # type='credit_note' in tool responses.
+    ("credit_note", "CREATE"): _fmt_credit_note_create,
+    ("credit_note", "DELETE"): _fmt_credit_note_delete,
     ("entry", "CREATE"): _fmt_entry_create,
     ("price", "DELETE"): _fmt_price_delete,
     ("budget", "UPDATE"): _fmt_budget_update,

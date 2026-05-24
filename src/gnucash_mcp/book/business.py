@@ -2181,6 +2181,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         doc_id: str | None = None,
+        extra_slots: dict | None = None,
     ) -> dict:
         """Shared create path for customer invoice and vendor bill.
 
@@ -2192,7 +2193,8 @@ class BusinessMixin:
         with ``_verify_write``, and returns the canonical response.
 
         Args:
-            owner_type: 2 = customer invoice, 4 = vendor bill.
+            owner_type: 2 = customer invoice, 4 = vendor bill,
+                5 = employee voucher.
             owner_id: Customer ID or vendor ID (human-readable '000001').
             date_opened: ISO date; defaults to now.
             notes: Free-text notes.
@@ -2351,6 +2353,19 @@ class BusinessMixin:
                 f"{config['doc_label']} '{doc_id}'",
             )
 
+            # Apply caller-supplied slots BEFORE save so the slot
+            # writes and the row insert land in a single
+            # transaction. The credit-note feature uses this to
+            # set ``credit-note`` and ``gnc-mcp/applies-to-invoice``
+            # without opening a second write session — preserves
+            # the "one book open per write" invariant.
+            if extra_slots:
+                new_inv = book.session.query(Invoice).filter_by(
+                    guid=inv_guid,
+                ).first()
+                for key, value in extra_slots.items():
+                    new_inv[key] = value
+
             book.save()
 
             return {
@@ -2475,6 +2490,373 @@ class BusinessMixin:
             term=term,
             doc_id=voucher_id,
         )
+
+    # ── Credit-note resolution ─────────────────────────────────
+    #
+    # Credit notes share the ``invoices`` table with their non-
+    # credit twins; what distinguishes them is the ``credit-note``
+    # slot. Tools like ``add_credit_note_entry`` and
+    # ``delete_credit_note`` need to look up a document by ID,
+    # validate it IS a credit note (not a regular invoice/bill
+    # that happens to share the ID space), and report a clear
+    # error otherwise. This helper centralizes that lookup +
+    # validation.
+
+    def _resolve_credit_note(
+        self, book, credit_note_id: str, owner_type: str | None = None,
+    ):
+        """Find a credit note by ID, validating that the document
+        is in fact flagged as a credit note.
+
+        Args:
+            book: Open piecash book session.
+            credit_note_id: Human-readable ID.
+            owner_type: Optional 'customer' or 'vendor' for
+                disambiguation when the ID collides across owner
+                types. None lets ``_find_invoice`` either resolve
+                an unambiguous match or raise its collision error.
+
+        Returns:
+            piecash Invoice object (the credit-note row).
+
+        Raises:
+            ValueError: If not found, found but not a credit note,
+                or ambiguous across owner types.
+        """
+        int_ot = (
+            self._parse_owner_type(owner_type)
+            if owner_type else None
+        )
+        if int_ot == 5:
+            # Employee credit notes are deliberately excluded —
+            # the create path rejects them, but a caller could
+            # still try to use this helper with owner_type='employee'.
+            # Surface the same constraint here.
+            raise ValueError(
+                "Credit notes are not supported for employees. "
+                "Use unpost_invoice + edit on the original voucher "
+                "to amend an employee reimbursement."
+            )
+        inv = self._find_invoice(
+            book, credit_note_id, owner_type=int_ot,
+        )
+        if not inv:
+            raise ValueError(
+                f"Credit note not found: {credit_note_id}"
+            )
+        if not self._get_is_credit_note(inv):
+            # Found the ID but it's a regular invoice/bill — name
+            # the right tool to use instead so the LLM can correct
+            # course in one hop.
+            entry_tool = (
+                "add_invoice_entry"
+                if inv.owner_type == 2
+                else "add_bill_entry"
+            )
+            delete_tool = (
+                "delete_invoice"
+                if inv.owner_type == 2
+                else "delete_bill"
+            )
+            raise ValueError(
+                f"{self._doc_label_for(inv.owner_type)} "
+                f"{credit_note_id} is not a credit note. Use "
+                f"{entry_tool} / {delete_tool} for the regular "
+                f"document, or check the ID."
+            )
+        return inv
+
+    def create_credit_note(
+        self,
+        owner_id: str,
+        owner_type: str,
+        applies_to_invoice_id: str | None = None,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        credit_note_id: str | None = None,
+    ) -> dict:
+        """Create a credit note against a customer invoice or
+        vendor bill.
+
+        A credit note is the audit-trail-preserving way to reverse
+        part or all of a posted invoice. At post time the posting
+        direction reverses: customer credit notes debit Income and
+        credit A/R (reducing what the customer owes you); vendor
+        credit notes debit A/P and credit Expense (reducing what
+        you owe the vendor).
+
+        **Linking**: when ``applies_to_invoice_id`` is given, the
+        credit note is linked to the source. Validation ensures
+        the source has the same owner_id and currency. The link is
+        stored as a custom slot (``gnc-mcp/applies-to-invoice``)
+        and surfaced in ``get_invoice`` / ``list_invoices``
+        responses. Highly recommended for audit trail; can be
+        omitted for floating credit notes the bookkeeper will
+        attach to a future invoice via ``apply_credit_note``.
+
+        **Employees deliberately excluded**: GnuCash desktop has
+        no UI for employee credit notes. Supporting them at the
+        MCP layer would create documents the desktop app couldn't
+        view or edit. For employee corrections, use
+        ``unpost_invoice`` + edit on the original voucher.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., '000001').
+            owner_type: 'customer' or 'vendor'.
+            applies_to_invoice_id: Optional source invoice/bill ID.
+                Must belong to the same owner and use the same
+                currency. Stored as a GUID slot for robustness;
+                resolved back to ``{id, type}`` for display.
+            date_opened: ISO date; defaults to today.
+            notes: Free-text notes (e.g., "Credit for out-of-scope
+                work on invoice 000028").
+            currency: ISO currency code. Defaults to the source
+                invoice's currency when ``applies_to_invoice_id``
+                is given, else the owner's currency, else the
+                book's default.
+            term: Billterm name. Rarely used for credit notes but
+                accepted for symmetry.
+            credit_note_id: Custom ID. If omitted, auto-generates
+                from ``counter_invoice`` (customer) or
+                ``counter_bill`` (vendor) — GnuCash desktop shares
+                the invoice/bill counter with credit notes rather
+                than maintaining a separate sequence.
+
+        Returns:
+            Dict with ``guid``, ``id``, ``customer_id`` /
+            ``vendor_id``, ``date_opened``, ``status='created'``,
+            ``is_credit_note=True``, and ``applies_to={id, type}``
+            when linked.
+
+        Raises:
+            ValueError: If owner_type is invalid or 'employee'; if
+                applies_to_invoice_id is given but the source
+                doesn't exist, belongs to a different owner, or
+                has a currency that conflicts with an explicit
+                ``currency`` argument.
+        """
+        int_owner_type = self._parse_owner_type(owner_type)
+        if int_owner_type == 5:
+            raise ValueError(
+                "Credit notes are not supported for employees. "
+                "GnuCash desktop has no UI for employee credit "
+                "notes; supporting them at the MCP layer would "
+                "create documents desktop users can't view or "
+                "edit. Use unpost_invoice + edit on the original "
+                "voucher to amend an employee reimbursement."
+            )
+        if int_owner_type not in (2, 4):
+            # Defensive — _parse_owner_type would only return 2,
+            # 4, or 5; this guards against a future addition.
+            raise ValueError(
+                f"Credit notes require owner_type 'customer' or "
+                f"'vendor', got {owner_type!r}."
+            )
+
+        # Always set the credit-note flag.
+        extra_slots: dict = {self._CREDIT_NOTE_SLOT_KEY: 1}
+        applies_to_dict: dict | None = None
+
+        # Validate + capture data from the source invoice if linked.
+        # This is a read-only lookup so it doesn't conflict with
+        # the create path's separate write session.
+        if applies_to_invoice_id:
+            with self.open(readonly=True) as book:
+                source = self._find_invoice(
+                    book, applies_to_invoice_id,
+                    owner_type=int_owner_type,
+                )
+                if not source:
+                    raise ValueError(
+                        f"Source "
+                        f"{self._doc_label_for(int_owner_type).lower()} "
+                        f"not found: {applies_to_invoice_id}"
+                    )
+                # Cross-owner check — credit note for customer A
+                # cannot apply to customer B's invoice.
+                source_owner = self._find_invoice_owner_by_guid(
+                    book, source.owner_type, source.owner_guid,
+                )
+                if source_owner is None:
+                    raise ValueError(
+                        f"Source {applies_to_invoice_id} has a "
+                        f"dangling owner reference — can't verify "
+                        f"it belongs to {owner_id}."
+                    )
+                if source_owner.id != owner_id:
+                    raise ValueError(
+                        f"Source "
+                        f"{self._doc_label_for(int_owner_type).lower()} "
+                        f"{applies_to_invoice_id} belongs to "
+                        f"{source_owner.id!r}, not {owner_id!r}. "
+                        f"Credit notes must apply to a document "
+                        f"from the same customer/vendor."
+                    )
+                source_currency_mnemonic = (
+                    source.currency.mnemonic
+                    if source.currency else None
+                )
+                source_guid = source.guid
+
+            # Currency rules:
+            #  - If caller passed currency, it must match source's.
+            #  - If caller omitted currency, inherit source's.
+            if currency and source_currency_mnemonic and currency != source_currency_mnemonic:
+                raise ValueError(
+                    f"Credit note currency {currency!r} doesn't "
+                    f"match source {applies_to_invoice_id}'s "
+                    f"currency {source_currency_mnemonic!r}. "
+                    f"Netting a credit against an invoice in a "
+                    f"different currency would create an FX "
+                    f"adjustment GnuCash doesn't track here."
+                )
+            if currency is None and source_currency_mnemonic:
+                currency = source_currency_mnemonic
+
+            extra_slots[self._APPLIES_TO_SLOT_KEY] = source_guid
+            applies_to_dict = {
+                "id": applies_to_invoice_id,
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    int_owner_type, "invoice",
+                ),
+            }
+
+        result = self._create_business_document(
+            owner_type=int_owner_type,
+            owner_id=owner_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=credit_note_id,
+            extra_slots=extra_slots,
+        )
+
+        # Augment the standard response with credit-note keys.
+        # The owner_id key from _create_business_document is
+        # ``customer_id`` (for owner_type=2) or ``vendor_id``
+        # (for owner_type=4) per _BUSINESS_DOC_CONFIG; we keep it.
+        result["is_credit_note"] = True
+        if applies_to_dict:
+            result["applies_to"] = applies_to_dict
+        return result
+
+    def add_credit_note_entry(
+        self,
+        credit_note_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Add a line item to a credit note.
+
+        Mirrors ``add_invoice_entry`` / ``add_bill_entry`` but
+        validates the target IS a credit note before delegating
+        to ``_add_entry``. The flag is the gate; a regular invoice
+        with the same ID gets a clear "not a credit note" error
+        naming the right tool to use instead.
+
+        The underlying entry shape is identical to a non-credit
+        document of the same owner_type: customer credit notes
+        accept INCOME accounts (the reversal reduces revenue);
+        vendor credit notes accept EXPENSE/ASSET (the reversal
+        reduces the recognized expense / capitalized inventory).
+
+        Args:
+            credit_note_id: Credit note ID (e.g., '000032').
+            account: Account path. INCOME for customer credit
+                notes, EXPENSE or ASSET for vendor credit notes.
+            description: Line item description.
+            quantity: Quantity as decimal string.
+            price: Unit price as decimal string. Positive even on
+                a credit note — the credit-note flag inverts the
+                posting direction at post time, so the entry
+                shape stays the same as a normal document.
+            owner_type: Optional 'customer' or 'vendor'. Required
+                only when the credit_note_id collides across owner
+                types (rare). Auto-detect otherwise.
+
+        Returns:
+            Dict with ``guid``, ``credit_note_id``, ``description``,
+            ``quantity``, ``price``, ``total``, ``status='created'``.
+
+        Raises:
+            ValueError: If the credit note isn't found, isn't a
+                credit note, account type is wrong for the owner
+                type, or the credit note is already posted.
+        """
+        with self.open(readonly=True) as book:
+            inv = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            resolved_owner_type = inv.owner_type
+
+        # Delegate to _add_entry with the resolved owner_type.
+        # The helper's allowed-account-type validation is the same
+        # for credit notes as for the corresponding regular
+        # document (the entry shape is identical; only the post-
+        # time direction differs).
+        result = self._add_entry(
+            owner_type=resolved_owner_type,
+            doc_id=credit_note_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+        )
+        # Surface the credit_note_id key in the response (the
+        # base helper returns invoice_id / bill_id based on
+        # owner_type config; we re-key for credit-note clarity).
+        legacy_key = (
+            "invoice_id" if resolved_owner_type == 2 else "bill_id"
+        )
+        if legacy_key in result:
+            result["credit_note_id"] = result.pop(legacy_key)
+        return result
+
+    def delete_credit_note(
+        self,
+        credit_note_id: str,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Delete an unposted credit note.
+
+        Mirrors ``delete_invoice`` / ``delete_bill`` but validates
+        the target IS a credit note before delegating to
+        ``_delete_invoice_or_bill``. Posted credit notes cannot be
+        deleted — unpost first via ``unpost_invoice``, then delete.
+
+        Args:
+            credit_note_id: Credit note ID.
+            owner_type: Optional disambiguator when the ID collides
+                across customer/vendor sides.
+
+        Returns:
+            Dict with ``id``, ``guid``, ``entries_deleted``,
+            ``type='credit_note'``, ``status='deleted'``.
+
+        Raises:
+            ValueError: If not found, not a credit note, or
+                posted.
+        """
+        with self.open(readonly=True) as book:
+            inv = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            resolved_owner_type = inv.owner_type
+
+        result = self._delete_invoice_or_bill(
+            credit_note_id, owner_type=resolved_owner_type,
+        )
+        # Re-key the response: base returns ``type`` of
+        # ``invoice``/``bill``; for a credit note the truth is
+        # ``credit_note`` (the slot was the differentiator).
+        result["type"] = "credit_note"
+        return result
 
     # owner_type → per-document config table for ``_add_entry``.
     # Same dispatch idiom as ``_BUSINESS_DOC_CONFIG`` for create —
@@ -2905,8 +3287,18 @@ class BusinessMixin:
             )
             owner_name = owner.name if owner else None
 
+            # Resolve applies_to for credit notes — the source
+            # link is stored as a GUID slot; we render it as the
+            # human-readable ``{id, type}`` pair. ``_invoice_to_dict``
+            # only emits the ``applies_to`` key when the credit-note
+            # flag is also set, so normal invoices/bills get the
+            # same shape they did pre-v1.3.
+            applies_to = self._resolve_applies_to(book, inv)
             result = self._invoice_to_dict(
-                inv, entries=entries, owner_name=owner_name,
+                inv,
+                entries=entries,
+                owner_name=owner_name,
+                applies_to=applies_to,
             )
             result["total"] = str(total)
             return result
