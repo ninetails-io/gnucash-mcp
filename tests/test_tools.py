@@ -21,12 +21,15 @@ def _load_all_extracted_tool_modules():
     we force-load all modules and bind each registered tool's underlying
     function back onto the server module namespace.
 
-    Teardown removes the tools we added from the FastMCP registry so
-    later test modules (notably test_modules.py) see a clean state where
-    extracted tools are absent at import — preserving the lazy-loading
-    assertions.
+    Teardown removes the tools we added from the FastMCP registry AND
+    resets ``_loaded_tool_files`` so later test modules (notably
+    test_modules.py) see a clean state where extracted tools are absent
+    at import — preserving the lazy-loading assertions. Without the
+    lazy-load reset, subsequent ``_apply_module_filter`` calls in other
+    test modules would become no-ops while the registry sits empty.
     """
     pre_tools = dict(server_module.mcp._tool_manager._tools)
+    server_module._reset_lazy_load_state()
     server_module._apply_module_filter("all")
     for name, tool in server_module.mcp._tool_manager._tools.items():
         if not hasattr(server_module, name):
@@ -37,6 +40,7 @@ def _load_all_extracted_tool_modules():
     added = set(server_module.mcp._tool_manager._tools.keys()) - set(pre_tools.keys())
     for name in added:
         del server_module.mcp._tool_manager._tools[name]
+    server_module._reset_lazy_load_state()
 
 
 @pytest.fixture
