@@ -225,77 +225,6 @@ class ReportingMixin:
 
     # ── SQL-filtered split iterator ───────────────────────────────────
 
-    def _query_filtered_splits(
-        self,
-        book: piecash.Book,
-        *,
-        start_date: date | None = None,
-        end_date: date | None = None,
-        account_types: frozenset[str] | set[str] | None = None,
-        account_guids: frozenset[str] | set[str] | None = None,
-        order_by_post_date: bool = False,
-    ):
-        """Build an indexed SQL query over ``(Split, Transaction, Account)``
-        rows matching the given filters.
-
-        Every filter maps to an indexable WHERE clause against the
-        SQLite backing store — one query returns exactly the rows the
-        caller needs, replacing the Python-side
-        ``for txn in book.transactions: if date_match`` pattern that
-        used to touch every row in the book regardless of relevance.
-
-        The query yields ORM objects (not raw num/denom pairs) so
-        callers can aggregate ``split.quantity`` / ``split.value`` as
-        exact ``Decimal`` values in Python. Aggregating in SQL via
-        ``SUM(num * 1.0 / denom)`` would collapse to IEEE-754 floats,
-        which is unacceptable for financial arithmetic.
-
-        Null ``post_date`` rows (an old-book artifact) are excluded so
-        they don't show up in date-ranged reports.
-
-        Args:
-            book: An open piecash session.
-            start_date: Include only transactions with
-                ``post_date >= start_date``. ``None`` disables the
-                lower bound.
-            end_date: Include only transactions with
-                ``post_date <= end_date``. ``None`` disables the upper
-                bound.
-            account_types: Restrict to accounts whose
-                ``type in account_types`` (e.g., ``_ASSET_TYPES``).
-                ``None`` disables the filter.
-            account_guids: Restrict to accounts whose ``guid`` is in
-                the given set. Used by ``cash_flow`` when filtering to
-                a single named account.
-            order_by_post_date: When ``True``, rows come back sorted
-                ascending by ``post_date``. Required for the
-                cumulative-sum trick used by the ``net_worth``
-                time-series.
-
-        Returns:
-            A SQLAlchemy ``Query`` object the caller can iterate.
-        """
-        from piecash.core.account import Account
-        from piecash.core.transaction import Split, Transaction
-
-        q = (
-            book.session.query(Split, Transaction, Account)
-            .join(Transaction, Split.transaction_guid == Transaction.guid)
-            .join(Account, Split.account_guid == Account.guid)
-            .filter(Transaction.post_date.isnot(None))
-        )
-        if start_date is not None:
-            q = q.filter(Transaction.post_date >= start_date)
-        if end_date is not None:
-            q = q.filter(Transaction.post_date <= end_date)
-        if account_types is not None:
-            q = q.filter(Account.type.in_(list(account_types)))
-        if account_guids is not None:
-            q = q.filter(Account.guid.in_(list(account_guids)))
-        if order_by_post_date:
-            q = q.order_by(Transaction.post_date)
-        return q
-
     # ── Period breakdowns ─────────────────────────────────────────────
 
     def spending_by_category(
@@ -833,12 +762,14 @@ class ReportingMixin:
         while any(d["balance"] > 0 for d in working) and month < max_months:
             month += 1
 
-            # Step 1: Apply monthly interest to each balance
+            # Step 1: Apply monthly interest to each balance. Rate is
+            # pre-computed per debt in ``debt_payoff_plan`` (apr/100/12);
+            # this loop runs up to 1200 × N times and recomputing the
+            # division each iteration was pure waste.
             for d in working:
                 if d["balance"] <= 0:
                     continue
-                monthly_rate = d["apr"] / Decimal("100") / Decimal("12")
-                interest = (d["balance"] * monthly_rate).quantize(Decimal("0.01"))
+                interest = (d["balance"] * d["monthly_rate"]).quantize(Decimal("0.01"))
                 d["balance"] += interest
                 d["interest_paid"] += interest
 
@@ -949,11 +880,21 @@ class ReportingMixin:
                 if account.type not in debt_types:
                     continue
 
+                # Materialize ``account.slots`` into a dict once. Pre-fix,
+                # each ``account[key]`` access (apr, minimum_payment,
+                # credit_limit — three per account) went through piecash's
+                # slot-helper path, hitting the slots collection
+                # independently per key. One iteration + three dict gets
+                # is cheaper.
+                slot_by_name = {s.name: s for s in account.slots}
+
+                apr_val = slot_by_name.get("apr")
+                if apr_val is None:
+                    continue
                 try:
-                    apr_val = account["apr"]
                     apr_str = str(apr_val.value) if hasattr(apr_val, "value") else str(apr_val)
                     apr = Decimal(apr_str)
-                except (KeyError, InvalidOperation):
+                except InvalidOperation:
                     continue
 
                 if apr <= 0:
@@ -973,12 +914,13 @@ class ReportingMixin:
                 # 1. Check minimum_payment slot (user override).
                 #    Wins for both CREDIT and LIABILITY — the user has
                 #    declared the contractual amount.
-                try:
-                    mp_val = account["minimum_payment"]
-                    mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
-                    min_payment = Decimal(mp_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                mp_val = slot_by_name.get("minimum_payment")
+                if mp_val is not None:
+                    try:
+                        mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
+                        min_payment = Decimal(mp_str)
+                    except InvalidOperation:
+                        pass
 
                 # 2. Type-aware fallback. Credit cards and amortizing
                 #    loans have very different minimum-payment shapes:
@@ -1022,17 +964,23 @@ class ReportingMixin:
                             min_payment = balance
 
                 credit_limit = None
-                try:
-                    cl_val = account["credit_limit"]
-                    cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
-                    credit_limit = Decimal(cl_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                cl_val = slot_by_name.get("credit_limit")
+                if cl_val is not None:
+                    try:
+                        cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
+                        credit_limit = Decimal(cl_str)
+                    except InvalidOperation:
+                        pass
 
                 debts.append({
                     "name": account.fullname,
                     "balance": balance,
                     "apr": apr,
+                    # Pre-compute monthly rate once per debt. _run_avalanche's
+                    # inner loop iterates up to 1200 months, and pre-fix
+                    # recomputed apr/100/12 every iteration for every debt
+                    # that still had a balance.
+                    "monthly_rate": apr / Decimal("100") / Decimal("12"),
                     "min_payment": min_payment,
                     "credit_limit": credit_limit,
                 })

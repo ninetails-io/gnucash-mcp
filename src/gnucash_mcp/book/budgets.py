@@ -798,28 +798,33 @@ class BudgetsMixin:
             # of which ``--modules`` are enabled.
             factors = self._account_conversion_factors(book)
 
-            # Calculate actuals from transactions
+            # Calculate actuals from transactions. Date filter pushed
+            # to SQL via _query_filtered_splits — pre-fix the inner
+            # Python loop touched every transaction in the book before
+            # gating on the date range. The rollup-membership check
+            # and the EXPENSE/INCOME sign discipline stay in Python
+            # (the rollup map is per-budget, not expressible as a
+            # plain WHERE clause).
             actuals: dict[str, Decimal] = {}
-            for transaction in book.transactions:
-                if not (first_start <= transaction.post_date <= last_end):
+            rows = self._query_filtered_splits(
+                book, start_date=first_start, end_date=last_end,
+            )
+            for split, _txn, account in rows:
+                rollup_target = rollup_map.get(account.fullname)
+                if rollup_target is None:
                     continue
-                for split in transaction.splits:
-                    acct_name = split.account.fullname
-                    rollup_target = rollup_map.get(acct_name)
-                    if rollup_target is None:
-                        continue
-                    amount = self._split_in_default_currency(
-                        split, split.account,
-                        factors.get(split.account.guid),
-                    )
-                    if split.account.type == "EXPENSE" and amount > 0:
-                        actuals[rollup_target] = actuals.get(
-                            rollup_target, Decimal("0")
-                        ) + amount
-                    elif split.account.type == "INCOME" and amount < 0:
-                        actuals[rollup_target] = actuals.get(
-                            rollup_target, Decimal("0")
-                        ) + (-amount)
+                amount = self._split_in_default_currency(
+                    split, account,
+                    factors.get(account.guid),
+                )
+                if account.type == "EXPENSE" and amount > 0:
+                    actuals[rollup_target] = actuals.get(
+                        rollup_target, Decimal("0")
+                    ) + amount
+                elif account.type == "INCOME" and amount < 0:
+                    actuals[rollup_target] = actuals.get(
+                        rollup_target, Decimal("0")
+                    ) + (-amount)
 
             accounts_result = []
             total_budgeted = Decimal("0")

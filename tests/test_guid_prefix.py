@@ -409,3 +409,58 @@ class TestResolveGuidValidation:
             book._resolve_guid("transactions", "xyz_not_hex")
         with pytest.raises(ValueError, match="Invalid table"):
             book._resolve_guid("bogus_table", "deadbeef00")
+
+
+class TestTransactionPrefixMapCache:
+    """The mtime-gated cache for the full-table transaction prefix map.
+
+    Multiple read paths (``list_transactions``, ``search_transactions``,
+    duplicate detection) build the same prefix map every call. The
+    cache on ``BaseGnuCashBook`` keys on ``book_path.stat().st_mtime_ns``
+    so repeated reads against an unchanged book skip the rebuild; any
+    write bumps mtime and forces a fresh map.
+    """
+
+    def test_cache_hit_returns_same_object(self, test_book: Path):
+        """Two reads with no intervening write return the identical
+        cached dict (not just equal — same object)."""
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            first = gc_book._transaction_prefix_map(book)
+            second = gc_book._transaction_prefix_map(book)
+        assert first is second
+
+    def test_cache_invalidates_on_book_mutation(self, test_book: Path):
+        """A write bumps the file's mtime; the next request rebuilds."""
+        import time
+        gc_book = GnuCashBook(str(test_book))
+        with gc_book.open(readonly=True) as book:
+            first = gc_book._transaction_prefix_map(book)
+            first_count = len(first)
+
+        # Sleep just long enough to guarantee a different mtime_ns
+        # even on filesystems with coarser-than-nanosecond resolution.
+        time.sleep(0.01)
+
+        # Add a transaction — SQLite touches the file on commit.
+        gc_book.create_transaction(
+            description="cache-invalidation-test",
+            splits=[
+                {"account": "Assets:Checking", "amount": "1.00"},
+                {"account": "Expenses:Groceries", "amount": "-1.00"},
+            ],
+            trans_date=__import__("datetime").date(2024, 2, 1),
+            check_duplicates=False,
+        )
+
+        with gc_book.open(readonly=True) as book:
+            second = gc_book._transaction_prefix_map(book)
+        assert second is not first, "Cache should have rebuilt after write"
+        assert len(second) == first_count + 1, (
+            "Rebuilt map should reflect the new transaction"
+        )
+
+    def test_cache_initially_empty(self, test_book: Path):
+        """Fresh ``GnuCashBook`` has no cached prefix map."""
+        gc_book = GnuCashBook(str(test_book))
+        assert gc_book._txn_prefix_cache is None
