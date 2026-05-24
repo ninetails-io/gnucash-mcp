@@ -672,6 +672,204 @@ class TestDeleteJob:
             gb.delete_job(job_id="999999")
 
 
+class TestInvoiceJobLinkage:
+    """Tests for the job_id parameter on create_invoice /
+    create_bill, plus the cascading effects on _invoice_to_dict
+    (type field computation, job field surfacing) and
+    list_invoices (job_id filter).
+    """
+
+    def test_create_invoice_with_job_id(self, business_book):
+        """Invoice attached to a job: owner_type=3 internally,
+        but the response surface still reports type='invoice'
+        (semantic) and adds job: {id, name}."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="API Rewrite",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001",
+            job_id=job["id"],
+        )
+        # get_invoice surfaces both the semantic type and the
+        # job link.
+        fetched = gb.get_invoice(
+            inv["id"], owner_type=None,
+        )
+        # owner_type=3 internally; type stays 'invoice' from the
+        # semantic resolution through the job's underlying owner.
+        assert fetched["type"] == "invoice"
+        assert fetched["owner_name"] == "Acme Co"
+        assert fetched["job"] == {
+            "id": job["id"], "name": "API Rewrite",
+        }
+
+    def test_create_bill_with_job_id(self, business_book):
+        """Symmetric for vendor side: bill attached to a vendor
+        job. type='bill' resolved through the job."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        job = gb.create_job(
+            owner_id="000001", owner_type="vendor",
+            name="Q3 supply contract",
+        )
+        bill = gb.create_bill(
+            vendor_id="000001",
+            job_id=job["id"],
+        )
+        fetched = gb.get_invoice(bill["id"])
+        assert fetched["type"] == "bill"
+        assert fetched["owner_name"] == "Office Depot"
+        assert fetched["job"]["id"] == job["id"]
+
+    def test_job_id_cross_customer_rejected(self, business_book):
+        """Job belonging to customer A cannot be used on an
+        invoice for customer B."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        # Acme is 000001; Beta is 000002.
+        acme_job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        with pytest.raises(
+            ValueError, match="belongs to.*not",
+        ):
+            gb.create_invoice(
+                customer_id="000002",
+                job_id=acme_job["id"],
+            )
+
+    def test_customer_invoice_with_vendor_job_rejected(
+        self, business_book,
+    ):
+        """A customer invoice can't link to a vendor job and
+        vice-versa — owner_type must match."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_vendor(name="Office Depot")
+        # Vendor job
+        v_job = gb.create_job(
+            owner_id="000001", owner_type="vendor", name="X",
+        )
+        with pytest.raises(
+            ValueError, match="is a vendor job; this is a customer",
+        ):
+            gb.create_invoice(
+                customer_id="000001",
+                job_id=v_job["id"],
+            )
+
+    def test_job_id_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        with pytest.raises(ValueError, match="Job not found"):
+            gb.create_invoice(
+                customer_id="000001",
+                job_id="999999",
+            )
+
+    def test_normal_invoice_omits_job_key(self, business_book):
+        """Invoices NOT attached to a job omit the 'job' field
+        entirely — same shape as pre-v1.3 for non-job docs."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")  # no job
+        fetched = gb.get_invoice("000001")
+        assert "job" not in fetched
+
+    def test_list_invoices_filtered_by_job(self, business_book):
+        """list_invoices(job_id=...) returns only invoices linked
+        to that job."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job_a = gb.create_job(
+            owner_id="000001", owner_type="customer", name="A",
+        )
+        job_b = gb.create_job(
+            owner_id="000001", owner_type="customer", name="B",
+        )
+        # 2 invoices on job A, 1 on job B, 1 standalone
+        gb.create_invoice(customer_id="000001", job_id=job_a["id"])
+        gb.create_invoice(customer_id="000001", job_id=job_a["id"])
+        gb.create_invoice(customer_id="000001", job_id=job_b["id"])
+        gb.create_invoice(customer_id="000001")  # standalone
+
+        result_a = gb.list_invoices(
+            job_id=job_a["id"], compact=False,
+        )
+        # ``invoices`` is the envelope key set by list_invoices
+        assert len(result_a["invoices"]) == 2
+        result_b = gb.list_invoices(
+            job_id=job_b["id"], compact=False,
+        )
+        assert len(result_b["invoices"]) == 1
+        # All invoices (no job filter) shows all 4
+        result_all = gb.list_invoices(compact=False)
+        assert len(result_all["invoices"]) == 4
+
+    def test_list_invoices_job_id_with_mismatched_owner_type(
+        self, business_book,
+    ):
+        """If caller passes both job_id and owner_type, they
+        must agree — vendor-job + owner_type=customer rejected."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        v_job = gb.create_job(
+            owner_id="000001", owner_type="vendor", name="X",
+        )
+        with pytest.raises(
+            ValueError, match="vendor job.*doesn't match",
+        ):
+            gb.list_invoices(
+                job_id=v_job["id"],
+                owner_type="customer",
+            )
+
+    def test_get_job_includes_linked_invoices(self, business_book):
+        """After Commit-1 returned count=0 / ids=[] for empty
+        jobs, Commit-2 actually links invoices — verify
+        get_job's linked_invoices list now populates."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        gb.create_invoice(customer_id="000001", job_id=job["id"])
+        gb.create_invoice(customer_id="000001", job_id=job["id"])
+        result = gb.get_job(job_id=job["id"])
+        assert result["linked_invoices"]["count"] == 2
+        assert len(result["linked_invoices"]["ids"]) == 2
+
+    def test_voucher_with_job_id_rejected(self, business_book):
+        """Vouchers can't be grouped under jobs — piecash's
+        job model is customer/vendor only. Surfaces at the
+        _create_business_document level when job_id is set
+        alongside owner_type=5."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_employee(name="Maria")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        with pytest.raises(
+            ValueError, match="Employee vouchers cannot be grouped",
+        ):
+            # We call _create_business_document directly because
+            # create_voucher doesn't have a job_id parameter at
+            # the public surface — verifies the inner guard
+            # catches anyone who reaches the helper via a
+            # future path.
+            gb._create_business_document(
+                owner_type=5,
+                owner_id="000001",
+                doc_id=None,
+                job_id=job["id"],
+            )
+
+
 class TestUpdateCustomer:
     """Tests for ``update_customer``.
 

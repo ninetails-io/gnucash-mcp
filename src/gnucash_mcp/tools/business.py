@@ -355,6 +355,7 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         term: str | None = None,
         invoice_id: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         """Create a customer invoice.
 
@@ -368,12 +369,18 @@ def register(mcp, get_book) -> None:
             term: Billterm name (e.g., "Net 30"). Optional.
             invoice_id: Custom invoice number (e.g., "INV-2026-001"). If omitted,
                 auto-generates from the book's invoice counter.
+            job_id: Optional Job ID. When set, groups the invoice
+                under the named job. The job must belong to the
+                same customer and be a customer-job (created
+                with owner_type='customer'). Use ``create_job``
+                first to define the job, then attach invoices
+                to it via this parameter.
         """
         book = get_book()
         result = book.create_invoice(
             customer_id=customer_id, date_opened=date_opened,
             notes=notes, currency=currency, term=term,
-            invoice_id=invoice_id,
+            invoice_id=invoice_id, job_id=job_id,
         )
         return _json(result)
 
@@ -387,6 +394,7 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         term: str | None = None,
         bill_id: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         """Create a vendor bill.
 
@@ -400,12 +408,15 @@ def register(mcp, get_book) -> None:
             term: Billterm name (e.g., "Net 30"). Optional.
             bill_id: Custom bill number (e.g., "BILL-2026-001"). If omitted,
                 auto-generates from the book's bill counter.
+            job_id: Optional Job ID. When set, groups the bill
+                under the named job. The job must belong to the
+                same vendor and be a vendor-job.
         """
         book = get_book()
         result = book.create_bill(
             vendor_id=vendor_id, date_opened=date_opened,
             notes=notes, currency=currency, term=term,
-            bill_id=bill_id,
+            bill_id=bill_id, job_id=job_id,
         )
         return _json(result)
 
@@ -740,6 +751,7 @@ def register(mcp, get_book) -> None:
         status: str | None = None,
         verbose: bool = False,
         limit: int = 50,
+        job_id: str | None = None,
     ) -> str:
         """List invoices and/or vendor bills.
 
@@ -754,6 +766,9 @@ def register(mcp, get_book) -> None:
             limit: Maximum invoices to return. Defaults to 50, capped
                    at 250. Compact output appends a truncation notice
                    when results are clipped.
+            job_id: Filter to invoices grouped under a specific
+                job — useful for the "what's part of this
+                engagement?" listing pattern.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -762,6 +777,7 @@ def register(mcp, get_book) -> None:
             status=status,
             compact=not verbose,
             limit=limit,
+            job_id=job_id,
         )
         if verbose:
             return json.dumps(result, indent=2)
