@@ -228,7 +228,7 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 87 tools."""
+        """--modules=all should keep all 91 tools (88 +3 vouchers)."""
         _apply_module_filter("all")
         assert len(self._tool_names()) == 91
 
@@ -265,7 +265,7 @@ class TestApplyModuleFilter:
         assert len(self._tool_names()) == 91
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 87 tools."""
+        """'all' mixed with other modules should keep all 91 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
         assert len(self._tool_names()) == 91
 
@@ -555,3 +555,35 @@ class TestOwnerTypeGating:
         _LOADED_MODULES.update({"core", "freelancer"})
         with pytest.raises(ValueError, match="requires the Business module"):
             _gate_owner_type("vendor")
+
+    def test_business_absent_rejects_explicit_employee(self):
+        """Symmetric with the vendor rejection — employee gating
+        was added with vouchers (v1.3) and needs the same
+        guardrail. Without business, owner_type='employee' raises
+        with the Business-module-required message. (Copilot PR
+        #86 review found this coverage gap.)"""
+        import pytest
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        with pytest.raises(ValueError, match="requires the Business module"):
+            _gate_owner_type("employee")
+
+    def test_business_absent_rejects_typo(self):
+        """Without business, a typo like 'venddor' must fail fast
+        — pre-fix the gate silently coerced unknown strings to
+        'customer', masking the typo behind a confusing "invoice
+        not found" downstream error. The gate now rejects anything
+        outside {None, 'customer'} (or the two business-gated
+        names which raise their own messages). (Copilot PR #86
+        review.)"""
+        import pytest
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            _gate_owner_type("venddor")

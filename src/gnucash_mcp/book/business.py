@@ -2036,6 +2036,25 @@ class BusinessMixin:
         """
         return owner_type in (4, 5)
 
+    # Human-readable document label for use in error messages,
+    # status returns, and audit log entries. Title-case canonical
+    # form. Three-way (Invoice / Bill / Voucher) replaces the
+    # legacy binary ``"Bill" if is_bill else "Invoice"`` which
+    # mislabeled vouchers as bills. (Copilot PR #86 review.)
+    _OWNER_TYPE_TO_DOC_LABEL = {2: "Invoice", 4: "Bill", 5: "Voucher"}
+
+    @staticmethod
+    def _doc_label_for(owner_type: int | None) -> str:
+        """Title-case label naming the document type — used in
+        error messages and status strings. ``None`` falls back to
+        the generic ``"Document"`` since we don't know what kind
+        the caller meant; the three known types map cleanly."""
+        if owner_type is None:
+            return "Document"
+        return BusinessMixin._OWNER_TYPE_TO_DOC_LABEL.get(
+            owner_type, "Document"
+        )
+
     def _create_business_document(
         self,
         *,
@@ -2721,7 +2740,7 @@ class BusinessMixin:
         with self.open() as book:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
-                raise ValueError(f"Invoice/bill not found: {invoice_id}")
+                raise ValueError(f"Document not found: {invoice_id}")
 
             is_bill = self._is_bill_side(inv.owner_type)
 
@@ -2846,7 +2865,7 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             # Truthy check rather than ``is not None``: piecash's
@@ -2865,7 +2884,8 @@ class BusinessMixin:
             # check in ``_invoice_dependency_check``.
             if _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is already posted"
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is already posted"
                 )
 
             is_bill = self._is_bill_side(inv.owner_type)
@@ -3073,16 +3093,20 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             if not _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is not posted"
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is not posted"
                 )
 
             is_bill = self._is_bill_side(inv.owner_type)
-            doc_label = "Bill" if is_bill else "Invoice"
+            # Three-way label dispatch — was a binary "Bill if
+            # is_bill else Invoice" that mislabeled vouchers as
+            # bills (Copilot PR #86 review).
+            doc_label = self._doc_label_for(inv.owner_type)
 
             # Capture before-state for the audit log: the user wants
             # to see what they unposted ("was posted: 2026-04-01,
@@ -3243,12 +3267,13 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             if not _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is not posted — "
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is not posted — "
                     f"post it before recording payment"
                 )
 
