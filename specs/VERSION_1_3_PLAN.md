@@ -77,6 +77,41 @@ perf item. Vouchers and the rest land in `Business` directly; the
 indexed `book.prices` perf item lands in `Portfolio` directly. Doing
 the restructure first avoids two rounds of code moves.
 
+**Open question — shared-operation tool placement.** Several
+business tools dispatch on `owner_type` to handle both customer
+invoices AND vendor bills from a single entry point:
+`post_invoice`, `unpost_invoice`, `pay_invoice`, `list_invoices`,
+`get_invoice`. Steve's partition lists them in `Freelancer`, but
+they also operate on bills (owner_type='vendor') — so a user with
+only `--modules=Core,Freelancer` could call `pay_invoice` against
+a bill if one exists in the book. The original plan flagged this
+as "the wrinkle" and noted "a naive entity-based split duplicates
+these or requires a shared third module." Four resolutions
+worth considering:
+
+1. **Place in Freelancer, accept the cross-module reach.** Tools
+   work for both invoices and bills regardless of which module a
+   given entity lives in. Side effect: Freelancer-only users can
+   touch bills if they exist (created via import, prior session,
+   etc.). Pragmatic; matches the partition as drafted.
+2. **Place in Freelancer with runtime owner_type gating.** Reject
+   `pay_invoice(owner_type='vendor')` when Business isn't loaded.
+   Awkward — couples runtime behavior to module loading; the same
+   tool call works or doesn't depending on `--modules`.
+3. **Duplicate as `pay_invoice` (Freelancer, customer-only) +
+   `pay_bill` (Business).** Owner_type dispatch becomes per-module.
+   Clean separation; reverses the "shared lifecycle" design that
+   the current single-entry-point shape codifies.
+4. **Promote shared-lifecycle tools to a third module
+   (e.g. `Documents`).** Both Freelancer and Business depend on
+   it. Restores the "shared third module" path the original plan
+   rejected as naive, but might be the right answer if option 1
+   feels too leaky.
+
+Don't decide here. Worth raising before the restructure starts
+because the choice ripples through the partition and the mixin
+layout.
+
 ---
 
 ## Headline features
@@ -219,6 +254,23 @@ already done.
 - `_address_to_dict` deliberately drops `addr_fax` (documented).
   Dict with `fax` round-trips lossily. Either preserve or document
   inbound rejection. `business.py:731`.
+
+**Doc-only TODOs** (no code change, just docstrings):
+
+- `_DEFAULT_TYPES` English-only. Hardcoded to English chart-of-
+  accounts names ("Assets", "Liabilities", …). A book with a
+  Spanish / German / 资产 / 負債 chart gets the redundant
+  `[ASSET]` annotation on every account because the type-suppression
+  dict never matches. Known limitation; no fix planned for v1.3.
+  Needs a one-line docstring note on `_DEFAULT_TYPES` documenting
+  the assumption and pointing toward a future localization pass.
+  `_base.py` around the constant definition.
+- `_strip_noise` convention. Recurses into all dicts and removes
+  empty strings (correct under the project's "absent = empty"
+  convention, but undocumented in the function itself). A future
+  tool returning `{"field": ""}` to mean "cleared" would lose that
+  signal silently. Add a docstring clarifying the convention and
+  the edge case.
 
 **Already done — no action needed** (verified 2026-05-23):
 `_collect_warnings` section numbering, `_format_audit_entry_text`
