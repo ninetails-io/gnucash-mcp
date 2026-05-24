@@ -1525,6 +1525,280 @@ class TestVoucherLifecycle:
         assert gb.get_balance("Assets:Checking") == Decimal("9950.00")
 
 
+class TestCreditNoteSlotHelpers:
+    """Tests for the credit-note slot infrastructure
+    (``_get_is_credit_note`` / ``_set_is_credit_note`` /
+    ``_get_applies_to_invoice_guid`` /
+    ``_set_applies_to_invoice_guid`` / ``_resolve_applies_to``).
+
+    These are the foundation: every higher-level credit-note tool
+    in subsequent commits relies on them. Lock the contract so
+    the abstraction can't drift silently — particularly the
+    "value=1 / absent=false" convention and the dangling-reference
+    handling on resolve.
+    """
+
+    def _new_invoice(self, gb):
+        """Make a customer + invoice quickly. Returns the invoice
+        ORM object inside a fresh writable session — caller owns
+        the ``with gb.open()`` block."""
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+
+    def test_get_is_credit_note_false_for_unflagged(self, business_book):
+        """A freshly-created invoice has no credit-note slot;
+        the helper returns False (not None, not raise)."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is False
+
+    def test_set_and_read_is_credit_note(self, business_book):
+        """Round-trip: set True, save, re-open, read back True."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is True
+
+    def test_set_false_clears_slot(self, business_book):
+        """``_set_is_credit_note(False)`` removes the slot entirely
+        (not stores ``0``). Important: the "absent-means-False"
+        convention is what GnuCash desktop reads — storing 0 would
+        be a non-standard state."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, False)
+            book.save()
+        # Slot should be gone — re-read returns False AND the
+        # underlying access raises KeyError on direct lookup.
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is False
+            with pytest.raises(KeyError):
+                inv[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+
+    def test_set_false_on_unflagged_is_idempotent(self, business_book):
+        """Clearing a slot that was never set must not raise.
+        Defensive — the higher-level ``delete_credit_note`` path
+        could conceivably hit this case after partial state."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            # Should not raise.
+            BusinessMixin._set_is_credit_note(inv, False)
+
+    def test_applies_to_guid_returns_none_when_unset(self, business_book):
+        """A fresh credit note (no link to source) returns None
+        from the GUID accessor, not KeyError."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_applies_to_invoice_guid(inv) is None
+
+    def test_set_and_read_applies_to_guid(self, business_book):
+        """Round-trip: store a 32-char GUID, read back the same
+        string. The namespaced slot key (``gnc-mcp/applies-to-
+        invoice``) uses ``/`` which creates a sub-slot in GnuCash's
+        KVP store — verifying the round-trip confirms the
+        sub-slot path doesn't lose data."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        source_guid = "0" * 32  # Real shape, but invalid as a lookup
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_applies_to_invoice_guid(inv, source_guid)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_applies_to_invoice_guid(inv) == source_guid
+
+    def test_resolve_applies_to_returns_id_and_type(self, business_book):
+        """When the link points at a real invoice, resolve returns
+        the human-readable ``{id, type}`` pair."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Source invoice (the one being credited)
+        source = gb.create_invoice(customer_id="000001")
+        # Credit note (links back to source)
+        credit = gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            cn = book.session.query(Invoice).filter_by(
+                id=credit["id"],
+            ).first()
+            BusinessMixin._set_is_credit_note(cn, True)
+            BusinessMixin._set_applies_to_invoice_guid(cn, source["guid"])
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            cn = book.session.query(Invoice).filter_by(
+                id=credit["id"],
+            ).first()
+            resolved = BusinessMixin._resolve_applies_to(book, cn)
+            assert resolved == {"id": source["id"], "type": "invoice"}
+
+    def test_resolve_applies_to_returns_none_for_dangling_reference(
+        self, business_book,
+    ):
+        """When the linked source GUID doesn't exist (e.g. the
+        source was deleted after the credit note was created),
+        resolve returns None rather than crashing the response.
+        Dangling references shouldn't break ``get_invoice``."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_applies_to_invoice_guid(
+                inv, "deadbeef" * 4,  # 32 chars, won't match any row
+            )
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._resolve_applies_to(book, inv) is None
+
+    def test_resolve_applies_to_returns_none_when_no_link(
+        self, business_book,
+    ):
+        """When the credit-note flag is set but no source link is
+        stored, resolve returns None (a credit note that floats
+        without explicit source is valid — the bookkeeper might
+        attach it via Process Payment netting later)."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._resolve_applies_to(book, inv) is None
+
+
+class TestInvoiceToDictCreditNoteKeys:
+    """The response-shape contract: credit-note keys appear only
+    when the credit-note flag is set on the invoice.
+
+    Normal invoices/bills/vouchers must produce byte-identical
+    output to pre-v1.3 — verified by inspecting the absence of
+    the new keys on unflagged docs. Flagged docs get
+    ``is_credit_note: True``, and ``applies_to: {...}`` when the
+    caller threaded a resolved dict.
+    """
+
+    def test_normal_invoice_omits_credit_note_keys(self, business_book):
+        """Pre-v1.3 contract — a normal invoice produces a dict
+        without ``is_credit_note`` or ``applies_to`` keys."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(inv)
+            assert "is_credit_note" not in result
+            assert "applies_to" not in result
+
+    def test_credit_note_flag_included_when_set(self, business_book):
+        """``is_credit_note: True`` appears when the slot is set."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(inv)
+            assert result["is_credit_note"] is True
+            # applies_to absent when caller didn't pass it.
+            assert "applies_to" not in result
+
+    def test_applies_to_threaded_when_flag_and_kwarg_both_set(
+        self, business_book,
+    ):
+        """When both the credit-note flag AND the caller-resolved
+        applies_to are present, both keys appear in the dict."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        applies_to = {"id": "000028", "type": "invoice"}
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(
+                inv, applies_to=applies_to,
+            )
+            assert result["is_credit_note"] is True
+            assert result["applies_to"] == applies_to
+
+    def test_applies_to_dropped_when_flag_absent(self, business_book):
+        """Defensive — even if a caller mistakenly passes
+        ``applies_to`` for a non-credit-note invoice, the dict
+        shouldn't include it. The credit-note flag is the gate;
+        no flag means no credit-note keys at all."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        applies_to = {"id": "000028", "type": "invoice"}
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(
+                inv, applies_to=applies_to,
+            )
+            assert "is_credit_note" not in result
+            assert "applies_to" not in result
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 

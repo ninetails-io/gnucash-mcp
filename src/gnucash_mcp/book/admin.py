@@ -7,30 +7,22 @@ statement close day, etc. Values are stored as strings.
 
 import re
 
+from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported for callers)
+
 # Slot keys with embedded ``/`` create hierarchical sub-slots in
-# GnuCash's KVP store rather than flat keys. The MCP-facing tools
-# only manage flat keys (``apr``, ``credit_limit``, ``minimum_payment``,
-# etc.), so we restrict input to a safe alphabet up-front. Pre-fix
-# a key like ``credit/limit`` silently created a sub-slot under
-# ``credit`` — invisible to ``get_account_slots`` keyed lookups.
+# GnuCash's KVP store rather than flat keys. The MCP-facing
+# account-slot tools only manage flat keys (``apr``,
+# ``credit_limit``, ``minimum_payment``, etc.), so we restrict
+# user input to a safe alphabet up-front. Pre-fix a key like
+# ``credit/limit`` silently created a sub-slot under ``credit`` —
+# invisible to ``get_account_slots`` keyed lookups.
+#
+# Note: internal slot keys (set by our own book methods, not
+# accepted from users) can and do use ``/`` for namespacing —
+# see the ``gnc-mcp/...`` convention in
+# ``BusinessMixin._APPLIES_TO_SLOT_KEY``. This regex gates
+# USER input only.
 _SLOT_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-
-
-def _slot_value_str(value) -> str:
-    """Stringify a piecash slot value to a stable str.
-
-    piecash returns either a typed wrapper with a ``.value``
-    attribute or the raw value depending on slot type. The
-    single-key path and the all-keys path of ``get_account_slots``
-    used to handle these differently — single-key fell back to
-    ``str(value)`` when ``.value`` was missing, all-keys assumed
-    ``.value`` always present and would AttributeError on the
-    first row that didn't have it. Centralizing the access
-    makes both paths agree.
-    """
-    if hasattr(value, "value"):
-        return str(value.value)
-    return str(value)
 
 
 class AdminMixin:

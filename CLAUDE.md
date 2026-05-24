@@ -193,7 +193,25 @@ existed.
   (`entity.addr_addr1 = "..."`) on update.
 - **Slot ORM conflicts**: polymorphic relationships on the Slot
   table make direct ORM queries fail. Use raw SQL via
-  `sqlalchemy.text()` for slot reads/deletes.
+  `sqlalchemy.text()` for slot reads/deletes. For slot **writes
+  and per-entity reads**, the `entity[key] = value` /
+  `entity[key]` accessors work — piecash handles the polymorphism
+  internally. Use `_slot_value_str(...)` from `book/_base.py` to
+  extract a stable string from typed slot wrappers
+  (`SlotString`, `SlotInt64`, etc.).
+- **Slot key naming convention**: bare keys for universal
+  financial concepts (`apr`, `credit_limit`,
+  `statement_close_day`, `reward_rate`); namespaced
+  `gnc-mcp/<key>` prefix for tool-specific state where collisions
+  with another tool's convention are plausible (e.g.
+  `gnc-mcp/applies-to-invoice` for our credit-note linkage).
+  Test for which side: *could a reasonable developer arrive at
+  this exact key independently?* Yes → bare. No → namespaced.
+  Path-style keys (containing `/`) create hierarchical sub-slots
+  in GnuCash's KVP store; that's what the namespace prefix
+  exploits. The `_SLOT_KEY_RE` validator in `book/admin.py`
+  gates USER input to flat keys only — internal slot keys set
+  by book methods bypass that gate by design.
 - **KVP_Type enum**: `SlotType` TypeDecorator expects `KVP_Type`
   enum values (e.g., `KVP_Type.KVP_TYPE_STRING`), not raw ints.
 - **Detached instances**: ORM object attributes are only accessible

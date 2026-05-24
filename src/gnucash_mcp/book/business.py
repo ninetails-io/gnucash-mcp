@@ -20,6 +20,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _slot_value_str,
     _to_decimal,
     _verify_composite_write,
     _verify_write,
@@ -892,22 +893,37 @@ class BusinessMixin:
         return num, denom
 
     @staticmethod
-    def _invoice_to_dict(invoice, entries=None, owner_name: str | None = None) -> dict:
+    def _invoice_to_dict(
+        invoice,
+        entries=None,
+        owner_name: str | None = None,
+        applies_to: dict | None = None,
+    ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
-        ``owner_type`` (numeric 2/4) was redundant with the
+        ``owner_type`` (numeric 2/4/5) was redundant with the
         human-readable ``type`` field and is dropped. ``is_posted``
         is derivable from ``date_posted`` (non-null = posted) and
         is dropped too. Phase 3C: ``owner_guid`` (raw 32-char hex)
         is dropped in favor of ``owner_name`` resolved by the caller
         — the same readability swap we did for entry account refs.
 
+        Credit-note keys (``is_credit_note``, ``applies_to``) are
+        emitted only when set, so normal invoices/bills/vouchers
+        get the same shape they had before v1.3. ``is_credit_note``
+        is auto-detected from the invoice's slot; ``applies_to``
+        must be resolved by the caller (the static-method shape
+        means we can't query the source invoice here, same
+        constraint as ``owner_name``).
+
         Args:
             invoice: piecash Invoice object.
-            entries: Optional list of entry dicts. If None, entries are not included.
-            owner_name: Resolved customer/vendor name. The static-method
-                shape means we can't query for it here; the caller
-                (``get_invoice``) does the lookup once and threads it.
+            entries: Optional list of entry dicts. If ``None``, entries
+                are not included.
+            owner_name: Resolved customer/vendor/employee name.
+            applies_to: For credit notes only, the ``{id, type}`` dict
+                naming the source invoice. The caller resolves this
+                via ``_resolve_applies_to(book, invoice)``.
         """
         result = {
             "guid": invoice.guid,
@@ -928,6 +944,16 @@ class BusinessMixin:
             "active": bool(invoice.active),
             "currency": invoice.currency.mnemonic if invoice.currency else None,
         }
+        # Credit-note keys conditionally included so the response
+        # shape for normal documents is byte-identical to pre-v1.3.
+        # Both keys present together when the credit-note flag is
+        # set; ``applies_to`` further conditional on whether the
+        # link is set (a credit note that floats without a source
+        # link is unusual but valid).
+        if BusinessMixin._get_is_credit_note(invoice):
+            result["is_credit_note"] = True
+            if applies_to:
+                result["applies_to"] = applies_to
         if entries is not None:
             result["entries"] = entries
         return result
@@ -2054,6 +2080,96 @@ class BusinessMixin:
         return BusinessMixin._OWNER_TYPE_TO_DOC_LABEL.get(
             owner_type, "Document"
         )
+
+    # ── Credit-note slot helpers ─────────────────────────────────
+    #
+    # GnuCash stores the credit-note flag in slots, not as a
+    # column: KVP key ``credit-note``, integer value ``1`` for
+    # credit notes, slot absent for normal documents. The flag
+    # is owner-type-agnostic — a customer invoice or vendor bill
+    # with ``credit-note=1`` is the credit-note form of that
+    # document, with reversed posting direction at post time.
+    #
+    # We add a second slot, ``gnc-mcp/applies-to-invoice``, that
+    # links a credit note back to its source document. GnuCash
+    # desktop doesn't track this linkage — its Process Payment
+    # dialog handles credit-vs-invoice netting through user
+    # selection, not stored references. The ``gnc-mcp/`` prefix
+    # signals this is an MCP-server extension (per our slot
+    # convention: bare keys for universal concepts, namespaced
+    # for tool-specific state). Stored value is the source
+    # invoice's 32-char GUID; displayed as the human-readable
+    # ``{id, type}`` pair via ``_resolve_applies_to``.
+
+    _CREDIT_NOTE_SLOT_KEY = "credit-note"
+    _APPLIES_TO_SLOT_KEY = "gnc-mcp/applies-to-invoice"
+
+    @staticmethod
+    def _get_is_credit_note(invoice) -> bool:
+        """Read the GnuCash ``credit-note`` slot. True iff value=1."""
+        try:
+            raw = invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+        except KeyError:
+            return False
+        return _slot_value_str(raw) == "1"
+
+    @staticmethod
+    def _set_is_credit_note(invoice, value: bool = True) -> None:
+        """Set or clear the GnuCash ``credit-note`` slot.
+
+        Stores integer ``1`` for credit notes (GnuCash convention);
+        clearing removes the slot entirely so the absence-means-False
+        invariant holds for both desktop and MCP readers.
+        """
+        if value:
+            invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1
+        else:
+            try:
+                del invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+            except KeyError:
+                pass
+
+    @staticmethod
+    def _get_applies_to_invoice_guid(invoice) -> str | None:
+        """Read the source-invoice GUID this credit note applies
+        to, if set. Returns None when no source is linked."""
+        try:
+            raw = invoice[BusinessMixin._APPLIES_TO_SLOT_KEY]
+        except KeyError:
+            return None
+        val = _slot_value_str(raw)
+        return val if val else None
+
+    @staticmethod
+    def _set_applies_to_invoice_guid(invoice, source_guid: str) -> None:
+        """Link this credit note to a source invoice by GUID. The
+        stored value is the canonical 32-char hex GUID; display
+        helpers resolve it back to the human-readable ID."""
+        invoice[BusinessMixin._APPLIES_TO_SLOT_KEY] = source_guid
+
+    @staticmethod
+    def _resolve_applies_to(book, invoice) -> dict | None:
+        """Resolve the applies-to slot to a ``{id, type}`` dict
+        suitable for display in tool responses. Returns None when:
+
+        - no source is linked (normal credit note that floats),
+        - the slot points at a GUID that doesn't exist anymore
+          (dangling reference; surface as absent rather than
+          crash the response).
+        """
+        guid = BusinessMixin._get_applies_to_invoice_guid(invoice)
+        if not guid:
+            return None
+        from piecash.business.invoice import Invoice
+        source = book.session.query(Invoice).filter_by(guid=guid).first()
+        if not source:
+            return None
+        return {
+            "id": source.id,
+            "type": BusinessMixin._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                source.owner_type, "invoice"
+            ),
+        }
 
     def _create_business_document(
         self,
