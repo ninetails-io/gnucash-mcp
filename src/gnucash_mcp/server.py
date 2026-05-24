@@ -114,7 +114,13 @@ MODULE_GROUPS: dict[str, list[str]] = {}
 # ---------------------------------------------------------------------------
 MODULE_BACKED_BY: dict[str, set[str]] = {
     "core": {"core", "reconciliation", "reporting", "admin", "backup"},
-    # Other modules unchanged for now — populated as splits land.
+    # ``portfolio`` (prices / commodities) and ``investor`` (tax lots)
+    # are the two halves of what used to be the ``investments`` module.
+    # Both back onto the same InvestmentsMixin / tools/investments.py —
+    # the mixin layer stays unchanged; only the tool-surface partition
+    # splits along the prices/lots axis.
+    "portfolio": {"investments"},
+    "investor": {"investments"},
 }
 
 
@@ -191,19 +197,26 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_scheduled_transaction",
         "delete_scheduled_transaction",
     ],
-    "investments": [
+    # ``investments`` split into ``portfolio`` (the multi-currency
+    # primitive: commodities + prices) and ``investor`` (tax-lot
+    # management). A multi-currency household without a brokerage
+    # picks portfolio without investor; a single-currency investor
+    # picks the inverse.
+    "portfolio": [
         "list_commodities",
         "create_commodity",
         "create_price",
         "get_prices",
         "get_latest_price",
+        "delete_price",
+    ],
+    "investor": [
         "create_lot",
         "list_lots",
         "get_lot",
         "assign_split_to_lot",
         "calculate_lot_gain",
         "close_lot",
-        "delete_price",
     ],
     "business": [
         "create_customer",
@@ -264,12 +277,20 @@ def _validate_tool_modules() -> None:
             f"Add them to the appropriate module."
         )
 
-    # Phantom check is scoped to modules that ship their tools in server.py
-    # (the non-extracted ones). Extracted modules' tools are loaded lazily.
+    # Phantom check is scoped to modules whose backing tool files
+    # aren't extracted (i.e., tools ship at server.py import time
+    # rather than lazy-load). A module's backing files come from
+    # MODULE_BACKED_BY when set, otherwise default 1:1 to the module
+    # name itself. ``portfolio`` and ``investor`` back onto the
+    # extracted ``investments`` file, so their tools are lazy-loaded
+    # despite the module names being new.
     extracted = extracted_modules()
     expected_now = set()
     for mod_name, tools in TOOL_MODULES.items():
-        if mod_name not in extracted:
+        backing = MODULE_BACKED_BY.get(mod_name, {mod_name})
+        if not (backing & extracted):
+            # No backing file is extracted → tools must register at
+            # import time; expect them to be present already.
             expected_now.update(tools)
     phantom = expected_now - registered
     if phantom:

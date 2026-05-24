@@ -33,14 +33,21 @@ class TestToolModulesMapping:
         registered = set(mcp._tool_manager._tools.keys())
         assert registered.issubset(all_mapped)
 
-    def test_every_tool_file_is_known(self):
-        """Every tools/<file>.py corresponds to a key in _MIXIN_MAP via
-        ``extracted_modules()``. Post-restructure, ``extracted_modules()``
-        is a superset of ``TOOL_MODULES.keys()`` — the dissolved
-        ``admin`` and ``backup`` modules still have their tool files
-        (their tools migrated INTO Core, not away from the filesystem).
+    def test_every_tool_module_backs_onto_extracted_files(self):
+        """Every TOOL_MODULES key must back onto extracted-module
+        files. After the restructure the relationship is no longer
+        ``TOOL_MODULES.keys() ⊆ extracted_modules()``: ``portfolio``
+        and ``investor`` are new public modules that don't have
+        their own tool files (they're slices of the legacy
+        ``investments`` file, mapped via MODULE_BACKED_BY).
         """
-        assert extracted_modules() >= set(TOOL_MODULES.keys())
+        for mod_name in TOOL_MODULES:
+            backing = MODULE_BACKED_BY.get(mod_name, {mod_name})
+            assert backing <= extracted_modules(), (
+                f"TOOL_MODULES[{mod_name!r}] backs onto "
+                f"{sorted(backing - extracted_modules())} which "
+                f"aren't extracted modules"
+            )
 
     def test_no_duplicate_tools_across_modules(self):
         """No tool should appear in more than one module."""
@@ -69,7 +76,7 @@ class TestToolModulesMapping:
         tools migrated into Core)."""
         expected = {
             "core", "reconciliation", "reporting", "budgets",
-            "scheduling", "investments", "business",
+            "scheduling", "portfolio", "investor", "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
 
@@ -259,17 +266,32 @@ class TestApplyModuleFilter:
         )
         assert remaining == expected
 
-    def test_investments_module_tools(self):
-        """Investments module should include commodity and lot tools."""
-        _apply_module_filter("investments")
+    def test_portfolio_and_investor_split(self):
+        """``portfolio`` (commodities + prices) and ``investor``
+        (tax lots) used to be one ``investments`` module. After the
+        split they're independently selectable: a multi-currency
+        household without a brokerage picks portfolio alone."""
+        # portfolio alone — price tools yes, lot tools no
+        _apply_module_filter("portfolio")
         remaining = self._tool_names()
         assert "list_commodities" in remaining
+        assert "create_price" in remaining
+        assert "create_lot" not in remaining
+        assert "calculate_lot_gain" not in remaining
+        # Core always loaded
+        assert "list_accounts" in remaining
+        # Non-selected modules not present
+        assert "spending_by_category" not in remaining
+
+        # investor alone — lot tools yes, price tools no
+        _reset_lazy_load_state()
+        mcp._tool_manager._tools.clear()
+        _apply_module_filter("investor")
+        remaining = self._tool_names()
         assert "create_lot" in remaining
         assert "calculate_lot_gain" in remaining
-        # Core should also be present
-        assert "list_accounts" in remaining
-        # Non-selected modules should not be present
-        assert "spending_by_category" not in remaining
+        assert "list_commodities" not in remaining
+        assert "create_price" not in remaining
 
     def test_filter_is_subtractive(self):
         """Filtering should only remove tools, never add non-existent ones."""
