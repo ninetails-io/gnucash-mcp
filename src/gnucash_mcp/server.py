@@ -96,9 +96,33 @@ SAFETY:
 MODULE_GROUPS: dict[str, list[str]] = {}
 
 
+# ---------------------------------------------------------------------------
+# MODULE_BACKED_BY — per public-module, the set of legacy tool-file /
+# mixin names needed to back its tools.
+#
+# Pre-restructure the mapping was 1:1 (module ``X`` → tool file
+# ``tools/X.py`` → mixin ``XMixin``). The restructure breaks that:
+# Core's 26 tools include void/unvoid (from ``reconciliation.py``),
+# the slot tools + audit log (from ``admin.py``), and the backup tools
+# (from ``backup.py``). The mixin classes still live in their original
+# files; this dict tells ``_apply_module_filter`` which tool files to
+# lazy-load AND ``main()`` which mixins to compose for the requested
+# module set.
+#
+# An entry missing from this dict means "1:1 — uses the legacy name
+# of the same module."
+# ---------------------------------------------------------------------------
+MODULE_BACKED_BY: dict[str, set[str]] = {
+    "core": {"core", "reconciliation", "reporting", "admin", "backup"},
+    # Other modules unchanged for now — populated as splits land.
+}
+
+
 TOOL_MODULES: dict[str, list[str]] = {
     "core": [
+        # Orientation
         "get_book_summary",
+        # Account CRUD
         "list_accounts",
         "get_account",
         "get_balance",
@@ -106,6 +130,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_account",
         "move_account",
         "delete_account",
+        # Transaction CRUD
         "list_transactions",
         "get_transaction",
         "create_transaction",
@@ -113,18 +138,39 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_transaction",
         "replace_splits",
         "search_transactions",
+        # Void / unvoid — couples with delete_transaction
+        # (delete refuses posted documents and points at void)
+        "void_transaction",
+        "unvoid_transaction",
+        # Balance sheet — THE canonical accounting report; the
+        # ledger primitives wouldn't be complete without it.
+        # Analytical reports stay in the reporting module.
+        "balance_sheet",
+        # Account slot CRUD — metadata used by multiple modules
+        # (APR / credit_limit / statement-close on credit accounts)
+        "get_account_slots",
+        "set_account_slot",
+        "delete_account_slot",
+        # Audit log reader (transparency surface)
+        "get_audit_log",
+        # Backups (auto-snapshot hook is always-on regardless;
+        # these expose the manual control surface)
+        "create_backup",
+        "list_backups",
+        "prune_backups",
+        # Server diagnostic — was --debug-only; now unconditional
+        # so users can always check loaded modules / tool count /
+        # version without restarting in debug mode.
+        "get_server_config",
     ],
     "reconciliation": [
         "get_unreconciled_splits",
         "set_reconcile_state",
         "reconcile_account",
-        "void_transaction",
-        "unvoid_transaction",
     ],
     "reporting": [
         "spending_by_category",
         "income_by_source",
-        "balance_sheet",
         "net_worth",
         "cash_flow",
         "debt_payoff_plan",
@@ -158,17 +204,6 @@ TOOL_MODULES: dict[str, list[str]] = {
         "calculate_lot_gain",
         "close_lot",
         "delete_price",
-    ],
-    "admin": [
-        "get_account_slots",
-        "set_account_slot",
-        "delete_account_slot",
-        "get_audit_log",
-    ],
-    "backup": [
-        "create_backup",
-        "list_backups",
-        "prune_backups",
     ],
     "business": [
         "create_customer",
@@ -244,14 +279,43 @@ def _validate_tool_modules() -> None:
         )
 
 
+# Track which ``gnucash_mcp.tools.<file>`` modules have already had
+# their ``register()`` called. The old heuristic — "skip if any tool
+# from this module is already registered" — broke after the
+# restructure: post-rebucket, ``void_transaction`` is in Core's tool
+# list but lives in ``tools/reconciliation.py``. With reconciliation
+# loaded first, ``any(t in registered for t in TOOL_MODULES['core'])``
+# returns True (because void_transaction is registered) — so
+# ``tools/core.py`` would never load, and create_transaction et al.
+# would never register. Tracking files explicitly avoids the false
+# positive.
+_loaded_tool_files: set[str] = set()
+
+
 def _lazy_load_tool_module(module_name: str) -> None:
-    """Import and register an extracted tool module if not already loaded."""
-    expected_tools = TOOL_MODULES.get(module_name, [])
-    # Idempotent: skip if any tool from this module is already registered
-    if any(t in mcp._tool_manager._tools for t in expected_tools):
+    """Import and register an extracted tool module if not already loaded.
+
+    ``module_name`` is the tool-file name under ``gnucash_mcp.tools``
+    (matches the legacy module name; the public TOOL_MODULES keys may
+    differ post-restructure).
+    """
+    if module_name in _loaded_tool_files:
         return
     tool_mod = importlib.import_module(f"gnucash_mcp.tools.{module_name}")
     tool_mod.register(mcp, get_book)
+    _loaded_tool_files.add(module_name)
+
+
+def _reset_lazy_load_state() -> None:
+    """Reset the ``_loaded_tool_files`` tracker.
+
+    Test-only helper. Production code never calls this. Tests that
+    manipulate ``mcp._tool_manager._tools`` directly (e.g. clearing it
+    between cases) must also reset the lazy-load tracker, otherwise
+    subsequent ``_lazy_load_tool_module`` calls become no-ops while
+    the registry is empty.
+    """
+    _loaded_tool_files.clear()
 
 
 def _apply_module_filter(modules_str: str | None) -> list[str]:
@@ -295,21 +359,24 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
                 )
             enabled_modules.add("core")
 
-    # `backup` is never optional — the auto-snapshot hook protects
-    # every user against data loss regardless of what modules they
-    # asked for, and the three manual tools (create_backup /
-    # list_backups / prune_backups) are small enough to always
-    # advertise. Treat it the same way as `core`.
-    enabled_modules.add("backup")
-
-    # Keep only known module names
+    # Keep only known module names. ``backup`` no longer needs a
+    # force-add — its tools moved into Core, so the auto-snapshot
+    # hook plus the three manual tools are always available via
+    # Core's tool list.
     enabled_modules &= set(TOOL_MODULES.keys())
 
-    # Lazy-load any enabled extracted modules
+    # Expand each enabled module to its backing tool-files (per
+    # MODULE_BACKED_BY; default 1:1). Lazy-load any backing files
+    # that are extracted.
+    backing_files: set[str] = set()
+    for mod_name in enabled_modules:
+        backing_files.update(
+            MODULE_BACKED_BY.get(mod_name, {mod_name})
+        )
     extracted = extracted_modules()
-    for mod_name in sorted(enabled_modules):
-        if mod_name in extracted:
-            _lazy_load_tool_module(mod_name)
+    for file_name in sorted(backing_files):
+        if file_name in extracted:
+            _lazy_load_tool_module(file_name)
 
     # Build the set of tool names to keep
     keep: set[str] = set()
@@ -400,15 +467,14 @@ def accounts_resource() -> str:
 # get_audit_log moved to gnucash_mcp/tools/admin.py.
 
 
-# ============== Debug Tool (conditionally registered) ==============
+# ============== Server Diagnostic Tool ==============
 
 
 def _get_server_config_impl() -> str:
     """Return current server configuration and runtime state.
 
-    Only available when the server is started with --debug.
-    Reports loaded modules, tool count, book path, and version
-    so the client can verify its own tool inventory.
+    Reports loaded modules, tool count, book path, debug mode,
+    and version so the client can verify its own tool inventory.
     """
     from gnucash_mcp import __version__
     lines = [
@@ -422,6 +488,22 @@ def _get_server_config_impl() -> str:
     if dc_ok is False:
         lines.append("Warning: Book has no default currency set")
     return "\n".join(lines)
+
+
+# Register get_server_config unconditionally at import time so it
+# survives _apply_module_filter's keep-set pass (Core's tool list
+# includes it). Previously gated behind --debug; now always
+# available as a diagnostic surface.
+@mcp.tool()
+@safe_tool
+def get_server_config() -> str:
+    """Get the server's loaded configuration.
+
+    Returns loaded modules, tool count, book path, debug mode,
+    and version. Use this to verify which tools are available in
+    this session.
+    """
+    return _get_server_config_impl()
 
 
 # ============== Main ==============
@@ -501,7 +583,19 @@ Logs are stored alongside the book file:
     # import), leave the existing instance alone; otherwise subsequent
     # get_book() calls will use this class.
     global _book_class
-    _book_class = build_book_class(set(loaded_modules))
+    # Expand each loaded module to its backing mixin set. With the
+    # Core restructure (void/unvoid + admin tools + backups migrated
+    # into Core), the mixin layer still owns those methods in their
+    # original files — Core needs CoreMixin + ReconciliationMixin +
+    # AdminMixin + BackupMixin composed together to back its 26
+    # tools. ``MODULE_BACKED_BY`` provides the mapping; modules not
+    # listed there default to 1:1 (the legacy convention).
+    backing_mixins: set[str] = set()
+    for mod_name in loaded_modules:
+        backing_mixins.update(
+            MODULE_BACKED_BY.get(mod_name, {mod_name})
+        )
+    _book_class = build_book_class(backing_mixins)
 
     # Check book health (non-fatal)
     currency_ok = None
@@ -535,27 +629,12 @@ Logs are stored alongside the book file:
         "default_currency_ok": currency_ok,
     })
 
-    if debug_flag:
-        # Register the debug-only diagnostic tool
-        @mcp.tool()
-        @safe_tool
-        def get_server_config() -> str:
-            """Get the server's loaded configuration.
-
-            Returns loaded modules, tool count, book path, debug mode,
-            and version. Only available when server is started with --debug.
-            Use this to verify which tools are available in this session.
-            """
-            return _get_server_config_impl()
-
-        # Update tool count to include the newly registered tool
-        _server_state["tool_count"] = len(mcp._tool_manager._tools)
+    # get_server_config is now registered unconditionally at module
+    # import time (see above), so no per-run conditional registration
+    # is needed here.
+    if debug_flag or _debug_mode:
         debug_log(f"Modules: {modules_display}")
-        debug_log(f"Tools loaded: {_server_state['tool_count']}")
-    else:
-        if _debug_mode:
-            debug_log(f"Modules: {modules_display}")
-            debug_log(f"Tools loaded: {tool_count}")
+        debug_log(f"Tools loaded: {tool_count}")
 
     mcp.run()
 
