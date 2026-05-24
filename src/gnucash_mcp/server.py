@@ -581,9 +581,45 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (15 tools). Use "all" for all 70 tools.
-                       Available: core, reconciliation, reporting, budgets,
-                       scheduling, investments, business, admin
+                       Default: core (26 tools, always-on). Use "all"
+                       for every module (88 tools).
+
+                       Modules (role-aligned, flat partition; pick
+                       what fits your workflow):
+                         core         The ledger + balance_sheet +
+                                      slots + audit log + backups.
+                                      Always on.
+                         personal     Budgets, scheduling,
+                                      reconciliation, lifestyle
+                                      reports (net_worth,
+                                      spending_by_category, cash_flow,
+                                      income_by_source,
+                                      debt_payoff_plan).
+                                      [NOTE: not yet a group alias;
+                                       compose its members directly
+                                       for now: budgets,scheduling,
+                                       reconciliation,reporting]
+                         budgets      Budget creation + variance.
+                         scheduling   Recurring transactions.
+                         reconciliation
+                                      Bank-statement reconciliation.
+                         reporting    Analytical reports (net_worth,
+                                      cash_flow, spending/income
+                                      breakdowns, debt_payoff_plan).
+                         portfolio    Commodities + prices —
+                                      the multi-currency primitive.
+                         investor     Tax-lot management.
+                         freelancer   Customer invoicing.
+                         business     Vendor + employee management +
+                                      vendor bills (additive to
+                                      freelancer for full business
+                                      workflow).
+
+                       Example: --modules=freelancer for a solo
+                       invoicer; --modules=budgets,scheduling,reporting
+                       for a personal-finance user;
+                       --modules=freelancer,business for a small
+                       business with vendor management.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message
