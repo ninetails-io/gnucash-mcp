@@ -33,6 +33,7 @@ from gnucash_mcp.book._currency import (  # noqa: F401
     _is_market_price,
     _to_date,
 )
+from gnucash_mcp.book._query import QueryMixin
 
 # GnuCash stores GUIDs as lowercase hex (via uuid4().hex). We accept both
 # cases on input for ergonomics — users pasting from external tools may
@@ -649,20 +650,21 @@ def _upcoming_to_compact_line(
 # ── Base class ─────────────────────────────────────────────────────
 
 
-class BaseGnuCashBook(CurrencyMixin):
+class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     """Thread-safe wrapper for piecash book operations.
 
     Holds the universal helpers used by every mixin. Module-specific
     mixins (AdminMixin, ReportingMixin, etc.) are combined with this
     base via `build_book_class` in gnucash_mcp.book.__init__.
 
-    Inherits from :class:`CurrencyMixin` so cross-commodity helpers
-    (``_rates_as_of``, ``_account_conversion_factors``,
+    Inherits from :class:`CurrencyMixin` (cross-commodity helpers:
+    ``_rates_as_of``, ``_account_conversion_factors``,
     ``_split_in_default_currency``, ``_market_value``,
-    ``_find_exchange_rate``) are available on every constructed
-    ``GnuCashBook`` regardless of which ``--modules`` are enabled.
-    Currency conversion is cross-cutting infrastructure, not a
-    feature flag.
+    ``_find_exchange_rate``) and :class:`QueryMixin` (the indexed
+    SQL split query, ``_query_filtered_splits``). Both are
+    composed unconditionally because they're cross-cutting
+    infrastructure, not module features — they're needed by
+    multiple mixins regardless of which ``--modules`` are enabled.
     """
 
     # Tables that support GUID resolution. Each entry maps table
