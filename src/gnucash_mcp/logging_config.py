@@ -1000,11 +1000,25 @@ def _fmt_credit_note_apply(entry: dict) -> list[str]:
             f"against: {target_id}"
         ),
     ]
-    if cn_remaining and cn_remaining != "0":
+    # ``apply_credit_note`` returns quantized strings like
+    # "0.00", not "0", so a string-equality check against "0"
+    # would print "remaining: 0.00" lines on fully-settled
+    # documents. Decimal comparison handles every quantize
+    # shape ("0", "0.00", "0.0000") uniformly.
+    # (Copilot PR #87 review.)
+    from decimal import Decimal as _D, InvalidOperation as _IO
+    def _is_zero(s: str) -> bool:
+        if not s:
+            return True
+        try:
+            return _D(s) == 0
+        except _IO:
+            return False
+    if not _is_zero(cn_remaining):
         lines.append(
             f"{_INDENT}credit note remaining: {cn_remaining}"
         )
-    if target_remaining and target_remaining != "0":
+    if not _is_zero(target_remaining):
         lines.append(
             f"{_INDENT}target remaining: {target_remaining}"
         )

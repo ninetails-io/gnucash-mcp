@@ -2495,6 +2495,171 @@ class TestApplyCreditNote:
             )
 
 
+class TestCreditNotePr87ReviewFollowups:
+    """Tests for the five Copilot PR #87 review findings.
+
+    Each test exercises one validation gap or formatting bug
+    Copilot flagged. They live in their own class so the
+    follow-up boundary is visible in test output and traceable
+    back to the review.
+    """
+
+    def test_resolve_credit_note_suggests_voucher_tool_for_voucher(
+        self, business_book,
+    ):
+        """Comment 1: ``_resolve_credit_note`` error message
+        should suggest ``add_voucher_entry`` / ``delete_voucher``
+        when the found document is a voucher (owner_type=5),
+        not ``add_bill_entry`` / ``delete_bill`` (the legacy
+        binary-dispatch bug)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria")
+        # Create a voucher with the same ID space as customer
+        # invoices — owner_type=5 row, not flagged as credit note.
+        gb.create_voucher(employee_id="000001")
+        # Now try to use add_credit_note_entry on the voucher's
+        # ID. _resolve_credit_note finds it, sees it's NOT a
+        # credit note, and emits the suggestion message.
+        with pytest.raises(
+            ValueError, match="add_voucher_entry / delete_voucher",
+        ):
+            gb.add_credit_note_entry(
+                credit_note_id="000001",
+                account="Expenses:Office Supplies",
+                description="x", quantity="1", price="50",
+            )
+
+    def test_create_credit_note_rejects_credit_note_source(
+        self, business_book,
+    ):
+        """Comment 5: linking a credit note to another credit
+        note is semantically meaningless and would mis-label
+        ``applies_to.type``. Reject with a clear message."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # First credit note (standalone, no source link)
+        cn1 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        # Try to create a second credit note pointing at the first
+        with pytest.raises(
+            ValueError, match="itself a credit note",
+        ):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="customer",
+                applies_to_invoice_id=cn1["id"],
+            )
+
+    def test_apply_credit_note_rejects_cross_currency_post_account(
+        self, business_book,
+    ):
+        """Comment 2: cross-currency apply isn't supported —
+        when the document currency differs from the post
+        account's commodity, the netting transaction can't
+        cleanly use a single amount. Reject with a clear
+        message that points at the per-currency A/R convention
+        as the fix.
+
+        Setup uses raw piecash to engineer the cross-currency
+        post state directly (EUR/USD price via piecash.Price,
+        EUR customer + EUR credit note posted to USD A/R).
+        The full posting flow validates the cross-currency
+        guard fires at apply time, not at post."""
+        import piecash
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        # Add EUR + EUR/USD price via raw piecash (same pattern
+        # the multi_currency tests use in test_book.py).
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.flush()
+            usd = bk.default_currency
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date_cls(2026, 5, 24),
+                value="1.10",
+                type="last",
+            ))
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        # Source invoice in EUR posted to USD A/R (cross-currency)
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="Cross-currency apply not supported",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_quantize_to_zero_rejected(self, business_book):
+        """Comment 3: a sub-quantum apply amount (e.g. "0.001"
+        on a USD account with 0.01 quantum) would round to zero
+        and produce a no-op netting transaction reported as
+        success. Guard rejects with the quantum named so the
+        caller knows the minimum."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Set up a posted invoice + credit note pair
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="quantizes to zero",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+                amount="0.001",
+            )
+
+
 class TestCreditNoteDisplayPolish:
     """Display rendering for credit notes: list_invoices,
     get_outstanding_invoices, and the dashboard's A/R / A/P

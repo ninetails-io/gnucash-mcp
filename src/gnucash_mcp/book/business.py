@@ -2579,18 +2579,27 @@ class BusinessMixin:
                 f"Credit note not found: {credit_note_id}"
             )
         if not self._get_is_credit_note(inv):
-            # Found the ID but it's a regular invoice/bill — name
-            # the right tool to use instead so the LLM can correct
-            # course in one hop.
-            entry_tool = (
-                "add_invoice_entry"
-                if inv.owner_type == 2
-                else "add_bill_entry"
+            # Found the ID but it's a regular invoice/bill/voucher.
+            # Name the right tool to use instead so the LLM can
+            # correct course in one hop. Three-way dispatch
+            # (Copilot PR #87 review): the legacy binary "INV vs
+            # BILL" branch would have suggested add_bill_entry /
+            # delete_bill for a voucher (owner_type=5) — wrong.
+            _ENTRY_TOOLS = {
+                2: "add_invoice_entry",
+                4: "add_bill_entry",
+                5: "add_voucher_entry",
+            }
+            _DELETE_TOOLS = {
+                2: "delete_invoice",
+                4: "delete_bill",
+                5: "delete_voucher",
+            }
+            entry_tool = _ENTRY_TOOLS.get(
+                inv.owner_type, "add_invoice_entry",
             )
-            delete_tool = (
-                "delete_invoice"
-                if inv.owner_type == 2
-                else "delete_bill"
+            delete_tool = _DELETE_TOOLS.get(
+                inv.owner_type, "delete_invoice",
             )
             raise ValueError(
                 f"{self._doc_label_for(inv.owner_type)} "
@@ -2727,6 +2736,19 @@ class BusinessMixin:
                         f"{source_owner.id!r}, not {owner_id!r}. "
                         f"Credit notes must apply to a document "
                         f"from the same customer/vendor."
+                    )
+                # Source must be a regular invoice/bill, not
+                # itself a credit note. Credit-note-against-
+                # credit-note is semantically meaningless: a
+                # credit reverses a posted document; chaining
+                # them doesn't represent anything in real
+                # bookkeeping. (Copilot PR #87 review.)
+                if self._get_is_credit_note(source):
+                    raise ValueError(
+                        f"Source {applies_to_invoice_id} is "
+                        f"itself a credit note. Link credit "
+                        f"notes to regular invoices or bills, "
+                        f"not to other credit notes."
                     )
                 source_currency_mnemonic = (
                     source.currency.mnemonic
@@ -4295,6 +4317,32 @@ class BusinessMixin:
 
             post_acct = cn.post_account
 
+            # Cross-currency apply isn't supported here — the
+            # netting transaction is in the post account's
+            # commodity, so the document currency must match.
+            # In practice every well-formed book has per-currency
+            # A/R accounts (Alex has 'Accounts Receivable',
+            # 'Accounts Receivable EUR', 'Accounts Receivable
+            # CAD'), so EUR documents post to EUR A/R and the
+            # commodity equals the document currency. The case
+            # this catches: someone deliberately posted a EUR
+            # invoice to a USD A/R account (unusual, but
+            # ``post_invoice`` supports it via FX rates). For
+            # those, apply_credit_note rejects with a clear
+            # message rather than silently producing wrong split
+            # values. (Copilot PR #87 review.)
+            if cn.currency_guid != post_acct.commodity.guid:
+                raise ValueError(
+                    f"Cross-currency apply not supported: credit "
+                    f"note currency {cn.currency.mnemonic!r} "
+                    f"differs from post account commodity "
+                    f"{post_acct.commodity.mnemonic!r}. The "
+                    f"netting transaction must be in the post "
+                    f"account's commodity. Most books have "
+                    f"per-currency A/R accounts; check that the "
+                    f"credit note was posted to the right one."
+                )
+
             # Resolve lots by GUID — same pattern as pay_invoice.
             cn_lot = next(
                 (l for l in post_acct.lots if l.guid == cn.post_lot_guid),
@@ -4350,6 +4398,25 @@ class BusinessMixin:
                         f"({target_remaining}). Use {max_apply} "
                         f"or less."
                     )
+
+            # Quantize the apply amount to the post account's
+            # commodity. Defensive guard against a sub-quantum
+            # amount (e.g. ``amount="0.001"`` on a USD account
+            # with 0.01 quantum) producing a no-op netting
+            # transaction that reports success while moving
+            # nothing. Same shape as the cross-currency
+            # quantize-to-zero guard in pay_invoice.
+            # (Copilot PR #87 review.)
+            quantum_pre = _commodity_quantum(post_acct.commodity)
+            apply_amount = apply_amount.quantize(quantum_pre)
+            if apply_amount == 0:
+                raise ValueError(
+                    f"Apply amount quantizes to zero in "
+                    f"{post_acct.commodity.mnemonic} "
+                    f"(quantum={quantum_pre}). Pass an amount "
+                    f"at or above the account's smallest "
+                    f"divisible unit."
+                )
 
             # Build the netting transaction:
             #   Customer side: cn_lot gets +apply_amount (settles
