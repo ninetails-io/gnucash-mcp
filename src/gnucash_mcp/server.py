@@ -316,6 +316,16 @@ TOOL_MODULES: dict[str, list[str]] = {
         "add_credit_note_entry",
         "delete_credit_note",
         "apply_credit_note",
+        # Jobs (v1.3). Project-level grouping over invoices/bills
+        # for a single customer or vendor. No posted state — only
+        # active/inactive. Linked invoices route through the
+        # polymorphic owner_type=3 dispatch (see create_invoice's
+        # job_id parameter).
+        "create_job",
+        "list_jobs",
+        "get_job",
+        "update_job",
+        "delete_job",
         "create_billterm",
         "list_billterms",
         "vendor_spending_report",
@@ -670,7 +680,7 @@ Usage: gnucash-mcp [OPTIONS]
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core (26 tools, always-on). Use "all"
-                       for every module (95 tools).
+                       for every module (100 tools).
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):

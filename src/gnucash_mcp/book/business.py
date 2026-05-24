@@ -653,6 +653,26 @@ class BusinessMixin:
         return book.session.query(Employee).filter_by(id=employee_id).first()
 
     @staticmethod
+    def _find_job(book, job_id: str):
+        """Find a job by its human-readable ID (e.g., '000001').
+
+        Indexed lookup. Returns None if no job has the given ID.
+        Unlike invoices, job IDs are unambiguous across owner
+        types — a single ``counter_job`` advances regardless of
+        whether the job is for a customer or vendor.
+        """
+        from piecash.business.invoice import Job
+        return book.session.query(Job).filter_by(id=job_id).first()
+
+    @staticmethod
+    def _find_job_by_guid(book, guid: str):
+        """Find a job by GUID. Used to resolve invoice→job links
+        where the invoice's ``owner_guid`` (with owner_type=3)
+        points at the job."""
+        from piecash.business.invoice import Job
+        return book.session.query(Job).filter_by(guid=guid).first()
+
+    @staticmethod
     def _parse_owner_type(owner_type: str | None) -> int | None:
         """Map an owner_type string to its piecash integer code.
 
@@ -876,6 +896,50 @@ class BusinessMixin:
     def _employee_to_compact_line(employee) -> str:
         """One-line compact: 'id  name  currency'."""
         return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
+
+    @staticmethod
+    def _job_to_dict(job, owner_name: str | None = None) -> dict:
+        """Convert a piecash Job to a serializable dict.
+
+        The job's ``owner_type`` is stored as the underlying
+        customer (2) or vendor (4) — we surface that as a
+        human-readable ``owner_type`` string for symmetry with
+        every other tool's owner-typed response. ``owner_name``
+        is resolved by the caller (static-method shape can't
+        query the session)."""
+        return {
+            "guid": job.guid,
+            "id": job.id,
+            "name": job.name,
+            "reference": job.reference or "",
+            "active": bool(job.active),
+            # Map back to the human label — Customer/Vendor only
+            # since piecash's PersonType is {Vendor:4, Customer:2}.
+            "owner_type": (
+                "customer" if job.owner_type == 2 else "vendor"
+            ),
+            "owner_name": owner_name,
+        }
+
+    @staticmethod
+    def _job_to_compact_line(job, owner_name: str | None = None) -> str:
+        """One-line compact: ``id  name  CUSTOMER/VENDOR  owner_name``.
+
+        The owner tag (CUSTOMER / VENDOR) is the differentiator
+        a bookkeeper would scan for — customer jobs and vendor
+        jobs serve different purposes (revenue-side vs cost-side).
+        Active/inactive isn't shown — list_jobs filters by
+        active_only at the call site, so a row appearing in the
+        list is implicitly active unless include_inactive was set.
+        """
+        owner_tag = (
+            "CUSTOMER" if job.owner_type == 2 else "VENDOR"
+        )
+        owner_str = owner_name or "?"
+        ref_part = f"  ref:{job.reference}" if job.reference else ""
+        return (
+            f"{job.id}\t{job.name}\t{owner_tag}\t{owner_str}{ref_part}"
+        )
 
     @staticmethod
     def _billterm_to_dict(bt) -> dict:
@@ -4840,6 +4904,401 @@ class BusinessMixin:
             find_entity_method="_find_employee",
             # Employees own nothing in 1.3.0 — no dependency check.
         )
+
+    # ── Job CRUD ─────────────────────────────────────────────────
+    #
+    # Jobs are a customer/vendor-level grouping over invoices or
+    # bills. Three things make them simpler than the other
+    # business entities we've built:
+    #
+    # 1. The ``piecash.Job(name, owner, reference, active)``
+    #    constructor is OPEN — unlike Invoice / Customer / Vendor
+    #    / Employee, which we wrestled into raw SQL inserts. We
+    #    use the ORM directly here.
+    # 2. The constructor auto-assigns the 6-digit ID via
+    #    ``on_book_add`` calling ``_assign_id`` (advances
+    #    ``counter_job``). No manual counter handling.
+    # 3. Jobs have no posted state — only ``active`` (1) /
+    #    ``inactive`` (0). No post / unpost / pay tools. The
+    #    financial lifecycle remains on the linked invoices.
+    #
+    # Employee jobs are deliberately not supported — piecash's
+    # ``PersonType`` map only has ``Customer: 2`` and
+    # ``Vendor: 4``; passing an Employee to ``Job()`` would
+    # raise ``KeyError``. Same desktop-parity principle as
+    # credit notes (no GnuCash UI for them).
+
+    def create_job(
+        self,
+        owner_id: str,
+        owner_type: str,
+        name: str,
+        reference: str = "",
+    ) -> dict:
+        """Create a job for a customer or vendor.
+
+        A job groups invoices (or bills) from one counterparty
+        under a project-level container. The financial lifecycle
+        stays on the invoices; the job is organizational only —
+        no posted state, no posting math, just ``active``/
+        ``inactive``.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., '000001').
+            owner_type: 'customer' or 'vendor'. Employees are not
+                supported (piecash's PersonType has no Employee
+                entry; GnuCash desktop has no Employee Job UI).
+            name: Human-readable job name (e.g., 'API Rewrite').
+            reference: Optional reference string (PO number, etc.).
+
+        Returns:
+            Dict with guid, id, name, reference, active,
+            owner_type, status='created'.
+
+        Raises:
+            ValueError: If owner_type is invalid, 'employee', or
+                the named owner doesn't exist.
+        """
+        from piecash.business.invoice import Job
+
+        int_owner_type = self._parse_owner_type(owner_type)
+        if int_owner_type == 5:
+            raise ValueError(
+                "Jobs are not supported for employees. GnuCash "
+                "desktop has no UI for employee jobs (piecash's "
+                "PersonType map has only Customer and Vendor), "
+                "so creating one here would produce a document "
+                "desktop users can't view or edit. Job-track "
+                "employee work via vouchers' notes field instead."
+            )
+        if int_owner_type not in (2, 4):
+            raise ValueError(
+                f"Jobs require owner_type 'customer' or 'vendor', "
+                f"got {owner_type!r}."
+            )
+
+        find_owner = (
+            self._find_customer
+            if int_owner_type == 2
+            else self._find_vendor
+        )
+        with self.open(readonly=False) as book:
+            owner = find_owner(book, owner_id)
+            if not owner:
+                label = (
+                    "Customer" if int_owner_type == 2 else "Vendor"
+                )
+                raise ValueError(f"{label} not found: {owner_id}")
+
+            # The Job constructor handles owner_type, owner_guid,
+            # and (on book.add) the auto-id assignment. The
+            # ``if owner.book:`` branch in piecash's __init__ adds
+            # the job to the book automatically, so we don't need
+            # a separate ``book.session.add(job)``.
+            job = Job(
+                name=name,
+                owner=owner,
+                reference=reference,
+                active=1,
+            )
+
+            book.save()
+
+            # Verify the row landed (consistency with the rest of
+            # the business module's "every write is verified"
+            # invariant).
+            from gnucash_mcp.book._base import _verify_write
+            _verify_write(
+                book.session, Job.__table__, job.guid,
+                f"Job '{name}'",
+            )
+
+            return {
+                "guid": job.guid,
+                "id": job.id,
+                "name": name,
+                "reference": reference,
+                "active": True,
+                "owner_type": owner_type,
+                "status": "created",
+            }
+
+    def list_jobs(
+        self,
+        owner_type: str | None = None,
+        owner_id: str | None = None,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List jobs, optionally filtered by owner_type and/or
+        owner_id.
+
+        Args:
+            owner_type: Filter by 'customer' or 'vendor'. Omit
+                for all.
+            owner_id: Filter by specific customer or vendor ID
+                (requires owner_type to disambiguate the lookup;
+                rejected otherwise to avoid ambiguous cross-
+                sequence ID matches).
+            active_only: If True (default), exclude inactive jobs.
+            compact: If True (default), return tab-separated
+                one-line-per-job string; otherwise a list of
+                dicts.
+
+        Returns:
+            Compact string or list of dicts depending on
+            ``compact``.
+        """
+        from piecash.business.invoice import Job
+
+        int_owner_type = (
+            self._parse_owner_type(owner_type) if owner_type else None
+        )
+        if int_owner_type == 5:
+            # Symmetric with create_job — surface the constraint
+            # at the filter boundary too rather than silently
+            # returning an empty list.
+            raise ValueError(
+                "Jobs are not supported for employees; "
+                "owner_type='employee' has no jobs to list."
+            )
+
+        if owner_id and not owner_type:
+            raise ValueError(
+                "owner_id requires owner_type to be set — "
+                "customer and vendor IDs share a sequence space, "
+                "so disambiguation is required."
+            )
+
+        with self.open() as book:
+            query = book.session.query(Job)
+            if int_owner_type is not None:
+                query = query.filter(Job.owner_type == int_owner_type)
+            if active_only:
+                query = query.filter(Job.active == 1)
+            if owner_id:
+                find_owner = (
+                    self._find_customer
+                    if int_owner_type == 2
+                    else self._find_vendor
+                )
+                owner = find_owner(book, owner_id)
+                if not owner:
+                    label = (
+                        "Customer" if int_owner_type == 2
+                        else "Vendor"
+                    )
+                    raise ValueError(
+                        f"{label} not found: {owner_id}"
+                    )
+                query = query.filter(Job.owner_guid == owner.guid)
+
+            jobs = sorted(query.all(), key=lambda j: j.id)
+
+            if compact:
+                lines = []
+                for job in jobs:
+                    owner = self._find_invoice_owner_by_guid(
+                        book, job.owner_type, job.owner_guid,
+                    )
+                    lines.append(
+                        self._job_to_compact_line(
+                            job, owner_name=(
+                                owner.name if owner else None
+                            ),
+                        )
+                    )
+                return "\n".join(lines)
+
+            results = []
+            for job in jobs:
+                owner = self._find_invoice_owner_by_guid(
+                    book, job.owner_type, job.owner_guid,
+                )
+                results.append(
+                    self._job_to_dict(
+                        job,
+                        owner_name=owner.name if owner else None,
+                    )
+                )
+            return results
+
+    def get_job(self, job_id: str) -> dict:
+        """Get a job's details by ID.
+
+        Returns:
+            Dict with guid, id, name, reference, active,
+            owner_type, owner_name, plus a ``linked_invoices``
+            summary (count + IDs) so the caller can see what's
+            attached without a separate ``list_invoices`` call.
+
+        Raises:
+            ValueError: If job not found.
+        """
+        from piecash.business.invoice import Invoice, Job
+        with self.open() as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            owner = self._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
+            result = self._job_to_dict(
+                job, owner_name=owner.name if owner else None,
+            )
+            # Linked invoices: owner_type=3 + owner_guid=job.guid
+            # is the polymorphic linkage. Sort by ID for stable
+            # output.
+            linked = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).order_by(Invoice.id).all()
+            result["linked_invoices"] = {
+                "count": len(linked),
+                "ids": [inv.id for inv in linked],
+            }
+            return result
+
+    def update_job(
+        self,
+        job_id: str,
+        name: str | None = None,
+        reference: str | None = None,
+        active: bool | None = None,
+    ) -> dict:
+        """Update a job's name, reference, or active state.
+
+        Any subset of fields can be passed; unspecified fields
+        are left unchanged. Returns a diff-style response
+        (changed fields only) following the same convention as
+        ``update_account`` / ``update_transaction``.
+
+        Args:
+            job_id: Job ID.
+            name: New name (optional).
+            reference: New reference (optional).
+            active: New active flag (optional).
+
+        Returns:
+            Dict with id, guid, status='updated', plus only the
+            fields that changed.
+
+        Raises:
+            ValueError: If job not found or no fields supplied.
+        """
+        if name is None and reference is None and active is None:
+            raise ValueError(
+                "update_job requires at least one of name, "
+                "reference, or active."
+            )
+        with self.open(readonly=False) as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            # Capture before-state for audit log staging.
+            before = {
+                "id": job.id,
+                "name": job.name,
+                "reference": job.reference or "",
+                "active": bool(job.active),
+            }
+            self._stage_audit_before(before)
+
+            changed = {}
+            if name is not None and name != job.name:
+                job.name = name
+                changed["name"] = name
+            if reference is not None and reference != (job.reference or ""):
+                job.reference = reference
+                changed["reference"] = reference
+            if active is not None and bool(job.active) != active:
+                job.active = 1 if active else 0
+                changed["active"] = active
+
+            book.save()
+
+            return {
+                "id": job.id,
+                "guid": job.guid,
+                "status": "updated",
+                **changed,
+            }
+
+    def delete_job(self, job_id: str, force: bool = False) -> dict:
+        """Delete a job.
+
+        Refuses by default when invoices/bills are linked to the
+        job — data-loss prevention. ``force=True`` re-parents
+        every linked invoice back to its underlying customer/
+        vendor (reverses the indirection by rewriting
+        owner_type/owner_guid) before deleting the job row,
+        preserving invoice history.
+
+        Args:
+            job_id: Job ID.
+            force: If True, re-parent linked invoices instead of
+                refusing. Default False.
+
+        Returns:
+            Dict with id, guid, name, reparented_count (0 unless
+            force was used), status='deleted'.
+
+        Raises:
+            ValueError: If job not found, or linked invoices
+                exist and ``force`` is False.
+        """
+        from piecash.business.invoice import Invoice, Job
+        with self.open(readonly=False) as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            job_name = job.name
+            job_guid = job.guid
+            underlying_owner_type = job.owner_type
+            underlying_owner_guid = job.owner_guid
+
+            linked = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).all()
+
+            reparented_count = 0
+            if linked:
+                if not force:
+                    raise ValueError(
+                        f"Job '{job_id}' has {len(linked)} linked "
+                        f"invoice(s)/bill(s). Pass force=True to "
+                        f"re-parent them back to the underlying "
+                        f"customer/vendor before deleting the "
+                        f"job, or unlink/delete the documents "
+                        f"first."
+                    )
+                # Re-parent: rewrite owner_type/owner_guid on
+                # each linked invoice to point at the customer
+                # or vendor the job was for. This preserves the
+                # invoice history while removing the
+                # intermediate Job row.
+                for inv in linked:
+                    inv.owner_type = underlying_owner_type
+                    inv.owner_guid = underlying_owner_guid
+                    reparented_count += 1
+
+            book.session.delete(job)
+            book.save()
+
+            from gnucash_mcp.book._base import _verify_delete
+            _verify_delete(
+                book.session, Job.__table__, {"guid": job_guid},
+                f"Job '{job_id}'",
+            )
+
+            return {
+                "id": job_id,
+                "guid": job_guid,
+                "name": job_name,
+                "reparented_count": reparented_count,
+                "status": "deleted",
+            }
 
     # ── Reporting ────────────────────────────────────────────────
 

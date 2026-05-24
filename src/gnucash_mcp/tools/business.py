@@ -988,6 +988,149 @@ def register(mcp, get_book) -> None:
         result = book.delete_employee(employee_id=employee_id)
         return _json(result)
 
+    # ── Job CRUD tools ───────────────────────────────────────
+    #
+    # Jobs are project-level grouping over invoices/bills for a
+    # single customer or vendor. The financial lifecycle stays
+    # on the linked invoices; the job itself only has
+    # ``active``/``inactive`` state. See create_invoice and
+    # create_bill (v1.3) for how to link a new invoice to a job.
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="job")
+    def create_job(
+        owner_id: str,
+        owner_type: str,
+        name: str,
+        reference: str = "",
+    ) -> str:
+        """Create a job for a customer or vendor.
+
+        A job groups invoices (or bills) from one counterparty
+        under a project-level container. Useful when a single
+        customer has multiple distinct engagements (e.g., 'API
+        Rewrite' and 'Q3 Maintenance') that should be reported
+        on separately even though invoices flow to the same A/R.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., "000001").
+            owner_type: "customer" or "vendor". Employees are
+                not supported (no GnuCash desktop UI for
+                employee jobs).
+            name: Human-readable job name (e.g., "API Rewrite").
+            reference: Optional reference string (PO number,
+                project code).
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.create_job(
+            owner_id=owner_id,
+            owner_type=owner_type,
+            name=name,
+            reference=reference,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def list_jobs(
+        owner_type: str | None = None,
+        owner_id: str | None = None,
+        active_only: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """List jobs, optionally filtered.
+
+        Args:
+            owner_type: Filter by "customer" or "vendor". Omit
+                for all.
+            owner_id: Filter by specific customer or vendor ID
+                (requires owner_type).
+            active_only: If True (default), exclude inactive jobs.
+            verbose: If True, return full JSON dicts; otherwise
+                compact tab-separated rows.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.list_jobs(
+            owner_type=owner_type,
+            owner_id=owner_id,
+            active_only=active_only,
+            compact=not verbose,
+        )
+        return _json(result) if verbose else result
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def get_job(job_id: str) -> str:
+        """Get a job's details by ID.
+
+        Returns name, owner, active state, plus a count + IDs
+        list of every invoice/bill linked to the job.
+
+        Args:
+            job_id: Job ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.get_job(job_id=job_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="job")
+    def update_job(
+        job_id: str,
+        name: str | None = None,
+        reference: str | None = None,
+        active: bool | None = None,
+    ) -> str:
+        """Update a job's name, reference, or active state.
+
+        Any subset of fields can be passed; unspecified fields
+        are left unchanged. Returns a diff-style response.
+
+        Args:
+            job_id: Job ID.
+            name: New name (optional).
+            reference: New reference (optional).
+            active: New active flag — pass False to deactivate a
+                completed job without deleting it (preserves
+                history).
+        """
+        book = get_book()
+        result = book.update_job(
+            job_id=job_id,
+            name=name,
+            reference=reference,
+            active=active,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="job")
+    def delete_job(job_id: str, force: bool = False) -> str:
+        """Delete a job.
+
+        Refuses by default when invoices/bills are linked to the
+        job (data-loss prevention). ``force=True`` re-parents
+        every linked invoice back to its underlying customer or
+        vendor before deleting the job row, preserving invoice
+        history. Use ``update_job(active=False)`` instead if you
+        want to keep the job in place but mark the project done.
+
+        Args:
+            job_id: Job ID.
+            force: If True, re-parent linked invoices instead of
+                refusing. Default False.
+        """
+        book = get_book()
+        result = book.delete_job(job_id=job_id, force=force)
+        return _json(result)
+
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
