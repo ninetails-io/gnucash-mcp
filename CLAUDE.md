@@ -350,6 +350,12 @@ For live verification against a personal GnuCash book, ensure
 - `## Summary` with bullet points, then `## Test plan` with checklist.
 - Merge with `--merge --delete-branch` (no squash — preserves feature
   commit history under the merge commit).
+- After addressing Copilot review threads (reply + fix), resolve
+  them with `uv run python scripts/resolve_pr_threads.py <PR>` —
+  bots don't resolve their own threads, so author-resolve keeps
+  the PR conversation tab clean. `--dry-run` previews; `--all`
+  resolves regardless of author for the rare case a human
+  reviewer leaves threads open after agreeing in chat.
 
 ### Staging
 
