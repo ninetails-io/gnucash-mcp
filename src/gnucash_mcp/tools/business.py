@@ -555,6 +555,185 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="credit_note")
+    def create_credit_note(
+        owner_id: str,
+        owner_type: str,
+        applies_to_invoice_id: str | None = None,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        credit_note_id: str | None = None,
+    ) -> str:
+        """Create a credit note against a customer invoice or
+        vendor bill.
+
+        A credit note reverses part or all of a posted invoice
+        while preserving the original posting in the audit trail.
+        At post time, posting direction reverses: customer credit
+        notes debit Income / credit A/R (reducing receivables);
+        vendor credit notes debit A/P / credit Expense (reducing
+        payables). Settled either by refund (``pay_invoice``) or
+        by netting against an outstanding invoice
+        (``apply_credit_note``).
+
+        Use ``add_credit_note_entry`` to add line items, then
+        ``post_invoice`` to post.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., "000001").
+            owner_type: "customer" or "vendor". Employees are not
+                supported (GnuCash desktop has no UI for employee
+                credit notes; use unpost_invoice + edit on the
+                voucher to amend an employee reimbursement).
+            applies_to_invoice_id: Optional source invoice / bill
+                ID. Must belong to the same owner and use the
+                same currency. Highly recommended for audit
+                trail. Can be omitted for floating credit notes
+                that will be applied later.
+            date_opened: ISO date (YYYY-MM-DD). Defaults to today.
+            notes: Free-text notes (e.g., reason for the credit).
+            currency: ISO currency code. Inherited from source
+                invoice when applies_to_invoice_id is given;
+                otherwise from owner's currency or book default.
+            term: Billterm name. Rarely used for credit notes.
+            credit_note_id: Custom ID. Auto-generated from the
+                shared invoice/bill counter when omitted.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.create_credit_note(
+            owner_id=owner_id,
+            owner_type=owner_type,
+            applies_to_invoice_id=applies_to_invoice_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            credit_note_id=credit_note_id,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="entry")
+    def add_credit_note_entry(
+        credit_note_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+        owner_type: str | None = None,
+    ) -> str:
+        """Add a line item to a credit note.
+
+        Mirrors ``add_invoice_entry`` / ``add_bill_entry`` but
+        validates the target is in fact a credit note (the slot
+        flag is the gate). Account type rules match the
+        non-credit twin: INCOME for customer credit notes,
+        EXPENSE/ASSET for vendor credit notes. Prices stay
+        positive — the credit-note flag inverts posting direction
+        at post time, not at entry-add time.
+
+        Args:
+            credit_note_id: Credit note ID (e.g., "000032").
+            account: Account path appropriate for the owner type
+                (INCOME for customer, EXPENSE/ASSET for vendor).
+            description: Line item description.
+            quantity: Quantity as decimal string.
+            price: Unit price as decimal string.
+            owner_type: Optional "customer" or "vendor"
+                disambiguator for ID collisions. Usually omitted.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.add_credit_note_entry(
+            credit_note_id=credit_note_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+            owner_type=owner_type,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="apply", entity_type="credit_note")
+    def apply_credit_note(
+        credit_note_id: str,
+        applies_to_invoice_id: str,
+        amount: str | None = None,
+        apply_date: str | None = None,
+        owner_type: str | None = None,
+    ) -> str:
+        """Net a posted credit note against a posted invoice or
+        bill from the same owner. No cash moves — the credit
+        balance transfers between lots on the same A/R or A/P
+        account.
+
+        This is the most common credit-note settlement path: the
+        bookkeeper issues a credit note against an overcharge,
+        then nets it against the next invoice from that customer
+        (or applies it to an outstanding bill on the vendor side).
+        Use ``pay_invoice`` instead when the credit note will be
+        settled by sending or receiving cash.
+
+        Args:
+            credit_note_id: The credit note to apply (must be
+                posted).
+            applies_to_invoice_id: The target invoice/bill (must
+                be posted, same owner, same currency, same A/R
+                or A/P post account).
+            amount: Decimal-string amount to apply, in the
+                document currency. Defaults to ``min(credit_note_
+                remaining, target_remaining)`` — apply as much
+                as possible.
+            apply_date: ISO date for the netting transaction.
+                Defaults to today.
+            owner_type: Optional 'customer' or 'vendor'
+                disambiguator for ID collisions.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.apply_credit_note(
+            credit_note_id=credit_note_id,
+            applies_to_invoice_id=applies_to_invoice_id,
+            amount=amount,
+            apply_date=apply_date,
+            owner_type=owner_type,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="credit_note")
+    def delete_credit_note(
+        credit_note_id: str,
+        owner_type: str | None = None,
+    ) -> str:
+        """Delete an unposted credit note.
+
+        Validates the target is a credit note before deletion.
+        Posted credit notes cannot be deleted — unpost first via
+        ``unpost_invoice``, then delete.
+
+        Args:
+            credit_note_id: Credit note ID.
+            owner_type: Optional "customer" or "vendor"
+                disambiguator for ID collisions.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.delete_credit_note(
+            credit_note_id=credit_note_id,
+            owner_type=owner_type,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="read")
     def list_invoices(
         owner_type: str | None = None,

@@ -48,6 +48,26 @@ debug_logger = logging.getLogger("gnucash_mcp.debug")
 # ── Module-level helpers ───────────────────────────────────────────
 
 
+def _slot_value_str(value) -> str:
+    """Stringify a piecash slot value to a stable ``str``.
+
+    piecash returns either a typed wrapper with a ``.value``
+    attribute (``SlotString``, ``SlotInt64``, etc.) or the raw
+    value depending on slot type. Centralizing the access keeps
+    every caller agreeing on the same extraction.
+
+    Hoisted to ``_base`` from ``admin`` in v1.3 — the credit-note
+    slot helpers in ``BusinessMixin`` need the same access pattern,
+    and a sideways import from ``business`` into ``admin`` would
+    add a coupling that doesn't reflect the dependency direction
+    (admin is the slot-tool mixin; business is also a slot
+    consumer; both should pull a shared utility from ``_base``).
+    """
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 

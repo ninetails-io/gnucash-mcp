@@ -80,11 +80,12 @@ class TestToolModulesMapping:
         assert len(_core_tool_names()) == 26
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 91 — 88
-        post-module-restructure + 3 voucher tools added in v1.3
-        (create_voucher, add_voucher_entry, delete_voucher)."""
+        """Total tools across all sub-modules should be 95 —
+        88 post-module-restructure + 3 voucher tools + 4 credit-
+        note tools (create_credit_note, add_credit_note_entry,
+        delete_credit_note, apply_credit_note) added in v1.3."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 91
+        assert total == 95
 
     def test_expected_modules_exist(self):
         """All expected sub-module names should be present after the
@@ -228,9 +229,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 87 tools."""
+        """--modules=all should keep all 95 tools (88 + 3 vouchers + 4 credit notes)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 95
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -262,12 +263,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 95
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 87 tools."""
+        """'all' mixed with other modules should keep all 95 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 91
+        assert len(self._tool_names()) == 95
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""
@@ -555,3 +556,35 @@ class TestOwnerTypeGating:
         _LOADED_MODULES.update({"core", "freelancer"})
         with pytest.raises(ValueError, match="requires the Business module"):
             _gate_owner_type("vendor")
+
+    def test_business_absent_rejects_explicit_employee(self):
+        """Symmetric with the vendor rejection — employee gating
+        was added with vouchers (v1.3) and needs the same
+        guardrail. Without business, owner_type='employee' raises
+        with the Business-module-required message. (Copilot PR
+        #86 review found this coverage gap.)"""
+        import pytest
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        with pytest.raises(ValueError, match="requires the Business module"):
+            _gate_owner_type("employee")
+
+    def test_business_absent_rejects_typo(self):
+        """Without business, a typo like 'venddor' must fail fast
+        — pre-fix the gate silently coerced unknown strings to
+        'customer', masking the typo behind a confusing "invoice
+        not found" downstream error. The gate now rejects anything
+        outside {None, 'customer'} (or the two business-gated
+        names which raise their own messages). (Copilot PR #86
+        review.)"""
+        import pytest
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            _gate_owner_type("venddor")

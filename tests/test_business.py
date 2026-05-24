@@ -1525,6 +1525,1296 @@ class TestVoucherLifecycle:
         assert gb.get_balance("Assets:Checking") == Decimal("9950.00")
 
 
+class TestCreditNoteSlotHelpers:
+    """Tests for the credit-note slot infrastructure
+    (``_get_is_credit_note`` / ``_set_is_credit_note`` /
+    ``_get_applies_to_invoice_guid`` /
+    ``_set_applies_to_invoice_guid`` / ``_resolve_applies_to``).
+
+    These are the foundation: every higher-level credit-note tool
+    in subsequent commits relies on them. Lock the contract so
+    the abstraction can't drift silently — particularly the
+    "value=1 / absent=false" convention and the dangling-reference
+    handling on resolve.
+    """
+
+    def _new_invoice(self, gb):
+        """Make a customer + invoice quickly. Returns the invoice
+        ORM object inside a fresh writable session — caller owns
+        the ``with gb.open()`` block."""
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+
+    def test_get_is_credit_note_false_for_unflagged(self, business_book):
+        """A freshly-created invoice has no credit-note slot;
+        the helper returns False (not None, not raise)."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is False
+
+    def test_set_and_read_is_credit_note(self, business_book):
+        """Round-trip: set True, save, re-open, read back True."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is True
+
+    def test_set_false_clears_slot(self, business_book):
+        """``_set_is_credit_note(False)`` removes the slot entirely
+        (not stores ``0``). Important: the "absent-means-False"
+        convention is what GnuCash desktop reads — storing 0 would
+        be a non-standard state."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, False)
+            book.save()
+        # Slot should be gone — re-read returns False AND the
+        # underlying access raises KeyError on direct lookup.
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_is_credit_note(inv) is False
+            with pytest.raises(KeyError):
+                inv[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+
+    def test_set_false_on_unflagged_is_idempotent(self, business_book):
+        """Clearing a slot that was never set must not raise.
+        Defensive — the higher-level ``delete_credit_note`` path
+        could conceivably hit this case after partial state."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            # Should not raise.
+            BusinessMixin._set_is_credit_note(inv, False)
+
+    def test_applies_to_guid_returns_none_when_unset(self, business_book):
+        """A fresh credit note (no link to source) returns None
+        from the GUID accessor, not KeyError."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_applies_to_invoice_guid(inv) is None
+
+    def test_set_and_read_applies_to_guid(self, business_book):
+        """Round-trip: store a 32-char GUID, read back the same
+        string. The namespaced slot key (``gnc-mcp/applies-to-
+        invoice``) uses ``/`` which creates a sub-slot in GnuCash's
+        KVP store — verifying the round-trip confirms the
+        sub-slot path doesn't lose data."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        source_guid = "0" * 32  # Real shape, but invalid as a lookup
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_applies_to_invoice_guid(inv, source_guid)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._get_applies_to_invoice_guid(inv) == source_guid
+
+    def test_resolve_applies_to_returns_id_and_type(self, business_book):
+        """When the link points at a real invoice, resolve returns
+        the human-readable ``{id, type}`` pair."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Source invoice (the one being credited)
+        source = gb.create_invoice(customer_id="000001")
+        # Credit note (links back to source)
+        credit = gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            cn = book.session.query(Invoice).filter_by(
+                id=credit["id"],
+            ).first()
+            BusinessMixin._set_is_credit_note(cn, True)
+            BusinessMixin._set_applies_to_invoice_guid(cn, source["guid"])
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            cn = book.session.query(Invoice).filter_by(
+                id=credit["id"],
+            ).first()
+            resolved = BusinessMixin._resolve_applies_to(book, cn)
+            assert resolved == {"id": source["id"], "type": "invoice"}
+
+    def test_resolve_applies_to_returns_none_for_dangling_reference(
+        self, business_book,
+    ):
+        """When the linked source GUID doesn't exist (e.g. the
+        source was deleted after the credit note was created),
+        resolve returns None rather than crashing the response.
+        Dangling references shouldn't break ``get_invoice``."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_applies_to_invoice_guid(
+                inv, "deadbeef" * 4,  # 32 chars, won't match any row
+            )
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._resolve_applies_to(book, inv) is None
+
+    def test_resolve_applies_to_returns_none_when_no_link(
+        self, business_book,
+    ):
+        """When the credit-note flag is set but no source link is
+        stored, resolve returns None (a credit note that floats
+        without explicit source is valid — the bookkeeper might
+        attach it via Process Payment netting later)."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        self._new_invoice(gb)
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            assert BusinessMixin._resolve_applies_to(book, inv) is None
+
+
+class TestInvoiceToDictCreditNoteKeys:
+    """The response-shape contract: credit-note keys appear only
+    when the credit-note flag is set on the invoice.
+
+    Normal invoices/bills/vouchers must produce byte-identical
+    output to pre-v1.3 — verified by inspecting the absence of
+    the new keys on unflagged docs. Flagged docs get
+    ``is_credit_note: True``, and ``applies_to: {...}`` when the
+    caller threaded a resolved dict.
+    """
+
+    def test_normal_invoice_omits_credit_note_keys(self, business_book):
+        """Pre-v1.3 contract — a normal invoice produces a dict
+        without ``is_credit_note`` or ``applies_to`` keys."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(inv)
+            assert "is_credit_note" not in result
+            assert "applies_to" not in result
+
+    def test_credit_note_flag_included_when_set(self, business_book):
+        """``is_credit_note: True`` appears when the slot is set."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(inv)
+            assert result["is_credit_note"] is True
+            # applies_to absent when caller didn't pass it.
+            assert "applies_to" not in result
+
+    def test_applies_to_threaded_when_flag_and_kwarg_both_set(
+        self, business_book,
+    ):
+        """When both the credit-note flag AND the caller-resolved
+        applies_to are present, both keys appear in the dict."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with gb.open(readonly=False) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            BusinessMixin._set_is_credit_note(inv, True)
+            book.save()
+        applies_to = {"id": "000028", "type": "invoice"}
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(
+                inv, applies_to=applies_to,
+            )
+            assert result["is_credit_note"] is True
+            assert result["applies_to"] == applies_to
+
+    def test_applies_to_dropped_when_flag_absent(self, business_book):
+        """Defensive — even if a caller mistakenly passes
+        ``applies_to`` for a non-credit-note invoice, the dict
+        shouldn't include it. The credit-note flag is the gate;
+        no flag means no credit-note keys at all."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        applies_to = {"id": "000028", "type": "invoice"}
+        with gb.open(readonly=True) as book:
+            from piecash.business.invoice import Invoice
+            inv = book.session.query(Invoice).filter_by(id="000001").first()
+            result = BusinessMixin._invoice_to_dict(
+                inv, applies_to=applies_to,
+            )
+            assert "is_credit_note" not in result
+            assert "applies_to" not in result
+
+
+class TestCreateCreditNote:
+    """Tests for create_credit_note — the user-facing entry
+    point. Validates owner_type gating, applies_to source
+    matching, currency inheritance and currency conflict
+    rejection, and the credit-note flag / applies_to keys in
+    the response.
+    """
+
+    def test_customer_credit_note_basic(self, business_book):
+        """Standalone credit note — no applies_to, customer
+        side. Response surfaces is_credit_note=True and the
+        customer_id key from the underlying create path."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        result = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        assert result["status"] == "created"
+        assert result["customer_id"] == "000001"
+        assert result["is_credit_note"] is True
+        assert "applies_to" not in result
+        # Round-trip via get_invoice confirms the slot was set.
+        full = gb.get_invoice(result["id"], owner_type="customer")
+        assert full["is_credit_note"] is True
+        assert full["type"] == "invoice"  # owner-type-driven; flag is separate
+
+    def test_vendor_credit_note_basic(self, business_book):
+        """Symmetric — vendor side credit note. Response keys
+        use vendor_id."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        result = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        assert result["status"] == "created"
+        assert result["vendor_id"] == "000001"
+        assert result["is_credit_note"] is True
+
+    def test_employee_owner_type_rejected(self, business_book):
+        """Employees explicitly excluded — no GnuCash desktop UI
+        for employee credit notes."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria")
+        with pytest.raises(ValueError, match="not supported for employees"):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="employee",
+            )
+
+    def test_invalid_owner_type_rejected(self, business_book):
+        """Typos / unknown owner types rejected via the standard
+        _parse_owner_type path."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid owner_type"):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="custmer",
+            )
+
+    def test_applies_to_link_resolved_in_response(self, business_book):
+        """When applies_to_invoice_id is given and valid, the
+        response includes applies_to={id, type} dict."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        source = gb.create_invoice(customer_id="000001")
+        result = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            applies_to_invoice_id=source["id"],
+        )
+        assert result["applies_to"] == {
+            "id": source["id"], "type": "invoice",
+        }
+        # The link also round-trips through get_invoice.
+        full = gb.get_invoice(result["id"], owner_type="customer")
+        assert full["applies_to"]["id"] == source["id"]
+
+    def test_applies_to_source_not_found(self, business_book):
+        """Source ID that doesn't exist is rejected with a clear
+        error rather than silently creating an orphan link."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        with pytest.raises(ValueError, match="Source.*not found"):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id="NOPE",
+            )
+
+    def test_applies_to_cross_owner_rejected(self, business_book):
+        """A credit note for customer A pointing at customer B's
+        invoice is wrong bookkeeping — reject with the
+        mismatched IDs named in the error."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        # Acme is 000001; Beta is 000002.
+        beta_invoice = gb.create_invoice(customer_id="000002")
+        with pytest.raises(
+            ValueError, match="belongs to.*not.*000001",
+        ):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id=beta_invoice["id"],
+            )
+
+    def test_currency_inherited_from_source(self, business_book):
+        """When applies_to is given and currency is omitted, the
+        credit note adopts the source's currency. Important for
+        multi-currency books where issuing a credit note in the
+        wrong currency would create FX confusion."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        # Add EUR to the test book and create a EUR customer.
+        with gb.open(readonly=False) as bk:
+            bk.session.add(
+                piecash.factories.create_currency_from_ISO("EUR")
+            )
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        source = gb.create_invoice(customer_id="000001")
+        # No explicit currency; should inherit EUR from source.
+        cn = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            applies_to_invoice_id=source["id"],
+        )
+        full = gb.get_invoice(cn["id"], owner_type="customer")
+        assert full["currency"] == "EUR"
+
+    def test_currency_mismatch_rejected(self, business_book):
+        """Explicit currency conflicting with source's is rejected
+        — netting across currencies would create FX adjustments
+        outside GnuCash's tracking."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as bk:
+            bk.session.add(
+                piecash.factories.create_currency_from_ISO("EUR")
+            )
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        source = gb.create_invoice(customer_id="000001")
+        with pytest.raises(
+            ValueError, match="doesn't match source.*currency",
+        ):
+            gb.create_credit_note(
+                owner_id="000001",
+                owner_type="customer",
+                applies_to_invoice_id=source["id"],
+                currency="USD",
+            )
+
+    def test_custom_credit_note_id_accepted(self, business_book):
+        """Custom IDs (e.g. 'CN-2026-001') override the
+        auto-counter, same as invoices/bills."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        result = gb.create_credit_note(
+            owner_id="000001",
+            owner_type="customer",
+            credit_note_id="CN-2026-001",
+        )
+        assert result["id"] == "CN-2026-001"
+
+
+class TestAddCreditNoteEntry:
+    """Tests for add_credit_note_entry — validates the target
+    is a credit note before delegating to _add_entry. Account
+    type rules mirror the host owner_type."""
+
+    def test_customer_credit_note_accepts_income_entry(self, business_book):
+        """Customer credit note entry → INCOME account
+        (mirrors regular customer invoice)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        result = gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Out-of-scope work credit",
+            quantity="1", price="500.00",
+        )
+        assert result["status"] == "created"
+        assert result["credit_note_id"] == cn["id"]
+        assert result["total"] == "500.00"
+
+    def test_vendor_credit_note_accepts_expense_entry(self, business_book):
+        """Vendor credit note entry → EXPENSE account (mirrors
+        regular vendor bill)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        result = gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Expenses:Office Supplies",
+            description="Defective product return",
+            quantity="1", price="42.00",
+        )
+        assert result["status"] == "created"
+        assert result["credit_note_id"] == cn["id"]
+
+    def test_non_credit_note_rejected_with_helpful_message(self, business_book):
+        """If the caller passes a regular invoice's ID to
+        add_credit_note_entry, fail loud and name the correct
+        tool to use instead. Pre-fix this would silently add
+        an entry to the wrong document type."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")  # regular invoice
+        with pytest.raises(
+            ValueError, match="not a credit note.*add_invoice_entry",
+        ):
+            gb.add_credit_note_entry(
+                credit_note_id="000001",
+                account="Income:Sales",
+                description="Wrong tool",
+                quantity="1", price="100",
+            )
+
+    def test_credit_note_not_found(self, business_book):
+        """Missing ID → 'Credit note not found' (clearer than
+        the generic invoice error)."""
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Credit note not found"):
+            gb.add_credit_note_entry(
+                credit_note_id="NOPE",
+                account="Income:Sales",
+                description="x", quantity="1", price="1",
+            )
+
+    def test_wrong_account_type_rejected(self, business_book):
+        """Account-type validation flows through to _add_entry;
+        EXPENSE on a customer credit note rejected just as on a
+        customer invoice."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="must be INCOME"):
+            gb.add_credit_note_entry(
+                credit_note_id=cn["id"],
+                account="Expenses:Office Supplies",
+                description="Wrong direction",
+                quantity="1", price="100",
+            )
+
+
+class TestDeleteCreditNote:
+    """Tests for delete_credit_note — validates the target is
+    a credit note, blocks deletion of posted credit notes,
+    cleans up entries."""
+
+    def test_delete_unposted_credit_note(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        result = gb.delete_credit_note(credit_note_id=cn["id"])
+        assert result["status"] == "deleted"
+        # type re-keyed to credit_note (base would say 'invoice')
+        assert result["type"] == "credit_note"
+
+    def test_delete_with_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        result = gb.delete_credit_note(credit_note_id=cn["id"])
+        assert result["status"] == "deleted"
+        assert result["entries_deleted"] == 1
+
+    def test_non_credit_note_rejected(self, business_book):
+        """A regular invoice cannot be deleted via this tool —
+        the validation gate fails loud and names the right tool."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(
+            ValueError, match="not a credit note.*delete_invoice",
+        ):
+            gb.delete_credit_note(credit_note_id="000001")
+
+
+class TestCreditNotePosting:
+    """Tests for the posting-direction reversal on credit notes.
+
+    Customer credit notes credit A/R (reduce receivable) and
+    debit Income (reverse revenue) — opposite of a normal
+    customer invoice. Vendor credit notes debit A/P (reduce
+    payable) and credit Expense (reverse expense). The XOR
+    trick (effective_is_bill = is_bill ^ is_credit_note) is
+    the implementation; these tests lock the math from the
+    outside.
+    """
+
+    def _setup_customer_credit_note(
+        self, gb, amount="100.00",
+    ) -> str:
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Out-of-scope work credit",
+            quantity="1", price=amount,
+        )
+        return cn["id"]
+
+    def _setup_vendor_credit_note(
+        self, gb, amount="100.00",
+    ) -> str:
+        gb.create_vendor(name="Office Depot")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Expenses:Office Supplies",
+            description="Defective product",
+            quantity="1", price=amount,
+        )
+        return cn["id"]
+
+    def test_customer_credit_note_post_reverses_ar(self, business_book):
+        """Posting a customer credit note CREDITS A/R (negative
+        movement) — reducing what the customer owes. Compare to
+        a normal customer invoice which DEBITS A/R (positive)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "credit_note"
+        ar_after = gb.get_balance("Assets:Accounts Receivable")
+        # A/R went DOWN (became more negative or less positive)
+        # by the credit note amount — opposite of an invoice post.
+        assert ar_after - ar_before == Decimal("-100.00")
+        # Income reversed: Income:Sales decreased by 100.
+        # Income natural balance in piecash is negative (credit-
+        # normal), so a debit to Income MAKES the signed balance
+        # LESS NEGATIVE (closer to zero) — net +100 in signed terms.
+        income_balance = gb.get_balance("Income:Sales")
+        # Was 0, now +100 (the debit pushed credit-normal toward 0
+        # and past, into positive signed-balance territory).
+        assert income_balance == Decimal("100.00")
+
+    def test_vendor_credit_note_post_reverses_ap(self, business_book):
+        """Posting a vendor credit note DEBITS A/P (reduces what
+        we owe the vendor) — opposite of a vendor bill which
+        CREDITS A/P (creates payable)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_vendor_credit_note(gb)
+        ap_before = gb.get_balance("Liabilities:Accounts Payable")
+        result = gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "credit_note"
+        ap_after = gb.get_balance("Liabilities:Accounts Payable")
+        # A/P went UP (less negative, or positive) — reducing
+        # the liability from the company's perspective.
+        assert ap_after - ap_before == Decimal("100.00")
+
+    def test_credit_note_unpost_reverses_post(self, business_book):
+        """Unposting a credit note removes the netting and
+        returns A/R / A/P to its pre-post state. Just like
+        unposting an invoice — the transaction is removed."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        ar_before_post = gb.get_balance("Assets:Accounts Receivable")
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        result = gb.unpost_invoice(
+            invoice_id=cn_id, owner_type="customer",
+        )
+        assert result["status"] == "unposted"
+        assert result["type"] == "credit_note"
+        ar_after_unpost = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_after_unpost == ar_before_post
+
+    def test_pay_customer_credit_note_refunds_cash(self, business_book):
+        """``pay_invoice`` on a customer credit note SENDS cash
+        to the customer (refund). Checking goes DOWN, A/R returns
+        from credit balance back toward zero (positive movement)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        checking_before = gb.get_balance("Assets:Checking")
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.pay_invoice(
+            invoice_id=cn_id,
+            payment_account="Assets:Checking",
+            amount="100.00",
+            owner_type="customer",
+        )
+        assert result["status"] == "paid"
+        assert result["type"] == "credit_note"
+        # Cash left the company (refund).
+        assert gb.get_balance("Assets:Checking") - checking_before == Decimal("-100.00")
+        # A/R movement REVERSED the post: credit went DOWN $100
+        # post, then went UP $100 on refund (net to zero).
+        assert gb.get_balance("Assets:Accounts Receivable") - ar_before == Decimal("100.00")
+
+    def test_pay_vendor_credit_note_receives_cash(self, business_book):
+        """``pay_invoice`` on a vendor credit note RECEIVES cash
+        from the vendor (vendor sent us a refund check). Checking
+        UP, A/P down."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_vendor_credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        checking_before = gb.get_balance("Assets:Checking")
+        ap_before = gb.get_balance("Liabilities:Accounts Payable")
+        gb.pay_invoice(
+            invoice_id=cn_id,
+            payment_account="Assets:Checking",
+            amount="100.00",
+            owner_type="vendor",
+        )
+        # Cash arrived.
+        assert gb.get_balance("Assets:Checking") - checking_before == Decimal("100.00")
+        # A/P movement reversed the post.
+        assert gb.get_balance("Liabilities:Accounts Payable") - ap_before == Decimal("-100.00")
+
+
+class TestApplyCreditNote:
+    """Tests for apply_credit_note — the netting tool.
+
+    The headline cases: a posted credit note nets against a
+    posted invoice from the same customer/vendor. Both lots
+    reduce by the applied amount; no cash moves. Validation
+    rejects cross-owner, cross-currency, cross-account, and
+    over-apply attempts.
+    """
+
+    def _setup_pair(
+        self, gb, source_amount="500.00", credit_amount="100.00",
+    ):
+        """Post an invoice and a credit note from the same
+        customer. Returns (invoice_id, credit_note_id)."""
+        gb.create_customer(name="Acme Co")
+        # Source invoice: $500 owed by Acme
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"],
+            account="Income:Sales",
+            description="Services", quantity="1", price=source_amount,
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note: $100 reduction
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Disputed line",
+            quantity="1", price=credit_amount,
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        return src["id"], cn["id"]
+
+    def test_apply_full_credit_against_larger_invoice(self, business_book):
+        """Credit $100 against $500 invoice: credit fully
+        consumed, invoice's remaining drops to $400, A/R net
+        movement is zero (the credit was already booked at post
+        time; apply just transfers between lots)."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        assert result["status"] == "applied"
+        assert result["amount_applied"] == "100.00"
+        # Credit note fully settled, invoice has $400 left.
+        assert Decimal(result["credit_note_remaining"]) == Decimal("0")
+        assert Decimal(result["target_remaining"]) == Decimal("400")
+        # A/R net movement: zero. The apply is a lot-rearrangement,
+        # not a balance change. (Net effect: A/R was 500 - 100 =
+        # 400 after both posts; after apply, still 400.)
+        ar_after = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_after == ar_before
+
+    def test_apply_partial_amount(self, business_book):
+        """Explicit amount, smaller than credit_note_remaining,
+        partially applies and leaves both lots open."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+            amount="40.00",
+        )
+        assert result["amount_applied"] == "40.00"
+        assert Decimal(result["credit_note_remaining"]) == Decimal("60")
+        assert Decimal(result["target_remaining"]) == Decimal("460")
+
+    def test_apply_default_amount_is_min_of_remaining(self, business_book):
+        """When amount is omitted, the apply defaults to
+        min(credit_note_remaining, target_remaining)."""
+        gb = GnuCashBook(str(business_book))
+        # Make the credit LARGER than the invoice so the target
+        # is the limiting side.
+        src_id, cn_id = self._setup_pair(
+            gb, source_amount="50.00", credit_amount="200.00",
+        )
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        # min(200, 50) = 50 applied; invoice fully cleared,
+        # credit note has $150 remaining.
+        assert result["amount_applied"] == "50.00"
+        assert Decimal(result["target_remaining"]) == Decimal("0")
+        assert Decimal(result["credit_note_remaining"]) == Decimal("150")
+
+    def test_apply_over_max_rejected(self, business_book):
+        """Applying more than the lesser-remaining is rejected
+        with both balances named in the error."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        with pytest.raises(ValueError, match="exceeds the smaller of"):
+            gb.apply_credit_note(
+                credit_note_id=cn_id,
+                applies_to_invoice_id=src_id,
+                amount="200.00",
+            )
+
+    def test_apply_to_unposted_target_rejected(self, business_book):
+        """Target must be posted (no lot to settle otherwise)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Source invoice unposted
+        src = gb.create_invoice(customer_id="000001")
+        # Credit note posted
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="not posted"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_unposted_credit_note_rejected(self, business_book):
+        """Credit note must be posted too."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note unposted
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="Credit note.*not posted"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_to_credit_note_rejected(self, business_book):
+        """Target can't itself be a credit note — credits don't
+        net against credits."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn1 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn1["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn1["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn2 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn2["id"], account="Income:Sales",
+            description="x", quantity="1", price="30",
+        )
+        gb.post_invoice(
+            invoice_id=cn2["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="itself a credit note",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn1["id"],
+                applies_to_invoice_id=cn2["id"],
+            )
+
+    def test_apply_cross_owner_rejected(self, business_book):
+        """Credit notes can only net against documents from the
+        same customer/vendor."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        # Beta's invoice
+        beta_inv = gb.create_invoice(customer_id="000002")
+        gb.add_invoice_entry(
+            invoice_id=beta_inv["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=beta_inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Acme's credit note — different owner
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="same customer/vendor",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=beta_inv["id"],
+            )
+
+
+class TestCreditNotePr87ReviewFollowups:
+    """Tests for the five Copilot PR #87 review findings.
+
+    Each test exercises one validation gap or formatting bug
+    Copilot flagged. They live in their own class so the
+    follow-up boundary is visible in test output and traceable
+    back to the review.
+    """
+
+    def test_resolve_credit_note_suggests_voucher_tool_for_voucher(
+        self, business_book,
+    ):
+        """Comment 1: ``_resolve_credit_note`` error message
+        should suggest ``add_voucher_entry`` / ``delete_voucher``
+        when the found document is a voucher (owner_type=5),
+        not ``add_bill_entry`` / ``delete_bill`` (the legacy
+        binary-dispatch bug)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria")
+        # Create a voucher with the same ID space as customer
+        # invoices — owner_type=5 row, not flagged as credit note.
+        gb.create_voucher(employee_id="000001")
+        # Now try to use add_credit_note_entry on the voucher's
+        # ID. _resolve_credit_note finds it, sees it's NOT a
+        # credit note, and emits the suggestion message.
+        with pytest.raises(
+            ValueError, match="add_voucher_entry / delete_voucher",
+        ):
+            gb.add_credit_note_entry(
+                credit_note_id="000001",
+                account="Expenses:Office Supplies",
+                description="x", quantity="1", price="50",
+            )
+
+    def test_create_credit_note_rejects_credit_note_source(
+        self, business_book,
+    ):
+        """Comment 5: linking a credit note to another credit
+        note is semantically meaningless and would mis-label
+        ``applies_to.type``. Reject with a clear message."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # First credit note (standalone, no source link)
+        cn1 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        # Try to create a second credit note pointing at the first
+        with pytest.raises(
+            ValueError, match="itself a credit note",
+        ):
+            gb.create_credit_note(
+                owner_id="000001", owner_type="customer",
+                applies_to_invoice_id=cn1["id"],
+            )
+
+    def test_apply_credit_note_rejects_cross_currency_post_account(
+        self, business_book,
+    ):
+        """Comment 2: cross-currency apply isn't supported —
+        when the document currency differs from the post
+        account's commodity, the netting transaction can't
+        cleanly use a single amount. Reject with a clear
+        message that points at the per-currency A/R convention
+        as the fix.
+
+        Setup uses raw piecash to engineer the cross-currency
+        post state directly (EUR/USD price via piecash.Price,
+        EUR customer + EUR credit note posted to USD A/R).
+        The full posting flow validates the cross-currency
+        guard fires at apply time, not at post."""
+        import piecash
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        # Add EUR + EUR/USD price via raw piecash (same pattern
+        # the multi_currency tests use in test_book.py).
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.flush()
+            usd = bk.default_currency
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date_cls(2026, 5, 24),
+                value="1.10",
+                type="last",
+            ))
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        # Source invoice in EUR posted to USD A/R (cross-currency)
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="Cross-currency apply not supported",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_quantize_to_zero_rejected(self, business_book):
+        """Comment 3: a sub-quantum apply amount (e.g. "0.001"
+        on a USD account with 0.01 quantum) would round to zero
+        and produce a no-op netting transaction reported as
+        success. Guard rejects with the quantum named so the
+        caller knows the minimum."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Set up a posted invoice + credit note pair
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="quantizes to zero",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+                amount="0.001",
+            )
+
+
+class TestCreditNoteDisplayPolish:
+    """Display rendering for credit notes: list_invoices,
+    get_outstanding_invoices, and the dashboard's A/R / A/P
+    netting. Tests pin the surface a reviewer would scan to
+    understand which documents are credit notes at a glance.
+    """
+
+    def test_list_invoices_compact_marks_credit_notes(
+        self, business_book,
+    ):
+        """Credit notes get a ``(CN)`` suffix on the type tag in
+        compact output. Customer credit notes render as ``INV
+        (CN)``; vendor as ``BILL (CN)``. Tab-separated, so the
+        suffix is easy to grep for or split on."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")  # plain INV
+        gb.create_bill(vendor_id="000001")  # plain BILL
+        gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        out = gb.list_invoices()  # compact default
+        # Both credit notes show the (CN) suffix on the tag column.
+        assert "INV (CN)" in out
+        assert "BILL (CN)" in out
+        # Plain invoice/bill still render with bare tags.
+        # Look for the bare tag NOT followed by " (CN)" — a single
+        # tab-after-tag is the canonical separator.
+        assert "\tINV\t" in out  # plain customer invoice
+        assert "\tBILL\t" in out  # plain vendor bill
+
+    def test_get_outstanding_invoices_marks_credit_notes(
+        self, business_book,
+    ):
+        """Outstanding credit notes appear with a ``(CN)`` suffix
+        on the owner column AND a "credit available" annotation
+        in the due-date column — distinguishing them from
+        invoices that read as "X days past due"."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Post a regular invoice (creates one outstanding row)
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Post a credit note (also outstanding — unapplied credit)
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="dispute", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        out = gb.get_outstanding_invoices()  # compact default
+        # Both rows present.
+        assert "000001" in out
+        assert cn["id"] in out
+        # Credit note has the (CN) marker and the "credit
+        # available" action column.
+        assert "(CN)" in out
+        assert "credit available" in out
+        # The "past due" wording does NOT appear for the credit
+        # note row (it should only appear for the regular invoice
+        # if its due date is past; with default test date, the
+        # invoice probably has a due-in or past-due reading —
+        # either way the credit note shouldn't carry that text).
+        # Pull the CN's line specifically and check.
+        cn_line = [
+            ln for ln in out.split("\n") if cn["id"] in ln
+        ][0]
+        assert "past due" not in cn_line
+        assert "credit available" in cn_line
+
+    def test_get_outstanding_verbose_carries_is_credit_note(
+        self, business_book,
+    ):
+        """Verbose output exposes the is_credit_note flag in the
+        dict shape — important for LLMs that filter / branch on
+        credit-note state programmatically."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        rows = gb.get_outstanding_invoices(compact=False)
+        cn_row = next(r for r in rows if r["id"] == cn["id"])
+        assert cn_row["is_credit_note"] is True
+
+    def test_dashboard_ar_nets_credit_notes_against_invoices(
+        self, business_book,
+    ):
+        """The headline regression — get_book_summary's
+        Receivables total uses the raw A/R balance, which already
+        nets credit notes against invoices because the post
+        directions reverse. Invoice $500 + credit note $100 →
+        A/R should read $400 (not $500 + $100 = $600, and not
+        $500). Locking this so a future refactor that misroutes
+        credit-note posting math gets caught.
+        """
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Invoice $500 posted.
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note $100 posted (reduces what customer owes).
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="dispute", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # A/R balance should net to $400 — the raw split sum.
+        ar_balance = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_balance == Decimal("400.00")
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 

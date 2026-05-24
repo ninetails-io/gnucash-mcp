@@ -306,6 +306,16 @@ TOOL_MODULES: dict[str, list[str]] = {
         "create_voucher",
         "add_voucher_entry",
         "delete_voucher",
+        # Credit notes (v1.3). Customer and vendor only —
+        # employees deliberately excluded (no GnuCash desktop
+        # equivalent). Lifecycle (post / unpost / pay / apply)
+        # flows through the polymorphic invoice tools in
+        # freelancer, detecting the credit-note slot to reverse
+        # posting direction.
+        "create_credit_note",
+        "add_credit_note_entry",
+        "delete_credit_note",
+        "apply_credit_note",
         "create_billterm",
         "list_billterms",
         "vendor_spending_report",
@@ -660,7 +670,7 @@ Usage: gnucash-mcp [OPTIONS]
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core (26 tools, always-on). Use "all"
-                       for every module (91 tools).
+                       for every module (95 tools).
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):

@@ -20,6 +20,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _slot_value_str,
     _to_decimal,
     _verify_composite_write,
     _verify_write,
@@ -163,18 +164,25 @@ def _format_vendor_spending_compact(
 
 
 def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
-    """Render outstanding invoices/bills as a one-line-per-doc string.
+    """Render outstanding invoices/bills/credit-notes as a
+    one-line-per-doc string.
 
     Format per row:
 
         000028  Berlin Digital GmbH  EUR 4,200  posted:2026-02-01  due:2026-03-03  55 days past due
         000011  BookkeepingCo (BILL)  USD 450  posted:2026-03-15  due:2026-04-14  13 days past due
+        000035  Emerald Analytics (CN)  USD 500  posted:2026-05-15  credit available
 
     Action columns are the win here: ``due:`` and the days-past-due
     count tell the bookkeeper exactly which invoice is bleeding the
     most days, without forcing a separate calculation. ``(BILL)`` is
     appended to vendor-bill owners so receivables and payables don't
-    get confused at a glance.
+    get confused at a glance. ``(CN)`` marks credit notes — their
+    ``amount_due`` represents the unsettled credit balance
+    (available to apply via ``apply_credit_note`` or refund via
+    ``pay_invoice``), not money owed by the customer/vendor. The
+    "due_date" column reads as "credit available" instead of a
+    past-due count to make that semantic distinction explicit.
 
     When the due date came from the 30-day default (``no_terms`` flag),
     the days count is anchored to the assumption ("days past 30-day
@@ -185,13 +193,33 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     lines = []
     for r in rows:
         owner = r.get("owner_name") or f"#{r['id']}"
-        if r.get("type") == "bill":
+        is_credit_note = r.get("is_credit_note", False)
+        # Owner suffix communicates the document side. Credit
+        # notes win over BILL because the credit-note semantic
+        # is more important — a "(CN)" tag tells the reader the
+        # whole amount column reads as "available credit" not
+        # "amount owed."
+        if is_credit_note:
+            owner = f"{owner} (CN)"
+        elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
         amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
         posted = r.get("date_posted") or "?"
+        # Credit notes don't have a "due date" concept the way
+        # invoices/bills do — they sit as available credit until
+        # applied or refunded. Replace the due column with that
+        # semantic so a reviewer scanning the list immediately
+        # sees the difference.
+        if is_credit_note:
+            action_str = "  credit available"
+            lines.append(
+                f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
+                f"posted:{posted}{action_str}"
+            )
+            continue
         due = r.get("due_date") or "?"
         days = r.get("days_past_due")
         if days is None:
@@ -892,22 +920,37 @@ class BusinessMixin:
         return num, denom
 
     @staticmethod
-    def _invoice_to_dict(invoice, entries=None, owner_name: str | None = None) -> dict:
+    def _invoice_to_dict(
+        invoice,
+        entries=None,
+        owner_name: str | None = None,
+        applies_to: dict | None = None,
+    ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
-        ``owner_type`` (numeric 2/4) was redundant with the
+        ``owner_type`` (numeric 2/4/5) was redundant with the
         human-readable ``type`` field and is dropped. ``is_posted``
         is derivable from ``date_posted`` (non-null = posted) and
         is dropped too. Phase 3C: ``owner_guid`` (raw 32-char hex)
         is dropped in favor of ``owner_name`` resolved by the caller
         — the same readability swap we did for entry account refs.
 
+        Credit-note keys (``is_credit_note``, ``applies_to``) are
+        emitted only when set, so normal invoices/bills/vouchers
+        get the same shape they had before v1.3. ``is_credit_note``
+        is auto-detected from the invoice's slot; ``applies_to``
+        must be resolved by the caller (the static-method shape
+        means we can't query the source invoice here, same
+        constraint as ``owner_name``).
+
         Args:
             invoice: piecash Invoice object.
-            entries: Optional list of entry dicts. If None, entries are not included.
-            owner_name: Resolved customer/vendor name. The static-method
-                shape means we can't query for it here; the caller
-                (``get_invoice``) does the lookup once and threads it.
+            entries: Optional list of entry dicts. If ``None``, entries
+                are not included.
+            owner_name: Resolved customer/vendor/employee name.
+            applies_to: For credit notes only, the ``{id, type}`` dict
+                naming the source invoice. The caller resolves this
+                via ``_resolve_applies_to(book, invoice)``.
         """
         result = {
             "guid": invoice.guid,
@@ -928,6 +971,16 @@ class BusinessMixin:
             "active": bool(invoice.active),
             "currency": invoice.currency.mnemonic if invoice.currency else None,
         }
+        # Credit-note keys conditionally included so the response
+        # shape for normal documents is byte-identical to pre-v1.3.
+        # Both keys present together when the credit-note flag is
+        # set; ``applies_to`` further conditional on whether the
+        # link is set (a credit note that floats without a source
+        # link is unusual but valid).
+        if BusinessMixin._get_is_credit_note(invoice):
+            result["is_credit_note"] = True
+            if applies_to:
+                result["applies_to"] = applies_to
         if entries is not None:
             result["entries"] = entries
         return result
@@ -945,9 +998,16 @@ class BusinessMixin:
         Currency is shown when present so multi-currency books read
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
+        # Type tag: INV/BILL/VCHR per owner_type, plus a "(CN)"
+        # suffix when the credit-note flag is set. Compact-line
+        # consumers can grep for the tag to filter (e.g. "CN" to
+        # find every credit note in a list). The suffix preserves
+        # the owner-side info that a bare "CN" tag would hide.
         inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
             invoice.owner_type, "INV"
         )
+        if self._get_is_credit_note(invoice):
+            inv_type = f"{inv_type} (CN)"
         opened = _safe_invoice_date(invoice, "date_opened")
         date_str = (
             str(opened.date()) if opened else "n/a"
@@ -2036,6 +2096,115 @@ class BusinessMixin:
         """
         return owner_type in (4, 5)
 
+    # Human-readable document label for use in error messages,
+    # status returns, and audit log entries. Title-case canonical
+    # form. Three-way (Invoice / Bill / Voucher) replaces the
+    # legacy binary ``"Bill" if is_bill else "Invoice"`` which
+    # mislabeled vouchers as bills. (Copilot PR #86 review.)
+    _OWNER_TYPE_TO_DOC_LABEL = {2: "Invoice", 4: "Bill", 5: "Voucher"}
+
+    @staticmethod
+    def _doc_label_for(owner_type: int | None) -> str:
+        """Title-case label naming the document type — used in
+        error messages and status strings. ``None`` falls back to
+        the generic ``"Document"`` since we don't know what kind
+        the caller meant; the three known types map cleanly."""
+        if owner_type is None:
+            return "Document"
+        return BusinessMixin._OWNER_TYPE_TO_DOC_LABEL.get(
+            owner_type, "Document"
+        )
+
+    # ── Credit-note slot helpers ─────────────────────────────────
+    #
+    # GnuCash stores the credit-note flag in slots, not as a
+    # column: KVP key ``credit-note``, integer value ``1`` for
+    # credit notes, slot absent for normal documents. The flag
+    # is owner-type-agnostic — a customer invoice or vendor bill
+    # with ``credit-note=1`` is the credit-note form of that
+    # document, with reversed posting direction at post time.
+    #
+    # We add a second slot, ``gnc-mcp/applies-to-invoice``, that
+    # links a credit note back to its source document. GnuCash
+    # desktop doesn't track this linkage — its Process Payment
+    # dialog handles credit-vs-invoice netting through user
+    # selection, not stored references. The ``gnc-mcp/`` prefix
+    # signals this is an MCP-server extension (per our slot
+    # convention: bare keys for universal concepts, namespaced
+    # for tool-specific state). Stored value is the source
+    # invoice's 32-char GUID; displayed as the human-readable
+    # ``{id, type}`` pair via ``_resolve_applies_to``.
+
+    _CREDIT_NOTE_SLOT_KEY = "credit-note"
+    _APPLIES_TO_SLOT_KEY = "gnc-mcp/applies-to-invoice"
+
+    @staticmethod
+    def _get_is_credit_note(invoice) -> bool:
+        """Read the GnuCash ``credit-note`` slot. True iff value=1."""
+        try:
+            raw = invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+        except KeyError:
+            return False
+        return _slot_value_str(raw) == "1"
+
+    @staticmethod
+    def _set_is_credit_note(invoice, value: bool = True) -> None:
+        """Set or clear the GnuCash ``credit-note`` slot.
+
+        Stores integer ``1`` for credit notes (GnuCash convention);
+        clearing removes the slot entirely so the absence-means-False
+        invariant holds for both desktop and MCP readers.
+        """
+        if value:
+            invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY] = 1
+        else:
+            try:
+                del invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
+            except KeyError:
+                pass
+
+    @staticmethod
+    def _get_applies_to_invoice_guid(invoice) -> str | None:
+        """Read the source-invoice GUID this credit note applies
+        to, if set. Returns None when no source is linked."""
+        try:
+            raw = invoice[BusinessMixin._APPLIES_TO_SLOT_KEY]
+        except KeyError:
+            return None
+        val = _slot_value_str(raw)
+        return val if val else None
+
+    @staticmethod
+    def _set_applies_to_invoice_guid(invoice, source_guid: str) -> None:
+        """Link this credit note to a source invoice by GUID. The
+        stored value is the canonical 32-char hex GUID; display
+        helpers resolve it back to the human-readable ID."""
+        invoice[BusinessMixin._APPLIES_TO_SLOT_KEY] = source_guid
+
+    @staticmethod
+    def _resolve_applies_to(book, invoice) -> dict | None:
+        """Resolve the applies-to slot to a ``{id, type}`` dict
+        suitable for display in tool responses. Returns None when:
+
+        - no source is linked (normal credit note that floats),
+        - the slot points at a GUID that doesn't exist anymore
+          (dangling reference; surface as absent rather than
+          crash the response).
+        """
+        guid = BusinessMixin._get_applies_to_invoice_guid(invoice)
+        if not guid:
+            return None
+        from piecash.business.invoice import Invoice
+        source = book.session.query(Invoice).filter_by(guid=guid).first()
+        if not source:
+            return None
+        return {
+            "id": source.id,
+            "type": BusinessMixin._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                source.owner_type, "invoice"
+            ),
+        }
+
     def _create_business_document(
         self,
         *,
@@ -2046,6 +2215,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         doc_id: str | None = None,
+        extra_slots: dict | None = None,
     ) -> dict:
         """Shared create path for customer invoice and vendor bill.
 
@@ -2057,7 +2227,8 @@ class BusinessMixin:
         with ``_verify_write``, and returns the canonical response.
 
         Args:
-            owner_type: 2 = customer invoice, 4 = vendor bill.
+            owner_type: 2 = customer invoice, 4 = vendor bill,
+                5 = employee voucher.
             owner_id: Customer ID or vendor ID (human-readable '000001').
             date_opened: ISO date; defaults to now.
             notes: Free-text notes.
@@ -2216,6 +2387,19 @@ class BusinessMixin:
                 f"{config['doc_label']} '{doc_id}'",
             )
 
+            # Apply caller-supplied slots BEFORE save so the slot
+            # writes and the row insert land in a single
+            # transaction. The credit-note feature uses this to
+            # set ``credit-note`` and ``gnc-mcp/applies-to-invoice``
+            # without opening a second write session — preserves
+            # the "one book open per write" invariant.
+            if extra_slots:
+                new_inv = book.session.query(Invoice).filter_by(
+                    guid=inv_guid,
+                ).first()
+                for key, value in extra_slots.items():
+                    new_inv[key] = value
+
             book.save()
 
             return {
@@ -2340,6 +2524,395 @@ class BusinessMixin:
             term=term,
             doc_id=voucher_id,
         )
+
+    # ── Credit-note resolution ─────────────────────────────────
+    #
+    # Credit notes share the ``invoices`` table with their non-
+    # credit twins; what distinguishes them is the ``credit-note``
+    # slot. Tools like ``add_credit_note_entry`` and
+    # ``delete_credit_note`` need to look up a document by ID,
+    # validate it IS a credit note (not a regular invoice/bill
+    # that happens to share the ID space), and report a clear
+    # error otherwise. This helper centralizes that lookup +
+    # validation.
+
+    def _resolve_credit_note(
+        self, book, credit_note_id: str, owner_type: str | None = None,
+    ):
+        """Find a credit note by ID, validating that the document
+        is in fact flagged as a credit note.
+
+        Args:
+            book: Open piecash book session.
+            credit_note_id: Human-readable ID.
+            owner_type: Optional 'customer' or 'vendor' for
+                disambiguation when the ID collides across owner
+                types. None lets ``_find_invoice`` either resolve
+                an unambiguous match or raise its collision error.
+
+        Returns:
+            piecash Invoice object (the credit-note row).
+
+        Raises:
+            ValueError: If not found, found but not a credit note,
+                or ambiguous across owner types.
+        """
+        int_ot = (
+            self._parse_owner_type(owner_type)
+            if owner_type else None
+        )
+        if int_ot == 5:
+            # Employee credit notes are deliberately excluded —
+            # the create path rejects them, but a caller could
+            # still try to use this helper with owner_type='employee'.
+            # Surface the same constraint here.
+            raise ValueError(
+                "Credit notes are not supported for employees. "
+                "Use unpost_invoice + edit on the original voucher "
+                "to amend an employee reimbursement."
+            )
+        inv = self._find_invoice(
+            book, credit_note_id, owner_type=int_ot,
+        )
+        if not inv:
+            raise ValueError(
+                f"Credit note not found: {credit_note_id}"
+            )
+        if not self._get_is_credit_note(inv):
+            # Found the ID but it's a regular invoice/bill/voucher.
+            # Name the right tool to use instead so the LLM can
+            # correct course in one hop. Three-way dispatch
+            # (Copilot PR #87 review): the legacy binary "INV vs
+            # BILL" branch would have suggested add_bill_entry /
+            # delete_bill for a voucher (owner_type=5) — wrong.
+            _ENTRY_TOOLS = {
+                2: "add_invoice_entry",
+                4: "add_bill_entry",
+                5: "add_voucher_entry",
+            }
+            _DELETE_TOOLS = {
+                2: "delete_invoice",
+                4: "delete_bill",
+                5: "delete_voucher",
+            }
+            entry_tool = _ENTRY_TOOLS.get(
+                inv.owner_type, "add_invoice_entry",
+            )
+            delete_tool = _DELETE_TOOLS.get(
+                inv.owner_type, "delete_invoice",
+            )
+            raise ValueError(
+                f"{self._doc_label_for(inv.owner_type)} "
+                f"{credit_note_id} is not a credit note. Use "
+                f"{entry_tool} / {delete_tool} for the regular "
+                f"document, or check the ID."
+            )
+        return inv
+
+    def create_credit_note(
+        self,
+        owner_id: str,
+        owner_type: str,
+        applies_to_invoice_id: str | None = None,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        credit_note_id: str | None = None,
+    ) -> dict:
+        """Create a credit note against a customer invoice or
+        vendor bill.
+
+        A credit note is the audit-trail-preserving way to reverse
+        part or all of a posted invoice. At post time the posting
+        direction reverses: customer credit notes debit Income and
+        credit A/R (reducing what the customer owes you); vendor
+        credit notes debit A/P and credit Expense (reducing what
+        you owe the vendor).
+
+        **Linking**: when ``applies_to_invoice_id`` is given, the
+        credit note is linked to the source. Validation ensures
+        the source has the same owner_id and currency. The link is
+        stored as a custom slot (``gnc-mcp/applies-to-invoice``)
+        and surfaced in ``get_invoice`` / ``list_invoices``
+        responses. Highly recommended for audit trail; can be
+        omitted for floating credit notes the bookkeeper will
+        attach to a future invoice via ``apply_credit_note``.
+
+        **Employees deliberately excluded**: GnuCash desktop has
+        no UI for employee credit notes. Supporting them at the
+        MCP layer would create documents the desktop app couldn't
+        view or edit. For employee corrections, use
+        ``unpost_invoice`` + edit on the original voucher.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., '000001').
+            owner_type: 'customer' or 'vendor'.
+            applies_to_invoice_id: Optional source invoice/bill ID.
+                Must belong to the same owner and use the same
+                currency. Stored as a GUID slot for robustness;
+                resolved back to ``{id, type}`` for display.
+            date_opened: ISO date; defaults to today.
+            notes: Free-text notes (e.g., "Credit for out-of-scope
+                work on invoice 000028").
+            currency: ISO currency code. Defaults to the source
+                invoice's currency when ``applies_to_invoice_id``
+                is given, else the owner's currency, else the
+                book's default.
+            term: Billterm name. Rarely used for credit notes but
+                accepted for symmetry.
+            credit_note_id: Custom ID. If omitted, auto-generates
+                from ``counter_invoice`` (customer) or
+                ``counter_bill`` (vendor) — GnuCash desktop shares
+                the invoice/bill counter with credit notes rather
+                than maintaining a separate sequence.
+
+        Returns:
+            Dict with ``guid``, ``id``, ``customer_id`` /
+            ``vendor_id``, ``date_opened``, ``status='created'``,
+            ``is_credit_note=True``, and ``applies_to={id, type}``
+            when linked.
+
+        Raises:
+            ValueError: If owner_type is invalid or 'employee'; if
+                applies_to_invoice_id is given but the source
+                doesn't exist, belongs to a different owner, or
+                has a currency that conflicts with an explicit
+                ``currency`` argument.
+        """
+        int_owner_type = self._parse_owner_type(owner_type)
+        if int_owner_type == 5:
+            raise ValueError(
+                "Credit notes are not supported for employees. "
+                "GnuCash desktop has no UI for employee credit "
+                "notes; supporting them at the MCP layer would "
+                "create documents desktop users can't view or "
+                "edit. Use unpost_invoice + edit on the original "
+                "voucher to amend an employee reimbursement."
+            )
+        if int_owner_type not in (2, 4):
+            # Defensive — _parse_owner_type would only return 2,
+            # 4, or 5; this guards against a future addition.
+            raise ValueError(
+                f"Credit notes require owner_type 'customer' or "
+                f"'vendor', got {owner_type!r}."
+            )
+
+        # Always set the credit-note flag.
+        extra_slots: dict = {self._CREDIT_NOTE_SLOT_KEY: 1}
+        applies_to_dict: dict | None = None
+
+        # Validate + capture data from the source invoice if linked.
+        # This is a read-only lookup so it doesn't conflict with
+        # the create path's separate write session.
+        if applies_to_invoice_id:
+            with self.open(readonly=True) as book:
+                source = self._find_invoice(
+                    book, applies_to_invoice_id,
+                    owner_type=int_owner_type,
+                )
+                if not source:
+                    raise ValueError(
+                        f"Source "
+                        f"{self._doc_label_for(int_owner_type).lower()} "
+                        f"not found: {applies_to_invoice_id}"
+                    )
+                # Cross-owner check — credit note for customer A
+                # cannot apply to customer B's invoice.
+                source_owner = self._find_invoice_owner_by_guid(
+                    book, source.owner_type, source.owner_guid,
+                )
+                if source_owner is None:
+                    raise ValueError(
+                        f"Source {applies_to_invoice_id} has a "
+                        f"dangling owner reference — can't verify "
+                        f"it belongs to {owner_id}."
+                    )
+                if source_owner.id != owner_id:
+                    raise ValueError(
+                        f"Source "
+                        f"{self._doc_label_for(int_owner_type).lower()} "
+                        f"{applies_to_invoice_id} belongs to "
+                        f"{source_owner.id!r}, not {owner_id!r}. "
+                        f"Credit notes must apply to a document "
+                        f"from the same customer/vendor."
+                    )
+                # Source must be a regular invoice/bill, not
+                # itself a credit note. Credit-note-against-
+                # credit-note is semantically meaningless: a
+                # credit reverses a posted document; chaining
+                # them doesn't represent anything in real
+                # bookkeeping. (Copilot PR #87 review.)
+                if self._get_is_credit_note(source):
+                    raise ValueError(
+                        f"Source {applies_to_invoice_id} is "
+                        f"itself a credit note. Link credit "
+                        f"notes to regular invoices or bills, "
+                        f"not to other credit notes."
+                    )
+                source_currency_mnemonic = (
+                    source.currency.mnemonic
+                    if source.currency else None
+                )
+                source_guid = source.guid
+
+            # Currency rules:
+            #  - If caller passed currency, it must match source's.
+            #  - If caller omitted currency, inherit source's.
+            if currency and source_currency_mnemonic and currency != source_currency_mnemonic:
+                raise ValueError(
+                    f"Credit note currency {currency!r} doesn't "
+                    f"match source {applies_to_invoice_id}'s "
+                    f"currency {source_currency_mnemonic!r}. "
+                    f"Netting a credit against an invoice in a "
+                    f"different currency would create an FX "
+                    f"adjustment GnuCash doesn't track here."
+                )
+            if currency is None and source_currency_mnemonic:
+                currency = source_currency_mnemonic
+
+            extra_slots[self._APPLIES_TO_SLOT_KEY] = source_guid
+            applies_to_dict = {
+                "id": applies_to_invoice_id,
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    int_owner_type, "invoice",
+                ),
+            }
+
+        result = self._create_business_document(
+            owner_type=int_owner_type,
+            owner_id=owner_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=credit_note_id,
+            extra_slots=extra_slots,
+        )
+
+        # Augment the standard response with credit-note keys.
+        # The owner_id key from _create_business_document is
+        # ``customer_id`` (for owner_type=2) or ``vendor_id``
+        # (for owner_type=4) per _BUSINESS_DOC_CONFIG; we keep it.
+        result["is_credit_note"] = True
+        if applies_to_dict:
+            result["applies_to"] = applies_to_dict
+        return result
+
+    def add_credit_note_entry(
+        self,
+        credit_note_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Add a line item to a credit note.
+
+        Mirrors ``add_invoice_entry`` / ``add_bill_entry`` but
+        validates the target IS a credit note before delegating
+        to ``_add_entry``. The flag is the gate; a regular invoice
+        with the same ID gets a clear "not a credit note" error
+        naming the right tool to use instead.
+
+        The underlying entry shape is identical to a non-credit
+        document of the same owner_type: customer credit notes
+        accept INCOME accounts (the reversal reduces revenue);
+        vendor credit notes accept EXPENSE/ASSET (the reversal
+        reduces the recognized expense / capitalized inventory).
+
+        Args:
+            credit_note_id: Credit note ID (e.g., '000032').
+            account: Account path. INCOME for customer credit
+                notes, EXPENSE or ASSET for vendor credit notes.
+            description: Line item description.
+            quantity: Quantity as decimal string.
+            price: Unit price as decimal string. Positive even on
+                a credit note — the credit-note flag inverts the
+                posting direction at post time, so the entry
+                shape stays the same as a normal document.
+            owner_type: Optional 'customer' or 'vendor'. Required
+                only when the credit_note_id collides across owner
+                types (rare). Auto-detect otherwise.
+
+        Returns:
+            Dict with ``guid``, ``credit_note_id``, ``description``,
+            ``quantity``, ``price``, ``total``, ``status='created'``.
+
+        Raises:
+            ValueError: If the credit note isn't found, isn't a
+                credit note, account type is wrong for the owner
+                type, or the credit note is already posted.
+        """
+        with self.open(readonly=True) as book:
+            inv = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            resolved_owner_type = inv.owner_type
+
+        # Delegate to _add_entry with the resolved owner_type.
+        # The helper's allowed-account-type validation is the same
+        # for credit notes as for the corresponding regular
+        # document (the entry shape is identical; only the post-
+        # time direction differs).
+        result = self._add_entry(
+            owner_type=resolved_owner_type,
+            doc_id=credit_note_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+        )
+        # Surface the credit_note_id key in the response (the
+        # base helper returns invoice_id / bill_id based on
+        # owner_type config; we re-key for credit-note clarity).
+        legacy_key = (
+            "invoice_id" if resolved_owner_type == 2 else "bill_id"
+        )
+        if legacy_key in result:
+            result["credit_note_id"] = result.pop(legacy_key)
+        return result
+
+    def delete_credit_note(
+        self,
+        credit_note_id: str,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Delete an unposted credit note.
+
+        Mirrors ``delete_invoice`` / ``delete_bill`` but validates
+        the target IS a credit note before delegating to
+        ``_delete_invoice_or_bill``. Posted credit notes cannot be
+        deleted — unpost first via ``unpost_invoice``, then delete.
+
+        Args:
+            credit_note_id: Credit note ID.
+            owner_type: Optional disambiguator when the ID collides
+                across customer/vendor sides.
+
+        Returns:
+            Dict with ``id``, ``guid``, ``entries_deleted``,
+            ``type='credit_note'``, ``status='deleted'``.
+
+        Raises:
+            ValueError: If not found, not a credit note, or
+                posted.
+        """
+        with self.open(readonly=True) as book:
+            inv = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            resolved_owner_type = inv.owner_type
+
+        result = self._delete_invoice_or_bill(
+            credit_note_id, owner_type=resolved_owner_type,
+        )
+        # Re-key the response: base returns ``type`` of
+        # ``invoice``/``bill``; for a credit note the truth is
+        # ``credit_note`` (the slot was the differentiator).
+        result["type"] = "credit_note"
+        return result
 
     # owner_type → per-document config table for ``_add_entry``.
     # Same dispatch idiom as ``_BUSINESS_DOC_CONFIG`` for create —
@@ -2721,7 +3294,7 @@ class BusinessMixin:
         with self.open() as book:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
-                raise ValueError(f"Invoice/bill not found: {invoice_id}")
+                raise ValueError(f"Document not found: {invoice_id}")
 
             is_bill = self._is_bill_side(inv.owner_type)
 
@@ -2770,8 +3343,18 @@ class BusinessMixin:
             )
             owner_name = owner.name if owner else None
 
+            # Resolve applies_to for credit notes — the source
+            # link is stored as a GUID slot; we render it as the
+            # human-readable ``{id, type}`` pair. ``_invoice_to_dict``
+            # only emits the ``applies_to`` key when the credit-note
+            # flag is also set, so normal invoices/bills get the
+            # same shape they did pre-v1.3.
+            applies_to = self._resolve_applies_to(book, inv)
             result = self._invoice_to_dict(
-                inv, entries=entries, owner_name=owner_name,
+                inv,
+                entries=entries,
+                owner_name=owner_name,
+                applies_to=applies_to,
             )
             result["total"] = str(total)
             return result
@@ -2846,7 +3429,7 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             # Truthy check rather than ``is not None``: piecash's
@@ -2865,7 +3448,8 @@ class BusinessMixin:
             # check in ``_invoice_dependency_check``.
             if _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is already posted"
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is already posted"
                 )
 
             is_bill = self._is_bill_side(inv.owner_type)
@@ -2940,9 +3524,19 @@ class BusinessMixin:
             # Build transaction splits
             # For customer invoice: A/R debit (positive), income credit (negative)
             # For vendor bill: A/P credit (negative), expense debit (positive)
+            # For credit notes: posting direction reverses — customer
+            # credit note credits A/R (reduces receivable) and debits
+            # Income (reverses recognized revenue); vendor credit note
+            # debits A/P (reduces payable) and credits Expense (reverses
+            # recognized expense). Expressed as XOR: a credit note flips
+            # whichever side it was on, so customer-credit-note behaves
+            # like vendor-bill posting and vice-versa. ``effective_is_bill``
+            # captures this — the rest of the math is unchanged.
+            is_credit_note = self._get_is_credit_note(inv)
+            effective_is_bill = is_bill ^ is_credit_note
             piecash_splits = []
 
-            if is_bill:
+            if effective_is_bill:
                 ar_ap_value = -grand_total
             else:
                 ar_ap_value = grand_total
@@ -2965,7 +3559,7 @@ class BusinessMixin:
                         f"Entry account not found: {acct_guid}"
                     )
 
-                if is_bill:
+                if effective_is_bill:
                     split_value = acct_total
                 else:
                     split_value = -acct_total
@@ -3020,8 +3614,17 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                # When the credit-note flag is set, surface
+                # ``type='credit_note'`` so the audit log
+                # decorator swaps entity_type accordingly.
+                # Otherwise the owner-type-driven label
+                # (invoice/bill/voucher) wins.
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "status": "posted",
                 "total": str(grand_total),
@@ -3073,16 +3676,20 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             if not _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is not posted"
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is not posted"
                 )
 
             is_bill = self._is_bill_side(inv.owner_type)
-            doc_label = "Bill" if is_bill else "Invoice"
+            # Three-way label dispatch — was a binary "Bill if
+            # is_bill else Invoice" that mislabeled vouchers as
+            # bills (Copilot PR #86 review).
+            doc_label = self._doc_label_for(inv.owner_type)
 
             # Capture before-state for the audit log: the user wants
             # to see what they unposted ("was posted: 2026-04-01,
@@ -3094,8 +3701,12 @@ class BusinessMixin:
             )
             self._stage_audit_before({
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "type": (
+                    "credit_note"
+                    if self._get_is_credit_note(inv)
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "date_posted": (
                     str(prev_post_date.date()) if prev_post_date else None
@@ -3146,6 +3757,17 @@ class BusinessMixin:
             inv.post_account = None
             book.flush()
 
+            # Capture the credit-note flag BEFORE we delete the
+            # posting transaction / lot. Post-save, slot reads on
+            # the invoice can flake with the "Multiple rows
+            # returned with uselist=False" piecash quirk when
+            # lots and transactions are being deleted in the
+            # same session. Reading the flag now and stashing it
+            # avoids the state-disturbance window.
+            is_credit_note = self._get_is_credit_note(inv)
+            inv_id_snapshot = inv.id
+            owner_type_snapshot = inv.owner_type
+
             # Delete the posting transaction (which cascades its
             # splits) and the lot (now empty after the inv.post_lot
             # = None nullified the only split-lot link).
@@ -3157,9 +3779,13 @@ class BusinessMixin:
             book.save()
 
             return {
-                "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "id": inv_id_snapshot,
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        owner_type_snapshot, "invoice"
+                    )
                 ),
                 "status": "unposted",
             }
@@ -3243,12 +3869,13 @@ class BusinessMixin:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
-                    f"Invoice/bill not found: {invoice_id}"
+                    f"Document not found: {invoice_id}"
                 )
 
             if not _is_invoice_posted(inv):
                 raise ValueError(
-                    f"Invoice {invoice_id} is not posted — "
+                    f"{self._doc_label_for(inv.owner_type)} "
+                    f"{invoice_id} is not posted — "
                     f"post it before recording payment"
                 )
 
@@ -3394,8 +4021,18 @@ class BusinessMixin:
                     f"{pay_acct.commodity.mnemonic}."
                 )
 
-            if is_bill:
-                # Pay vendor bill: debit A/P (positive), credit bank (negative)
+            # Credit-note refund direction reverses: paying a
+            # customer credit note means SENDING cash to the
+            # customer (refund), so signs flip versus a normal
+            # customer invoice payment. Same XOR trick as
+            # post_invoice — a credit note swaps the is_bill
+            # branch.
+            is_credit_note = self._get_is_credit_note(inv)
+            effective_is_bill = is_bill ^ is_credit_note
+
+            if effective_is_bill:
+                # Pay vendor bill (or refund customer credit note):
+                # debit A/P (positive), credit bank (negative)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=payment_amount,
@@ -3410,7 +4047,9 @@ class BusinessMixin:
                     memo="",
                 )
             else:
-                # Receive customer payment: credit A/R (negative), debit bank (positive)
+                # Receive customer payment (or refund-in from a
+                # vendor credit note): credit A/R (negative),
+                # debit bank (positive)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=-payment_amount,
@@ -3442,10 +4081,15 @@ class BusinessMixin:
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
+                # FX gain/loss direction follows the effective
+                # is_bill of THIS payment — a customer credit
+                # note refund behaves like a vendor bill payment
+                # from the FX-direction perspective (cash leaving
+                # the company on the bank side).
                 fx_result = self._compute_fx_gain_loss(
                     book,
                     inv=inv,
-                    is_bill=is_bill,
+                    is_bill=effective_is_bill,
                     pay_acct=pay_acct,
                     payment_amount=payment_amount,
                     pay_quantity=pay_quantity,
@@ -3479,8 +4123,12 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "status": "paid",
                 "amount_paid": str(payment_amount),
@@ -3518,6 +4166,351 @@ class BusinessMixin:
                         result["fx_notice"] = fx_result["fx_notice"]
 
         return result
+
+    def apply_credit_note(
+        self,
+        credit_note_id: str,
+        applies_to_invoice_id: str,
+        amount: str | None = None,
+        apply_date: str | None = None,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Net a posted credit note against a posted invoice/bill
+        from the same owner. No cash moves — the credit balance
+        transfers between lots on the same A/R or A/P account.
+
+        This is the "Process Payment with both checked" workflow
+        from GnuCash desktop, factored into a dedicated tool for
+        LLM legibility. ``pay_invoice`` continues to handle the
+        cash-refund case (when the customer was already paid and
+        the credit note represents money owed BACK to them).
+
+        Booking shape:
+
+        - **Customer side**: two splits on the A/R account, summing
+          to zero. One debit assigned to the credit note's lot
+          (settles the negative balance there); one credit assigned
+          to the target invoice's lot (reduces what's still owed).
+        - **Vendor side**: symmetric — two splits on the A/P
+          account, credit on the credit note's lot (settles the
+          positive balance), debit on the target's lot (reduces
+          what's still owed to the vendor).
+
+        Validation:
+
+        - Both documents must be posted (nothing to net otherwise).
+        - Same owner (customer A's credit note can't net B's bill).
+        - Same currency (cross-currency netting would create FX
+          adjustments outside GnuCash's tracking).
+        - Same A/R or A/P post account.
+        - Target must be a regular invoice/bill (not another credit
+          note — credits don't net against credits).
+        - ``amount`` (if supplied) must not exceed the lesser of
+          the two remaining balances.
+
+        Args:
+            credit_note_id: The credit note to apply (must be
+                posted).
+            applies_to_invoice_id: The target invoice/bill to net
+                against (must be posted, same owner, same currency).
+            amount: Amount to apply, as a decimal string in the
+                document currency. Defaults to ``min(credit_note_
+                remaining, target_remaining)`` — apply as much as
+                possible.
+            apply_date: ISO date for the netting transaction.
+                Defaults to today.
+            owner_type: Optional disambiguator for ID collisions.
+
+        Returns:
+            Dict with ``credit_note_id``, ``applies_to_invoice_id``,
+            ``amount_applied``, ``credit_note_remaining``,
+            ``target_remaining``, ``transaction_guid``,
+            ``apply_date``, ``status='applied'``.
+
+        Raises:
+            ValueError: For any of the validation failures above,
+                or if ``amount`` rounds to zero in the target
+                commodity.
+        """
+        from datetime import datetime as _dt
+        # piecash Transaction.post_date wants a ``date`` object, not
+        # a ``datetime`` — passing a datetime raises GncValidationError.
+        parsed_date = (
+            _dt.strptime(apply_date, "%Y-%m-%d").date()
+            if apply_date else _dt.now().date()
+        )
+
+        with self.open(readonly=False) as book:
+            # Resolve the credit note (validates it IS a credit note).
+            cn = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            # Resolve the target — use the credit note's owner_type
+            # to disambiguate (they must match anyway).
+            target = self._find_invoice(
+                book, applies_to_invoice_id,
+                owner_type=cn.owner_type,
+            )
+            if not target:
+                raise ValueError(
+                    f"Target {self._doc_label_for(cn.owner_type).lower()} "
+                    f"not found: {applies_to_invoice_id}"
+                )
+
+            # Target must NOT be a credit note itself — netting
+            # credits against credits is semantically meaningless.
+            if self._get_is_credit_note(target):
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} is itself a "
+                    f"credit note. Apply credit notes to regular "
+                    f"invoices/bills, not to each other."
+                )
+
+            # Both must be posted (no lots to net otherwise).
+            if not _is_invoice_posted(cn):
+                raise ValueError(
+                    f"Credit note {credit_note_id} is not posted "
+                    f"— post it before applying."
+                )
+            if not _is_invoice_posted(target):
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} is not "
+                    f"posted — post it before applying credits."
+                )
+
+            # Same owner check.
+            if cn.owner_guid != target.owner_guid:
+                cn_owner = self._find_invoice_owner_by_guid(
+                    book, cn.owner_type, cn.owner_guid,
+                )
+                target_owner = self._find_invoice_owner_by_guid(
+                    book, target.owner_type, target.owner_guid,
+                )
+                raise ValueError(
+                    f"Credit note belongs to "
+                    f"{cn_owner.id if cn_owner else '?'!r} but "
+                    f"target belongs to "
+                    f"{target_owner.id if target_owner else '?'!r}. "
+                    f"Credit notes can only net against documents "
+                    f"from the same customer/vendor."
+                )
+
+            # Same currency check.
+            if cn.currency_guid != target.currency_guid:
+                raise ValueError(
+                    f"Credit note currency "
+                    f"{cn.currency.mnemonic!r} doesn't match "
+                    f"target currency {target.currency.mnemonic!r}. "
+                    f"Cross-currency netting would create an FX "
+                    f"adjustment outside GnuCash's tracking."
+                )
+
+            # Same A/R or A/P account.
+            if cn.post_acc_guid != target.post_acc_guid:
+                raise ValueError(
+                    f"Credit note posted to "
+                    f"{cn.post_account.fullname!r} but target "
+                    f"posted to {target.post_account.fullname!r}. "
+                    f"Both must use the same A/R or A/P account "
+                    f"to net."
+                )
+
+            post_acct = cn.post_account
+
+            # Cross-currency apply isn't supported here — the
+            # netting transaction is in the post account's
+            # commodity, so the document currency must match.
+            # In practice every well-formed book has per-currency
+            # A/R accounts (Alex has 'Accounts Receivable',
+            # 'Accounts Receivable EUR', 'Accounts Receivable
+            # CAD'), so EUR documents post to EUR A/R and the
+            # commodity equals the document currency. The case
+            # this catches: someone deliberately posted a EUR
+            # invoice to a USD A/R account (unusual, but
+            # ``post_invoice`` supports it via FX rates). For
+            # those, apply_credit_note rejects with a clear
+            # message rather than silently producing wrong split
+            # values. (Copilot PR #87 review.)
+            if cn.currency_guid != post_acct.commodity.guid:
+                raise ValueError(
+                    f"Cross-currency apply not supported: credit "
+                    f"note currency {cn.currency.mnemonic!r} "
+                    f"differs from post account commodity "
+                    f"{post_acct.commodity.mnemonic!r}. The "
+                    f"netting transaction must be in the post "
+                    f"account's commodity. Most books have "
+                    f"per-currency A/R accounts; check that the "
+                    f"credit note was posted to the right one."
+                )
+
+            # Resolve lots by GUID — same pattern as pay_invoice.
+            cn_lot = next(
+                (l for l in post_acct.lots if l.guid == cn.post_lot_guid),
+                None,
+            )
+            target_lot = next(
+                (l for l in post_acct.lots if l.guid == target.post_lot_guid),
+                None,
+            )
+            if cn_lot is None or target_lot is None:
+                raise ValueError(
+                    f"Could not resolve lots for credit note "
+                    f"or target — book may be inconsistent."
+                )
+
+            # Lot balances. Customer-side: target_lot is positive
+            # (receivable), cn_lot is negative (credit). Vendor
+            # side: signs reversed. Either way, ``abs()`` gives
+            # the available amount on each side.
+            cn_remaining = abs(self._calculate_lot_balance(cn_lot))
+            target_remaining = abs(
+                self._calculate_lot_balance(target_lot)
+            )
+
+            if cn_remaining == 0:
+                raise ValueError(
+                    f"Credit note {credit_note_id} has no "
+                    f"remaining balance to apply (already fully "
+                    f"netted or refunded)."
+                )
+            if target_remaining == 0:
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} has no "
+                    f"remaining balance — nothing to apply credit "
+                    f"against."
+                )
+
+            max_apply = min(cn_remaining, target_remaining)
+            if amount is None:
+                apply_amount = max_apply
+            else:
+                apply_amount = _to_decimal(amount)
+                if apply_amount <= 0:
+                    raise ValueError(
+                        f"Apply amount must be positive, got "
+                        f"{apply_amount}."
+                    )
+                if apply_amount > max_apply:
+                    raise ValueError(
+                        f"Apply amount {apply_amount} exceeds the "
+                        f"smaller of credit-note remaining "
+                        f"({cn_remaining}) and target remaining "
+                        f"({target_remaining}). Use {max_apply} "
+                        f"or less."
+                    )
+
+            # Quantize the apply amount to the post account's
+            # commodity. Defensive guard against a sub-quantum
+            # amount (e.g. ``amount="0.001"`` on a USD account
+            # with 0.01 quantum) producing a no-op netting
+            # transaction that reports success while moving
+            # nothing. Same shape as the cross-currency
+            # quantize-to-zero guard in pay_invoice.
+            # (Copilot PR #87 review.)
+            quantum_pre = _commodity_quantum(post_acct.commodity)
+            apply_amount = apply_amount.quantize(quantum_pre)
+            if apply_amount == 0:
+                raise ValueError(
+                    f"Apply amount quantizes to zero in "
+                    f"{post_acct.commodity.mnemonic} "
+                    f"(quantum={quantum_pre}). Pass an amount "
+                    f"at or above the account's smallest "
+                    f"divisible unit."
+                )
+
+            # Build the netting transaction:
+            #   Customer side: cn_lot gets +apply_amount (settles
+            #     credit toward zero from negative); target_lot
+            #     gets -apply_amount (reduces receivable).
+            #   Vendor side: cn_lot gets -apply_amount; target_lot
+            #     gets +apply_amount. Symmetric.
+            is_bill_side = self._is_bill_side(cn.owner_type)
+            if is_bill_side:
+                cn_split_value = -apply_amount
+                target_split_value = apply_amount
+            else:
+                cn_split_value = apply_amount
+                target_split_value = -apply_amount
+
+            # Quantize to the post-account's commodity.
+            quantum = _commodity_quantum(post_acct.commodity)
+            cn_split_value = cn_split_value.quantize(quantum)
+            target_split_value = target_split_value.quantize(quantum)
+
+            txn_desc = (
+                f"Credit applied: {credit_note_id} → "
+                f"{applies_to_invoice_id}"
+            )
+            cn_split = piecash.Split(
+                account=post_acct,
+                value=cn_split_value,
+                quantity=cn_split_value,
+                memo=f"Net against {applies_to_invoice_id}",
+                action="Payment",
+            )
+            target_split = piecash.Split(
+                account=post_acct,
+                value=target_split_value,
+                quantity=target_split_value,
+                memo=f"Credit from {credit_note_id}",
+                action="Payment",
+            )
+
+            txn = piecash.Transaction(
+                currency=post_acct.commodity,
+                description=txn_desc,
+                post_date=parsed_date,
+                num="",
+                splits=[cn_split, target_split],
+            )
+
+            # Assign splits to the respective lots — this is what
+            # tells GnuCash the lots are being settled.
+            cn_split.lot = cn_lot
+            target_split.lot = target_lot
+
+            book.flush()
+
+            # Mark txn as a payment-type transaction (GnuCash UI
+            # convention) so desktop knows to render it under
+            # the lot's payment activity.
+            txn["trans-txn-type"] = "P"
+
+            # Close lots that reached zero. A fully-settled credit
+            # note (apply == cn_remaining) closes its lot. A
+            # fully-settled target (apply == target_remaining)
+            # closes its lot. Either or both can close.
+            new_cn_remaining = abs(
+                self._calculate_lot_balance(cn_lot)
+            )
+            new_target_remaining = abs(
+                self._calculate_lot_balance(target_lot)
+            )
+            if new_cn_remaining == 0:
+                cn_lot.is_closed = -1
+            if new_target_remaining == 0:
+                target_lot.is_closed = -1
+
+            book.save()
+
+            # Quantize all amounts to the post-account's commodity
+            # so the response shape stays consistent regardless
+            # of whether the lot-balance Decimals carried extra
+            # precision. "$100.00" not "$100".
+            return {
+                "credit_note_id": credit_note_id,
+                "applies_to_invoice_id": applies_to_invoice_id,
+                "amount_applied": str(apply_amount.quantize(quantum)),
+                "credit_note_remaining": str(
+                    new_cn_remaining.quantize(quantum)
+                ),
+                "target_remaining": str(
+                    new_target_remaining.quantize(quantum)
+                ),
+                "transaction_guid": txn.guid,
+                "apply_date": str(parsed_date),
+                "status": "applied",
+            }
 
     # ── Delete paths ──────────────────────────────────────────────
 
@@ -3976,11 +4969,18 @@ class BusinessMixin:
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
+                # Credit-note row: type stays as the owner-type
+                # tag ('invoice' / 'bill'), but we add a flag so
+                # the compact formatter can distinguish. The
+                # amount-due is the unsettled credit balance —
+                # what's still available to apply or refund.
+                is_credit_note = self._get_is_credit_note(inv)
                 results.append({
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
-                ),
+                        inv.owner_type, "invoice"
+                    ),
+                    "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
                     "currency": currency,
                     "date_posted": (

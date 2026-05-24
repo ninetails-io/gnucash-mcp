@@ -240,6 +240,20 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
             "the server with --modules=...,Business or omit "
             "owner_type to operate on customer invoices only."
         )
+    # Only None and 'customer' fall through to "customer" coercion.
+    # Anything else (typos like 'venddor', unknown future types) is
+    # rejected here so the LLM gets a clear validation error instead
+    # of a silent coercion that masks the typo as "search customer
+    # invoices, find nothing, return not-found." Pre-fix: 'venddor'
+    # → coerced to 'customer' → book-layer lookup against customer
+    # invoices → "invoice not found", with no indication the input
+    # was misspelled. (Copilot review on PR #86.)
+    if owner_type is not None and owner_type != "customer":
+        raise ValueError(
+            f"Invalid owner_type {owner_type!r}. Must be 'customer' "
+            f"(or omit). 'vendor' and 'employee' require the "
+            f"Business module."
+        )
     return "customer"
 
 
