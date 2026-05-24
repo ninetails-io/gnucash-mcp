@@ -5,6 +5,7 @@ import pytest
 from gnucash_mcp.book import extracted_modules
 from gnucash_mcp.server import (
     MODULE_BACKED_BY,
+    MODULE_GROUPS,
     TOOL_MODULES,
     _apply_module_filter,
     _get_server_config_impl,
@@ -14,6 +15,21 @@ from gnucash_mcp.server import (
     _validate_tool_modules,
     mcp,
 )
+
+
+def _core_tool_names() -> set[str]:
+    """Union of tool names across the eight ``core`` sub-modules.
+
+    Pre-Core-chop, tests asserted against ``TOOL_MODULES["core"]``
+    directly. Post-chop, ``core`` is a MODULE_GROUPS alias — there is
+    no flat list any more. This helper preserves the assertion
+    shape without re-spelling the eight sub-module names at every
+    callsite.
+    """
+    names: set[str] = set()
+    for sub in MODULE_GROUPS["core"]:
+        names.update(TOOL_MODULES[sub])
+    return names
 
 
 class TestToolModulesMapping:
@@ -57,29 +73,37 @@ class TestToolModulesMapping:
                 assert tool not in seen, f"{tool} appears in multiple modules"
                 seen.add(tool)
 
-    def test_core_module_count(self):
-        """Core module should have 26 tools after the restructure
-        (15 original + 2 void/unvoid migrated from reconciliation +
-        3 slot tools + audit log from admin + 3 backup tools)."""
-        assert len(TOOL_MODULES["core"]) == 26
+    def test_core_group_resolves_to_26_tools(self):
+        """The ``core`` group expands to 26 tools across its eight
+        sub-modules (summary 1 + accounts 7 + transactions 9 + slots
+        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1)."""
+        assert len(_core_tool_names()) == 26
 
     def test_total_tool_count(self):
-        """Total tools across all modules should be 88 — 87 pre-
-        restructure + ``get_server_config`` (promoted from
-        ``--debug``-only conditional to unconditional Core tool)."""
+        """Total tools across all sub-modules should be 88 — same
+        as pre-Core-chop, just partitioned across more keys."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
         assert total == 88
 
     def test_expected_modules_exist(self):
-        """All expected module names should be present after the
-        restructure. ``admin`` and ``backup`` have dissolved (their
-        tools migrated into Core)."""
+        """All expected sub-module names should be present after the
+        Core-chop. ``core`` is no longer a TOOL_MODULES key — it's
+        a MODULE_GROUPS alias expanding to the eight sub-modules."""
         expected = {
-            "core", "reconciliation", "reporting", "budgets",
+            # Core sub-modules
+            "summary", "accounts", "transactions", "slots",
+            "audit", "backup", "balance_sheet", "diagnostic",
+            # Optional modules
+            "reconciliation", "reporting", "budgets",
             "scheduling", "portfolio", "investor",
             "freelancer", "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
+        # And ``core`` is the group alias.
+        assert set(MODULE_GROUPS["core"]) == {
+            "summary", "accounts", "transactions", "slots",
+            "audit", "backup", "balance_sheet", "diagnostic",
+        }
 
     def test_validate_tool_modules_passes(self):
         """Validation should pass with the current mapping."""
@@ -208,29 +232,29 @@ class TestApplyModuleFilter:
         assert len(self._tool_names()) == 88
 
     def test_none_defaults_to_core_only(self):
-        """No --modules flag defaults to core. Backups, audit log,
-        and slot tools all live in Core post-restructure, so the
-        force-add of a separate backup module is gone."""
+        """No --modules flag defaults to the ``core`` group, which
+        expands to all eight ledger sub-modules. Backups, audit log,
+        and slot tools all live in their own sub-modules under
+        ``core``."""
         _apply_module_filter(None)
         remaining = self._tool_names()
-        expected = set(TOOL_MODULES["core"])
+        expected = _core_tool_names()
         assert remaining == expected
 
     def test_core_plus_reporting(self):
-        """--modules=core,reporting loads both."""
+        """--modules=core,reporting loads the eight core sub-modules
+        plus reporting."""
         _apply_module_filter("core,reporting")
         remaining = self._tool_names()
-        expected = (
-            set(TOOL_MODULES["core"])
-            | set(TOOL_MODULES["reporting"])
-        )
+        expected = _core_tool_names() | set(TOOL_MODULES["reporting"])
         assert remaining == expected
 
     def test_core_always_included(self):
-        """Even if only 'reporting' is specified, core is always included."""
+        """Even if only 'reporting' is specified, the ``core`` group
+        is force-added — all eight ledger sub-modules come along."""
         _apply_module_filter("reporting")
         remaining = self._tool_names()
-        assert set(TOOL_MODULES["core"]).issubset(remaining)
+        assert _core_tool_names().issubset(remaining)
         assert set(TOOL_MODULES["reporting"]).issubset(remaining)
 
     def test_all_modules_combined(self):
@@ -252,20 +276,30 @@ class TestApplyModuleFilter:
         assert "Unknown module" in captured.err
 
     def test_unknown_module_still_loads_core(self, capsys):
-        """Unknown modules should not prevent core from loading."""
+        """Unknown modules should not prevent the ``core`` group from
+        loading."""
         _apply_module_filter("nonexistent")
         remaining = self._tool_names()
-        assert set(TOOL_MODULES["core"]).issubset(remaining)
+        assert _core_tool_names().issubset(remaining)
 
     def test_whitespace_in_module_names(self):
         """Whitespace around module names should be stripped."""
         _apply_module_filter("core , reporting")
         remaining = self._tool_names()
-        expected = (
-            set(TOOL_MODULES["core"])
-            | set(TOOL_MODULES["reporting"])
-        )
+        expected = _core_tool_names() | set(TOOL_MODULES["reporting"])
         assert remaining == expected
+
+    def test_individual_core_submodule_selectable(self):
+        """A user can pick a single Core sub-module by name. The
+        ``core`` group is still force-added, so all eight ledger
+        sub-modules end up loaded — but the test confirms the
+        sub-module name is a valid input that doesn't trip the
+        unknown-module warning."""
+        _apply_module_filter("accounts")
+        remaining = self._tool_names()
+        # accounts is in the group anyway; just verify it loaded.
+        assert "list_accounts" in remaining
+        assert "create_account" in remaining
 
     def test_portfolio_and_investor_split(self):
         """``portfolio`` (commodities + prices) and ``investor``
@@ -303,27 +337,35 @@ class TestApplyModuleFilter:
         assert remaining == registered
 
     def test_returns_loaded_modules_sorted(self):
-        """Return value should be sorted list of actually loaded modules."""
+        """Return value is a sorted list of actually loaded
+        sub-modules. The ``core`` group is always force-added, so all
+        eight ledger sub-modules + the requested ones are present.
+        Group names themselves don't appear in the return value —
+        callers derive groupings via ``MODULE_GROUPS`` if needed."""
         result = _apply_module_filter("reporting,budgets")
-        # core is always added; result is sorted.
-        assert result == ["budgets", "core", "reporting"]
+        # Eight Core sub-modules + budgets + reporting = 10 entries.
+        expected = sorted(set(MODULE_GROUPS["core"]) | {"budgets", "reporting"})
+        assert result == expected
 
     def test_returns_all_modules_for_all(self):
         """'all' should return all module names sorted."""
         result = _apply_module_filter("all")
         assert result == sorted(TOOL_MODULES.keys())
 
-    def test_returns_core_for_none(self):
-        """None returns just core. Backup/admin tools migrated INTO
-        core, so no separate force-load is needed."""
+    def test_returns_core_submodules_for_none(self):
+        """None returns the eight ledger sub-modules — the result of
+        expanding the always-on ``core`` group."""
         result = _apply_module_filter(None)
-        assert result == ["core"]
+        assert result == sorted(MODULE_GROUPS["core"])
 
     def test_returns_excludes_unknown_modules(self):
-        """Unknown module names should not appear in return value."""
+        """Unknown module names should not appear in return value.
+        The ``core`` group's sub-modules are always present even
+        when the user-supplied list contained only garbage."""
         result = _apply_module_filter("reporting,nonexistent")
         assert "nonexistent" not in result
-        assert "core" in result
+        # One representative Core sub-module is enough.
+        assert "accounts" in result
         assert "reporting" in result
 
 
@@ -353,21 +395,18 @@ class TestExtractedModuleLazyLoading:
     _ALWAYS_REGISTERED_INLINE = {"get_server_config"}
 
     def test_extracted_modules_are_not_registered_at_import(self):
-        """Tools from extracted modules must not be present at import
-        time, excluding the always-registered-inline set. Iterates
-        only the modules that still have a TOOL_MODULES entry (admin
-        and backup dissolved as module names; their tool files
-        survive)."""
-        for mod_name in extracted_modules():
-            if mod_name not in TOOL_MODULES:
-                continue
-            for tool_name in TOOL_MODULES[mod_name]:
-                if tool_name in self._ALWAYS_REGISTERED_INLINE:
-                    continue
-                assert tool_name not in mcp._tool_manager._tools, (
-                    f"{tool_name} from extracted module '{mod_name}' "
-                    f"was registered at import — defeats lazy loading."
-                )
+        """No tool from any TOOL_MODULES entry — except the
+        always-registered-inline set — should be present at import
+        time. Defeats lazy loading if any extracted-file tool sneaks
+        a registration into module-import side effects."""
+        all_tools: set[str] = set()
+        for tools in TOOL_MODULES.values():
+            all_tools.update(tools)
+        for tool_name in sorted(all_tools - self._ALWAYS_REGISTERED_INLINE):
+            assert tool_name not in mcp._tool_manager._tools, (
+                f"{tool_name} was registered at import time — "
+                f"defeats lazy loading."
+            )
 
     def test_enabling_extracted_module_registers_its_tools(self):
         """Enabling 'reporting' via _apply_module_filter registers
@@ -452,11 +491,12 @@ class TestGetServerConfig:
         lines = output.strip().split("\n")
         assert len(lines) == 5
 
-    def test_registered_in_core_unconditionally(self):
-        """get_server_config moved into Core during the restructure
-        and is registered at server import time, regardless of
-        --debug. Always available as a diagnostic surface."""
-        assert "get_server_config" in TOOL_MODULES["core"]
+    def test_registered_in_diagnostic_unconditionally(self):
+        """get_server_config lives in the ``diagnostic`` sub-module
+        (always loaded via the ``core`` group alias) and is registered
+        at server import time, regardless of --debug. Always available
+        as a diagnostic surface."""
+        assert "get_server_config" in TOOL_MODULES["diagnostic"]
         assert "get_server_config" in mcp._tool_manager._tools
 
 

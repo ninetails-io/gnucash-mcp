@@ -93,7 +93,17 @@ SAFETY:
 # partition is deliberately flat; if nesting becomes useful later we'll
 # add cycle detection then.
 # ---------------------------------------------------------------------------
-MODULE_GROUPS: dict[str, list[str]] = {}
+MODULE_GROUPS: dict[str, list[str]] = {
+    # ``core`` expands to its eight ledger sub-modules. Always-on
+    # (force-added in _apply_module_filter), so a user with no
+    # --modules flag gets all eight. Users can ALSO pick individual
+    # sub-modules — e.g. ``--modules=accounts`` is valid but doesn't
+    # change the fact that core is loaded too.
+    "core": [
+        "summary", "accounts", "transactions", "slots",
+        "audit", "backup", "balance_sheet", "diagnostic",
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -113,31 +123,43 @@ MODULE_GROUPS: dict[str, list[str]] = {}
 # of the same module."
 # ---------------------------------------------------------------------------
 MODULE_BACKED_BY: dict[str, set[str]] = {
-    "core": {"core", "reconciliation", "reporting", "admin", "backup"},
+    # Core sub-modules — each maps to the legacy tool-file / mixin
+    # name(s) that host its tools. summary/accounts/transactions/
+    # balance_sheet are largely served by ``core.py`` and
+    # ``reporting.py`` (balance_sheet specifically); slots/audit by
+    # ``admin.py``; backup by ``backup.py``; the void/unvoid pair in
+    # transactions by ``reconciliation.py``. The diagnostic
+    # sub-module's one tool registers inline in server.py, so it
+    # needs no backing file.
+    "summary": {"core"},
+    "accounts": {"core"},
+    "transactions": {"core", "reconciliation"},
+    "slots": {"admin"},
+    "audit": {"admin"},
+    "backup": {"backup"},
+    "balance_sheet": {"reporting"},
+    "diagnostic": set(),
     # ``portfolio`` (prices / commodities) and ``investor`` (tax lots)
     # are the two halves of what used to be the ``investments`` module.
-    # Both back onto the same InvestmentsMixin / tools/investments.py —
-    # the mixin layer stays unchanged; only the tool-surface partition
-    # splits along the prices/lots axis.
     "portfolio": {"investments"},
     "investor": {"investments"},
     # ``freelancer`` (customer-facing invoicing) and ``business``
     # (vendor + employee management, vendor bills) split the legacy
-    # ``business`` module along persona lines. Both back onto the
-    # same BusinessMixin / tools/business.py. Shared-lifecycle tools
-    # (post/unpost/pay_invoice, list/get_invoice, get_outstanding_invoices)
-    # live in freelancer with runtime owner_type gating that rejects
-    # vendor-side use when ``business`` isn't loaded.
+    # ``business`` module along persona lines.
     "freelancer": {"business"},
     "business": {"business"},
 }
 
 
 TOOL_MODULES: dict[str, list[str]] = {
-    "core": [
-        # Orientation
+    # ── Core ledger sub-modules (composed via MODULE_GROUPS["core"]) ──
+    # Each is independently selectable via --modules but normally all
+    # eight are loaded together because the ``core`` group alias is
+    # always force-added.
+    "summary": [
         "get_book_summary",
-        # Account CRUD
+    ],
+    "accounts": [
         "list_accounts",
         "get_account",
         "get_balance",
@@ -145,7 +167,8 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_account",
         "move_account",
         "delete_account",
-        # Transaction CRUD
+    ],
+    "transactions": [
         "list_transactions",
         "get_transaction",
         "create_transaction",
@@ -153,29 +176,40 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_transaction",
         "replace_splits",
         "search_transactions",
-        # Void / unvoid — couples with delete_transaction
-        # (delete refuses posted documents and points at void)
+        # Void / unvoid live here — they're the audit-preserving
+        # erasure path for transactions, paired with delete_transaction
+        # (which refuses posted documents and points at void).
         "void_transaction",
         "unvoid_transaction",
-        # Balance sheet — THE canonical accounting report; the
-        # ledger primitives wouldn't be complete without it.
-        # Analytical reports stay in the reporting module.
-        "balance_sheet",
-        # Account slot CRUD — metadata used by multiple modules
-        # (APR / credit_limit / statement-close on credit accounts)
+    ],
+    "slots": [
+        # Per-account metadata used by multiple modules — APR,
+        # credit_limit, statement-close-day, minimum_payment.
         "get_account_slots",
         "set_account_slot",
         "delete_account_slot",
-        # Audit log reader (transparency surface)
+    ],
+    "audit": [
         "get_audit_log",
-        # Backups (auto-snapshot hook is always-on regardless;
-        # these expose the manual control surface)
+    ],
+    "backup": [
+        # Auto-snapshot hook is always-on regardless; these expose
+        # the manual control surface for inspecting / pruning the
+        # snapshot history.
         "create_backup",
         "list_backups",
         "prune_backups",
-        # Server diagnostic — was --debug-only; now unconditional
-        # so users can always check loaded modules / tool count /
-        # version without restarting in debug mode.
+    ],
+    "balance_sheet": [
+        # THE canonical accounting report — Assets, Liabilities,
+        # Equity reconciling to zero. Analytical reports (cash flow,
+        # spending breakdowns, net worth time series) stay in the
+        # ``reporting`` module.
+        "balance_sheet",
+    ],
+    "diagnostic": [
+        # Server config introspection — loaded modules, tool count,
+        # version. Always available regardless of --debug.
         "get_server_config",
     ],
     "reconciliation": [
@@ -377,49 +411,81 @@ def is_module_enabled(name: str) -> bool:
 def _apply_module_filter(modules_str: str | None) -> list[str]:
     """Enable the requested modules and remove tools not in that set.
 
-    For extracted modules (admin, ...) this also lazy-imports the matching
-    gnucash_mcp/tools/<name>.py and calls its register() function — so
-    disabled extracted modules never parse their tool definitions.
+    For extracted modules this also lazy-imports the matching
+    ``gnucash_mcp/tools/<name>.py`` and calls its ``register()``
+    function — so disabled extracted modules never parse their tool
+    definitions.
 
     Args:
-        modules_str: Comma-separated module names, "all", or None (core only).
+        modules_str: Comma-separated module/group names, ``"all"``,
+            or ``None`` (core only).
 
     Returns:
-        Sorted list of module names that were actually loaded.
+        Sorted list of TOOL_MODULES sub-module names that were
+        actually loaded. ``_LOADED_MODULES`` (the global) holds the
+        same set plus the group names that expanded into it, so
+        ``is_module_enabled("core")`` works alongside
+        ``is_module_enabled("transactions")``.
     """
     if modules_str is None:
-        enabled_modules = {"core"}
+        requested = {"core"}
     else:
-        enabled_modules = {m.strip() for m in modules_str.split(",")}
-        if "all" in enabled_modules:
-            enabled_modules = set(TOOL_MODULES.keys())
-        else:
-            # Expand any MODULE_GROUPS aliases to their constituent
-            # module names. Single-pass (groups don't reference other
-            # groups). Names that aren't groups pass through unchanged.
-            expanded: set[str] = set()
-            for name in enabled_modules:
-                if name in MODULE_GROUPS:
-                    expanded.update(MODULE_GROUPS[name])
-                else:
-                    expanded.add(name)
-            enabled_modules = expanded
+        requested = {m.strip() for m in modules_str.split(",")}
 
-            known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
-            unknown = enabled_modules - set(TOOL_MODULES.keys())
-            if unknown:
-                print(
-                    f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
-                    f"Available: {', '.join(sorted(known))}, all",
-                    file=sys.stderr,
-                )
-            enabled_modules.add("core")
+    if "all" in requested:
+        enabled_modules = set(TOOL_MODULES.keys())
+        groups_used: list[str] = ["all"]
+    else:
+        # ``core`` is always-on. Force-add before group expansion so
+        # the eight core sub-modules come along even when the user
+        # passes only e.g. ``--modules=reporting``.
+        requested.add("core")
 
-    # Keep only known module names. ``backup`` no longer needs a
-    # force-add — its tools moved into Core, so the auto-snapshot
-    # hook plus the three manual tools are always available via
-    # Core's tool list.
+        # Expand groups single-pass. Groups don't reference other
+        # groups (deliberate flat partition); if that changes,
+        # cycle-detection lands here.
+        enabled_modules: set[str] = set()
+        groups_used = []
+        for name in requested:
+            if name in MODULE_GROUPS:
+                enabled_modules.update(MODULE_GROUPS[name])
+                groups_used.append(name)
+            else:
+                enabled_modules.add(name)
+
+        # Warn on names that don't resolve to a known sub-module.
+        known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
+        all_referenced = requested | enabled_modules
+        unknown = all_referenced - known - {"all"}
+        if unknown:
+            print(
+                f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
+                f"Available: {', '.join(sorted(known))}, all",
+                file=sys.stderr,
+            )
+
+    # Keep only known sub-module names. Group expansion above may
+    # have introduced names that aren't TOOL_MODULES keys if the
+    # group def is stale; filter them out before lookup.
     enabled_modules &= set(TOOL_MODULES.keys())
+
+    # Build a group-aware display string for get_server_config.
+    # Groups render as ``group[member1, member2, ...]``; standalone
+    # sub-modules (not covered by any group the user requested)
+    # render bare.
+    accounted_for: set[str] = set()
+    display_parts: list[str] = []
+    for group_name in sorted(groups_used):
+        if group_name == "all":
+            display_parts.append("all")
+            accounted_for.update(enabled_modules)
+            continue
+        members = sorted(MODULE_GROUPS.get(group_name, []))
+        display_parts.append(f"{group_name}[{', '.join(members)}]")
+        accounted_for.update(members)
+    standalone = sorted(enabled_modules - accounted_for)
+    display_parts.extend(standalone)
+    _server_state["modules_display"] = ", ".join(display_parts)
 
     # Expand each enabled module to its backing tool-files (per
     # MODULE_BACKED_BY; default 1:1). Lazy-load any backing files
@@ -447,9 +513,15 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
 
     # Snapshot the enabled set for tool wrappers that gate behavior
     # on module availability (e.g., owner_type='vendor' on Freelancer
-    # tools when Business isn't loaded).
+    # tools when Business isn't loaded). Also register any group
+    # whose members are fully loaded — that way
+    # ``is_module_enabled("core")`` works alongside the
+    # individual sub-module checks.
     _LOADED_MODULES.clear()
     _LOADED_MODULES.update(enabled_modules)
+    for group_name, members in MODULE_GROUPS.items():
+        if set(members) <= enabled_modules:
+            _LOADED_MODULES.add(group_name)
 
     return sorted(enabled_modules)
 
@@ -586,19 +658,25 @@ Options:
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):
-                         core         The ledger + balance_sheet +
-                                      slots + audit log + backups.
-                                      Always on.
-                         personal     Budgets, scheduling,
-                                      reconciliation, lifestyle
-                                      reports (net_worth,
-                                      spending_by_category, cash_flow,
-                                      income_by_source,
-                                      debt_payoff_plan).
-                                      [NOTE: not yet a group alias;
-                                       compose its members directly
-                                       for now: budgets,scheduling,
-                                       reconciliation,reporting]
+
+                       Core sub-modules — always loaded via the
+                       ``core`` group alias; selectable individually
+                       too:
+                         summary      get_book_summary dashboard.
+                         accounts     Account CRUD + balance/list.
+                         transactions Transaction CRUD + search +
+                                      void/unvoid.
+                         slots        Per-account metadata (APR,
+                                      credit_limit, statement-close).
+                         audit        get_audit_log reader.
+                         backup       Manual backup CRUD (the
+                                      auto-snapshot hook runs
+                                      unconditionally).
+                         balance_sheet
+                                      THE canonical accounting report.
+                         diagnostic   get_server_config introspection.
+
+                       Optional modules:
                          budgets      Budget creation + variance.
                          scheduling   Recurring transactions.
                          reconciliation
@@ -619,7 +697,8 @@ Options:
                        invoicer; --modules=budgets,scheduling,reporting
                        for a personal-finance user;
                        --modules=freelancer,business for a small
-                       business with vendor management.
+                       business with vendor management. ``core`` is
+                       always added regardless.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message
@@ -716,9 +795,15 @@ Logs are stored alongside the book file:
         except Exception:
             pass  # Book may be locked — don't block startup
 
-    # Populate runtime state and conditionally register debug tool
+    # Populate runtime state and conditionally register debug tool.
+    # ``modules_display`` was set by ``_apply_module_filter`` with
+    # group-aware rendering (``core[summary, accounts, ...], reporting``
+    # rather than the flat list of 8+ sub-modules). Fall back to a
+    # bare join if the display key wasn't set for some reason.
     tool_count = len(mcp._tool_manager._tools)
-    modules_display = ", ".join(loaded_modules)
+    modules_display = _server_state.get(
+        "modules_display", ", ".join(loaded_modules)
+    )
     _server_state.update({
         "modules": modules_display,
         "tool_count": tool_count,
