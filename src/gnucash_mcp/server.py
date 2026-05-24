@@ -80,6 +80,22 @@ SAFETY:
 # ---------------------------------------------------------------------------
 # Tool module definitions — controls which tools are advertised via --modules
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MODULE_GROUPS — composition aliases that expand to one or more modules.
+#
+# Lets ``--modules=core`` (or any group name) expand to a set of underlying
+# module keys. Today the dict is empty — no behavior change vs. the
+# pre-restructure baseline. Populated in subsequent commits as the
+# role-aligned partition (Core / Personal / Portfolio / Investor /
+# Freelancer / Business) takes shape.
+#
+# Expansion is single-pass (groups don't reference other groups). The
+# partition is deliberately flat; if nesting becomes useful later we'll
+# add cycle detection then.
+# ---------------------------------------------------------------------------
+MODULE_GROUPS: dict[str, list[str]] = {}
+
+
 TOOL_MODULES: dict[str, list[str]] = {
     "core": [
         "get_book_summary",
@@ -258,11 +274,23 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         if "all" in enabled_modules:
             enabled_modules = set(TOOL_MODULES.keys())
         else:
+            # Expand any MODULE_GROUPS aliases to their constituent
+            # module names. Single-pass (groups don't reference other
+            # groups). Names that aren't groups pass through unchanged.
+            expanded: set[str] = set()
+            for name in enabled_modules:
+                if name in MODULE_GROUPS:
+                    expanded.update(MODULE_GROUPS[name])
+                else:
+                    expanded.add(name)
+            enabled_modules = expanded
+
+            known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
             unknown = enabled_modules - set(TOOL_MODULES.keys())
             if unknown:
                 print(
                     f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
-                    f"Available: {', '.join(sorted(TOOL_MODULES.keys()))}, all",
+                    f"Available: {', '.join(sorted(known))}, all",
                     file=sys.stderr,
                 )
             enabled_modules.add("core")
