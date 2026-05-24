@@ -164,18 +164,25 @@ def _format_vendor_spending_compact(
 
 
 def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
-    """Render outstanding invoices/bills as a one-line-per-doc string.
+    """Render outstanding invoices/bills/credit-notes as a
+    one-line-per-doc string.
 
     Format per row:
 
         000028  Berlin Digital GmbH  EUR 4,200  posted:2026-02-01  due:2026-03-03  55 days past due
         000011  BookkeepingCo (BILL)  USD 450  posted:2026-03-15  due:2026-04-14  13 days past due
+        000035  Emerald Analytics (CN)  USD 500  posted:2026-05-15  credit available
 
     Action columns are the win here: ``due:`` and the days-past-due
     count tell the bookkeeper exactly which invoice is bleeding the
     most days, without forcing a separate calculation. ``(BILL)`` is
     appended to vendor-bill owners so receivables and payables don't
-    get confused at a glance.
+    get confused at a glance. ``(CN)`` marks credit notes — their
+    ``amount_due`` represents the unsettled credit balance
+    (available to apply via ``apply_credit_note`` or refund via
+    ``pay_invoice``), not money owed by the customer/vendor. The
+    "due_date" column reads as "credit available" instead of a
+    past-due count to make that semantic distinction explicit.
 
     When the due date came from the 30-day default (``no_terms`` flag),
     the days count is anchored to the assumption ("days past 30-day
@@ -186,13 +193,33 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     lines = []
     for r in rows:
         owner = r.get("owner_name") or f"#{r['id']}"
-        if r.get("type") == "bill":
+        is_credit_note = r.get("is_credit_note", False)
+        # Owner suffix communicates the document side. Credit
+        # notes win over BILL because the credit-note semantic
+        # is more important — a "(CN)" tag tells the reader the
+        # whole amount column reads as "available credit" not
+        # "amount owed."
+        if is_credit_note:
+            owner = f"{owner} (CN)"
+        elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
         amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
         posted = r.get("date_posted") or "?"
+        # Credit notes don't have a "due date" concept the way
+        # invoices/bills do — they sit as available credit until
+        # applied or refunded. Replace the due column with that
+        # semantic so a reviewer scanning the list immediately
+        # sees the difference.
+        if is_credit_note:
+            action_str = "  credit available"
+            lines.append(
+                f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
+                f"posted:{posted}{action_str}"
+            )
+            continue
         due = r.get("due_date") or "?"
         days = r.get("days_past_due")
         if days is None:
@@ -971,9 +998,16 @@ class BusinessMixin:
         Currency is shown when present so multi-currency books read
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
+        # Type tag: INV/BILL/VCHR per owner_type, plus a "(CN)"
+        # suffix when the credit-note flag is set. Compact-line
+        # consumers can grep for the tag to filter (e.g. "CN" to
+        # find every credit note in a list). The suffix preserves
+        # the owner-side info that a bare "CN" tag would hide.
         inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
             invoice.owner_type, "INV"
         )
+        if self._get_is_credit_note(invoice):
+            inv_type = f"{inv_type} (CN)"
         opened = _safe_invoice_date(invoice, "date_opened")
         date_str = (
             str(opened.date()) if opened else "n/a"
@@ -4868,11 +4902,18 @@ class BusinessMixin:
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
+                # Credit-note row: type stays as the owner-type
+                # tag ('invoice' / 'bill'), but we add a flag so
+                # the compact formatter can distinguish. The
+                # amount-due is the unsettled credit balance —
+                # what's still available to apply or refund.
+                is_credit_note = self._get_is_credit_note(inv)
                 results.append({
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
-                ),
+                        inv.owner_type, "invoice"
+                    ),
+                    "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
                     "currency": currency,
                     "date_posted": (

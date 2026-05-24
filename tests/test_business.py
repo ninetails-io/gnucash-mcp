@@ -2495,6 +2495,161 @@ class TestApplyCreditNote:
             )
 
 
+class TestCreditNoteDisplayPolish:
+    """Display rendering for credit notes: list_invoices,
+    get_outstanding_invoices, and the dashboard's A/R / A/P
+    netting. Tests pin the surface a reviewer would scan to
+    understand which documents are credit notes at a glance.
+    """
+
+    def test_list_invoices_compact_marks_credit_notes(
+        self, business_book,
+    ):
+        """Credit notes get a ``(CN)`` suffix on the type tag in
+        compact output. Customer credit notes render as ``INV
+        (CN)``; vendor as ``BILL (CN)``. Tab-separated, so the
+        suffix is easy to grep for or split on."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_vendor(name="Office Depot")
+        gb.create_invoice(customer_id="000001")  # plain INV
+        gb.create_bill(vendor_id="000001")  # plain BILL
+        gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        out = gb.list_invoices()  # compact default
+        # Both credit notes show the (CN) suffix on the tag column.
+        assert "INV (CN)" in out
+        assert "BILL (CN)" in out
+        # Plain invoice/bill still render with bare tags.
+        # Look for the bare tag NOT followed by " (CN)" — a single
+        # tab-after-tag is the canonical separator.
+        assert "\tINV\t" in out  # plain customer invoice
+        assert "\tBILL\t" in out  # plain vendor bill
+
+    def test_get_outstanding_invoices_marks_credit_notes(
+        self, business_book,
+    ):
+        """Outstanding credit notes appear with a ``(CN)`` suffix
+        on the owner column AND a "credit available" annotation
+        in the due-date column — distinguishing them from
+        invoices that read as "X days past due"."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Post a regular invoice (creates one outstanding row)
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Post a credit note (also outstanding — unapplied credit)
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="dispute", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        out = gb.get_outstanding_invoices()  # compact default
+        # Both rows present.
+        assert "000001" in out
+        assert cn["id"] in out
+        # Credit note has the (CN) marker and the "credit
+        # available" action column.
+        assert "(CN)" in out
+        assert "credit available" in out
+        # The "past due" wording does NOT appear for the credit
+        # note row (it should only appear for the regular invoice
+        # if its due date is past; with default test date, the
+        # invoice probably has a due-in or past-due reading —
+        # either way the credit note shouldn't carry that text).
+        # Pull the CN's line specifically and check.
+        cn_line = [
+            ln for ln in out.split("\n") if cn["id"] in ln
+        ][0]
+        assert "past due" not in cn_line
+        assert "credit available" in cn_line
+
+    def test_get_outstanding_verbose_carries_is_credit_note(
+        self, business_book,
+    ):
+        """Verbose output exposes the is_credit_note flag in the
+        dict shape — important for LLMs that filter / branch on
+        credit-note state programmatically."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        rows = gb.get_outstanding_invoices(compact=False)
+        cn_row = next(r for r in rows if r["id"] == cn["id"])
+        assert cn_row["is_credit_note"] is True
+
+    def test_dashboard_ar_nets_credit_notes_against_invoices(
+        self, business_book,
+    ):
+        """The headline regression — get_book_summary's
+        Receivables total uses the raw A/R balance, which already
+        nets credit notes against invoices because the post
+        directions reverse. Invoice $500 + credit note $100 →
+        A/R should read $400 (not $500 + $100 = $600, and not
+        $500). Locking this so a future refactor that misroutes
+        credit-note posting math gets caught.
+        """
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Invoice $500 posted.
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note $100 posted (reduces what customer owes).
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="dispute", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # A/R balance should net to $400 — the raw split sum.
+        ar_balance = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_balance == Decimal("400.00")
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
