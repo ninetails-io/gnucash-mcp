@@ -1076,7 +1076,14 @@ def register(mcp, get_book) -> None:
             active_only=active_only,
             compact=not verbose,
         )
-        return _json(result) if verbose else result
+        # Match the other list_* tools' verbose pattern
+        # (json.dumps indent=2 preserves empty strings; _json
+        # strips them, which Copilot flagged as a shape
+        # divergence on PR #88).
+        if verbose:
+            import json
+            return json.dumps(result, indent=2)
+        return result
 
     @mcp.tool()
     @safe_tool

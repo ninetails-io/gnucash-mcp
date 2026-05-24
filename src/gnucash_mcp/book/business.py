@@ -204,8 +204,13 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
         # Job annotation — appended after any (CN)/(BILL) tag
-        # so a row that's BOTH (e.g. a vendor credit note on a
-        # vendor job) reads as ``Vendor (BILL) (job:JOB-001)``.
+        # so a row that's both a credit note AND job-attached
+        # reads as ``Customer (CN) (job:JOB-001)``, or a plain
+        # vendor bill in a job as ``Vendor (BILL) (job:JOB-001)``.
+        # ``(CN)`` and ``(BILL)`` are mutually exclusive per the
+        # if/elif above — credit notes are flagged via (CN)
+        # regardless of side. (Copilot PR #88 review caught the
+        # original comment showing them together.)
         job_id = r.get("job_id")
         if job_id:
             owner = f"{owner} (job:{job_id})"
@@ -1160,7 +1165,14 @@ class BusinessMixin:
         # matters for filtering is "is this a customer invoice
         # or a vendor bill", with the job link a separate
         # annotation appended via the owner column.
-        effective_ot = self._effective_owner_type(book, invoice)
+        #
+        # Single Job lookup via ``_resolve_owner_type_and_job``
+        # — both the type tag and the job annotation come from
+        # the same Job row. (Copilot PR #88 review flagged the
+        # original two-call pattern as redundant.)
+        effective_ot, job = self._resolve_owner_type_and_job(
+            book, invoice,
+        )
         inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
             effective_ot, "INV"
         )
@@ -1187,10 +1199,8 @@ class BusinessMixin:
         # can immediately see which project each row belongs to.
         # Using the job's ID (not name) keeps the column narrow
         # — the name surfaces in ``get_job(job_id)`` if needed.
-        if invoice.owner_type == 3:
-            job = self._find_job_by_guid(book, invoice.owner_guid)
-            if job is not None:
-                owner_name = f"{owner_name} (job:{job.id})"
+        if job is not None:
+            owner_name = f"{owner_name} (job:{job.id})"
 
         # Total: sum of (quantity * price) across entries. Falls back
         # to "?" when entries can't be loaded — keeps the row legible
@@ -2284,6 +2294,11 @@ class BusinessMixin:
         raw owner_type if the job lookup fails (dangling
         owner_guid). Same defensive shape as
         ``_find_invoice_owner_by_guid``.
+
+        For callers that also need the Job itself (e.g. to
+        surface a (job:JOB-X) annotation), use
+        ``_resolve_owner_type_and_job`` instead — single Job
+        query, both outputs.
         """
         if invoice.owner_type != 3:
             return invoice.owner_type
@@ -2291,6 +2306,31 @@ class BusinessMixin:
         if job is None:
             return invoice.owner_type
         return job.owner_type
+
+    @staticmethod
+    def _resolve_owner_type_and_job(book, invoice):
+        """Single-query variant of ``_effective_owner_type``
+        that also returns the Job object when one is linked.
+
+        Returns ``(effective_owner_type, job_or_none)``. For
+        direct documents (owner_type 2/4/5) the Job is None.
+        For job-attached docs (owner_type=3), both are derived
+        from a single Job lookup — avoids the redundant query
+        pattern Copilot flagged on PR #88 where callsites in
+        ``_invoice_to_compact_line`` and
+        ``get_outstanding_invoices`` were doing
+        ``_effective_owner_type`` AND ``_find_job_by_guid``
+        side-by-side (each chasing the same Job row).
+
+        Defensive fallback to (raw_owner_type, None) on dangling
+        owner_guid — same shape as the original helper.
+        """
+        if invoice.owner_type != 3:
+            return invoice.owner_type, None
+        job = BusinessMixin._find_job_by_guid(book, invoice.owner_guid)
+        if job is None:
+            return invoice.owner_type, None
+        return job.owner_type, job
 
     # Human-readable document label for use in error messages,
     # status returns, and audit log entries. Title-case canonical
@@ -3281,13 +3321,11 @@ class BusinessMixin:
             # so reaching here with the wrong side means a true
             # caller mistake (customer-id passed to
             # add_bill_entry, e.g.).
-            effective_owner_type = inv.owner_type
-            if inv.owner_type == 3:
-                job_for_inv = self._find_job_by_guid(
-                    book, inv.owner_guid,
-                )
-                if job_for_inv is not None:
-                    effective_owner_type = job_for_inv.owner_type
+            # Centralize via _effective_owner_type — Copilot PR
+            # #88 flagged this as duplicate logic with the helper.
+            effective_owner_type = self._effective_owner_type(
+                book, inv,
+            )
             if effective_owner_type != owner_type:
                 raise ValueError(
                     f"'{doc_id}' is a {cfg['twin_label']}, not a "
@@ -3564,20 +3602,33 @@ class BusinessMixin:
                 # Verbose path: resolve owner per invoice so each dict
                 # carries the readable name. ``owner_guid`` was dropped
                 # from the dict shape in Phase 3C.
+                #
+                # Job preload — avoids the N+1 query pattern Copilot
+                # flagged on PR #88. Single query for every Job
+                # referenced by job-attached invoices in the result
+                # set, indexed by GUID, then in-memory lookup per
+                # row. With 100 job-attached invoices spanning 5
+                # jobs, this is 1 query instead of 100.
+                from piecash.business.invoice import Job
+                job_attached_guids = [
+                    i.owner_guid for i in invoices
+                    if i.owner_type == 3 and i.owner_guid
+                ]
+                jobs_by_guid: dict = {}
+                if job_attached_guids:
+                    for j in book.session.query(Job).filter(
+                        Job.guid.in_(set(job_attached_guids))
+                    ).all():
+                        jobs_by_guid[j.guid] = j
+
                 results = []
                 for i in invoices:
                     o = self._find_invoice_owner_by_guid(
                         book, i.owner_type, i.owner_guid,
                     )
-                    # Job linkage threads through to the response
-                    # so the verbose listing shows ``job: {id,
-                    # name}`` on grouped invoices — important for
-                    # LLMs / dashboards filtering by job.
                     j_dict = None
                     if i.owner_type == 3:
-                        j_obj = self._find_job_by_guid(
-                            book, i.owner_guid,
-                        )
+                        j_obj = jobs_by_guid.get(i.owner_guid)
                         if j_obj is not None:
                             j_dict = self._job_to_dict(j_obj)
                     results.append(
@@ -5679,19 +5730,21 @@ class BusinessMixin:
 
                 amount_paid = grand_total - abs(balance)
 
-                owner_name = None
-                if is_bill:
-                    v = self._find_vendor_by_guid(
-                        book, inv.owner_guid
-                    )
-                    if v:
-                        owner_name = v.name
-                else:
-                    c = self._find_customer_by_guid(
-                        book, inv.owner_guid
-                    )
-                    if c:
-                        owner_name = c.name
+                # Owner lookup via the polymorphic dispatcher —
+                # routes customer/vendor/employee/job (chasing
+                # owner_type=3 through the Job to the underlying
+                # counterparty). Pre-fix this used the direct
+                # customer/vendor finders keyed off ``is_bill``,
+                # which returned None for job-attached invoices
+                # because inv.owner_guid points at a Job, not a
+                # customer/vendor row. Bookkeeper didn't probe
+                # this path; Copilot caught the related redundant-
+                # query pattern below and the bug surfaced
+                # during the refactor.
+                owner = self._find_invoice_owner_by_guid(
+                    book, inv.owner_type, inv.owner_guid,
+                )
+                owner_name = owner.name if owner else None
 
                 posted_dt = _safe_invoice_date(inv, "date_posted")
                 # Resolve the due date through the same three-step
@@ -5719,15 +5772,18 @@ class BusinessMixin:
                 # underlying customer/vendor); we also surface
                 # a job_id so the formatter can annotate the
                 # row.
+                #
+                # Single Job query via _resolve_owner_type_and_job
+                # — Copilot PR #88 review caught the original
+                # ``_effective_owner_type`` + ``_find_job_by_guid``
+                # side-by-side as redundant.
                 is_credit_note = self._get_is_credit_note(inv)
-                effective_ot = self._effective_owner_type(
-                    book, inv,
+                effective_ot, job_for_inv = (
+                    self._resolve_owner_type_and_job(book, inv)
                 )
-                job_id_field = None
-                if inv.owner_type == 3:
-                    j = self._find_job_by_guid(book, inv.owner_guid)
-                    if j is not None:
-                        job_id_field = j.id
+                job_id_field = (
+                    job_for_inv.id if job_for_inv else None
+                )
                 results.append({
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(

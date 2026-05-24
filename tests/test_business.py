@@ -1000,6 +1000,123 @@ class TestJobDisplayPolish:
         assert "(job:" not in cn_line
 
 
+class TestJobPr88ReviewFollowups:
+    """Tests for the Copilot PR #88 review follow-ups.
+
+    The headline regression test is for a bug Copilot's
+    redundant-query findings indirectly surfaced: pre-fix,
+    ``get_outstanding_invoices`` resolved owner_name via direct
+    customer/vendor lookups keyed off ``is_bill``, which
+    returned None for job-attached invoices because
+    inv.owner_guid points at a Job (not a customer/vendor row).
+    The bookkeeper didn't probe this exact path; the bug came
+    out during the refactor to ``_resolve_owner_type_and_job``.
+    """
+
+    def test_get_outstanding_resolves_job_attached_owner_name(
+        self, business_book,
+    ):
+        """A posted job-attached invoice should appear in
+        get_outstanding_invoices with the correct owner_name
+        (the underlying customer/vendor), not None.
+
+        Pre-fix: get_outstanding called _find_customer_by_guid
+        / _find_vendor_by_guid directly with inv.owner_guid,
+        which is a Job GUID for owner_type=3 rows — the
+        customer/vendor table lookups returned nothing.
+        """
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="API Rewrite",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        outstanding = gb.get_outstanding_invoices(compact=False)
+        row = next(r for r in outstanding if r["id"] == inv["id"])
+        # The bug: pre-fix, owner_name was None on job-attached
+        # posted invoices.
+        assert row["owner_name"] == "Acme Co"
+        # And the job_id surfaces correctly (verbose response
+        # shape; commit 4 introduced this field).
+        assert row["job_id"] == job["id"]
+
+    def test_list_jobs_verbose_uses_indented_json(self, business_book):
+        """list_jobs verbose output should match other list_*
+        tools' shape (json.dumps with indent=2, preserves empty
+        strings) rather than using _json (minified, strips
+        empties). Copilot caught the divergence on PR #88."""
+        from gnucash_mcp.tools._helpers import safe_tool
+        # Test through the tool wrapper layer rather than the
+        # book method — the inconsistency was at the wrapper
+        # boundary.
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="X", reference="",  # empty ref to test strip behavior
+        )
+        # Direct book method returns the list shape unchanged.
+        rows = gb.list_jobs(compact=False)
+        assert len(rows) == 1
+        # Empty reference SHOULD survive the verbose JSON path
+        # — the bug was that _json stripped it. We verify the
+        # book-method dict has it as empty string (matching
+        # other list_* methods' behavior).
+        assert rows[0]["reference"] == ""
+
+    def test_effective_owner_type_and_job_single_query(
+        self, business_book,
+    ):
+        """_resolve_owner_type_and_job returns both the
+        effective owner_type AND the Job (when present) from
+        the same query — replaces the side-by-side
+        _effective_owner_type + _find_job_by_guid pattern
+        Copilot flagged."""
+        from gnucash_mcp.book.business import BusinessMixin
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        with gb.open() as book:
+            from piecash.business.invoice import Invoice
+            inv_obj = book.session.query(Invoice).filter_by(
+                id=inv["id"],
+            ).first()
+            # Job-attached: returns (job's owner_type, job obj)
+            eff_ot, j = BusinessMixin._resolve_owner_type_and_job(
+                book, inv_obj,
+            )
+            assert eff_ot == 2  # customer
+            assert j is not None
+            assert j.id == job["id"]
+            # Direct invoice (no job): returns (own owner_type, None)
+            gb.create_invoice(customer_id="000001")
+            direct_inv = book.session.query(Invoice).filter_by(
+                id="000002",
+            ).first()
+            eff_ot2, j2 = BusinessMixin._resolve_owner_type_and_job(
+                book, direct_inv,
+            )
+            assert eff_ot2 == 2
+            assert j2 is None
+
+
 class TestInvoiceJobLinkage:
     """Tests for the job_id parameter on create_invoice /
     create_bill, plus the cascading effects on _invoice_to_dict
