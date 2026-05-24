@@ -1127,6 +1127,29 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="read")
+    def get_job_report(job_id: str) -> str:
+        """Per-job summary: billed / paid / outstanding totals
+        across all linked invoices, plus the per-invoice
+        breakdown.
+
+        Totals are returned as ``totals_by_currency`` (a dict
+        keyed by ISO currency code) so the same shape works
+        whether the job's invoices share a currency or span
+        multiple. Both posted and unposted (draft) invoices are
+        included — drafts contribute their face value as
+        ``billed`` + ``outstanding`` with ``paid=0``, so the
+        report shows the full pipeline.
+
+        Args:
+            job_id: Job ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.get_job_report(job_id=job_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="job")
     def delete_job(job_id: str, force: bool = False) -> str:
         """Delete a job.

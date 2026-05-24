@@ -326,6 +326,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_job",
         "update_job",
         "delete_job",
+        "get_job_report",
         "create_billterm",
         "list_billterms",
         "vendor_spending_report",
@@ -680,7 +681,7 @@ Usage: gnucash-mcp [OPTIONS]
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core (26 tools, always-on). Use "all"
-                       for every module (100 tools).
+                       for every module (101 tools).
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):

@@ -672,6 +672,204 @@ class TestDeleteJob:
             gb.delete_job(job_id="999999")
 
 
+class TestGetJobReport:
+    """Tests for get_job_report.
+
+    Per-job summary aggregating billed/paid/outstanding across
+    every linked invoice. Multi-currency support via
+    ``totals_by_currency``. Posted invoices contribute lot-
+    based amounts; unposted (draft) invoices contribute face
+    value with paid=0 so the report shows the pipeline.
+    """
+
+    def _setup_customer_with_posted_invoice(
+        self, gb, customer_name="Acme Co",
+        amount="500.00", post=True,
+    ):
+        """Helper to create customer + invoice + entry +
+        optionally post. Returns (job_id, invoice_id).
+        """
+        gb.create_customer(name=customer_name)
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"],
+            account="Income:Sales",
+            description="Work",
+            quantity="1", price=amount,
+        )
+        if post:
+            gb.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                owner_type="customer",
+            )
+        return job["id"], inv["id"]
+
+    def test_job_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Job not found"):
+            gb.get_job_report(job_id="999999")
+
+    def test_empty_job_report(self, business_book):
+        """A job with no linked invoices reports zero counts and
+        an empty totals_by_currency dict — not an error."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        result = gb.get_job_report(job_id=job["id"])
+        assert result["linked_invoices_count"] == 0
+        assert result["posted_count"] == 0
+        assert result["open_count"] == 0
+        assert result["totals_by_currency"] == {}
+        assert result["invoices"] == []
+
+    def test_single_posted_invoice(self, business_book):
+        """Posted invoice with no payments: billed=500,
+        paid=0, outstanding=500."""
+        gb = GnuCashBook(str(business_book))
+        job_id, _ = self._setup_customer_with_posted_invoice(gb)
+        result = gb.get_job_report(job_id=job_id)
+        assert result["linked_invoices_count"] == 1
+        assert result["posted_count"] == 1
+        assert result["open_count"] == 0
+        usd_totals = result["totals_by_currency"]["USD"]
+        assert Decimal(usd_totals["billed"]) == Decimal("500")
+        assert Decimal(usd_totals["paid"]) == Decimal("0")
+        assert Decimal(usd_totals["outstanding"]) == Decimal("500")
+        # Per-invoice row
+        assert len(result["invoices"]) == 1
+        assert result["invoices"][0]["status"] == "posted"
+
+    def test_partial_payment(self, business_book):
+        """After paying $200 against a $500 invoice: paid=200,
+        outstanding=300."""
+        gb = GnuCashBook(str(business_book))
+        job_id, inv_id = self._setup_customer_with_posted_invoice(gb)
+        gb.pay_invoice(
+            invoice_id=inv_id,
+            payment_account="Assets:Checking",
+            amount="200.00",
+            owner_type="customer",
+        )
+        result = gb.get_job_report(job_id=job_id)
+        usd = result["totals_by_currency"]["USD"]
+        assert Decimal(usd["paid"]) == Decimal("200")
+        assert Decimal(usd["outstanding"]) == Decimal("300")
+
+    def test_unposted_invoice_included(self, business_book):
+        """Drafts (unposted) contribute face value as billed +
+        outstanding, paid=0. Shows the pipeline alongside the
+        posted obligations."""
+        gb = GnuCashBook(str(business_book))
+        # Create posted invoice for $500
+        job_id, _ = self._setup_customer_with_posted_invoice(gb)
+        # Create draft invoice for $300 on same job
+        draft = gb.create_invoice(
+            customer_id="000001", job_id=job_id,
+        )
+        gb.add_invoice_entry(
+            invoice_id=draft["id"],
+            account="Income:Sales",
+            description="Future work",
+            quantity="1", price="300.00",
+        )
+        result = gb.get_job_report(job_id=job_id)
+        assert result["posted_count"] == 1
+        assert result["open_count"] == 1
+        usd = result["totals_by_currency"]["USD"]
+        # Total billed: 500 (posted) + 300 (draft) = 800
+        assert Decimal(usd["billed"]) == Decimal("800")
+        # Total outstanding: 500 (posted, unpaid) + 300 (draft) = 800
+        assert Decimal(usd["outstanding"]) == Decimal("800")
+
+    def test_multi_currency_totals(self, business_book):
+        """Mixed-currency job: totals_by_currency has one entry
+        per currency seen."""
+        import piecash
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.flush()
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=bk.default_currency,
+                date=date_cls(2026, 5, 24),
+                value="1.10", type="last",
+            ))
+            bk.save()
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="Project",
+        )
+        # USD invoice
+        inv_usd = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv_usd["id"], account="Income:Sales",
+            description="USD work", quantity="1", price="500",
+        )
+        # EUR invoice
+        inv_eur = gb.create_invoice(
+            customer_id="000001", job_id=job["id"], currency="EUR",
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv_eur["id"], account="Income:Sales",
+            description="EUR work", quantity="1", price="400",
+        )
+        result = gb.get_job_report(job_id=job["id"])
+        assert result["linked_invoices_count"] == 2
+        assert "USD" in result["totals_by_currency"]
+        assert "EUR" in result["totals_by_currency"]
+        assert (
+            Decimal(result["totals_by_currency"]["USD"]["billed"])
+            == Decimal("500")
+        )
+        assert (
+            Decimal(result["totals_by_currency"]["EUR"]["billed"])
+            == Decimal("400")
+        )
+
+    def test_vendor_job_report(self, business_book):
+        """Vendor jobs work symmetrically — bills posted to A/P
+        report the same shape, owner_type='vendor'."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        job = gb.create_job(
+            owner_id="000001", owner_type="vendor", name="Supply",
+        )
+        bill = gb.create_bill(
+            vendor_id="000001", job_id=job["id"],
+        )
+        gb.add_bill_entry(
+            bill_id=bill["id"],
+            account="Expenses:Office Supplies",
+            description="Paper", quantity="1", price="150.00",
+        )
+        gb.post_invoice(
+            invoice_id=bill["id"],
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        result = gb.get_job_report(job_id=job["id"])
+        assert result["owner_type"] == "vendor"
+        assert result["owner_name"] == "Office Depot"
+        usd = result["totals_by_currency"]["USD"]
+        assert Decimal(usd["billed"]) == Decimal("150")
+        assert Decimal(usd["outstanding"]) == Decimal("150")
+
+
 class TestInvoiceJobLinkage:
     """Tests for the job_id parameter on create_invoice /
     create_bill, plus the cascading effects on _invoice_to_dict

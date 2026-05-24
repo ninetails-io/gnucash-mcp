@@ -780,6 +780,39 @@ class BusinessMixin:
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
+            # Job-attached invoices have owner_type=3 internally
+            # — the owner_guid points at a Job, which in turn
+            # points at the customer or vendor. From the
+            # bookkeeper's perspective, those invoices are still
+            # customer/vendor invoices (just grouped). So an
+            # owner_type=2 lookup must match BOTH direct
+            # customer invoices (owner_type=2) AND job-attached
+            # invoices whose job has owner_type=2.
+            #
+            # Pre-fix: ``add_invoice_entry`` /
+            # ``delete_invoice`` / etc. all filter by
+            # owner_type=2 and would have failed with "Invoice
+            # not found" on any invoice attached to a job. Fix:
+            # build a subquery of job GUIDs matching the
+            # requested owner_type and OR it in.
+            #
+            # Employee (owner_type=5) is exempt — piecash's job
+            # model is customer/vendor only, so vouchers can't
+            # be job-attached. The lookup degrades to the
+            # original direct-match filter.
+            from sqlalchemy import and_, or_
+            from piecash.business.invoice import Job
+            if owner_type in (2, 4):
+                job_guid_sq = book.session.query(Job.guid).filter(
+                    Job.owner_type == owner_type
+                ).subquery()
+                return query.filter(or_(
+                    Invoice.owner_type == owner_type,
+                    and_(
+                        Invoice.owner_type == 3,
+                        Invoice.owner_guid.in_(job_guid_sq),
+                    ),
+                )).first()
             return query.filter(Invoice.owner_type == owner_type).first()
 
         # owner_type=None: caller didn't disambiguate. Pull all
@@ -1420,7 +1453,7 @@ class BusinessMixin:
         """
         from sqlalchemy import text
 
-        is_bill = self._is_bill_side(inv.owner_type)
+        is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
         if is_bill:
             rows = book.session.execute(
                 text("SELECT * FROM entries WHERE bill = :guid"),
@@ -2205,8 +2238,34 @@ class BusinessMixin:
         column group (``b_*``), same allowed account types. The
         legacy code used ``inv.owner_type == 4`` to mean this; the
         rename to ``_is_bill_side`` captures the truth.
+
+        For job-attached invoices (owner_type=3), pass the job's
+        owner_type instead — see ``_effective_owner_type``.
         """
         return owner_type in (4, 5)
+
+    @staticmethod
+    def _effective_owner_type(book, invoice) -> int:
+        """Resolve a document's "semantic" owner_type.
+
+        Direct customer invoices / vendor bills / vouchers
+        return their owner_type unchanged (2/4/5). Job-attached
+        invoices (owner_type=3) chase through the Job to its
+        underlying owner_type (2 or 4) — that's the side every
+        side-aware check (posting direction, account-type
+        validation, label dispatch) actually cares about.
+
+        Returns the underlying owner_type, falling back to the
+        raw owner_type if the job lookup fails (dangling
+        owner_guid). Same defensive shape as
+        ``_find_invoice_owner_by_guid``.
+        """
+        if invoice.owner_type != 3:
+            return invoice.owner_type
+        job = BusinessMixin._find_job_by_guid(book, invoice.owner_guid)
+        if job is None:
+            return invoice.owner_type
+        return job.owner_type
 
     # Human-readable document label for use in error messages,
     # status returns, and audit log entries. Title-case canonical
@@ -3189,7 +3248,22 @@ class BusinessMixin:
                 raise ValueError(
                     f"{cfg['label']} not found: {doc_id}"
                 )
-            if inv.owner_type != owner_type:
+            # Side-check: the invoice's "effective" owner_type
+            # is owner_type directly when 2/4/5; for owner_type=3
+            # (job-attached) it's the underlying job's
+            # owner_type. ``_find_invoice`` already filters by
+            # both direct and job-attached for owner_type 2/4,
+            # so reaching here with the wrong side means a true
+            # caller mistake (customer-id passed to
+            # add_bill_entry, e.g.).
+            effective_owner_type = inv.owner_type
+            if inv.owner_type == 3:
+                job_for_inv = self._find_job_by_guid(
+                    book, inv.owner_guid,
+                )
+                if job_for_inv is not None:
+                    effective_owner_type = job_for_inv.owner_type
+            if effective_owner_type != owner_type:
                 raise ValueError(
                     f"'{doc_id}' is a {cfg['twin_label']}, not a "
                     f"{cfg['label'].lower()}. Use "
@@ -3527,7 +3601,7 @@ class BusinessMixin:
             if not inv:
                 raise ValueError(f"Document not found: {invoice_id}")
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             # Get entries via raw SQL since ORM relationship doesn't
             # work for vendor bills (bill column is VARCHAR, not FK)
@@ -3697,7 +3771,7 @@ class BusinessMixin:
                     f"{invoice_id} is already posted"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             post_acct = self._resolve_account(book, post_account)
             if not post_acct:
@@ -3930,7 +4004,7 @@ class BusinessMixin:
                     f"{invoice_id} is not posted"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
             # Three-way label dispatch — was a binary "Bill if
             # is_bill else Invoice" that mislabeled vouchers as
             # bills (Copilot PR #86 review).
@@ -4124,7 +4198,7 @@ class BusinessMixin:
                     f"post it before recording payment"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
@@ -5550,7 +5624,7 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                is_bill = self._is_bill_side(inv.owner_type)
+                is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
                 post_acc_guid = inv.post_acc_guid
                 post_acct = book.session.query(
@@ -5645,6 +5719,163 @@ class BusinessMixin:
             if compact:
                 return _format_outstanding_invoices_compact(results)
             return results
+
+    def get_job_report(self, job_id: str) -> dict:
+        """Per-job summary: billed / paid / outstanding totals
+        across all linked invoices, plus the per-invoice
+        breakdown.
+
+        **Currency handling**: a job's linked invoices CAN span
+        multiple currencies (a project that bills mostly in EUR
+        but had one USD reimbursement on the same engagement),
+        so totals are returned as a dict keyed by currency
+        rather than a single scalar. Single-currency jobs render
+        as a one-key dict — the shape is consistent regardless
+        of cardinality, which is friendlier for LLMs that would
+        otherwise have to branch on whether ``totals_by_currency``
+        is flat or keyed.
+
+        **Posted vs unposted**: both are included. Posted
+        invoices contribute to ``billed`` / ``paid`` /
+        ``outstanding`` via their lot balance. Unposted (draft)
+        invoices contribute the entry-computed face value as
+        ``billed`` and ``outstanding``, with ``paid=0`` — a
+        bookkeeper looking at a job's pipeline wants drafts in
+        the picture too, not just what's been formalized.
+
+        Args:
+            job_id: Job ID.
+
+        Returns:
+            Dict with:
+
+            - ``job_id``, ``job_name``, ``owner_type``,
+              ``owner_name`` — job identity context
+            - ``linked_invoices_count`` — total invoices linked
+            - ``posted_count``, ``open_count`` — status breakdown
+            - ``totals_by_currency`` — ``{ccy: {billed, paid,
+              outstanding}}`` per currency present in the
+              linked invoices
+            - ``invoices`` — per-invoice list of ``{id, status,
+              currency, billed, paid, outstanding, date_opened,
+              date_posted}``
+
+        Raises:
+            ValueError: If job not found.
+        """
+        from piecash.business.invoice import Invoice
+        with self.open() as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            owner = self._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
+            owner_name = owner.name if owner else None
+            owner_type = (
+                "customer" if job.owner_type == 2 else "vendor"
+            )
+
+            # Linked invoices: polymorphic owner pointer where
+            # owner_type=3 and owner_guid=job.guid. Indexed query.
+            invoices = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).order_by(Invoice.date_opened).all()
+
+            totals_by_currency: dict[str, dict[str, Decimal]] = {}
+            invoice_rows = []
+            posted_count = 0
+            open_count = 0
+
+            for inv in invoices:
+                ccy = inv.currency.mnemonic if inv.currency else "?"
+                # Face value: sum of (qty * price) across entries.
+                # Falls back to 0 on entry-load failure rather
+                # than aborting the whole report — matches the
+                # _invoice_to_compact_line defensive shape.
+                try:
+                    _, _, billed = (
+                        self._get_invoice_entries_and_total(book, inv)
+                    )
+                except (ValueError, AttributeError):
+                    billed = Decimal("0")
+
+                if _is_invoice_posted(inv):
+                    posted_count += 1
+                    # Posted: paid = billed - outstanding (from
+                    # the lot balance). The lot balance is the
+                    # unsettled amount, so abs(balance) =
+                    # outstanding.
+                    post_acct_guid = inv.post_acc_guid
+                    post_acct = book.session.query(
+                        piecash.Account
+                    ).filter_by(guid=post_acct_guid).first()
+                    lot_obj = None
+                    if post_acct:
+                        for lot in post_acct.lots:
+                            if lot.guid == inv.post_lot_guid:
+                                lot_obj = lot
+                                break
+                    if lot_obj:
+                        outstanding = abs(
+                            self._calculate_lot_balance(lot_obj)
+                        )
+                        paid = billed - outstanding
+                    else:
+                        # Defensive: lot not found despite
+                        # posted state — treat as fully owed
+                        # rather than crashing the report.
+                        outstanding = billed
+                        paid = Decimal("0")
+                    status = "posted"
+                else:
+                    open_count += 1
+                    paid = Decimal("0")
+                    outstanding = billed
+                    status = "open"
+
+                posted_dt = _safe_invoice_date(inv, "date_posted")
+                opened_dt = _safe_invoice_date(inv, "date_opened")
+                invoice_rows.append({
+                    "id": inv.id,
+                    "status": status,
+                    "currency": ccy,
+                    "billed": str(billed),
+                    "paid": str(paid),
+                    "outstanding": str(outstanding),
+                    "date_opened": (
+                        str(opened_dt.date()) if opened_dt else None
+                    ),
+                    "date_posted": (
+                        str(posted_dt.date()) if posted_dt else None
+                    ),
+                })
+
+                bucket = totals_by_currency.setdefault(ccy, {
+                    "billed": Decimal("0"),
+                    "paid": Decimal("0"),
+                    "outstanding": Decimal("0"),
+                })
+                bucket["billed"] += billed
+                bucket["paid"] += paid
+                bucket["outstanding"] += outstanding
+
+            # Stringify Decimal totals for JSON-friendly output.
+            return {
+                "job_id": job.id,
+                "job_name": job.name,
+                "owner_type": owner_type,
+                "owner_name": owner_name,
+                "linked_invoices_count": len(invoices),
+                "posted_count": posted_count,
+                "open_count": open_count,
+                "totals_by_currency": {
+                    ccy: {k: str(v) for k, v in bucket.items()}
+                    for ccy, bucket in totals_by_currency.items()
+                },
+                "invoices": invoice_rows,
+            }
 
     def vendor_spending_report(
         self,
