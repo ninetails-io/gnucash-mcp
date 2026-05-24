@@ -76,7 +76,8 @@ class TestToolModulesMapping:
         tools migrated into Core)."""
         expected = {
             "core", "reconciliation", "reporting", "budgets",
-            "scheduling", "portfolio", "investor", "business",
+            "scheduling", "portfolio", "investor",
+            "freelancer", "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
 
@@ -457,3 +458,59 @@ class TestGetServerConfig:
         --debug. Always available as a diagnostic surface."""
         assert "get_server_config" in TOOL_MODULES["core"]
         assert "get_server_config" in mcp._tool_manager._tools
+
+
+class TestOwnerTypeGating:
+    """The Freelancer module hosts the shared-lifecycle invoice
+    tools (post/unpost/pay_invoice, list/get_invoice,
+    get_outstanding_invoices). Those tools dispatch on owner_type to
+    handle both customer invoices AND vendor bills — but the Business
+    module owns vendor management. Runtime gating in
+    ``_gate_owner_type`` enforces the split: a Freelancer-only user
+    can't reach vendor bills through the shared tools.
+    """
+
+    @pytest.fixture(autouse=True)
+    def save_and_restore_modules(self):
+        from gnucash_mcp.server import _LOADED_MODULES
+        original = set(_LOADED_MODULES)
+        yield
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update(original)
+
+    def test_business_loaded_passes_through(self):
+        """With business enabled, _gate_owner_type returns its input
+        unchanged — both halves of the polymorphic dispatch work."""
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer", "business"})
+        assert _gate_owner_type("customer") == "customer"
+        assert _gate_owner_type("vendor") == "vendor"
+        assert _gate_owner_type(None) is None
+
+    def test_business_absent_coerces_to_customer(self):
+        """Without business, omitted or 'customer' owner_type is
+        coerced to 'customer' explicitly so the book-layer lookup
+        filters out vendor bills."""
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        assert _gate_owner_type(None) == "customer"
+        assert _gate_owner_type("customer") == "customer"
+
+    def test_business_absent_rejects_explicit_vendor(self):
+        """Without business, an explicit owner_type='vendor' raises
+        a clear error rather than silently coercing or returning
+        not-found from the book layer."""
+        import pytest
+        from gnucash_mcp.server import _LOADED_MODULES
+        from gnucash_mcp.tools._helpers import _gate_owner_type
+
+        _LOADED_MODULES.clear()
+        _LOADED_MODULES.update({"core", "freelancer"})
+        with pytest.raises(ValueError, match="requires the Business module"):
+            _gate_owner_type("vendor")

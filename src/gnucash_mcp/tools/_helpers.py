@@ -186,6 +186,50 @@ def _json(obj) -> str:
     )
 
 
+def _gate_owner_type(owner_type: str | None) -> str | None:
+    """Enforce the Freelancer/Business module split at the
+    ``owner_type`` boundary.
+
+    Shared-lifecycle invoice/bill tools (post_invoice, unpost_invoice,
+    pay_invoice, list_invoices, get_invoice, get_outstanding_invoices)
+    live in the Freelancer module because customer-facing invoicing is
+    the natural Freelancer surface. Vendor bills travel through the
+    same tools via ``owner_type='vendor'`` dispatch — but the Business
+    module owns vendor management. A user with only Freelancer loaded
+    should never be able to touch vendor bills.
+
+    Two cases:
+
+    - **Explicit ``owner_type='vendor'`` without Business loaded:**
+      reject with a clear error. The user is explicitly asking for
+      vendor-side behavior they didn't enable.
+    - **``owner_type`` omitted or ``'customer'`` without Business:**
+      coerce to ``'customer'``. The tool only sees customer entities.
+      Any vendor-ID collision is treated as "not found" at the
+      lookup layer (book methods filter on owner_type).
+
+    Returns the (possibly coerced) owner_type the book method should
+    receive. Caller passes the return value through to ``book.X(...,
+    owner_type=...)``.
+
+    Imports server lazily to avoid an import-time cycle (server.py
+    imports from tools.* via lazy-load).
+    """
+    from gnucash_mcp.server import is_module_enabled
+
+    if is_module_enabled("business"):
+        return owner_type  # Both halves available; no gating.
+
+    if owner_type == "vendor":
+        raise ValueError(
+            "owner_type='vendor' requires the Business module. "
+            "Restart the server with --modules=...,Business to access "
+            "vendor bills, or omit owner_type to operate on customer "
+            "invoices only."
+        )
+    return "customer"
+
+
 def safe_tool(func: Callable) -> Callable:
     """Decorator that wraps tool functions with comprehensive error handling.
 

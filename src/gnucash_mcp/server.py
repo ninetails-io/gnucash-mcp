@@ -121,6 +121,15 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     # splits along the prices/lots axis.
     "portfolio": {"investments"},
     "investor": {"investments"},
+    # ``freelancer`` (customer-facing invoicing) and ``business``
+    # (vendor + employee management, vendor bills) split the legacy
+    # ``business`` module along persona lines. Both back onto the
+    # same BusinessMixin / tools/business.py. Shared-lifecycle tools
+    # (post/unpost/pay_invoice, list/get_invoice, get_outstanding_invoices)
+    # live in freelancer with runtime owner_type gating that rejects
+    # vendor-side use when ``business`` isn't loaded.
+    "freelancer": {"business"},
+    "business": {"business"},
 }
 
 
@@ -218,36 +227,47 @@ TOOL_MODULES: dict[str, list[str]] = {
         "calculate_lot_gain",
         "close_lot",
     ],
-    "business": [
+    # ``business`` split into ``freelancer`` (customer-facing
+    # invoicing — the natural surface for a solo consultant) and
+    # ``business`` (vendor + employee management, vendor bills —
+    # additive to freelancer for full small-business workflow). The
+    # shared-lifecycle tools (post/unpost/pay_invoice, list/get_invoice,
+    # get_outstanding_invoices) live in freelancer because customer
+    # invoicing is the dominant use case; runtime owner_type gating
+    # (see _gate_owner_type in tools/_helpers.py) rejects vendor-side
+    # use when business isn't loaded.
+    "freelancer": [
         "create_customer",
         "list_customers",
         "get_customer",
         "update_customer",
-        "create_vendor",
-        "list_vendors",
-        "get_vendor",
-        "update_vendor",
-        "create_employee",
-        "list_employees",
-        "get_employee",
-        "update_employee",
-        "create_billterm",
-        "list_billterms",
+        "delete_customer",
         "create_invoice",
-        "create_bill",
         "add_invoice_entry",
-        "add_bill_entry",
         "list_invoices",
         "get_invoice",
         "post_invoice",
         "unpost_invoice",
         "pay_invoice",
         "delete_invoice",
-        "delete_bill",
-        "delete_customer",
-        "delete_vendor",
-        "delete_employee",
         "get_outstanding_invoices",
+    ],
+    "business": [
+        "create_vendor",
+        "list_vendors",
+        "get_vendor",
+        "update_vendor",
+        "delete_vendor",
+        "create_bill",
+        "add_bill_entry",
+        "delete_bill",
+        "create_employee",
+        "list_employees",
+        "get_employee",
+        "update_employee",
+        "delete_employee",
+        "create_billterm",
+        "list_billterms",
         "vendor_spending_report",
     ],
 }
@@ -339,6 +359,21 @@ def _reset_lazy_load_state() -> None:
     _loaded_tool_files.clear()
 
 
+# Snapshot of which public module names are enabled in the current
+# run. Populated by ``_apply_module_filter``; read by tool wrappers
+# that need to gate behavior on module availability (e.g., the
+# Freelancer-side shared-lifecycle invoice tools reject
+# ``owner_type='vendor'`` when ``business`` isn't loaded).
+_LOADED_MODULES: set[str] = set()
+
+
+def is_module_enabled(name: str) -> bool:
+    """True iff the given public module is in the current run's
+    enabled set. Tool wrappers call this to gate per-module behavior.
+    """
+    return name in _LOADED_MODULES
+
+
 def _apply_module_filter(modules_str: str | None) -> list[str]:
     """Enable the requested modules and remove tools not in that set.
 
@@ -409,6 +444,12 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     for tool_name in list(mcp._tool_manager._tools.keys()):
         if tool_name not in keep:
             mcp.remove_tool(tool_name)
+
+    # Snapshot the enabled set for tool wrappers that gate behavior
+    # on module availability (e.g., owner_type='vendor' on Freelancer
+    # tools when Business isn't loaded).
+    _LOADED_MODULES.clear()
+    _LOADED_MODULES.update(enabled_modules)
 
     return sorted(enabled_modules)
 

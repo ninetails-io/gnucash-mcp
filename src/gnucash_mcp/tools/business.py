@@ -6,7 +6,7 @@ Registered only when the 'business' module is enabled via --modules.
 import json
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import _gate_owner_type, _json, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -490,6 +490,7 @@ def register(mcp, get_book) -> None:
                    at 250. Compact output appends a truncation notice
                    when results are clipped.
         """
+        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.list_invoices(
             owner_type=owner_type,
@@ -520,6 +521,7 @@ def register(mcp, get_book) -> None:
                         "vendor" for bills. Useful when an invoice and
                         bill share the same ID (independent counters).
         """
+        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.get_invoice(invoice_id=id, owner_type=owner_type)
         return _json(result)
@@ -548,6 +550,7 @@ def register(mcp, get_book) -> None:
             description: Description for the posting transaction. Optional.
             owner_type: "customer" or "vendor" for disambiguation when IDs collide.
         """
+        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.post_invoice(
             invoice_id=id,
@@ -579,6 +582,7 @@ def register(mcp, get_book) -> None:
             owner_type: "customer" or "vendor" for disambiguation
                 when IDs collide.
         """
+        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.unpost_invoice(
             invoice_id=id,
@@ -626,6 +630,7 @@ def register(mcp, get_book) -> None:
                 realized FX gain/loss (cross-currency payments only).
                 Accepts a full path, %short GUID, or full 32-char GUID.
         """
+        owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.pay_invoice(
             invoice_id=id,
@@ -744,6 +749,19 @@ def register(mcp, get_book) -> None:
             vendor_id: Filter by specific vendor ID.
             verbose: If true, return full JSON details.
         """
+        owner_type = _gate_owner_type(owner_type)
+        # When Business isn't loaded, vendor_id is also a vendor-only
+        # surface — reject it the same way an explicit
+        # owner_type='vendor' is rejected. _gate_owner_type already
+        # handled owner_type; vendor_id needs its own check.
+        if vendor_id is not None:
+            from gnucash_mcp.server import is_module_enabled
+            if not is_module_enabled("business"):
+                raise ValueError(
+                    "vendor_id filtering requires the Business module. "
+                    "Restart with --modules=...,Business to access "
+                    "vendor bills."
+                )
         book = get_book()
         result = book.get_outstanding_invoices(
             owner_type=owner_type,
