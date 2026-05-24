@@ -203,6 +203,12 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
             owner = f"{owner} (CN)"
         elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
+        # Job annotation — appended after any (CN)/(BILL) tag
+        # so a row that's BOTH (e.g. a vendor credit note on a
+        # vendor job) reads as ``Vendor (BILL) (job:JOB-001)``.
+        job_id = r.get("job_id")
+        if job_id:
+            owner = f"{owner} (job:{job_id})"
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
@@ -1148,8 +1154,15 @@ class BusinessMixin:
         # consumers can grep for the tag to filter (e.g. "CN" to
         # find every credit note in a list). The suffix preserves
         # the owner-side info that a bare "CN" tag would hide.
+        # For job-attached invoices (owner_type=3), the tag
+        # follows the underlying side (INV/BILL via the job's
+        # owner_type) rather than a generic "JOB" tag — what
+        # matters for filtering is "is this a customer invoice
+        # or a vendor bill", with the job link a separate
+        # annotation appended via the owner column.
+        effective_ot = self._effective_owner_type(book, invoice)
         inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
-            invoice.owner_type, "INV"
+            effective_ot, "INV"
         )
         if self._get_is_credit_note(invoice):
             inv_type = f"{inv_type} (CN)"
@@ -1159,13 +1172,25 @@ class BusinessMixin:
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
-        # Owner lookup — customers/vendors/employees share the
-        # same ``owner_guid`` namespace shape across three tables.
-        # ``_find_invoice_owner_by_guid`` dispatches on owner_type.
+        # Owner lookup — customers/vendors/employees/jobs share
+        # the same ``owner_guid`` namespace shape across four
+        # tables. ``_find_invoice_owner_by_guid`` dispatches on
+        # owner_type and chases owner_type=3 through the Job to
+        # the underlying customer/vendor.
         owner = self._find_invoice_owner_by_guid(
             book, invoice.owner_type, invoice.owner_guid,
         )
         owner_name = owner.name if owner else "?"
+
+        # Job annotation: append ``(job:XXXXXX)`` to the owner
+        # column so a bookkeeper scanning a long invoice list
+        # can immediately see which project each row belongs to.
+        # Using the job's ID (not name) keeps the column narrow
+        # — the name surfaces in ``get_job(job_id)`` if needed.
+        if invoice.owner_type == 3:
+            job = self._find_job_by_guid(book, invoice.owner_guid)
+            if job is not None:
+                owner_name = f"{owner_name} (job:{job.id})"
 
         # Total: sum of (quantity * price) across entries. Falls back
         # to "?" when entries can't be loaded — keeps the row legible
@@ -5688,11 +5713,25 @@ class BusinessMixin:
                 # the compact formatter can distinguish. The
                 # amount-due is the unsettled credit balance —
                 # what's still available to apply or refund.
+                # For job-attached docs (owner_type=3), the
+                # semantic type comes from the effective
+                # owner_type (chases through the Job to the
+                # underlying customer/vendor); we also surface
+                # a job_id so the formatter can annotate the
+                # row.
                 is_credit_note = self._get_is_credit_note(inv)
+                effective_ot = self._effective_owner_type(
+                    book, inv,
+                )
+                job_id_field = None
+                if inv.owner_type == 3:
+                    j = self._find_job_by_guid(book, inv.owner_guid)
+                    if j is not None:
+                        job_id_field = j.id
                 results.append({
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        effective_ot, "invoice"
                     ),
                     "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
@@ -5708,6 +5747,7 @@ class BusinessMixin:
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(abs(balance)),
+                    "job_id": job_id_field,
                 })
 
             # Sort: most overdue first (largest days_past_due), so the

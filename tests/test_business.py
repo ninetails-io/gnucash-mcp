@@ -870,6 +870,136 @@ class TestGetJobReport:
         assert Decimal(usd["outstanding"]) == Decimal("150")
 
 
+class TestJobDisplayPolish:
+    """Tests for the (job:JOB-X) annotation in list_invoices and
+    get_outstanding_invoices compact output. Job-attached
+    invoices should be visibly distinguished from direct
+    customer invoices / vendor bills in any compact-list view.
+    """
+
+    def test_list_invoices_compact_shows_job_annotation(
+        self, business_book,
+    ):
+        """A job-attached customer invoice renders with both
+        the INV tag (semantic side, resolved via the job's
+        underlying owner_type) and a (job:JOB-X) suffix on the
+        owner column."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="API Rewrite",
+        )
+        gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        out = gb.list_invoices()  # compact default
+        # Semantic tag is INV (customer-side), not generic
+        assert "\tINV\t" in out
+        # Owner column carries the job annotation
+        assert f"(job:{job['id']})" in out
+
+    def test_list_invoices_vendor_bill_in_job(self, business_book):
+        """Symmetric: vendor bill attached to vendor job renders
+        BILL tag + (job:JOB-X) annotation."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        job = gb.create_job(
+            owner_id="000001", owner_type="vendor", name="Supplies",
+        )
+        gb.create_bill(vendor_id="000001", job_id=job["id"])
+        out = gb.list_invoices()
+        assert "\tBILL\t" in out
+        assert f"(job:{job['id']})" in out
+
+    def test_non_job_invoice_no_annotation(self, business_book):
+        """Pre-v1.3 contract — direct customer invoices (no job)
+        produce compact output without a job annotation."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_invoice(customer_id="000001")  # no job_id
+        out = gb.list_invoices()
+        assert "(job:" not in out
+
+    def test_get_outstanding_shows_job_annotation(self, business_book):
+        """get_outstanding_invoices compact output annotates
+        job-attached docs with (job:JOB-X) on the owner
+        column."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="API Rewrite",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        out = gb.get_outstanding_invoices()  # compact default
+        assert f"(job:{job['id']})" in out
+
+    def test_get_outstanding_credit_note_in_job(self, business_book):
+        """A credit note attached to a job carries BOTH the (CN)
+        tag AND the (job:JOB-X) annotation — order: owner →
+        (CN) → (job:X)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer", name="X",
+        )
+        # Create + post a source invoice first so the credit
+        # note has something to link to
+        src = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=src["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        # Note: credit notes themselves aren't job-linked
+        # here — only the source invoice is. The credit
+        # note's compact line should NOT show a job
+        # annotation (it's not attached to a job).
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        out = gb.get_outstanding_invoices()
+        # The source invoice line carries the job annotation
+        src_line = next(
+            ln for ln in out.split("\n") if ln.startswith(src["id"])
+        )
+        assert f"(job:{job['id']})" in src_line
+        # The credit note line carries (CN) but not (job:...)
+        cn_line = next(
+            ln for ln in out.split("\n") if ln.startswith(cn["id"])
+        )
+        assert "(CN)" in cn_line
+        assert "(job:" not in cn_line
+
+
 class TestInvoiceJobLinkage:
     """Tests for the job_id parameter on create_invoice /
     create_bill, plus the cascading effects on _invoice_to_dict
