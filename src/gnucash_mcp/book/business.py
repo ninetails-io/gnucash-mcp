@@ -253,6 +253,30 @@ class BusinessMixin:
         from piecash.business.person import Vendor
         return book.session.query(Vendor).filter_by(guid=guid).first()
 
+    @staticmethod
+    def _find_employee_by_guid(book, guid: str):
+        """Find an employee by GUID (indexed)."""
+        from piecash.business.person import Employee
+        return book.session.query(Employee).filter_by(guid=guid).first()
+
+    @staticmethod
+    def _find_invoice_owner_by_guid(book, owner_type: int, guid: str):
+        """Find any invoice/bill/voucher owner by their (type, guid)
+        pair. Picks the right table to query based on owner_type.
+
+        ``invoices.owner_guid`` is a generic FK — the row points at
+        the customer/vendor/employee table depending on
+        ``owner_type``. Centralizing the picker keeps the three-way
+        dispatch out of every callsite that needs the owner's name.
+        """
+        if owner_type == 2:
+            return BusinessMixin._find_customer_by_guid(book, guid)
+        if owner_type == 4:
+            return BusinessMixin._find_vendor_by_guid(book, guid)
+        if owner_type == 5:
+            return BusinessMixin._find_employee_by_guid(book, guid)
+        return None
+
     # Path for the auto-created realized-FX-gain/loss income account.
     # Single credit-natural account: positive balance = net gain, negative
     # = net loss across the period. Named to match GAAP convention
@@ -607,21 +631,16 @@ class BusinessMixin:
         ``None`` → ``None`` (caller wants no filter).
         ``"customer"`` → 2.
         ``"vendor"`` → 4.
+        ``"employee"`` → 5.
 
         Anything else raises ``ValueError`` with a message that
-        names the valid options *and* explicitly calls out
-        ``"employee"`` as not yet supported. Employee expense
-        vouchers (``owner_type=5`` in piecash) are explicitly out
-        of scope for the 1.2.x business module — see the
-        ``delete_employee`` docstring's reference to
-        ``counter_exp_voucher``. Pre-fix, an LLM passing
-        ``owner_type="employee"`` would silently fall through to
-        the unfiltered lookup and discover the limitation only
-        via a confusing downstream error (e.g. a cross-sequence
-        ID-collision message that suggests "customer or vendor"
-        without mentioning employee at all). The upfront
-        rejection saves the LLM a tool call and frames the
-        limitation cleanly.
+        names the three valid options. ``"employee"`` (added in
+        v1.3 with the vouchers feature) is the third counterparty
+        type in piecash's invoice/bill/voucher polymorphic
+        table — see ``counter_exp_voucher`` in piecash's Book
+        model. Pre-vouchers this returned a "not yet supported"
+        error explicitly to give the LLM a useful hint; now it's
+        a first-class type.
         """
         if owner_type is None:
             return None
@@ -630,15 +649,10 @@ class BusinessMixin:
         if owner_type == "vendor":
             return 4
         if owner_type == "employee":
-            raise ValueError(
-                "owner_type='employee' is not yet supported. "
-                "Employee expense vouchers are out of scope for "
-                "the 1.2.x business module. Use 'customer' or "
-                "'vendor'."
-            )
+            return 5
         raise ValueError(
             f"Invalid owner_type {owner_type!r}. "
-            f"Must be 'customer' or 'vendor'."
+            f"Must be 'customer', 'vendor', or 'employee'."
         )
 
     @staticmethod
@@ -717,14 +731,23 @@ class BusinessMixin:
             return matches[0] if matches else None
 
         candidates = []
+        # Three-way label dispatch — collisions can now include
+        # vouchers since v1.3 added the third owner_type.
+        _COLLISION_LABELS = {
+            2: "customer invoice",
+            4: "vendor bill",
+            5: "employee voucher",
+        }
         for m in matches:
-            label = "vendor bill" if m.owner_type == 4 else "customer invoice"
+            label = _COLLISION_LABELS.get(
+                m.owner_type, f"unknown owner_type={m.owner_type}",
+            )
             currency = m.currency.mnemonic if m.currency else "?"
             candidates.append(f"{label} (currency={currency})")
         raise ValueError(
             f"Found {len(matches)} documents with ID {invoice_id!r}: "
-            f"{', '.join(candidates)}. Pass owner_type='customer' "
-            f"or 'vendor' to disambiguate."
+            f"{', '.join(candidates)}. Pass owner_type='customer', "
+            f"'vendor', or 'employee' to disambiguate."
         )
 
     @staticmethod
@@ -889,7 +912,9 @@ class BusinessMixin:
         result = {
             "guid": invoice.guid,
             "id": invoice.id,
-            "type": "bill" if invoice.owner_type == 4 else "invoice",
+            "type": BusinessMixin._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                invoice.owner_type, "invoice"
+            ),
             "owner_name": owner_name,
             "date_opened": (
                 str(_safe_invoice_date(invoice, "date_opened").date())
@@ -920,21 +945,21 @@ class BusinessMixin:
         Currency is shown when present so multi-currency books read
         unambiguously. Bills get the ``BILL`` tag (was already there).
         """
-        inv_type = "BILL" if invoice.owner_type == 4 else "INV"
+        inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
+            invoice.owner_type, "INV"
+        )
         opened = _safe_invoice_date(invoice, "date_opened")
         date_str = (
             str(opened.date()) if opened else "n/a"
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
-        # Owner lookup — vendors and customers share the same
-        # ``owner_guid`` namespace (different table, but same handle
-        # shape). Picking the right finder by ``owner_type`` matches
-        # how every other code path in this file resolves it.
-        if invoice.owner_type == 4:
-            owner = self._find_vendor_by_guid(book, invoice.owner_guid)
-        else:
-            owner = self._find_customer_by_guid(book, invoice.owner_guid)
+        # Owner lookup — customers/vendors/employees share the
+        # same ``owner_guid`` namespace shape across three tables.
+        # ``_find_invoice_owner_by_guid`` dispatches on owner_type.
+        owner = self._find_invoice_owner_by_guid(
+            book, invoice.owner_type, invoice.owner_guid,
+        )
         owner_name = owner.name if owner else "?"
 
         # Total: sum of (quantity * price) across entries. Falls back
@@ -1223,7 +1248,7 @@ class BusinessMixin:
         """
         from sqlalchemy import text
 
-        is_bill = inv.owner_type == 4
+        is_bill = self._is_bill_side(inv.owner_type)
         if is_bill:
             rows = book.session.execute(
                 text("SELECT * FROM entries WHERE bill = :guid"),
@@ -1967,7 +1992,49 @@ class BusinessMixin:
             "counter_attr": "counter_bill",
             "find_owner_method": "_find_vendor",
         },
+        5: {  # employee expense voucher
+            "owner_label": "Employee",
+            "doc_label": "Voucher",
+            "owner_id_key": "employee_id",
+            "doc_id_param": "voucher_id",
+            "counter_attr": "counter_exp_voucher",
+            "find_owner_method": "_find_employee",
+        },
     }
+
+    # ── Owner-type label helpers ─────────────────────────────────
+    # The legacy two-way "is_bill = owner_type == 4" idiom doesn't
+    # extend cleanly to three counterparty types. These small
+    # helpers replace the binary check with a three-way lookup so
+    # rendering / dispatch code stays readable.
+
+    # Response ``type`` field — lowercase, used by the audit log
+    # decorator to swap entity_type for the post/pay/unpost
+    # polymorphism.
+    _OWNER_TYPE_TO_RESPONSE_TYPE = {2: "invoice", 4: "bill", 5: "voucher"}
+
+    # Compact-line type tag (short, all-caps). Invoices stay "INV"
+    # for backward compat with existing render tests; bills /
+    # vouchers get explicit tags.
+    _OWNER_TYPE_TO_COMPACT_TAG = {2: "INV", 4: "BILL", 5: "VCHR"}
+
+    # Audit log entity_type — matches the (entity_type, operation)
+    # dispatch table in logging_config.py.
+    _OWNER_TYPE_TO_AUDIT_ENTITY = {
+        2: "invoice",
+        4: "bill",
+        5: "voucher",
+    }
+
+    @staticmethod
+    def _is_bill_side(owner_type: int) -> bool:
+        """Bills (4) and vouchers (5) both represent "company owes
+        someone" semantics — same posting direction, same entry
+        column group (``b_*``), same allowed account types. The
+        legacy code used ``inv.owner_type == 4`` to mean this; the
+        rename to ``_is_bill_side`` captures the truth.
+        """
+        return owner_type in (4, 5)
 
     def _create_business_document(
         self,
@@ -2231,6 +2298,49 @@ class BusinessMixin:
             doc_id=bill_id,
         )
 
+    def create_voucher(
+        self,
+        employee_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        voucher_id: str | None = None,
+    ) -> dict:
+        """Create an employee expense voucher.
+
+        A voucher is the document an employee submits for
+        reimbursement of out-of-pocket business expenses. Posts as
+        a liability ("company owes employee") just like a vendor
+        bill, then ``pay_invoice`` settles it from a cash account.
+
+        Args:
+            employee_id: Employee ID (e.g., '000001').
+            date_opened: Date in ISO format. Defaults to today.
+            notes: Optional notes.
+            currency: ISO currency code. Defaults to the employee's
+                currency, falling back to the book's default. Pass
+                explicitly to override.
+            term: Billterm name (e.g., 'Net 30'). Optional —
+                vouchers rarely use payment terms but the field
+                accepts them for symmetry with bills.
+            voucher_id: Custom voucher number. If omitted,
+                auto-generates from the book's
+                ``counter_exp_voucher``.
+
+        Returns:
+            Dict with guid, id, employee_id, status.
+        """
+        return self._create_business_document(
+            owner_type=5,
+            owner_id=employee_id,
+            date_opened=date_opened,
+            notes=notes,
+            currency=currency,
+            term=term,
+            doc_id=voucher_id,
+        )
+
     # owner_type → per-document config table for ``_add_entry``.
     # Same dispatch idiom as ``_BUSINESS_DOC_CONFIG`` for create —
     # one row per document kind, the helper below stays generic.
@@ -2260,6 +2370,26 @@ class BusinessMixin:
                 "ASSET for inventory purchases that capitalize."
             ),
         },
+        5: {  # employee expense voucher
+            # Voucher entries route through the SAME ``b_*`` columns
+            # and ``bill`` FK as vendor bills — GnuCash's schema
+            # collapses "company owes someone" semantics into one
+            # column group regardless of whether the someone is a
+            # vendor or an employee. Only owner_type on the parent
+            # row distinguishes them.
+            "label": "Voucher",
+            "id_param": "voucher_id",
+            "twin_method": "add_invoice_entry",
+            "twin_label": "customer invoice",
+            "allowed_types": frozenset({"EXPENSE", "ASSET"}),
+            "type_error_msg": (
+                "Voucher entry account must be EXPENSE or ASSET "
+                "(got {got} on '{path}'). EXPENSE for normal "
+                "reimbursable expenses (meals, supplies, travel); "
+                "ASSET for employee-purchased inventory that "
+                "capitalizes."
+            ),
+        },
     }
 
     def _add_entry(
@@ -2284,7 +2414,12 @@ class BusinessMixin:
         from piecash.business.invoice import Entry
 
         cfg = self._ENTRY_CONFIG[owner_type]
-        is_bill = owner_type == 4
+        # Both vendor bills (4) and employee expense vouchers (5)
+        # route through the ``b_*`` column group and the ``bill``
+        # FK — GnuCash's schema treats them as the same "company
+        # owes someone" shape. Only owner_type on the parent row
+        # distinguishes them.
+        is_bill_side = owner_type in (4, 5)
         qty = _to_decimal(quantity)
         unit_price = _to_decimal(price)
 
@@ -2326,8 +2461,10 @@ class BusinessMixin:
             # The Entries table has parallel ``i_*`` (invoice side)
             # and ``b_*`` (bill side) column groups. Exactly one
             # group carries values for any given entry; the other
-            # is zeroed/NULL.
-            if is_bill:
+            # is zeroed/NULL. Voucher entries (owner_type=5) share
+            # the ``b_*`` / ``bill`` group with vendor bills — see
+            # ``is_bill_side`` above.
+            if is_bill_side:
                 values = dict(
                     i_acct=None, i_price_num=0, i_price_denom=1,
                     invoice=None,
@@ -2447,6 +2584,42 @@ class BusinessMixin:
             price=price,
         )
 
+    def add_voucher_entry(
+        self,
+        voucher_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+    ) -> dict:
+        """Add a line item entry to an employee expense voucher.
+
+        Voucher entries are typically one-per-expense-category
+        (meals, supplies, travel, etc.) on a single submission. The
+        underlying storage uses the same ``b_*`` column group as
+        vendor bills — see ``_add_entry``.
+
+        Args:
+            voucher_id: Voucher ID (e.g., '000001').
+            account: Expense account full path (e.g.,
+                'Expenses:Meals & Entertainment'). Must be an
+                EXPENSE or ASSET account.
+            description: Line item description.
+            quantity: Quantity as string (e.g., '1').
+            price: Unit price as string (e.g., '42.50').
+
+        Returns:
+            Dict with guid, voucher_id, total, status.
+        """
+        return self._add_entry(
+            owner_type=5,
+            doc_id=voucher_id,
+            account=account,
+            description=description,
+            quantity=quantity,
+            price=price,
+        )
+
     def list_invoices(
         self,
         owner_type: str | None = None,
@@ -2503,10 +2676,9 @@ class BusinessMixin:
                 # from the dict shape in Phase 3C.
                 results = []
                 for i in invoices:
-                    if i.owner_type == 4:
-                        o = self._find_vendor_by_guid(book, i.owner_guid)
-                    else:
-                        o = self._find_customer_by_guid(book, i.owner_guid)
+                    o = self._find_invoice_owner_by_guid(
+                        book, i.owner_type, i.owner_guid,
+                    )
                     results.append(
                         self._invoice_to_dict(
                             i, owner_name=o.name if o else None,
@@ -2551,7 +2723,7 @@ class BusinessMixin:
             if not inv:
                 raise ValueError(f"Invoice/bill not found: {invoice_id}")
 
-            is_bill = inv.owner_type == 4
+            is_bill = self._is_bill_side(inv.owner_type)
 
             # Get entries via raw SQL since ORM relationship doesn't
             # work for vendor bills (bill column is VARCHAR, not FK)
@@ -2588,15 +2760,15 @@ class BusinessMixin:
                 for e in entries
             )
 
-            owner_name = None
-            if is_bill:
-                vendor = self._find_vendor_by_guid(book, inv.owner_guid)
-                if vendor:
-                    owner_name = vendor.name
-            else:
-                customer = self._find_customer_by_guid(book, inv.owner_guid)
-                if customer:
-                    owner_name = customer.name
+            # Three-way owner lookup — vouchers route to employees,
+            # bills to vendors, invoices to customers. Pre-fix this
+            # was a binary "is_bill → vendor else customer" check
+            # that returned None for vouchers because employees
+            # weren't in the dispatch.
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+            owner_name = owner.name if owner else None
 
             result = self._invoice_to_dict(
                 inv, entries=entries, owner_name=owner_name,
@@ -2696,7 +2868,7 @@ class BusinessMixin:
                     f"Invoice {invoice_id} is already posted"
                 )
 
-            is_bill = inv.owner_type == 4
+            is_bill = self._is_bill_side(inv.owner_type)
 
             post_acct = self._resolve_account(book, post_account)
             if not post_acct:
@@ -2848,7 +3020,9 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": "bill" if is_bill else "invoice",
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                ),
                 "status": "posted",
                 "total": str(grand_total),
                 "post_date": str(parsed_date),
@@ -2907,7 +3081,7 @@ class BusinessMixin:
                     f"Invoice {invoice_id} is not posted"
                 )
 
-            is_bill = inv.owner_type == 4
+            is_bill = self._is_bill_side(inv.owner_type)
             doc_label = "Bill" if is_bill else "Invoice"
 
             # Capture before-state for the audit log: the user wants
@@ -2920,7 +3094,9 @@ class BusinessMixin:
             )
             self._stage_audit_before({
                 "id": inv.id,
-                "type": "bill" if is_bill else "invoice",
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                ),
                 "date_posted": (
                     str(prev_post_date.date()) if prev_post_date else None
                 ),
@@ -2982,7 +3158,9 @@ class BusinessMixin:
 
             return {
                 "id": inv.id,
-                "type": "bill" if is_bill else "invoice",
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                ),
                 "status": "unposted",
             }
 
@@ -3074,7 +3252,7 @@ class BusinessMixin:
                     f"post it before recording payment"
                 )
 
-            is_bill = inv.owner_type == 4
+            is_bill = self._is_bill_side(inv.owner_type)
 
             pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
@@ -3301,7 +3479,9 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": "bill" if is_bill else "invoice",
+                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                ),
                 "status": "paid",
                 "amount_paid": str(payment_amount),
                 "remaining_balance": str(abs(remaining)),
@@ -3375,15 +3555,43 @@ class BusinessMixin:
         """
         return self._delete_invoice_or_bill(bill_id, owner_type=4)
 
+    def delete_voucher(self, voucher_id: str) -> dict:
+        """Delete an unposted employee expense voucher.
+
+        Automatically removes associated entries. Posted vouchers
+        cannot be deleted — unpost first via ``unpost_invoice``,
+        then delete.
+
+        Args:
+            voucher_id: Voucher ID (e.g., '000001').
+
+        Returns:
+            Dict with id, guid, entries_deleted, status.
+
+        Raises:
+            ValueError: If voucher not found or is posted.
+        """
+        return self._delete_invoice_or_bill(voucher_id, owner_type=5)
+
     def _delete_invoice_or_bill(self, doc_id: str, owner_type: int) -> dict:
-        """Shared implementation for delete_invoice and delete_bill."""
+        """Shared implementation for delete_invoice / delete_bill /
+        delete_voucher.
+
+        owner_type 2 (invoice) uses the ``invoice`` entry FK; 4
+        (bill) and 5 (voucher) both use the ``bill`` entry FK —
+        GnuCash's schema collapses bill-side semantics into one
+        column group.
+        """
         from sqlalchemy import func, select
         from piecash.business.invoice import Entry, Invoice
 
         from gnucash_mcp.book._base import _verify_delete
 
-        type_label = "Bill" if owner_type == 4 else "Invoice"
-        entry_fk = "bill" if owner_type == 4 else "invoice"
+        _TYPE_LABELS = {2: "Invoice", 4: "Bill", 5: "Voucher"}
+        type_label = _TYPE_LABELS[owner_type]
+        # Bills (4) and vouchers (5) both write to the ``bill`` FK
+        # column on entries — see ``_add_entry`` is_bill_side.
+        entry_fk = "invoice" if owner_type == 2 else "bill"
         entry_fk_col = getattr(Entry.__table__.c, entry_fk)
 
         with self.open(readonly=False) as book:
@@ -3709,7 +3917,7 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                is_bill = inv.owner_type == 4
+                is_bill = self._is_bill_side(inv.owner_type)
 
                 post_acc_guid = inv.post_acc_guid
                 post_acct = book.session.query(
@@ -3770,7 +3978,9 @@ class BusinessMixin:
                 )
                 results.append({
                     "id": inv.id,
-                    "type": "bill" if is_bill else "invoice",
+                    "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                ),
                     "owner_name": owner_name,
                     "currency": currency,
                     "date_posted": (

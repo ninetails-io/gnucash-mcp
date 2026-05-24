@@ -469,6 +469,92 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="voucher")
+    def create_voucher(
+        employee_id: str,
+        date_opened: str | None = None,
+        notes: str = "",
+        currency: str | None = None,
+        term: str | None = None,
+        voucher_id: str | None = None,
+    ) -> str:
+        """Create an employee expense voucher.
+
+        A voucher is the document an employee submits for
+        reimbursement of out-of-pocket business expenses. It
+        behaves like a vendor bill: post creates the obligation
+        (debit expense accounts, credit A/P), pay settles it from
+        a cash account.
+
+        Args:
+            employee_id: Employee ID (e.g., "000001").
+            date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
+            notes: Optional notes.
+            currency: ISO currency code. Defaults to the employee's
+                currency, falling back to the book's default.
+            term: Billterm name (e.g., "Net 30"). Optional —
+                vouchers rarely use payment terms.
+            voucher_id: Custom voucher number. If omitted,
+                auto-generates from the book's voucher counter.
+        """
+        book = get_book()
+        result = book.create_voucher(
+            employee_id=employee_id, date_opened=date_opened,
+            notes=notes, currency=currency, term=term,
+            voucher_id=voucher_id,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="entry")
+    def add_voucher_entry(
+        voucher_id: str,
+        account: str,
+        description: str,
+        quantity: str,
+        price: str,
+    ) -> str:
+        """Add a line item to an employee expense voucher.
+
+        The voucher must not be posted yet. Each entry is typically
+        a separate expense category (meals, supplies, travel).
+        Account must be EXPENSE or ASSET.
+
+        Args:
+            voucher_id: Voucher ID (e.g., "000001").
+            account: Expense account path (e.g.,
+                "Expenses:Meals & Entertainment").
+            description: Line item description.
+            quantity: Quantity as decimal string (e.g., "1").
+            price: Unit price as decimal string (e.g., "42.50").
+        """
+        book = get_book()
+        result = book.add_voucher_entry(
+            voucher_id=voucher_id, account=account,
+            description=description, quantity=quantity, price=price,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="voucher")
+    def delete_voucher(voucher_id: str) -> str:
+        """Delete an unposted employee expense voucher.
+
+        Automatically removes associated entries. Posted vouchers
+        cannot be deleted — unpost first via ``unpost_invoice``,
+        then delete.
+
+        Args:
+            voucher_id: Voucher ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.delete_voucher(voucher_id=voucher_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="read")
     def list_invoices(
         owner_type: str | None = None,

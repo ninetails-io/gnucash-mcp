@@ -300,6 +300,12 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_employee",
         "update_employee",
         "delete_employee",
+        # Employee expense vouchers (v1.3). Lifecycle (post /
+        # unpost / pay) flows through the polymorphic invoice
+        # tools in freelancer with owner_type='employee'.
+        "create_voucher",
+        "add_voucher_entry",
+        "delete_voucher",
         "create_billterm",
         "list_billterms",
         "vendor_spending_report",
@@ -654,7 +660,7 @@ Usage: gnucash-mcp [OPTIONS]
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core (26 tools, always-on). Use "all"
-                       for every module (88 tools).
+                       for every module (91 tools).
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):
