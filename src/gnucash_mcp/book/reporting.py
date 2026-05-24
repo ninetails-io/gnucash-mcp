@@ -833,12 +833,14 @@ class ReportingMixin:
         while any(d["balance"] > 0 for d in working) and month < max_months:
             month += 1
 
-            # Step 1: Apply monthly interest to each balance
+            # Step 1: Apply monthly interest to each balance. Rate is
+            # pre-computed per debt in ``debt_payoff_plan`` (apr/100/12);
+            # this loop runs up to 1200 × N times and recomputing the
+            # division each iteration was pure waste.
             for d in working:
                 if d["balance"] <= 0:
                     continue
-                monthly_rate = d["apr"] / Decimal("100") / Decimal("12")
-                interest = (d["balance"] * monthly_rate).quantize(Decimal("0.01"))
+                interest = (d["balance"] * d["monthly_rate"]).quantize(Decimal("0.01"))
                 d["balance"] += interest
                 d["interest_paid"] += interest
 
@@ -949,11 +951,21 @@ class ReportingMixin:
                 if account.type not in debt_types:
                     continue
 
+                # Materialize ``account.slots`` into a dict once. Pre-fix,
+                # each ``account[key]`` access (apr, minimum_payment,
+                # credit_limit — three per account) went through piecash's
+                # slot-helper path, hitting the slots collection
+                # independently per key. One iteration + three dict gets
+                # is cheaper.
+                slot_by_name = {s.name: s for s in account.slots}
+
+                apr_val = slot_by_name.get("apr")
+                if apr_val is None:
+                    continue
                 try:
-                    apr_val = account["apr"]
                     apr_str = str(apr_val.value) if hasattr(apr_val, "value") else str(apr_val)
                     apr = Decimal(apr_str)
-                except (KeyError, InvalidOperation):
+                except InvalidOperation:
                     continue
 
                 if apr <= 0:
@@ -973,12 +985,13 @@ class ReportingMixin:
                 # 1. Check minimum_payment slot (user override).
                 #    Wins for both CREDIT and LIABILITY — the user has
                 #    declared the contractual amount.
-                try:
-                    mp_val = account["minimum_payment"]
-                    mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
-                    min_payment = Decimal(mp_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                mp_val = slot_by_name.get("minimum_payment")
+                if mp_val is not None:
+                    try:
+                        mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
+                        min_payment = Decimal(mp_str)
+                    except InvalidOperation:
+                        pass
 
                 # 2. Type-aware fallback. Credit cards and amortizing
                 #    loans have very different minimum-payment shapes:
@@ -1022,17 +1035,23 @@ class ReportingMixin:
                             min_payment = balance
 
                 credit_limit = None
-                try:
-                    cl_val = account["credit_limit"]
-                    cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
-                    credit_limit = Decimal(cl_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                cl_val = slot_by_name.get("credit_limit")
+                if cl_val is not None:
+                    try:
+                        cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
+                        credit_limit = Decimal(cl_str)
+                    except InvalidOperation:
+                        pass
 
                 debts.append({
                     "name": account.fullname,
                     "balance": balance,
                     "apr": apr,
+                    # Pre-compute monthly rate once per debt. _run_avalanche's
+                    # inner loop iterates up to 1200 months, and pre-fix
+                    # recomputed apr/100/12 every iteration for every debt
+                    # that still had a balance.
+                    "monthly_rate": apr / Decimal("100") / Decimal("12"),
                     "min_payment": min_payment,
                     "credit_limit": credit_limit,
                 })
