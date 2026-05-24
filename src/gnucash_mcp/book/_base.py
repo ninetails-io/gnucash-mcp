@@ -726,6 +726,16 @@ class BaseGnuCashBook(CurrencyMixin):
         # `_consume_audit_before()` after the tool returns. This avoids
         # a second read-only book open per write (~40-100ms).
         self._audit_tls = threading.local()
+        # Cache for the full-table transaction prefix map. Three call
+        # sites (``list_transactions``, ``search_transactions``,
+        # ``_collect_create_signals``) build the same map over every
+        # transaction GUID; the map is correct as long as the book
+        # hasn't been mutated since last build. Gate on
+        # ``book_path.stat().st_mtime_ns`` — SQLite touches the file
+        # on every commit, so a write through this server (or any
+        # other writer) invalidates the cache on the next request.
+        # Shape: ``(mtime_ns, prefix_dict)`` or ``None`` when empty.
+        self._txn_prefix_cache: tuple[int, dict[str, str]] | None = None
 
     def _stage_audit_before(self, state: dict | None) -> None:
         """Stage a before-state dict for the next audit-log consume.
@@ -957,6 +967,40 @@ class BaseGnuCashBook(CurrencyMixin):
             guids, min_len=self._SHORT_ACCOUNT_GUID_MIN_LEN
         )
         return {g: self._SHORT_ACCOUNT_GUID_PREFIX + p for g, p in raw.items()}
+
+    def _transaction_prefix_map(
+        self, book: piecash.Book
+    ) -> dict[str, str]:
+        """Return the full-table transaction-GUID prefix map, cached.
+
+        Multiple read paths (``list_transactions``, ``search_transactions``,
+        the duplicate-detection signal collector) all emit short
+        prefixes that must be collision-safe against
+        ``_resolve_guid``'s table-wide LIKE lookup. Each independently
+        called ``_guid_prefix_map(t.guid for t in book.transactions)``
+        — paying the iteration plus the sort-and-map-build cost on
+        every request.
+
+        Cache invariant: the prefix map is correct as long as no
+        transaction has been added, removed, or had its GUID changed.
+        SQLite touches the book file on every commit, so
+        ``book_path.stat().st_mtime_ns`` is a sufficient proxy —
+        any mutation (this process or any other writer) bumps mtime
+        and forces a rebuild on the next request.
+
+        Same-nanosecond writes after a request could theoretically
+        serve a stale map, but mtime precision is nanoseconds on
+        modern filesystems and request rate is well below that.
+        """
+        mtime_ns = self.book_path.stat().st_mtime_ns
+        if (
+            self._txn_prefix_cache is not None
+            and self._txn_prefix_cache[0] == mtime_ns
+        ):
+            return self._txn_prefix_cache[1]
+        prefix_map = _guid_prefix_map(t.guid for t in book.transactions)
+        self._txn_prefix_cache = (mtime_ns, prefix_map)
+        return prefix_map
 
     def _resolve_account(
         self, book: piecash.Book, ref: str

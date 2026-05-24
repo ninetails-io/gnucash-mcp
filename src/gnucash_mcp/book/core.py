@@ -2221,7 +2221,9 @@ class CoreMixin:
                 # Build collision-safe prefix map across ALL transactions in
                 # the book (not just the filtered batch) so emitted prefixes
                 # remain valid _resolve_guid lookup keys against the full table.
-                prefixes = _guid_prefix_map(t.guid for t in book.transactions)
+                # Cached on BaseGnuCashBook by book mtime — repeated calls
+                # against an unchanged book skip the iterate-sort-build pass.
+                prefixes = self._transaction_prefix_map(book)
                 lines = [
                     _transaction_to_compact_line(
                         t, focus_account=focus_fullname, prefixes=prefixes
@@ -2433,9 +2435,10 @@ class CoreMixin:
         # Short-guid prefix map built once, shared across all emitted
         # guids (auto-fill source, duplicates). Caller never sees the
         # raw 32-char guid — prefixes flow straight into tool responses.
+        # Cached on BaseGnuCashBook by book mtime.
         emitting_guids = want_auto_fill or want_duplicates
         txn_prefixes = (
-            _guid_prefix_map(t.guid for t in book.transactions)
+            self._transaction_prefix_map(book)
             if emitting_guids
             else {}
         )
@@ -3116,8 +3119,9 @@ class CoreMixin:
             matched = matched[:effective_limit]
 
             if compact:
-                # Collision-safe prefix map over the whole transactions table
-                prefixes = _guid_prefix_map(t.guid for t in book.transactions)
+                # Collision-safe prefix map over the whole transactions
+                # table — cached on BaseGnuCashBook by book mtime.
+                prefixes = self._transaction_prefix_map(book)
                 lines = [
                     _transaction_to_compact_line(t, prefixes=prefixes)
                     for t in matched
