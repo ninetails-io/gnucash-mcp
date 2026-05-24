@@ -190,23 +190,28 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     """Enforce the Freelancer/Business module split at the
     ``owner_type`` boundary.
 
-    Shared-lifecycle invoice/bill tools (post_invoice, unpost_invoice,
-    pay_invoice, list_invoices, get_invoice, get_outstanding_invoices)
-    live in the Freelancer module because customer-facing invoicing is
-    the natural Freelancer surface. Vendor bills travel through the
-    same tools via ``owner_type='vendor'`` dispatch — but the Business
-    module owns vendor management. A user with only Freelancer loaded
-    should never be able to touch vendor bills.
+    Shared-lifecycle invoice/bill/voucher tools (post_invoice,
+    unpost_invoice, pay_invoice, list_invoices, get_invoice,
+    get_outstanding_invoices) live in the Freelancer module
+    because customer-facing invoicing is the natural Freelancer
+    surface. Vendor bills (``owner_type='vendor'``) and employee
+    expense vouchers (``owner_type='employee'``) travel through
+    the same tools via owner_type dispatch — but the Business
+    module owns BOTH vendor and employee management. A user with
+    only Freelancer loaded should never be able to touch either.
 
-    Two cases:
+    Three cases:
 
-    - **Explicit ``owner_type='vendor'`` without Business loaded:**
-      reject with a clear error. The user is explicitly asking for
-      vendor-side behavior they didn't enable.
+    - **Explicit ``owner_type='vendor'`` or ``'employee'`` without
+      Business loaded:** reject with a clear error. The user is
+      explicitly asking for behavior they didn't enable.
     - **``owner_type`` omitted or ``'customer'`` without Business:**
-      coerce to ``'customer'``. The tool only sees customer entities.
-      Any vendor-ID collision is treated as "not found" at the
-      lookup layer (book methods filter on owner_type).
+      coerce to ``'customer'``. The tool only sees customer
+      entities. Any vendor/employee-ID collision is treated as
+      "not found" at the lookup layer (book methods filter on
+      owner_type).
+    - **Business loaded:** pass through unchanged; all three halves
+      available.
 
     Returns the (possibly coerced) owner_type the book method should
     receive. Caller passes the return value through to ``book.X(...,
@@ -218,7 +223,7 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     from gnucash_mcp.server import is_module_enabled
 
     if is_module_enabled("business"):
-        return owner_type  # Both halves available; no gating.
+        return owner_type  # All three halves available; no gating.
 
     if owner_type == "vendor":
         raise ValueError(
@@ -226,6 +231,14 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
             "Restart the server with --modules=...,Business to access "
             "vendor bills, or omit owner_type to operate on customer "
             "invoices only."
+        )
+    if owner_type == "employee":
+        raise ValueError(
+            "owner_type='employee' requires the Business module. "
+            "Employee expense vouchers live with employee "
+            "management, which the Business module owns. Restart "
+            "the server with --modules=...,Business or omit "
+            "owner_type to operate on customer invoices only."
         )
     return "customer"
 

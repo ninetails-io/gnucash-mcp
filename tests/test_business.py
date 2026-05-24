@@ -1295,6 +1295,236 @@ class TestDeleteBill:
             gb.delete_bill(bill_id="NOPE")
 
 
+class TestCreateVoucher:
+    """Tests for create_voucher — employee expense reimbursement.
+
+    Routes through ``_create_business_document`` with owner_type=5,
+    so the cross-currency / billterm / custom-id / counter
+    behaviors all come for free from the bill path. These tests
+    pin the voucher-specific surface: response shape, the
+    employee_id key, the auto-generated counter, and rejection
+    paths.
+    """
+
+    def test_basic_creation(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        result = gb.create_voucher(employee_id="000001")
+        assert result["status"] == "created"
+        assert result["employee_id"] == "000001"
+        # Voucher counter starts at 0; first auto-id is 000001.
+        assert result["id"] == "000001"
+        assert len(result["guid"]) == 32
+
+    def test_employee_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Employee not found"):
+            gb.create_voucher(employee_id="999999")
+
+    def test_custom_voucher_id(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        result = gb.create_voucher(
+            employee_id="000001", voucher_id="VCHR-2026-001",
+        )
+        assert result["id"] == "VCHR-2026-001"
+
+    def test_duplicate_voucher_id_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001", voucher_id="V1")
+        with pytest.raises(ValueError, match="already exists"):
+            gb.create_voucher(employee_id="000001", voucher_id="V1")
+
+    def test_voucher_counter_independent_from_bill_counter(self, business_book):
+        """Vouchers use ``counter_exp_voucher``, bills use
+        ``counter_bill``. The two sequences should be independent
+        — a voucher created after a bill should NOT inherit the
+        bill's counter value."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_employee(name="Maria Garcia")
+        # Bill #1 — counter_bill goes to 1.
+        bill = gb.create_bill(vendor_id="000001")
+        assert bill["id"] == "000001"
+        # Voucher #1 — counter_exp_voucher goes to 1, independent.
+        voucher = gb.create_voucher(employee_id="000001")
+        assert voucher["id"] == "000001"
+
+    def test_inherits_employee_currency(self, business_book):
+        """Currency resolution: voucher inherits the employee's
+        currency by default (same rule bills/invoices use for
+        vendor/customer)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia", currency="USD")
+        result = gb.create_voucher(employee_id="000001")
+        full = gb.get_invoice(result["id"], owner_type="employee")
+        assert full["currency"] == "USD"
+
+
+class TestAddVoucherEntry:
+    """Tests for add_voucher_entry.
+
+    Voucher entries use the same ``b_*`` column group as bill
+    entries (GnuCash schema collapses bill-side semantics). These
+    tests pin the voucher-specific surface: account type
+    validation, response shape, twin-method error messaging.
+    """
+
+    def test_basic_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        result = gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Pens and notebooks",
+            quantity="1",
+            price="42.50",
+        )
+        assert result["status"] == "created"
+        assert result["voucher_id"] == "000001"
+        assert result["total"] == "42.50"
+
+    def test_multiple_entries_one_voucher(self, business_book):
+        """Vouchers are typically multi-line — a single expense
+        report covers groceries, gas, meals, etc."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        e1 = gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Supplies",
+            quantity="1", price="50.00",
+        )
+        e2 = gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Client lunch",
+            quantity="1", price="100.00",
+        )
+        assert e1["guid"] != e2["guid"]
+
+    def test_income_account_rejected(self, business_book):
+        """Voucher entries take EXPENSE/ASSET only — same as
+        bills. INCOME would invert the posting math."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        with pytest.raises(ValueError, match="EXPENSE or ASSET"):
+            gb.add_voucher_entry(
+                voucher_id="000001",
+                account="Income:Sales",
+                description="Wrong direction",
+                quantity="1", price="100",
+            )
+
+    def test_voucher_not_found(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.add_voucher_entry(
+                voucher_id="NOPE",
+                account="Expenses:Office Supplies",
+                description="x",
+                quantity="1", price="1",
+            )
+
+
+class TestDeleteVoucher:
+    """Tests for delete_voucher. Mirrors delete_bill but with
+    employee + voucher semantics."""
+
+    def test_delete_unposted_voucher(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        result = gb.delete_voucher(voucher_id="000001")
+        assert result["status"] == "deleted"
+        assert result["id"] == "000001"
+        assert result["type"] == "voucher"
+
+    def test_delete_with_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Supplies", quantity="1", price="50",
+        )
+        result = gb.delete_voucher(voucher_id="000001")
+        assert result["status"] == "deleted"
+        assert result["entries_deleted"] == 1
+
+
+class TestVoucherLifecycle:
+    """End-to-end: create voucher → add entries → post → pay.
+    Vouchers travel through the polymorphic post_invoice /
+    pay_invoice path with owner_type='employee'.
+
+    This is the load-bearing test: if any seam between voucher
+    create and the bill-shaped lifecycle code is misrouted, it
+    surfaces here.
+    """
+
+    def test_post_voucher_via_polymorphic_path(self, business_book):
+        """post_invoice with owner_type='employee' debits the
+        expense accounts, credits A/P. Same math as a bill, same
+        polymorphic tool."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Pens", quantity="1", price="50.00",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="employee",
+        )
+        # The polymorphism handler returns type='voucher' so the
+        # audit log can dispatch correctly.
+        assert result["type"] == "voucher"
+        # A/P is credited — piecash signs liability balances as
+        # negative (signed quantity convention: credits subtract).
+        ap_balance = gb.get_balance("Liabilities:Accounts Payable")
+        assert ap_balance == Decimal("-50.00")
+        # Expense account is debited (positive expense balance).
+        exp_balance = gb.get_balance("Expenses:Office Supplies")
+        assert exp_balance == Decimal("50.00")
+
+    def test_pay_voucher_via_polymorphic_path(self, business_book):
+        """pay_invoice with owner_type='employee' debits A/P,
+        credits the payment account — net effect: cash leaves the
+        company, A/P returns to zero."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Maria Garcia")
+        gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Pens", quantity="1", price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="employee",
+        )
+        # Pay $50 from Checking.
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="50.00",
+            owner_type="employee",
+        )
+        # A/P back to zero; Checking down $50 from opening 10000.
+        assert gb.get_balance("Liabilities:Accounts Payable") == Decimal("0.00")
+        assert gb.get_balance("Assets:Checking") == Decimal("9950.00")
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
@@ -1700,47 +1930,38 @@ class TestInvoiceBillIdCollision:
 class TestOwnerTypeValidation:
     """Centralized rejection of invalid ``owner_type`` values.
 
-    The bookkeeper hit this on a session where an LLM passed
-    ``owner_type="employee"``. Pre-fix, the value silently fell
-    through to no-filter and the LLM saw a confusing
-    cross-sequence ID-collision error suggesting "customer or
-    vendor" — never explaining that "employee" is the actual
-    problem. Upfront validation saves the LLM a tool call and
-    frames the limitation cleanly.
+    Pre-v1.3 the validator explicitly rejected ``"employee"`` with
+    a "not yet supported" message because vouchers weren't built
+    yet. v1.3 added vouchers; ``"employee"`` is now a first-class
+    type returning 5 (alongside customer=2, vendor=4). The
+    validator still rejects typos / unknown strings with a clear
+    options list.
     """
-
-    def test_employee_owner_type_rejected_with_clear_message(
-        self, business_book,
-    ):
-        """The headline scenario: ``owner_type="employee"`` is
-        explicitly out of scope for the 1.2.x business module
-        (employee expense vouchers are a 1.3 thing). Reject
-        upfront with a message that says so."""
-        gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError) as exc_info:
-            gb.get_invoice("000001", owner_type="employee")
-        msg = str(exc_info.value)
-        assert "employee" in msg.lower()
-        assert "not yet supported" in msg
-        # Hint at the valid options so the LLM doesn't have to
-        # call back blindly.
-        assert "customer" in msg
-        assert "vendor" in msg
 
     def test_typo_owner_type_rejected_with_valid_options(
         self, business_book,
     ):
-        """Typos like ``"custmer"`` (missing 'o') get the same
-        upfront rejection. Pre-fix they silently fell through to
-        no-filter."""
+        """Typos like ``"custmer"`` (missing 'o') get the upfront
+        rejection. The error names all three valid options so the
+        LLM doesn't have to call back blindly."""
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError) as exc_info:
             gb.get_invoice("000001", owner_type="custmer")
         msg = str(exc_info.value)
         assert "Invalid owner_type" in msg
         assert "'custmer'" in msg
+        # All three valid options should appear in the hint.
         assert "customer" in msg
         assert "vendor" in msg
+        assert "employee" in msg
+
+    def test_employee_owner_type_accepted(self, business_book):
+        """v1.3 invariant: ``owner_type="employee"`` is now valid
+        and returns 5 from ``_parse_owner_type``. The function-
+        level test is here; the end-to-end voucher exercise is in
+        TestCreateVoucher / TestVoucherLifecycle."""
+        from gnucash_mcp.book.business import BusinessMixin
+        assert BusinessMixin._parse_owner_type("employee") == 5
 
     def test_none_owner_type_still_works(self, business_book):
         """``None`` means "no filter" — the existing semantic
@@ -1752,31 +1973,11 @@ class TestOwnerTypeValidation:
         inv = gb.get_invoice("000001", owner_type=None)
         assert inv["type"] == "invoice"
 
-    def test_post_invoice_rejects_employee_owner_type(
-        self, business_book,
-    ):
-        """All four entrypoints share the same validator; verify
-        ``post_invoice`` specifically since the bookkeeper's
-        report mentioned posting an invoice with employee
-        owner_type."""
-        gb = GnuCashBook(str(business_book))
-        gb.create_customer(name="Acme Corp")
-        gb.create_invoice(customer_id="000001")
-        gb.add_invoice_entry(
-            invoice_id="000001", account="Income:Sales",
-            description="x", quantity="1", price="100",
-        )
-        with pytest.raises(ValueError, match="not yet supported"):
-            gb.post_invoice(
-                invoice_id="000001",
-                post_account="Assets:Accounts Receivable",
-                owner_type="employee",
-            )
-
     def test_pay_invoice_rejects_typo_owner_type(
         self, business_book,
     ):
-        """Symmetry: ``pay_invoice`` validates too."""
+        """``pay_invoice`` shares the same validator — typos get
+        rejected here too."""
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
         with pytest.raises(ValueError, match="Invalid owner_type"):
@@ -1787,15 +1988,6 @@ class TestOwnerTypeValidation:
                 owner_type="venddor",  # typo
             )
 
-    def test_unpost_invoice_rejects_employee(self, business_book):
-        """Symmetry: ``unpost_invoice`` (added in this same
-        patch) validates too."""
-        gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="not yet supported"):
-            gb.unpost_invoice(
-                invoice_id="000001", owner_type="employee",
-            )
-
     def test_list_invoices_rejects_invalid_owner_type(
         self, business_book,
     ):
@@ -1803,14 +1995,6 @@ class TestOwnerTypeValidation:
         gb = GnuCashBook(str(business_book))
         with pytest.raises(ValueError, match="Invalid owner_type"):
             gb.list_invoices(owner_type="bogus")
-
-    def test_get_outstanding_invoices_rejects_invalid_owner_type(
-        self, business_book,
-    ):
-        """The other read with owner_type also validates."""
-        gb = GnuCashBook(str(business_book))
-        with pytest.raises(ValueError, match="not yet supported"):
-            gb.get_outstanding_invoices(owner_type="employee")
 
 
 # ============== Post Invoice Tests ==============

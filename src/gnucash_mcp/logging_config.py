@@ -877,13 +877,78 @@ def _fmt_bill_delete(entry: dict) -> list[str]:
     return lines
 
 
+# ── Voucher formatters ───────────────────────────────────────
+# Vouchers (employee expense reimbursements) share the
+# post/unpost/pay lifecycle code path with bills — the audit log
+# decorator swaps entity_type from "invoice" to "voucher" when the
+# response's ``type`` field is "voucher" (see the decorator's
+# polymorphism block). These formatters mirror the bill ones with
+# the right label.
+
+
+def _fmt_voucher_post(entry: dict) -> list[str]:
+    lines = _fmt_invoice_post(entry)
+    if lines:
+        lines[0] = lines[0].replace("POST INVOICE", "POST VOUCHER")
+    return lines
+
+
+def _fmt_voucher_unpost(entry: dict) -> list[str]:
+    lines = _fmt_invoice_unpost(entry)
+    if lines:
+        lines[0] = lines[0].replace("UNPOST INVOICE", "UNPOST VOUCHER")
+    return lines
+
+
+def _fmt_voucher_pay(entry: dict) -> list[str]:
+    lines = _fmt_invoice_pay(entry)
+    if lines:
+        lines[0] = lines[0].replace("PAY INVOICE", "PAY VOUCHER")
+    return lines
+
+
+def _fmt_voucher_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    voucher_id = after.get("id", "")
+    employee_id = after.get("employee_id", params.get("employee_id", ""))
+    return [
+        f"{time_part}  CREATE VOUCHER  id:{voucher_id}",
+        f"{_INDENT}employee: {employee_id}",
+    ]
+
+
+def _fmt_voucher_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    lines = [
+        f"{time_part}  DELETE VOUCHER  "
+        f"id:{params.get('voucher_id', '')}"
+    ]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
 def _fmt_entry_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
     desc = after.get("description", params.get("description", ""))
     total = after.get("total", "")
-    inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
+    # Entry can belong to an invoice / bill / voucher — the params
+    # carry whichever ID key the tool wrapper used. First-match
+    # wins; all three are mutually exclusive in practice.
+    inv_id = (
+        params.get("invoice_id", "")
+        or params.get("bill_id", "")
+        or params.get("voucher_id", "")
+    )
     return [
         f"{time_part}  CREATE ENTRY",
         f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
@@ -1025,6 +1090,11 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("bill", "POST"): _fmt_bill_post,
     ("bill", "UNPOST"): _fmt_bill_unpost,
     ("bill", "PAY"): _fmt_bill_pay,
+    ("voucher", "CREATE"): _fmt_voucher_create,
+    ("voucher", "DELETE"): _fmt_voucher_delete,
+    ("voucher", "POST"): _fmt_voucher_post,
+    ("voucher", "UNPOST"): _fmt_voucher_unpost,
+    ("voucher", "PAY"): _fmt_voucher_pay,
     ("entry", "CREATE"): _fmt_entry_create,
     ("price", "DELETE"): _fmt_price_delete,
     ("budget", "UPDATE"): _fmt_budget_update,
@@ -1385,19 +1455,22 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            # Invoice/bill polymorphism: post_invoice
-                            # / unpost_invoice / pay_invoice all carry
+                            # Invoice/bill/voucher polymorphism:
+                            # post_invoice / unpost_invoice /
+                            # pay_invoice all carry
                             # entity_type="invoice" on the decorator
-                            # but accept either kind. The response's
-                            # ``type`` field is the truth — swap
-                            # entity_type to ``bill`` when the call
-                            # operated on a vendor bill so the audit
-                            # log doesn't mis-categorize the entry.
+                            # but accept any of the three kinds.
+                            # The response's ``type`` field is the
+                            # truth — swap entity_type to match so
+                            # the audit log doesn't mis-categorize.
                             if (
                                 entity_type == "invoice"
-                                and result_data.get("type") == "bill"
+                                and result_data.get("type")
+                                in {"bill", "voucher"}
                             ):
-                                entry["entity_type"] = "bill"
+                                entry["entity_type"] = (
+                                    result_data["type"]
+                                )
                             after = _extract_after_state(
                                 result, entry["entity_type"]
                             )
