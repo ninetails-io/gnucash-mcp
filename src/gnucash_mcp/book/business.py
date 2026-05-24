@@ -2760,15 +2760,15 @@ class BusinessMixin:
                 for e in entries
             )
 
-            owner_name = None
-            if is_bill:
-                vendor = self._find_vendor_by_guid(book, inv.owner_guid)
-                if vendor:
-                    owner_name = vendor.name
-            else:
-                customer = self._find_customer_by_guid(book, inv.owner_guid)
-                if customer:
-                    owner_name = customer.name
+            # Three-way owner lookup — vouchers route to employees,
+            # bills to vendors, invoices to customers. Pre-fix this
+            # was a binary "is_bill → vendor else customer" check
+            # that returned None for vouchers because employees
+            # weren't in the dispatch.
+            owner = self._find_invoice_owner_by_guid(
+                book, inv.owner_type, inv.owner_guid,
+            )
+            owner_name = owner.name if owner else None
 
             result = self._invoice_to_dict(
                 inv, entries=entries, owner_name=owner_name,
