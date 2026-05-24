@@ -944,6 +944,73 @@ def _fmt_voucher_delete(entry: dict) -> list[str]:
 # shown when the link is set.
 
 
+def _fmt_credit_note_post(entry: dict) -> list[str]:
+    """Credit note POST — same shape as invoice POST but
+    explicitly labeled. The posting direction was reversed at
+    the book layer; the audit log just reports what happened."""
+    lines = _fmt_invoice_post(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "POST INVOICE", "POST CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_unpost(entry: dict) -> list[str]:
+    lines = _fmt_invoice_unpost(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "UNPOST INVOICE", "UNPOST CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_pay(entry: dict) -> list[str]:
+    """Credit note PAY — for credit notes, ``pay_invoice`` is
+    the cash-refund path (the bookkeeper sent cash to a customer
+    or received it from a vendor, depending on side). The
+    audit-log label calls it out so a reviewer doesn't mistake
+    a refund for a normal payment."""
+    lines = _fmt_invoice_pay(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "PAY INVOICE", "REFUND CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_apply(entry: dict) -> list[str]:
+    """Credit note APPLY — the netting transaction that
+    settles a credit note against an outstanding invoice/bill
+    from the same owner. No cash moves; the credit balance just
+    transfers between lots on the same A/R or A/P account.
+    """
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    cn_id = params.get("credit_note_id", "")
+    target_id = params.get("applies_to_invoice_id", "")
+    amount = after.get("amount_applied", "")
+    cn_remaining = after.get("credit_note_remaining", "")
+    target_remaining = after.get("target_remaining", "")
+    lines = [
+        f"{time_part}  APPLY CREDIT NOTE  id:{cn_id}",
+        (
+            f"{_INDENT}applied: {amount}  "
+            f"against: {target_id}"
+        ),
+    ]
+    if cn_remaining and cn_remaining != "0":
+        lines.append(
+            f"{_INDENT}credit note remaining: {cn_remaining}"
+        )
+    if target_remaining and target_remaining != "0":
+        lines.append(
+            f"{_INDENT}target remaining: {target_remaining}"
+        )
+    return lines
+
+
 def _fmt_credit_note_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1145,12 +1212,19 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("voucher", "POST"): _fmt_voucher_post,
     ("voucher", "UNPOST"): _fmt_voucher_unpost,
     ("voucher", "PAY"): _fmt_voucher_pay,
-    # Credit-note CREATE / DELETE land here; POST / UNPOST /
-    # PAY / APPLY are added in the lifecycle commit alongside
-    # the polymorphic-entity-type-swap handler that recognizes
-    # type='credit_note' in tool responses.
+    # Credit-note CREATE / DELETE for the create-side surface;
+    # POST / UNPOST / PAY are reached via the polymorphic
+    # entity_type swap (the lifecycle tools register as
+    # ``entity_type="invoice"`` and the audit-decorator's
+    # polymorphism handler rewrites it when the response type
+    # is "credit_note"). APPLY is the netting tool added
+    # alongside this commit.
     ("credit_note", "CREATE"): _fmt_credit_note_create,
     ("credit_note", "DELETE"): _fmt_credit_note_delete,
+    ("credit_note", "POST"): _fmt_credit_note_post,
+    ("credit_note", "UNPOST"): _fmt_credit_note_unpost,
+    ("credit_note", "PAY"): _fmt_credit_note_pay,
+    ("credit_note", "APPLY"): _fmt_credit_note_apply,
     ("entry", "CREATE"): _fmt_entry_create,
     ("price", "DELETE"): _fmt_price_delete,
     ("budget", "UPDATE"): _fmt_budget_update,
@@ -1511,18 +1585,23 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            # Invoice/bill/voucher polymorphism:
-                            # post_invoice / unpost_invoice /
-                            # pay_invoice all carry
+                            # Invoice/bill/voucher/credit_note
+                            # polymorphism: post_invoice /
+                            # unpost_invoice / pay_invoice all carry
                             # entity_type="invoice" on the decorator
-                            # but accept any of the three kinds.
+                            # but accept any of the four kinds.
                             # The response's ``type`` field is the
                             # truth — swap entity_type to match so
                             # the audit log doesn't mis-categorize.
+                            # Credit notes can be customer- or
+                            # vendor-sided; the type field is just
+                            # "credit_note" regardless of owner_type
+                            # (the formatter pulls the owner side
+                            # from the response payload).
                             if (
                                 entity_type == "invoice"
                                 and result_data.get("type")
-                                in {"bill", "voucher"}
+                                in {"bill", "voucher", "credit_note"}
                             ):
                                 entry["entity_type"] = (
                                     result_data["type"]

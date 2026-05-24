@@ -2094,6 +2094,407 @@ class TestDeleteCreditNote:
             gb.delete_credit_note(credit_note_id="000001")
 
 
+class TestCreditNotePosting:
+    """Tests for the posting-direction reversal on credit notes.
+
+    Customer credit notes credit A/R (reduce receivable) and
+    debit Income (reverse revenue) — opposite of a normal
+    customer invoice. Vendor credit notes debit A/P (reduce
+    payable) and credit Expense (reverse expense). The XOR
+    trick (effective_is_bill = is_bill ^ is_credit_note) is
+    the implementation; these tests lock the math from the
+    outside.
+    """
+
+    def _setup_customer_credit_note(
+        self, gb, amount="100.00",
+    ) -> str:
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Out-of-scope work credit",
+            quantity="1", price=amount,
+        )
+        return cn["id"]
+
+    def _setup_vendor_credit_note(
+        self, gb, amount="100.00",
+    ) -> str:
+        gb.create_vendor(name="Office Depot")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="vendor",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Expenses:Office Supplies",
+            description="Defective product",
+            quantity="1", price=amount,
+        )
+        return cn["id"]
+
+    def test_customer_credit_note_post_reverses_ar(self, business_book):
+        """Posting a customer credit note CREDITS A/R (negative
+        movement) — reducing what the customer owes. Compare to
+        a normal customer invoice which DEBITS A/R (positive)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "credit_note"
+        ar_after = gb.get_balance("Assets:Accounts Receivable")
+        # A/R went DOWN (became more negative or less positive)
+        # by the credit note amount — opposite of an invoice post.
+        assert ar_after - ar_before == Decimal("-100.00")
+        # Income reversed: Income:Sales decreased by 100.
+        # Income natural balance in piecash is negative (credit-
+        # normal), so a debit to Income MAKES the signed balance
+        # LESS NEGATIVE (closer to zero) — net +100 in signed terms.
+        income_balance = gb.get_balance("Income:Sales")
+        # Was 0, now +100 (the debit pushed credit-normal toward 0
+        # and past, into positive signed-balance territory).
+        assert income_balance == Decimal("100.00")
+
+    def test_vendor_credit_note_post_reverses_ap(self, business_book):
+        """Posting a vendor credit note DEBITS A/P (reduces what
+        we owe the vendor) — opposite of a vendor bill which
+        CREDITS A/P (creates payable)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_vendor_credit_note(gb)
+        ap_before = gb.get_balance("Liabilities:Accounts Payable")
+        result = gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        assert result["status"] == "posted"
+        assert result["type"] == "credit_note"
+        ap_after = gb.get_balance("Liabilities:Accounts Payable")
+        # A/P went UP (less negative, or positive) — reducing
+        # the liability from the company's perspective.
+        assert ap_after - ap_before == Decimal("100.00")
+
+    def test_credit_note_unpost_reverses_post(self, business_book):
+        """Unposting a credit note removes the netting and
+        returns A/R / A/P to its pre-post state. Just like
+        unposting an invoice — the transaction is removed."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        ar_before_post = gb.get_balance("Assets:Accounts Receivable")
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        result = gb.unpost_invoice(
+            invoice_id=cn_id, owner_type="customer",
+        )
+        assert result["status"] == "unposted"
+        assert result["type"] == "credit_note"
+        ar_after_unpost = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_after_unpost == ar_before_post
+
+    def test_pay_customer_credit_note_refunds_cash(self, business_book):
+        """``pay_invoice`` on a customer credit note SENDS cash
+        to the customer (refund). Checking goes DOWN, A/R returns
+        from credit balance back toward zero (positive movement)."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_customer_credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        checking_before = gb.get_balance("Assets:Checking")
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.pay_invoice(
+            invoice_id=cn_id,
+            payment_account="Assets:Checking",
+            amount="100.00",
+            owner_type="customer",
+        )
+        assert result["status"] == "paid"
+        assert result["type"] == "credit_note"
+        # Cash left the company (refund).
+        assert gb.get_balance("Assets:Checking") - checking_before == Decimal("-100.00")
+        # A/R movement REVERSED the post: credit went DOWN $100
+        # post, then went UP $100 on refund (net to zero).
+        assert gb.get_balance("Assets:Accounts Receivable") - ar_before == Decimal("100.00")
+
+    def test_pay_vendor_credit_note_receives_cash(self, business_book):
+        """``pay_invoice`` on a vendor credit note RECEIVES cash
+        from the vendor (vendor sent us a refund check). Checking
+        UP, A/P down."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._setup_vendor_credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        checking_before = gb.get_balance("Assets:Checking")
+        ap_before = gb.get_balance("Liabilities:Accounts Payable")
+        gb.pay_invoice(
+            invoice_id=cn_id,
+            payment_account="Assets:Checking",
+            amount="100.00",
+            owner_type="vendor",
+        )
+        # Cash arrived.
+        assert gb.get_balance("Assets:Checking") - checking_before == Decimal("100.00")
+        # A/P movement reversed the post.
+        assert gb.get_balance("Liabilities:Accounts Payable") - ap_before == Decimal("-100.00")
+
+
+class TestApplyCreditNote:
+    """Tests for apply_credit_note — the netting tool.
+
+    The headline cases: a posted credit note nets against a
+    posted invoice from the same customer/vendor. Both lots
+    reduce by the applied amount; no cash moves. Validation
+    rejects cross-owner, cross-currency, cross-account, and
+    over-apply attempts.
+    """
+
+    def _setup_pair(
+        self, gb, source_amount="500.00", credit_amount="100.00",
+    ):
+        """Post an invoice and a credit note from the same
+        customer. Returns (invoice_id, credit_note_id)."""
+        gb.create_customer(name="Acme Co")
+        # Source invoice: $500 owed by Acme
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"],
+            account="Income:Sales",
+            description="Services", quantity="1", price=source_amount,
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note: $100 reduction
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id=src["id"],
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Disputed line",
+            quantity="1", price=credit_amount,
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        return src["id"], cn["id"]
+
+    def test_apply_full_credit_against_larger_invoice(self, business_book):
+        """Credit $100 against $500 invoice: credit fully
+        consumed, invoice's remaining drops to $400, A/R net
+        movement is zero (the credit was already booked at post
+        time; apply just transfers between lots)."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        ar_before = gb.get_balance("Assets:Accounts Receivable")
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        assert result["status"] == "applied"
+        assert result["amount_applied"] == "100.00"
+        # Credit note fully settled, invoice has $400 left.
+        assert Decimal(result["credit_note_remaining"]) == Decimal("0")
+        assert Decimal(result["target_remaining"]) == Decimal("400")
+        # A/R net movement: zero. The apply is a lot-rearrangement,
+        # not a balance change. (Net effect: A/R was 500 - 100 =
+        # 400 after both posts; after apply, still 400.)
+        ar_after = gb.get_balance("Assets:Accounts Receivable")
+        assert ar_after == ar_before
+
+    def test_apply_partial_amount(self, business_book):
+        """Explicit amount, smaller than credit_note_remaining,
+        partially applies and leaves both lots open."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+            amount="40.00",
+        )
+        assert result["amount_applied"] == "40.00"
+        assert Decimal(result["credit_note_remaining"]) == Decimal("60")
+        assert Decimal(result["target_remaining"]) == Decimal("460")
+
+    def test_apply_default_amount_is_min_of_remaining(self, business_book):
+        """When amount is omitted, the apply defaults to
+        min(credit_note_remaining, target_remaining)."""
+        gb = GnuCashBook(str(business_book))
+        # Make the credit LARGER than the invoice so the target
+        # is the limiting side.
+        src_id, cn_id = self._setup_pair(
+            gb, source_amount="50.00", credit_amount="200.00",
+        )
+        result = gb.apply_credit_note(
+            credit_note_id=cn_id,
+            applies_to_invoice_id=src_id,
+        )
+        # min(200, 50) = 50 applied; invoice fully cleared,
+        # credit note has $150 remaining.
+        assert result["amount_applied"] == "50.00"
+        assert Decimal(result["target_remaining"]) == Decimal("0")
+        assert Decimal(result["credit_note_remaining"]) == Decimal("150")
+
+    def test_apply_over_max_rejected(self, business_book):
+        """Applying more than the lesser-remaining is rejected
+        with both balances named in the error."""
+        gb = GnuCashBook(str(business_book))
+        src_id, cn_id = self._setup_pair(gb)
+        with pytest.raises(ValueError, match="exceeds the smaller of"):
+            gb.apply_credit_note(
+                credit_note_id=cn_id,
+                applies_to_invoice_id=src_id,
+                amount="200.00",
+            )
+
+    def test_apply_to_unposted_target_rejected(self, business_book):
+        """Target must be posted (no lot to settle otherwise)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        # Source invoice unposted
+        src = gb.create_invoice(customer_id="000001")
+        # Credit note posted
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="not posted"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_unposted_credit_note_rejected(self, business_book):
+        """Credit note must be posted too."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        src = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=src["id"],
+            account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=src["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Credit note unposted
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        with pytest.raises(ValueError, match="Credit note.*not posted"):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=src["id"],
+            )
+
+    def test_apply_to_credit_note_rejected(self, business_book):
+        """Target can't itself be a credit note — credits don't
+        net against credits."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn1 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn1["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn1["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn2 = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn2["id"], account="Income:Sales",
+            description="x", quantity="1", price="30",
+        )
+        gb.post_invoice(
+            invoice_id=cn2["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="itself a credit note",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn1["id"],
+                applies_to_invoice_id=cn2["id"],
+            )
+
+    def test_apply_cross_owner_rejected(self, business_book):
+        """Credit notes can only net against documents from the
+        same customer/vendor."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        # Beta's invoice
+        beta_inv = gb.create_invoice(customer_id="000002")
+        gb.add_invoice_entry(
+            invoice_id=beta_inv["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=beta_inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Acme's credit note — different owner
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="same customer/vendor",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=beta_inv["id"],
+            )
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 

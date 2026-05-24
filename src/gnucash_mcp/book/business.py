@@ -3468,9 +3468,19 @@ class BusinessMixin:
             # Build transaction splits
             # For customer invoice: A/R debit (positive), income credit (negative)
             # For vendor bill: A/P credit (negative), expense debit (positive)
+            # For credit notes: posting direction reverses — customer
+            # credit note credits A/R (reduces receivable) and debits
+            # Income (reverses recognized revenue); vendor credit note
+            # debits A/P (reduces payable) and credits Expense (reverses
+            # recognized expense). Expressed as XOR: a credit note flips
+            # whichever side it was on, so customer-credit-note behaves
+            # like vendor-bill posting and vice-versa. ``effective_is_bill``
+            # captures this — the rest of the math is unchanged.
+            is_credit_note = self._get_is_credit_note(inv)
+            effective_is_bill = is_bill ^ is_credit_note
             piecash_splits = []
 
-            if is_bill:
+            if effective_is_bill:
                 ar_ap_value = -grand_total
             else:
                 ar_ap_value = grand_total
@@ -3493,7 +3503,7 @@ class BusinessMixin:
                         f"Entry account not found: {acct_guid}"
                     )
 
-                if is_bill:
+                if effective_is_bill:
                     split_value = acct_total
                 else:
                     split_value = -acct_total
@@ -3548,8 +3558,17 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                # When the credit-note flag is set, surface
+                # ``type='credit_note'`` so the audit log
+                # decorator swaps entity_type accordingly.
+                # Otherwise the owner-type-driven label
+                # (invoice/bill/voucher) wins.
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "status": "posted",
                 "total": str(grand_total),
@@ -3626,8 +3645,12 @@ class BusinessMixin:
             )
             self._stage_audit_before({
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "type": (
+                    "credit_note"
+                    if self._get_is_credit_note(inv)
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "date_posted": (
                     str(prev_post_date.date()) if prev_post_date else None
@@ -3678,6 +3701,17 @@ class BusinessMixin:
             inv.post_account = None
             book.flush()
 
+            # Capture the credit-note flag BEFORE we delete the
+            # posting transaction / lot. Post-save, slot reads on
+            # the invoice can flake with the "Multiple rows
+            # returned with uselist=False" piecash quirk when
+            # lots and transactions are being deleted in the
+            # same session. Reading the flag now and stashing it
+            # avoids the state-disturbance window.
+            is_credit_note = self._get_is_credit_note(inv)
+            inv_id_snapshot = inv.id
+            owner_type_snapshot = inv.owner_type
+
             # Delete the posting transaction (which cascades its
             # splits) and the lot (now empty after the inv.post_lot
             # = None nullified the only split-lot link).
@@ -3689,9 +3723,13 @@ class BusinessMixin:
             book.save()
 
             return {
-                "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "id": inv_id_snapshot,
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        owner_type_snapshot, "invoice"
+                    )
                 ),
                 "status": "unposted",
             }
@@ -3927,8 +3965,18 @@ class BusinessMixin:
                     f"{pay_acct.commodity.mnemonic}."
                 )
 
-            if is_bill:
-                # Pay vendor bill: debit A/P (positive), credit bank (negative)
+            # Credit-note refund direction reverses: paying a
+            # customer credit note means SENDING cash to the
+            # customer (refund), so signs flip versus a normal
+            # customer invoice payment. Same XOR trick as
+            # post_invoice — a credit note swaps the is_bill
+            # branch.
+            is_credit_note = self._get_is_credit_note(inv)
+            effective_is_bill = is_bill ^ is_credit_note
+
+            if effective_is_bill:
+                # Pay vendor bill (or refund customer credit note):
+                # debit A/P (positive), credit bank (negative)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=payment_amount,
@@ -3943,7 +3991,9 @@ class BusinessMixin:
                     memo="",
                 )
             else:
-                # Receive customer payment: credit A/R (negative), debit bank (positive)
+                # Receive customer payment (or refund-in from a
+                # vendor credit note): credit A/R (negative),
+                # debit bank (positive)
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=-payment_amount,
@@ -3975,10 +4025,15 @@ class BusinessMixin:
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
+                # FX gain/loss direction follows the effective
+                # is_bill of THIS payment — a customer credit
+                # note refund behaves like a vendor bill payment
+                # from the FX-direction perspective (cash leaving
+                # the company on the bank side).
                 fx_result = self._compute_fx_gain_loss(
                     book,
                     inv=inv,
-                    is_bill=is_bill,
+                    is_bill=effective_is_bill,
                     pay_acct=pay_acct,
                     payment_amount=payment_amount,
                     pay_quantity=pay_quantity,
@@ -4012,8 +4067,12 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                    inv.owner_type, "invoice"
+                "type": (
+                    "credit_note"
+                    if is_credit_note
+                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                        inv.owner_type, "invoice"
+                    )
                 ),
                 "status": "paid",
                 "amount_paid": str(payment_amount),
@@ -4051,6 +4110,306 @@ class BusinessMixin:
                         result["fx_notice"] = fx_result["fx_notice"]
 
         return result
+
+    def apply_credit_note(
+        self,
+        credit_note_id: str,
+        applies_to_invoice_id: str,
+        amount: str | None = None,
+        apply_date: str | None = None,
+        owner_type: str | None = None,
+    ) -> dict:
+        """Net a posted credit note against a posted invoice/bill
+        from the same owner. No cash moves — the credit balance
+        transfers between lots on the same A/R or A/P account.
+
+        This is the "Process Payment with both checked" workflow
+        from GnuCash desktop, factored into a dedicated tool for
+        LLM legibility. ``pay_invoice`` continues to handle the
+        cash-refund case (when the customer was already paid and
+        the credit note represents money owed BACK to them).
+
+        Booking shape:
+
+        - **Customer side**: two splits on the A/R account, summing
+          to zero. One debit assigned to the credit note's lot
+          (settles the negative balance there); one credit assigned
+          to the target invoice's lot (reduces what's still owed).
+        - **Vendor side**: symmetric — two splits on the A/P
+          account, credit on the credit note's lot (settles the
+          positive balance), debit on the target's lot (reduces
+          what's still owed to the vendor).
+
+        Validation:
+
+        - Both documents must be posted (nothing to net otherwise).
+        - Same owner (customer A's credit note can't net B's bill).
+        - Same currency (cross-currency netting would create FX
+          adjustments outside GnuCash's tracking).
+        - Same A/R or A/P post account.
+        - Target must be a regular invoice/bill (not another credit
+          note — credits don't net against credits).
+        - ``amount`` (if supplied) must not exceed the lesser of
+          the two remaining balances.
+
+        Args:
+            credit_note_id: The credit note to apply (must be
+                posted).
+            applies_to_invoice_id: The target invoice/bill to net
+                against (must be posted, same owner, same currency).
+            amount: Amount to apply, as a decimal string in the
+                document currency. Defaults to ``min(credit_note_
+                remaining, target_remaining)`` — apply as much as
+                possible.
+            apply_date: ISO date for the netting transaction.
+                Defaults to today.
+            owner_type: Optional disambiguator for ID collisions.
+
+        Returns:
+            Dict with ``credit_note_id``, ``applies_to_invoice_id``,
+            ``amount_applied``, ``credit_note_remaining``,
+            ``target_remaining``, ``transaction_guid``,
+            ``apply_date``, ``status='applied'``.
+
+        Raises:
+            ValueError: For any of the validation failures above,
+                or if ``amount`` rounds to zero in the target
+                commodity.
+        """
+        from datetime import datetime as _dt
+        # piecash Transaction.post_date wants a ``date`` object, not
+        # a ``datetime`` — passing a datetime raises GncValidationError.
+        parsed_date = (
+            _dt.strptime(apply_date, "%Y-%m-%d").date()
+            if apply_date else _dt.now().date()
+        )
+
+        with self.open(readonly=False) as book:
+            # Resolve the credit note (validates it IS a credit note).
+            cn = self._resolve_credit_note(
+                book, credit_note_id, owner_type=owner_type,
+            )
+            # Resolve the target — use the credit note's owner_type
+            # to disambiguate (they must match anyway).
+            target = self._find_invoice(
+                book, applies_to_invoice_id,
+                owner_type=cn.owner_type,
+            )
+            if not target:
+                raise ValueError(
+                    f"Target {self._doc_label_for(cn.owner_type).lower()} "
+                    f"not found: {applies_to_invoice_id}"
+                )
+
+            # Target must NOT be a credit note itself — netting
+            # credits against credits is semantically meaningless.
+            if self._get_is_credit_note(target):
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} is itself a "
+                    f"credit note. Apply credit notes to regular "
+                    f"invoices/bills, not to each other."
+                )
+
+            # Both must be posted (no lots to net otherwise).
+            if not _is_invoice_posted(cn):
+                raise ValueError(
+                    f"Credit note {credit_note_id} is not posted "
+                    f"— post it before applying."
+                )
+            if not _is_invoice_posted(target):
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} is not "
+                    f"posted — post it before applying credits."
+                )
+
+            # Same owner check.
+            if cn.owner_guid != target.owner_guid:
+                cn_owner = self._find_invoice_owner_by_guid(
+                    book, cn.owner_type, cn.owner_guid,
+                )
+                target_owner = self._find_invoice_owner_by_guid(
+                    book, target.owner_type, target.owner_guid,
+                )
+                raise ValueError(
+                    f"Credit note belongs to "
+                    f"{cn_owner.id if cn_owner else '?'!r} but "
+                    f"target belongs to "
+                    f"{target_owner.id if target_owner else '?'!r}. "
+                    f"Credit notes can only net against documents "
+                    f"from the same customer/vendor."
+                )
+
+            # Same currency check.
+            if cn.currency_guid != target.currency_guid:
+                raise ValueError(
+                    f"Credit note currency "
+                    f"{cn.currency.mnemonic!r} doesn't match "
+                    f"target currency {target.currency.mnemonic!r}. "
+                    f"Cross-currency netting would create an FX "
+                    f"adjustment outside GnuCash's tracking."
+                )
+
+            # Same A/R or A/P account.
+            if cn.post_acc_guid != target.post_acc_guid:
+                raise ValueError(
+                    f"Credit note posted to "
+                    f"{cn.post_account.fullname!r} but target "
+                    f"posted to {target.post_account.fullname!r}. "
+                    f"Both must use the same A/R or A/P account "
+                    f"to net."
+                )
+
+            post_acct = cn.post_account
+
+            # Resolve lots by GUID — same pattern as pay_invoice.
+            cn_lot = next(
+                (l for l in post_acct.lots if l.guid == cn.post_lot_guid),
+                None,
+            )
+            target_lot = next(
+                (l for l in post_acct.lots if l.guid == target.post_lot_guid),
+                None,
+            )
+            if cn_lot is None or target_lot is None:
+                raise ValueError(
+                    f"Could not resolve lots for credit note "
+                    f"or target — book may be inconsistent."
+                )
+
+            # Lot balances. Customer-side: target_lot is positive
+            # (receivable), cn_lot is negative (credit). Vendor
+            # side: signs reversed. Either way, ``abs()`` gives
+            # the available amount on each side.
+            cn_remaining = abs(self._calculate_lot_balance(cn_lot))
+            target_remaining = abs(
+                self._calculate_lot_balance(target_lot)
+            )
+
+            if cn_remaining == 0:
+                raise ValueError(
+                    f"Credit note {credit_note_id} has no "
+                    f"remaining balance to apply (already fully "
+                    f"netted or refunded)."
+                )
+            if target_remaining == 0:
+                raise ValueError(
+                    f"Target {applies_to_invoice_id} has no "
+                    f"remaining balance — nothing to apply credit "
+                    f"against."
+                )
+
+            max_apply = min(cn_remaining, target_remaining)
+            if amount is None:
+                apply_amount = max_apply
+            else:
+                apply_amount = _to_decimal(amount)
+                if apply_amount <= 0:
+                    raise ValueError(
+                        f"Apply amount must be positive, got "
+                        f"{apply_amount}."
+                    )
+                if apply_amount > max_apply:
+                    raise ValueError(
+                        f"Apply amount {apply_amount} exceeds the "
+                        f"smaller of credit-note remaining "
+                        f"({cn_remaining}) and target remaining "
+                        f"({target_remaining}). Use {max_apply} "
+                        f"or less."
+                    )
+
+            # Build the netting transaction:
+            #   Customer side: cn_lot gets +apply_amount (settles
+            #     credit toward zero from negative); target_lot
+            #     gets -apply_amount (reduces receivable).
+            #   Vendor side: cn_lot gets -apply_amount; target_lot
+            #     gets +apply_amount. Symmetric.
+            is_bill_side = self._is_bill_side(cn.owner_type)
+            if is_bill_side:
+                cn_split_value = -apply_amount
+                target_split_value = apply_amount
+            else:
+                cn_split_value = apply_amount
+                target_split_value = -apply_amount
+
+            # Quantize to the post-account's commodity.
+            quantum = _commodity_quantum(post_acct.commodity)
+            cn_split_value = cn_split_value.quantize(quantum)
+            target_split_value = target_split_value.quantize(quantum)
+
+            txn_desc = (
+                f"Credit applied: {credit_note_id} → "
+                f"{applies_to_invoice_id}"
+            )
+            cn_split = piecash.Split(
+                account=post_acct,
+                value=cn_split_value,
+                quantity=cn_split_value,
+                memo=f"Net against {applies_to_invoice_id}",
+                action="Payment",
+            )
+            target_split = piecash.Split(
+                account=post_acct,
+                value=target_split_value,
+                quantity=target_split_value,
+                memo=f"Credit from {credit_note_id}",
+                action="Payment",
+            )
+
+            txn = piecash.Transaction(
+                currency=post_acct.commodity,
+                description=txn_desc,
+                post_date=parsed_date,
+                num="",
+                splits=[cn_split, target_split],
+            )
+
+            # Assign splits to the respective lots — this is what
+            # tells GnuCash the lots are being settled.
+            cn_split.lot = cn_lot
+            target_split.lot = target_lot
+
+            book.flush()
+
+            # Mark txn as a payment-type transaction (GnuCash UI
+            # convention) so desktop knows to render it under
+            # the lot's payment activity.
+            txn["trans-txn-type"] = "P"
+
+            # Close lots that reached zero. A fully-settled credit
+            # note (apply == cn_remaining) closes its lot. A
+            # fully-settled target (apply == target_remaining)
+            # closes its lot. Either or both can close.
+            new_cn_remaining = abs(
+                self._calculate_lot_balance(cn_lot)
+            )
+            new_target_remaining = abs(
+                self._calculate_lot_balance(target_lot)
+            )
+            if new_cn_remaining == 0:
+                cn_lot.is_closed = -1
+            if new_target_remaining == 0:
+                target_lot.is_closed = -1
+
+            book.save()
+
+            # Quantize all amounts to the post-account's commodity
+            # so the response shape stays consistent regardless
+            # of whether the lot-balance Decimals carried extra
+            # precision. "$100.00" not "$100".
+            return {
+                "credit_note_id": credit_note_id,
+                "applies_to_invoice_id": applies_to_invoice_id,
+                "amount_applied": str(apply_amount.quantize(quantum)),
+                "credit_note_remaining": str(
+                    new_cn_remaining.quantize(quantum)
+                ),
+                "target_remaining": str(
+                    new_target_remaining.quantize(quantum)
+                ),
+                "transaction_guid": txn.guid,
+                "apply_date": str(parsed_date),
+                "status": "applied",
+            }
 
     # ── Delete paths ──────────────────────────────────────────────
 
