@@ -718,6 +718,74 @@ def _fmt_employee_delete(entry: dict) -> list[str]:
     return _fmt_person_delete(entry, "employee", "employee_id")
 
 
+# ── Job formatters ───────────────────────────────────────────
+# Jobs aren't business-persons (no currency/address fields), so
+# they get their own formatters rather than going through
+# _fmt_person_*. Owner_type and owner_id surface so a reviewer
+# scanning the audit log can immediately see which counterparty
+# the job belongs to without a separate lookup.
+
+
+def _fmt_job_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    job_id = after.get("id", "")
+    name = after.get("name", params.get("name", ""))
+    owner_type = (
+        after.get("owner_type") or params.get("owner_type", "")
+    )
+    owner_id = params.get("owner_id", "")
+    ref = after.get("reference") or params.get("reference", "")
+    lines = [
+        f"{time_part}  CREATE JOB  id:{job_id}",
+        f'{_INDENT}name: "{name}"  {owner_type}: {owner_id}',
+    ]
+    if ref:
+        lines.append(f"{_INDENT}reference: {ref}")
+    return lines
+
+
+def _fmt_job_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    after = entry.get("after_state") or {}
+    job_id = params.get("job_id", "")
+    lines = [f"{time_part}  UPDATE JOB  id:{job_id}"]
+    # Show only the fields that changed (the book method returns
+    # only changed keys in after_state — anything missing means
+    # unchanged, anything present means new value).
+    for key in ("name", "reference", "active"):
+        if key in after:
+            old_val = before.get(key, "?")
+            new_val = after[key]
+            lines.append(
+                f"{_INDENT}{key}: {old_val!r} → {new_val!r}"
+            )
+    return lines
+
+
+def _fmt_job_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    job_id = params.get("job_id", "")
+    name = after.get("name", "")
+    reparented = after.get("reparented_count", 0)
+    lines = [f"{time_part}  DELETE JOB  id:{job_id}"]
+    if name:
+        lines.append(f'{_INDENT}name: "{name}"')
+    if reparented:
+        # force=True re-parented invoices to the underlying
+        # customer/vendor — call that out so a reviewer sees the
+        # invoice owners changed as a side effect of the delete.
+        lines.append(
+            f"{_INDENT}reparented invoices: {reparented}"
+        )
+    return lines
+
+
 def _fmt_billterm_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1210,6 +1278,9 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("employee", "CREATE"): _fmt_employee_create,
     ("employee", "UPDATE"): _fmt_employee_update,
     ("employee", "DELETE"): _fmt_employee_delete,
+    ("job", "CREATE"): _fmt_job_create,
+    ("job", "UPDATE"): _fmt_job_update,
+    ("job", "DELETE"): _fmt_job_delete,
     ("billterm", "CREATE"): _fmt_billterm_create,
     ("invoice", "CREATE"): _fmt_invoice_create,
     ("invoice", "DELETE"): _fmt_invoice_delete,

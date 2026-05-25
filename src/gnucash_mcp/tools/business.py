@@ -355,6 +355,7 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         term: str | None = None,
         invoice_id: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         """Create a customer invoice.
 
@@ -368,12 +369,18 @@ def register(mcp, get_book) -> None:
             term: Billterm name (e.g., "Net 30"). Optional.
             invoice_id: Custom invoice number (e.g., "INV-2026-001"). If omitted,
                 auto-generates from the book's invoice counter.
+            job_id: Optional Job ID. When set, groups the invoice
+                under the named job. The job must belong to the
+                same customer and be a customer-job (created
+                with owner_type='customer'). Use ``create_job``
+                first to define the job, then attach invoices
+                to it via this parameter.
         """
         book = get_book()
         result = book.create_invoice(
             customer_id=customer_id, date_opened=date_opened,
             notes=notes, currency=currency, term=term,
-            invoice_id=invoice_id,
+            invoice_id=invoice_id, job_id=job_id,
         )
         return _json(result)
 
@@ -387,6 +394,7 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         term: str | None = None,
         bill_id: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         """Create a vendor bill.
 
@@ -400,12 +408,15 @@ def register(mcp, get_book) -> None:
             term: Billterm name (e.g., "Net 30"). Optional.
             bill_id: Custom bill number (e.g., "BILL-2026-001"). If omitted,
                 auto-generates from the book's bill counter.
+            job_id: Optional Job ID. When set, groups the bill
+                under the named job. The job must belong to the
+                same vendor and be a vendor-job.
         """
         book = get_book()
         result = book.create_bill(
             vendor_id=vendor_id, date_opened=date_opened,
             notes=notes, currency=currency, term=term,
-            bill_id=bill_id,
+            bill_id=bill_id, job_id=job_id,
         )
         return _json(result)
 
@@ -740,6 +751,7 @@ def register(mcp, get_book) -> None:
         status: str | None = None,
         verbose: bool = False,
         limit: int = 50,
+        job_id: str | None = None,
     ) -> str:
         """List invoices and/or vendor bills.
 
@@ -754,6 +766,9 @@ def register(mcp, get_book) -> None:
             limit: Maximum invoices to return. Defaults to 50, capped
                    at 250. Compact output appends a truncation notice
                    when results are clipped.
+            job_id: Filter to invoices grouped under a specific
+                job — useful for the "what's part of this
+                engagement?" listing pattern.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -762,6 +777,7 @@ def register(mcp, get_book) -> None:
             status=status,
             compact=not verbose,
             limit=limit,
+            job_id=job_id,
         )
         if verbose:
             return json.dumps(result, indent=2)
@@ -986,6 +1002,179 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         result = book.delete_employee(employee_id=employee_id)
+        return _json(result)
+
+    # ── Job CRUD tools ───────────────────────────────────────
+    #
+    # Jobs are project-level grouping over invoices/bills for a
+    # single customer or vendor. The financial lifecycle stays
+    # on the linked invoices; the job itself only has
+    # ``active``/``inactive`` state. See create_invoice and
+    # create_bill (v1.3) for how to link a new invoice to a job.
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="job")
+    def create_job(
+        owner_id: str,
+        owner_type: str,
+        name: str,
+        reference: str = "",
+    ) -> str:
+        """Create a job for a customer or vendor.
+
+        A job groups invoices (or bills) from one counterparty
+        under a project-level container. Useful when a single
+        customer has multiple distinct engagements (e.g., 'API
+        Rewrite' and 'Q3 Maintenance') that should be reported
+        on separately even though invoices flow to the same A/R.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., "000001").
+            owner_type: "customer" or "vendor". Employees are
+                not supported (no GnuCash desktop UI for
+                employee jobs).
+            name: Human-readable job name (e.g., "API Rewrite").
+            reference: Optional reference string (PO number,
+                project code).
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.create_job(
+            owner_id=owner_id,
+            owner_type=owner_type,
+            name=name,
+            reference=reference,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def list_jobs(
+        owner_type: str | None = None,
+        owner_id: str | None = None,
+        active_only: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """List jobs, optionally filtered.
+
+        Args:
+            owner_type: Filter by "customer" or "vendor". Omit
+                for all.
+            owner_id: Filter by specific customer or vendor ID
+                (requires owner_type).
+            active_only: If True (default), exclude inactive jobs.
+            verbose: If True, return full JSON dicts; otherwise
+                compact tab-separated rows.
+        """
+        owner_type = _gate_owner_type(owner_type)
+        book = get_book()
+        result = book.list_jobs(
+            owner_type=owner_type,
+            owner_id=owner_id,
+            active_only=active_only,
+            compact=not verbose,
+        )
+        # Match the other list_* tools' verbose pattern
+        # (json.dumps indent=2 preserves empty strings; _json
+        # strips them, which Copilot flagged as a shape
+        # divergence on PR #88).
+        if verbose:
+            import json
+            return json.dumps(result, indent=2)
+        return result
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def get_job(job_id: str) -> str:
+        """Get a job's details by ID.
+
+        Returns name, owner, active state, plus a count + IDs
+        list of every invoice/bill linked to the job.
+
+        Args:
+            job_id: Job ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.get_job(job_id=job_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="job")
+    def update_job(
+        job_id: str,
+        name: str | None = None,
+        reference: str | None = None,
+        active: bool | None = None,
+    ) -> str:
+        """Update a job's name, reference, or active state.
+
+        Any subset of fields can be passed; unspecified fields
+        are left unchanged. Returns a diff-style response.
+
+        Args:
+            job_id: Job ID.
+            name: New name (optional).
+            reference: New reference (optional).
+            active: New active flag — pass False to deactivate a
+                completed job without deleting it (preserves
+                history).
+        """
+        book = get_book()
+        result = book.update_job(
+            job_id=job_id,
+            name=name,
+            reference=reference,
+            active=active,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def get_job_report(job_id: str) -> str:
+        """Per-job summary: billed / paid / outstanding totals
+        across all linked invoices, plus the per-invoice
+        breakdown.
+
+        Totals are returned as ``totals_by_currency`` (a dict
+        keyed by ISO currency code) so the same shape works
+        whether the job's invoices share a currency or span
+        multiple. Both posted and unposted (draft) invoices are
+        included — drafts contribute their face value as
+        ``billed`` + ``outstanding`` with ``paid=0``, so the
+        report shows the full pipeline.
+
+        Args:
+            job_id: Job ID (e.g., "000001").
+        """
+        book = get_book()
+        result = book.get_job_report(job_id=job_id)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="job")
+    def delete_job(job_id: str, force: bool = False) -> str:
+        """Delete a job.
+
+        Refuses by default when invoices/bills are linked to the
+        job (data-loss prevention). ``force=True`` re-parents
+        every linked invoice back to its underlying customer or
+        vendor before deleting the job row, preserving invoice
+        history. Use ``update_job(active=False)`` instead if you
+        want to keep the job in place but mark the project done.
+
+        Args:
+            job_id: Job ID.
+            force: If True, re-parent linked invoices instead of
+                refusing. Default False.
+        """
+        book = get_book()
+        result = book.delete_job(job_id=job_id, force=force)
         return _json(result)
 
     @mcp.tool()

@@ -203,6 +203,17 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
             owner = f"{owner} (CN)"
         elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
+        # Job annotation — appended after any (CN)/(BILL) tag
+        # so a row that's both a credit note AND job-attached
+        # reads as ``Customer (CN) (job:JOB-001)``, or a plain
+        # vendor bill in a job as ``Vendor (BILL) (job:JOB-001)``.
+        # ``(CN)`` and ``(BILL)`` are mutually exclusive per the
+        # if/elif above — credit notes are flagged via (CN)
+        # regardless of side. (Copilot PR #88 review caught the
+        # original comment showing them together.)
+        job_id = r.get("job_id")
+        if job_id:
+            owner = f"{owner} (job:{job_id})"
         ccy = r.get("currency") or ""
         # Strip trailing zeros for compact display: "4200.00" → "4,200".
         amount_dec = Decimal(r.get("amount_due") or "0")
@@ -293,9 +304,15 @@ class BusinessMixin:
         pair. Picks the right table to query based on owner_type.
 
         ``invoices.owner_guid`` is a generic FK — the row points at
-        the customer/vendor/employee table depending on
-        ``owner_type``. Centralizing the picker keeps the three-way
+        the customer/vendor/employee/job table depending on
+        ``owner_type``. Centralizing the picker keeps the four-way
         dispatch out of every callsite that needs the owner's name.
+
+        For owner_type=3 (Job), the helper chases through the Job
+        to return the underlying customer/vendor — that's the
+        counterparty a bookkeeper cares about. Callers that need
+        the Job itself (e.g. to surface ``job: {id, name}``)
+        should query Job directly via ``_find_job_by_guid``.
         """
         if owner_type == 2:
             return BusinessMixin._find_customer_by_guid(book, guid)
@@ -303,6 +320,13 @@ class BusinessMixin:
             return BusinessMixin._find_vendor_by_guid(book, guid)
         if owner_type == 5:
             return BusinessMixin._find_employee_by_guid(book, guid)
+        if owner_type == 3:
+            job = BusinessMixin._find_job_by_guid(book, guid)
+            if job is None:
+                return None
+            return BusinessMixin._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
         return None
 
     # Path for the auto-created realized-FX-gain/loss income account.
@@ -653,6 +677,26 @@ class BusinessMixin:
         return book.session.query(Employee).filter_by(id=employee_id).first()
 
     @staticmethod
+    def _find_job(book, job_id: str):
+        """Find a job by its human-readable ID (e.g., '000001').
+
+        Indexed lookup. Returns None if no job has the given ID.
+        Unlike invoices, job IDs are unambiguous across owner
+        types — a single ``counter_job`` advances regardless of
+        whether the job is for a customer or vendor.
+        """
+        from piecash.business.invoice import Job
+        return book.session.query(Job).filter_by(id=job_id).first()
+
+    @staticmethod
+    def _find_job_by_guid(book, guid: str):
+        """Find a job by GUID. Used to resolve invoice→job links
+        where the invoice's ``owner_guid`` (with owner_type=3)
+        points at the job."""
+        from piecash.business.invoice import Job
+        return book.session.query(Job).filter_by(guid=guid).first()
+
+    @staticmethod
     def _parse_owner_type(owner_type: str | None) -> int | None:
         """Map an owner_type string to its piecash integer code.
 
@@ -747,6 +791,39 @@ class BusinessMixin:
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
+            # Job-attached invoices have owner_type=3 internally
+            # — the owner_guid points at a Job, which in turn
+            # points at the customer or vendor. From the
+            # bookkeeper's perspective, those invoices are still
+            # customer/vendor invoices (just grouped). So an
+            # owner_type=2 lookup must match BOTH direct
+            # customer invoices (owner_type=2) AND job-attached
+            # invoices whose job has owner_type=2.
+            #
+            # Pre-fix: ``add_invoice_entry`` /
+            # ``delete_invoice`` / etc. all filter by
+            # owner_type=2 and would have failed with "Invoice
+            # not found" on any invoice attached to a job. Fix:
+            # build a subquery of job GUIDs matching the
+            # requested owner_type and OR it in.
+            #
+            # Employee (owner_type=5) is exempt — piecash's job
+            # model is customer/vendor only, so vouchers can't
+            # be job-attached. The lookup degrades to the
+            # original direct-match filter.
+            from sqlalchemy import and_, or_
+            from piecash.business.invoice import Job
+            if owner_type in (2, 4):
+                job_guid_sq = book.session.query(Job.guid).filter(
+                    Job.owner_type == owner_type
+                ).subquery()
+                return query.filter(or_(
+                    Invoice.owner_type == owner_type,
+                    and_(
+                        Invoice.owner_type == 3,
+                        Invoice.owner_guid.in_(job_guid_sq),
+                    ),
+                )).first()
             return query.filter(Invoice.owner_type == owner_type).first()
 
         # owner_type=None: caller didn't disambiguate. Pull all
@@ -878,6 +955,50 @@ class BusinessMixin:
         return f"{employee.id}\t{employee.name}\t{employee.currency.mnemonic}"
 
     @staticmethod
+    def _job_to_dict(job, owner_name: str | None = None) -> dict:
+        """Convert a piecash Job to a serializable dict.
+
+        The job's ``owner_type`` is stored as the underlying
+        customer (2) or vendor (4) — we surface that as a
+        human-readable ``owner_type`` string for symmetry with
+        every other tool's owner-typed response. ``owner_name``
+        is resolved by the caller (static-method shape can't
+        query the session)."""
+        return {
+            "guid": job.guid,
+            "id": job.id,
+            "name": job.name,
+            "reference": job.reference or "",
+            "active": bool(job.active),
+            # Map back to the human label — Customer/Vendor only
+            # since piecash's PersonType is {Vendor:4, Customer:2}.
+            "owner_type": (
+                "customer" if job.owner_type == 2 else "vendor"
+            ),
+            "owner_name": owner_name,
+        }
+
+    @staticmethod
+    def _job_to_compact_line(job, owner_name: str | None = None) -> str:
+        """One-line compact: ``id  name  CUSTOMER/VENDOR  owner_name``.
+
+        The owner tag (CUSTOMER / VENDOR) is the differentiator
+        a bookkeeper would scan for — customer jobs and vendor
+        jobs serve different purposes (revenue-side vs cost-side).
+        Active/inactive isn't shown — list_jobs filters by
+        active_only at the call site, so a row appearing in the
+        list is implicitly active unless include_inactive was set.
+        """
+        owner_tag = (
+            "CUSTOMER" if job.owner_type == 2 else "VENDOR"
+        )
+        owner_str = owner_name or "?"
+        ref_part = f"  ref:{job.reference}" if job.reference else ""
+        return (
+            f"{job.id}\t{job.name}\t{owner_tag}\t{owner_str}{ref_part}"
+        )
+
+    @staticmethod
     def _billterm_to_dict(bt) -> dict:
         """Convert a Billterm to a serializable dict."""
         return {
@@ -925,6 +1046,7 @@ class BusinessMixin:
         entries=None,
         owner_name: str | None = None,
         applies_to: dict | None = None,
+        job: dict | None = None,
     ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
@@ -937,27 +1059,55 @@ class BusinessMixin:
 
         Credit-note keys (``is_credit_note``, ``applies_to``) are
         emitted only when set, so normal invoices/bills/vouchers
-        get the same shape they had before v1.3. ``is_credit_note``
-        is auto-detected from the invoice's slot; ``applies_to``
-        must be resolved by the caller (the static-method shape
-        means we can't query the source invoice here, same
-        constraint as ``owner_name``).
+        get the same shape they had before v1.3.
+
+        Job linkage (``job`` field) is emitted only when the
+        invoice is grouped under a Job (owner_type=3). The
+        ``type`` field stays semantic (invoice/bill) — for
+        job-attached invoices we look through the Job to its
+        underlying customer/vendor to decide whether this is a
+        customer invoice or vendor bill. From the bookkeeper's
+        perspective, "Berlin Digital's invoice under the API
+        Rewrite job" is still an invoice; the job is grouping
+        metadata.
 
         Args:
             invoice: piecash Invoice object.
             entries: Optional list of entry dicts. If ``None``, entries
                 are not included.
             owner_name: Resolved customer/vendor/employee name.
+                For job-attached invoices, this is the underlying
+                customer/vendor name (the job's owner), resolved
+                by the caller through ``_find_invoice_owner_by_guid``
+                which chases owner_type=3 through to the real owner.
             applies_to: For credit notes only, the ``{id, type}`` dict
-                naming the source invoice. The caller resolves this
-                via ``_resolve_applies_to(book, invoice)``.
+                naming the source invoice.
+            job: For job-attached invoices only, the ``{id, name}``
+                dict naming the grouping job. Caller resolves via
+                ``_find_job_by_guid(book, invoice.owner_guid)``
+                when ``invoice.owner_type == 3``.
         """
+        # Type resolution: owner_type 2/4/5 maps directly. For
+        # owner_type=3 (Job), the semantic type follows the job's
+        # underlying owner — customer-job → "invoice", vendor-job
+        # → "bill". The ``job`` kwarg carries that resolution from
+        # the caller (we can't query the session from a staticmethod).
+        if invoice.owner_type == 3 and job is not None:
+            # The job dict carries 'owner_type' as a string —
+            # 'customer' or 'vendor' — from the caller's lookup.
+            type_field = (
+                "invoice" if job.get("owner_type") == "customer"
+                else "bill"
+            )
+        else:
+            type_field = BusinessMixin._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                invoice.owner_type, "invoice",
+            )
+
         result = {
             "guid": invoice.guid,
             "id": invoice.id,
-            "type": BusinessMixin._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                invoice.owner_type, "invoice"
-            ),
+            "type": type_field,
             "owner_name": owner_name,
             "date_opened": (
                 str(_safe_invoice_date(invoice, "date_opened").date())
@@ -981,6 +1131,12 @@ class BusinessMixin:
             result["is_credit_note"] = True
             if applies_to:
                 result["applies_to"] = applies_to
+        # Job link present iff caller threaded a job dict. The
+        # ``id`` and ``name`` are the surface a bookkeeper wants;
+        # ``owner_type`` lives on the parent caller's
+        # ``_job_to_dict`` output if they need it.
+        if job is not None:
+            result["job"] = {"id": job["id"], "name": job["name"]}
         if entries is not None:
             result["entries"] = entries
         return result
@@ -1003,8 +1159,22 @@ class BusinessMixin:
         # consumers can grep for the tag to filter (e.g. "CN" to
         # find every credit note in a list). The suffix preserves
         # the owner-side info that a bare "CN" tag would hide.
+        # For job-attached invoices (owner_type=3), the tag
+        # follows the underlying side (INV/BILL via the job's
+        # owner_type) rather than a generic "JOB" tag — what
+        # matters for filtering is "is this a customer invoice
+        # or a vendor bill", with the job link a separate
+        # annotation appended via the owner column.
+        #
+        # Single Job lookup via ``_resolve_owner_type_and_job``
+        # — both the type tag and the job annotation come from
+        # the same Job row. (Copilot PR #88 review flagged the
+        # original two-call pattern as redundant.)
+        effective_ot, job = self._resolve_owner_type_and_job(
+            book, invoice,
+        )
         inv_type = self._OWNER_TYPE_TO_COMPACT_TAG.get(
-            invoice.owner_type, "INV"
+            effective_ot, "INV"
         )
         if self._get_is_credit_note(invoice):
             inv_type = f"{inv_type} (CN)"
@@ -1014,13 +1184,23 @@ class BusinessMixin:
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
-        # Owner lookup — customers/vendors/employees share the
-        # same ``owner_guid`` namespace shape across three tables.
-        # ``_find_invoice_owner_by_guid`` dispatches on owner_type.
+        # Owner lookup — customers/vendors/employees/jobs share
+        # the same ``owner_guid`` namespace shape across four
+        # tables. ``_find_invoice_owner_by_guid`` dispatches on
+        # owner_type and chases owner_type=3 through the Job to
+        # the underlying customer/vendor.
         owner = self._find_invoice_owner_by_guid(
             book, invoice.owner_type, invoice.owner_guid,
         )
         owner_name = owner.name if owner else "?"
+
+        # Job annotation: append ``(job:XXXXXX)`` to the owner
+        # column so a bookkeeper scanning a long invoice list
+        # can immediately see which project each row belongs to.
+        # Using the job's ID (not name) keeps the column narrow
+        # — the name surfaces in ``get_job(job_id)`` if needed.
+        if job is not None:
+            owner_name = f"{owner_name} (job:{job.id})"
 
         # Total: sum of (quantity * price) across entries. Falls back
         # to "?" when entries can't be loaded — keeps the row legible
@@ -1308,7 +1488,7 @@ class BusinessMixin:
         """
         from sqlalchemy import text
 
-        is_bill = self._is_bill_side(inv.owner_type)
+        is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
         if is_bill:
             rows = book.session.execute(
                 text("SELECT * FROM entries WHERE bill = :guid"),
@@ -2093,8 +2273,64 @@ class BusinessMixin:
         column group (``b_*``), same allowed account types. The
         legacy code used ``inv.owner_type == 4`` to mean this; the
         rename to ``_is_bill_side`` captures the truth.
+
+        For job-attached invoices (owner_type=3), pass the job's
+        owner_type instead — see ``_effective_owner_type``.
         """
         return owner_type in (4, 5)
+
+    @staticmethod
+    def _effective_owner_type(book, invoice) -> int:
+        """Resolve a document's "semantic" owner_type.
+
+        Direct customer invoices / vendor bills / vouchers
+        return their owner_type unchanged (2/4/5). Job-attached
+        invoices (owner_type=3) chase through the Job to its
+        underlying owner_type (2 or 4) — that's the side every
+        side-aware check (posting direction, account-type
+        validation, label dispatch) actually cares about.
+
+        Returns the underlying owner_type, falling back to the
+        raw owner_type if the job lookup fails (dangling
+        owner_guid). Same defensive shape as
+        ``_find_invoice_owner_by_guid``.
+
+        For callers that also need the Job itself (e.g. to
+        surface a (job:JOB-X) annotation), use
+        ``_resolve_owner_type_and_job`` instead — single Job
+        query, both outputs.
+        """
+        if invoice.owner_type != 3:
+            return invoice.owner_type
+        job = BusinessMixin._find_job_by_guid(book, invoice.owner_guid)
+        if job is None:
+            return invoice.owner_type
+        return job.owner_type
+
+    @staticmethod
+    def _resolve_owner_type_and_job(book, invoice):
+        """Single-query variant of ``_effective_owner_type``
+        that also returns the Job object when one is linked.
+
+        Returns ``(effective_owner_type, job_or_none)``. For
+        direct documents (owner_type 2/4/5) the Job is None.
+        For job-attached docs (owner_type=3), both are derived
+        from a single Job lookup — avoids the redundant query
+        pattern Copilot flagged on PR #88 where callsites in
+        ``_invoice_to_compact_line`` and
+        ``get_outstanding_invoices`` were doing
+        ``_effective_owner_type`` AND ``_find_job_by_guid``
+        side-by-side (each chasing the same Job row).
+
+        Defensive fallback to (raw_owner_type, None) on dangling
+        owner_guid — same shape as the original helper.
+        """
+        if invoice.owner_type != 3:
+            return invoice.owner_type, None
+        job = BusinessMixin._find_job_by_guid(book, invoice.owner_guid)
+        if job is None:
+            return invoice.owner_type, None
+        return job.owner_type, job
 
     # Human-readable document label for use in error messages,
     # status returns, and audit log entries. Title-case canonical
@@ -2216,6 +2452,7 @@ class BusinessMixin:
         term: str | None = None,
         doc_id: str | None = None,
         extra_slots: dict | None = None,
+        job_id: str | None = None,
     ) -> dict:
         """Shared create path for customer invoice and vendor bill.
 
@@ -2263,6 +2500,54 @@ class BusinessMixin:
                 raise ValueError(
                     f"{config['owner_label']} not found: {owner_id}"
                 )
+
+            # Job linkage: when ``job_id`` is given, the invoice
+            # is grouped under a Job. The job must (a) exist,
+            # (b) belong to the same customer/vendor the caller
+            # named, and (c) match the owner_type (customer-
+            # invoice → customer-job; vendor-bill → vendor-job).
+            # On success, we override the insert's owner_type to
+            # 3 (Job) and owner_guid to job.guid — GnuCash's
+            # polymorphic owner_guid encoding. The customer/
+            # vendor relationship is preserved indirectly: the
+            # Job row itself carries the underlying owner.
+            job_obj = None
+            if job_id:
+                if owner_type == 5:
+                    raise ValueError(
+                        "Employee vouchers cannot be grouped under "
+                        "a job — piecash's job model is "
+                        "customer/vendor only."
+                    )
+                job_obj = self._find_job(book, job_id)
+                if not job_obj:
+                    raise ValueError(f"Job not found: {job_id}")
+                if job_obj.owner_type != owner_type:
+                    expected = (
+                        "customer" if owner_type == 2 else "vendor"
+                    )
+                    got = (
+                        "customer" if job_obj.owner_type == 2
+                        else "vendor"
+                    )
+                    raise ValueError(
+                        f"Job {job_id!r} is a {got} job; this "
+                        f"is a {expected} document. Customer "
+                        f"invoices can only be grouped under "
+                        f"customer jobs, vendor bills under "
+                        f"vendor jobs."
+                    )
+                if job_obj.owner_guid != owner.guid:
+                    job_owner = self._find_invoice_owner_by_guid(
+                        book, job_obj.owner_type, job_obj.owner_guid,
+                    )
+                    raise ValueError(
+                        f"Job {job_id!r} belongs to "
+                        f"{(job_owner.id if job_owner else '?')!r}, "
+                        f"not {owner_id!r}. The job and the "
+                        f"document must reference the same "
+                        f"customer/vendor."
+                    )
 
             if currency:
                 currency_obj = None
@@ -2369,8 +2654,14 @@ class BusinessMixin:
                     notes=notes,
                     active=1,
                     currency=currency_guid,
-                    owner_type=owner_type,
-                    owner_guid=owner.guid,
+                    # When linked to a job, the invoice's
+                    # polymorphic owner pointer routes to the
+                    # Job row (owner_type=3) — the job carries
+                    # the underlying customer/vendor reference.
+                    owner_type=3 if job_obj else owner_type,
+                    owner_guid=(
+                        job_obj.guid if job_obj else owner.guid
+                    ),
                     terms=term_guid,
                     billing_id="",
                     post_txn=None,
@@ -2418,6 +2709,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         invoice_id: str | None = None,
+        job_id: str | None = None,
     ) -> dict:
         """Create a customer invoice.
 
@@ -2432,9 +2724,19 @@ class BusinessMixin:
             term: Billterm name (e.g., 'Net 30'). Optional.
             invoice_id: Custom invoice number. If omitted, auto-generates
                 from the book's invoice counter.
+            job_id: Optional Job ID to group this invoice under.
+                The job must belong to the same customer and be
+                a customer-job (created with owner_type='customer').
+                When set, the invoice's owner_type becomes 3 (Job)
+                with owner_guid pointing at the Job, per GnuCash's
+                polymorphic owner encoding; the customer
+                relationship is preserved indirectly through the
+                Job row.
 
         Returns:
-            Dict with guid, id, customer_id, status.
+            Dict with guid, id, customer_id, status (plus a
+            ``job: {id, name}`` field surfaces in ``get_invoice``
+            responses when linked).
         """
         return self._create_business_document(
             owner_type=2,
@@ -2444,6 +2746,7 @@ class BusinessMixin:
             currency=currency,
             term=term,
             doc_id=invoice_id,
+            job_id=job_id,
         )
 
     def create_bill(
@@ -2454,6 +2757,7 @@ class BusinessMixin:
         currency: str | None = None,
         term: str | None = None,
         bill_id: str | None = None,
+        job_id: str | None = None,
     ) -> dict:
         """Create a vendor bill.
 
@@ -2468,6 +2772,10 @@ class BusinessMixin:
             term: Billterm name (e.g., 'Net 30'). Optional.
             bill_id: Custom bill number. If omitted, auto-generates
                 from the book's bill counter.
+            job_id: Optional Job ID to group this bill under. The
+                job must belong to the same vendor and be a
+                vendor-job. Same polymorphic routing as
+                ``create_invoice``'s ``job_id``.
 
         Returns:
             Dict with guid, id, vendor_id, status.
@@ -2480,6 +2788,7 @@ class BusinessMixin:
             currency=currency,
             term=term,
             doc_id=bill_id,
+            job_id=job_id,
         )
 
     def create_voucher(
@@ -3004,7 +3313,20 @@ class BusinessMixin:
                 raise ValueError(
                     f"{cfg['label']} not found: {doc_id}"
                 )
-            if inv.owner_type != owner_type:
+            # Side-check: the invoice's "effective" owner_type
+            # is owner_type directly when 2/4/5; for owner_type=3
+            # (job-attached) it's the underlying job's
+            # owner_type. ``_find_invoice`` already filters by
+            # both direct and job-attached for owner_type 2/4,
+            # so reaching here with the wrong side means a true
+            # caller mistake (customer-id passed to
+            # add_bill_entry, e.g.).
+            # Centralize via _effective_owner_type — Copilot PR
+            # #88 flagged this as duplicate logic with the helper.
+            effective_owner_type = self._effective_owner_type(
+                book, inv,
+            )
+            if effective_owner_type != owner_type:
                 raise ValueError(
                     f"'{doc_id}' is a {cfg['twin_label']}, not a "
                     f"{cfg['label'].lower()}. Use "
@@ -3199,6 +3521,7 @@ class BusinessMixin:
         status: str | None = None,
         compact: bool = True,
         limit: int | None = None,
+        job_id: str | None = None,
     ) -> list[dict] | str:
         """List invoices and/or bills.
 
@@ -3209,6 +3532,13 @@ class BusinessMixin:
             limit: Maximum invoices to return. Defaults to 50, capped at
                    250 server-side. Pre-fix this method dumped every
                    invoice in the book regardless of caller intent.
+            job_id: Filter to invoices grouped under a specific job
+                — useful for the per-engagement listing pattern
+                (e.g., "what invoices are part of the API Rewrite
+                project?"). Job-attached invoices have
+                ``owner_type=3`` with ``owner_guid`` pointing at
+                the job; this filter resolves the job and matches
+                against its GUID.
 
         Returns:
             Compact string (with optional truncation notice) or list of
@@ -3220,7 +3550,32 @@ class BusinessMixin:
         with self.open() as book:
             query = book.session.query(Invoice)
 
-            if ot is not None:
+            # job_id filter trumps owner_type for the SQL query —
+            # job-attached invoices have owner_type=3 regardless
+            # of whether the underlying counterparty is customer
+            # or vendor. We rewrite the filter to "owner_guid =
+            # <job.guid>" and skip the owner_type filter (or
+            # cross-check it against the job's underlying type
+            # if the caller passed both).
+            if job_id:
+                job = self._find_job(book, job_id)
+                if not job:
+                    raise ValueError(f"Job not found: {job_id}")
+                if ot is not None and ot != job.owner_type:
+                    expected = (
+                        "customer" if job.owner_type == 2 else "vendor"
+                    )
+                    raise ValueError(
+                        f"Job {job_id!r} is a {expected} job; "
+                        f"owner_type={owner_type!r} doesn't match. "
+                        f"Drop the owner_type filter or pass a "
+                        f"matching job_id."
+                    )
+                query = query.filter(
+                    Invoice.owner_type == 3,
+                    Invoice.owner_guid == job.guid,
+                )
+            elif ot is not None:
                 query = query.filter(Invoice.owner_type == ot)
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
@@ -3247,14 +3602,40 @@ class BusinessMixin:
                 # Verbose path: resolve owner per invoice so each dict
                 # carries the readable name. ``owner_guid`` was dropped
                 # from the dict shape in Phase 3C.
+                #
+                # Job preload — avoids the N+1 query pattern Copilot
+                # flagged on PR #88. Single query for every Job
+                # referenced by job-attached invoices in the result
+                # set, indexed by GUID, then in-memory lookup per
+                # row. With 100 job-attached invoices spanning 5
+                # jobs, this is 1 query instead of 100.
+                from piecash.business.invoice import Job
+                job_attached_guids = [
+                    i.owner_guid for i in invoices
+                    if i.owner_type == 3 and i.owner_guid
+                ]
+                jobs_by_guid: dict = {}
+                if job_attached_guids:
+                    for j in book.session.query(Job).filter(
+                        Job.guid.in_(set(job_attached_guids))
+                    ).all():
+                        jobs_by_guid[j.guid] = j
+
                 results = []
                 for i in invoices:
                     o = self._find_invoice_owner_by_guid(
                         book, i.owner_type, i.owner_guid,
                     )
+                    j_dict = None
+                    if i.owner_type == 3:
+                        j_obj = jobs_by_guid.get(i.owner_guid)
+                        if j_obj is not None:
+                            j_dict = self._job_to_dict(j_obj)
                     results.append(
                         self._invoice_to_dict(
-                            i, owner_name=o.name if o else None,
+                            i,
+                            owner_name=o.name if o else None,
+                            job=j_dict,
                         )
                     )
                 # Envelope shape matches ``get_unreconciled_splits`` and
@@ -3296,7 +3677,7 @@ class BusinessMixin:
             if not inv:
                 raise ValueError(f"Document not found: {invoice_id}")
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             # Get entries via raw SQL since ORM relationship doesn't
             # work for vendor bills (bill column is VARCHAR, not FK)
@@ -3350,11 +3731,25 @@ class BusinessMixin:
             # flag is also set, so normal invoices/bills get the
             # same shape they did pre-v1.3.
             applies_to = self._resolve_applies_to(book, inv)
+            # Resolve job linkage for job-attached invoices
+            # (owner_type=3 means owner_guid points at a Job).
+            # _invoice_to_dict uses the dict to compute the
+            # type field (invoice vs bill based on the job's
+            # underlying owner) AND to emit the surface
+            # ``job: {id, name}`` field.
+            job_dict = None
+            if inv.owner_type == 3:
+                job_obj = self._find_job_by_guid(
+                    book, inv.owner_guid,
+                )
+                if job_obj is not None:
+                    job_dict = self._job_to_dict(job_obj)
             result = self._invoice_to_dict(
                 inv,
                 entries=entries,
                 owner_name=owner_name,
                 applies_to=applies_to,
+                job=job_dict,
             )
             result["total"] = str(total)
             return result
@@ -3452,7 +3847,7 @@ class BusinessMixin:
                     f"{invoice_id} is already posted"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             post_acct = self._resolve_account(book, post_account)
             if not post_acct:
@@ -3685,7 +4080,7 @@ class BusinessMixin:
                     f"{invoice_id} is not posted"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
             # Three-way label dispatch — was a binary "Bill if
             # is_bill else Invoice" that mislabeled vouchers as
             # bills (Copilot PR #86 review).
@@ -3879,7 +4274,7 @@ class BusinessMixin:
                     f"post it before recording payment"
                 )
 
-            is_bill = self._is_bill_side(inv.owner_type)
+            is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
             pay_acct = self._resolve_account(book, payment_account)
             if not pay_acct:
@@ -4841,6 +5236,401 @@ class BusinessMixin:
             # Employees own nothing in 1.3.0 — no dependency check.
         )
 
+    # ── Job CRUD ─────────────────────────────────────────────────
+    #
+    # Jobs are a customer/vendor-level grouping over invoices or
+    # bills. Three things make them simpler than the other
+    # business entities we've built:
+    #
+    # 1. The ``piecash.Job(name, owner, reference, active)``
+    #    constructor is OPEN — unlike Invoice / Customer / Vendor
+    #    / Employee, which we wrestled into raw SQL inserts. We
+    #    use the ORM directly here.
+    # 2. The constructor auto-assigns the 6-digit ID via
+    #    ``on_book_add`` calling ``_assign_id`` (advances
+    #    ``counter_job``). No manual counter handling.
+    # 3. Jobs have no posted state — only ``active`` (1) /
+    #    ``inactive`` (0). No post / unpost / pay tools. The
+    #    financial lifecycle remains on the linked invoices.
+    #
+    # Employee jobs are deliberately not supported — piecash's
+    # ``PersonType`` map only has ``Customer: 2`` and
+    # ``Vendor: 4``; passing an Employee to ``Job()`` would
+    # raise ``KeyError``. Same desktop-parity principle as
+    # credit notes (no GnuCash UI for them).
+
+    def create_job(
+        self,
+        owner_id: str,
+        owner_type: str,
+        name: str,
+        reference: str = "",
+    ) -> dict:
+        """Create a job for a customer or vendor.
+
+        A job groups invoices (or bills) from one counterparty
+        under a project-level container. The financial lifecycle
+        stays on the invoices; the job is organizational only —
+        no posted state, no posting math, just ``active``/
+        ``inactive``.
+
+        Args:
+            owner_id: Customer or vendor ID (e.g., '000001').
+            owner_type: 'customer' or 'vendor'. Employees are not
+                supported (piecash's PersonType has no Employee
+                entry; GnuCash desktop has no Employee Job UI).
+            name: Human-readable job name (e.g., 'API Rewrite').
+            reference: Optional reference string (PO number, etc.).
+
+        Returns:
+            Dict with guid, id, name, reference, active,
+            owner_type, status='created'.
+
+        Raises:
+            ValueError: If owner_type is invalid, 'employee', or
+                the named owner doesn't exist.
+        """
+        from piecash.business.invoice import Job
+
+        int_owner_type = self._parse_owner_type(owner_type)
+        if int_owner_type == 5:
+            raise ValueError(
+                "Jobs are not supported for employees. GnuCash "
+                "desktop has no UI for employee jobs (piecash's "
+                "PersonType map has only Customer and Vendor), "
+                "so creating one here would produce a document "
+                "desktop users can't view or edit. Job-track "
+                "employee work via vouchers' notes field instead."
+            )
+        if int_owner_type not in (2, 4):
+            raise ValueError(
+                f"Jobs require owner_type 'customer' or 'vendor', "
+                f"got {owner_type!r}."
+            )
+
+        find_owner = (
+            self._find_customer
+            if int_owner_type == 2
+            else self._find_vendor
+        )
+        with self.open(readonly=False) as book:
+            owner = find_owner(book, owner_id)
+            if not owner:
+                label = (
+                    "Customer" if int_owner_type == 2 else "Vendor"
+                )
+                raise ValueError(f"{label} not found: {owner_id}")
+
+            # The Job constructor handles owner_type, owner_guid,
+            # and (on book.add) the auto-id assignment. The
+            # ``if owner.book:`` branch in piecash's __init__ adds
+            # the job to the book automatically, so we don't need
+            # a separate ``book.session.add(job)``.
+            job = Job(
+                name=name,
+                owner=owner,
+                reference=reference,
+                active=1,
+            )
+
+            book.save()
+
+            # Verify the row landed (consistency with the rest of
+            # the business module's "every write is verified"
+            # invariant).
+            from gnucash_mcp.book._base import _verify_write
+            _verify_write(
+                book.session, Job.__table__, job.guid,
+                f"Job '{name}'",
+            )
+
+            return {
+                "guid": job.guid,
+                "id": job.id,
+                "name": name,
+                "reference": reference,
+                "active": True,
+                "owner_type": owner_type,
+                "status": "created",
+            }
+
+    def list_jobs(
+        self,
+        owner_type: str | None = None,
+        owner_id: str | None = None,
+        active_only: bool = True,
+        compact: bool = True,
+    ) -> list[dict] | str:
+        """List jobs, optionally filtered by owner_type and/or
+        owner_id.
+
+        Args:
+            owner_type: Filter by 'customer' or 'vendor'. Omit
+                for all.
+            owner_id: Filter by specific customer or vendor ID
+                (requires owner_type to disambiguate the lookup;
+                rejected otherwise to avoid ambiguous cross-
+                sequence ID matches).
+            active_only: If True (default), exclude inactive jobs.
+            compact: If True (default), return tab-separated
+                one-line-per-job string; otherwise a list of
+                dicts.
+
+        Returns:
+            Compact string or list of dicts depending on
+            ``compact``.
+        """
+        from piecash.business.invoice import Job
+
+        int_owner_type = (
+            self._parse_owner_type(owner_type) if owner_type else None
+        )
+        if int_owner_type == 5:
+            # Symmetric with create_job — surface the constraint
+            # at the filter boundary too rather than silently
+            # returning an empty list.
+            raise ValueError(
+                "Jobs are not supported for employees; "
+                "owner_type='employee' has no jobs to list."
+            )
+
+        if owner_id and not owner_type:
+            raise ValueError(
+                "owner_id requires owner_type to be set — "
+                "customer and vendor IDs share a sequence space, "
+                "so disambiguation is required."
+            )
+
+        with self.open() as book:
+            query = book.session.query(Job)
+            if int_owner_type is not None:
+                query = query.filter(Job.owner_type == int_owner_type)
+            if active_only:
+                query = query.filter(Job.active == 1)
+            if owner_id:
+                find_owner = (
+                    self._find_customer
+                    if int_owner_type == 2
+                    else self._find_vendor
+                )
+                owner = find_owner(book, owner_id)
+                if not owner:
+                    label = (
+                        "Customer" if int_owner_type == 2
+                        else "Vendor"
+                    )
+                    raise ValueError(
+                        f"{label} not found: {owner_id}"
+                    )
+                query = query.filter(Job.owner_guid == owner.guid)
+
+            jobs = sorted(query.all(), key=lambda j: j.id)
+
+            if compact:
+                lines = []
+                for job in jobs:
+                    owner = self._find_invoice_owner_by_guid(
+                        book, job.owner_type, job.owner_guid,
+                    )
+                    lines.append(
+                        self._job_to_compact_line(
+                            job, owner_name=(
+                                owner.name if owner else None
+                            ),
+                        )
+                    )
+                return "\n".join(lines)
+
+            results = []
+            for job in jobs:
+                owner = self._find_invoice_owner_by_guid(
+                    book, job.owner_type, job.owner_guid,
+                )
+                results.append(
+                    self._job_to_dict(
+                        job,
+                        owner_name=owner.name if owner else None,
+                    )
+                )
+            return results
+
+    def get_job(self, job_id: str) -> dict:
+        """Get a job's details by ID.
+
+        Returns:
+            Dict with guid, id, name, reference, active,
+            owner_type, owner_name, plus a ``linked_invoices``
+            summary (count + IDs) so the caller can see what's
+            attached without a separate ``list_invoices`` call.
+
+        Raises:
+            ValueError: If job not found.
+        """
+        from piecash.business.invoice import Invoice, Job
+        with self.open() as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            owner = self._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
+            result = self._job_to_dict(
+                job, owner_name=owner.name if owner else None,
+            )
+            # Linked invoices: owner_type=3 + owner_guid=job.guid
+            # is the polymorphic linkage. Sort by ID for stable
+            # output.
+            linked = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).order_by(Invoice.id).all()
+            result["linked_invoices"] = {
+                "count": len(linked),
+                "ids": [inv.id for inv in linked],
+            }
+            return result
+
+    def update_job(
+        self,
+        job_id: str,
+        name: str | None = None,
+        reference: str | None = None,
+        active: bool | None = None,
+    ) -> dict:
+        """Update a job's name, reference, or active state.
+
+        Any subset of fields can be passed; unspecified fields
+        are left unchanged. Returns a diff-style response
+        (changed fields only) following the same convention as
+        ``update_account`` / ``update_transaction``.
+
+        Args:
+            job_id: Job ID.
+            name: New name (optional).
+            reference: New reference (optional).
+            active: New active flag (optional).
+
+        Returns:
+            Dict with id, guid, status='updated', plus only the
+            fields that changed.
+
+        Raises:
+            ValueError: If job not found or no fields supplied.
+        """
+        if name is None and reference is None and active is None:
+            raise ValueError(
+                "update_job requires at least one of name, "
+                "reference, or active."
+            )
+        with self.open(readonly=False) as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            # Capture before-state for audit log staging.
+            before = {
+                "id": job.id,
+                "name": job.name,
+                "reference": job.reference or "",
+                "active": bool(job.active),
+            }
+            self._stage_audit_before(before)
+
+            changed = {}
+            if name is not None and name != job.name:
+                job.name = name
+                changed["name"] = name
+            if reference is not None and reference != (job.reference or ""):
+                job.reference = reference
+                changed["reference"] = reference
+            if active is not None and bool(job.active) != active:
+                job.active = 1 if active else 0
+                changed["active"] = active
+
+            book.save()
+
+            return {
+                "id": job.id,
+                "guid": job.guid,
+                "status": "updated",
+                **changed,
+            }
+
+    def delete_job(self, job_id: str, force: bool = False) -> dict:
+        """Delete a job.
+
+        Refuses by default when invoices/bills are linked to the
+        job — data-loss prevention. ``force=True`` re-parents
+        every linked invoice back to its underlying customer/
+        vendor (reverses the indirection by rewriting
+        owner_type/owner_guid) before deleting the job row,
+        preserving invoice history.
+
+        Args:
+            job_id: Job ID.
+            force: If True, re-parent linked invoices instead of
+                refusing. Default False.
+
+        Returns:
+            Dict with id, guid, name, reparented_count (0 unless
+            force was used), status='deleted'.
+
+        Raises:
+            ValueError: If job not found, or linked invoices
+                exist and ``force`` is False.
+        """
+        from piecash.business.invoice import Invoice, Job
+        with self.open(readonly=False) as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            job_name = job.name
+            job_guid = job.guid
+            underlying_owner_type = job.owner_type
+            underlying_owner_guid = job.owner_guid
+
+            linked = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).all()
+
+            reparented_count = 0
+            if linked:
+                if not force:
+                    raise ValueError(
+                        f"Job '{job_id}' has {len(linked)} linked "
+                        f"invoice(s)/bill(s). Pass force=True to "
+                        f"re-parent them back to the underlying "
+                        f"customer/vendor before deleting the "
+                        f"job, or unlink/delete the documents "
+                        f"first."
+                    )
+                # Re-parent: rewrite owner_type/owner_guid on
+                # each linked invoice to point at the customer
+                # or vendor the job was for. This preserves the
+                # invoice history while removing the
+                # intermediate Job row.
+                for inv in linked:
+                    inv.owner_type = underlying_owner_type
+                    inv.owner_guid = underlying_owner_guid
+                    reparented_count += 1
+
+            book.session.delete(job)
+            book.save()
+
+            from gnucash_mcp.book._base import _verify_delete
+            _verify_delete(
+                book.session, Job.__table__, {"guid": job_guid},
+                f"Job '{job_id}'",
+            )
+
+            return {
+                "id": job_id,
+                "guid": job_guid,
+                "name": job_name,
+                "reparented_count": reparented_count,
+                "status": "deleted",
+            }
+
     # ── Reporting ────────────────────────────────────────────────
 
     def get_outstanding_invoices(
@@ -4910,7 +5700,7 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                is_bill = self._is_bill_side(inv.owner_type)
+                is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
 
                 post_acc_guid = inv.post_acc_guid
                 post_acct = book.session.query(
@@ -4940,19 +5730,21 @@ class BusinessMixin:
 
                 amount_paid = grand_total - abs(balance)
 
-                owner_name = None
-                if is_bill:
-                    v = self._find_vendor_by_guid(
-                        book, inv.owner_guid
-                    )
-                    if v:
-                        owner_name = v.name
-                else:
-                    c = self._find_customer_by_guid(
-                        book, inv.owner_guid
-                    )
-                    if c:
-                        owner_name = c.name
+                # Owner lookup via the polymorphic dispatcher —
+                # routes customer/vendor/employee/job (chasing
+                # owner_type=3 through the Job to the underlying
+                # counterparty). Pre-fix this used the direct
+                # customer/vendor finders keyed off ``is_bill``,
+                # which returned None for job-attached invoices
+                # because inv.owner_guid points at a Job, not a
+                # customer/vendor row. Bookkeeper didn't probe
+                # this path; Copilot caught the related redundant-
+                # query pattern below and the bug surfaced
+                # during the refactor.
+                owner = self._find_invoice_owner_by_guid(
+                    book, inv.owner_type, inv.owner_guid,
+                )
+                owner_name = owner.name if owner else None
 
                 posted_dt = _safe_invoice_date(inv, "date_posted")
                 # Resolve the due date through the same three-step
@@ -4974,11 +5766,28 @@ class BusinessMixin:
                 # the compact formatter can distinguish. The
                 # amount-due is the unsettled credit balance —
                 # what's still available to apply or refund.
+                # For job-attached docs (owner_type=3), the
+                # semantic type comes from the effective
+                # owner_type (chases through the Job to the
+                # underlying customer/vendor); we also surface
+                # a job_id so the formatter can annotate the
+                # row.
+                #
+                # Single Job query via _resolve_owner_type_and_job
+                # — Copilot PR #88 review caught the original
+                # ``_effective_owner_type`` + ``_find_job_by_guid``
+                # side-by-side as redundant.
                 is_credit_note = self._get_is_credit_note(inv)
+                effective_ot, job_for_inv = (
+                    self._resolve_owner_type_and_job(book, inv)
+                )
+                job_id_field = (
+                    job_for_inv.id if job_for_inv else None
+                )
                 results.append({
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
+                        effective_ot, "invoice"
                     ),
                     "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
@@ -4994,6 +5803,7 @@ class BusinessMixin:
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(abs(balance)),
+                    "job_id": job_id_field,
                 })
 
             # Sort: most overdue first (largest days_past_due), so the
@@ -5005,6 +5815,163 @@ class BusinessMixin:
             if compact:
                 return _format_outstanding_invoices_compact(results)
             return results
+
+    def get_job_report(self, job_id: str) -> dict:
+        """Per-job summary: billed / paid / outstanding totals
+        across all linked invoices, plus the per-invoice
+        breakdown.
+
+        **Currency handling**: a job's linked invoices CAN span
+        multiple currencies (a project that bills mostly in EUR
+        but had one USD reimbursement on the same engagement),
+        so totals are returned as a dict keyed by currency
+        rather than a single scalar. Single-currency jobs render
+        as a one-key dict — the shape is consistent regardless
+        of cardinality, which is friendlier for LLMs that would
+        otherwise have to branch on whether ``totals_by_currency``
+        is flat or keyed.
+
+        **Posted vs unposted**: both are included. Posted
+        invoices contribute to ``billed`` / ``paid`` /
+        ``outstanding`` via their lot balance. Unposted (draft)
+        invoices contribute the entry-computed face value as
+        ``billed`` and ``outstanding``, with ``paid=0`` — a
+        bookkeeper looking at a job's pipeline wants drafts in
+        the picture too, not just what's been formalized.
+
+        Args:
+            job_id: Job ID.
+
+        Returns:
+            Dict with:
+
+            - ``job_id``, ``job_name``, ``owner_type``,
+              ``owner_name`` — job identity context
+            - ``linked_invoices_count`` — total invoices linked
+            - ``posted_count``, ``open_count`` — status breakdown
+            - ``totals_by_currency`` — ``{ccy: {billed, paid,
+              outstanding}}`` per currency present in the
+              linked invoices
+            - ``invoices`` — per-invoice list of ``{id, status,
+              currency, billed, paid, outstanding, date_opened,
+              date_posted}``
+
+        Raises:
+            ValueError: If job not found.
+        """
+        from piecash.business.invoice import Invoice
+        with self.open() as book:
+            job = self._find_job(book, job_id)
+            if not job:
+                raise ValueError(f"Job not found: {job_id}")
+            owner = self._find_invoice_owner_by_guid(
+                book, job.owner_type, job.owner_guid,
+            )
+            owner_name = owner.name if owner else None
+            owner_type = (
+                "customer" if job.owner_type == 2 else "vendor"
+            )
+
+            # Linked invoices: polymorphic owner pointer where
+            # owner_type=3 and owner_guid=job.guid. Indexed query.
+            invoices = book.session.query(Invoice).filter(
+                Invoice.owner_type == 3,
+                Invoice.owner_guid == job.guid,
+            ).order_by(Invoice.date_opened).all()
+
+            totals_by_currency: dict[str, dict[str, Decimal]] = {}
+            invoice_rows = []
+            posted_count = 0
+            open_count = 0
+
+            for inv in invoices:
+                ccy = inv.currency.mnemonic if inv.currency else "?"
+                # Face value: sum of (qty * price) across entries.
+                # Falls back to 0 on entry-load failure rather
+                # than aborting the whole report — matches the
+                # _invoice_to_compact_line defensive shape.
+                try:
+                    _, _, billed = (
+                        self._get_invoice_entries_and_total(book, inv)
+                    )
+                except (ValueError, AttributeError):
+                    billed = Decimal("0")
+
+                if _is_invoice_posted(inv):
+                    posted_count += 1
+                    # Posted: paid = billed - outstanding (from
+                    # the lot balance). The lot balance is the
+                    # unsettled amount, so abs(balance) =
+                    # outstanding.
+                    post_acct_guid = inv.post_acc_guid
+                    post_acct = book.session.query(
+                        piecash.Account
+                    ).filter_by(guid=post_acct_guid).first()
+                    lot_obj = None
+                    if post_acct:
+                        for lot in post_acct.lots:
+                            if lot.guid == inv.post_lot_guid:
+                                lot_obj = lot
+                                break
+                    if lot_obj:
+                        outstanding = abs(
+                            self._calculate_lot_balance(lot_obj)
+                        )
+                        paid = billed - outstanding
+                    else:
+                        # Defensive: lot not found despite
+                        # posted state — treat as fully owed
+                        # rather than crashing the report.
+                        outstanding = billed
+                        paid = Decimal("0")
+                    status = "posted"
+                else:
+                    open_count += 1
+                    paid = Decimal("0")
+                    outstanding = billed
+                    status = "open"
+
+                posted_dt = _safe_invoice_date(inv, "date_posted")
+                opened_dt = _safe_invoice_date(inv, "date_opened")
+                invoice_rows.append({
+                    "id": inv.id,
+                    "status": status,
+                    "currency": ccy,
+                    "billed": str(billed),
+                    "paid": str(paid),
+                    "outstanding": str(outstanding),
+                    "date_opened": (
+                        str(opened_dt.date()) if opened_dt else None
+                    ),
+                    "date_posted": (
+                        str(posted_dt.date()) if posted_dt else None
+                    ),
+                })
+
+                bucket = totals_by_currency.setdefault(ccy, {
+                    "billed": Decimal("0"),
+                    "paid": Decimal("0"),
+                    "outstanding": Decimal("0"),
+                })
+                bucket["billed"] += billed
+                bucket["paid"] += paid
+                bucket["outstanding"] += outstanding
+
+            # Stringify Decimal totals for JSON-friendly output.
+            return {
+                "job_id": job.id,
+                "job_name": job.name,
+                "owner_type": owner_type,
+                "owner_name": owner_name,
+                "linked_invoices_count": len(invoices),
+                "posted_count": posted_count,
+                "open_count": open_count,
+                "totals_by_currency": {
+                    ccy: {k: str(v) for k, v in bucket.items()}
+                    for ccy, bucket in totals_by_currency.items()
+                },
+                "invoices": invoice_rows,
+            }
 
     def vendor_spending_report(
         self,

@@ -80,12 +80,12 @@ class TestToolModulesMapping:
         assert len(_core_tool_names()) == 26
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 95 —
-        88 post-module-restructure + 3 voucher tools + 4 credit-
-        note tools (create_credit_note, add_credit_note_entry,
-        delete_credit_note, apply_credit_note) added in v1.3."""
+        """Total tools across all sub-modules should be 101 —
+        88 post-module-restructure + 3 voucher tools +
+        4 credit-note tools + 5 job CRUD tools +
+        1 get_job_report added in v1.3."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 95
+        assert total == 101
 
     def test_expected_modules_exist(self):
         """All expected sub-module names should be present after the
@@ -229,9 +229,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 95 tools (88 + 3 vouchers + 4 credit notes)."""
+        """--modules=all should keep all 101 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 95
+        assert len(self._tool_names()) == 101
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -263,12 +263,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 95
+        assert len(self._tool_names()) == 101
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 95 tools."""
+        """'all' mixed with other modules should keep all 101 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 95
+        assert len(self._tool_names()) == 101
 
     def test_unknown_module_warns(self, capsys):
         """Unknown module names should produce a warning on stderr."""
