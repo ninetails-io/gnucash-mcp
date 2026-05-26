@@ -3284,6 +3284,202 @@ class TestTaxtableLifecycle:
             )
 
 
+class TestTaxtableDisplay:
+    """Commit 5: per-entry tax tags + document-level tax_summary
+    block. Conditional emission keeps non-tax responses
+    byte-identical to pre-taxtable shape."""
+
+    def _setup(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        return gb, gst, pst
+
+    def test_non_tax_invoice_unchanged_shape(self, business_book):
+        """Backward-compat: an invoice with no tax-bearing entries
+        returns no tax_summary key and entries lack tax fields."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Plain",
+            quantity="1",
+            price="100",
+        )
+        inv = gb.get_invoice("000001")
+        assert "tax_summary" not in inv
+        assert inv["entries"][0].keys() == {
+            "guid", "date", "description",
+            "quantity", "price", "total", "account",
+        }
+
+    def test_taxable_entry_carries_tax_fields(self, business_book):
+        gb, _, _ = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        inv = gb.get_invoice("000001")
+        e = inv["entries"][0]
+        assert e["taxable"] is True
+        assert e["tax_included"] is False
+        assert e["taxtable"] == "GST 5%"
+
+    def test_tax_included_flag_surfaces(self, business_book):
+        gb, _, _ = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Gross",
+            quantity="1",
+            price="105",
+            taxtable="GST 5%",
+            tax_included=True,
+        )
+        inv = gb.get_invoice("000001")
+        e = inv["entries"][0]
+        assert e["tax_included"] is True
+
+    def test_tax_summary_block_emitted(self, business_book):
+        """Single-entry invoice with tax produces a complete
+        tax_summary with all five fields populated."""
+        gb, gst, _ = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        inv = gb.get_invoice("000001")
+        ts = inv["tax_summary"]
+        assert ts["subtotal"] == "100.00"
+        assert ts["tax_total"] == "5.00"
+        assert ts["total"] == "105.00"
+        assert ts["by_taxtable"] == {"GST 5%": "5.00"}
+        assert ts["by_account"] == {
+            "Liabilities:GST Payable": "5.00"
+        }
+        # Customer-facing total uses the gross figure.
+        assert inv["total"] == "105.00"
+
+    def test_tax_summary_composite_by_taxtable(self, business_book):
+        """Multi-line invoice spanning two taxtables: by_taxtable
+        rolls up each taxtable's contribution; by_account splits
+        across the underlying payable accounts."""
+        gb, gst, pst = self._setup(business_book)
+        # Line A: $100 GST 5% → $5 tax → GST Payable
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="A",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        # Line B: $200 BC GST+PST → $10 GST + $14 PST → both
+        # accounts
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="B",
+            quantity="1",
+            price="200",
+            taxtable="BC GST+PST",
+        )
+        inv = gb.get_invoice("000001")
+        ts = inv["tax_summary"]
+        assert ts["subtotal"] == "300.00"
+        assert ts["tax_total"] == "29.00"
+        assert ts["total"] == "329.00"
+        # Per-taxtable rollup:
+        assert ts["by_taxtable"] == {
+            "GST 5%": "5.00",
+            "BC GST+PST": "24.00",  # 10 + 14
+        }
+        # Per-account: GST Payable collects from both taxtables.
+        assert ts["by_account"] == {
+            "Liabilities:GST Payable": "15.00",  # 5 + 10
+            "Liabilities:PST Payable": "14.00",
+        }
+
+    def test_mixed_invoice_only_tax_lines_in_summary(
+        self, business_book,
+    ):
+        """An invoice with some tax-bearing and some non-tax lines
+        still produces a tax_summary; non-tax lines simply
+        contribute to subtotal/total but not to tax_total."""
+        gb, _, _ = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="No tax",
+            quantity="1",
+            price="50",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Taxed",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        inv = gb.get_invoice("000001")
+        ts = inv["tax_summary"]
+        # Subtotal is sum of per-line pretax = 50 + 100 = 150.
+        assert ts["subtotal"] == "150.00"
+        # Tax_total only from the taxed line.
+        assert ts["tax_total"] == "5.00"
+        assert ts["total"] == "155.00"
+
+    def test_bill_taxable_entry_displays(self, business_book):
+        """Vendor bill displays b_taxable correctly (not i_taxable)."""
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50",
+            taxtable="GST 5%",
+        )
+        inv = gb.get_invoice("000001", owner_type="vendor")
+        e = inv["entries"][0]
+        assert e["taxable"] is True
+        assert e["taxtable"] == "GST 5%"
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 

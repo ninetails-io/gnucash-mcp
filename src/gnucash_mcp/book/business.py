@@ -1130,6 +1130,7 @@ class BusinessMixin:
         owner_name: str | None = None,
         applies_to: dict | None = None,
         job: dict | None = None,
+        tax_summary: dict | None = None,
     ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
@@ -1222,6 +1223,11 @@ class BusinessMixin:
             result["job"] = {"id": job["id"], "name": job["name"]}
         if entries is not None:
             result["entries"] = entries
+        # Tax summary conditional on the invoice having any
+        # tax-bearing lines. Non-tax invoices keep their pre-v1.3
+        # response shape byte-identical.
+        if tax_summary is not None:
+            result["tax_summary"] = tax_summary
         return result
 
     def _invoice_to_compact_line(self, book, invoice) -> str:
@@ -1321,6 +1327,7 @@ class BusinessMixin:
         entry_row,
         is_bill: bool = False,
         account_paths: dict | None = None,
+        taxtable_names: dict | None = None,
     ) -> dict:
         """Convert an entry row (from raw SQL) to a serializable dict.
 
@@ -1333,6 +1340,11 @@ class BusinessMixin:
                 builds this map once per invoice and passes it through;
                 this keeps the static-method shape while letting the
                 response be readable to humans/LLMs.
+            taxtable_names: Optional ``{taxtable_guid: name}`` map for
+                resolving the entry's applied taxtable to its readable
+                name. Tax fields (taxable, tax_included, taxtable) are
+                emitted only when the entry is taxable — non-tax
+                entries keep their pre-v1.3 shape exactly.
         """
         q_num = entry_row.quantity_num or 0
         q_denom = entry_row.quantity_denom or 1
@@ -1342,10 +1354,16 @@ class BusinessMixin:
             p_num = entry_row.b_price_num or 0
             p_denom = entry_row.b_price_denom or 1
             acct_guid = entry_row.b_acct
+            taxable = bool(entry_row.b_taxable)
+            tax_included = bool(entry_row.b_taxincluded)
+            taxtable_guid = entry_row.b_taxtable
         else:
             p_num = entry_row.i_price_num or 0
             p_denom = entry_row.i_price_denom or 1
             acct_guid = entry_row.i_acct
+            taxable = bool(entry_row.i_taxable)
+            tax_included = bool(entry_row.i_taxincluded)
+            taxtable_guid = entry_row.i_taxtable
 
         price = Decimal(p_num) / Decimal(p_denom)
         total = quantity * price
@@ -1375,6 +1393,20 @@ class BusinessMixin:
             )
         else:
             result["account_guid"] = acct_guid or ""
+
+        # Tax fields conditional on taxable=1 — non-tax entries
+        # keep their byte-identical pre-v1.3 shape so existing
+        # consumers see no diff.
+        if taxable:
+            result["taxable"] = True
+            result["tax_included"] = tax_included
+            if taxtable_guid:
+                if taxtable_names is not None:
+                    result["taxtable"] = taxtable_names.get(
+                        taxtable_guid, taxtable_guid,
+                    )
+                else:
+                    result["taxtable_guid"] = taxtable_guid
         return result
 
     @staticmethod
@@ -1591,6 +1623,11 @@ class BusinessMixin:
             - ``tax_breakdown``: ``{account_guid: Decimal}`` — the
               tax-only portion, available separately for display
               surfaces that want to render a tax summary.
+            - ``tax_by_taxtable``: ``{taxtable_guid: Decimal}`` —
+              tax aggregated by the taxtable that produced it,
+              for surfaces that want to render a "Tax — GST 5%:
+              $15, BC GST+PST: $7" rollup. A taxtable with zero
+              tax-bearing lines on this invoice does not appear.
 
         Raises:
             ValueError: when the invoice has no entries.
@@ -1649,6 +1686,7 @@ class BusinessMixin:
         quantum = _commodity_quantum(inv.currency)
         acct_totals: dict[str, Decimal] = {}
         tax_breakdown: dict[str, Decimal] = {}
+        tax_by_taxtable: dict[str, Decimal] = {}
         grand_total = Decimal(0)
         subtotal = Decimal(0)
 
@@ -1705,6 +1743,16 @@ class BusinessMixin:
                     + tax_amount
                 )
 
+            # Per-taxtable rollup: when this line was tax-bearing,
+            # attribute its total tax to the source taxtable so
+            # display surfaces can render "GST 5%: $15, BC GST+PST:
+            # $7" without re-deriving from row data.
+            if taxtable_guid and tax_result["tax_total"] != 0:
+                tax_by_taxtable[taxtable_guid] = (
+                    tax_by_taxtable.get(taxtable_guid, Decimal(0))
+                    + tax_result["tax_total"]
+                )
+
             grand_total += tax_result["gross"]
             subtotal += tax_result["pretax"]
 
@@ -1714,6 +1762,7 @@ class BusinessMixin:
             "grand_total": grand_total,
             "subtotal": subtotal,
             "tax_breakdown": tax_breakdown,
+            "tax_by_taxtable": tax_by_taxtable,
         }
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
@@ -4695,17 +4744,63 @@ class BusinessMixin:
             for a in book.accounts:
                 account_paths[a.guid] = a.fullname
 
+            # Build taxtable_guid → name map for entries that
+            # reference taxtables. One query, like account_paths.
+            from piecash.business.tax import Taxtable
+            taxtable_names: dict[str, str] = {}
+            for tt in book.session.query(Taxtable).all():
+                taxtable_names[tt.guid] = tt.name
+
             entries = [
                 self._entry_to_dict(
-                    r, is_bill=is_bill, account_paths=account_paths,
+                    r,
+                    is_bill=is_bill,
+                    account_paths=account_paths,
+                    taxtable_names=taxtable_names,
                 )
                 for r in rows
             ]
 
-            total = sum(
-                Decimal(e["quantity"]) * Decimal(e["price"])
-                for e in entries
-            )
+            # Tax summary: compute via the seam so the math
+            # matches what posting would produce. Empty entries
+            # raises ValueError on the seam — guarded by the
+            # outer rows check. If no entries are tax-bearing,
+            # tax_summary stays None and the response shape
+            # matches pre-v1.3 byte-for-byte.
+            tax_summary = None
+            if rows:
+                totals = self._get_invoice_entries_and_total(
+                    book, inv,
+                )
+                if totals["tax_breakdown"]:
+                    tax_summary = {
+                        "subtotal": str(totals["subtotal"]),
+                        "tax_total": str(
+                            sum(
+                                totals["tax_breakdown"].values(),
+                                Decimal(0),
+                            )
+                        ),
+                        "by_taxtable": {
+                            taxtable_names.get(g, g): str(v)
+                            for g, v in totals[
+                                "tax_by_taxtable"
+                            ].items()
+                        },
+                        "by_account": {
+                            account_paths.get(g, g): str(v)
+                            for g, v in totals[
+                                "tax_breakdown"
+                            ].items()
+                        },
+                        "total": str(totals["grand_total"]),
+                    }
+                # Customer-facing total uses the seam's
+                # grand_total (gross). Non-tax invoices fold to
+                # the same Q×P sum they had pre-v1.3.
+                total = totals["grand_total"]
+            else:
+                total = Decimal(0)
 
             # Three-way owner lookup — vouchers route to employees,
             # bills to vendors, invoices to customers. Pre-fix this
@@ -4743,6 +4838,7 @@ class BusinessMixin:
                 owner_name=owner_name,
                 applies_to=applies_to,
                 job=job_dict,
+                tax_summary=tax_summary,
             )
             result["total"] = str(total)
             return result
