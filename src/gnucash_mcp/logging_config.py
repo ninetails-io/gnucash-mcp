@@ -798,6 +798,87 @@ def _fmt_billterm_create(entry: dict) -> list[str]:
     ]
 
 
+def _fmt_taxtable_entry_line(e: dict) -> str:
+    """Render one taxtable entry as ``5%→GST Payable`` or
+    ``$5→Eco Fee Payable``. Mirrors the runtime
+    ``_taxtable_entry_summary`` so audit-log rows look identical
+    to what list_taxtables prints."""
+    type_val = e.get("type", "")
+    amount = e.get("amount", "")
+    # account_paths-resolved (preferred) → "account"; falls back
+    # to "account_guid" for entries serialized without the path
+    # map (shouldn't happen via our book methods, but defensive).
+    acct = e.get("account") or e.get("account_guid", "?")
+    if type_val == "percentage":
+        return f"{amount}%→{acct}"
+    return f"${amount}→{acct}"
+
+
+def _fmt_taxtable_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    entries = after.get("entries") or params.get("entries") or []
+    lines = [
+        f"{time_part}  CREATE TAXTABLE",
+        f'{_INDENT}name: "{name}"  entries: {len(entries)}',
+    ]
+    for e in entries:
+        lines.append(f"{_INDENT}  {_fmt_taxtable_entry_line(e)}")
+    return lines
+
+
+def _fmt_taxtable_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = params.get("name", "")
+    lines = [f'{time_part}  UPDATE TAXTABLE  name: "{name}"']
+    changed = after.get("changed") or {}
+    if "name" in changed:
+        old = changed["name"].get("before", "?")
+        new = changed["name"].get("after", "?")
+        lines.append(f"{_INDENT}name: {old!r} → {new!r}")
+    if "entries" in changed:
+        before_entries = changed["entries"].get("before") or []
+        after_entries = changed["entries"].get("after") or []
+        lines.append(
+            f"{_INDENT}entries: {len(before_entries)} → "
+            f"{len(after_entries)}"
+        )
+        # Show the before/after detail; this is the audit
+        # rationale for keeping the diff in the response.
+        if before_entries:
+            lines.append(f"{_INDENT}  before:")
+            for e in before_entries:
+                lines.append(
+                    f"{_INDENT}    {_fmt_taxtable_entry_line(e)}"
+                )
+        if after_entries:
+            lines.append(f"{_INDENT}  after:")
+            for e in after_entries:
+                lines.append(
+                    f"{_INDENT}    {_fmt_taxtable_entry_line(e)}"
+                )
+    return lines
+
+
+def _fmt_taxtable_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = params.get("name", "")
+    entries = before.get("entries") or []
+    lines = [
+        f'{time_part}  DELETE TAXTABLE  name: "{name}"',
+        f"{_INDENT}removed entries: {len(entries)}",
+    ]
+    for e in entries:
+        lines.append(f"{_INDENT}  {_fmt_taxtable_entry_line(e)}")
+    return lines
+
+
 def _fmt_invoice_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1282,6 +1363,9 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("job", "UPDATE"): _fmt_job_update,
     ("job", "DELETE"): _fmt_job_delete,
     ("billterm", "CREATE"): _fmt_billterm_create,
+    ("taxtable", "CREATE"): _fmt_taxtable_create,
+    ("taxtable", "UPDATE"): _fmt_taxtable_update,
+    ("taxtable", "DELETE"): _fmt_taxtable_delete,
     ("invoice", "CREATE"): _fmt_invoice_create,
     ("invoice", "DELETE"): _fmt_invoice_delete,
     ("invoice", "POST"): _fmt_invoice_post,

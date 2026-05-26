@@ -1710,6 +1710,626 @@ class TestListBillterms:
         assert result[0]["description"] == "Standard terms"
 
 
+def _add_tax_accounts(gb):
+    """Helper: add two LIABILITY tax-payable accounts to the
+    business book fixture so taxtable tests have somewhere to
+    route tax components. Returns the paths for reuse in test
+    assertions."""
+    gb.create_account(
+        name="GST Payable",
+        account_type="LIABILITY",
+        parent="Liabilities",
+    )
+    gb.create_account(
+        name="PST Payable",
+        account_type="LIABILITY",
+        parent="Liabilities",
+    )
+    return (
+        "Liabilities:GST Payable",
+        "Liabilities:PST Payable",
+    )
+
+
+class TestCreateTaxtable:
+    """Tests for create_taxtable."""
+
+    def test_single_entry_percentage(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        result = gb.create_taxtable(
+            name="GST 5%",
+            entries=[
+                {"type": "percentage", "amount": "5.00",
+                 "account": gst},
+            ],
+        )
+        assert result["status"] == "created"
+        assert result["name"] == "GST 5%"
+        assert result["entry_count"] == 1
+        assert len(result["guid"]) == 32
+        assert result["entries"][0]["type"] == "percentage"
+        assert result["entries"][0]["amount"] == "5"
+        assert result["entries"][0]["account"] == gst
+
+    def test_multi_entry_composite(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        result = gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5.00",
+                 "account": gst},
+                {"type": "percentage", "amount": "7.00",
+                 "account": pst},
+            ],
+        )
+        assert result["entry_count"] == 2
+        accounts = {e["account"] for e in result["entries"]}
+        assert accounts == {gst, pst}
+
+    def test_flat_value_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        result = gb.create_taxtable(
+            name="Eco Fee $5",
+            entries=[
+                {"type": "value", "amount": "5.00", "account": gst},
+            ],
+        )
+        assert result["entries"][0]["type"] == "value"
+        assert result["entries"][0]["amount"] == "5"
+
+    def test_mixed_value_and_percentage(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        result = gb.create_taxtable(
+            name="Sales+Eco",
+            entries=[
+                {"type": "percentage", "amount": "7.25",
+                 "account": gst},
+                {"type": "value", "amount": "5.00", "account": pst},
+            ],
+        )
+        types = {e["type"] for e in result["entries"]}
+        assert types == {"percentage", "value"}
+
+    def test_account_via_short_guid(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst_path, _ = _add_tax_accounts(gb)
+        # Find the short-guid prefix from list_accounts output.
+        listing = gb.list_accounts()
+        gst_row = next(
+            line for line in listing.splitlines()
+            if "GST Payable" in line
+        )
+        short_guid = gst_row.split("\t")[0]
+        assert short_guid.startswith("%")
+        result = gb.create_taxtable(
+            name="GST via short",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": short_guid},
+            ],
+        )
+        # Resolved to the path in the response.
+        assert result["entries"][0]["account"] == gst_path
+
+    def test_duplicate_name_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        with pytest.raises(ValueError, match="already exists"):
+            gb.create_taxtable(
+                name="GST 5%",
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": gst}],
+            )
+
+    def test_empty_entries_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        _add_tax_accounts(gb)
+        with pytest.raises(ValueError, match="at least one entry"):
+            gb.create_taxtable(name="Empty", entries=[])
+
+    def test_bad_type_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        with pytest.raises(ValueError, match="type must be"):
+            gb.create_taxtable(
+                name="Bad",
+                entries=[{"type": "flat", "amount": "5",
+                          "account": gst}],
+            )
+
+    def test_zero_amount_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        with pytest.raises(ValueError, match="amount must be > 0"):
+            gb.create_taxtable(
+                name="Zero",
+                entries=[{"type": "percentage", "amount": "0",
+                          "account": gst}],
+            )
+
+    def test_negative_amount_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        with pytest.raises(ValueError, match="amount must be > 0"):
+            gb.create_taxtable(
+                name="Neg",
+                entries=[{"type": "percentage", "amount": "-5",
+                          "account": gst}],
+            )
+
+    def test_high_percentage_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        # 100%+ rate almost certainly indicates the user expressed
+        # the rate as a fraction (0.05) and we're seeing 5.0 — but
+        # also 100% itself is a likely user error.
+        with pytest.raises(ValueError, match="user error"):
+            gb.create_taxtable(
+                name="Too high",
+                entries=[{"type": "percentage", "amount": "150",
+                          "account": gst}],
+            )
+
+    def test_missing_account_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        _add_tax_accounts(gb)
+        with pytest.raises(ValueError, match="account not found"):
+            gb.create_taxtable(
+                name="Bad acct",
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": "Liabilities:Does Not Exist"}],
+            )
+
+    def test_wrong_account_type_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        _add_tax_accounts(gb)
+        # Income accounts are valid existing accounts but the wrong
+        # type for tax routing.
+        with pytest.raises(ValueError, match="ASSET.*LIABILITY"):
+            gb.create_taxtable(
+                name="Wrong type",
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": "Income:Sales"}],
+            )
+
+    def test_multi_currency_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        _add_tax_accounts(gb)
+        # Add a EUR-denominated liability account and pair it with
+        # a USD one to trigger the multi-commodity guard.
+        gb.create_account(
+            name="EU VAT Payable",
+            account_type="LIABILITY",
+            parent="Liabilities",
+            commodity="EUR",
+        )
+        with pytest.raises(ValueError, match="different commodit"):
+            gb.create_taxtable(
+                name="Mixed currency",
+                entries=[
+                    {"type": "percentage", "amount": "5",
+                     "account": "Liabilities:GST Payable"},
+                    {"type": "percentage", "amount": "19",
+                     "account": "Liabilities:EU VAT Payable"},
+                ],
+            )
+
+    def test_initial_refcount_zero(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 0
+
+
+class TestListTaxtables:
+    """Tests for list_taxtables."""
+
+    def test_empty_list(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        assert gb.list_taxtables() == ""
+        assert gb.list_taxtables(compact=False) == []
+
+    def test_compact_single_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        result = gb.list_taxtables()
+        assert "GST 5%" in result
+        assert "1 entry" in result
+        # Summary token has the arrow renderer.
+        assert "5%→GST Payable" in result
+
+    def test_compact_multi_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        result = gb.list_taxtables()
+        assert "2 entries" in result
+        assert "5%→GST Payable" in result
+        assert "7%→PST Payable" in result
+
+    def test_verbose_includes_refcount(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        result = gb.list_taxtables(compact=False)
+        assert len(result) == 1
+        assert result[0]["name"] == "GST 5%"
+        assert result[0]["refcount"] == 0
+        assert result[0]["entries"][0]["account"] == gst
+
+    def test_sorted_by_name(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        for nm in ["Zeta", "Alpha", "Mu"]:
+            gb.create_taxtable(
+                name=nm,
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": gst}],
+            )
+        result = gb.list_taxtables(compact=False)
+        assert [t["name"] for t in result] == ["Alpha", "Mu", "Zeta"]
+
+
+class TestGetTaxtable:
+    """Tests for get_taxtable."""
+
+    def test_basic_lookup(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        tt = gb.get_taxtable("BC GST+PST")
+        assert tt["name"] == "BC GST+PST"
+        assert len(tt["entries"]) == 2
+        assert tt["refcount"] == 0
+        # Account paths resolved on each entry.
+        accounts = {e["account"] for e in tt["entries"]}
+        assert accounts == {gst, pst}
+
+    def test_not_found_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.get_taxtable("Nonexistent")
+
+
+class TestUpdateTaxtable:
+    """Tests for update_taxtable."""
+
+    def test_no_fields_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        with pytest.raises(ValueError, match="at least one"):
+            gb.update_taxtable(name="GST 5%")
+
+    def test_rename(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        result = gb.update_taxtable(
+            name="GST 5%", new_name="Federal GST",
+        )
+        assert result["status"] == "updated"
+        assert result["name"] == "Federal GST"
+        assert "name" in result["changed"]
+        # Confirm rename via lookup under the new name.
+        tt = gb.get_taxtable("Federal GST")
+        assert tt["name"] == "Federal GST"
+
+    def test_rename_collision_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        for nm in ["GST 5%", "PST 7%"]:
+            gb.create_taxtable(
+                name=nm,
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": gst}],
+            )
+        with pytest.raises(ValueError, match="already exists"):
+            gb.update_taxtable(name="GST 5%", new_name="PST 7%")
+
+    def test_replace_entries(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        result = gb.update_taxtable(
+            name="GST 5%",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        assert result["status"] == "updated"
+        assert "entries" in result["changed"]
+        # ``after`` entries must carry the resolved account path
+        # — pre-flush, the FK is None and the path would silently
+        # drop. Regression guard for the bookkeeper-found bug
+        # on Commit 1 live test.
+        after = result["changed"]["entries"]["after"]
+        assert len(after) == 2
+        assert {e["account"] for e in after} == {gst, pst}
+        # Verify via re-read.
+        tt = gb.get_taxtable("GST 5%")
+        assert len(tt["entries"]) == 2
+
+    def test_replace_entries_in_use_without_force_rejected(
+        self, business_book,
+    ):
+        """Direct SQL insert simulates an in-use refcount > 0
+        without needing Commit 4's wire-up."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        tt = gb.get_taxtable("GST 5%")
+        # Insert a phantom Entry row referencing the taxtable so
+        # the refcount-computer reports > 0.
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "INSERT INTO entries "
+                    "(guid, date, date_entered, description, action, "
+                    "notes, quantity_num, quantity_denom, "
+                    "i_acct, i_price_num, i_price_denom, "
+                    "i_discount_num, i_discount_denom, "
+                    "i_disc_type, i_disc_how, "
+                    "i_taxable, i_taxincluded, i_taxtable, "
+                    "b_acct, b_price_num, b_price_denom, "
+                    "b_taxable, b_taxincluded, b_taxtable, "
+                    "b_paytype, billable, billto_type, "
+                    "billto_guid, order_guid, invoice, bill) "
+                    "VALUES "
+                    "(:guid, :now, :now, '', '', '', "
+                    "1, 1, NULL, 0, 1, 0, 1, '', '', "
+                    "1, 0, :ttg, NULL, 0, 1, 0, 0, NULL, "
+                    "0, 0, 0, NULL, NULL, NULL, NULL)"
+                ),
+                {
+                    "guid": "deadbeef" * 4,
+                    "now": "2026-01-01 00:00:00",
+                    "ttg": tt["guid"],
+                },
+            )
+            book.save()
+        with pytest.raises(ValueError, match="force=True"):
+            gb.update_taxtable(
+                name="GST 5%",
+                entries=[{"type": "percentage", "amount": "10",
+                          "account": gst}],
+            )
+
+    def test_replace_entries_in_use_with_force(self, business_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        tt = gb.get_taxtable("GST 5%")
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "INSERT INTO entries "
+                    "(guid, date, date_entered, description, action, "
+                    "notes, quantity_num, quantity_denom, "
+                    "i_acct, i_price_num, i_price_denom, "
+                    "i_discount_num, i_discount_denom, "
+                    "i_disc_type, i_disc_how, "
+                    "i_taxable, i_taxincluded, i_taxtable, "
+                    "b_acct, b_price_num, b_price_denom, "
+                    "b_taxable, b_taxincluded, b_taxtable, "
+                    "b_paytype, billable, billto_type, "
+                    "billto_guid, order_guid, invoice, bill) "
+                    "VALUES "
+                    "(:guid, :now, :now, '', '', '', "
+                    "1, 1, NULL, 0, 1, 0, 1, '', '', "
+                    "1, 0, :ttg, NULL, 0, 1, 0, 0, NULL, "
+                    "0, 0, 0, NULL, NULL, NULL, NULL)"
+                ),
+                {
+                    "guid": "deadbeef" * 4,
+                    "now": "2026-01-01 00:00:00",
+                    "ttg": tt["guid"],
+                },
+            )
+            book.save()
+        result = gb.update_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "10",
+                      "account": gst}],
+            force=True,
+        )
+        assert result["status"] == "updated"
+
+
+class TestDeleteTaxtable:
+    """Tests for delete_taxtable."""
+
+    def test_delete_unused(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        result = gb.delete_taxtable("GST 5%")
+        assert result["status"] == "deleted"
+        assert result["name"] == "GST 5%"
+        # Confirm gone.
+        with pytest.raises(ValueError, match="not found"):
+            gb.get_taxtable("GST 5%")
+
+    def test_not_found_raises(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="not found"):
+            gb.delete_taxtable("Nonexistent")
+
+    def test_in_use_rejected(self, business_book):
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        tt = gb.get_taxtable("GST 5%")
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text(
+                    "INSERT INTO entries "
+                    "(guid, date, date_entered, description, action, "
+                    "notes, quantity_num, quantity_denom, "
+                    "i_acct, i_price_num, i_price_denom, "
+                    "i_discount_num, i_discount_denom, "
+                    "i_disc_type, i_disc_how, "
+                    "i_taxable, i_taxincluded, i_taxtable, "
+                    "b_acct, b_price_num, b_price_denom, "
+                    "b_taxable, b_taxincluded, b_taxtable, "
+                    "b_paytype, billable, billto_type, "
+                    "billto_guid, order_guid, invoice, bill) "
+                    "VALUES "
+                    "(:guid, :now, :now, '', '', '', "
+                    "1, 1, NULL, 0, 1, 0, 1, '', '', "
+                    "1, 0, :ttg, NULL, 0, 1, 0, 0, NULL, "
+                    "0, 0, 0, NULL, NULL, NULL, NULL)"
+                ),
+                {
+                    "guid": "deadbeef" * 4,
+                    "now": "2026-01-01 00:00:00",
+                    "ttg": tt["guid"],
+                },
+            )
+            book.save()
+        with pytest.raises(ValueError, match="1 entries reference"):
+            gb.delete_taxtable("GST 5%")
+
+
+class TestTaxtableRefcount:
+    """Direct tests for the SQL-computed refcount helper."""
+
+    def test_refcount_zero_for_unused(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        with gb.open() as book:
+            tt = gb._find_taxtable(book, "GST 5%")
+            assert gb._compute_taxtable_refcount(book, tt.guid) == 0
+
+    def test_refcount_counts_b_taxtable_too(self, business_book):
+        """The refcount SQL must OR ``i_taxtable`` and
+        ``b_taxtable`` — vendor bills route through the b_*
+        columns and their refs must count."""
+        from sqlalchemy import text
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        tt = gb.get_taxtable("GST 5%")
+        # Insert one i_taxtable row and one b_taxtable row.
+        with gb.open(readonly=False) as book:
+            for tag, payload in (
+                ("i", {"i_tt": tt["guid"], "b_tt": None}),
+                ("b", {"i_tt": None, "b_tt": tt["guid"]}),
+            ):
+                book.session.execute(
+                    text(
+                        "INSERT INTO entries "
+                        "(guid, date, date_entered, description, "
+                        "action, notes, quantity_num, quantity_denom, "
+                        "i_acct, i_price_num, i_price_denom, "
+                        "i_discount_num, i_discount_denom, "
+                        "i_disc_type, i_disc_how, "
+                        "i_taxable, i_taxincluded, i_taxtable, "
+                        "b_acct, b_price_num, b_price_denom, "
+                        "b_taxable, b_taxincluded, b_taxtable, "
+                        "b_paytype, billable, billto_type, "
+                        "billto_guid, order_guid, invoice, bill) "
+                        "VALUES (:guid, :now, :now, '', '', '', "
+                        "1, 1, NULL, 0, 1, 0, 1, '', '', "
+                        "1, 0, :i_tt, NULL, 0, 1, 0, 0, :b_tt, "
+                        "0, 0, 0, NULL, NULL, NULL, NULL)"
+                    ),
+                    {
+                        "guid": tag * 32,
+                        "now": "2026-01-01 00:00:00",
+                        **payload,
+                    },
+                )
+            book.save()
+        with gb.open() as book:
+            tt_obj = gb._find_taxtable(book, "GST 5%")
+            assert gb._compute_taxtable_refcount(
+                book, tt_obj.guid,
+            ) == 2
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 

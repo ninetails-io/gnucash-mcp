@@ -689,6 +689,27 @@ class BusinessMixin:
         return book.session.query(Job).filter_by(id=job_id).first()
 
     @staticmethod
+    def _find_taxtable(book, name: str):
+        """Find a Taxtable by exact name.
+
+        Taxtables are keyed by name across the book — there is no
+        per-jurisdiction or per-entity namespace. A book has at most
+        one taxtable named "GST 5%" and lookups are O(log n) via the
+        unique-name index. Returns None if not found; callers raise.
+        """
+        from piecash.business.tax import Taxtable
+        return book.session.query(Taxtable).filter_by(name=name).first()
+
+    @staticmethod
+    def _find_taxtable_by_guid(book, guid: str):
+        """Find a Taxtable by full GUID. Caller passes a 32-char hex
+        string (resolved via :meth:`_resolve_guid` upstream when the
+        input was a short prefix). Returns None if not found.
+        """
+        from piecash.business.tax import Taxtable
+        return book.session.query(Taxtable).filter_by(guid=guid).first()
+
+    @staticmethod
     def _find_job_by_guid(book, guid: str):
         """Find a job by GUID. Used to resolve invoice→job links
         where the invoice's ``owner_guid`` (with owner_type=3)
@@ -1009,6 +1030,68 @@ class BusinessMixin:
             "due_days": bt.duedays,
             "discount_days": bt.discountdays if bt.discountdays else 0,
             "discount": str(bt.discount) if bt.discount else "0",
+        }
+
+    @staticmethod
+    def _taxtable_entry_to_dict(
+        tte,
+        account_paths: dict | None = None,
+    ) -> dict:
+        """Serialize a TaxtableEntry to a dict.
+
+        Args:
+            tte: piecash TaxtableEntry object.
+            account_paths: Optional ``{account_guid: fullname}`` map.
+                When present, the entry's ``account`` field is the
+                resolved path (readable); otherwise the raw GUID
+                appears as ``account_guid``. Same pattern as
+                ``_entry_to_dict``.
+        """
+        result = {
+            "id": tte.id,
+            "type": tte.type,
+            "amount": str(tte.amount),
+        }
+        if account_paths is not None:
+            result["account"] = account_paths.get(
+                tte.account_guid, tte.account_guid,
+            )
+        else:
+            result["account_guid"] = tte.account_guid
+        return result
+
+    @staticmethod
+    def _taxtable_to_dict(
+        tt,
+        account_paths: dict | None = None,
+        refcount: int | None = None,
+    ) -> dict:
+        """Serialize a Taxtable to a dict.
+
+        Args:
+            tt: piecash Taxtable object.
+            account_paths: Optional ``{account_guid: fullname}`` map
+                covering every entry's account. Pre-built by the
+                caller (one query rather than N).
+            refcount: Optional computed-from-SQL refcount. The
+                stored ``Taxtable.refcount`` column tracks GnuCash
+                desktop's bookkeeping; the SQL-computed value is
+                authoritative for lifecycle checks. When given,
+                replaces the stored value in the response.
+        """
+        entries = [
+            BusinessMixin._taxtable_entry_to_dict(
+                e, account_paths=account_paths,
+            )
+            for e in tt.entries
+        ]
+        return {
+            "guid": tt.guid,
+            "name": tt.name,
+            "refcount": (
+                refcount if refcount is not None else tt.refcount
+            ),
+            "entries": entries,
         }
 
     @staticmethod
@@ -2206,6 +2289,563 @@ class BusinessMixin:
                 return "\n".join(lines)
             else:
                 return [self._billterm_to_dict(t) for t in terms]
+
+    # ── Taxtable CRUD ─────────────────────────────────────────────
+    #
+    # Taxtables route sales-tax math on invoice/bill/voucher/credit-
+    # note line entries. A taxtable holds one or more
+    # ``TaxtableEntry`` rows; each entry contributes either a
+    # percentage rate (5.00 means 5%) or a flat value (5.00 means a
+    # fixed $5 surcharge) routed to a specific GL account.
+    #
+    # A multi-entry taxtable (e.g., GST 5% + PST 7%) produces N tax
+    # splits per line at posting time, one per entry to its own
+    # account — see commit 3's posting math. This commit is pure
+    # data CRUD; the wire-up into entries (commit 4) and into
+    # ``_get_invoice_entries_and_total`` (commit 3) happens later.
+    #
+    # **Refcount discipline.** GnuCash desktop maintains
+    # ``Taxtable.refcount`` as the number of entries referencing the
+    # taxtable. piecash does not auto-maintain it; we manage it
+    # manually on entry create/delete in commit 4. For lifecycle
+    # checks here (delete guard, update warning), we use
+    # ``_compute_taxtable_refcount`` — an indexed SQL count over the
+    # ``entries`` table, authoritative regardless of the stored
+    # ``refcount`` column. Voided invoices still pin their taxtables
+    # because their entry rows persist for audit trail.
+
+    @staticmethod
+    def _compute_taxtable_refcount(book, taxtable_guid: str) -> int:
+        """Count Entry rows referencing this taxtable via
+        ``i_taxtable`` or ``b_taxtable``. Authoritative for delete
+        guards and update warnings — independent of the stored
+        ``Taxtable.refcount`` column which is maintained for desktop
+        interop but not used for our own logic.
+        """
+        from sqlalchemy import text
+        row = book.session.execute(
+            text(
+                "SELECT COUNT(*) FROM entries "
+                "WHERE i_taxtable = :guid OR b_taxtable = :guid"
+            ),
+            {"guid": taxtable_guid},
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _taxtable_entry_summary(e) -> str:
+        """One-token compact summary of a taxtable entry.
+
+        ``5%→GST Payable`` for percentage entries, ``$5→Eco Fee``
+        for flat-value. The arrow makes the routing direction
+        visually unmistakable.
+        """
+        acct_name = e.account.name if e.account else "?"
+        if e.type == "percentage":
+            return f"{e.amount}%→{acct_name}"
+        return f"${e.amount}→{acct_name}"
+
+    def _validate_taxtable_entries(
+        self, book, entries: list[dict],
+    ) -> list[dict]:
+        """Validate a list of taxtable-entry dicts and resolve their
+        accounts. Returns piecash-ready ``{type, amount, account}``
+        records.
+
+        Validations:
+          - non-empty list
+          - each entry has ``type`` in ``{"value", "percentage"}``
+          - amount parses to ``Decimal`` and is > 0
+          - percentage amount < 100 (rates expressed as percent,
+            not fraction; >=100% is almost certainly user error)
+          - account resolves and has type ASSET or LIABILITY
+            (sales-tax payable / input-tax-credit receivable —
+            anything else would book tax into the wrong section)
+          - all entries reference accounts in the same commodity
+            (multi-commodity taxtables are rejected per spec; one
+            taxtable per jurisdiction/commodity is the supported
+            model)
+
+        Args:
+            book: open piecash book session.
+            entries: list of ``{type, amount, account}`` dicts as
+                they arrive from the MCP tool layer.
+
+        Returns:
+            List of resolved records with ``amount`` as ``Decimal``
+            and ``account`` as the piecash ``Account`` object.
+
+        Raises:
+            ValueError on any validation failure, with the entry
+            index in the message so the caller can pinpoint which
+            entry was the problem.
+        """
+        if not entries:
+            raise ValueError(
+                "Taxtable must have at least one entry"
+            )
+
+        resolved: list[dict] = []
+        commodities_seen: set[str] = set()
+
+        for i, e in enumerate(entries):
+            type_val = e.get("type")
+            if type_val not in ("value", "percentage"):
+                raise ValueError(
+                    f"Entry {i}: type must be 'value' or "
+                    f"'percentage', got {type_val!r}"
+                )
+
+            try:
+                amount = _to_decimal(str(e.get("amount", "")))
+            except Exception:
+                raise ValueError(
+                    f"Entry {i}: amount {e.get('amount')!r} not a "
+                    f"valid decimal"
+                )
+            if amount <= 0:
+                raise ValueError(
+                    f"Entry {i}: amount must be > 0, got {amount}"
+                )
+            if (
+                type_val == "percentage"
+                and amount >= Decimal("100")
+            ):
+                raise ValueError(
+                    f"Entry {i}: percentage rate {amount} >= 100 "
+                    f"is almost certainly user error. Rates are "
+                    f"expressed as a percentage (5.0 for 5%, not "
+                    f"0.05). If you genuinely want a rate this "
+                    f"large, file an issue."
+                )
+
+            account_ref = e.get("account")
+            if not account_ref:
+                raise ValueError(f"Entry {i}: account is required")
+            acct = self._resolve_account(book, account_ref)
+            if not acct:
+                raise ValueError(
+                    f"Entry {i}: account not found: {account_ref!r}"
+                )
+            if acct.type not in ("ASSET", "LIABILITY"):
+                raise ValueError(
+                    f"Entry {i}: account {acct.fullname!r} has type "
+                    f"{acct.type!r}; taxtable entries must reference "
+                    f"ASSET (input-tax-credit receivable) or "
+                    f"LIABILITY (output sales-tax payable) accounts. "
+                    f"Got something else — verify the account "
+                    f"hierarchy."
+                )
+            commodities_seen.add(acct.commodity.guid)
+            resolved.append({
+                "type": type_val,
+                "amount": amount,
+                "account": acct,
+            })
+
+        if len(commodities_seen) > 1:
+            raise ValueError(
+                f"Taxtable entries must all reference accounts in "
+                f"the same commodity; got accounts in "
+                f"{len(commodities_seen)} different commodities. "
+                f"Multi-currency taxtables are rejected — split "
+                f"into one taxtable per jurisdiction/commodity."
+            )
+
+        return resolved
+
+    def create_taxtable(
+        self,
+        name: str,
+        entries: list[dict],
+    ) -> dict:
+        """Create a new tax table.
+
+        A taxtable holds one or more entries. Each entry contributes
+        either a percentage rate (``type='percentage'``,
+        ``amount=5.00`` means 5%) or a flat value
+        (``type='value'``, ``amount=5.00`` means a fixed $5
+        surcharge) routed to a specific ASSET or LIABILITY account.
+
+        Multi-entry taxtables (e.g., GST 5% + PST 7%) are
+        supported. At posting time each entry produces its own
+        split to its own account. All entries on a single taxtable
+        must reference accounts in the same commodity.
+
+        Args:
+            name: Taxtable name. Must be unique within the book.
+            entries: List of ``{type, amount, account}`` dicts.
+                ``type`` is ``'value'`` or ``'percentage'``.
+                ``amount`` is a positive Decimal as string;
+                percentages are expressed as the rate (``5.00`` =
+                5%, not ``0.05``). ``account`` is a path,
+                ``%short-guid``, or full GUID; must resolve to an
+                ASSET or LIABILITY account.
+
+        Returns:
+            ``{guid, name, entry_count, entries, status='created'}``.
+
+        Raises:
+            ValueError: duplicate name; empty entries; invalid
+                type/amount/account; wrong account type;
+                multi-currency entry mix.
+        """
+        from piecash.business.tax import Taxtable, TaxtableEntry
+
+        with self.open(readonly=False) as book:
+            existing = self._find_taxtable(book, name)
+            if existing:
+                raise ValueError(
+                    f"Taxtable {name!r} already exists "
+                    f"(guid={existing.guid[:8]})"
+                )
+
+            resolved = self._validate_taxtable_entries(book, entries)
+
+            tt = Taxtable(
+                name=name,
+                entries=[
+                    TaxtableEntry(
+                        type=r["type"],
+                        amount=r["amount"],
+                        account=r["account"],
+                    )
+                    for r in resolved
+                ],
+            )
+            book.session.add(tt)
+            book.flush()
+
+            # Capture before-close to avoid DetachedInstanceError
+            # on attribute access after ``book.save()`` exits the
+            # session.
+            tt_guid = tt.guid
+            tt_name = tt.name
+            account_paths = {
+                r["account"].guid: r["account"].fullname
+                for r in resolved
+            }
+            entry_dicts = [
+                self._taxtable_entry_to_dict(
+                    e, account_paths=account_paths,
+                )
+                for e in tt.entries
+            ]
+
+            book.save()
+
+            return {
+                "guid": tt_guid,
+                "name": tt_name,
+                "entry_count": len(entry_dicts),
+                "entries": entry_dicts,
+                "status": "created",
+            }
+
+    def list_taxtables(
+        self, compact: bool = True,
+    ) -> list[dict] | str:
+        """List all tax tables.
+
+        Args:
+            compact: When True (default), return a newline-separated
+                string with one line per taxtable. Each line is
+                ``name<TAB>N entry/entries: summary`` where the
+                summary is a comma-separated rendering of each
+                entry (e.g., ``5%→GST Payable, 7%→PST Payable``).
+                When False, return a list of full dicts including
+                resolved account paths and computed refcount.
+
+        Returns:
+            Compact string or verbose list, as documented above.
+            Empty taxtable list returns empty string / empty list.
+        """
+        from piecash.business.tax import Taxtable
+
+        with self.open() as book:
+            tables = book.session.query(Taxtable).order_by(
+                Taxtable.name,
+            ).all()
+
+            if compact:
+                lines = []
+                for tt in tables:
+                    summary = ", ".join(
+                        self._taxtable_entry_summary(e)
+                        for e in tt.entries
+                    )
+                    n = len(tt.entries)
+                    suffix = "entry" if n == 1 else "entries"
+                    lines.append(
+                        f"{tt.name}\t{n} {suffix}: {summary}"
+                    )
+                return "\n".join(lines)
+
+            return [
+                self._taxtable_to_dict(
+                    tt,
+                    account_paths={
+                        e.account_guid: e.account.fullname
+                        for e in tt.entries
+                    },
+                    refcount=self._compute_taxtable_refcount(
+                        book, tt.guid,
+                    ),
+                )
+                for tt in tables
+            ]
+
+    def get_taxtable(self, name: str) -> dict:
+        """Full details for a tax table.
+
+        Args:
+            name: Taxtable name.
+
+        Returns:
+            ``{guid, name, refcount, entries: [...]}`` with resolved
+            account paths on each entry. ``refcount`` is the
+            SQL-computed count of Entry rows referencing this
+            taxtable.
+
+        Raises:
+            ValueError: taxtable not found.
+        """
+        with self.open() as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            return self._taxtable_to_dict(
+                tt,
+                account_paths={
+                    e.account_guid: e.account.fullname
+                    for e in tt.entries
+                },
+                refcount=self._compute_taxtable_refcount(
+                    book, tt.guid,
+                ),
+            )
+
+    def update_taxtable(
+        self,
+        name: str,
+        new_name: str | None = None,
+        entries: list[dict] | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Update a tax table's name and/or entries.
+
+        Diff-style response: only changed fields are returned.
+
+        **Entry replacement on an in-use taxtable** is destructive
+        to FUTURE entries' tax math (existing posted invoices
+        retain their splits — splits are stored, not derived). When
+        the SQL-computed refcount > 0 and ``entries`` is given,
+        ``force=True`` is required. The check uses the SQL refcount
+        not the stored ``refcount`` column, so voided invoices that
+        still pin the taxtable are honored.
+
+        Args:
+            name: Current taxtable name.
+            new_name: New name (optional). Rejected if it collides
+                with another taxtable.
+            entries: Replacement entry list (optional). Validated
+                with the same rules as ``create_taxtable``.
+                Old entries are deleted via the relation's
+                ``delete-orphan`` cascade.
+            force: Required to replace entries when refcount > 0.
+                Has no effect on name-only updates.
+
+        Returns:
+            ``{guid, name, status, changed}`` where ``changed``
+            lists only the fields that actually changed.
+
+        Raises:
+            ValueError: taxtable not found; no fields supplied;
+                new_name collision; entry validation failure;
+                in-use taxtable without ``force=True``.
+        """
+        if new_name is None and entries is None:
+            raise ValueError(
+                "update_taxtable requires at least one of "
+                "new_name or entries."
+            )
+
+        from piecash.business.tax import TaxtableEntry
+
+        with self.open(readonly=False) as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            tt_guid = tt.guid
+
+            # Capture before-state for the audit log (entries
+            # snapshot serialized eagerly so detach doesn't bite
+            # the formatter at write time).
+            before_entries = [
+                self._taxtable_entry_to_dict(
+                    e,
+                    account_paths={
+                        e.account_guid: e.account.fullname,
+                    },
+                )
+                for e in tt.entries
+            ]
+            self._stage_audit_before({
+                "name": tt.name,
+                "entries": before_entries,
+            })
+
+            changed: dict = {}
+
+            if new_name is not None and new_name != tt.name:
+                collision = self._find_taxtable(book, new_name)
+                if collision and collision.guid != tt.guid:
+                    raise ValueError(
+                        f"Taxtable {new_name!r} already exists "
+                        f"(guid={collision.guid[:8]})"
+                    )
+                changed["name"] = {
+                    "before": tt.name, "after": new_name,
+                }
+                tt.name = new_name
+
+            if entries is not None:
+                refcount = self._compute_taxtable_refcount(
+                    book, tt_guid,
+                )
+                if refcount > 0 and not force:
+                    raise ValueError(
+                        f"Taxtable {name!r} is referenced by "
+                        f"{refcount} entries. Replacing its "
+                        f"entries changes the tax math for "
+                        f"FUTURE entries on those documents — "
+                        f"existing posted invoices retain their "
+                        f"original splits. Pass ``force=True`` "
+                        f"to proceed."
+                    )
+                resolved = self._validate_taxtable_entries(
+                    book, entries,
+                )
+                # Replacing via slice assignment relies on the
+                # entries relation's ``cascade="all, delete-orphan"``
+                # to remove the displaced rows. The new TaxtableEntry
+                # objects auto-register with the taxtable via the
+                # back_populates relation; no explicit session.add()
+                # needed.
+                tt.entries[:] = [
+                    TaxtableEntry(
+                        type=r["type"],
+                        amount=r["amount"],
+                        account=r["account"],
+                    )
+                    for r in resolved
+                ]
+                # Flush so the new entries' ``account_guid`` FK and
+                # autoincrement ``id`` columns are populated before
+                # we serialize the after-state. Pre-flush,
+                # ``e.account_guid`` is None on the new entries and
+                # ``_taxtable_entry_to_dict`` would drop the resolved
+                # ``account`` path. Matches the explicit flush in
+                # ``create_taxtable``.
+                book.flush()
+                after_entries = [
+                    self._taxtable_entry_to_dict(
+                        e,
+                        account_paths={
+                            r["account"].guid: r["account"].fullname
+                            for r in resolved
+                        },
+                    )
+                    for e in tt.entries
+                ]
+                changed["entries"] = {
+                    "before": before_entries,
+                    "after": after_entries,
+                }
+
+            book.save()
+
+            if not changed:
+                return {
+                    "guid": tt_guid,
+                    "name": name,
+                    "status": "unchanged",
+                }
+
+            return {
+                "guid": tt_guid,
+                "name": new_name if new_name else name,
+                "status": "updated",
+                "changed": changed,
+            }
+
+    def delete_taxtable(self, name: str) -> dict:
+        """Delete a tax table.
+
+        Refuses when the SQL-computed refcount is > 0 — see the
+        Refcount Discipline note in the section header. Voided
+        invoices still pin their taxtables. The entries-relation
+        ``cascade="all, delete-orphan"`` cleans up child
+        TaxtableEntry rows automatically.
+
+        Args:
+            name: Taxtable name.
+
+        Returns:
+            ``{guid, name, status='deleted'}``.
+
+        Raises:
+            ValueError: taxtable not found, or refcount > 0 with a
+                clear message naming the count.
+        """
+        from piecash.business.tax import Taxtable
+
+        with self.open(readonly=False) as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            tt_guid = tt.guid
+
+            refcount = self._compute_taxtable_refcount(book, tt_guid)
+            if refcount > 0:
+                raise ValueError(
+                    f"Cannot delete taxtable {name!r}: {refcount} "
+                    f"entries reference it. Remove or re-assign "
+                    f"those entries first. (Note: voided invoices "
+                    f"still pin their taxtables — voided entry "
+                    f"rows persist for audit-trail purposes.)"
+                )
+
+            # Capture serializable snapshot for the audit log
+            # before delete (entries are detached after save).
+            self._stage_audit_before({
+                "name": name,
+                "entries": [
+                    self._taxtable_entry_to_dict(
+                        e,
+                        account_paths={
+                            e.account_guid: e.account.fullname,
+                        },
+                    )
+                    for e in tt.entries
+                ],
+            })
+
+            book.session.delete(tt)
+            book.save()
+
+            from gnucash_mcp.book._base import _verify_delete
+            _verify_delete(
+                book.session, Taxtable.__table__,
+                {"guid": tt_guid},
+                f"Taxtable {name!r}",
+            )
+
+            return {
+                "guid": tt_guid,
+                "name": name,
+                "status": "deleted",
+            }
 
     # ── Invoice / Bill creation, posting, payment ─────────────────
     #
