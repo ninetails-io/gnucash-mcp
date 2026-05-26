@@ -3480,6 +3480,145 @@ class TestTaxtableDisplay:
         assert e["taxtable"] == "GST 5%"
 
 
+class TestTaxtableCrossCurrency:
+    """Cross-currency × tax interaction: EUR invoice with a
+    USD-denominated tax-payable account exercises the existing
+    _qty_for_split FX conversion on the tax component. The tax
+    math itself is currency-agnostic (rates and amounts apply
+    in invoice currency); FX kicks in only when the tax-payable
+    account's commodity differs from the invoice currency."""
+
+    def _setup_eur_with_usd_gst(self, business_book, rate="1.10"):
+        """Wire up: EUR commodity, EUR/USD price, USD GST Payable
+        account (in the book's default USD), EUR-denominated
+        customer + invoice. Returns the GnuCashBook handle."""
+        import piecash
+        from datetime import date as date_cls
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.flush()
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=bk.default_currency,
+                date=date_cls(2026, 5, 24),
+                value=rate, type="last",
+            ))
+            bk.save()
+        # USD GST Payable (book default commodity)
+        gb.create_account(
+            name="GST Payable",
+            account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": "Liabilities:GST Payable"}],
+        )
+        gb.create_customer(name="EUR Client")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+        )
+        return gb
+
+    def test_eur_invoice_with_usd_tax_payable(
+        self, business_book,
+    ):
+        """EUR 100 invoice with USD GST Payable at GST 5% → tax
+        component is EUR 5 in invoice currency, which converts to
+        USD 5.50 in the tax-payable account at the 1.10 rate."""
+        gb = self._setup_eur_with_usd_gst(business_book, rate="1.10")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR work",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        # Customer-facing total in EUR (invoice currency).
+        assert Decimal(result["total"]) == Decimal("105.00")
+        txn = gb.get_transaction(result["transaction_guid"])
+        # Build a per-account dict keyed by fullname carrying
+        # both value (EUR — invoice currency) and quantity
+        # (account commodity — USD or EUR depending on side).
+        by_acct = {
+            s["account"]: (Decimal(s["value"]), Decimal(s["quantity"]))
+            for s in txn["splits"]
+        }
+        # A/R is RECEIVABLE in USD (fixture default). value is in
+        # EUR (transaction currency); quantity converts to USD.
+        ar_value, ar_quantity = by_acct["Assets:Accounts Receivable"]
+        assert ar_value == Decimal("105.00")
+        assert ar_quantity == Decimal("115.50")  # 105 × 1.10
+        # Income split is in USD (fixture default).
+        inc_value, inc_quantity = by_acct["Income:Sales"]
+        assert inc_value == Decimal("-100.00")
+        assert inc_quantity == Decimal("-110.00")
+        # Tax-payable split — the focal point of the test.
+        # Value (EUR): -5 (tax in invoice currency).
+        # Quantity (USD): -5.50 (converted at the rate).
+        gst_value, gst_quantity = by_acct["Liabilities:GST Payable"]
+        assert gst_value == Decimal("-5.00")
+        assert gst_quantity == Decimal("-5.50")
+        # Value-side sums to zero (the transaction-currency
+        # balance invariant — quantities don't need to balance
+        # across commodities).
+        value_sum = sum(v for v, _ in by_acct.values())
+        assert value_sum == Decimal(0)
+
+    def test_cross_currency_tax_requires_rate(
+        self, business_book,
+    ):
+        """When no price is on file for the EUR/USD pair near
+        post date, posting raises a clear error — the same
+        rate-not-found path already exercised by non-tax
+        cross-currency posting."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        # Add EUR commodity but no price.
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.save()
+        gb.create_account(
+            name="GST Payable",
+            account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": "Liabilities:GST Payable"}],
+        )
+        gb.create_customer(name="EUR Client")
+        gb.create_invoice(customer_id="000001", currency="EUR")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR work",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        with pytest.raises(ValueError, match="exchange rate"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+            )
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 
