@@ -1289,9 +1289,9 @@ class BusinessMixin:
         # to "?" when entries can't be loaded — keeps the row legible
         # even on data-corruption edge cases.
         try:
-            _, _, grand_total = self._get_invoice_entries_and_total(
+            grand_total = self._get_invoice_entries_and_total(
                 book, invoice,
-            )
+            )["grand_total"]
             ccy = (
                 invoice.currency.mnemonic
                 if invoice.currency else ""
@@ -1563,13 +1563,40 @@ class BusinessMixin:
         return posted + timedelta(days=30), True
 
     def _get_invoice_entries_and_total(self, book, inv):
-        """Query entries for an invoice/bill and compute total.
+        """Query entries for an invoice/bill and compute totals,
+        absorbing per-line tax math.
+
+        For each entry, looks up its taxtable (when ``i_taxable``
+        or ``b_taxable`` is set) and invokes ``_compute_entry_tax``
+        to derive pretax / tax / gross + per-tax-account splits.
+        Aggregates revenue/expense AND tax-payable account amounts
+        into a single ``acct_totals`` dict so the downstream
+        ``post_invoice`` loop emits one split per account without
+        knowing about tax specifically.
 
         Returns:
-            Tuple of (entries_list, per_account_totals_dict, grand_total).
-            per_account_totals maps account_guid -> Decimal total.
+            Dict with keys:
+
+            - ``rows``: raw SQL rows from the entries table
+              (unchanged interface; callers don't read them
+              directly).
+            - ``acct_totals``: ``{account_guid: Decimal}`` covering
+              revenue/expense accounts AND tax-payable accounts
+              together. Used by ``post_invoice`` to emit splits.
+            - ``grand_total``: ``Decimal`` — gross customer-facing
+              total (sum of per-line gross). Includes tax for
+              tax-bearing entries.
+            - ``subtotal``: ``Decimal`` — sum of per-line pretax
+              amounts.
+            - ``tax_breakdown``: ``{account_guid: Decimal}`` — the
+              tax-only portion, available separately for display
+              surfaces that want to render a tax summary.
+
+        Raises:
+            ValueError: when the invoice has no entries.
         """
         from sqlalchemy import text
+        from piecash.business.tax import Taxtable
 
         is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
         if is_bill:
@@ -1588,8 +1615,43 @@ class BusinessMixin:
                 f"Cannot post: invoice {inv.id} has no entries"
             )
 
+        # Taxtable resolution is cached so an invoice with many
+        # lines sharing the same taxtable hits SQL once per
+        # distinct taxtable, not once per line.
+        taxtable_cache: dict[str, list[dict]] = {}
+
+        def _resolve_taxtable_entries(taxtable_guid):
+            if not taxtable_guid:
+                return []
+            if taxtable_guid in taxtable_cache:
+                return taxtable_cache[taxtable_guid]
+            tt = book.session.query(Taxtable).filter_by(
+                guid=taxtable_guid,
+            ).first()
+            if not tt:
+                # Defensive: ``i_taxtable``/``b_taxtable`` points at
+                # a missing row. Entry creation validates this; if
+                # we land here the book is mid-corruption — treat
+                # as no-tax rather than crash the math seam.
+                taxtable_cache[taxtable_guid] = []
+                return []
+            resolved = [
+                {
+                    "type": e.type,
+                    "amount": e.amount,
+                    "account_guid": e.account_guid,
+                }
+                for e in tt.entries
+            ]
+            taxtable_cache[taxtable_guid] = resolved
+            return resolved
+
+        quantum = _commodity_quantum(inv.currency)
         acct_totals: dict[str, Decimal] = {}
+        tax_breakdown: dict[str, Decimal] = {}
         grand_total = Decimal(0)
+        subtotal = Decimal(0)
+
         for row in rows:
             q_num = row.quantity_num or 0
             q_denom = row.quantity_denom or 1
@@ -1599,19 +1661,60 @@ class BusinessMixin:
                 p_num = row.b_price_num or 0
                 p_denom = row.b_price_denom or 1
                 acct_guid = row.b_acct
+                taxable = bool(row.b_taxable)
+                tax_included = bool(row.b_taxincluded)
+                taxtable_guid = row.b_taxtable
             else:
                 p_num = row.i_price_num or 0
                 p_denom = row.i_price_denom or 1
                 acct_guid = row.i_acct
+                taxable = bool(row.i_taxable)
+                tax_included = bool(row.i_taxincluded)
+                taxtable_guid = row.i_taxtable
 
             price = Decimal(p_num) / Decimal(p_denom)
-            entry_total = quantity * price
-            grand_total += entry_total
-            acct_totals[acct_guid] = acct_totals.get(
-                acct_guid, Decimal(0)
-            ) + entry_total
+            taxtable_entries = _resolve_taxtable_entries(taxtable_guid)
 
-        return rows, acct_totals, grand_total
+            tax_result = self._compute_entry_tax(
+                quantity=quantity,
+                price=price,
+                taxable=taxable,
+                tax_included=tax_included,
+                taxtable_entries=taxtable_entries,
+                quantum=quantum,
+            )
+
+            # Revenue/expense account gets the pretax portion.
+            acct_totals[acct_guid] = (
+                acct_totals.get(acct_guid, Decimal(0))
+                + tax_result["pretax"]
+            )
+            # Tax-payable accounts get their per-entry components.
+            # Composite taxtables that route to the same account
+            # already collapse inside _compute_entry_tax; we just
+            # fold the result into the global acct_totals here.
+            for tax_acct, tax_amount in (
+                tax_result["tax_by_acct"].items()
+            ):
+                acct_totals[tax_acct] = (
+                    acct_totals.get(tax_acct, Decimal(0))
+                    + tax_amount
+                )
+                tax_breakdown[tax_acct] = (
+                    tax_breakdown.get(tax_acct, Decimal(0))
+                    + tax_amount
+                )
+
+            grand_total += tax_result["gross"]
+            subtotal += tax_result["pretax"]
+
+        return {
+            "rows": rows,
+            "acct_totals": acct_totals,
+            "grand_total": grand_total,
+            "subtotal": subtotal,
+            "tax_breakdown": tax_breakdown,
+        }
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
@@ -4668,9 +4771,9 @@ class BusinessMixin:
                     f"got {post_acct.type}"
                 )
 
-            _, acct_totals, grand_total = (
-                self._get_invoice_entries_and_total(book, inv)
-            )
+            totals = self._get_invoice_entries_and_total(book, inv)
+            acct_totals = totals["acct_totals"]
+            grand_total = totals["grand_total"]
 
             lot = Lot(
                 title=f"Invoice {inv.id}",
@@ -6529,9 +6632,9 @@ class BusinessMixin:
                     continue
 
                 try:
-                    _, _, grand_total = (
-                        self._get_invoice_entries_and_total(book, inv)
-                    )
+                    grand_total = self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"]
                 except ValueError:
                     grand_total = abs(balance)
 
@@ -6698,9 +6801,9 @@ class BusinessMixin:
                 # than aborting the whole report — matches the
                 # _invoice_to_compact_line defensive shape.
                 try:
-                    _, _, billed = (
-                        self._get_invoice_entries_and_total(book, inv)
-                    )
+                    billed = self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"]
                 except (ValueError, AttributeError):
                     billed = Decimal("0")
 
@@ -6880,11 +6983,9 @@ class BusinessMixin:
                             break
 
                 try:
-                    _, _, total = (
-                        self._get_invoice_entries_and_total(
-                            book, bill
-                        )
-                    )
+                    total = self._get_invoice_entries_and_total(
+                        book, bill,
+                    )["grand_total"]
                 except ValueError:
                     # Empty/corrupted entries — fall back to the
                     # lot balance (computed above). Pre-fix this

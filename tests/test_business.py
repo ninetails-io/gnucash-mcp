@@ -2659,6 +2659,327 @@ class TestTaxtableMath:
         assert r["gross"] == Decimal("105.00")
 
 
+def _set_entry_tax(
+    gb, invoice_id, taxtable_name,
+    tax_included=False, is_bill=False,
+):
+    """Raw-SQL helper to flip i_taxable/b_taxable + assign a
+    taxtable on every entry of an invoice/bill. Pre-Commit-4
+    workaround so posting tests can exercise tax math without
+    the entry-creation wire-up.
+    """
+    from sqlalchemy import text
+    with gb.open(readonly=False) as book:
+        tt = gb._find_taxtable(book, taxtable_name)
+        col = "bill" if is_bill else "invoice"
+        rows = book.session.execute(
+            text(
+                f"SELECT e.guid AS entry_guid FROM entries e "
+                f"JOIN invoices i ON i.guid = e.{col} "
+                f"WHERE i.id = :id"
+            ),
+            {"id": invoice_id},
+        ).fetchall()
+        ti_val = 1 if tax_included else 0
+        for r in rows:
+            if is_bill:
+                stmt = text(
+                    "UPDATE entries SET "
+                    "b_taxable=1, b_taxincluded=:ti, "
+                    "b_taxtable=:tt WHERE guid=:guid"
+                )
+            else:
+                stmt = text(
+                    "UPDATE entries SET "
+                    "i_taxable=1, i_taxincluded=:ti, "
+                    "i_taxtable=:tt WHERE guid=:guid"
+                )
+            book.session.execute(
+                stmt,
+                {
+                    "ti": ti_val,
+                    "tt": tt.guid,
+                    "guid": r.entry_guid,
+                },
+            )
+        book.save()
+
+
+class TestTaxtablePosting:
+    """End-to-end tests: invoice/bill with tax-bearing entries
+    posts to the correct split shape, with revenue/expense
+    splits separate from tax-payable splits."""
+
+    def _splits_by_account(self, gb, txn_guid):
+        """Helper: pull splits by account fullname from get_transaction."""
+        txn = gb.get_transaction(txn_guid)
+        out = {}
+        for s in txn["splits"]:
+            out.setdefault(s["account"], []).append(
+                Decimal(s["value"])
+            )
+        return out
+
+    def test_post_invoice_with_tax_exclusive_three_splits(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100.00",
+        )
+        # Seed tax on the entry (pre-Commit-4 workaround).
+        _set_entry_tax(gb, "000001", "GST 5%", tax_included=False)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        # Customer-facing total is gross.
+        assert Decimal(result["total"]) == Decimal("105.00")
+        # Three splits: A/R (debit 105), Income (credit -100),
+        # GST Payable (credit -5).
+        splits = self._splits_by_account(gb, result["transaction_guid"])
+        assert splits["Assets:Accounts Receivable"] == [Decimal("105.00")]
+        assert splits["Income:Sales"] == [Decimal("-100.00")]
+        assert splits["Liabilities:GST Payable"] == [Decimal("-5.00")]
+        # Sum to zero (the double-entry invariant).
+        assert sum(
+            sum(amounts) for amounts in splits.values()
+        ) == Decimal(0)
+
+    def test_post_invoice_tax_inclusive_extracts_pretax(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="105.00",  # gross, tax included
+        )
+        _set_entry_tax(gb, "000001", "GST 5%", tax_included=True)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        # Gross is the line value (tax-inclusive).
+        assert Decimal(result["total"]) == Decimal("105.00")
+        splits = self._splits_by_account(gb, result["transaction_guid"])
+        assert splits["Assets:Accounts Receivable"] == [Decimal("105.00")]
+        # Pretax = 100 extracted from gross.
+        assert splits["Income:Sales"] == [Decimal("-100.00")]
+        assert splits["Liabilities:GST Payable"] == [Decimal("-5.00")]
+
+    def test_post_invoice_composite_taxtable_four_splits(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100.00",
+        )
+        _set_entry_tax(gb, "000001", "BC GST+PST")
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert Decimal(result["total"]) == Decimal("112.00")
+        splits = self._splits_by_account(gb, result["transaction_guid"])
+        # Four splits: A/R, Income, GST Payable, PST Payable.
+        assert splits["Assets:Accounts Receivable"] == [Decimal("112.00")]
+        assert splits["Income:Sales"] == [Decimal("-100.00")]
+        assert splits["Liabilities:GST Payable"] == [Decimal("-5.00")]
+        assert splits["Liabilities:PST Payable"] == [Decimal("-7.00")]
+        # Double-entry invariant.
+        assert sum(
+            sum(amounts) for amounts in splits.values()
+        ) == Decimal(0)
+
+    def test_post_invoice_no_tax_unchanged(self, business_book):
+        """Sanity: a non-tax invoice still posts identically to
+        pre-Commit-3 behavior — two splits, A/R and Income."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100.00",
+        )
+        # No tax seeding — entries default to taxable=0.
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert Decimal(result["total"]) == Decimal("100.00")
+        splits = self._splits_by_account(gb, result["transaction_guid"])
+        # Just two splits: A/R + Income.
+        assert set(splits.keys()) == {
+            "Assets:Accounts Receivable", "Income:Sales",
+        }
+
+    def test_post_bill_with_tax_routes_correctly(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        # Tax credit on vendor side often lives as an ASSET (input
+        # tax credit receivable). Using the LIABILITY account from
+        # the fixture is also valid — what matters is the routing.
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        _set_entry_tax(gb, "000001", "GST 5%", is_bill=True)
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        # Vendor-side signs are inverted: A/P credit (-), Expense
+        # debit (+), GST debit (+) for input tax credit.
+        assert Decimal(result["total"]) == Decimal("52.50")
+        splits = self._splits_by_account(gb, result["transaction_guid"])
+        assert splits["Liabilities:Accounts Payable"] == [Decimal("-52.50")]
+        assert splits["Expenses:Office Supplies"] == [Decimal("50.00")]
+        assert splits["Liabilities:GST Payable"] == [Decimal("2.50")]
+        assert sum(
+            sum(amounts) for amounts in splits.values()
+        ) == Decimal(0)
+
+
+class TestTaxtableCreditNoteReversal:
+    """Credit notes with tax reverse all splits including tax via
+    the existing XOR sign-flip — refunding a tax-inclusive sale
+    credits A/R, debits revenue, AND debits tax payable."""
+
+    def _splits_by_account(self, gb, txn_guid):
+        txn = gb.get_transaction(txn_guid)
+        out = {}
+        for s in txn["splits"]:
+            out.setdefault(s["account"], []).append(
+                Decimal(s["value"])
+            )
+        return out
+
+    def test_credit_note_reverses_revenue_and_tax(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme Corp")
+        # First, a normal invoice to set the original numbers.
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100.00",
+        )
+        _set_entry_tax(gb, "000001", "GST 5%")
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+
+        # Now a credit note refunding the same amount.
+        gb.create_credit_note(
+            owner_type="customer",
+            owner_id="000001",
+        )
+        envelope = gb.list_invoices(
+            compact=False, owner_type="customer",
+        )
+        cn_doc = next(
+            (
+                d for d in envelope["invoices"]
+                if d.get("is_credit_note")
+            ),
+            None,
+        )
+        assert cn_doc is not None, "credit note not found via list"
+        gb.add_credit_note_entry(
+            credit_note_id=cn_doc["id"],
+            account="Income:Sales",
+            description="Widget refund",
+            quantity="1",
+            price="100.00",
+        )
+        _set_entry_tax(gb, cn_doc["id"], "GST 5%")
+        result = gb.post_invoice(
+            invoice_id=cn_doc["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        # Total stays positive (it's the magnitude of the refund);
+        # the sign-flip happens at the splits.
+        assert Decimal(result["total"]) == Decimal("105.00")
+        splits = self._splits_by_account(
+            gb, result["transaction_guid"],
+        )
+        # Credit-note sign-flip: A/R credit (negative), revenue
+        # debit (positive — reversing recognized revenue), tax
+        # payable debit (positive — reversing collected tax).
+        assert splits["Assets:Accounts Receivable"] == [Decimal("-105.00")]
+        assert splits["Income:Sales"] == [Decimal("100.00")]
+        assert splits["Liabilities:GST Payable"] == [Decimal("5.00")]
+        # Invariant.
+        assert sum(
+            sum(amounts) for amounts in splits.values()
+        ) == Decimal(0)
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 
