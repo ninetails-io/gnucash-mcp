@@ -2330,6 +2330,335 @@ class TestTaxtableRefcount:
             ) == 2
 
 
+class TestTaxtableMath:
+    """Tests for ``_compute_entry_tax`` — the per-quadrant tax
+    math helper. Pure function, no book fixture required."""
+
+    # The helper is a staticmethod on BusinessMixin; we reach
+    # through GnuCashBook (which mixes it in).
+    from gnucash_mcp.book import GnuCashBook as _GB
+    _fn = staticmethod(_GB._compute_entry_tax)
+
+    USD_QUANTUM = Decimal("0.01")
+    JPY_QUANTUM = Decimal("1")
+
+    GST_GUID = "g" * 32
+    PST_GUID = "p" * 32
+    ECO_GUID = "e" * 32
+
+    def _gst_5(self):
+        return {"type": "percentage", "amount": Decimal("5"),
+                "account_guid": self.GST_GUID}
+
+    def _pst_7(self):
+        return {"type": "percentage", "amount": Decimal("7"),
+                "account_guid": self.PST_GUID}
+
+    def _eco_5(self):
+        return {"type": "value", "amount": Decimal("5"),
+                "account_guid": self.ECO_GUID}
+
+    # ── Quadrant 1: no tax ────────────────────────────────────
+
+    def test_q1_not_taxable(self):
+        r = self._fn(
+            quantity=Decimal("2"), price=Decimal("100"),
+            taxable=False, tax_included=False,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("200.00")
+        assert r["tax_total"] == Decimal(0)
+        assert r["tax_by_acct"] == {}
+        assert r["gross"] == Decimal("200.00")
+
+    def test_q1_empty_taxtable_treated_as_not_taxable(self):
+        # Defensive: taxable=True but no entries. Caller should
+        # have validated; behave as no-tax.
+        r = self._fn(
+            quantity=Decimal("2"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("200.00")
+        assert r["tax_total"] == Decimal(0)
+        assert r["gross"] == Decimal("200.00")
+
+    # ── Quadrant 2: tax-exclusive (tax added on top) ───────────
+
+    def test_q2_single_percentage(self):
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["tax_by_acct"] == {self.GST_GUID: Decimal("5.00")}
+        assert r["gross"] == Decimal("105.00")
+
+    def test_q2_multi_percentage_composite(self):
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._gst_5(), self._pst_7()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("12.00")
+        assert r["tax_by_acct"] == {
+            self.GST_GUID: Decimal("5.00"),
+            self.PST_GUID: Decimal("7.00"),
+        }
+        assert r["gross"] == Decimal("112.00")
+
+    def test_q2_flat_value(self):
+        r = self._fn(
+            quantity=Decimal("3"), price=Decimal("20"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._eco_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        # Flat $5 on a $60 line: gross = 65.
+        assert r["pretax"] == Decimal("60.00")
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["gross"] == Decimal("65.00")
+
+    def test_q2_mixed_value_and_percentage(self):
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._gst_5(), self._eco_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        # Pretax 100, GST 5%, Eco $5 → gross 110.
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("10.00")
+        assert r["tax_by_acct"] == {
+            self.GST_GUID: Decimal("5.00"),
+            self.ECO_GUID: Decimal("5.00"),
+        }
+        assert r["gross"] == Decimal("110.00")
+
+    def test_q2_composite_same_account_collapses(self):
+        # Two percentage entries pointing to the same account
+        # should sum into one tax_by_acct entry.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[
+                {"type": "percentage", "amount": Decimal("3"),
+                 "account_guid": self.GST_GUID},
+                {"type": "percentage", "amount": Decimal("2"),
+                 "account_guid": self.GST_GUID},
+            ],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["tax_by_acct"] == {self.GST_GUID: Decimal("5.00")}
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["gross"] == Decimal("105.00")
+
+    # ── Quadrant 3: tax-inclusive, percentage-only ─────────────
+
+    def test_q3_single_percentage_clean(self):
+        # Gross $105 includes 5% GST → pretax = 105/1.05 = 100.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("105"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["gross"] == Decimal("105.00")
+        # And the residual identity must hold exactly.
+        assert r["pretax"] + r["tax_total"] == r["gross"]
+
+    def test_q3_composite_clean(self):
+        # Gross $112 with GST 5% + PST 7% → pretax = 112/1.12 = 100.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("112"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._gst_5(), self._pst_7()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_by_acct"] == {
+            self.GST_GUID: Decimal("5.00"),
+            self.PST_GUID: Decimal("7.00"),
+        }
+        assert r["gross"] == Decimal("112.00")
+        assert r["pretax"] + r["tax_total"] == r["gross"]
+
+    def test_q3_residual_to_largest_rate(self):
+        # Gross $100 with GST 5% + PST 7% has no clean integer
+        # pretax. pretax = 100 / 1.12 = 89.2857... → 89.29.
+        # Per-entry independent rounding: 89.29 * 0.05 = 4.4645
+        # → 4.46, 89.29 * 0.07 = 6.2503 → 6.25.
+        # Sum: 4.46 + 6.25 = 10.71. Residual:
+        # 100.00 - 89.29 - 10.71 = 0.00 → no adjustment needed
+        # in this case. Let's pick numbers that DO show residual.
+        # Gross $100.07 with GST 5%: pretax = 100.07/1.05
+        # = 95.30476... → 95.30. tax = 95.30*0.05 = 4.765 → 4.77
+        # (with banker's; 4.765 → 4.76 because 6 is even).
+        # 95.30 + 4.76 = 100.06; residual = 100.07 - 100.06 = 0.01.
+        # Residual goes to the largest-rate (only) entry.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("100.07"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        # The residual identity is the contract — the math may
+        # round either way under banker's, but the identity
+        # MUST hold.
+        assert r["pretax"] + r["tax_total"] == r["gross"]
+        # And the gross is preserved exactly.
+        assert r["gross"] == Decimal("100.07")
+
+    def test_q3_residual_routes_to_largest_percentage(self):
+        # Construct a case where the residual is non-zero and
+        # verify the per-account allocation puts the residual on
+        # the largest-rate entry. Pick numbers that produce a
+        # one-cent residual under banker's rounding.
+        # Gross $10.05 with GST 5% + PST 7%:
+        # pretax = 10.05 / 1.12 = 8.973214... → 8.97
+        # GST: 8.97 * 0.05 = 0.4485 → 0.45 (banker's: 5 even)
+        # PST: 8.97 * 0.07 = 0.6279 → 0.63
+        # Sum tax: 1.08. pretax + tax = 10.05 → no residual.
+        # Try gross $10.06:
+        # pretax = 10.06 / 1.12 = 8.982142... → 8.98
+        # GST: 8.98 * 0.05 = 0.449 → 0.45
+        # PST: 8.98 * 0.07 = 0.6286 → 0.63
+        # Sum: 1.08; pretax + tax = 10.06 → no residual.
+        # Try gross $10.13:
+        # pretax = 10.13 / 1.12 = 9.04464... → 9.04
+        # GST: 9.04 * 0.05 = 0.452 → 0.45
+        # PST: 9.04 * 0.07 = 0.6328 → 0.63
+        # Sum: 1.08; pretax + tax = 10.12 → residual 0.01.
+        # → PST is largest rate, gets the +0.01.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("10.13"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._gst_5(), self._pst_7()],
+            quantum=self.USD_QUANTUM,
+        )
+        # Contract: identity holds, residual targets PST (the
+        # 7% entry, which has the higher rate).
+        assert r["pretax"] + r["tax_total"] == r["gross"]
+        assert r["gross"] == Decimal("10.13")
+        # PST tax should be slightly more than the "clean"
+        # per-entry calculation; GST should be the clean amount.
+        gst = r["tax_by_acct"][self.GST_GUID]
+        pst = r["tax_by_acct"][self.PST_GUID]
+        # GST gets the clean 5% (4.5 mils → 0.45 under banker's,
+        # though either rounding direction is acceptable).
+        # PST absorbs the residual.
+        assert gst == Decimal("0.45")
+        # PST is "0.63 + residual", testing that the residual
+        # landed there: PST > pretax * 0.07 quantized.
+        pretax = r["pretax"]
+        pst_clean = (pretax * Decimal("7") / Decimal("100")).quantize(
+            self.USD_QUANTUM
+        )
+        assert pst >= pst_clean
+
+    # ── Quadrant 4: tax-inclusive, mixed value + percentage ────
+
+    def test_q4_mixed_clean(self):
+        # Gross $110 with GST 5% (percentage) + Eco $5 (value).
+        # Algebra: pretax = (110 - 5) / 1.05 = 105 / 1.05 = 100.
+        # GST: 100 * 0.05 = 5.00. Eco: 5.00.
+        # Sum tax: 10.00. pretax + tax = 110 ✓
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("110"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._gst_5(), self._eco_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_by_acct"] == {
+            self.GST_GUID: Decimal("5.00"),
+            self.ECO_GUID: Decimal("5.00"),
+        }
+        assert r["gross"] == Decimal("110.00")
+        assert r["pretax"] + r["tax_total"] == r["gross"]
+
+    def test_q4_all_value_collapses_to_subtraction(self):
+        # Tax-inclusive all-value: pretax = gross − Σ value.
+        # No rate to extract, no residual.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("105"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[self._eco_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["gross"] == Decimal("105.00")
+
+    # ── Different commodity quanta ─────────────────────────────
+
+    def test_jpy_no_decimals(self):
+        # JPY's quantum is 1 (no sub-yen). Tax math should round
+        # to integer amounts.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("1000"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[
+                {"type": "percentage", "amount": Decimal("10"),
+                 "account_guid": self.GST_GUID},
+            ],
+            quantum=self.JPY_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("1000")
+        assert r["tax_total"] == Decimal("100")
+        assert r["gross"] == Decimal("1100")
+
+    def test_jpy_tax_inclusive_rounds_correctly(self):
+        # ¥1100 with 10% included → pretax = 1100/1.1 = 1000.
+        r = self._fn(
+            quantity=Decimal("1"), price=Decimal("1100"),
+            taxable=True, tax_included=True,
+            taxtable_entries=[
+                {"type": "percentage", "amount": Decimal("10"),
+                 "account_guid": self.GST_GUID},
+            ],
+            quantum=self.JPY_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("1000")
+        assert r["tax_total"] == Decimal("100")
+        assert r["gross"] == Decimal("1100")
+
+    # ── Quantity × price edge cases ────────────────────────────
+
+    def test_zero_quantity(self):
+        r = self._fn(
+            quantity=Decimal("0"), price=Decimal("100"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        assert r["pretax"] == Decimal("0.00")
+        assert r["tax_total"] == Decimal("0.00")
+        assert r["gross"] == Decimal("0.00")
+
+    def test_fractional_quantity(self):
+        # 2.5 hours @ $40/hr taxable at 5%.
+        r = self._fn(
+            quantity=Decimal("2.5"), price=Decimal("40"),
+            taxable=True, tax_included=False,
+            taxtable_entries=[self._gst_5()],
+            quantum=self.USD_QUANTUM,
+        )
+        # pretax = 100, tax = 5, gross = 105.
+        assert r["pretax"] == Decimal("100.00")
+        assert r["tax_total"] == Decimal("5.00")
+        assert r["gross"] == Decimal("105.00")
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 

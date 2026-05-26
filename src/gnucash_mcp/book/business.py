@@ -2454,6 +2454,173 @@ class BusinessMixin:
 
         return resolved
 
+    @staticmethod
+    def _compute_entry_tax(
+        quantity: Decimal,
+        price: Decimal,
+        taxable: bool,
+        tax_included: bool,
+        taxtable_entries: list[dict],
+        quantum: Decimal,
+    ) -> dict:
+        """Per-line tax math. Pure function; no book access.
+
+        Caller resolves the taxtable to a list of
+        ``{type, amount, account_guid}`` dicts before invoking
+        (``type`` is ``'value'`` or ``'percentage'``; ``amount``
+        is ``Decimal``; ``account_guid`` is the FK to wherever the
+        tax component routes).
+
+        Four quadrants of behavior:
+
+        1. ``taxable=False``: no tax. ``pretax = Q × P``,
+           ``tax_total = 0``, ``tax_by_acct = {}``, ``gross = Q × P``.
+
+        2. ``taxable=True, tax_included=False`` (tax-exclusive):
+           Line value IS pre-tax; tax adds on top. For each entry,
+           percentage entries contribute ``pretax × rate / 100``,
+           value entries contribute their flat amount. Each is
+           quantized independently per the per-line rounding policy
+           (auditable line-by-line, matches GnuCash desktop).
+
+        3. ``taxable=True, tax_included=True``, all-percentage
+           taxtable: Line value is gross. Pretax extracted via
+           ``pretax = gross / (1 + Σ rate / 100)``. Per-entry tax
+           computed from extracted pretax.
+
+        4. ``taxable=True, tax_included=True``, mixed value +
+           percentage: Pretax extracted via
+           ``pretax = (gross − Σ value) / (1 + Σ rate / 100)``.
+           Value entries contribute their flat amount unchanged;
+           percentage entries contribute ``pretax × rate / 100``.
+
+        **Rounding residual policy** (Quadrants 3/4): after
+        independent per-entry quantization, ``gross == pretax +
+        Σ tax`` may differ by at most one quantum. The residual is
+        applied to the largest-rate percentage entry (or the first
+        value entry as fallback for all-value tax-inclusive — an
+        edge case that's algebraically degenerate but harmless).
+        Done this way to keep the dominant tax authority's bucket
+        carrying the rounding noise rather than smearing it across
+        all entries.
+
+        Args:
+            quantity, price: line-item quantity and unit price as
+                ``Decimal``.
+            taxable: whether this line has a taxtable applied.
+            tax_included: whether ``Q × P`` represents gross
+                (tax-inclusive) or pre-tax (tax-exclusive).
+            taxtable_entries: resolved taxtable entries as dicts
+                with ``type``, ``amount`` (``Decimal``), and
+                ``account_guid`` keys.
+            quantum: smallest representable unit of the currency
+                (typically ``Decimal('0.01')``; derived from
+                ``_commodity_quantum`` on the invoice currency).
+
+        Returns:
+            ``{pretax, tax_total, tax_by_acct, gross}`` — all
+            ``Decimal`` values; ``tax_by_acct`` is
+            ``{account_guid: Decimal}`` with one entry per distinct
+            payable account (composite taxtables routing to the
+            same account collapse to one entry by sum).
+        """
+        line_value = quantity * price
+
+        if not taxable or not taxtable_entries:
+            # Quadrant 1, or defensive no-entries fallback (the
+            # caller should have validated; behave as no-tax).
+            qv = line_value.quantize(quantum)
+            return {
+                "pretax": qv,
+                "tax_total": Decimal(0),
+                "tax_by_acct": {},
+                "gross": qv,
+            }
+
+        sum_values = sum(
+            (
+                e["amount"]
+                for e in taxtable_entries
+                if e["type"] == "value"
+            ),
+            Decimal(0),
+        )
+        sum_rates = sum(
+            (
+                e["amount"]
+                for e in taxtable_entries
+                if e["type"] == "percentage"
+            ),
+            Decimal(0),
+        )
+        rate_factor = sum_rates / Decimal(100)
+
+        if tax_included:
+            # Quadrants 3/4: extract pretax from gross.
+            gross = line_value.quantize(quantum)
+            if rate_factor == 0:
+                # All-value tax-inclusive: pretax = gross − values.
+                pretax = (gross - sum_values).quantize(quantum)
+            else:
+                pretax = (
+                    (gross - sum_values)
+                    / (Decimal(1) + rate_factor)
+                ).quantize(quantum)
+        else:
+            # Quadrant 2: line value IS pretax.
+            pretax = line_value.quantize(quantum)
+            gross = None  # computed after tax_total
+
+        tax_by_acct: dict[str, Decimal] = {}
+        for e in taxtable_entries:
+            acct_guid = e["account_guid"]
+            if e["type"] == "percentage":
+                tax_e = (
+                    pretax * e["amount"] / Decimal(100)
+                ).quantize(quantum)
+            else:
+                tax_e = e["amount"].quantize(quantum)
+            tax_by_acct[acct_guid] = (
+                tax_by_acct.get(acct_guid, Decimal(0)) + tax_e
+            )
+
+        tax_total = sum(tax_by_acct.values(), Decimal(0))
+
+        if tax_included:
+            # Residual adjustment: enforce gross = pretax + tax_total
+            # exactly. The residual is at most ±1 quantum from the
+            # independent per-entry rounding.
+            residual = gross - pretax - tax_total
+            if residual != 0:
+                # Find largest-rate percentage entry; fall back to
+                # first value entry if no percentage entries exist.
+                target_acct = None
+                largest_rate = Decimal(0)
+                for e in taxtable_entries:
+                    if (
+                        e["type"] == "percentage"
+                        and e["amount"] > largest_rate
+                    ):
+                        largest_rate = e["amount"]
+                        target_acct = e["account_guid"]
+                if target_acct is None:
+                    target_acct = (
+                        taxtable_entries[0]["account_guid"]
+                    )
+                tax_by_acct[target_acct] = (
+                    tax_by_acct[target_acct] + residual
+                )
+                tax_total = tax_total + residual
+        else:
+            gross = pretax + tax_total
+
+        return {
+            "pretax": pretax,
+            "tax_total": tax_total,
+            "tax_by_acct": tax_by_acct,
+            "gross": gross,
+        }
+
     def create_taxtable(
         self,
         name: str,
