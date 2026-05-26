@@ -565,6 +565,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a customer invoice.
 
@@ -577,11 +579,19 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1", "2.5").
             price: Unit price as decimal string (e.g., "100.00").
+            taxtable: Optional taxtable name. When given, the line
+                contributes tax components per the taxtable's entries
+                at posting time. Multi-entry taxtables (e.g., GST+PST)
+                produce one tax split per entry.
+            tax_included: If true, ``price`` is the gross (tax-included)
+                value; pretax extracted at posting. If false (default),
+                ``price`` is pre-tax and tax adds on top.
         """
         book = get_book()
         result = book.add_invoice_entry(
             invoice_id=invoice_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -594,6 +604,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a vendor bill.
 
@@ -606,11 +618,18 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1", "2.5").
             price: Unit price as decimal string (e.g., "50.00").
+            taxtable: Optional taxtable name. For vendor bills, the
+                tax component typically routes to an ASSET account
+                (input-tax credit receivable) per the taxtable's
+                entries.
+            tax_included: If true, ``price`` is gross; pretax extracted
+                at posting. If false (default), tax adds on top.
         """
         book = get_book()
         result = book.add_bill_entry(
             bill_id=bill_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -661,6 +680,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to an employee expense voucher.
 
@@ -675,11 +696,16 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1").
             price: Unit price as decimal string (e.g., "42.50").
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_bill_entry``.
+            tax_included: If true, ``price`` is gross; pretax extracted
+                at posting.
         """
         book = get_book()
         result = book.add_voucher_entry(
             voucher_id=voucher_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -772,6 +798,8 @@ def register(mcp, get_book) -> None:
         quantity: str,
         price: str,
         owner_type: str | None = None,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a credit note.
 
@@ -792,6 +820,13 @@ def register(mcp, get_book) -> None:
             price: Unit price as decimal string.
             owner_type: Optional "customer" or "vendor"
                 disambiguator for ID collisions. Usually omitted.
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_invoice_entry``; the credit-note flag inverts
+                tax-split direction at posting time so a refunded
+                tax-inclusive sale produces a debit to the tax-payable
+                account.
+            tax_included: If true, ``price`` is gross; pretax
+                extracted at posting.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -802,6 +837,8 @@ def register(mcp, get_book) -> None:
             quantity=quantity,
             price=price,
             owner_type=owner_type,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
         return _json(result)
 

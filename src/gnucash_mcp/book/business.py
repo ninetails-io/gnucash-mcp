@@ -4026,6 +4026,8 @@ class BusinessMixin:
         quantity: str,
         price: str,
         owner_type: str | None = None,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item to a credit note.
 
@@ -4082,6 +4084,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
         # Surface the credit_note_id key in the response (the
         # base helper returns invoice_id / bill_id based on
@@ -4192,6 +4196,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Shared implementation behind ``add_invoice_entry`` and
         ``add_bill_entry``. The two methods were 90% duplicated
@@ -4201,9 +4207,34 @@ class BusinessMixin:
         helper takes ``owner_type`` (2=customer invoice, 4=vendor
         bill), looks up the per-doc config in ``_ENTRY_CONFIG``,
         and writes the entry.
+
+        **Taxtable wire-up (commit 4 of the v1.3 taxtable arc):**
+
+        When ``taxtable`` is given, the entry is marked taxable and
+        the resolved taxtable's GUID is written to ``i_taxtable``
+        or ``b_taxtable`` (side-dependent). ``tax_included`` flags
+        whether the line price represents pre-tax (False, default)
+        or gross (True) — the posting math in
+        ``_get_invoice_entries_and_total`` uses this to decide
+        whether to extract pretax from gross or add tax on top.
+
+        ``tax_included=True`` without ``taxtable`` raises — silently
+        treating it as no-op would drop the caller's signal that
+        they thought they were enabling tax.
+
+        The taxtable's stored ``refcount`` column is incremented
+        post-insert to keep GnuCash desktop's bookkeeping in sync
+        (our own lifecycle checks use SQL-computed counts, but the
+        desktop UI reads the stored value).
         """
         import uuid
         from piecash.business.invoice import Entry
+
+        if tax_included and not taxtable:
+            raise ValueError(
+                "tax_included=True requires a taxtable. Specify "
+                "which taxtable applies, or omit tax_included."
+            )
 
         cfg = self._ENTRY_CONFIG[owner_type]
         # Both vendor bills (4) and employee expense vouchers (5)
@@ -4263,18 +4294,42 @@ class BusinessMixin:
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
             entry_guid = uuid.uuid4().hex
 
+            # Resolve the taxtable upfront so a missing-taxtable
+            # error fires before any write. The resolved Taxtable
+            # is also captured so we can bump its refcount after
+            # the INSERT succeeds.
+            tt_obj = None
+            if taxtable:
+                tt_obj = self._find_taxtable(book, taxtable)
+                if not tt_obj:
+                    raise ValueError(
+                        f"Taxtable not found: {taxtable!r}"
+                    )
+
+            taxable_int = 1 if taxtable else 0
+            taxincl_int = 1 if tax_included else 0
+            tt_guid = tt_obj.guid if tt_obj else None
+
             # The Entries table has parallel ``i_*`` (invoice side)
             # and ``b_*`` (bill side) column groups. Exactly one
             # group carries values for any given entry; the other
             # is zeroed/NULL. Voucher entries (owner_type=5) share
             # the ``b_*`` / ``bill`` group with vendor bills — see
             # ``is_bill_side`` above.
+            #
+            # Tax fields land on the same side as the price/account
+            # — invoice-side entries write ``i_taxtable``, bill-side
+            # write ``b_taxtable``. The other side stays zeroed.
             if is_bill_side:
                 values = dict(
                     i_acct=None, i_price_num=0, i_price_denom=1,
                     invoice=None,
                     b_acct=acct.guid, b_price_num=p_num,
                     b_price_denom=p_denom, bill=inv.guid,
+                    i_taxable=0, i_taxincluded=0, i_taxtable=None,
+                    b_taxable=taxable_int,
+                    b_taxincluded=taxincl_int,
+                    b_taxtable=tt_guid,
                 )
             else:
                 values = dict(
@@ -4282,6 +4337,10 @@ class BusinessMixin:
                     i_price_denom=p_denom, invoice=inv.guid,
                     b_acct=None, b_price_num=0, b_price_denom=1,
                     bill=None,
+                    i_taxable=taxable_int,
+                    i_taxincluded=taxincl_int,
+                    i_taxtable=tt_guid,
+                    b_taxable=0, b_taxincluded=0, b_taxtable=None,
                 )
 
             book.session.execute(
@@ -4298,12 +4357,6 @@ class BusinessMixin:
                     i_discount_denom=1,
                     i_disc_type="",
                     i_disc_how="",
-                    i_taxable=0,
-                    i_taxincluded=0,
-                    i_taxtable=None,
-                    b_taxable=0,
-                    b_taxincluded=0,
-                    b_taxtable=None,
                     b_paytype=0,
                     billable=0,
                     billto_type=0,
@@ -4317,6 +4370,14 @@ class BusinessMixin:
                 f"{cfg['label']} entry '{description}' on "
                 f"{cfg['label'].lower()} {doc_id}",
             )
+
+            # Refcount maintenance: GnuCash desktop reads
+            # Taxtable.refcount to know whether a taxtable is in
+            # use. Our own lifecycle checks use the SQL-computed
+            # count (authoritative), but we keep the stored value
+            # in sync so desktop interop stays clean.
+            if tt_obj is not None:
+                tt_obj.refcount = (tt_obj.refcount or 0) + 1
 
             book.save()
 
@@ -4338,6 +4399,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to a customer invoice.
 
@@ -4358,6 +4421,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def add_bill_entry(
@@ -4367,6 +4432,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to a vendor bill.
 
@@ -4376,6 +4443,12 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '50.00').
+            taxtable: Optional taxtable name. When given, the entry
+                contributes tax components per the taxtable's entries
+                at posting time.
+            tax_included: If True, ``price`` is treated as gross
+                (tax-inclusive); pretax extracted. If False (default),
+                ``price`` is pre-tax and tax adds on top.
 
         Returns:
             Dict with guid, bill_id, total, status.
@@ -4387,6 +4460,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def add_voucher_entry(
@@ -4396,6 +4471,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to an employee expense voucher.
 
@@ -4412,6 +4489,10 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1').
             price: Unit price as string (e.g., '42.50').
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_bill_entry``.
+            tax_included: If True, ``price`` is gross; pretax
+                extracted at posting.
 
         Returns:
             Dict with guid, voucher_id, total, status.
@@ -4423,6 +4504,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def list_invoices(
@@ -5915,6 +5998,38 @@ class BusinessMixin:
                 .where(entry_fk_col == inv_guid)
             ).scalar()
             if entry_count:
+                # Refcount maintenance: before deleting tax-bearing
+                # entries, tally per-taxtable counts and decrement
+                # the stored ``Taxtable.refcount`` so desktop interop
+                # stays clean. Both ``i_taxtable`` and ``b_taxtable``
+                # columns are checked — the side depends on
+                # owner_type, but a defensive UNION covers any
+                # legacy data oddities. SQL-computed counts in our
+                # own logic are unaffected by this step (they query
+                # the entries table fresh).
+                from sqlalchemy import text
+                tax_refs = book.session.execute(
+                    text(
+                        "SELECT taxtable_guid, COUNT(*) AS n FROM ("
+                        "  SELECT i_taxtable AS taxtable_guid FROM entries "
+                        f"  WHERE {entry_fk} = :guid AND i_taxtable IS NOT NULL "
+                        "  UNION ALL "
+                        "  SELECT b_taxtable AS taxtable_guid FROM entries "
+                        f"  WHERE {entry_fk} = :guid AND b_taxtable IS NOT NULL "
+                        ") AS refs GROUP BY taxtable_guid"
+                    ),
+                    {"guid": inv_guid},
+                ).fetchall()
+                for ref in tax_refs:
+                    book.session.execute(
+                        text(
+                            "UPDATE taxtables "
+                            "SET refcount = MAX(0, refcount - :n) "
+                            "WHERE guid = :guid"
+                        ),
+                        {"n": ref.n, "guid": ref.taxtable_guid},
+                    )
+
                 book.session.execute(
                     Entry.__table__.delete().where(entry_fk_col == inv_guid)
                 )

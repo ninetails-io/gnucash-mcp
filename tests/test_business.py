@@ -2980,6 +2980,310 @@ class TestTaxtableCreditNoteReversal:
         ) == Decimal(0)
 
 
+class TestTaxtableEntryWireup:
+    """Commit 4: add_*_entry tools accept taxtable + tax_included
+    kwargs. End-to-end create-entry-with-tax → post → see splits
+    without needing the raw-SQL ``_set_entry_tax`` shim."""
+
+    def _setup(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_taxtable(
+            name="BC GST+PST",
+            entries=[
+                {"type": "percentage", "amount": "5",
+                 "account": gst},
+                {"type": "percentage", "amount": "7",
+                 "account": pst},
+            ],
+        )
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        return gb, gst, pst
+
+    def test_invoice_entry_with_taxtable(self, business_book):
+        gb, gst, _ = self._setup(business_book)
+        result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        assert result["status"] == "created"
+        # Refcount incremented from 0 to 1.
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 1
+
+    def test_invoice_entry_no_taxtable_unchanged(self, business_book):
+        """Backward compat: omitting taxtable leaves tax fields zeroed
+        and refcount untouched."""
+        gb, _, _ = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="No-tax",
+            quantity="1",
+            price="100",
+        )
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 0
+
+    def test_tax_included_requires_taxtable(self, business_book):
+        gb, _, _ = self._setup(business_book)
+        with pytest.raises(ValueError, match="tax_included.*requires"):
+            gb.add_invoice_entry(
+                invoice_id="000001",
+                account="Income:Sales",
+                description="No taxtable",
+                quantity="1",
+                price="100",
+                tax_included=True,
+            )
+
+    def test_unknown_taxtable_rejected(self, business_book):
+        gb, _, _ = self._setup(business_book)
+        with pytest.raises(ValueError, match="Taxtable not found"):
+            gb.add_invoice_entry(
+                invoice_id="000001",
+                account="Income:Sales",
+                description="Bad taxtable",
+                quantity="1",
+                price="100",
+                taxtable="Nonexistent",
+            )
+
+    def test_end_to_end_post_with_added_tax(self, business_book):
+        """Full integration: create entry with tax via the tool,
+        post, verify the posting transaction has correct splits."""
+        gb, gst, pst = self._setup(business_book)
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100",
+            taxtable="BC GST+PST",
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        assert Decimal(result["total"]) == Decimal("112.00")
+        txn = gb.get_transaction(result["transaction_guid"])
+        splits = {s["account"]: Decimal(s["value"]) for s in txn["splits"]}
+        assert splits["Assets:Accounts Receivable"] == Decimal("112.00")
+        assert splits["Income:Sales"] == Decimal("-100.00")
+        assert splits["Liabilities:GST Payable"] == Decimal("-5.00")
+        assert splits["Liabilities:PST Payable"] == Decimal("-7.00")
+
+    def test_bill_entry_with_taxtable_routes_b_side(
+        self, business_book,
+    ):
+        """Vendor bills must write to b_taxtable (not i_taxtable)."""
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50",
+            taxtable="GST 5%",
+        )
+        # Refcount incremented (no matter which side).
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 1
+        # Direct SQL verification that the routing is b_*, not i_*.
+        from sqlalchemy import text
+        with gb.open() as book:
+            row = book.session.execute(
+                text(
+                    "SELECT i_taxtable, b_taxtable FROM entries "
+                    "ORDER BY date DESC LIMIT 1"
+                )
+            ).fetchone()
+            assert row.i_taxtable is None
+            assert row.b_taxtable is not None
+
+    def test_voucher_entry_with_taxtable_routes_b_side(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_employee(name="Jane Smith")
+        gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id="000001",
+            account="Expenses:Office Supplies",
+            description="Pens",
+            quantity="1",
+            price="20",
+            taxtable="GST 5%",
+        )
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 1
+
+    def test_credit_note_entry_with_taxtable(self, business_book):
+        gb, gst, _ = self._setup(business_book)
+        gb.create_credit_note(
+            owner_type="customer", owner_id="000001",
+        )
+        # Find the credit note's ID.
+        envelope = gb.list_invoices(
+            compact=False, owner_type="customer",
+        )
+        cn = next(d for d in envelope["invoices"]
+                  if d.get("is_credit_note"))
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Refund",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 1
+
+
+class TestTaxtableLifecycle:
+    """Refcount lifecycle: maintained on entry add/delete,
+    enforced as guards on update/delete of the taxtable itself."""
+
+    def test_refcount_increments_per_entry(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="A",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="B",
+            quantity="2",
+            price="50",
+            taxtable="GST 5%",
+        )
+        tt = gb.get_taxtable("GST 5%")
+        assert tt["refcount"] == 2
+
+    def test_refcount_decrements_on_invoice_delete(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="A",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="B",
+            quantity="1",
+            price="50",
+            taxtable="GST 5%",
+        )
+        assert gb.get_taxtable("GST 5%")["refcount"] == 2
+        gb.delete_invoice(invoice_id="000001")
+        # Both refs gone after the invoice's entries are deleted.
+        assert gb.get_taxtable("GST 5%")["refcount"] == 0
+
+    def test_delete_in_use_taxtable_rejected_via_real_entries(
+        self, business_book,
+    ):
+        """The Commit-1 ``delete_taxtable`` guard now sees real
+        entries (not just simulated SQL inserts). End-to-end."""
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="A",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        with pytest.raises(ValueError, match="1 entries reference"):
+            gb.delete_taxtable("GST 5%")
+
+    def test_update_in_use_rejected_via_real_entries(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="A",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        with pytest.raises(ValueError, match="force=True"):
+            gb.update_taxtable(
+                name="GST 5%",
+                entries=[{"type": "percentage", "amount": "10",
+                          "account": gst}],
+            )
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 
