@@ -1367,18 +1367,36 @@ class TestResolveMcpDir:
         os.name != "posix",
         reason="POSIX permission check skipped on non-Unix",
     )
-    def test_sticky_bit_exempt_from_check(self, tmp_path):
-        """Sticky-bit directories (like /tmp) are exempt — the
-        sticky bit prevents non-owner symlink creation, which is
-        exactly the vector the perm check defends against."""
-        # World-writable BUT with sticky bit set — analogous to /tmp.
+    def test_sticky_bit_does_not_exempt(self, tmp_path):
+        """Sticky-bit directories (like /tmp) are STILL rejected.
+        Copilot PR #91 review: the sticky bit prevents non-owner
+        deletion/rename but does not prevent non-owner creation
+        of new entries — a hostile process can still pre-create
+        ``{book}.mcp`` as a symlink in /tmp before the server
+        runs. Set GNUCASH_LOG_DIR explicitly if the book lives
+        in a sticky-bit dir."""
         os.chmod(tmp_path, 0o1777)
         try:
-            # Should not raise.
-            result = resolve_mcp_dir(tmp_path / "alex.gnucash")
-            assert result == tmp_path / "alex.gnucash.mcp"
+            with pytest.raises(ValueError, match="world-writable"):
+                resolve_mcp_dir(tmp_path / "alex.gnucash")
         finally:
             os.chmod(tmp_path, 0o755)
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX symlink check skipped on non-Unix",
+    )
+    def test_existing_mcp_symlink_rejected(self, tmp_path):
+        """Defense in depth: if a ``.mcp`` already exists at the
+        derived path and is a symlink, refuse. Catches the case
+        where an earlier symlink-hijack attempt left an artifact
+        even after the parent's permissions were tightened."""
+        book = tmp_path / "alex.gnucash"
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (tmp_path / "alex.gnucash.mcp").symlink_to(target)
+        with pytest.raises(ValueError, match="symlink"):
+            resolve_mcp_dir(book)
 
     def test_env_override_bypasses_perm_check(
         self, tmp_path, monkeypatch,

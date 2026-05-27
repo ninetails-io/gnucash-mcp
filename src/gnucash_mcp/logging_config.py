@@ -212,19 +212,25 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     that path is used directly (the user has opted into an explicit
     location, typically a user-private directory outside the book's
     folder). When unset, the directory is derived from
-    ``book_path.parent / f"{book_path.name}.mcp"`` and the parent
-    directory's permissions are sanity-checked: if it's group- or
-    world-writable on a POSIX system, refuse to use it.
+    ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
+    sanity checks fire:
 
-    The hardening guards against a hostile co-located process pre-
-    creating a malicious ``.mcp`` symlink in the book's parent
-    directory — which would redirect log writes (and audit-trail
-    history) to an attacker-controlled location. The threat model
-    is "shared host with untrusted local users"; on a single-user
-    laptop the check is effectively a no-op since the home
-    directory is mode 0o700 / 0o755 already.
+      1. The parent directory must not be group- or world-writable
+         (no sticky-bit exemption: that bit prevents non-owner
+         deletion, but anyone with write access can still create
+         a malicious ``.mcp`` symlink). Pre-existing entries that
+         pass this check are still subject to (2).
+      2. If a ``.mcp`` entry already exists, it must be a real
+         directory owned by the current user — not a symlink, and
+         not owned by another uid.
 
-    On Windows the permission check is skipped (POSIX mode bits
+    Together these guard against the symlink-hijack vector where
+    a hostile co-located process pre-creates ``{book}.mcp`` as a
+    symlink to attacker-controlled storage before the server
+    runs; the subsequent ``mkdir(parents=True, exist_ok=True)``
+    would otherwise follow that symlink.
+
+    On Windows the checks are skipped (POSIX mode bits and uid
     don't map cleanly); set ``GNUCASH_LOG_DIR`` explicitly if
     hardening is needed there.
 
@@ -238,9 +244,10 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
         needed.
 
     Raises:
-        ValueError: parent directory has unsafe permissions
-            (group- or world-writable) and ``GNUCASH_LOG_DIR``
-            isn't set.
+        ValueError: parent directory has unsafe permissions,
+            OR an existing ``.mcp`` is a symlink, OR is owned by
+            a different uid. ``GNUCASH_LOG_DIR`` set bypasses
+            all checks (explicit user opt-in).
     """
     env_override = os.environ.get("GNUCASH_LOG_DIR")
     if env_override:
@@ -248,17 +255,23 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
 
     book_path = Path(book_path)
     parent = book_path.parent
+    mcp_dir = parent / f"{book_path.name}.mcp"
 
     if os.name == "posix":
         try:
             mode = parent.stat().st_mode
             # 0o020 = group-write, 0o002 = world-write.
-            # Sticky-bit (0o1000) directories like /tmp would
-            # otherwise reject here; check for it and exempt
-            # since the sticky bit defeats the symlink-hijack
-            # vector that the perm check is defending against.
-            sticky = bool(mode & 0o1000)
-            if not sticky and (mode & 0o022):
+            # Reject regardless of sticky bit: the sticky bit
+            # prevents non-owner *deletion/rename*, but any
+            # principal with write access to the parent can
+            # still *create* a new entry (e.g. a symlink named
+            # ``{book}.mcp`` pointing to attacker-controlled
+            # storage) before this process runs. The subsequent
+            # mkdir(parents=True, exist_ok=True) would follow
+            # that symlink. Sticky-bit-protected dirs like /tmp
+            # are explicitly unsafe for this use; set
+            # GNUCASH_LOG_DIR if the book really lives there.
+            if mode & 0o022:
                 raise ValueError(
                     f"Refusing to use {parent} for logs/backups: "
                     f"directory is group- or world-writable "
@@ -274,7 +287,36 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
             # the issue naturally with its own error.
             pass
 
-    return parent / f"{book_path.name}.mcp"
+        # Defense in depth: if a ``.mcp`` already exists at the
+        # derived path, require it to be a real directory owned
+        # by the current user. Catches the case where an earlier
+        # attack already pre-created the symlink and the parent
+        # has since been re-tightened.
+        try:
+            if mcp_dir.exists() or mcp_dir.is_symlink():
+                if mcp_dir.is_symlink():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: path is a "
+                        f"symlink. Logs/backups must live in a "
+                        f"real directory you own; a symlink "
+                        f"could redirect writes elsewhere. "
+                        f"Remove or replace it, or set "
+                        f"GNUCASH_LOG_DIR to a different path."
+                    )
+                st = mcp_dir.stat()
+                if st.st_uid != os.geteuid():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: directory "
+                        f"is owned by uid={st.st_uid}, not the "
+                        f"current user (uid={os.geteuid()}). "
+                        f"Logs/backups go to a directory you "
+                        f"own; mismatched ownership suggests an "
+                        f"earlier symlink/hijack attempt."
+                    )
+        except FileNotFoundError:
+            pass
+
+    return mcp_dir
 
 
 def setup_logging(
