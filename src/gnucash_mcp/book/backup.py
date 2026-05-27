@@ -330,12 +330,15 @@ class BackupMixin:
     def _backups_dir(self) -> Path:
         """Where backups live: ``{book_path}.mcp/backups/``.
 
-        Consistent with audit / debug log locations so users backing up
-        their GnuCash folder (e.g., via Time Machine) pick up the
-        snapshots automatically.
+        Resolved via the shared ``resolve_mcp_dir`` helper so the
+        ``GNUCASH_LOG_DIR`` env override + parent-dir permission
+        check apply to backup storage the same way they apply to
+        audit / debug logs. Consistent location means users
+        backing up their GnuCash folder (Time Machine, etc.)
+        pick up the snapshots automatically.
         """
-        book_path = self.book_path
-        return book_path.parent / f"{book_path.name}.mcp" / "backups"
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+        return resolve_mcp_dir(self.book_path) / "backups"
 
     # ── Core primitive: create a backup ──────────────────────────
 

@@ -8,6 +8,7 @@ Logs are stored alongside the GnuCash book file:
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -30,6 +31,78 @@ _book_path_str: str | None = None
 def get_log_dir() -> Path | None:
     """Get the configured log directory path."""
     return _log_dir
+
+
+def resolve_mcp_dir(book_path: Path | str) -> Path:
+    """Resolve the ``.mcp`` directory for audit / debug / backup storage.
+
+    Honors the ``GNUCASH_LOG_DIR`` environment override — when set,
+    that path is used directly (the user has opted into an explicit
+    location, typically a user-private directory outside the book's
+    folder). When unset, the directory is derived from
+    ``book_path.parent / f"{book_path.name}.mcp"`` and the parent
+    directory's permissions are sanity-checked: if it's group- or
+    world-writable on a POSIX system, refuse to use it.
+
+    The hardening guards against a hostile co-located process pre-
+    creating a malicious ``.mcp`` symlink in the book's parent
+    directory — which would redirect log writes (and audit-trail
+    history) to an attacker-controlled location. The threat model
+    is "shared host with untrusted local users"; on a single-user
+    laptop the check is effectively a no-op since the home
+    directory is mode 0o700 / 0o755 already.
+
+    On Windows the permission check is skipped (POSIX mode bits
+    don't map cleanly); set ``GNUCASH_LOG_DIR`` explicitly if
+    hardening is needed there.
+
+    Args:
+        book_path: Path to the ``.gnucash`` file. Accepts ``str``
+            or ``Path``.
+
+    Returns:
+        Path to the ``.mcp`` directory. The caller creates
+        ``audit/``, ``debug/``, ``backups/`` subdirectories as
+        needed.
+
+    Raises:
+        ValueError: parent directory has unsafe permissions
+            (group- or world-writable) and ``GNUCASH_LOG_DIR``
+            isn't set.
+    """
+    env_override = os.environ.get("GNUCASH_LOG_DIR")
+    if env_override:
+        return Path(env_override).expanduser()
+
+    book_path = Path(book_path)
+    parent = book_path.parent
+
+    if os.name == "posix":
+        try:
+            mode = parent.stat().st_mode
+            # 0o020 = group-write, 0o002 = world-write.
+            # Sticky-bit (0o1000) directories like /tmp would
+            # otherwise reject here; check for it and exempt
+            # since the sticky bit defeats the symlink-hijack
+            # vector that the perm check is defending against.
+            sticky = bool(mode & 0o1000)
+            if not sticky and (mode & 0o022):
+                raise ValueError(
+                    f"Refusing to use {parent} for logs/backups: "
+                    f"directory is group- or world-writable "
+                    f"(mode={oct(mode & 0o777)}). A hostile co-"
+                    f"located process could pre-create a "
+                    f"malicious .mcp symlink redirecting log "
+                    f"writes. Either tighten permissions "
+                    f"(chmod go-w {parent}) or set "
+                    f"GNUCASH_LOG_DIR to a user-private location."
+                )
+        except FileNotFoundError:
+            # Parent missing — let downstream mkdir surface
+            # the issue naturally with its own error.
+            pass
+
+    return parent / f"{book_path.name}.mcp"
 
 
 def setup_logging(
@@ -77,10 +150,12 @@ def setup_logging(
             "Set GNUCASH_BOOK_PATH environment variable."
         )
 
-    # Log directory lives alongside the book file
-    # e.g., /path/to/finances.gnucash -> /path/to/finances.gnucash.mcp/
-    book_path_obj = Path(book_path)
-    log_dir = book_path_obj.parent / f"{book_path_obj.name}.mcp"
+    # Log directory lives alongside the book file by default
+    # (e.g., /path/to/finances.gnucash → /path/to/finances.gnucash.mcp/),
+    # or wherever GNUCASH_LOG_DIR points if set. The helper also
+    # performs the parent-dir permission sanity check that
+    # defends against symlink-hijack on shared-user POSIX hosts.
+    log_dir = resolve_mcp_dir(book_path)
     _log_dir = log_dir
 
     now_local = datetime.now().astimezone()

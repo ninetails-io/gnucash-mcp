@@ -13,6 +13,7 @@ from gnucash_mcp.logging_config import (
     DEBUG_LOGGER_NAME,
     _resolve_entry_field,
     audit_log,
+    resolve_mcp_dir,
     setup_logging,
 )
 
@@ -1299,3 +1300,101 @@ class TestCreateSignalsCollector:
             f"find the source, one to run duplicates/recent against "
             f"the resulting amounts); got {call_count[0]}."
         )
+
+
+class TestResolveMcpDir:
+    """Stage 6 — path-traversal hardening on the .mcp directory
+    resolver. Audit / debug / backup all flow through this helper
+    so an attacker who can write to the book's parent directory
+    can't redirect log writes via a pre-created symlink."""
+
+    def test_default_derivation(self, tmp_path):
+        """Without GNUCASH_LOG_DIR, the .mcp dir is derived from
+        the book path's parent and name."""
+        book = tmp_path / "alex.gnucash"
+        # Don't actually need the file to exist; the helper
+        # only stats the parent.
+        result = resolve_mcp_dir(book)
+        assert result == tmp_path / "alex.gnucash.mcp"
+
+    def test_env_override_used(self, tmp_path, monkeypatch):
+        """GNUCASH_LOG_DIR takes precedence over derivation."""
+        override = tmp_path / "elsewhere"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
+        result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+        assert result == override
+
+    def test_env_override_expands_tilde(self, monkeypatch):
+        """GNUCASH_LOG_DIR=~/foo expands to the user's home."""
+        monkeypatch.setenv("GNUCASH_LOG_DIR", "~/my-logs")
+        result = resolve_mcp_dir("/anywhere/book.gnucash")
+        assert "~" not in str(result)
+        assert str(result).endswith("my-logs")
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_rejects_world_writable_parent(self, tmp_path):
+        """A book in a 777 parent directory raises a clear error.
+
+        Threat model: hostile co-located process pre-creates
+        ``alex.gnucash.mcp`` as a symlink to attacker-controlled
+        storage before the server runs.
+        """
+        # Make tmp_path world-writable (without sticky bit).
+        os.chmod(tmp_path, 0o777)
+        book = tmp_path / "alex.gnucash"
+        try:
+            with pytest.raises(ValueError, match="world-writable"):
+                resolve_mcp_dir(book)
+        finally:
+            # Restore for pytest cleanup.
+            os.chmod(tmp_path, 0o755)
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_accepts_user_only_writable_parent(self, tmp_path):
+        """Default tmp_path permissions are safe."""
+        # tmp_path defaults to 0o700 on most pytest configs.
+        result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+        assert result == tmp_path / "alex.gnucash.mcp"
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_sticky_bit_exempt_from_check(self, tmp_path):
+        """Sticky-bit directories (like /tmp) are exempt — the
+        sticky bit prevents non-owner symlink creation, which is
+        exactly the vector the perm check defends against."""
+        # World-writable BUT with sticky bit set — analogous to /tmp.
+        os.chmod(tmp_path, 0o1777)
+        try:
+            # Should not raise.
+            result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+            assert result == tmp_path / "alex.gnucash.mcp"
+        finally:
+            os.chmod(tmp_path, 0o755)
+
+    def test_env_override_bypasses_perm_check(
+        self, tmp_path, monkeypatch,
+    ):
+        """The env-override path lets a user opt into any
+        location they want — the perm check is for the derived
+        path only. Setting GNUCASH_LOG_DIR is an explicit
+        statement of trust."""
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o777)
+        override = tmp_path / "explicit"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
+        try:
+            # Should not raise despite the world-writable
+            # parent — env override bypasses the check.
+            result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+            assert result == override
+        finally:
+            if os.name == "posix":
+                os.chmod(tmp_path, 0o755)
