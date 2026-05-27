@@ -270,6 +270,15 @@ TOOL_MODULES: dict[str, list[str]] = {
     # invoicing is the dominant use case; runtime owner_type gating
     # (see _gate_owner_type in tools/_helpers.py) rejects vendor-side
     # use when business isn't loaded.
+    #
+    # Taxtables live in freelancer because customer-facing sales
+    # tax (Canadian GST, UK VAT, US state sales tax on services)
+    # is a primary freelancer concern — a solo consultant
+    # collecting tax on invoices needs the CRUD surface without
+    # also pulling in vendor management. The polymorphic
+    # add_*_entry tools share the taxtable parameter; runtime
+    # use on a vendor bill or voucher reads the same taxtable
+    # registry whether ``business`` is loaded or not.
     "freelancer": [
         "create_customer",
         "list_customers",
@@ -285,6 +294,11 @@ TOOL_MODULES: dict[str, list[str]] = {
         "pay_invoice",
         "delete_invoice",
         "get_outstanding_invoices",
+        "create_taxtable",
+        "list_taxtables",
+        "get_taxtable",
+        "update_taxtable",
+        "delete_taxtable",
     ],
     "business": [
         "create_vendor",
@@ -681,7 +695,7 @@ Usage: gnucash-mcp [OPTIONS]
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core (26 tools, always-on). Use "all"
-                       for every module (101 tools).
+                       for every module (106 tools).
 
                        Modules (role-aligned, flat partition; pick
                        what fits your workflow):
@@ -714,9 +728,12 @@ Options:
                          portfolio    Commodities + prices —
                                       the multi-currency primitive.
                          investor     Tax-lot management.
-                         freelancer   Customer invoicing.
-                         business     Vendor + employee management +
-                                      vendor bills (additive to
+                         freelancer   Customer invoicing + sales-tax
+                                      configuration (taxtables for
+                                      GST / VAT / US state sales tax).
+                         business     Vendor + employee management,
+                                      vendor bills, jobs, credit
+                                      notes, billterms (additive to
                                       freelancer for full business
                                       workflow).
 

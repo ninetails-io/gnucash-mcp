@@ -689,6 +689,27 @@ class BusinessMixin:
         return book.session.query(Job).filter_by(id=job_id).first()
 
     @staticmethod
+    def _find_taxtable(book, name: str):
+        """Find a Taxtable by exact name.
+
+        Taxtables are keyed by name across the book — there is no
+        per-jurisdiction or per-entity namespace. A book has at most
+        one taxtable named "GST 5%" and lookups are O(log n) via the
+        unique-name index. Returns None if not found; callers raise.
+        """
+        from piecash.business.tax import Taxtable
+        return book.session.query(Taxtable).filter_by(name=name).first()
+
+    @staticmethod
+    def _find_taxtable_by_guid(book, guid: str):
+        """Find a Taxtable by full GUID. Caller passes a 32-char hex
+        string (resolved via :meth:`_resolve_guid` upstream when the
+        input was a short prefix). Returns None if not found.
+        """
+        from piecash.business.tax import Taxtable
+        return book.session.query(Taxtable).filter_by(guid=guid).first()
+
+    @staticmethod
     def _find_job_by_guid(book, guid: str):
         """Find a job by GUID. Used to resolve invoice→job links
         where the invoice's ``owner_guid`` (with owner_type=3)
@@ -1012,6 +1033,68 @@ class BusinessMixin:
         }
 
     @staticmethod
+    def _taxtable_entry_to_dict(
+        tte,
+        account_paths: dict | None = None,
+    ) -> dict:
+        """Serialize a TaxtableEntry to a dict.
+
+        Args:
+            tte: piecash TaxtableEntry object.
+            account_paths: Optional ``{account_guid: fullname}`` map.
+                When present, the entry's ``account`` field is the
+                resolved path (readable); otherwise the raw GUID
+                appears as ``account_guid``. Same pattern as
+                ``_entry_to_dict``.
+        """
+        result = {
+            "id": tte.id,
+            "type": tte.type,
+            "amount": str(tte.amount),
+        }
+        if account_paths is not None:
+            result["account"] = account_paths.get(
+                tte.account_guid, tte.account_guid,
+            )
+        else:
+            result["account_guid"] = tte.account_guid
+        return result
+
+    @staticmethod
+    def _taxtable_to_dict(
+        tt,
+        account_paths: dict | None = None,
+        refcount: int | None = None,
+    ) -> dict:
+        """Serialize a Taxtable to a dict.
+
+        Args:
+            tt: piecash Taxtable object.
+            account_paths: Optional ``{account_guid: fullname}`` map
+                covering every entry's account. Pre-built by the
+                caller (one query rather than N).
+            refcount: Optional computed-from-SQL refcount. The
+                stored ``Taxtable.refcount`` column tracks GnuCash
+                desktop's bookkeeping; the SQL-computed value is
+                authoritative for lifecycle checks. When given,
+                replaces the stored value in the response.
+        """
+        entries = [
+            BusinessMixin._taxtable_entry_to_dict(
+                e, account_paths=account_paths,
+            )
+            for e in tt.entries
+        ]
+        return {
+            "guid": tt.guid,
+            "name": tt.name,
+            "refcount": (
+                refcount if refcount is not None else tt.refcount
+            ),
+            "entries": entries,
+        }
+
+    @staticmethod
     def _decimal_to_num_denom(value: Decimal) -> tuple[int, int]:
         """Convert a Decimal to numerator/denominator pair.
 
@@ -1047,6 +1130,7 @@ class BusinessMixin:
         owner_name: str | None = None,
         applies_to: dict | None = None,
         job: dict | None = None,
+        tax_summary: dict | None = None,
     ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
@@ -1139,6 +1223,11 @@ class BusinessMixin:
             result["job"] = {"id": job["id"], "name": job["name"]}
         if entries is not None:
             result["entries"] = entries
+        # Tax summary conditional on the invoice having any
+        # tax-bearing lines. Non-tax invoices keep their pre-v1.3
+        # response shape byte-identical.
+        if tax_summary is not None:
+            result["tax_summary"] = tax_summary
         return result
 
     def _invoice_to_compact_line(self, book, invoice) -> str:
@@ -1206,9 +1295,9 @@ class BusinessMixin:
         # to "?" when entries can't be loaded — keeps the row legible
         # even on data-corruption edge cases.
         try:
-            _, _, grand_total = self._get_invoice_entries_and_total(
+            grand_total = self._get_invoice_entries_and_total(
                 book, invoice,
-            )
+            )["grand_total"]
             ccy = (
                 invoice.currency.mnemonic
                 if invoice.currency else ""
@@ -1238,6 +1327,7 @@ class BusinessMixin:
         entry_row,
         is_bill: bool = False,
         account_paths: dict | None = None,
+        taxtable_names: dict | None = None,
     ) -> dict:
         """Convert an entry row (from raw SQL) to a serializable dict.
 
@@ -1250,6 +1340,11 @@ class BusinessMixin:
                 builds this map once per invoice and passes it through;
                 this keeps the static-method shape while letting the
                 response be readable to humans/LLMs.
+            taxtable_names: Optional ``{taxtable_guid: name}`` map for
+                resolving the entry's applied taxtable to its readable
+                name. Tax fields (taxable, tax_included, taxtable) are
+                emitted only when the entry is taxable — non-tax
+                entries keep their pre-v1.3 shape exactly.
         """
         q_num = entry_row.quantity_num or 0
         q_denom = entry_row.quantity_denom or 1
@@ -1259,10 +1354,16 @@ class BusinessMixin:
             p_num = entry_row.b_price_num or 0
             p_denom = entry_row.b_price_denom or 1
             acct_guid = entry_row.b_acct
+            taxable = bool(entry_row.b_taxable)
+            tax_included = bool(entry_row.b_taxincluded)
+            taxtable_guid = entry_row.b_taxtable
         else:
             p_num = entry_row.i_price_num or 0
             p_denom = entry_row.i_price_denom or 1
             acct_guid = entry_row.i_acct
+            taxable = bool(entry_row.i_taxable)
+            tax_included = bool(entry_row.i_taxincluded)
+            taxtable_guid = entry_row.i_taxtable
 
         price = Decimal(p_num) / Decimal(p_denom)
         total = quantity * price
@@ -1292,6 +1393,20 @@ class BusinessMixin:
             )
         else:
             result["account_guid"] = acct_guid or ""
+
+        # Tax fields conditional on taxable=1 — non-tax entries
+        # keep their byte-identical pre-v1.3 shape so existing
+        # consumers see no diff.
+        if taxable:
+            result["taxable"] = True
+            result["tax_included"] = tax_included
+            if taxtable_guid:
+                if taxtable_names is not None:
+                    result["taxtable"] = taxtable_names.get(
+                        taxtable_guid, taxtable_guid,
+                    )
+                else:
+                    result["taxtable_guid"] = taxtable_guid
         return result
 
     @staticmethod
@@ -1480,13 +1595,45 @@ class BusinessMixin:
         return posted + timedelta(days=30), True
 
     def _get_invoice_entries_and_total(self, book, inv):
-        """Query entries for an invoice/bill and compute total.
+        """Query entries for an invoice/bill and compute totals,
+        absorbing per-line tax math.
+
+        For each entry, looks up its taxtable (when ``i_taxable``
+        or ``b_taxable`` is set) and invokes ``_compute_entry_tax``
+        to derive pretax / tax / gross + per-tax-account splits.
+        Aggregates revenue/expense AND tax-payable account amounts
+        into a single ``acct_totals`` dict so the downstream
+        ``post_invoice`` loop emits one split per account without
+        knowing about tax specifically.
 
         Returns:
-            Tuple of (entries_list, per_account_totals_dict, grand_total).
-            per_account_totals maps account_guid -> Decimal total.
+            Dict with keys:
+
+            - ``rows``: raw SQL rows from the entries table
+              (unchanged interface; callers don't read them
+              directly).
+            - ``acct_totals``: ``{account_guid: Decimal}`` covering
+              revenue/expense accounts AND tax-payable accounts
+              together. Used by ``post_invoice`` to emit splits.
+            - ``grand_total``: ``Decimal`` — gross customer-facing
+              total (sum of per-line gross). Includes tax for
+              tax-bearing entries.
+            - ``subtotal``: ``Decimal`` — sum of per-line pretax
+              amounts.
+            - ``tax_breakdown``: ``{account_guid: Decimal}`` — the
+              tax-only portion, available separately for display
+              surfaces that want to render a tax summary.
+            - ``tax_by_taxtable``: ``{taxtable_guid: Decimal}`` —
+              tax aggregated by the taxtable that produced it,
+              for surfaces that want to render a "Tax — GST 5%:
+              $15, BC GST+PST: $7" rollup. A taxtable with zero
+              tax-bearing lines on this invoice does not appear.
+
+        Raises:
+            ValueError: when the invoice has no entries.
         """
         from sqlalchemy import text
+        from piecash.business.tax import Taxtable
 
         is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
         if is_bill:
@@ -1505,8 +1652,44 @@ class BusinessMixin:
                 f"Cannot post: invoice {inv.id} has no entries"
             )
 
+        # Taxtable resolution is cached so an invoice with many
+        # lines sharing the same taxtable hits SQL once per
+        # distinct taxtable, not once per line.
+        taxtable_cache: dict[str, list[dict]] = {}
+
+        def _resolve_taxtable_entries(taxtable_guid):
+            if not taxtable_guid:
+                return []
+            if taxtable_guid in taxtable_cache:
+                return taxtable_cache[taxtable_guid]
+            tt = book.session.query(Taxtable).filter_by(
+                guid=taxtable_guid,
+            ).first()
+            if not tt:
+                # Defensive: ``i_taxtable``/``b_taxtable`` points at
+                # a missing row. Entry creation validates this; if
+                # we land here the book is mid-corruption — treat
+                # as no-tax rather than crash the math seam.
+                taxtable_cache[taxtable_guid] = []
+                return []
+            resolved = [
+                {
+                    "type": e.type,
+                    "amount": e.amount,
+                    "account_guid": e.account_guid,
+                }
+                for e in tt.entries
+            ]
+            taxtable_cache[taxtable_guid] = resolved
+            return resolved
+
+        quantum = _commodity_quantum(inv.currency)
         acct_totals: dict[str, Decimal] = {}
+        tax_breakdown: dict[str, Decimal] = {}
+        tax_by_taxtable: dict[str, Decimal] = {}
         grand_total = Decimal(0)
+        subtotal = Decimal(0)
+
         for row in rows:
             q_num = row.quantity_num or 0
             q_denom = row.quantity_denom or 1
@@ -1516,19 +1699,71 @@ class BusinessMixin:
                 p_num = row.b_price_num or 0
                 p_denom = row.b_price_denom or 1
                 acct_guid = row.b_acct
+                taxable = bool(row.b_taxable)
+                tax_included = bool(row.b_taxincluded)
+                taxtable_guid = row.b_taxtable
             else:
                 p_num = row.i_price_num or 0
                 p_denom = row.i_price_denom or 1
                 acct_guid = row.i_acct
+                taxable = bool(row.i_taxable)
+                tax_included = bool(row.i_taxincluded)
+                taxtable_guid = row.i_taxtable
 
             price = Decimal(p_num) / Decimal(p_denom)
-            entry_total = quantity * price
-            grand_total += entry_total
-            acct_totals[acct_guid] = acct_totals.get(
-                acct_guid, Decimal(0)
-            ) + entry_total
+            taxtable_entries = _resolve_taxtable_entries(taxtable_guid)
 
-        return rows, acct_totals, grand_total
+            tax_result = self._compute_entry_tax(
+                quantity=quantity,
+                price=price,
+                taxable=taxable,
+                tax_included=tax_included,
+                taxtable_entries=taxtable_entries,
+                quantum=quantum,
+            )
+
+            # Revenue/expense account gets the pretax portion.
+            acct_totals[acct_guid] = (
+                acct_totals.get(acct_guid, Decimal(0))
+                + tax_result["pretax"]
+            )
+            # Tax-payable accounts get their per-entry components.
+            # Composite taxtables that route to the same account
+            # already collapse inside _compute_entry_tax; we just
+            # fold the result into the global acct_totals here.
+            for tax_acct, tax_amount in (
+                tax_result["tax_by_acct"].items()
+            ):
+                acct_totals[tax_acct] = (
+                    acct_totals.get(tax_acct, Decimal(0))
+                    + tax_amount
+                )
+                tax_breakdown[tax_acct] = (
+                    tax_breakdown.get(tax_acct, Decimal(0))
+                    + tax_amount
+                )
+
+            # Per-taxtable rollup: when this line was tax-bearing,
+            # attribute its total tax to the source taxtable so
+            # display surfaces can render "GST 5%: $15, BC GST+PST:
+            # $7" without re-deriving from row data.
+            if taxtable_guid and tax_result["tax_total"] != 0:
+                tax_by_taxtable[taxtable_guid] = (
+                    tax_by_taxtable.get(taxtable_guid, Decimal(0))
+                    + tax_result["tax_total"]
+                )
+
+            grand_total += tax_result["gross"]
+            subtotal += tax_result["pretax"]
+
+        return {
+            "rows": rows,
+            "acct_totals": acct_totals,
+            "grand_total": grand_total,
+            "subtotal": subtotal,
+            "tax_breakdown": tax_breakdown,
+            "tax_by_taxtable": tax_by_taxtable,
+        }
 
     # ── Customer / Vendor / Billterm CRUD ─────────────────────────
 
@@ -2206,6 +2441,730 @@ class BusinessMixin:
                 return "\n".join(lines)
             else:
                 return [self._billterm_to_dict(t) for t in terms]
+
+    # ── Taxtable CRUD ─────────────────────────────────────────────
+    #
+    # Taxtables route sales-tax math on invoice/bill/voucher/credit-
+    # note line entries. A taxtable holds one or more
+    # ``TaxtableEntry`` rows; each entry contributes either a
+    # percentage rate (5.00 means 5%) or a flat value (5.00 means a
+    # fixed $5 surcharge) routed to a specific GL account.
+    #
+    # A multi-entry taxtable (e.g., GST 5% + PST 7%) produces N tax
+    # splits per line at posting time, one per entry to its own
+    # account — see commit 3's posting math. This commit is pure
+    # data CRUD; the wire-up into entries (commit 4) and into
+    # ``_get_invoice_entries_and_total`` (commit 3) happens later.
+    #
+    # **Refcount discipline.** GnuCash desktop maintains
+    # ``Taxtable.refcount`` as the number of entries referencing the
+    # taxtable. piecash does not auto-maintain it; we manage it
+    # manually on entry create/delete in commit 4. For lifecycle
+    # checks here (delete guard, update warning), we use
+    # ``_compute_taxtable_refcount`` — an indexed SQL count over the
+    # ``entries`` table, authoritative regardless of the stored
+    # ``refcount`` column. Voided invoices still pin their taxtables
+    # because their entry rows persist for audit trail.
+
+    @staticmethod
+    def _compute_taxtable_refcount(book, taxtable_guid: str) -> int:
+        """Count Entry rows referencing this taxtable via
+        ``i_taxtable`` or ``b_taxtable``. Authoritative for delete
+        guards and update warnings — independent of the stored
+        ``Taxtable.refcount`` column which is maintained for desktop
+        interop but not used for our own logic.
+        """
+        from sqlalchemy import text
+        row = book.session.execute(
+            text(
+                "SELECT COUNT(*) FROM entries "
+                "WHERE i_taxtable = :guid OR b_taxtable = :guid"
+            ),
+            {"guid": taxtable_guid},
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _taxtable_entry_summary(e) -> str:
+        """One-token compact summary of a taxtable entry.
+
+        ``5%→GST Payable`` for percentage entries, ``$5→Eco Fee``
+        for flat-value. The arrow makes the routing direction
+        visually unmistakable.
+        """
+        acct_name = e.account.name if e.account else "?"
+        if e.type == "percentage":
+            return f"{e.amount}%→{acct_name}"
+        return f"${e.amount}→{acct_name}"
+
+    def _validate_taxtable_entries(
+        self, book, entries: list[dict],
+    ) -> list[dict]:
+        """Validate a list of taxtable-entry dicts and resolve their
+        accounts. Returns piecash-ready ``{type, amount, account}``
+        records.
+
+        Validations:
+          - non-empty list
+          - each entry has ``type`` in ``{"value", "percentage"}``
+          - amount parses to ``Decimal`` and is > 0
+          - percentage amount < 100 (rates expressed as percent,
+            not fraction; >=100% is almost certainly user error)
+          - account resolves and has type ASSET or LIABILITY
+            (sales-tax payable / input-tax-credit receivable —
+            anything else would book tax into the wrong section)
+          - all entries reference accounts in the same commodity
+            (multi-commodity taxtables are rejected per spec; one
+            taxtable per jurisdiction/commodity is the supported
+            model)
+
+        Args:
+            book: open piecash book session.
+            entries: list of ``{type, amount, account}`` dicts as
+                they arrive from the MCP tool layer.
+
+        Returns:
+            List of resolved records with ``amount`` as ``Decimal``
+            and ``account`` as the piecash ``Account`` object.
+
+        Raises:
+            ValueError on any validation failure, with the entry
+            index in the message so the caller can pinpoint which
+            entry was the problem.
+        """
+        if not entries:
+            raise ValueError(
+                "Taxtable must have at least one entry"
+            )
+
+        resolved: list[dict] = []
+        commodities_seen: set[str] = set()
+
+        for i, e in enumerate(entries):
+            type_val = e.get("type")
+            if type_val not in ("value", "percentage"):
+                raise ValueError(
+                    f"Entry {i}: type must be 'value' or "
+                    f"'percentage', got {type_val!r}"
+                )
+
+            try:
+                amount = _to_decimal(str(e.get("amount", "")))
+            except Exception:
+                raise ValueError(
+                    f"Entry {i}: amount {e.get('amount')!r} not a "
+                    f"valid decimal"
+                )
+            if amount <= 0:
+                raise ValueError(
+                    f"Entry {i}: amount must be > 0, got {amount}"
+                )
+            if (
+                type_val == "percentage"
+                and amount >= Decimal("100")
+            ):
+                raise ValueError(
+                    f"Entry {i}: percentage rate {amount} >= 100 "
+                    f"is almost certainly user error. Rates are "
+                    f"expressed as a percentage (5.0 for 5%, not "
+                    f"0.05). If you genuinely want a rate this "
+                    f"large, file an issue."
+                )
+
+            account_ref = e.get("account")
+            if not account_ref:
+                raise ValueError(f"Entry {i}: account is required")
+            acct = self._resolve_account(book, account_ref)
+            if not acct:
+                raise ValueError(
+                    f"Entry {i}: account not found: {account_ref!r}"
+                )
+            if acct.type not in ("ASSET", "LIABILITY"):
+                raise ValueError(
+                    f"Entry {i}: account {acct.fullname!r} has type "
+                    f"{acct.type!r}; taxtable entries must reference "
+                    f"ASSET (input-tax-credit receivable) or "
+                    f"LIABILITY (output sales-tax payable) accounts. "
+                    f"Got something else — verify the account "
+                    f"hierarchy."
+                )
+            commodities_seen.add(acct.commodity.guid)
+            resolved.append({
+                "type": type_val,
+                "amount": amount,
+                "account": acct,
+            })
+
+        if len(commodities_seen) > 1:
+            raise ValueError(
+                f"Taxtable entries must all reference accounts in "
+                f"the same commodity; got accounts in "
+                f"{len(commodities_seen)} different commodities. "
+                f"Multi-currency taxtables are rejected — split "
+                f"into one taxtable per jurisdiction/commodity."
+            )
+
+        return resolved
+
+    @staticmethod
+    def _compute_entry_tax(
+        quantity: Decimal,
+        price: Decimal,
+        taxable: bool,
+        tax_included: bool,
+        taxtable_entries: list[dict],
+        quantum: Decimal,
+    ) -> dict:
+        """Per-line tax math. Pure function; no book access.
+
+        Caller resolves the taxtable to a list of
+        ``{type, amount, account_guid}`` dicts before invoking
+        (``type`` is ``'value'`` or ``'percentage'``; ``amount``
+        is ``Decimal``; ``account_guid`` is the FK to wherever the
+        tax component routes).
+
+        Four quadrants of behavior:
+
+        1. ``taxable=False``: no tax. ``pretax = Q × P``,
+           ``tax_total = 0``, ``tax_by_acct = {}``, ``gross = Q × P``.
+
+        2. ``taxable=True, tax_included=False`` (tax-exclusive):
+           Line value IS pre-tax; tax adds on top. For each entry,
+           percentage entries contribute ``pretax × rate / 100``,
+           value entries contribute their flat amount. Each is
+           quantized independently per the per-line rounding policy
+           (auditable line-by-line, matches GnuCash desktop).
+
+        3. ``taxable=True, tax_included=True``, all-percentage
+           taxtable: Line value is gross. Pretax extracted via
+           ``pretax = gross / (1 + Σ rate / 100)``. Per-entry tax
+           computed from extracted pretax.
+
+        4. ``taxable=True, tax_included=True``, mixed value +
+           percentage: Pretax extracted via
+           ``pretax = (gross − Σ value) / (1 + Σ rate / 100)``.
+           Value entries contribute their flat amount unchanged;
+           percentage entries contribute ``pretax × rate / 100``.
+
+        **Rounding residual policy** (Quadrants 3/4): after
+        independent per-entry quantization, ``gross == pretax +
+        Σ tax`` may differ by at most one quantum. The residual is
+        applied to the largest-rate percentage entry (or the first
+        value entry as fallback for all-value tax-inclusive — an
+        edge case that's algebraically degenerate but harmless).
+        Done this way to keep the dominant tax authority's bucket
+        carrying the rounding noise rather than smearing it across
+        all entries.
+
+        Args:
+            quantity, price: line-item quantity and unit price as
+                ``Decimal``.
+            taxable: whether this line has a taxtable applied.
+            tax_included: whether ``Q × P`` represents gross
+                (tax-inclusive) or pre-tax (tax-exclusive).
+            taxtable_entries: resolved taxtable entries as dicts
+                with ``type``, ``amount`` (``Decimal``), and
+                ``account_guid`` keys.
+            quantum: smallest representable unit of the currency
+                (typically ``Decimal('0.01')``; derived from
+                ``_commodity_quantum`` on the invoice currency).
+
+        Returns:
+            ``{pretax, tax_total, tax_by_acct, gross}`` — all
+            ``Decimal`` values; ``tax_by_acct`` is
+            ``{account_guid: Decimal}`` with one entry per distinct
+            payable account (composite taxtables routing to the
+            same account collapse to one entry by sum).
+        """
+        line_value = quantity * price
+
+        if not taxable or not taxtable_entries:
+            # Quadrant 1, or defensive no-entries fallback (the
+            # caller should have validated; behave as no-tax).
+            qv = line_value.quantize(quantum)
+            return {
+                "pretax": qv,
+                "tax_total": Decimal(0),
+                "tax_by_acct": {},
+                "gross": qv,
+            }
+
+        sum_values = sum(
+            (
+                e["amount"]
+                for e in taxtable_entries
+                if e["type"] == "value"
+            ),
+            Decimal(0),
+        )
+        sum_rates = sum(
+            (
+                e["amount"]
+                for e in taxtable_entries
+                if e["type"] == "percentage"
+            ),
+            Decimal(0),
+        )
+        rate_factor = sum_rates / Decimal(100)
+
+        if tax_included:
+            # Quadrants 3/4: extract pretax from gross.
+            gross = line_value.quantize(quantum)
+            if rate_factor == 0:
+                # All-value tax-inclusive: pretax = gross − values.
+                pretax = (gross - sum_values).quantize(quantum)
+            else:
+                pretax = (
+                    (gross - sum_values)
+                    / (Decimal(1) + rate_factor)
+                ).quantize(quantum)
+        else:
+            # Quadrant 2: line value IS pretax.
+            pretax = line_value.quantize(quantum)
+            gross = None  # computed after tax_total
+
+        tax_by_acct: dict[str, Decimal] = {}
+        for e in taxtable_entries:
+            acct_guid = e["account_guid"]
+            if e["type"] == "percentage":
+                tax_e = (
+                    pretax * e["amount"] / Decimal(100)
+                ).quantize(quantum)
+            else:
+                tax_e = e["amount"].quantize(quantum)
+            tax_by_acct[acct_guid] = (
+                tax_by_acct.get(acct_guid, Decimal(0)) + tax_e
+            )
+
+        tax_total = sum(tax_by_acct.values(), Decimal(0))
+
+        if tax_included:
+            # Residual adjustment: enforce gross = pretax + tax_total
+            # exactly. The residual is at most ±1 quantum from the
+            # independent per-entry rounding.
+            residual = gross - pretax - tax_total
+            if residual != 0:
+                # Find largest-rate percentage entry; fall back to
+                # first value entry if no percentage entries exist.
+                target_acct = None
+                largest_rate = Decimal(0)
+                for e in taxtable_entries:
+                    if (
+                        e["type"] == "percentage"
+                        and e["amount"] > largest_rate
+                    ):
+                        largest_rate = e["amount"]
+                        target_acct = e["account_guid"]
+                if target_acct is None:
+                    target_acct = (
+                        taxtable_entries[0]["account_guid"]
+                    )
+                tax_by_acct[target_acct] = (
+                    tax_by_acct[target_acct] + residual
+                )
+                tax_total = tax_total + residual
+        else:
+            gross = pretax + tax_total
+
+        return {
+            "pretax": pretax,
+            "tax_total": tax_total,
+            "tax_by_acct": tax_by_acct,
+            "gross": gross,
+        }
+
+    def create_taxtable(
+        self,
+        name: str,
+        entries: list[dict],
+    ) -> dict:
+        """Create a new tax table.
+
+        A taxtable holds one or more entries. Each entry contributes
+        either a percentage rate (``type='percentage'``,
+        ``amount=5.00`` means 5%) or a flat value
+        (``type='value'``, ``amount=5.00`` means a fixed $5
+        surcharge) routed to a specific ASSET or LIABILITY account.
+
+        Multi-entry taxtables (e.g., GST 5% + PST 7%) are
+        supported. At posting time each entry produces its own
+        split to its own account. All entries on a single taxtable
+        must reference accounts in the same commodity.
+
+        Args:
+            name: Taxtable name. Must be unique within the book.
+            entries: List of ``{type, amount, account}`` dicts.
+                ``type`` is ``'value'`` or ``'percentage'``.
+                ``amount`` is a positive Decimal as string;
+                percentages are expressed as the rate (``5.00`` =
+                5%, not ``0.05``). ``account`` is a path,
+                ``%short-guid``, or full GUID; must resolve to an
+                ASSET or LIABILITY account.
+
+        Returns:
+            ``{guid, name, entry_count, entries, status='created'}``.
+
+        Raises:
+            ValueError: duplicate name; empty entries; invalid
+                type/amount/account; wrong account type;
+                multi-currency entry mix.
+        """
+        from piecash.business.tax import Taxtable, TaxtableEntry
+
+        with self.open(readonly=False) as book:
+            existing = self._find_taxtable(book, name)
+            if existing:
+                raise ValueError(
+                    f"Taxtable {name!r} already exists "
+                    f"(guid={existing.guid[:8]})"
+                )
+
+            resolved = self._validate_taxtable_entries(book, entries)
+
+            tt = Taxtable(
+                name=name,
+                entries=[
+                    TaxtableEntry(
+                        type=r["type"],
+                        amount=r["amount"],
+                        account=r["account"],
+                    )
+                    for r in resolved
+                ],
+            )
+            book.session.add(tt)
+            book.flush()
+
+            # Capture before-close to avoid DetachedInstanceError
+            # on attribute access after ``book.save()`` exits the
+            # session.
+            tt_guid = tt.guid
+            tt_name = tt.name
+            account_paths = {
+                r["account"].guid: r["account"].fullname
+                for r in resolved
+            }
+            entry_dicts = [
+                self._taxtable_entry_to_dict(
+                    e, account_paths=account_paths,
+                )
+                for e in tt.entries
+            ]
+
+            book.save()
+
+            return {
+                "guid": tt_guid,
+                "name": tt_name,
+                "entry_count": len(entry_dicts),
+                "entries": entry_dicts,
+                "status": "created",
+            }
+
+    def list_taxtables(
+        self, compact: bool = True,
+    ) -> list[dict] | str:
+        """List all tax tables.
+
+        Args:
+            compact: When True (default), return a newline-separated
+                string with one line per taxtable. Each line is
+                ``name<TAB>N entry/entries: summary`` where the
+                summary is a comma-separated rendering of each
+                entry (e.g., ``5%→GST Payable, 7%→PST Payable``).
+                When False, return a list of full dicts including
+                resolved account paths and computed refcount.
+
+        Returns:
+            Compact string or verbose list, as documented above.
+            Empty taxtable list returns empty string / empty list.
+        """
+        from piecash.business.tax import Taxtable
+
+        with self.open() as book:
+            tables = book.session.query(Taxtable).order_by(
+                Taxtable.name,
+            ).all()
+
+            if compact:
+                lines = []
+                for tt in tables:
+                    summary = ", ".join(
+                        self._taxtable_entry_summary(e)
+                        for e in tt.entries
+                    )
+                    n = len(tt.entries)
+                    suffix = "entry" if n == 1 else "entries"
+                    lines.append(
+                        f"{tt.name}\t{n} {suffix}: {summary}"
+                    )
+                return "\n".join(lines)
+
+            return [
+                self._taxtable_to_dict(
+                    tt,
+                    account_paths={
+                        e.account_guid: e.account.fullname
+                        for e in tt.entries
+                    },
+                    refcount=self._compute_taxtable_refcount(
+                        book, tt.guid,
+                    ),
+                )
+                for tt in tables
+            ]
+
+    def get_taxtable(self, name: str) -> dict:
+        """Full details for a tax table.
+
+        Args:
+            name: Taxtable name.
+
+        Returns:
+            ``{guid, name, refcount, entries: [...]}`` with resolved
+            account paths on each entry. ``refcount`` is the
+            SQL-computed count of Entry rows referencing this
+            taxtable.
+
+        Raises:
+            ValueError: taxtable not found.
+        """
+        with self.open() as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            return self._taxtable_to_dict(
+                tt,
+                account_paths={
+                    e.account_guid: e.account.fullname
+                    for e in tt.entries
+                },
+                refcount=self._compute_taxtable_refcount(
+                    book, tt.guid,
+                ),
+            )
+
+    def update_taxtable(
+        self,
+        name: str,
+        new_name: str | None = None,
+        entries: list[dict] | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Update a tax table's name and/or entries.
+
+        Diff-style response: only changed fields are returned.
+
+        **Entry replacement on an in-use taxtable** is destructive
+        to FUTURE entries' tax math (existing posted invoices
+        retain their splits — splits are stored, not derived). When
+        the SQL-computed refcount > 0 and ``entries`` is given,
+        ``force=True`` is required. The check uses the SQL refcount
+        not the stored ``refcount`` column, so voided invoices that
+        still pin the taxtable are honored.
+
+        Args:
+            name: Current taxtable name.
+            new_name: New name (optional). Rejected if it collides
+                with another taxtable.
+            entries: Replacement entry list (optional). Validated
+                with the same rules as ``create_taxtable``.
+                Old entries are deleted via the relation's
+                ``delete-orphan`` cascade.
+            force: Required to replace entries when refcount > 0.
+                Has no effect on name-only updates.
+
+        Returns:
+            ``{guid, name, status, changed}`` where ``changed``
+            lists only the fields that actually changed.
+
+        Raises:
+            ValueError: taxtable not found; no fields supplied;
+                new_name collision; entry validation failure;
+                in-use taxtable without ``force=True``.
+        """
+        if new_name is None and entries is None:
+            raise ValueError(
+                "update_taxtable requires at least one of "
+                "new_name or entries."
+            )
+
+        from piecash.business.tax import TaxtableEntry
+
+        with self.open(readonly=False) as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            tt_guid = tt.guid
+
+            # Capture before-state for the audit log (entries
+            # snapshot serialized eagerly so detach doesn't bite
+            # the formatter at write time).
+            before_entries = [
+                self._taxtable_entry_to_dict(
+                    e,
+                    account_paths={
+                        e.account_guid: e.account.fullname,
+                    },
+                )
+                for e in tt.entries
+            ]
+            self._stage_audit_before({
+                "name": tt.name,
+                "entries": before_entries,
+            })
+
+            changed: dict = {}
+
+            if new_name is not None and new_name != tt.name:
+                collision = self._find_taxtable(book, new_name)
+                if collision and collision.guid != tt.guid:
+                    raise ValueError(
+                        f"Taxtable {new_name!r} already exists "
+                        f"(guid={collision.guid[:8]})"
+                    )
+                changed["name"] = {
+                    "before": tt.name, "after": new_name,
+                }
+                tt.name = new_name
+
+            if entries is not None:
+                refcount = self._compute_taxtable_refcount(
+                    book, tt_guid,
+                )
+                if refcount > 0 and not force:
+                    raise ValueError(
+                        f"Taxtable {name!r} is referenced by "
+                        f"{refcount} entries. Replacing its "
+                        f"entries changes the tax math for "
+                        f"FUTURE entries on those documents — "
+                        f"existing posted invoices retain their "
+                        f"original splits. Pass ``force=True`` "
+                        f"to proceed."
+                    )
+                resolved = self._validate_taxtable_entries(
+                    book, entries,
+                )
+                # Replacing via slice assignment relies on the
+                # entries relation's ``cascade="all, delete-orphan"``
+                # to remove the displaced rows. The new TaxtableEntry
+                # objects auto-register with the taxtable via the
+                # back_populates relation; no explicit session.add()
+                # needed.
+                tt.entries[:] = [
+                    TaxtableEntry(
+                        type=r["type"],
+                        amount=r["amount"],
+                        account=r["account"],
+                    )
+                    for r in resolved
+                ]
+                # Flush so the new entries' ``account_guid`` FK and
+                # autoincrement ``id`` columns are populated before
+                # we serialize the after-state. Pre-flush,
+                # ``e.account_guid`` is None on the new entries and
+                # ``_taxtable_entry_to_dict`` would drop the resolved
+                # ``account`` path. Matches the explicit flush in
+                # ``create_taxtable``.
+                book.flush()
+                after_entries = [
+                    self._taxtable_entry_to_dict(
+                        e,
+                        account_paths={
+                            r["account"].guid: r["account"].fullname
+                            for r in resolved
+                        },
+                    )
+                    for e in tt.entries
+                ]
+                changed["entries"] = {
+                    "before": before_entries,
+                    "after": after_entries,
+                }
+
+            book.save()
+
+            if not changed:
+                return {
+                    "guid": tt_guid,
+                    "name": name,
+                    "status": "unchanged",
+                }
+
+            return {
+                "guid": tt_guid,
+                "name": new_name if new_name else name,
+                "status": "updated",
+                "changed": changed,
+            }
+
+    def delete_taxtable(self, name: str) -> dict:
+        """Delete a tax table.
+
+        Refuses when the SQL-computed refcount is > 0 — see the
+        Refcount Discipline note in the section header. Voided
+        invoices still pin their taxtables. The entries-relation
+        ``cascade="all, delete-orphan"`` cleans up child
+        TaxtableEntry rows automatically.
+
+        Args:
+            name: Taxtable name.
+
+        Returns:
+            ``{guid, name, status='deleted'}``.
+
+        Raises:
+            ValueError: taxtable not found, or refcount > 0 with a
+                clear message naming the count.
+        """
+        from piecash.business.tax import Taxtable
+
+        with self.open(readonly=False) as book:
+            tt = self._find_taxtable(book, name)
+            if not tt:
+                raise ValueError(f"Taxtable not found: {name!r}")
+            tt_guid = tt.guid
+
+            refcount = self._compute_taxtable_refcount(book, tt_guid)
+            if refcount > 0:
+                raise ValueError(
+                    f"Cannot delete taxtable {name!r}: {refcount} "
+                    f"entries reference it. Remove or re-assign "
+                    f"those entries first. (Note: voided invoices "
+                    f"still pin their taxtables — voided entry "
+                    f"rows persist for audit-trail purposes.)"
+                )
+
+            # Capture serializable snapshot for the audit log
+            # before delete (entries are detached after save).
+            self._stage_audit_before({
+                "name": name,
+                "entries": [
+                    self._taxtable_entry_to_dict(
+                        e,
+                        account_paths={
+                            e.account_guid: e.account.fullname,
+                        },
+                    )
+                    for e in tt.entries
+                ],
+            })
+
+            book.session.delete(tt)
+            book.save()
+
+            from gnucash_mcp.book._base import _verify_delete
+            _verify_delete(
+                book.session, Taxtable.__table__,
+                {"guid": tt_guid},
+                f"Taxtable {name!r}",
+            )
+
+            return {
+                "guid": tt_guid,
+                "name": name,
+                "status": "deleted",
+            }
 
     # ── Invoice / Bill creation, posting, payment ─────────────────
     #
@@ -3116,6 +4075,8 @@ class BusinessMixin:
         quantity: str,
         price: str,
         owner_type: str | None = None,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item to a credit note.
 
@@ -3172,6 +4133,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
         # Surface the credit_note_id key in the response (the
         # base helper returns invoice_id / bill_id based on
@@ -3282,6 +4245,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Shared implementation behind ``add_invoice_entry`` and
         ``add_bill_entry``. The two methods were 90% duplicated
@@ -3291,9 +4256,34 @@ class BusinessMixin:
         helper takes ``owner_type`` (2=customer invoice, 4=vendor
         bill), looks up the per-doc config in ``_ENTRY_CONFIG``,
         and writes the entry.
+
+        **Taxtable wire-up (commit 4 of the v1.3 taxtable arc):**
+
+        When ``taxtable`` is given, the entry is marked taxable and
+        the resolved taxtable's GUID is written to ``i_taxtable``
+        or ``b_taxtable`` (side-dependent). ``tax_included`` flags
+        whether the line price represents pre-tax (False, default)
+        or gross (True) — the posting math in
+        ``_get_invoice_entries_and_total`` uses this to decide
+        whether to extract pretax from gross or add tax on top.
+
+        ``tax_included=True`` without ``taxtable`` raises — silently
+        treating it as no-op would drop the caller's signal that
+        they thought they were enabling tax.
+
+        The taxtable's stored ``refcount`` column is incremented
+        post-insert to keep GnuCash desktop's bookkeeping in sync
+        (our own lifecycle checks use SQL-computed counts, but the
+        desktop UI reads the stored value).
         """
         import uuid
         from piecash.business.invoice import Entry
+
+        if tax_included and not taxtable:
+            raise ValueError(
+                "tax_included=True requires a taxtable. Specify "
+                "which taxtable applies, or omit tax_included."
+            )
 
         cfg = self._ENTRY_CONFIG[owner_type]
         # Both vendor bills (4) and employee expense vouchers (5)
@@ -3353,18 +4343,42 @@ class BusinessMixin:
             p_num, p_denom = self._decimal_to_num_denom(unit_price)
             entry_guid = uuid.uuid4().hex
 
+            # Resolve the taxtable upfront so a missing-taxtable
+            # error fires before any write. The resolved Taxtable
+            # is also captured so we can bump its refcount after
+            # the INSERT succeeds.
+            tt_obj = None
+            if taxtable:
+                tt_obj = self._find_taxtable(book, taxtable)
+                if not tt_obj:
+                    raise ValueError(
+                        f"Taxtable not found: {taxtable!r}"
+                    )
+
+            taxable_int = 1 if taxtable else 0
+            taxincl_int = 1 if tax_included else 0
+            tt_guid = tt_obj.guid if tt_obj else None
+
             # The Entries table has parallel ``i_*`` (invoice side)
             # and ``b_*`` (bill side) column groups. Exactly one
             # group carries values for any given entry; the other
             # is zeroed/NULL. Voucher entries (owner_type=5) share
             # the ``b_*`` / ``bill`` group with vendor bills — see
             # ``is_bill_side`` above.
+            #
+            # Tax fields land on the same side as the price/account
+            # — invoice-side entries write ``i_taxtable``, bill-side
+            # write ``b_taxtable``. The other side stays zeroed.
             if is_bill_side:
                 values = dict(
                     i_acct=None, i_price_num=0, i_price_denom=1,
                     invoice=None,
                     b_acct=acct.guid, b_price_num=p_num,
                     b_price_denom=p_denom, bill=inv.guid,
+                    i_taxable=0, i_taxincluded=0, i_taxtable=None,
+                    b_taxable=taxable_int,
+                    b_taxincluded=taxincl_int,
+                    b_taxtable=tt_guid,
                 )
             else:
                 values = dict(
@@ -3372,6 +4386,10 @@ class BusinessMixin:
                     i_price_denom=p_denom, invoice=inv.guid,
                     b_acct=None, b_price_num=0, b_price_denom=1,
                     bill=None,
+                    i_taxable=taxable_int,
+                    i_taxincluded=taxincl_int,
+                    i_taxtable=tt_guid,
+                    b_taxable=0, b_taxincluded=0, b_taxtable=None,
                 )
 
             book.session.execute(
@@ -3388,12 +4406,6 @@ class BusinessMixin:
                     i_discount_denom=1,
                     i_disc_type="",
                     i_disc_how="",
-                    i_taxable=0,
-                    i_taxincluded=0,
-                    i_taxtable=None,
-                    b_taxable=0,
-                    b_taxincluded=0,
-                    b_taxtable=None,
                     b_paytype=0,
                     billable=0,
                     billto_type=0,
@@ -3407,6 +4419,14 @@ class BusinessMixin:
                 f"{cfg['label']} entry '{description}' on "
                 f"{cfg['label'].lower()} {doc_id}",
             )
+
+            # Refcount maintenance: GnuCash desktop reads
+            # Taxtable.refcount to know whether a taxtable is in
+            # use. Our own lifecycle checks use the SQL-computed
+            # count (authoritative), but we keep the stored value
+            # in sync so desktop interop stays clean.
+            if tt_obj is not None:
+                tt_obj.refcount = (tt_obj.refcount or 0) + 1
 
             book.save()
 
@@ -3428,6 +4448,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to a customer invoice.
 
@@ -3448,6 +4470,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def add_bill_entry(
@@ -3457,6 +4481,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to a vendor bill.
 
@@ -3466,6 +4492,12 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '50.00').
+            taxtable: Optional taxtable name. When given, the entry
+                contributes tax components per the taxtable's entries
+                at posting time.
+            tax_included: If True, ``price`` is treated as gross
+                (tax-inclusive); pretax extracted. If False (default),
+                ``price`` is pre-tax and tax adds on top.
 
         Returns:
             Dict with guid, bill_id, total, status.
@@ -3477,6 +4509,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def add_voucher_entry(
@@ -3486,6 +4520,8 @@ class BusinessMixin:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> dict:
         """Add a line item entry to an employee expense voucher.
 
@@ -3502,6 +4538,10 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1').
             price: Unit price as string (e.g., '42.50').
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_bill_entry``.
+            tax_included: If True, ``price`` is gross; pretax
+                extracted at posting.
 
         Returns:
             Dict with guid, voucher_id, total, status.
@@ -3513,6 +4553,8 @@ class BusinessMixin:
             description=description,
             quantity=quantity,
             price=price,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
 
     def list_invoices(
@@ -3702,17 +4744,79 @@ class BusinessMixin:
             for a in book.accounts:
                 account_paths[a.guid] = a.fullname
 
+            # Build taxtable_guid → name map only for taxtables
+            # actually referenced by this invoice's entries — skip
+            # the query entirely when no entries are tax-bearing,
+            # and otherwise filter to just the needed GUIDs. Saves
+            # an O(N-taxtables-in-book) scan on every get_invoice
+            # call against a large book. Same preload pattern as
+            # the Job lookup in list_invoices.
+            if is_bill:
+                needed_tt_guids = {
+                    r.b_taxtable for r in rows if r.b_taxtable
+                }
+            else:
+                needed_tt_guids = {
+                    r.i_taxtable for r in rows if r.i_taxtable
+                }
+            taxtable_names: dict[str, str] = {}
+            if needed_tt_guids:
+                from piecash.business.tax import Taxtable
+                for tt in book.session.query(Taxtable).filter(
+                    Taxtable.guid.in_(needed_tt_guids),
+                ).all():
+                    taxtable_names[tt.guid] = tt.name
+
             entries = [
                 self._entry_to_dict(
-                    r, is_bill=is_bill, account_paths=account_paths,
+                    r,
+                    is_bill=is_bill,
+                    account_paths=account_paths,
+                    taxtable_names=taxtable_names,
                 )
                 for r in rows
             ]
 
-            total = sum(
-                Decimal(e["quantity"]) * Decimal(e["price"])
-                for e in entries
-            )
+            # Tax summary: compute via the seam so the math
+            # matches what posting would produce. Empty entries
+            # raises ValueError on the seam — guarded by the
+            # outer rows check. If no entries are tax-bearing,
+            # tax_summary stays None and the response shape
+            # matches pre-v1.3 byte-for-byte.
+            tax_summary = None
+            if rows:
+                totals = self._get_invoice_entries_and_total(
+                    book, inv,
+                )
+                if totals["tax_breakdown"]:
+                    tax_summary = {
+                        "subtotal": str(totals["subtotal"]),
+                        "tax_total": str(
+                            sum(
+                                totals["tax_breakdown"].values(),
+                                Decimal(0),
+                            )
+                        ),
+                        "by_taxtable": {
+                            taxtable_names.get(g, g): str(v)
+                            for g, v in totals[
+                                "tax_by_taxtable"
+                            ].items()
+                        },
+                        "by_account": {
+                            account_paths.get(g, g): str(v)
+                            for g, v in totals[
+                                "tax_breakdown"
+                            ].items()
+                        },
+                        "total": str(totals["grand_total"]),
+                    }
+                # Customer-facing total uses the seam's
+                # grand_total (gross). Non-tax invoices fold to
+                # the same Q×P sum they had pre-v1.3.
+                total = totals["grand_total"]
+            else:
+                total = Decimal(0)
 
             # Three-way owner lookup — vouchers route to employees,
             # bills to vendors, invoices to customers. Pre-fix this
@@ -3750,6 +4854,7 @@ class BusinessMixin:
                 owner_name=owner_name,
                 applies_to=applies_to,
                 job=job_dict,
+                tax_summary=tax_summary,
             )
             result["total"] = str(total)
             return result
@@ -3861,9 +4966,9 @@ class BusinessMixin:
                     f"got {post_acct.type}"
                 )
 
-            _, acct_totals, grand_total = (
-                self._get_invoice_entries_and_total(book, inv)
-            )
+            totals = self._get_invoice_entries_and_total(book, inv)
+            acct_totals = totals["acct_totals"]
+            grand_total = totals["grand_total"]
 
             lot = Lot(
                 title=f"Invoice {inv.id}",
@@ -5005,6 +6110,38 @@ class BusinessMixin:
                 .where(entry_fk_col == inv_guid)
             ).scalar()
             if entry_count:
+                # Refcount maintenance: before deleting tax-bearing
+                # entries, tally per-taxtable counts and decrement
+                # the stored ``Taxtable.refcount`` so desktop interop
+                # stays clean. Both ``i_taxtable`` and ``b_taxtable``
+                # columns are checked — the side depends on
+                # owner_type, but a defensive UNION covers any
+                # legacy data oddities. SQL-computed counts in our
+                # own logic are unaffected by this step (they query
+                # the entries table fresh).
+                from sqlalchemy import text
+                tax_refs = book.session.execute(
+                    text(
+                        "SELECT taxtable_guid, COUNT(*) AS n FROM ("
+                        "  SELECT i_taxtable AS taxtable_guid FROM entries "
+                        f"  WHERE {entry_fk} = :guid AND i_taxtable IS NOT NULL "
+                        "  UNION ALL "
+                        "  SELECT b_taxtable AS taxtable_guid FROM entries "
+                        f"  WHERE {entry_fk} = :guid AND b_taxtable IS NOT NULL "
+                        ") AS refs GROUP BY taxtable_guid"
+                    ),
+                    {"guid": inv_guid},
+                ).fetchall()
+                for ref in tax_refs:
+                    book.session.execute(
+                        text(
+                            "UPDATE taxtables "
+                            "SET refcount = MAX(0, refcount - :n) "
+                            "WHERE guid = :guid"
+                        ),
+                        {"n": ref.n, "guid": ref.taxtable_guid},
+                    )
+
                 book.session.execute(
                     Entry.__table__.delete().where(entry_fk_col == inv_guid)
                 )
@@ -5722,9 +6859,9 @@ class BusinessMixin:
                     continue
 
                 try:
-                    _, _, grand_total = (
-                        self._get_invoice_entries_and_total(book, inv)
-                    )
+                    grand_total = self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"]
                 except ValueError:
                     grand_total = abs(balance)
 
@@ -5891,9 +7028,9 @@ class BusinessMixin:
                 # than aborting the whole report — matches the
                 # _invoice_to_compact_line defensive shape.
                 try:
-                    _, _, billed = (
-                        self._get_invoice_entries_and_total(book, inv)
-                    )
+                    billed = self._get_invoice_entries_and_total(
+                        book, inv,
+                    )["grand_total"]
                 except (ValueError, AttributeError):
                     billed = Decimal("0")
 
@@ -6073,11 +7210,9 @@ class BusinessMixin:
                             break
 
                 try:
-                    _, _, total = (
-                        self._get_invoice_entries_and_total(
-                            book, bill
-                        )
-                    )
+                    total = self._get_invoice_entries_and_total(
+                        book, bill,
+                    )["grand_total"]
                 except ValueError:
                     # Empty/corrupted entries — fall back to the
                     # lot balance (computed above). Pre-fix this

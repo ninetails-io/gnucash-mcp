@@ -347,6 +347,142 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(classification="write", operation="create", entity_type="taxtable")
+    def create_taxtable(
+        name: str,
+        entries: list[dict],
+    ) -> str:
+        """Create a new sales-tax table.
+
+        A taxtable holds one or more entries. Each entry contributes
+        either a percentage rate or a flat-value surcharge routed to
+        a specific GL account (ASSET for input-tax credit, LIABILITY
+        for output sales tax payable). Multi-entry composites (e.g.,
+        GST 5% + PST 7%) produce multiple tax splits per line at
+        posting time.
+
+        Args:
+            name: Taxtable name, unique within the book
+                (e.g., "CA Sales 7.25%", "BC GST+PST").
+            entries: List of {type, amount, account} dicts.
+                ``type``: "value" or "percentage".
+                ``amount``: positive decimal as string. Percentages
+                are the rate ("5.00" = 5%, not "0.05").
+                ``account``: account path, %short-guid, or full GUID.
+                Must be ASSET or LIABILITY type. All entries on a
+                single taxtable must reference accounts in the same
+                commodity.
+
+        Example:
+            create_taxtable(
+                name="BC GST+PST",
+                entries=[
+                    {"type": "percentage", "amount": "5.00",
+                     "account": "Liabilities:GST Payable"},
+                    {"type": "percentage", "amount": "7.00",
+                     "account": "Liabilities:PST Payable"},
+                ],
+            )
+        """
+        book = get_book()
+        result = book.create_taxtable(name=name, entries=entries)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def list_taxtables(
+        verbose: bool = False,
+    ) -> str:
+        """List all sales-tax tables.
+
+        Compact format (default): one line per taxtable with name,
+        entry count, and per-entry rate→account routing. Verbose:
+        full JSON with resolved account paths and refcount.
+
+        Args:
+            verbose: If true, return full JSON for each taxtable.
+        """
+        book = get_book()
+        result = book.list_taxtables(compact=not verbose)
+        if verbose:
+            return json.dumps(result, indent=2)
+        return result
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
+    def get_taxtable(name: str) -> str:
+        """Get full details for one sales-tax table.
+
+        Returns guid, name, refcount (count of Entry rows
+        referencing it — voided invoices still count), and the
+        resolved entry list with account paths.
+
+        Args:
+            name: Taxtable name.
+        """
+        book = get_book()
+        result = book.get_taxtable(name=name)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="update", entity_type="taxtable")
+    def update_taxtable(
+        name: str,
+        new_name: str | None = None,
+        entries: list[dict] | None = None,
+        force: bool = False,
+    ) -> str:
+        """Update a sales-tax table's name and/or entries.
+
+        Diff-style response: only changed fields are returned.
+
+        **Entry replacement on a taxtable that's already in use** is
+        destructive to FUTURE entries' tax math. Existing posted
+        invoices retain their original splits (splits are stored,
+        not derived), but new entries on any document will use the
+        replacement entries' rates. When refcount > 0 and
+        ``entries`` is given, ``force=True`` is required to proceed.
+
+        Args:
+            name: Current taxtable name.
+            new_name: New name (optional).
+            entries: Replacement entry list (optional). Same shape
+                and validation as ``create_taxtable``.
+            force: Required to replace entries when the taxtable
+                is already referenced by document entries.
+        """
+        book = get_book()
+        result = book.update_taxtable(
+            name=name,
+            new_name=new_name,
+            entries=entries,
+            force=force,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="taxtable")
+    def delete_taxtable(name: str) -> str:
+        """Delete a sales-tax table.
+
+        Refuses when any Entry row references the taxtable (computed
+        via SQL on the entries table). Voided invoices still pin
+        their taxtables — voided entry rows persist for audit-trail
+        purposes. Remove or re-assign referencing entries first.
+
+        Args:
+            name: Taxtable name.
+        """
+        book = get_book()
+        result = book.delete_taxtable(name=name)
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="write", operation="create", entity_type="invoice")
     def create_invoice(
         customer_id: str,
@@ -429,6 +565,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a customer invoice.
 
@@ -441,11 +579,19 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1", "2.5").
             price: Unit price as decimal string (e.g., "100.00").
+            taxtable: Optional taxtable name. When given, the line
+                contributes tax components per the taxtable's entries
+                at posting time. Multi-entry taxtables (e.g., GST+PST)
+                produce one tax split per entry.
+            tax_included: If true, ``price`` is the gross (tax-included)
+                value; pretax extracted at posting. If false (default),
+                ``price`` is pre-tax and tax adds on top.
         """
         book = get_book()
         result = book.add_invoice_entry(
             invoice_id=invoice_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -458,6 +604,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a vendor bill.
 
@@ -470,11 +618,18 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1", "2.5").
             price: Unit price as decimal string (e.g., "50.00").
+            taxtable: Optional taxtable name. For vendor bills, the
+                tax component typically routes to an ASSET account
+                (input-tax credit receivable) per the taxtable's
+                entries.
+            tax_included: If true, ``price`` is gross; pretax extracted
+                at posting. If false (default), tax adds on top.
         """
         book = get_book()
         result = book.add_bill_entry(
             bill_id=bill_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -525,6 +680,8 @@ def register(mcp, get_book) -> None:
         description: str,
         quantity: str,
         price: str,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to an employee expense voucher.
 
@@ -539,11 +696,16 @@ def register(mcp, get_book) -> None:
             description: Line item description.
             quantity: Quantity as decimal string (e.g., "1").
             price: Unit price as decimal string (e.g., "42.50").
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_bill_entry``.
+            tax_included: If true, ``price`` is gross; pretax extracted
+                at posting.
         """
         book = get_book()
         result = book.add_voucher_entry(
             voucher_id=voucher_id, account=account,
             description=description, quantity=quantity, price=price,
+            taxtable=taxtable, tax_included=tax_included,
         )
         return _json(result)
 
@@ -636,6 +798,8 @@ def register(mcp, get_book) -> None:
         quantity: str,
         price: str,
         owner_type: str | None = None,
+        taxtable: str | None = None,
+        tax_included: bool = False,
     ) -> str:
         """Add a line item to a credit note.
 
@@ -656,6 +820,13 @@ def register(mcp, get_book) -> None:
             price: Unit price as decimal string.
             owner_type: Optional "customer" or "vendor"
                 disambiguator for ID collisions. Usually omitted.
+            taxtable: Optional taxtable name. Same semantics as
+                ``add_invoice_entry``; the credit-note flag inverts
+                tax-split direction at posting time so a refunded
+                tax-inclusive sale produces a debit to the tax-payable
+                account.
+            tax_included: If true, ``price`` is gross; pretax
+                extracted at posting.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -666,6 +837,8 @@ def register(mcp, get_book) -> None:
             quantity=quantity,
             price=price,
             owner_type=owner_type,
+            taxtable=taxtable,
+            tax_included=tax_included,
         )
         return _json(result)
 
