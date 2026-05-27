@@ -8,6 +8,7 @@ Logs are stored alongside the GnuCash book file:
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -30,6 +31,292 @@ _book_path_str: str | None = None
 def get_log_dir() -> Path | None:
     """Get the configured log directory path."""
     return _log_dir
+
+
+class _WriteRateLimiter:
+    """Token-bucket rate limiter for MCP write operations.
+
+    Refills at ``rate`` tokens per second up to ``burst`` capacity.
+    ``consume()`` is the hot path — thread-safe, returns whether
+    the call is allowed and (if not) how long until a token is
+    available so the response can include a useful retry hint.
+
+    Token bucket beats simple per-window counting because it
+    accommodates honest bursts (e.g., posting 5 invoices in quick
+    succession) while still throttling sustained runaway loops.
+    The burst capacity is the ceiling; the rate is the steady-
+    state allowance.
+    """
+
+    def __init__(self, rate: float, burst: int):
+        import threading
+        self.rate = float(rate)
+        self.burst = int(burst)
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> tuple[bool, float]:
+        """Try to consume one token.
+
+        Returns:
+            ``(allowed, retry_after_sec)`` where ``allowed`` is
+            True when a token was available (and consumed) and
+            False when the bucket is empty. ``retry_after_sec``
+            is meaningful only when not allowed — the wall-clock
+            seconds until the next full token would be available.
+        """
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(
+                self.burst,
+                self.tokens + elapsed * self.rate,
+            )
+            self.last_refill = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, 0.0
+            retry = (1.0 - self.tokens) / self.rate
+            return False, retry
+
+
+# Lazy module-level cache. Reset via reset_write_rate_limiter()
+# (callers: tests, ``setup_logging`` restart paths).
+_write_limiter: _WriteRateLimiter | None = None
+_write_limiter_initialized: bool = False
+
+
+def _get_write_rate_limiter() -> _WriteRateLimiter | None:
+    """Resolve the write rate limiter from env, caching the result.
+
+    Honors:
+      - ``GNUCASH_WRITE_RATE_LIMIT`` (tokens per second, positive
+        float). Absent or non-positive disables limiting entirely
+        — the cached return is ``None`` and the per-call check
+        becomes a fast nullity test.
+      - ``GNUCASH_WRITE_BURST`` (integer max bucket size; default
+        10). Allows the user to tolerate honest bursts above the
+        steady-state rate.
+
+    Default (no env vars): no limiting — writes proceed at full
+    speed, matching pre-Stage-6 behavior.
+    """
+    global _write_limiter, _write_limiter_initialized
+    if _write_limiter_initialized:
+        return _write_limiter
+
+    rate_str = os.environ.get("GNUCASH_WRITE_RATE_LIMIT")
+    if not rate_str:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    try:
+        rate = float(rate_str)
+    except ValueError:
+        # Non-numeric env value: treat as unset, log a warning
+        # via the debug logger so the user sees the typo.
+        logging.getLogger(DEBUG_LOGGER_NAME).warning(
+            f"GNUCASH_WRITE_RATE_LIMIT={rate_str!r} is not a "
+            f"valid number; rate limiting disabled."
+        )
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    if rate <= 0:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    burst_str = os.environ.get("GNUCASH_WRITE_BURST", "10")
+    try:
+        burst = max(1, int(burst_str))
+    except ValueError:
+        burst = 10
+
+    _write_limiter = _WriteRateLimiter(rate=rate, burst=burst)
+    _write_limiter_initialized = True
+    return _write_limiter
+
+
+def reset_write_rate_limiter() -> None:
+    """Drop the cached rate limiter so the next call re-reads env.
+
+    Test seam — production code reads env once per process start.
+    """
+    global _write_limiter, _write_limiter_initialized
+    _write_limiter = None
+    _write_limiter_initialized = False
+
+
+def redact_paths(text: str) -> str:
+    """Replace absolute filesystem paths with their basename when the
+    ``GNUCASH_REDACT_PATHS=1`` env var is set. Pass-through otherwise.
+
+    Targets the case where MCP error messages might be shared
+    externally (issue trackers, screenshots, public bug reports)
+    and the user doesn't want their filesystem layout leaking.
+    Default off — paths in errors are usually the most useful
+    debugging signal for local development. Opt-in posture
+    matches GNUCASH_LOG_DIR (no behavior change unless asked).
+
+    Redaction is basename-only: ``/Users/alice/Books/alex.gnucash``
+    becomes ``alex.gnucash``. The filename is preserved because
+    the user still needs to know *which* file errored — the
+    sensitive bit is the directory structure leading to it.
+
+    Both POSIX (``/``) and Windows (``C:\\path`` / ``C:/path``)
+    absolute paths are matched. Relative paths pass through
+    unchanged because they don't leak filesystem layout.
+
+    Args:
+        text: Error message or other string that may contain
+            absolute paths.
+
+    Returns:
+        ``text`` with absolute paths replaced by basename, or
+        unchanged when redaction is disabled.
+    """
+    if os.environ.get("GNUCASH_REDACT_PATHS") != "1":
+        return text
+
+    import re
+
+    # POSIX absolute paths: /foo/bar/baz.ext
+    # Stop at whitespace, quotes, or common delimiter chars.
+    posix_re = re.compile(r"/(?:[^\s/'\"<>]+/)+[^\s/'\"<>]+")
+    # Windows: C:\foo\bar.ext or C:/foo/bar.ext
+    win_re = re.compile(
+        r"[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+    )
+
+    def to_basename(m):
+        # Split on either separator so Windows paths matched on a
+        # POSIX-running host (where ``Path("C:\\...").name`` would
+        # return the whole string) still extract the leaf.
+        full = m.group(0).replace("\\", "/")
+        return full.rsplit("/", 1)[-1]
+
+    # Windows first (more specific prefix); then POSIX.
+    text = win_re.sub(to_basename, text)
+    text = posix_re.sub(to_basename, text)
+    return text
+
+
+def resolve_mcp_dir(book_path: Path | str) -> Path:
+    """Resolve the ``.mcp`` directory for audit / debug / backup storage.
+
+    Honors the ``GNUCASH_LOG_DIR`` environment override — when set,
+    that path is used directly (the user has opted into an explicit
+    location, typically a user-private directory outside the book's
+    folder). When unset, the directory is derived from
+    ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
+    sanity checks fire:
+
+      1. The parent directory must not be group- or world-writable
+         (no sticky-bit exemption: that bit prevents non-owner
+         deletion, but anyone with write access can still create
+         a malicious ``.mcp`` symlink). Pre-existing entries that
+         pass this check are still subject to (2).
+      2. If a ``.mcp`` entry already exists, it must be a real
+         directory owned by the current user — not a symlink, and
+         not owned by another uid.
+
+    Together these guard against the symlink-hijack vector where
+    a hostile co-located process pre-creates ``{book}.mcp`` as a
+    symlink to attacker-controlled storage before the server
+    runs; the subsequent ``mkdir(parents=True, exist_ok=True)``
+    would otherwise follow that symlink.
+
+    On Windows the checks are skipped (POSIX mode bits and uid
+    don't map cleanly); set ``GNUCASH_LOG_DIR`` explicitly if
+    hardening is needed there.
+
+    Args:
+        book_path: Path to the ``.gnucash`` file. Accepts ``str``
+            or ``Path``.
+
+    Returns:
+        Path to the ``.mcp`` directory. The caller creates
+        ``audit/``, ``debug/``, ``backups/`` subdirectories as
+        needed.
+
+    Raises:
+        ValueError: parent directory has unsafe permissions,
+            OR an existing ``.mcp`` is a symlink, OR is owned by
+            a different uid. ``GNUCASH_LOG_DIR`` set bypasses
+            all checks (explicit user opt-in).
+    """
+    env_override = os.environ.get("GNUCASH_LOG_DIR")
+    if env_override:
+        return Path(env_override).expanduser()
+
+    book_path = Path(book_path)
+    parent = book_path.parent
+    mcp_dir = parent / f"{book_path.name}.mcp"
+
+    if os.name == "posix":
+        try:
+            mode = parent.stat().st_mode
+            # 0o020 = group-write, 0o002 = world-write.
+            # Reject regardless of sticky bit: the sticky bit
+            # prevents non-owner *deletion/rename*, but any
+            # principal with write access to the parent can
+            # still *create* a new entry (e.g. a symlink named
+            # ``{book}.mcp`` pointing to attacker-controlled
+            # storage) before this process runs. The subsequent
+            # mkdir(parents=True, exist_ok=True) would follow
+            # that symlink. Sticky-bit-protected dirs like /tmp
+            # are explicitly unsafe for this use; set
+            # GNUCASH_LOG_DIR if the book really lives there.
+            if mode & 0o022:
+                raise ValueError(
+                    f"Refusing to use {parent} for logs/backups: "
+                    f"directory is group- or world-writable "
+                    f"(mode={oct(mode & 0o777)}). A hostile co-"
+                    f"located process could pre-create a "
+                    f"malicious .mcp symlink redirecting log "
+                    f"writes. Either tighten permissions "
+                    f"(chmod go-w {parent}) or set "
+                    f"GNUCASH_LOG_DIR to a user-private location."
+                )
+        except FileNotFoundError:
+            # Parent missing — let downstream mkdir surface
+            # the issue naturally with its own error.
+            pass
+
+        # Defense in depth: if a ``.mcp`` already exists at the
+        # derived path, require it to be a real directory owned
+        # by the current user. Catches the case where an earlier
+        # attack already pre-created the symlink and the parent
+        # has since been re-tightened.
+        try:
+            if mcp_dir.exists() or mcp_dir.is_symlink():
+                if mcp_dir.is_symlink():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: path is a "
+                        f"symlink. Logs/backups must live in a "
+                        f"real directory you own; a symlink "
+                        f"could redirect writes elsewhere. "
+                        f"Remove or replace it, or set "
+                        f"GNUCASH_LOG_DIR to a different path."
+                    )
+                st = mcp_dir.stat()
+                if st.st_uid != os.geteuid():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: directory "
+                        f"is owned by uid={st.st_uid}, not the "
+                        f"current user (uid={os.geteuid()}). "
+                        f"Logs/backups go to a directory you "
+                        f"own; mismatched ownership suggests an "
+                        f"earlier symlink/hijack attempt."
+                    )
+        except FileNotFoundError:
+            pass
+
+    return mcp_dir
 
 
 def setup_logging(
@@ -77,10 +364,12 @@ def setup_logging(
             "Set GNUCASH_BOOK_PATH environment variable."
         )
 
-    # Log directory lives alongside the book file
-    # e.g., /path/to/finances.gnucash -> /path/to/finances.gnucash.mcp/
-    book_path_obj = Path(book_path)
-    log_dir = book_path_obj.parent / f"{book_path_obj.name}.mcp"
+    # Log directory lives alongside the book file by default
+    # (e.g., /path/to/finances.gnucash → /path/to/finances.gnucash.mcp/),
+    # or wherever GNUCASH_LOG_DIR points if set. The helper also
+    # performs the parent-dir permission sanity check that
+    # defends against symlink-hijack on shared-user POSIX hosts.
+    log_dir = resolve_mcp_dir(book_path)
     _log_dir = log_dir
 
     now_local = datetime.now().astimezone()
@@ -1682,6 +1971,36 @@ def audit_log(
             logger = logging.getLogger(AUDIT_LOGGER_NAME)
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
+
+            # Write rate limit (Stage 6 #3). Default disabled —
+            # enabled when the user sets GNUCASH_WRITE_RATE_LIMIT.
+            # Checked BEFORE the auto-backup trigger and BEFORE
+            # the pre-clear of staged audit state: a rate-limited
+            # call hasn't started the tool, so it shouldn't
+            # disturb the next call's audit-staging slot or
+            # provoke a backup snapshot.
+            if classification == "write":
+                limiter = _get_write_rate_limiter()
+                if limiter is not None:
+                    allowed, retry = limiter.consume()
+                    if not allowed:
+                        debug_logger.warning(
+                            f"Write rate limit hit on "
+                            f"{func.__name__}; retry in "
+                            f"{retry:.1f}s."
+                        )
+                        return json.dumps({
+                            "error": (
+                                f"Write rate limit exceeded "
+                                f"(retry in {retry:.1f}s). "
+                                f"Configured via "
+                                f"GNUCASH_WRITE_RATE_LIMIT="
+                                f"{os.environ.get('GNUCASH_WRITE_RATE_LIMIT')} "
+                                f"tokens/sec."
+                            ),
+                            "error_type": "rate_limited",
+                            "retry_after_seconds": round(retry, 2),
+                        })
 
             # Defense-in-depth: clear any previously-staged audit
             # before-state at the TOP of the wrapper. The post-call

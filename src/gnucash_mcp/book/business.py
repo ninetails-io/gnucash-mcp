@@ -4985,7 +4985,14 @@ class BusinessMixin:
                     book, inv.owner_guid
                 )
             owner_name = owner.name if owner else f"Invoice {inv.id}"
-            txn_desc = description or owner_name
+            # ``description=None`` (the default) falls back to the
+            # owner's name — historical behavior. An explicit ``""``
+            # is treated as "use an empty description on purpose"
+            # so the caller can deliberately blank the field
+            # without inheriting the owner name. Same pattern
+            # ``pay_invoice`` uses; pre-fix here was ``or owner_name``
+            # which collapsed "" into the fallback.
+            txn_desc = description if description is not None else owner_name
 
             parsed_due = (
                 date.fromisoformat(due_date) if due_date else None

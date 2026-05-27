@@ -264,6 +264,14 @@ def safe_tool(func: Callable) -> Callable:
     crashing the MCP server.
     """
 
+    # Path redaction is applied at the MCP boundary (response
+    # going out to the LLM) but NOT to the internal logger.error
+    # calls — local logs benefit from full paths for debugging,
+    # MCP responses are the surface that gets shared externally.
+    # Helper imported lazily to avoid a circular import; the
+    # logging_config module is the foundational layer.
+    from gnucash_mcp.logging_config import redact_paths
+
     @wraps(func)
     def wrapper(*args, **kwargs) -> str:
         try:
@@ -272,7 +280,7 @@ def safe_tool(func: Callable) -> Callable:
             logger.warning(f"Lock error in {func.__name__}: {e}")
             return _json(
                 {
-                    "error": str(e),
+                    "error": redact_paths(str(e)),
                     "error_type": "lock_error",
                     "suggestion": "Close GnuCash application and try again.",
                 }
@@ -281,14 +289,17 @@ def safe_tool(func: Callable) -> Callable:
             logger.error(f"File not found in {func.__name__}: {e}")
             return _json(
                 {
-                    "error": str(e),
+                    "error": redact_paths(str(e)),
                     "error_type": "file_not_found",
                     "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
                 }
             )
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
-            return _json({"error": str(e), "error_type": "validation_error"})
+            return _json({
+                "error": redact_paths(str(e)),
+                "error_type": "validation_error",
+            })
         except RuntimeError as e:
             # ``_verify_write`` / ``_verify_composite_write`` /
             # ``_verify_delete`` and the per-method
@@ -308,7 +319,9 @@ def safe_tool(func: Callable) -> Callable:
                 )
                 return _json(
                     {
-                        "error": f"Write verification failed: {e}",
+                        "error": redact_paths(
+                            f"Write verification failed: {e}"
+                        ),
                         "error_type": "write_verification_failed",
                     }
                 )
@@ -319,7 +332,9 @@ def safe_tool(func: Callable) -> Callable:
             )
             return _json(
                 {
-                    "error": f"Unexpected error: {type(e).__name__}: {e}",
+                    "error": redact_paths(
+                        f"Unexpected error: {type(e).__name__}: {e}"
+                    ),
                     "error_type": "unexpected_error",
                 }
             )
@@ -329,7 +344,9 @@ def safe_tool(func: Callable) -> Callable:
             )
             return _json(
                 {
-                    "error": f"Unexpected error: {type(e).__name__}: {e}",
+                    "error": redact_paths(
+                        f"Unexpected error: {type(e).__name__}: {e}"
+                    ),
                     "error_type": "unexpected_error",
                 }
             )

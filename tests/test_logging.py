@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from gnucash_mcp.logging_config import (
     DEBUG_LOGGER_NAME,
     _resolve_entry_field,
     audit_log,
+    resolve_mcp_dir,
     setup_logging,
 )
 
@@ -1299,3 +1301,303 @@ class TestCreateSignalsCollector:
             f"find the source, one to run duplicates/recent against "
             f"the resulting amounts); got {call_count[0]}."
         )
+
+
+class TestResolveMcpDir:
+    """Stage 6 — path-traversal hardening on the .mcp directory
+    resolver. Audit / debug / backup all flow through this helper
+    so an attacker who can write to the book's parent directory
+    can't redirect log writes via a pre-created symlink."""
+
+    def test_default_derivation(self, tmp_path):
+        """Without GNUCASH_LOG_DIR, the .mcp dir is derived from
+        the book path's parent and name."""
+        book = tmp_path / "alex.gnucash"
+        # Don't actually need the file to exist; the helper
+        # only stats the parent.
+        result = resolve_mcp_dir(book)
+        assert result == tmp_path / "alex.gnucash.mcp"
+
+    def test_env_override_used(self, tmp_path, monkeypatch):
+        """GNUCASH_LOG_DIR takes precedence over derivation."""
+        override = tmp_path / "elsewhere"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
+        result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+        assert result == override
+
+    def test_env_override_expands_tilde(self, monkeypatch):
+        """GNUCASH_LOG_DIR=~/foo expands to the user's home."""
+        monkeypatch.setenv("GNUCASH_LOG_DIR", "~/my-logs")
+        result = resolve_mcp_dir("/anywhere/book.gnucash")
+        assert "~" not in str(result)
+        assert str(result).endswith("my-logs")
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_rejects_world_writable_parent(self, tmp_path):
+        """A book in a 777 parent directory raises a clear error.
+
+        Threat model: hostile co-located process pre-creates
+        ``alex.gnucash.mcp`` as a symlink to attacker-controlled
+        storage before the server runs.
+        """
+        # Make tmp_path world-writable (without sticky bit).
+        os.chmod(tmp_path, 0o777)
+        book = tmp_path / "alex.gnucash"
+        try:
+            with pytest.raises(ValueError, match="world-writable"):
+                resolve_mcp_dir(book)
+        finally:
+            # Restore for pytest cleanup.
+            os.chmod(tmp_path, 0o755)
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_accepts_user_only_writable_parent(self, tmp_path):
+        """Default tmp_path permissions are safe."""
+        # tmp_path defaults to 0o700 on most pytest configs.
+        result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+        assert result == tmp_path / "alex.gnucash.mcp"
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX permission check skipped on non-Unix",
+    )
+    def test_sticky_bit_does_not_exempt(self, tmp_path):
+        """Sticky-bit directories (like /tmp) are STILL rejected.
+        Copilot PR #91 review: the sticky bit prevents non-owner
+        deletion/rename but does not prevent non-owner creation
+        of new entries — a hostile process can still pre-create
+        ``{book}.mcp`` as a symlink in /tmp before the server
+        runs. Set GNUCASH_LOG_DIR explicitly if the book lives
+        in a sticky-bit dir."""
+        os.chmod(tmp_path, 0o1777)
+        try:
+            with pytest.raises(ValueError, match="world-writable"):
+                resolve_mcp_dir(tmp_path / "alex.gnucash")
+        finally:
+            os.chmod(tmp_path, 0o755)
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="POSIX symlink check skipped on non-Unix",
+    )
+    def test_existing_mcp_symlink_rejected(self, tmp_path):
+        """Defense in depth: if a ``.mcp`` already exists at the
+        derived path and is a symlink, refuse. Catches the case
+        where an earlier symlink-hijack attempt left an artifact
+        even after the parent's permissions were tightened."""
+        book = tmp_path / "alex.gnucash"
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (tmp_path / "alex.gnucash.mcp").symlink_to(target)
+        with pytest.raises(ValueError, match="symlink"):
+            resolve_mcp_dir(book)
+
+    def test_env_override_bypasses_perm_check(
+        self, tmp_path, monkeypatch,
+    ):
+        """The env-override path lets a user opt into any
+        location they want — the perm check is for the derived
+        path only. Setting GNUCASH_LOG_DIR is an explicit
+        statement of trust."""
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o777)
+        override = tmp_path / "explicit"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
+        try:
+            # Should not raise despite the world-writable
+            # parent — env override bypasses the check.
+            result = resolve_mcp_dir(tmp_path / "alex.gnucash")
+            assert result == override
+        finally:
+            if os.name == "posix":
+                os.chmod(tmp_path, 0o755)
+
+
+class TestRedactPaths:
+    """Stage 6 — path leak redaction. When GNUCASH_REDACT_PATHS=1,
+    absolute paths in error messages are reduced to their basename
+    so externally-shared MCP responses don't leak filesystem
+    layout. Default off (opt-in)."""
+
+    from gnucash_mcp.logging_config import redact_paths
+    _rp = staticmethod(redact_paths)
+
+    def test_passthrough_when_unset(self, monkeypatch):
+        """Without the env var, text is returned unchanged."""
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"
+        assert self._rp(text) == text
+
+    def test_passthrough_when_set_to_zero(self, monkeypatch):
+        """Only the exact value '1' enables redaction."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "0")
+        text = "Path: /Users/alice/secret.gnucash"
+        assert self._rp(text) == text
+
+    def test_posix_path_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"
+        result = self._rp(text)
+        assert "/Users/stephen" not in result
+        assert "alex.gnucash" in result
+
+    def test_windows_path_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = r"Cannot open C:\Users\Alice\Documents\book.gnucash"
+        result = self._rp(text)
+        assert r"C:\Users" not in result
+        assert "book.gnucash" in result
+
+    def test_windows_forward_slash_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Path: C:/Users/Alice/book.gnucash"
+        result = self._rp(text)
+        assert "/Alice" not in result
+        assert "book.gnucash" in result
+
+    def test_relative_paths_pass_through(self, monkeypatch):
+        """Relative paths don't leak filesystem layout — left alone."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Failed to read samples/book.gnucash from working dir"
+        result = self._rp(text)
+        # The relative path itself doesn't get rewritten (no leading
+        # / or drive letter). "samples/book.gnucash" stays intact.
+        assert "samples/book.gnucash" in result
+
+    def test_multiple_paths_in_one_message(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = (
+            "Backup verification failed: "
+            "/Users/alice/books/source.gnucash -> "
+            "/Users/alice/backups/snapshot.db"
+        )
+        result = self._rp(text)
+        assert "/Users/alice" not in result
+        assert "source.gnucash" in result
+        assert "snapshot.db" in result
+
+    def test_path_in_quotes_redacted(self, monkeypatch):
+        """Paths inside quotes are caught at quote boundaries."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Lock on file '/Users/alice/book.gnucash' detected"
+        result = self._rp(text)
+        assert "/Users" not in result
+        assert "book.gnucash" in result
+
+    def test_no_paths_no_change(self, monkeypatch):
+        """Plain error messages with no paths pass through unchanged."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Account not found: Expenses:Coffee"
+        # Colon between words isn't a Windows drive letter, but
+        # the regex requires alphabetic single char + ":" + slash.
+        assert self._rp(text) == text
+
+
+class TestWriteRateLimiter:
+    """Stage 6 — write rate-limiting at the audit_log decorator.
+    Token bucket; disabled by default; opt-in via
+    GNUCASH_WRITE_RATE_LIMIT env var."""
+
+    def _setup_decorated_tool(self):
+        """Build a minimal write-classified tool decorated by
+        audit_log. Returns the wrapped function."""
+        @audit_log(classification="write", operation="create",
+                   entity_type="transaction")
+        def fake_write(description: str = "x") -> str:
+            return json.dumps({"guid": "abc12345", "status": "created"})
+        return fake_write
+
+    def test_no_limit_by_default(self, monkeypatch, temp_book_path):
+        """Without the env var, writes proceed unthrottled."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.delenv("GNUCASH_WRITE_RATE_LIMIT", raising=False)
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        tool = self._setup_decorated_tool()
+        # 50 consecutive writes — all succeed.
+        for _ in range(50):
+            result = json.loads(tool(description="x"))
+            assert "error" not in result
+
+    def test_rate_limit_kicks_in(self, monkeypatch, temp_book_path):
+        """Burst of 3 with rate 0.1 tok/s: 4th write rate-limited."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "0.1")
+        monkeypatch.setenv("GNUCASH_WRITE_BURST", "3")
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        tool = self._setup_decorated_tool()
+        # First three drain the burst capacity.
+        for i in range(3):
+            r = json.loads(tool(description=f"x{i}"))
+            assert "error" not in r, f"call {i} unexpectedly limited"
+        # Fourth hits the limit.
+        r = json.loads(tool(description="x3"))
+        assert r.get("error_type") == "rate_limited"
+        assert "retry_after_seconds" in r
+        # Retry is positive (some real wall-clock delay).
+        assert r["retry_after_seconds"] > 0
+
+    def test_reads_never_rate_limited(self, monkeypatch, temp_book_path):
+        """Even with an aggressive write limit, reads are
+        unaffected. The decorator's gate is on classification."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "0.01")
+        monkeypatch.setenv("GNUCASH_WRITE_BURST", "1")
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+
+        @audit_log(classification="read")
+        def fake_read() -> str:
+            return json.dumps({"ok": True})
+
+        # 20 reads in a row — none rate-limited.
+        for _ in range(20):
+            r = json.loads(fake_read())
+            assert "error" not in r
+
+    def test_invalid_env_value_disables(self, monkeypatch):
+        """A non-numeric env value disables the limiter (with a
+        debug-log warning) rather than crashing."""
+        from gnucash_mcp.logging_config import (
+            _get_write_rate_limiter,
+            reset_write_rate_limiter,
+        )
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "asdf")
+        reset_write_rate_limiter()
+        assert _get_write_rate_limiter() is None
+
+    def test_zero_or_negative_rate_disables(self, monkeypatch):
+        from gnucash_mcp.logging_config import (
+            _get_write_rate_limiter,
+            reset_write_rate_limiter,
+        )
+        for val in ("0", "0.0", "-5"):
+            monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", val)
+            reset_write_rate_limiter()
+            assert _get_write_rate_limiter() is None, f"{val} should disable"
+
+    def test_token_bucket_refills(self, monkeypatch):
+        """Direct unit test on the bucket: after waiting, tokens
+        refill at the configured rate."""
+        from gnucash_mcp.logging_config import _WriteRateLimiter
+        limiter = _WriteRateLimiter(rate=10.0, burst=2)
+        # Drain the bucket.
+        assert limiter.consume() == (True, 0.0)
+        assert limiter.consume() == (True, 0.0)
+        # Bucket empty — third call denied.
+        allowed, retry = limiter.consume()
+        assert not allowed
+        # Retry should be small (~0.1s for 1 token at 10 tok/s).
+        assert 0.05 < retry < 0.2
+        # Wait for refill (sleep slightly longer than retry).
+        time.sleep(0.15)
+        # Now allowed.
+        allowed, _ = limiter.consume()
+        assert allowed
