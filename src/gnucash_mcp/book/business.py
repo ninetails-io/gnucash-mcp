@@ -4744,12 +4744,28 @@ class BusinessMixin:
             for a in book.accounts:
                 account_paths[a.guid] = a.fullname
 
-            # Build taxtable_guid → name map for entries that
-            # reference taxtables. One query, like account_paths.
-            from piecash.business.tax import Taxtable
+            # Build taxtable_guid → name map only for taxtables
+            # actually referenced by this invoice's entries — skip
+            # the query entirely when no entries are tax-bearing,
+            # and otherwise filter to just the needed GUIDs. Saves
+            # an O(N-taxtables-in-book) scan on every get_invoice
+            # call against a large book. Same preload pattern as
+            # the Job lookup in list_invoices.
+            if is_bill:
+                needed_tt_guids = {
+                    r.b_taxtable for r in rows if r.b_taxtable
+                }
+            else:
+                needed_tt_guids = {
+                    r.i_taxtable for r in rows if r.i_taxtable
+                }
             taxtable_names: dict[str, str] = {}
-            for tt in book.session.query(Taxtable).all():
-                taxtable_names[tt.guid] = tt.name
+            if needed_tt_guids:
+                from piecash.business.tax import Taxtable
+                for tt in book.session.query(Taxtable).filter(
+                    Taxtable.guid.in_(needed_tt_guids),
+                ).all():
+                    taxtable_names[tt.guid] = tt.name
 
             entries = [
                 self._entry_to_dict(

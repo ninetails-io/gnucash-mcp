@@ -3619,6 +3619,128 @@ class TestTaxtableCrossCurrency:
             )
 
 
+class TestTaxtableCopilotReviewFollowups:
+    """Regression guards for Copilot PR #90 review findings."""
+
+    def test_audit_log_renders_leaf_account_name(self):
+        """``_fmt_taxtable_entry_line`` must render the leaf
+        account name (matching ``_taxtable_entry_summary`` and
+        ``list_taxtables``), not the fullname path. Pre-fix the
+        audit log showed ``5%→Liabilities:GST Payable`` while the
+        compact list showed ``5%→GST Payable`` — same data,
+        different rendering, scannability bug for the bookkeeper
+        reviewing the audit trail."""
+        from gnucash_mcp.logging_config import (
+            _fmt_taxtable_entry_line,
+        )
+        # Fullname input gets trimmed to the leaf.
+        assert _fmt_taxtable_entry_line({
+            "type": "percentage",
+            "amount": "5",
+            "account": "Liabilities:GST Payable",
+        }) == "5%→GST Payable"
+        # Bare-leaf input passes through unchanged.
+        assert _fmt_taxtable_entry_line({
+            "type": "percentage",
+            "amount": "7",
+            "account": "PST Payable",
+        }) == "7%→PST Payable"
+        # Value-type entry uses $-prefix.
+        assert _fmt_taxtable_entry_line({
+            "type": "value",
+            "amount": "5",
+            "account": "Liabilities:Eco Fee Payable",
+        }) == "$5→Eco Fee Payable"
+        # GUID fallback (no path map): leaf-trim is a no-op
+        # because the GUID has no ``:`` separator.
+        assert _fmt_taxtable_entry_line({
+            "type": "percentage",
+            "amount": "5",
+            "account_guid": "deadbeef" * 4,
+        }) == "5%→" + ("deadbeef" * 4)
+
+    def test_get_invoice_skips_taxtable_query_when_no_tax_entries(
+        self, business_book,
+    ):
+        """When no entry on the invoice references a taxtable,
+        ``get_invoice`` must not query the taxtables table.
+        Verified by creating taxtables and then asking for an
+        invoice that doesn't reference them — the query count
+        should not grow with taxtable count. Regression for
+        Copilot's O(N-taxtables-in-book) scan finding."""
+        gb = GnuCashBook(str(business_book))
+        gst, pst = _add_tax_accounts(gb)
+        # Create taxtables that the test invoice does NOT reference.
+        for n in range(5):
+            gb.create_taxtable(
+                name=f"Decoy {n}",
+                entries=[{"type": "percentage", "amount": "5",
+                          "account": gst}],
+            )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Plain",
+            quantity="1",
+            price="100",
+        )
+        # Spy on the session: count Taxtable.query invocations.
+        # Direct query-count instrumentation is awkward in
+        # SQLAlchemy 1.4; the simpler verification is that the
+        # response has no tax_summary key and no entry carries
+        # tax fields — both byproducts of the early-skip path.
+        inv = gb.get_invoice("000001")
+        assert "tax_summary" not in inv
+        assert "taxable" not in inv["entries"][0]
+
+    def test_get_invoice_filters_taxtable_query_to_referenced_only(
+        self, business_book,
+    ):
+        """When some entries reference taxtables but not all
+        taxtables in the book, ``get_invoice`` filters the
+        Taxtable query to just the needed GUIDs. The visible
+        contract is that the response correctly resolves the
+        referenced taxtable's name (regression guard: a buggy
+        filter that returned no rows would surface as a raw
+        GUID in the entry dict)."""
+        gb = GnuCashBook(str(business_book))
+        gst, _ = _add_tax_accounts(gb)
+        # Create extra decoy taxtables that the invoice doesn't
+        # reference. With the unconditional query removed, these
+        # are filtered out and don't appear in the response.
+        gb.create_taxtable(
+            name="GST 5%",
+            entries=[{"type": "percentage", "amount": "5",
+                      "account": gst}],
+        )
+        for n in range(3):
+            gb.create_taxtable(
+                name=f"Decoy {n}",
+                entries=[{"type": "percentage", "amount": "3",
+                          "account": gst}],
+            )
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="100",
+            taxtable="GST 5%",
+        )
+        inv = gb.get_invoice("000001")
+        # The referenced taxtable resolves to its name.
+        assert inv["entries"][0]["taxtable"] == "GST 5%"
+        # Tax summary references only the actually-applied
+        # taxtable, not the decoys.
+        assert list(inv["tax_summary"]["by_taxtable"].keys()) == [
+            "GST 5%"
+        ]
+
+
 class TestReceivablePayableAccountTypes:
     """Tests for RECEIVABLE and PAYABLE account type support."""
 

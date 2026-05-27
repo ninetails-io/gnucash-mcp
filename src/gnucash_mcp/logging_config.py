@@ -802,13 +802,29 @@ def _fmt_taxtable_entry_line(e: dict) -> str:
     """Render one taxtable entry as ``5%→GST Payable`` or
     ``$5→Eco Fee Payable``. Mirrors the runtime
     ``_taxtable_entry_summary`` so audit-log rows look identical
-    to what list_taxtables prints."""
+    to what ``list_taxtables`` prints — leaf account name, no
+    parent path prefix.
+
+    Per CLAUDE.md the audit log canonicalizes account *parameter*
+    references to fullnames (so a ``%shortguid`` input renders as
+    ``Income:Sales``). This renderer is for taxtable-entry
+    *structure* (metadata about the taxtable itself, not a user
+    parameter), so the leaf-name convention matches the user's
+    mental model from ``list_taxtables`` and keeps audit lines
+    scannable.
+    """
     type_val = e.get("type", "")
     amount = e.get("amount", "")
     # account_paths-resolved (preferred) → "account"; falls back
     # to "account_guid" for entries serialized without the path
     # map (shouldn't happen via our book methods, but defensive).
     acct = e.get("account") or e.get("account_guid", "?")
+    # Trim to leaf name to match _taxtable_entry_summary's
+    # ``e.account.name`` output. A path "Liabilities:GST Payable"
+    # becomes "GST Payable"; a bare leaf or raw GUID passes
+    # through unchanged.
+    if ":" in acct:
+        acct = acct.rsplit(":", 1)[-1]
     if type_val == "percentage":
         return f"{amount}%→{acct}"
     return f"${amount}→{acct}"
