@@ -8378,6 +8378,135 @@ class TestMultiCurrencyBalances:
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
 
+    def test_spending_by_category_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Bookkeeper-found bug (v1.3 blocker): EUR-denominated
+        expense splits used to be summed as raw EUR alongside USD
+        — silent wrong totals on multi-currency books. With the
+        ``_split_in_default_currency`` conversion in place, the
+        EUR amount converts at the book's EUR/USD price."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR-denominated expense account and one EUR
+        # expense transaction, plus a EUR/USD price the converter
+        # can use.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            expenses = next(
+                a for a in bk.accounts
+                if a.fullname == "Expenses"
+            )
+            travel_eur = piecash.Account(
+                name="Travel EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add(travel_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin trip — €100",
+                post_date=date(2024, 6, 15),
+                splits=[
+                    piecash.Split(
+                        account=travel_eur,
+                        value="100", quantity="100",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="-100", quantity="-110",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD groceries: $200. New EUR travel: €100 ×
+        # 1.10 = $110. Total in default currency: $310.
+        result = gc_book.spending_by_category(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("310")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["categories"]
+        }
+        assert amounts["Expenses:Groceries"] == Decimal("200")
+        assert amounts["Expenses:Travel EUR"] == Decimal("110")
+
+    def test_income_by_source_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Mirror of the spending fix on the income side."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            income = next(
+                a for a in bk.accounts
+                if a.fullname == "Income"
+            )
+            consulting_eur = piecash.Account(
+                name="Consulting EUR", type="INCOME",
+                parent=income, commodity=eur,
+            )
+            bk.session.add(consulting_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin client — €500",
+                post_date=date(2024, 7, 1),
+                splits=[
+                    piecash.Split(
+                        account=consulting_eur,
+                        value="-500", quantity="-500",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="500", quantity="550",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD salary: $3000. New EUR consulting: €500 ×
+        # 1.10 = $550. Total in default currency: $3550.
+        result = gc_book.income_by_source(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("3550")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["sources"]
+        }
+        assert amounts["Income:Salary"] == Decimal("3000")
+        assert amounts["Income:Consulting EUR"] == Decimal("550")
+
 
 class TestCreateCommodity:
     """Tests for create_commodity method."""

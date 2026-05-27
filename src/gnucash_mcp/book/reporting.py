@@ -256,10 +256,18 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
+            # Convert each split to the book's default currency.
+            # Without this, a EUR expense in a USD-default book
+            # contributes raw EUR to the same totals dict as USD
+            # entries — silently wrong sums on multi-currency books.
+            factors = self._account_conversion_factors(book)
+
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
                 # Expense splits are positive when money is spent.
-                amount = split.quantity
+                amount = self._split_in_default_currency(
+                    split, account, factors.get(account.guid),
+                )
                 if amount <= 0:
                     continue
                 group_account = self._get_account_at_depth(
@@ -321,11 +329,18 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
+            # Convert each split to the book's default currency.
+            # Multi-currency-book correctness: see spending_by_category
+            # for the rationale — same bug, same fix.
+            factors = self._account_conversion_factors(book)
+
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
                 # Income splits are stored negative (money coming in);
                 # flip to positive for the "how much did I earn" view.
-                amount = -split.quantity
+                amount = -self._split_in_default_currency(
+                    split, account, factors.get(account.guid),
+                )
                 if amount <= 0:
                     continue
                 group_account = self._get_account_at_depth(
