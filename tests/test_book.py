@@ -7416,6 +7416,88 @@ class TestReconcileAccount:
         )
         assert len(unreconciled["splits"]) >= 1
 
+    def test_except_guids_requires_reconcile_all(self, test_book: Path):
+        """``except_guids`` only makes sense with bulk mode — in
+        targeted mode the caller already controls which splits
+        get reconciled."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="only valid with reconcile_all"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+                split_guids=["deadbeef00000000"],
+                except_guids=["cafef00d00000000"],
+            )
+
+    def test_except_guids_skips_listed_splits(self, test_book: Path):
+        """The common case: reconcile everything except one
+        pending split. Bookkeeper's example was a CareCredit
+        payoff with one ACH still in flight — list it in
+        except_guids and the statement balance ties cleanly."""
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled["splits"]) >= 2, (
+            "Test setup: need at least 2 unreconciled splits."
+        )
+        # Pick one to exclude — use its short prefix to also
+        # exercise the prefix-resolution path.
+        excluded = unreconciled["splits"][0]
+        excluded_guid = excluded["guid"]
+        excluded_amt = Decimal(excluded["amount"])
+        # Statement balance = sum of everything except the excluded.
+        remaining_total = sum(
+            (
+                Decimal(s["amount"])
+                for s in unreconciled["splits"]
+                if s["guid"] != excluded_guid
+            ),
+            Decimal("0"),
+        )
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(remaining_total),
+            reconcile_all=True,
+            except_guids=[excluded_guid[:8]],
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == (
+            len(unreconciled["splits"]) - 1
+        )
+        # The excluded split is still unreconciled.
+        after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        remaining_guids = {s["guid"] for s in after["splits"]}
+        assert excluded_guid in remaining_guids
+
+    def test_except_guids_unknown_prefix_ignored(self, test_book: Path):
+        """A prefix that doesn't resolve to any split is silently
+        dropped — the goal is \"exclude these if present\", and
+        a non-matching prefix has no effect on the set."""
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        # Bogus prefix — well-formed hex but doesn't exist.
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+            except_guids=["deadbeef" * 4],
+        )
+        # All splits reconciled despite the bogus exclusion.
+        assert result["splits_reconciled"] == len(unreconciled["splits"])
+
 
 class TestVoidTransaction:
     """Tests for void_transaction method."""
