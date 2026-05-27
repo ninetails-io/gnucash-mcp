@@ -48,57 +48,23 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "gnucash-mcp",
     instructions="""GnuCash MCP Server — Double-Entry Accounting Tools
-
 ORIENTATION:
-- Call get_book_summary first to understand the book's structure, currency, and account hierarchy.
-- Use list_accounts to find exact account paths before creating transactions.
+- Call get_book_summary first. It returns structure, currency, balances, warnings, and reconciliation status.
+- Use list_accounts to get exact paths and short GUIDs before writing.
 - Use search_transactions before creating to avoid duplicates.
-
-DOUBLE-ENTRY BASICS:
-- Every transaction has splits that MUST balance to zero.
-- Debits are positive for Asset/Expense accounts, negative for Liability/Income/Equity.
-- Credit card payment example: checking -200 (credit), credit card +200 (debit) — reduces both balances.
-- Income received: checking +3000 (debit), income -3000 (credit).
-
+- Every transaction has splits that MUST sum to zero.
 ACCOUNT REFERENCES:
-- Anywhere a tool takes an account, you can pass a full path
-  ("Expenses:Groceries"), a short GUID ("%2e78c86"), or a full
-  32-char GUID. All three resolve to the same account.
-- Short GUIDs are emitted by list_accounts at the start of each line:
-  "%2e78c86<TAB>Assets:Current Assets:Savings Account [BANK]". Reuse
-  them in subsequent calls — they're ~80% smaller than full paths.
-- Paths remain useful when you're naming a new account or when your
-  reasoning depends on the hierarchy. Short GUIDs win for everything
-  else (transactions, balances, slots, lots, invoices, budgets).
-- Paths are colon-delimited and case-sensitive.
-
-GUID PREFIXES (transactions, splits, etc.):
-- All tools accepting GUIDs also accept 8+ character prefixes.
-- Use the short prefix from list_transactions output — no need to look up full GUIDs.
-- Account short GUIDs are 7+ hex chars *with* a leading "%" marker.
-  Transaction/split GUID prefixes are bare hex (no marker).
-
-RECONCILIATION WORKFLOW:
-1. list_transactions for the account and date range
-2. Match each statement line to an existing transaction or create missing ones
-3. Verify balance matches statement with get_balance
-4. Use reconcile_account to mark splits as reconciled
-
-INVESTMENT WORKFLOW:
-1. create_lot for each purchase
-2. create_transaction with quantity (shares) and amount (cost)
-3. assign_split_to_lot to link the investment split
-4. create_price to record the share price
-5. calculate_lot_gain to check performance
-
-SLOTS (CUSTOM METADATA):
-- Use get_account_slots / set_account_slot to store per-account data like APR, credit limit, statement close day.
-- Values are stored as strings. Store numbers as strings: set_account_slot("...", "apr", "23.49").
-
-SAFETY:
-- Reconciled splits are protected. Use force=true only when intentionally modifying reconciled data.
-- void_transaction preserves audit trail. Prefer void over delete for posted transactions.
-- delete_account is blocked if account has children or transactions.
+- Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%2e78c86"), or full 32-char GUIDs.
+- list_accounts emits short GUIDs at line start: "%2e78c86\\tAssets:Savings [BANK]". Reuse them — ~80% smaller than paths.
+- Paths are colon-delimited, case-sensitive. Use paths when naming new accounts or reasoning about hierarchy; short GUIDs for everything else.
+- Account short GUIDs: 7+ hex chars with leading "%". Transaction/split GUIDs: 8+ bare hex prefix, no marker.
+DOUBLE-ENTRY SIGN CONVENTION:
+- Positive = debit (increases Asset/Expense, decreases Liability/Income/Equity).
+- Negative = credit (reverse).
+- Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
+INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
+SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,
 )
 
