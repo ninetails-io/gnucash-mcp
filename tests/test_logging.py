@@ -1398,3 +1398,83 @@ class TestResolveMcpDir:
         finally:
             if os.name == "posix":
                 os.chmod(tmp_path, 0o755)
+
+
+class TestRedactPaths:
+    """Stage 6 — path leak redaction. When GNUCASH_REDACT_PATHS=1,
+    absolute paths in error messages are reduced to their basename
+    so externally-shared MCP responses don't leak filesystem
+    layout. Default off (opt-in)."""
+
+    from gnucash_mcp.logging_config import redact_paths
+    _rp = staticmethod(redact_paths)
+
+    def test_passthrough_when_unset(self, monkeypatch):
+        """Without the env var, text is returned unchanged."""
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"
+        assert self._rp(text) == text
+
+    def test_passthrough_when_set_to_zero(self, monkeypatch):
+        """Only the exact value '1' enables redaction."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "0")
+        text = "Path: /Users/alice/secret.gnucash"
+        assert self._rp(text) == text
+
+    def test_posix_path_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"
+        result = self._rp(text)
+        assert "/Users/stephen" not in result
+        assert "alex.gnucash" in result
+
+    def test_windows_path_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = r"Cannot open C:\Users\Alice\Documents\book.gnucash"
+        result = self._rp(text)
+        assert r"C:\Users" not in result
+        assert "book.gnucash" in result
+
+    def test_windows_forward_slash_redacted(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Path: C:/Users/Alice/book.gnucash"
+        result = self._rp(text)
+        assert "/Alice" not in result
+        assert "book.gnucash" in result
+
+    def test_relative_paths_pass_through(self, monkeypatch):
+        """Relative paths don't leak filesystem layout — left alone."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Failed to read samples/book.gnucash from working dir"
+        result = self._rp(text)
+        # The relative path itself doesn't get rewritten (no leading
+        # / or drive letter). "samples/book.gnucash" stays intact.
+        assert "samples/book.gnucash" in result
+
+    def test_multiple_paths_in_one_message(self, monkeypatch):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = (
+            "Backup verification failed: "
+            "/Users/alice/books/source.gnucash -> "
+            "/Users/alice/backups/snapshot.db"
+        )
+        result = self._rp(text)
+        assert "/Users/alice" not in result
+        assert "source.gnucash" in result
+        assert "snapshot.db" in result
+
+    def test_path_in_quotes_redacted(self, monkeypatch):
+        """Paths inside quotes are caught at quote boundaries."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Lock on file '/Users/alice/book.gnucash' detected"
+        result = self._rp(text)
+        assert "/Users" not in result
+        assert "book.gnucash" in result
+
+    def test_no_paths_no_change(self, monkeypatch):
+        """Plain error messages with no paths pass through unchanged."""
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        text = "Account not found: Expenses:Coffee"
+        # Colon between words isn't a Windows drive letter, but
+        # the regex requires alphabetic single char + ":" + slash.
+        assert self._rp(text) == text

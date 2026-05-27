@@ -33,6 +33,60 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
+def redact_paths(text: str) -> str:
+    """Replace absolute filesystem paths with their basename when the
+    ``GNUCASH_REDACT_PATHS=1`` env var is set. Pass-through otherwise.
+
+    Targets the case where MCP error messages might be shared
+    externally (issue trackers, screenshots, public bug reports)
+    and the user doesn't want their filesystem layout leaking.
+    Default off — paths in errors are usually the most useful
+    debugging signal for local development. Opt-in posture
+    matches GNUCASH_LOG_DIR (no behavior change unless asked).
+
+    Redaction is basename-only: ``/Users/alice/Books/alex.gnucash``
+    becomes ``alex.gnucash``. The filename is preserved because
+    the user still needs to know *which* file errored — the
+    sensitive bit is the directory structure leading to it.
+
+    Both POSIX (``/``) and Windows (``C:\\path`` / ``C:/path``)
+    absolute paths are matched. Relative paths pass through
+    unchanged because they don't leak filesystem layout.
+
+    Args:
+        text: Error message or other string that may contain
+            absolute paths.
+
+    Returns:
+        ``text`` with absolute paths replaced by basename, or
+        unchanged when redaction is disabled.
+    """
+    if os.environ.get("GNUCASH_REDACT_PATHS") != "1":
+        return text
+
+    import re
+
+    # POSIX absolute paths: /foo/bar/baz.ext
+    # Stop at whitespace, quotes, or common delimiter chars.
+    posix_re = re.compile(r"/(?:[^\s/'\"<>]+/)+[^\s/'\"<>]+")
+    # Windows: C:\foo\bar.ext or C:/foo/bar.ext
+    win_re = re.compile(
+        r"[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+    )
+
+    def to_basename(m):
+        # Split on either separator so Windows paths matched on a
+        # POSIX-running host (where ``Path("C:\\...").name`` would
+        # return the whole string) still extract the leaf.
+        full = m.group(0).replace("\\", "/")
+        return full.rsplit("/", 1)[-1]
+
+    # Windows first (more specific prefix); then POSIX.
+    text = win_re.sub(to_basename, text)
+    text = posix_re.sub(to_basename, text)
+    return text
+
+
 def resolve_mcp_dir(book_path: Path | str) -> Path:
     """Resolve the ``.mcp`` directory for audit / debug / backup storage.
 
