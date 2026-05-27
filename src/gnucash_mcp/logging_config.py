@@ -33,6 +33,124 @@ def get_log_dir() -> Path | None:
     return _log_dir
 
 
+class _WriteRateLimiter:
+    """Token-bucket rate limiter for MCP write operations.
+
+    Refills at ``rate`` tokens per second up to ``burst`` capacity.
+    ``consume()`` is the hot path — thread-safe, returns whether
+    the call is allowed and (if not) how long until a token is
+    available so the response can include a useful retry hint.
+
+    Token bucket beats simple per-window counting because it
+    accommodates honest bursts (e.g., posting 5 invoices in quick
+    succession) while still throttling sustained runaway loops.
+    The burst capacity is the ceiling; the rate is the steady-
+    state allowance.
+    """
+
+    def __init__(self, rate: float, burst: int):
+        import threading
+        self.rate = float(rate)
+        self.burst = int(burst)
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> tuple[bool, float]:
+        """Try to consume one token.
+
+        Returns:
+            ``(allowed, retry_after_sec)`` where ``allowed`` is
+            True when a token was available (and consumed) and
+            False when the bucket is empty. ``retry_after_sec``
+            is meaningful only when not allowed — the wall-clock
+            seconds until the next full token would be available.
+        """
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(
+                self.burst,
+                self.tokens + elapsed * self.rate,
+            )
+            self.last_refill = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, 0.0
+            retry = (1.0 - self.tokens) / self.rate
+            return False, retry
+
+
+# Lazy module-level cache. Reset via reset_write_rate_limiter()
+# (callers: tests, ``setup_logging`` restart paths).
+_write_limiter: _WriteRateLimiter | None = None
+_write_limiter_initialized: bool = False
+
+
+def _get_write_rate_limiter() -> _WriteRateLimiter | None:
+    """Resolve the write rate limiter from env, caching the result.
+
+    Honors:
+      - ``GNUCASH_WRITE_RATE_LIMIT`` (tokens per second, positive
+        float). Absent or non-positive disables limiting entirely
+        — the cached return is ``None`` and the per-call check
+        becomes a fast nullity test.
+      - ``GNUCASH_WRITE_BURST`` (integer max bucket size; default
+        10). Allows the user to tolerate honest bursts above the
+        steady-state rate.
+
+    Default (no env vars): no limiting — writes proceed at full
+    speed, matching pre-Stage-6 behavior.
+    """
+    global _write_limiter, _write_limiter_initialized
+    if _write_limiter_initialized:
+        return _write_limiter
+
+    rate_str = os.environ.get("GNUCASH_WRITE_RATE_LIMIT")
+    if not rate_str:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    try:
+        rate = float(rate_str)
+    except ValueError:
+        # Non-numeric env value: treat as unset, log a warning
+        # via the debug logger so the user sees the typo.
+        logging.getLogger(DEBUG_LOGGER_NAME).warning(
+            f"GNUCASH_WRITE_RATE_LIMIT={rate_str!r} is not a "
+            f"valid number; rate limiting disabled."
+        )
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    if rate <= 0:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    burst_str = os.environ.get("GNUCASH_WRITE_BURST", "10")
+    try:
+        burst = max(1, int(burst_str))
+    except ValueError:
+        burst = 10
+
+    _write_limiter = _WriteRateLimiter(rate=rate, burst=burst)
+    _write_limiter_initialized = True
+    return _write_limiter
+
+
+def reset_write_rate_limiter() -> None:
+    """Drop the cached rate limiter so the next call re-reads env.
+
+    Test seam — production code reads env once per process start.
+    """
+    global _write_limiter, _write_limiter_initialized
+    _write_limiter = None
+    _write_limiter_initialized = False
+
+
 def redact_paths(text: str) -> str:
     """Replace absolute filesystem paths with their basename when the
     ``GNUCASH_REDACT_PATHS=1`` env var is set. Pass-through otherwise.
@@ -1811,6 +1929,36 @@ def audit_log(
             logger = logging.getLogger(AUDIT_LOGGER_NAME)
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
+
+            # Write rate limit (Stage 6 #3). Default disabled —
+            # enabled when the user sets GNUCASH_WRITE_RATE_LIMIT.
+            # Checked BEFORE the auto-backup trigger and BEFORE
+            # the pre-clear of staged audit state: a rate-limited
+            # call hasn't started the tool, so it shouldn't
+            # disturb the next call's audit-staging slot or
+            # provoke a backup snapshot.
+            if classification == "write":
+                limiter = _get_write_rate_limiter()
+                if limiter is not None:
+                    allowed, retry = limiter.consume()
+                    if not allowed:
+                        debug_logger.warning(
+                            f"Write rate limit hit on "
+                            f"{func.__name__}; retry in "
+                            f"{retry:.1f}s."
+                        )
+                        return json.dumps({
+                            "error": (
+                                f"Write rate limit exceeded "
+                                f"(retry in {retry:.1f}s). "
+                                f"Configured via "
+                                f"GNUCASH_WRITE_RATE_LIMIT="
+                                f"{os.environ.get('GNUCASH_WRITE_RATE_LIMIT')} "
+                                f"tokens/sec."
+                            ),
+                            "error_type": "rate_limited",
+                            "retry_after_seconds": round(retry, 2),
+                        })
 
             # Defense-in-depth: clear any previously-staged audit
             # before-state at the TOP of the wrapper. The post-call

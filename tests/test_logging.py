@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1478,3 +1479,107 @@ class TestRedactPaths:
         # Colon between words isn't a Windows drive letter, but
         # the regex requires alphabetic single char + ":" + slash.
         assert self._rp(text) == text
+
+
+class TestWriteRateLimiter:
+    """Stage 6 — write rate-limiting at the audit_log decorator.
+    Token bucket; disabled by default; opt-in via
+    GNUCASH_WRITE_RATE_LIMIT env var."""
+
+    def _setup_decorated_tool(self):
+        """Build a minimal write-classified tool decorated by
+        audit_log. Returns the wrapped function."""
+        @audit_log(classification="write", operation="create",
+                   entity_type="transaction")
+        def fake_write(description: str = "x") -> str:
+            return json.dumps({"guid": "abc12345", "status": "created"})
+        return fake_write
+
+    def test_no_limit_by_default(self, monkeypatch, temp_book_path):
+        """Without the env var, writes proceed unthrottled."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.delenv("GNUCASH_WRITE_RATE_LIMIT", raising=False)
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        tool = self._setup_decorated_tool()
+        # 50 consecutive writes — all succeed.
+        for _ in range(50):
+            result = json.loads(tool(description="x"))
+            assert "error" not in result
+
+    def test_rate_limit_kicks_in(self, monkeypatch, temp_book_path):
+        """Burst of 3 with rate 0.1 tok/s: 4th write rate-limited."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "0.1")
+        monkeypatch.setenv("GNUCASH_WRITE_BURST", "3")
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+        tool = self._setup_decorated_tool()
+        # First three drain the burst capacity.
+        for i in range(3):
+            r = json.loads(tool(description=f"x{i}"))
+            assert "error" not in r, f"call {i} unexpectedly limited"
+        # Fourth hits the limit.
+        r = json.loads(tool(description="x3"))
+        assert r.get("error_type") == "rate_limited"
+        assert "retry_after_seconds" in r
+        # Retry is positive (some real wall-clock delay).
+        assert r["retry_after_seconds"] > 0
+
+    def test_reads_never_rate_limited(self, monkeypatch, temp_book_path):
+        """Even with an aggressive write limit, reads are
+        unaffected. The decorator's gate is on classification."""
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "0.01")
+        monkeypatch.setenv("GNUCASH_WRITE_BURST", "1")
+        reset_write_rate_limiter()
+        setup_logging(book_path=str(temp_book_path), debug=False)
+
+        @audit_log(classification="read")
+        def fake_read() -> str:
+            return json.dumps({"ok": True})
+
+        # 20 reads in a row — none rate-limited.
+        for _ in range(20):
+            r = json.loads(fake_read())
+            assert "error" not in r
+
+    def test_invalid_env_value_disables(self, monkeypatch):
+        """A non-numeric env value disables the limiter (with a
+        debug-log warning) rather than crashing."""
+        from gnucash_mcp.logging_config import (
+            _get_write_rate_limiter,
+            reset_write_rate_limiter,
+        )
+        monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", "asdf")
+        reset_write_rate_limiter()
+        assert _get_write_rate_limiter() is None
+
+    def test_zero_or_negative_rate_disables(self, monkeypatch):
+        from gnucash_mcp.logging_config import (
+            _get_write_rate_limiter,
+            reset_write_rate_limiter,
+        )
+        for val in ("0", "0.0", "-5"):
+            monkeypatch.setenv("GNUCASH_WRITE_RATE_LIMIT", val)
+            reset_write_rate_limiter()
+            assert _get_write_rate_limiter() is None, f"{val} should disable"
+
+    def test_token_bucket_refills(self, monkeypatch):
+        """Direct unit test on the bucket: after waiting, tokens
+        refill at the configured rate."""
+        from gnucash_mcp.logging_config import _WriteRateLimiter
+        limiter = _WriteRateLimiter(rate=10.0, burst=2)
+        # Drain the bucket.
+        assert limiter.consume() == (True, 0.0)
+        assert limiter.consume() == (True, 0.0)
+        # Bucket empty — third call denied.
+        allowed, retry = limiter.consume()
+        assert not allowed
+        # Retry should be small (~0.1s for 1 token at 10 tok/s).
+        assert 0.05 < retry < 0.2
+        # Wait for refill (sleep slightly longer than retry).
+        time.sleep(0.15)
+        # Now allowed.
+        allowed, _ = limiter.consume()
+        assert allowed
