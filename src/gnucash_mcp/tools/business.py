@@ -6,7 +6,7 @@ Registered only when the 'business' module is enabled via --modules.
 import json
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _gate_owner_type, _json, safe_tool
+from gnucash_mcp.tools._helpers import _gate_owner_type, _json, _resolve_id_alias, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -712,7 +712,10 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="voucher")
-    def delete_voucher(voucher_id: str) -> str:
+    def delete_voucher(
+        id: str | None = None,
+        voucher_id: str | None = None,
+    ) -> str:
         """Delete an unposted employee expense voucher.
 
         Automatically removes associated entries. Posted vouchers
@@ -720,10 +723,15 @@ def register(mcp, get_book) -> None:
         then delete.
 
         Args:
-            voucher_id: Voucher ID (e.g., "000001").
+            id: Voucher ID (e.g., "000001"). Preferred parameter
+                name — matches get_invoice / post_invoice / etc.
+            voucher_id: Legacy alias for ``id``. Accepted for
+                back-compat; pass exactly one of ``id`` or
+                ``voucher_id``.
         """
+        resolved_id = _resolve_id_alias(id, voucher_id, "voucher_id")
         book = get_book()
-        result = book.delete_voucher(voucher_id=voucher_id)
+        result = book.delete_voucher(voucher_id=resolved_id)
         return _json(result)
 
     @mcp.tool()
@@ -894,7 +902,8 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="credit_note")
     def delete_credit_note(
-        credit_note_id: str,
+        id: str | None = None,
+        credit_note_id: str | None = None,
         owner_type: str | None = None,
     ) -> str:
         """Delete an unposted credit note.
@@ -904,14 +913,19 @@ def register(mcp, get_book) -> None:
         ``unpost_invoice``, then delete.
 
         Args:
-            credit_note_id: Credit note ID.
+            id: Credit note ID. Preferred parameter name — matches
+                get_invoice / post_invoice / etc.
+            credit_note_id: Legacy alias for ``id``. Accepted for
+                back-compat; pass exactly one of ``id`` or
+                ``credit_note_id``.
             owner_type: Optional "customer" or "vendor"
                 disambiguator for ID collisions.
         """
+        resolved_id = _resolve_id_alias(id, credit_note_id, "credit_note_id")
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.delete_credit_note(
-            credit_note_id=credit_note_id,
+            credit_note_id=resolved_id,
             owner_type=owner_type,
         )
         return _json(result)
@@ -1100,33 +1114,51 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="invoice")
-    def delete_invoice(invoice_id: str) -> str:
+    def delete_invoice(
+        id: str | None = None,
+        invoice_id: str | None = None,
+    ) -> str:
         """Delete an unposted customer invoice.
 
         Automatically removes associated entries (line items). Posted invoices
         cannot be deleted — void them or issue a credit note instead.
 
         Args:
-            invoice_id: Invoice ID (e.g., "000001" or "INV-2026-001").
+            id: Invoice ID (e.g., "000001" or "INV-2026-001").
+                Preferred parameter name — matches get_invoice /
+                post_invoice / etc.
+            invoice_id: Legacy alias for ``id``. Accepted for
+                back-compat; pass exactly one of ``id`` or
+                ``invoice_id``.
         """
+        resolved_id = _resolve_id_alias(id, invoice_id, "invoice_id")
         book = get_book()
-        result = book.delete_invoice(invoice_id=invoice_id)
+        result = book.delete_invoice(invoice_id=resolved_id)
         return _json(result)
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="bill")
-    def delete_bill(bill_id: str) -> str:
+    def delete_bill(
+        id: str | None = None,
+        bill_id: str | None = None,
+    ) -> str:
         """Delete an unposted vendor bill.
 
         Automatically removes associated entries (line items). Posted bills
         cannot be deleted — void them or issue a credit note instead.
 
         Args:
-            bill_id: Bill ID (e.g., "000001" or "BILL-2026-001").
+            id: Bill ID (e.g., "000001" or "BILL-2026-001").
+                Preferred parameter name — matches get_invoice /
+                post_invoice / etc.
+            bill_id: Legacy alias for ``id``. Accepted for
+                back-compat; pass exactly one of ``id`` or
+                ``bill_id``.
         """
+        resolved_id = _resolve_id_alias(id, bill_id, "bill_id")
         book = get_book()
-        result = book.delete_bill(bill_id=bill_id)
+        result = book.delete_bill(bill_id=resolved_id)
         return _json(result)
 
     @mcp.tool()
