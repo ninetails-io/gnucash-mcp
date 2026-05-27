@@ -130,7 +130,18 @@ def register(mcp, get_book) -> None:
         Args:
             guid: Scheduled transaction GUID (or 8+ char prefix).
             enabled: Enable or disable.
-            end_date: Set end date (empty string to clear).
+            end_date: Three-state field for the schedule's end date.
+
+                - Omit (or pass ``null``): leave unchanged.
+                - Pass ``"YYYY-MM-DD"``: set to that date.
+                - Pass ``""`` (empty string): clear the existing
+                  end date back to "no end" (open-ended schedule).
+
+                The empty-string sentinel exists because MCP tool
+                schemas don't easily express "set to null" as a
+                distinct value from "no change supplied" — both
+                arrive as Python ``None``. Empty-string is the
+                explicit "clear it" signal.
         """
         book = get_book()
         result = book.update_scheduled_transaction(
