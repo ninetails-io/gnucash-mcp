@@ -53,7 +53,7 @@ class TestToolModulesMapping:
         """Every TOOL_MODULES key must back onto extracted-module
         files. After the restructure the relationship is no longer
         ``TOOL_MODULES.keys() ⊆ extracted_modules()``: ``portfolio``
-        and ``investor`` are new public modules that don't have
+        and ``tax_lots`` are new public modules that don't have
         their own tool files (they're slices of the legacy
         ``investments`` file, mapped via MODULE_BACKED_BY).
         """
@@ -88,23 +88,32 @@ class TestToolModulesMapping:
         assert total == 106
 
     def test_expected_modules_exist(self):
-        """All expected sub-module names should be present after the
-        Core-chop. ``core`` is no longer a TOOL_MODULES key — it's
-        a MODULE_GROUPS alias expanding to the eight sub-modules."""
+        """All expected leaf-module names should be present.
+        ``core``, ``bookkeeper``, and ``investor`` are group
+        aliases (in MODULE_GROUPS) — not TOOL_MODULES keys."""
         expected = {
             # Core sub-modules
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
-            # Optional modules
-            "reconciliation", "reporting", "budgets",
-            "scheduling", "portfolio", "investor",
+            # Bookkeeper-cluster leaves
+            "reconciliation", "reporting", "budgets", "scheduling",
+            # Investor-cluster leaves
+            "portfolio", "tax_lots",
+            # Business-side
             "freelancer", "business",
         }
         assert set(TOOL_MODULES.keys()) == expected
-        # And ``core`` is the group alias.
+        # Group aliases — ``core`` always-on plus the two new
+        # role groups landing in v1.3.
         assert set(MODULE_GROUPS["core"]) == {
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
+        }
+        assert set(MODULE_GROUPS["bookkeeper"]) == {
+            "reconciliation", "reporting", "budgets", "scheduling",
+        }
+        assert set(MODULE_GROUPS["investor"]) == {
+            "tax_lots", "portfolio",
         }
 
     def test_validate_tool_modules_passes(self):
@@ -303,11 +312,12 @@ class TestApplyModuleFilter:
         assert "list_accounts" in remaining
         assert "create_account" in remaining
 
-    def test_portfolio_and_investor_split(self):
-        """``portfolio`` (commodities + prices) and ``investor``
-        (tax lots) used to be one ``investments`` module. After the
-        split they're independently selectable: a multi-currency
-        household without a brokerage picks portfolio alone."""
+    def test_portfolio_and_tax_lots_split(self):
+        """``portfolio`` (commodities + prices) and ``tax_lots``
+        (cost-basis tracking) are the two leaves of what used to
+        be the ``investments`` module — independently selectable
+        for a finer cut. The ``investor`` group bundles them; see
+        test_investor_group_bundles_both below for that path."""
         # portfolio alone — price tools yes, lot tools no
         _apply_module_filter("portfolio")
         remaining = self._tool_names()
@@ -320,15 +330,45 @@ class TestApplyModuleFilter:
         # Non-selected modules not present
         assert "spending_by_category" not in remaining
 
-        # investor alone — lot tools yes, price tools no
+        # tax_lots alone — lot tools yes, price tools no
         _reset_lazy_load_state()
         mcp._tool_manager._tools.clear()
-        _apply_module_filter("investor")
+        _apply_module_filter("tax_lots")
         remaining = self._tool_names()
         assert "create_lot" in remaining
         assert "calculate_lot_gain" in remaining
         assert "list_commodities" not in remaining
         assert "create_price" not in remaining
+
+    def test_investor_group_bundles_both(self):
+        """``--modules=investor`` (the group alias) loads
+        tax_lots + portfolio together. Tax-lot accounting needs
+        market prices to compute gains, so the bundle is the
+        useful unit; the leaf modules exist for fine-grained
+        users."""
+        _apply_module_filter("investor")
+        remaining = self._tool_names()
+        # Both halves present.
+        assert "create_lot" in remaining
+        assert "calculate_lot_gain" in remaining
+        assert "list_commodities" in remaining
+        assert "create_price" in remaining
+
+    def test_bookkeeper_group_bundles_four_modules(self):
+        """``--modules=bookkeeper`` loads reconciliation +
+        reporting + budgets + scheduling — the personal-finance
+        management cluster."""
+        _apply_module_filter("bookkeeper")
+        remaining = self._tool_names()
+        # One probe per member module.
+        assert "reconcile_account" in remaining       # reconciliation
+        assert "spending_by_category" in remaining    # reporting
+        assert "create_budget" in remaining           # budgets
+        assert "create_scheduled_transaction" in remaining
+        # Core always loaded; non-bookkeeper modules absent.
+        assert "list_accounts" in remaining
+        assert "create_invoice" not in remaining      # freelancer
+        assert "create_lot" not in remaining          # tax_lots
 
     def test_filter_is_subtractive(self):
         """Filtering should only remove tools, never add non-existent ones."""

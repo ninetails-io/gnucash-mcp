@@ -103,6 +103,25 @@ MODULE_GROUPS: dict[str, list[str]] = {
         "summary", "accounts", "transactions", "slots",
         "audit", "backup", "balance_sheet", "diagnostic",
     ],
+    # ``bookkeeper`` bundles the personal-finance management
+    # cluster: reconcile bank statements, run reports, manage
+    # budgets, schedule recurring transactions. The four
+    # underlying modules stay separately selectable for users
+    # who want a finer cut.
+    "bookkeeper": [
+        "reconciliation", "reporting", "budgets", "scheduling",
+    ],
+    # ``investor`` bundles the two halves of the legacy
+    # ``investments`` module: ``tax_lots`` (cost-basis tracking)
+    # and ``portfolio`` (commodities + prices, the multi-currency
+    # primitive). A user typing ``--modules=investor`` wants both
+    # because tax-lot accounting is meaningless without prices.
+    # The split is preserved at the leaf-module level so a
+    # multi-currency household without a brokerage can still
+    # pick ``portfolio`` alone.
+    "investor": [
+        "tax_lots", "portfolio",
+    ],
 }
 
 
@@ -139,10 +158,13 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     "backup": {"backup"},
     "balance_sheet": {"reporting"},
     "diagnostic": set(),
-    # ``portfolio`` (prices / commodities) and ``investor`` (tax lots)
-    # are the two halves of what used to be the ``investments`` module.
+    # ``portfolio`` (prices / commodities) and ``tax_lots`` (cost-
+    # basis tracking) are the two halves of what used to be the
+    # ``investments`` module. The ``investor`` group alias in
+    # MODULE_GROUPS pulls them both in for users who want the full
+    # surface.
     "portfolio": {"investments"},
-    "investor": {"investments"},
+    "tax_lots": {"investments"},
     # ``freelancer`` (customer-facing invoicing) and ``business``
     # (vendor + employee management, vendor bills) split the legacy
     # ``business`` module along persona lines.
@@ -253,7 +275,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_latest_price",
         "delete_price",
     ],
-    "investor": [
+    "tax_lots": [
         "create_lot",
         "list_lots",
         "get_lot",
@@ -697,52 +719,39 @@ Options:
                        Default: core (26 tools, always-on). Use "all"
                        for every module (106 tools).
 
-                       Modules (role-aligned, flat partition; pick
-                       what fits your workflow):
+                       Role-based selections (group aliases that
+                       expand to underlying modules — start here):
+                         core         Ledger primitives. Always on
+                                      regardless. 26 tools.
+                         bookkeeper   Reconciliation + reporting +
+                                      budgets + scheduling. 20 tools.
+                         investor    tax_lots + portfolio (cost basis
+                                      + prices). 12 tools.
+                         freelancer  Customer invoicing + sales tax
+                                      (taxtables for GST / VAT /
+                                      US state sales tax). 19 tools.
+                         business     Additive to freelancer:
+                                      vendors, employees, bills,
+                                      vouchers, credit notes, jobs,
+                                      billterms. 29 tools.
 
-                       Core sub-modules — always loaded via the
-                       ``core`` group alias; selectable individually
-                       too:
-                         summary      get_book_summary dashboard.
-                         accounts     Account CRUD + balance/list.
-                         transactions Transaction CRUD + search +
-                                      void/unvoid.
-                         slots        Per-account metadata (APR,
-                                      credit_limit, statement-close).
-                         audit        get_audit_log reader.
-                         backup       Manual backup CRUD (the
-                                      auto-snapshot hook runs
-                                      unconditionally).
-                         balance_sheet
-                                      THE canonical accounting report.
-                         diagnostic   get_server_config introspection.
+                       Leaf modules (pick individually for finer
+                       control, or as members of the groups above):
 
-                       Optional modules:
-                         budgets      Budget creation + variance.
-                         scheduling   Recurring transactions.
-                         reconciliation
-                                      Bank-statement reconciliation.
-                         reporting    Analytical reports (net_worth,
-                                      cash_flow, spending/income
-                                      breakdowns, debt_payoff_plan).
-                         portfolio    Commodities + prices —
-                                      the multi-currency primitive.
-                         investor     Tax-lot management.
-                         freelancer   Customer invoicing + sales-tax
-                                      configuration (taxtables for
-                                      GST / VAT / US state sales tax).
-                         business     Vendor + employee management,
-                                      vendor bills, jobs, credit
-                                      notes, billterms (additive to
-                                      freelancer for full business
-                                      workflow).
+                       Core sub-modules (8): summary, accounts,
+                       transactions, slots, audit, backup,
+                       balance_sheet, diagnostic.
+
+                       Bookkeeper members (4): reconciliation,
+                       reporting, budgets, scheduling.
+
+                       Investor members (2): tax_lots, portfolio.
 
                        Example: --modules=freelancer for a solo
-                       invoicer; --modules=budgets,scheduling,reporting
-                       for a personal-finance user;
-                       --modules=freelancer,business for a small
-                       business with vendor management. ``core`` is
-                       always added regardless.
+                       invoicer; --modules=bookkeeper for personal
+                       finance; --modules=freelancer,business for a
+                       small business with vendor management.
+                       ``core`` is always added regardless.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message
