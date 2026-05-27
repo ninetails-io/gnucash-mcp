@@ -1282,3 +1282,75 @@ class TestNonAsciiJsonEncoding:
         assert "Rückversicherungs" in result
         data = json.loads(result)
         assert data["fullname"] == "Münchener Rückversicherungs-Gesellschaft"
+
+
+class TestStrictToolKwargs:
+    """Bookkeeper-found bug from PR #92 review: calling
+    ``reconcile_account`` with ``except=[...]`` instead of the
+    actual ``except_guids=[...]`` parameter ran the tool with no
+    exclusion at all. FastMCP's per-tool Pydantic arg model
+    inherited from ``ArgModelBase`` with no ``extra`` config,
+    defaulting to ``"ignore"`` — unknown kwargs silently dropped.
+
+    ``server.py`` monkey-patches ``ArgModelBase.model_config`` to
+    ``extra="forbid"`` at import time so any unknown kwarg raises
+    a clear validation error at the MCP boundary instead of
+    surfacing as a downstream balance mismatch.
+    """
+
+    def _arg_model_for(self, tool_name: str):
+        """Return the Pydantic arg model for a registered tool.
+
+        Tests bind ``tool.fn`` directly to ``server_module`` (see
+        the module-scoped ``_load_all_extracted_tool_modules``
+        fixture), which bypasses Pydantic validation entirely.
+        Grab the arg_model off the FastMCP tool entry to exercise
+        the same validation path the MCP wire boundary uses.
+        """
+        tool = server_module.mcp._tool_manager._tools[tool_name]
+        return tool.fn_metadata.arg_model
+
+    def test_unknown_kwarg_is_rejected(self):
+        from pydantic import ValidationError
+
+        arg_model = self._arg_model_for("reconcile_account")
+        with pytest.raises(ValidationError) as exc_info:
+            arg_model.model_validate({
+                "account": "Assets:Bank:Checking",
+                "statement_date": "2026-04-30",
+                "statement_balance": "1000.00",
+                # Bookkeeper's typo: ``except`` instead of ``except_guids``.
+                "except": ["deadbeef"],
+                "reconcile_all": True,
+            })
+        # Pydantic's standard message for extra="forbid".
+        assert "Extra inputs are not permitted" in str(exc_info.value)
+
+    def test_known_kwargs_still_validate(self):
+        """Sanity check: rejecting extras must not block legitimate calls."""
+        arg_model = self._arg_model_for("reconcile_account")
+        # Should not raise — every key is a real parameter.
+        arg_model.model_validate({
+            "account": "Assets:Bank:Checking",
+            "statement_date": "2026-04-30",
+            "statement_balance": "1000.00",
+            "except_guids": ["deadbeef"],
+            "reconcile_all": True,
+        })
+
+    def test_forbid_applies_to_all_tools(self):
+        """Spot-check a sample of unrelated tools — patch is global,
+        not per-tool. If a future FastMCP upgrade breaks the
+        ``ArgModelBase`` monkey-patch (e.g. by switching to a
+        non-inheriting model factory), this test fails loudly
+        across the surface rather than only on one tool.
+        """
+        from pydantic import ValidationError
+
+        for tool_name in ("get_balance", "create_transaction", "list_accounts"):
+            arg_model = self._arg_model_for(tool_name)
+            assert arg_model.model_config.get("extra") == "forbid", (
+                f"{tool_name} arg model is not strict — extras would be ignored"
+            )
+            with pytest.raises(ValidationError):
+                arg_model.model_validate({"this_is_not_a_real_kwarg": "x"})

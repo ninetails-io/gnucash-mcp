@@ -12,6 +12,31 @@ from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
+# Strict tool-argument validation: reject unknown kwargs at the MCP
+# boundary instead of silently ignoring them.
+#
+# FastMCP generates a Pydantic model per tool from the function
+# signature, all inheriting from ``ArgModelBase``. The base class's
+# default config doesn't set ``extra``, so Pydantic falls back to
+# ``"ignore"`` — typo'd or stale-spec parameter names silently
+# no-op. Bookkeeper-found bug on PR #92 review: calling
+# ``reconcile_account`` with ``except=[...]`` (the spec's name)
+# instead of ``except_guids=[...]`` (the actual Python-safe param)
+# ran the tool with no exclusion at all, surfacing only as a
+# balance mismatch downstream.
+#
+# Patching ``ArgModelBase.model_config`` to include
+# ``extra="forbid"`` makes the dynamically-created arg models
+# reject unknown fields with a clear ``"Extra inputs are not
+# permitted"`` error. Applied at import time, before any tool
+# module loads.
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+
+ArgModelBase.model_config = {
+    **ArgModelBase.model_config,
+    "extra": "forbid",
+}
+
 from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
 from gnucash_mcp.tools._helpers import _json, safe_tool
