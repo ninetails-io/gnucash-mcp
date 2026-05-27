@@ -1,5 +1,194 @@
 # Changelog
 
+## v1.3.0 — Business module complete, role-aligned modules
+
+v1.2.1 fixed everything the business module *should* have been at first
+ship. v1.3 finishes the headline features the bookkeeper had been
+asking for since v1.2 and reshapes the public module surface around
+how real users actually deploy the server.
+
+**Business module — the four big features.**
+
+- **Employee expense vouchers** (`create_voucher`, `add_voucher_entry`,
+  `post_invoice` / `pay_invoice` / `unpost_invoice` /
+  `delete_voucher` polymorphic). The third half of the invoice
+  lifecycle alongside customer invoices and vendor bills. Employees
+  submit reimbursable expenses; voucher posts to A/P, payment hits
+  the chosen cash account. Same `owner_type='employee'` dispatch the
+  other invoice tools already understood.
+- **Credit notes** (`create_credit_note`, `add_credit_note_entry`,
+  `apply_credit_note`, plus the shared `post_invoice` /
+  `unpost_invoice` / `delete_credit_note` path). Refund and return
+  documents for customers and vendors. Posts as a negative invoice;
+  applies against an outstanding invoice or bill to net the
+  payable/receivable down. Lifecycle tracks
+  `gnc-mcp/applies-to-invoice` so the link survives between sessions.
+- **Jobs** (`create_job`, `get_job`, `list_jobs`, `update_job`,
+  `get_job_report`, `delete_job`). Project-level grouping over
+  invoices and bills for a single customer or vendor. A jobs-level
+  P&L (`get_job_report`) shows revenue, costs, net by project — the
+  view a freelancer needs at year-end without manually slicing every
+  client's transactions. Invoices and bills accept an optional
+  `job_id` at creation; existing tools see job-attached documents
+  through the same surfaces.
+- **Tax tables** (`create_taxtable`, `add_taxtable_entry`,
+  `update_taxtable`, `list_taxtables`, `get_taxtable`,
+  `delete_taxtable`). Composite tax rates (e.g. state + local
+  sales tax stacked) attached to invoice/bill/voucher line items.
+  Posting builds the tax splits at post-time from each entry's
+  taxable amount × applicable rate, with residual-to-largest-rate
+  rounding so totals tie exactly. Tax-inclusive pricing (`price` is
+  gross, pretax extracted at post) handled symmetrically. Refcount
+  discipline blocks deletion of in-use taxtables.
+
+The Stage 3 surface adds 19 tools to the catalog (87 → 106), each
+exercised against the synthetic test books before release.
+
+**Module surface — role-aligned partition.**
+
+`--modules` previously partitioned by code organization
+(`core / admin / backup / investments / business`). The new partition
+matches how people actually use the server:
+
+- **`core`** (26 tools) — always-on ledger primitives: accounts,
+  transactions, slots, audit, backup, balance sheet, summary,
+  diagnostics. Now a group alias expanding to eight independently-
+  selectable sub-modules; you can opt into the group or pick the
+  sub-modules à la carte.
+- **`bookkeeper`** (20 tools) — personal-finance management:
+  reconciliation, reporting, budgets, scheduling. Group alias for
+  the four underlying modules.
+- **`investor`** (12 tools) — group alias for `portfolio`
+  (commodities + prices, the multi-currency primitive) plus
+  `tax_lots` (cost basis tracking).
+- **`freelancer`** (19 tools) — customer-facing invoicing: invoice
+  creation, posting, payment, outstanding-invoices, taxtables.
+- **`business`** (29 tools) — vendor management, employee
+  expenses, jobs, credit notes, customers, billing terms.
+
+`get_server_config` renders the loaded modules as
+`core[accounts, audit, ...], reporting, ...` so it's clear what's
+inside each group without reading source. Group expansion is single-
+pass; the partition is deliberately flat. See the README's "Choosing
+a module set" table for which modules to load for which use case.
+
+**Reconciliation — bulk mode for OFX-import workflows.**
+
+- **`reconcile_all=true`** reconciles every unreconciled split on
+  the account in one call. The common case for "I just imported a
+  bank statement — everything matches; reconcile it all." No
+  GUID round-trip; one call instead of ~100 if a month's worth of
+  transactions are involved.
+- **`except_guids=[...]`** carves exceptions out of the bulk set.
+  When the statement matches the book *except* for one pending
+  ACH or a manual split the bank doesn't know about yet, two
+  prefix tokens describe the exception instead of the 100+ a full
+  `split_guids` listing would cost.
+- **`through_date`** filters bulk mode to splits on or before a
+  date — useful when you're reconciling a mid-month statement.
+- **Account shortcuts** accepted everywhere the older
+  reconciliation tools wanted full paths. `%2e78c86` flows in and
+  out of `reconcile_account` the same way it does in every other
+  account-aware tool.
+
+**Dashboard refinements.**
+
+- **Overdue counts** on the receivables and payables lines —
+  *"Receivables: USD 7,420 outstanding (3 invoices, 1 overdue ⚠)"*.
+  The headline number was already there; what was missing was
+  whether any of it was overdue.
+- **Active jobs** line when at least one job is open —
+  *"Jobs: 4 active"*. Surfaces the new entity in the same place
+  the LLM already looks for "what's open."
+- **Foreign-currency conversion in `spending_by_category` and
+  `income_by_source`.** Pre-fix, these reports summed raw split
+  quantities across commodities — a USD spend and a CNY spend
+  added together to a meaningless number. Now each split is
+  converted to the book's default currency via the latest market
+  rate (with cost-basis fallback for unpriced commodities), the
+  same pattern `balance_sheet` and `net_worth` already used.
+
+**Security — Stage 6 hardening.**
+
+- **Path-traversal hardening on `.mcp` sidecar directories.** Backup
+  and audit-log paths derive from `GNUCASH_BOOK_PATH`; the sidecar
+  resolution now checks symlink targets, ownership, and world-
+  writable bits before trusting an existing directory. Sticky-bit
+  dirs (the `/tmp` class) get no exemption — sticky-bit prevents
+  deletion, not symlink creation. The optional `GNUCASH_LOG_DIR`
+  override lets containerized deployments redirect logs without
+  defeating the resolution checks.
+- **Path leak redaction at the MCP error boundary.** Tool error
+  responses now route through `redact_paths()` so absolute paths
+  on the host filesystem don't leak into error strings sent to the
+  LLM. Internal logger calls keep the full paths for debugging;
+  the boundary is the wire.
+- **Write rate-limiting via token bucket.** Defends against a
+  runaway agent loop accidentally hammering the database with
+  thousands of writes per second. Default: 60 writes/minute with
+  short bursts allowed; configurable via `GNUCASH_MCP_RATE_LIMIT`.
+  Read tools are unaffected.
+
+**Strict argument validation.**
+
+`extra="forbid"` is now the default on every tool's Pydantic
+argument model. Unknown kwargs — typos like `except=[...]` instead
+of `except_guids=[...]`, or stale-spec parameter names from older
+docs — fail loudly at the MCP boundary with `Extra inputs are not
+permitted` instead of silently no-opping. Bookkeeper-found bug:
+a `reconcile_account` call with the wrong exclusion parameter name
+ran with no exclusion at all and only surfaced as a downstream
+balance mismatch.
+
+**Parameter normalization.**
+
+`delete_invoice`, `delete_bill`, `delete_voucher`, and
+`delete_credit_note` now accept `id` (the standard name across
+`get_invoice` / `post_invoice` / `unpost_invoice` / `pay_invoice`)
+in addition to the legacy `<entity>_id`. Pass exactly one; back-
+compat preserved for existing callers.
+
+**Server instructions — 59% smaller.**
+
+The orientation block sent to MCP clients on connect went from
+~2,500 chars to 1,522 (24% under the 2K cap). Same coverage
+— double-entry sign convention, account ref formats, GUID
+conventions, investment workflow, safety rules — denser phrasing.
+Frees ~1KB of every client's context budget.
+
+**Internal refactors (no behavior change).**
+
+- **`CurrencyMixin` extraction.** The conversion-factor logic
+  (`_account_conversion_factors`, `_latest_market_rates`,
+  `_split_in_default_currency`) hoisted into a single mixin
+  composed unconditionally into `BaseGnuCashBook`. Four prior
+  copies of the `type='transaction'` price filter collapse to one
+  call site.
+- **`_compute_fx_gain_loss`** extracted from `pay_invoice`. The
+  tri-currency realized-FX delta calculation is now a standalone
+  helper, reusable across any future cross-currency payment path.
+- **`get_book_summary` decomposition.** The 460-line monolith
+  split into `_render_*` helpers per section, plus a single-pass
+  materialization of `book.accounts` and `book.transactions` that
+  shaves ~30% off the call's wall time on large books.
+- **`QueryMixin`** consolidates indexed `.filter_by(guid=...)`
+  finders that had previously been open-coded in each consumer.
+
+**1.4 roadmap.** Unrealized-gains synthetic equity line (closes
+the gap between market-value Assets and cost-basis Equity on
+investment-heavy books), accrual A/R revaluation, future-dated
+transaction warnings, and the v1.2.1 deferred-lows backlog. The
+bookkeeper's daily flow remains the production signal.
+
+**Tests:** 1,366 passing (was 1,114 at v1.2.1). New regression
+classes cover the four Stage 3 features end-to-end, the strict-
+kwargs contract, the `id` alias mutex, the FX-correct breakdowns,
+and the role-aligned module groups. The two synthetic test
+personas (Alex, Lin Wei) and the bookkeeper's real-book
+validation remain the verification harness.
+
+---
+
 ## v1.2.1 — Business module shipped, multi-currency hardened
 
 The long-tail completion of the v1.2 business-module promise. v1.2
