@@ -117,6 +117,103 @@ class CoreMixin:
     # pending before reconciliation makes sense.
     _LAST_ENTRY_WARN_DAYS = 14
 
+    def _business_summary_counts(self, book) -> dict:
+        """Action-signal counts for the get_book_summary business
+        lines: open invoices, open bills, how many overdue, and
+        active jobs. Returns zeros when BusinessMixin isn't loaded
+        (helpers like ``_calculate_lot_balance`` then come back
+        ``None``) — the rendering layer omits the lines anyway
+        when there's no Receivables/Payables activity.
+
+        The bookkeeper's principle for the summary: "tell the LLM
+        what needs attention, not what exists." Invoice counts
+        and overdue counts are actionable; account counts are
+        structural and already shown via the nested per-account
+        breakdown below each line.
+        """
+        out = {
+            "open_invoices": 0,
+            "overdue_invoices": 0,
+            "open_bills": 0,
+            "overdue_bills": 0,
+            "active_jobs": 0,
+        }
+        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
+        if calc_lot_balance is None:
+            return out
+        try:
+            from piecash.business.invoice import Invoice, Job
+        except ImportError:
+            return out
+
+        today = date.today()
+        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+
+        # Posted invoices/bills with non-zero lot balance = open.
+        # We rely on the Lot balance (not raw invoice total) so
+        # partially-paid invoices show as the still-owed amount,
+        # and credit notes / payments reduce the count correctly.
+        for inv in book.session.query(Invoice).filter(
+            Invoice.date_posted.isnot(None),
+        ).all():
+            try:
+                post_acc_guid = inv.post_acc_guid
+                post_acct = book.session.query(
+                    piecash.Account,
+                ).filter_by(guid=post_acc_guid).first()
+                if post_acct is None:
+                    continue
+                lot_obj = None
+                for lot in post_acct.lots:
+                    if lot.guid == inv.post_lot_guid:
+                        lot_obj = lot
+                        break
+                if lot_obj is None:
+                    continue
+                balance = calc_lot_balance(lot_obj)
+                if balance == 0:
+                    continue
+            except Exception:
+                continue
+
+            is_overdue = False
+            if resolve_due is not None:
+                try:
+                    due_date, _ = resolve_due(book, inv)
+                    if due_date is not None and due_date < today:
+                        is_overdue = True
+                except Exception:
+                    pass
+
+            if inv.owner_type == 4:  # vendor bill
+                out["open_bills"] += 1
+                if is_overdue:
+                    out["overdue_bills"] += 1
+            else:
+                # owner_type 2 (customer), 3 (job), 5 (voucher) all
+                # render as customer-side receivables here. Voucher
+                # liabilities are A/P from the company's view but
+                # the LLM-facing count is "things the business
+                # owes employees" — folded into open_bills below
+                # when post_account.type == PAYABLE.
+                if post_acct.type == "PAYABLE":
+                    out["open_bills"] += 1
+                    if is_overdue:
+                        out["overdue_bills"] += 1
+                else:
+                    out["open_invoices"] += 1
+                    if is_overdue:
+                        out["overdue_invoices"] += 1
+
+        try:
+            out["active_jobs"] = book.session.query(Job).filter(
+                Job.active == 1,
+            ).count()
+        except Exception:
+            pass
+
+        return out
+
     def _account_reconciliation_status(
         self, book: piecash.Book, accounts: list,
     ) -> list[dict]:
@@ -1910,23 +2007,51 @@ class CoreMixin:
                 top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
                 lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
 
-            # Receivables / Payables — only if non-zero
+            # Receivables / Payables — only if non-zero. The
+            # parenthesized action signal (open count + overdue)
+            # is the bookkeeper-asked-for addition: the LLM should
+            # see "2 overdue" and know to ask about collections,
+            # without us having to spell that out.
+            biz_counts = self._business_summary_counts(book)
             if receivable_accts:
+                inv_n = biz_counts["open_invoices"]
+                overdue = biz_counts["overdue_invoices"]
+                signal = (
+                    f" ({inv_n} invoice"
+                    f"{'s' if inv_n != 1 else ''}, "
+                    f"{overdue} overdue)"
+                ) if inv_n else ""
                 lines.append(
                     f"Receivables: {len(receivable_accts)} account"
                     f"{'s' if len(receivable_accts) != 1 else ''}, "
-                    f"{currency} {receivables_total}"
+                    f"{currency} {receivables_total}{signal}"
                 )
                 for name, bal in sorted(receivable_accts, key=lambda x: x[1], reverse=True):
                     lines.append(f"  {name}: {currency} {_r2(bal)}")
             if payable_accts:
+                bill_n = biz_counts["open_bills"]
+                overdue = biz_counts["overdue_bills"]
+                signal = (
+                    f" ({bill_n} bill"
+                    f"{'s' if bill_n != 1 else ''}, "
+                    f"{overdue} overdue)"
+                ) if bill_n else ""
                 lines.append(
                     f"Payables: {len(payable_accts)} account"
                     f"{'s' if len(payable_accts) != 1 else ''}, "
-                    f"{currency} {payables_total}"
+                    f"{currency} {payables_total}{signal}"
                 )
                 for name, bal in sorted(payable_accts, key=lambda x: x[1], reverse=True):
                     lines.append(f"  {name}: {currency} {_r2(bal)}")
+
+            # Jobs: one conditional line. Tells the LLM the
+            # job-grouping feature is in use on this book; absence
+            # is a stronger signal than "Jobs: 0 active". Per the
+            # bookkeeper: "Jobs existing doesn't need attention"
+            # but knowing they're in play points to the right
+            # drill-down tool (``get_job_report``).
+            if biz_counts["active_jobs"] > 0:
+                lines.append(f"Jobs: {biz_counts['active_jobs']} active")
 
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")

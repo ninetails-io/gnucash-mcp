@@ -2967,6 +2967,121 @@ class TestGetBookSummaryReconciliationSplitCount:
         assert "⚠" in recon_line
 
 
+class TestGetBookSummaryBusinessSignals:
+    """Bookkeeper-asked-for additions to the summary (v1.3 blocker):
+
+      - Receivables / Payables lines append ``(N invoice(s), M
+        overdue)`` — actionable signal beyond the "USD 13,500" total.
+      - ``Jobs: N active`` line emitted conditionally when the
+        feature is in use; absent when no jobs exist.
+    """
+
+    def _setup_overdue_invoice(self, gb):
+        """Create + post one invoice dated 60 days ago with a
+        30-day term, so it lands as overdue today."""
+        from datetime import date as _date, timedelta
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(name="Net 30", due_days=30)
+        opened = _date.today() - timedelta(days=60)
+        gb.create_invoice(
+            customer_id="000001",
+            date_opened=opened.isoformat(),
+            term="Net 30",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=opened.isoformat(),
+        )
+
+    def _setup_current_bill(self, gb):
+        """Create + post one bill dated today (not overdue)."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+
+    def test_receivables_signal_shows_overdue(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_overdue_invoice(gc)
+        result = gc.get_book_summary()
+        recv = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Receivables:")
+        )
+        assert "1 invoice" in recv
+        assert "1 overdue" in recv
+
+    def test_payables_signal_shows_open_count(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_current_bill(gc)
+        result = gc.get_book_summary()
+        pay = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Payables:")
+        )
+        assert "1 bill" in pay
+        assert "0 overdue" in pay
+
+    def test_jobs_line_present_when_active(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Acme")
+        gc.create_job(
+            owner_id="000001",
+            owner_type="customer",
+            name="API Rewrite",
+        )
+        result = gc.get_book_summary()
+        # One active job — exact "1 active" since "1" pluralizes
+        # to nothing extra in the rendered line.
+        assert "Jobs: 1 active" in result
+
+    def test_jobs_line_absent_when_none(
+        self, business_book: Path,
+    ):
+        """No jobs created — the line is omitted entirely.
+        Absence is the signal (per bookkeeper: 'Jobs existing
+        doesn't need attention')."""
+        gc = GnuCashBook(str(business_book))
+        result = gc.get_book_summary()
+        assert "Jobs:" not in result
+
+    def test_no_business_no_signals(self, test_book: Path):
+        """A non-business book (no posted invoices) still produces
+        a clean summary — no spurious '0 invoices' phrase, no
+        Jobs line. The signals only appear when there's something
+        to act on."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        # No invoice/bill activity → no signal phrases.
+        assert "0 invoices" not in result
+        assert "0 bills" not in result
+        assert "Jobs:" not in result
+
+
 class TestMissingDefaultCurrency:
     """Tests for books with no default currency."""
 
