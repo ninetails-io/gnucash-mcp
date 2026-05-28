@@ -91,6 +91,36 @@ a module set" table for which modules to load for which use case.
   out of `reconcile_account` the same way it does in every other
   account-aware tool.
 
+**`balance_sheet` now actually balances.**
+
+Two unrelated bugs were producing a silent A ≠ L + E identity
+failure on every multi-currency book and every book with
+outstanding invoices:
+
+- **RECEIVABLE and PAYABLE were excluded from balance_sheet's
+  asset/liability buckets.** Posted-but-unpaid invoices were
+  invisible — Alex's $16,200 of outstanding A/R didn't appear in
+  Assets at all. Both account types now sit in their natural
+  buckets across `balance_sheet`, `net_worth`, and the
+  `get_book_summary` trajectory anchor (cross-tool agreement on
+  net worth was the calibration the bookkeeper review pattern
+  catches).
+- **A synthetic "Unrealized Gain/Loss" equity row.** Assets
+  render at market value (factor × quantity for commodities and
+  foreign-currency cash) while equity rolls up at historical-
+  cost split values. The gap — investment market drift on
+  STOCK/MUTUAL plus FX translation adjustment on foreign-
+  currency holdings — now appears as a single signed line in the
+  equity section, computed as the balancing residual. Display-
+  only; no journal entry is booked, the ledger remains at cost
+  exactly the way GnuCash itself stores it. Positive = unrealized
+  gain; negative = unrealized loss. On Alex's book the line
+  reconciles a ~$13K gap; on Lin Wei's book the FX translation
+  effect is similarly absorbed.
+
+After both fixes, A = L + E holds by construction across the
+three tools that compute net worth.
+
 **Dashboard refinements.**
 
 - **Overdue counts** on the receivables and payables lines —
@@ -174,18 +204,21 @@ Frees ~1KB of every client's context budget.
 - **`QueryMixin`** consolidates indexed `.filter_by(guid=...)`
   finders that had previously been open-coded in each consumer.
 
-**1.4 roadmap.** Unrealized-gains synthetic equity line (closes
-the gap between market-value Assets and cost-basis Equity on
-investment-heavy books), accrual A/R revaluation, future-dated
-transaction warnings, and the v1.2.1 deferred-lows backlog. The
-bookkeeper's daily flow remains the production signal.
+**Looking ahead.** Accrual A/R revaluation (mark-to-market open
+foreign-currency invoices at reporting dates) and future-dated
+transaction warnings are the next correctness items on the
+backlog. The bookkeeper's daily flow remains the production
+signal.
 
-**Tests:** 1,366 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,372 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
-kwargs contract, the `id` alias mutex, the FX-correct breakdowns,
-and the role-aligned module groups. The two synthetic test
-personas (Alex, Lin Wei) and the bookkeeper's real-book
-validation remain the verification harness.
+kwargs contract, the `id` alias mutex, the FX-correct
+breakdowns, the role-aligned module groups, the balance-sheet
+equation closure across simple, multi-currency, and A/R-bearing
+books, and the synthetic Unrealized Gain/Loss line's presence/
+absence semantics. The two synthetic test personas (Alex, Lin
+Wei) and the bookkeeper's real-book validation remain the
+verification harness.
 
 ---
 
