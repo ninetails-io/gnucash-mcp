@@ -1866,18 +1866,31 @@ class CoreMixin:
             def _r2(v: Decimal) -> Decimal:
                 return v.quantize(Decimal("0.01"))
 
-            assets_total = _r2(
-                sum((v for _, v, _ in asset_leaves), Decimal("0"))
-            )
-            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
-            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
-            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
-            liabilities_total = _r2(credit_total + loan_total + other_liab_total)
+            # Receivables and payables roll into Assets / Liabilities
+            # totals (standard accounting — A/R is an asset, A/P is a
+            # liability) AND get their own dedicated dashboard
+            # sections below for at-a-glance "what's outstanding."
+            # Appearing in both places is intentional: the rolled-up
+            # totals tie to balance_sheet and the trajectory anchor;
+            # the breakout gives the bookkeeper an action lens. Pre-
+            # v1.3.0 only the breakouts existed — the headline
+            # Assets / Liabilities numbers excluded business
+            # activity, breaking cross-tool consistency.
             receivables_total = _r2(
                 sum((b for _, b in receivable_accts), Decimal("0"))
             )
             payables_total = _r2(
                 sum((b for _, b in payable_accts), Decimal("0"))
+            )
+            assets_total = _r2(
+                sum((v for _, v, _ in asset_leaves), Decimal("0"))
+                + receivables_total
+            )
+            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
+            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
+            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
+            liabilities_total = _r2(
+                credit_total + loan_total + other_liab_total + payables_total
             )
             net_worth = _r2(assets_total - liabilities_total)
 
@@ -1986,8 +1999,13 @@ class CoreMixin:
 
             lines.append(f"Accounts: {total_accounts} total")
 
-            # Assets section — leaf accounts with USD-valued balances
-            lines.append(f"Assets: {len(asset_leaves)} accounts, {currency} {assets_total}")
+            # Assets section — leaf accounts with USD-valued balances.
+            # Count includes A/R accounts (which roll into assets_total)
+            # so the headline N agrees with the total; per-account
+            # detail for A/R is shown in the Receivables section below
+            # rather than duplicated here.
+            assets_count = len(asset_leaves) + len(receivable_accts)
+            lines.append(f"Assets: {assets_count} accounts, {currency} {assets_total}")
             for name, usd_value, note in sorted(
                 asset_leaves, key=lambda x: x[1], reverse=True
             ):
@@ -1998,8 +2016,14 @@ class CoreMixin:
                         f"  {name}: {note} ({currency} {_r2(usd_value)})"
                     )
 
-            # Liabilities section — grouped subtotals + top 3
-            liab_count = len(credit_cards) + len(loan_accts) + len(other_liab_accts)
+            # Liabilities section — grouped subtotals + top 3.
+            # A/P accounts (rolled into liabilities_total) are
+            # included in the count; per-account detail lives in the
+            # Payables breakout below.
+            liab_count = (
+                len(credit_cards) + len(loan_accts)
+                + len(other_liab_accts) + len(payable_accts)
+            )
             lines.append(f"Liabilities: {liab_count} accounts, {currency} {liabilities_total}")
             if credit_cards:
                 lines.append(f"  Credit cards ({len(credit_cards)}): {currency} {credit_total}")

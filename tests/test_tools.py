@@ -1051,6 +1051,20 @@ class TestBalanceSheetTool:
         assert "liabilities" in data
         assert "equity" in data
 
+    def test_balance_sheet_defaults_to_today(self, setup_book_env):
+        """Bookkeeper-flagged: cross-tool comparison silently broke
+        because balance_sheet required an explicit date while
+        get_book_summary used today implicitly. As of v1.3.0,
+        balance_sheet defaults to today so the natural side-by-side
+        ``balance_sheet()`` vs. ``get_book_summary()`` call agrees
+        without threading the same date into both.
+        """
+        from datetime import date
+        # No as_of_date provided.
+        result = server_module.balance_sheet()
+        data = json.loads(result)
+        assert data["as_of_date"] == date.today().isoformat()
+
 
 class TestNetWorthTool:
     """Tests for net_worth tool."""

@@ -74,16 +74,23 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def balance_sheet(as_of_date: str) -> str:
+    def balance_sheet(as_of_date: str | None = None) -> str:
         """Generate a balance sheet as of a specific date.
 
         Shows assets, liabilities, and equity with account breakdowns.
+        A = L + E holds by construction; non-zero unrealized P&L
+        appears as a synthetic equity row.
 
         Args:
-            as_of_date: Date to calculate balances as of (YYYY-MM-DD)
+            as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to
+                today — matching ``get_book_summary``'s implicit
+                cutoff so cross-tool comparisons agree without
+                threading the same date into both calls. Pass an
+                explicit date for historical snapshots.
         """
         book = get_book()
-        result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
+        d = date.fromisoformat(as_of_date) if as_of_date else date.today()
+        result = book.balance_sheet(as_of_date=d)
         return _json(result)
 
     @mcp.tool()
