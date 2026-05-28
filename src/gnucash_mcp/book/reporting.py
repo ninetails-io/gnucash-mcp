@@ -32,8 +32,18 @@ from gnucash_mcp._format import _format_number
 # Account-type groups used across the reports. Defined at module level
 # so the SQL IN() clauses share a single canonical definition rather
 # than drifting across methods.
-_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
-_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+# Type sets for balance_sheet / net_worth bucketing.
+#
+# RECEIVABLE and PAYABLE belong here despite GnuCash treating them
+# as their own first-class account types. Accounting-wise, A/R is
+# an asset (someone owes us money) and A/P is a liability (we owe
+# someone money); both flow through the balance sheet's totals and
+# the canonical "net worth = total assets − total liabilities"
+# identity. Pre-v1.3.0 these were excluded — invoices issued to
+# customers were invisible on balance_sheet, breaking A = L + E by
+# the outstanding-invoice amount.
+_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
+_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
 _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
@@ -465,10 +475,42 @@ class ReportingMixin:
                 sum(i["usd"] for i in liabilities.values())
                 if liabilities else Decimal("0")
             )
-            equity_total = (
-                (sum(i["usd"] for i in equity.values()) if equity else Decimal("0"))
-                + net_income
+
+            # ── Unrealized gain/loss (balancing adjustment) ──────────
+            # Assets render at market value (factor × quantity for
+            # commodities and foreign-currency cash). Equity rolls
+            # up from the splits' raw values, which capture the
+            # historical-cost view. The two views differ by:
+            #
+            # 1. **Investment market drift** — STOCK/MUTUAL holdings
+            #    on a default-currency-denominated brokerage have
+            #    market value (shares × current_price) above or
+            #    below the recorded cost basis (split.value, in
+            #    default currency).
+            # 2. **FX translation adjustment** — foreign-currency
+            #    accounts have current default-currency value
+            #    (quantity × current_FX_rate) that drifts from the
+            #    historical default-currency equivalent at post
+            #    time. Same effect on both sides of foreign-
+            #    currency transactions, but cross-currency
+            #    settlements introduce per-currency imbalances.
+            #
+            # Both effects belong under the same equity adjustment in
+            # GAAP terms (accumulated other comprehensive income).
+            # Computed as the balancing residual so A = L + E holds
+            # by construction, regardless of the underlying mix.
+            # Surfacing the decomposition (how much is investment
+            # drift vs. how much is FX) is a separate feature; for
+            # the balance sheet's purpose ("does it balance?"), the
+            # single line is sufficient.
+            equity_acct_total = (
+                sum(i["usd"] for i in equity.values()) if equity else Decimal("0")
             )
+            unrealized = (
+                assets_total - liabilities_total
+                - equity_acct_total - net_income
+            )
+            equity_total = equity_acct_total + net_income + unrealized
 
             def format_accounts(accounts_dict: dict[str, dict]) -> list[dict]:
                 """Render each account row with the right balance shape.
@@ -557,6 +599,19 @@ class ReportingMixin:
                             "balance": _format_number(net_income, decimals=2),
                         }]
                         if net_income != 0 else []
+                    ) + (
+                        # Synthetic — closes A = L + E when assets
+                        # render at market value. Single signed line
+                        # (positive = unrealized gain; negative =
+                        # unrealized loss) keeps the report compact
+                        # and matches how analytical accounting
+                        # treats it under "Accumulated OCI" before
+                        # a mark-to-market entry is booked.
+                        [{
+                            "account": "Unrealized Gain/Loss",
+                            "balance": _format_number(unrealized, decimals=2),
+                        }]
+                        if unrealized != 0 else []
                     ),
                 },
             }

@@ -7807,6 +7807,159 @@ class TestBalanceSheetNumericContract:
             )
 
 
+class TestBalanceSheetEquationCloses:
+    """Pre-v1.3.0, ``balance_sheet`` could fail the fundamental
+    accounting identity A = L + E for two unrelated reasons:
+
+    1. ``_ASSET_TYPES`` / ``_LIABILITY_TYPES`` excluded RECEIVABLE
+       and PAYABLE — outstanding invoices issued to customers were
+       invisible in the totals.
+    2. Assets render at market value (factor × quantity for
+       commodities and foreign-currency cash) while equity rolls
+       up at historical-cost split values. The gap between the
+       two views (investment market drift + FX translation
+       adjustment) had no home on the equity side.
+
+    Both fixes land together: A/R / A/P join the right buckets,
+    and a synthetic "Unrealized Gain/Loss" equity line absorbs the
+    remaining mark-to-market gap. After v1.3.0, A = L + E holds by
+    construction on every book.
+    """
+
+    def test_equation_closes_on_simple_usd_book(self, test_book: Path):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Strict equality — no rounding slop.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_equation_closes_on_multi_currency_book(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Cross-currency transfer ($1100 USD → €1000 EUR) puts the
+        # current EUR balance at a different USD value than the
+        # historical post-time rate. The synthetic equity line
+        # absorbs that translation adjustment.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_unrealized_line_present_when_book_has_market_drift(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Lock a EUR price that differs from the historical post-time
+        # rate so unrealized != 0.
+        with gc_book.open(readonly=False) as book:
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            piecash.Price(
+                commodity=eur,
+                currency=book.default_currency,
+                date=date(2024, 12, 31),
+                value=Decimal("1.20"),  # vs. historical 1.10
+                type="last",
+                source="user:price",
+            )
+            book.save()
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" in eq_names, (
+            f"missing synthetic line on book with FX drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+    def test_unrealized_line_omitted_when_no_drift(
+        self, test_book: Path,
+    ):
+        # Single-currency USD test book with no investments — market
+        # == cost trivially, so the synthetic line should be absent.
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" not in eq_names, (
+            f"synthetic line present despite no drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+
+class TestBalanceSheetIncludesReceivablePayable:
+    """RECEIVABLE and PAYABLE join the asset / liability buckets in
+    v1.3.0 so balance_sheet reflects outstanding business activity.
+    Pre-fix, every posted invoice was invisible on the balance
+    sheet by the amount of the receivable.
+    """
+
+    def _setup_book_with_invoice(self, tmp_path: Path) -> Path:
+        from decimal import Decimal
+        book_path = tmp_path / "ar.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        ar = piecash.Account(
+            name="Accounts Receivable", type="RECEIVABLE",
+            parent=assets, commodity=usd,
+        )
+        income = piecash.Account(
+            name="Consulting", type="INCOME", parent=root, commodity=usd,
+        )
+        equity_p = piecash.Account(
+            name="Equity", type="EQUITY", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity_p, commodity=usd,
+        )
+        book.save()
+        # Single posted-invoice transaction: $1500 to A/R, $1500
+        # revenue. Both sides default currency, so nothing exotic.
+        t = piecash.Transaction(
+            currency=usd,
+            description="Posted invoice",
+            post_date=date(2024, 6, 1),
+            splits=[
+                piecash.Split(account=ar, value=Decimal("1500")),
+                piecash.Split(account=income, value=Decimal("-1500")),
+            ],
+        )
+        book.session.add(t)
+        book.save()
+        return book_path
+
+    def test_receivable_appears_in_assets(self, tmp_path: Path):
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        asset_names = [a["account"] for a in result["assets"]["accounts"]]
+        assert any("Receivable" in n for n in asset_names), (
+            f"A/R missing from assets section: {asset_names}"
+        )
+
+    def test_receivable_book_balances(self, tmp_path: Path):
+        from decimal import Decimal
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        assert A == Decimal("1500.00")
+        assert A - L - E == 0
+
+
 class TestCrossToolPriceAgreement:
     """Bookkeeper-flagged: ``get_book_summary`` was using stale prices
     (latest <= today) while ``balance_sheet`` used the absolute latest

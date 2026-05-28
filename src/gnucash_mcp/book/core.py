@@ -343,14 +343,19 @@ class CoreMixin:
         return results
 
     # Asset-side and liability-side type sets used by the net-worth
-    # computation. Mirrors the existing in-summary breakdown — the
-    # asset section iterates these types into per-leaf rows; the
-    # liability section iterates the liability set. Receivables and
-    # payables are intentionally excluded from net worth — they live
-    # in their own dedicated sections of the summary and aren't part
-    # of the assets_total − liabilities_total convention.
-    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
-    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+    # trajectory in get_book_summary. RECEIVABLE and PAYABLE belong
+    # here despite having dedicated dashboard sections elsewhere in
+    # the summary — accounting-wise, A/R is an asset and A/P a
+    # liability, so the trajectory's "now" anchor (and every past-
+    # anchor reconstruction) must include them to agree with
+    # balance_sheet and net_worth. Pre-v1.3.0 these were excluded
+    # here while balance_sheet excluded them too; both were wrong in
+    # the same direction, so the cross-tool numbers happened to
+    # agree. Fixing balance_sheet (v1.3) forces this set to follow
+    # so the dashboard's headline net worth doesn't drift from the
+    # canonical balance-sheet identity.
+    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
+    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 
     def _compute_net_worth_at(
         self,
