@@ -134,6 +134,38 @@ worth excluding outstanding business activity," which doesn't
 have a standard name and disagreed with the canonical balance-
 sheet identity.
 
+**Multi-currency aggregation sweep.**
+
+A class of bugs that v1.2.1's "FX correctness in
+spending_by_category / income_by_source" fix addressed for two
+reports, but left lurking in four other places that nobody
+flagged until the v1.3 pre-release audit:
+
+- **Monthly net** in `get_book_summary` was summing INCOME and
+  EXPENSE splits by `split.value` raw. The docstring called this
+  out as a known limitation "rare in practice for personal /
+  household books"; it isn't rare for the bookkeeper's
+  freelancer-with-foreign-clients case.
+- **Budget headline** actuals were summing `split.quantity` raw
+  across budgeted accounts. EUR-budgeted expense accounts
+  contributed raw EUR quantity to used_pct comparisons against
+  USD budget targets.
+- **Daily expense burn** (the runway divisor) summed EXPENSE
+  splits by raw value. On Lin Wei (CNY-default with USD
+  subscriptions) the burn was understated by the USD spot-rate
+  factor — overstating runway days.
+- **Vendor spending report** summed each bill's grand_total at
+  face value. A vendor list mixing USD and EUR bills produced
+  per-vendor and grand totals that were the sum of numbers in
+  unrelated units.
+
+All four now route through `_account_conversion_factors` and
+`_split_in_default_currency` (or latest-rate × bill total for
+vendor_spending), the same pattern `spending_by_category` and
+`income_by_source` already used. Three regression tests in
+TestMultiCurrencyDashboardHelpers cover the helpers; the
+vendor_spending fix is structurally verified.
+
 **Dashboard refinements.**
 
 - **Overdue counts** on the receivables and payables lines —
@@ -223,15 +255,16 @@ transaction warnings are the next correctness items on the
 backlog. The bookkeeper's daily flow remains the production
 signal.
 
-**Tests:** 1,372 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,376 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
-breakdowns, the role-aligned module groups, the balance-sheet
-equation closure across simple, multi-currency, and A/R-bearing
-books, and the synthetic Unrealized Gain/Loss line's presence/
-absence semantics. The two synthetic test personas (Alex, Lin
-Wei) and the bookkeeper's real-book validation remain the
-verification harness.
+breakdowns (now extended to monthly net, runway, budget
+headline, and vendor spending), the role-aligned module groups,
+the balance-sheet equation closure across simple, multi-
+currency, and A/R-bearing books, and the synthetic Unrealized
+Gain/Loss line's presence/absence semantics. The two synthetic
+test personas (Alex, Lin Wei) and the bookkeeper's real-book
+validation remain the verification harness.
 
 ---
 
