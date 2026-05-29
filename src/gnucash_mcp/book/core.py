@@ -1160,6 +1160,14 @@ class CoreMixin:
         # value flows for splits in budgeted accounts. INCOME is
         # stored negative; flip to a positive contribution to match
         # the spend-vs-target framing.
+        #
+        # Each split is converted to the book's default currency at
+        # the most recent market rate so foreign-currency budgeted
+        # accounts contribute their default-currency-equivalent
+        # spend, not raw quantity. Pre-v1.3.0 a EUR expense account
+        # budgeted at $X contributed raw EUR quantities to the
+        # actuals comparison, wildly miscalibrating used_pct.
+        factors = self._account_conversion_factors(book)
         actuals = Decimal("0")
         for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
@@ -1167,10 +1175,18 @@ class CoreMixin:
             for s in txn.splits:
                 if s.account.guid not in budgeted_account_guids:
                     continue
-                if s.account.type == "EXPENSE" and s.quantity > 0:
-                    actuals += s.quantity
-                elif s.account.type == "INCOME" and s.quantity < 0:
-                    actuals += -s.quantity
+                atype = s.account.type
+                if atype not in ("EXPENSE", "INCOME"):
+                    continue
+                amt = self._split_in_default_currency(
+                    s, s.account, factors.get(s.account.guid),
+                )
+                # EXPENSE: positive value = spend (count). INCOME:
+                # negative value = revenue (count as positive).
+                if atype == "EXPENSE" and amt > 0:
+                    actuals += amt
+                elif atype == "INCOME" and amt < 0:
+                    actuals += -amt
 
         # Period progression.
         total_days = (period_end - period_start).days + 1
@@ -1212,18 +1228,28 @@ class CoreMixin:
 
         Returns ``Decimal("0")`` when no expense activity in window
         — caller treats that as "no daily-burn signal."
+
+        Each EXPENSE split is converted to the book's default
+        currency at the most recent market rate. Pre-v1.3.0 this
+        summed ``split.value`` raw, mixing currencies on books with
+        foreign-currency expenses; on Lin Wei (CNY-default with
+        USD subscriptions) the burn was understated by the USD
+        component's spot-rate factor.
         """
         if days is None:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
         window_start = today - timedelta(days=days)
+        factors = self._account_conversion_factors(book)
         expenses = Decimal("0")
         for txn in transactions:
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             for s in txn.splits:
                 if s.account.type == "EXPENSE":
-                    expenses += Decimal(str(s.value))
+                    expenses += self._split_in_default_currency(
+                        s, s.account, factors.get(s.account.guid),
+                    )
         return expenses / Decimal(days)
 
     def _runway_metrics(
@@ -1397,16 +1423,16 @@ class CoreMixin:
         expense activity at all — the caller should omit the section
         entirely rather than emit six "+0" lines that say nothing.
 
-        Multi-currency caveat: ``split.value`` is in transaction
-        currency, not account commodity. For typical books where
-        income/expense accounts share the book default currency
-        (and transactions are recorded in that currency), the sum is
-        accurate. Cross-currency income/expense activity sums raw
-        without per-month FX conversion — flagged as a refinement
-        target in the spec; rare in practice for personal/household
-        books.
+        Multi-currency handling: each split is converted to the
+        book's default currency at the most recent market rate via
+        ``_split_in_default_currency``. Pre-v1.3.0 this summed
+        ``split.value`` raw across currencies — a EUR invoice
+        for €4,200 and a USD invoice for $5,000 mixed as 9,200 of
+        nothing-in-particular. Correct on USD-only books, silently
+        wrong on any book with foreign-currency income/expense.
         """
         today = date.today()
+        factors = self._account_conversion_factors(book)
 
         # Build the calendar-month windows, oldest → newest. Plain
         # arithmetic on (year, month) avoids a dateutil dependency
@@ -1459,12 +1485,18 @@ class CoreMixin:
                 continue
             for s in txn.splits:
                 atype = s.account.type
+                if atype not in ("INCOME", "EXPENSE"):
+                    continue
+                amt = self._split_in_default_currency(
+                    s, s.account, factors.get(s.account.guid),
+                )
                 if atype == "INCOME":
-                    nets[idx] += -Decimal(str(s.value))
-                    has_activity = True
-                elif atype == "EXPENSE":
-                    nets[idx] -= Decimal(str(s.value))
-                    has_activity = True
+                    # INCOME stored negative (credit-natural); flip
+                    # to positive contribution to monthly net.
+                    nets[idx] += -amt
+                else:  # EXPENSE
+                    nets[idx] -= amt
+                has_activity = True
 
         if not has_activity:
             return []

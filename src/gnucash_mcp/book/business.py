@@ -7153,9 +7153,16 @@ class BusinessMixin:
             # Capture default currency for the compact formatter —
             # pre-fix the table emitted ``$`` regardless of book
             # setting.
-            default_currency_mnemonic = (
-                self._require_default_currency(book).mnemonic
-            )
+            default_currency = self._require_default_currency(book)
+            default_currency_mnemonic = default_currency.mnemonic
+
+            # Latest market rates for FX conversion. A book with
+            # USD vendors AND EUR vendors needs each bill's
+            # grand_total converted to default currency before
+            # summing — raw-sum across currencies is the same
+            # multi-currency bug spending_by_category and
+            # income_by_source carried until v1.3.0.
+            latest_rates = self._rates_as_of(book)
 
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
@@ -7232,6 +7239,27 @@ class BusinessMixin:
 
                 outstanding = abs(balance)
                 paid = total - outstanding
+
+                # Convert each per-bill total from the bill's own
+                # currency to the book default before summing. A
+                # USD-default book with a EUR bill: bill.currency
+                # is EUR, total is in EUR; we multiply by the
+                # current EUR→USD rate (or 1 if same-currency).
+                # Without conversion the grand totals mixed
+                # currencies — a EUR €2,500 bill and a USD $3,000
+                # bill summed to "5,500" of nothing in particular.
+                if bill.currency != default_currency:
+                    rate = latest_rates.get(bill.currency.guid)
+                    if rate is not None:
+                        total = total * rate
+                        paid = paid * rate
+                        outstanding = outstanding * rate
+                    # If no rate is on file, fall back to the
+                    # un-converted figures rather than dropping the
+                    # bill silently. The bookkeeper sees a mixed-
+                    # currency total that's wrong by the FX delta,
+                    # which is the same fallback the rest of the
+                    # codebase uses for unpriced commodities.
 
                 vendor_data[v_name]["total_billed"] += total
                 vendor_data[v_name]["total_paid"] += paid
