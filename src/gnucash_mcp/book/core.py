@@ -1967,8 +1967,15 @@ class CoreMixin:
             ))
 
             # --- Build output ---
+            # Book line shows filename only — no directory leak.
+            # See _book_display_name for the privacy rationale; the
+            # filename is enough for the LLM to confirm which book
+            # is loaded ("alex.gnucash" vs "lin-wei.gnucash") while
+            # keeping the user's filesystem layout out of every
+            # transcript and screenshot.
+            from gnucash_mcp._format import _book_display_name
             lines = []
-            lines.append(f"Book: {self.book_path}")
+            lines.append(f"Book: {_book_display_name(self.book_path)}")
             lines.append(f"Currency: {currency}")
 
             if first_date and last_date:

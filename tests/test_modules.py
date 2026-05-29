@@ -507,7 +507,9 @@ class TestGetServerConfig:
         output = _get_server_config_impl()
         assert "Modules loaded: core,reporting" in output
         assert "Tools available: 20" in output
-        assert "Book path: /tmp/test.gnucash" in output
+        # Book line shows filename only — see _book_display_name
+        # for the privacy rationale. Path leak hardened in v1.3.0.
+        assert "Book: test.gnucash" in output
         assert "Debug mode: true" in output
         assert "Version:" in output
 
@@ -517,8 +519,34 @@ class TestGetServerConfig:
         output = _get_server_config_impl()
         assert "Modules loaded: unknown" in output
         assert "Tools available: unknown" in output
-        assert "Book path: not set" in output
+        assert "Book: not set" in output
         assert "Debug mode: false" in output
+
+    def test_impl_does_not_leak_directory_path(self):
+        """The book directory must not appear in the response.
+
+        Privacy hardening shipped in v1.3.0: routine LLM-visible
+        responses used to include the full absolute path to the
+        GnuCash book, leaking username and home directory layout
+        into every transcript and screenshot. The filename alone is
+        sufficient for the LLM to confirm which book is loaded.
+        """
+        _server_state.update({
+            "modules": "core",
+            "tool_count": 10,
+            "book_path": "/Users/alice/Finances/personal-2026.gnucash",
+            "debug": False,
+        })
+        output = _get_server_config_impl()
+        # Username and directory must NOT appear.
+        assert "/Users/" not in output, (
+            f"directory path leaked into output:\n{output}"
+        )
+        assert "alice" not in output
+        assert "Finances" not in output
+        # But the filename SHOULD appear so the caller can verify
+        # which book is loaded.
+        assert "personal-2026.gnucash" in output
 
     def test_impl_output_is_plain_text(self):
         """Output should be plain text, not JSON."""

@@ -153,10 +153,26 @@ class TestGetBookSummary:
         assert "Currency: USD" in result
 
     def test_get_book_summary_book_path(self, test_book: Path):
-        """Should include the book file path."""
+        """Should include the book filename only, no directory leak.
+
+        Privacy hardening shipped in v1.3.0: the "Book:" line used
+        to expose the full absolute path on every orientation call,
+        leaking the user's filesystem layout into every transcript.
+        Filename alone is enough for the LLM to confirm which book
+        is loaded — see ``_book_display_name``.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.get_book_summary()
-        assert f"Book: {test_book}" in result
+        # First line should be ``Book: <filename>``.
+        first_line = result.split("\n", 1)[0]
+        assert first_line == f"Book: {test_book.name}", (
+            f"unexpected Book line: {first_line!r}"
+        )
+        # And the directory components must NOT appear anywhere.
+        parent_path = str(test_book.parent)
+        assert parent_path not in result, (
+            f"directory leaked into summary: {parent_path!r}"
+        )
 
     def test_data_range_uses_transaction_dates_not_prices(
         self, test_book: Path,

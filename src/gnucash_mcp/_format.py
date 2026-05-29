@@ -16,6 +16,7 @@ Two pieces:
   plug in its own entity name.
 """
 
+import os
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TypeVar
 
@@ -81,6 +82,39 @@ def _format_number(
         return s or "0"
 
     return format(rounded, "f")
+
+
+# ── Path display ───────────────────────────────────────────────────
+
+
+def _book_display_name(book_path) -> str:
+    """Render a book path as filename only — no directory leakage.
+
+    Routine LLM-visible responses (``get_server_config``,
+    ``get_book_summary``'s orientation line) used to include the full
+    absolute path to the GnuCash book. That leaks the user's
+    username, home directory layout, and any custom organization
+    (``~/Finances/``, ``~/Documents/Books/``) into every transcript
+    — a privacy concern for a tool that gets used on real personal
+    financial data and a security concern for screenshots / shared
+    sessions.
+
+    The filename alone is sufficient to verify *which* book is
+    loaded ("yes, this is Alex's book, not Lin Wei's"); the path
+    components leading to it are the sensitive bit.
+
+    This is an always-on redaction for the book path specifically,
+    distinct from :func:`gnucash_mcp.logging_config.redact_paths`
+    which is opt-in via ``GNUCASH_REDACT_PATHS=1`` and aimed at
+    error-message paths (where the directory may be load-bearing
+    debugging signal).
+
+    Returns ``"not set"`` for falsy input so the orientation reads
+    sensibly when ``GNUCASH_BOOK_PATH`` was never set.
+    """
+    if not book_path:
+        return "not set"
+    return os.path.basename(str(book_path))
 
 
 # ── Limit enforcement ──────────────────────────────────────────────

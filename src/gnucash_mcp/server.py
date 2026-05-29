@@ -661,14 +661,17 @@ def accounts_resource() -> str:
 def _get_server_config_impl() -> str:
     """Return current server configuration and runtime state.
 
-    Reports loaded modules, tool count, book path, debug mode,
+    Reports loaded modules, tool count, book filename, debug mode,
     and version so the client can verify its own tool inventory.
+    The book is shown as filename only — see
+    ``_book_display_name`` for the privacy rationale.
     """
     from gnucash_mcp import __version__
+    from gnucash_mcp._format import _book_display_name
     lines = [
         f"Modules loaded: {_server_state.get('modules', 'unknown')}",
         f"Tools available: {_server_state.get('tool_count', 'unknown')}",
-        f"Book path: {_server_state.get('book_path', 'not set')}",
+        f"Book: {_book_display_name(_server_state.get('book_path'))}",
         f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
         f"Version: {__version__}",
     ]
