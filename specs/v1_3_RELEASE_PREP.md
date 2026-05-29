@@ -1,5 +1,13 @@
 # v1.3 Release Prep — Tasks for Claude Code
 
+> **Implementation note (post-merge):** The `except` parameter
+> was renamed to `except_guids` during implementation because
+> `except` is a Python reserved keyword. With v1.3's
+> `extra="forbid"` strict-kwargs validation, calling the tool
+> with `except=[...]` now raises a clear validation error. The
+> spec below is preserved as authored; the shipped name is
+> `except_guids` everywhere.
+
 ## 1. `reconcile_account` — add `except` parameter
 
 **Value:** When reconciling a statement, the common case is "all

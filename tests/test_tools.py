@@ -1065,6 +1065,27 @@ class TestBalanceSheetTool:
         data = json.loads(result)
         assert data["as_of_date"] == date.today().isoformat()
 
+    def test_balance_sheet_rejects_empty_string_as_of_date(
+        self, setup_book_env,
+    ):
+        """Copilot-flagged on PR #92 review: empty string is a
+        caller bug (probably a stale-template / missing-variable
+        substitution), not a "use today" signal. Pre-fix the falsy
+        check treated ``as_of_date=""`` the same as ``None`` and
+        silently substituted today, producing a wrong-dated
+        report the caller had no way to notice. Strict-kwargs
+        philosophy extends to the value: empty string → loud
+        validation error.
+        """
+        result = server_module.balance_sheet(as_of_date="")
+        data = json.loads(result)
+        # safe_tool wraps the ValueError from date.fromisoformat("")
+        # into a structured validation_error response.
+        assert data.get("error_type") == "validation_error", (
+            f"expected validation_error for empty as_of_date, got: "
+            f"{data!r}"
+        )
+
 
 class TestNetWorthTool:
     """Tests for net_worth tool."""

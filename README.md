@@ -163,7 +163,7 @@ repo, so copy the book somewhere outside the repo first:
 
 ```bash
 mkdir -p ~/gnucash-mcp-scratch
-cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
+cp gnucash-mcp/samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
 ### 3. Tell Claude Desktop about the server

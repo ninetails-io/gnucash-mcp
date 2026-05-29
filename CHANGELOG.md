@@ -210,9 +210,10 @@ vendor_spending fix is structurally verified.
   the boundary is the wire.
 - **Write rate-limiting via token bucket.** Defends against a
   runaway agent loop accidentally hammering the database with
-  thousands of writes per second. Default: 60 writes/minute with
-  short bursts allowed; configurable via `GNUCASH_MCP_RATE_LIMIT`.
-  Read tools are unaffected.
+  thousands of writes per second. Disabled by default; opt-in via
+  `GNUCASH_WRITE_RATE_LIMIT` (tokens-per-second, positive float)
+  with `GNUCASH_WRITE_BURST` (max bucket size, default 10). Read
+  tools are unaffected.
 
 **Strict argument validation.**
 

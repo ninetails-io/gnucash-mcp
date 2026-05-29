@@ -89,7 +89,16 @@ def register(mcp, get_book) -> None:
                 explicit date for historical snapshots.
         """
         book = get_book()
-        d = date.fromisoformat(as_of_date) if as_of_date else date.today()
+        # Distinguish "not provided" (None → today) from "provided
+        # but empty/garbage" (raise). Pre-fix, an empty-string
+        # ``as_of_date=""`` silently fell back to today — a caller
+        # bug that produced silently wrong-dated reports. Copilot
+        # PR #92 review caught this; the strict-kwargs pattern
+        # extends to the value, not just the parameter name.
+        if as_of_date is None:
+            d = date.today()
+        else:
+            d = date.fromisoformat(as_of_date)
         result = book.balance_sheet(as_of_date=d)
         return _json(result)
 
