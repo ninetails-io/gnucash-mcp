@@ -185,6 +185,16 @@ vendor_spending fix is structurally verified.
 
 **Security — Stage 6 hardening.**
 
+- **Book directory path redacted from routine LLM-visible
+  responses.** `get_server_config` and `get_book_summary` used
+  to render the full absolute path to the loaded book — every
+  orientation call and every "what's loaded?" diagnostic was
+  leaking the username, home directory layout, and book filename
+  into the LLM transcript. Now shown as filename only. Always-on
+  for the book path specifically; backup-tool responses
+  (`create_backup` restore hint, `list_backups` path field) still
+  carry full paths because the restore use case functionally
+  needs them.
 - **Path-traversal hardening on `.mcp` sidecar directories.** Backup
   and audit-log paths derive from `GNUCASH_BOOK_PATH`; the sidecar
   resolution now checks symlink targets, ownership, and world-
@@ -255,7 +265,7 @@ transaction warnings are the next correctness items on the
 backlog. The bookkeeper's daily flow remains the production
 signal.
 
-**Tests:** 1,376 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,377 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
