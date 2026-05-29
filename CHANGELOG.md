@@ -121,6 +121,19 @@ outstanding invoices:
 After both fixes, A = L + E holds by construction across the
 three tools that compute net worth.
 
+**Heads-up for users tracking trajectory month-over-month:** the
+net-worth number — and every historical anchor (12mo / 6mo / 3mo
+/ 1mo ago) — now includes outstanding A/R minus A/P. On books
+with active business activity this is a meaningful restatement
+of the trajectory. Alex's "now" anchor moves from ~$189K (pre-
+v1.3) to $204K because $15K of A/R that was previously
+excluded now sits in the total. Historical anchors shift by
+whatever A/R / A/P existed on those dates. This is the
+accounting-correct number; the pre-v1.3 view was "tangible net
+worth excluding outstanding business activity," which doesn't
+have a standard name and disagreed with the canonical balance-
+sheet identity.
+
 **Dashboard refinements.**
 
 - **Overdue counts** on the receivables and payables lines —
@@ -178,7 +191,7 @@ balance mismatch.
 in addition to the legacy `<entity>_id`. Pass exactly one; back-
 compat preserved for existing callers.
 
-**Server instructions — 59% smaller.**
+**Server instructions — 39% smaller.**
 
 The orientation block sent to MCP clients on connect went from
 ~2,500 chars to 1,522 (24% under the 2K cap). Same coverage
