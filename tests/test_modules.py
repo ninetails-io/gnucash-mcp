@@ -279,19 +279,49 @@ class TestApplyModuleFilter:
         _apply_module_filter("scheduling,reconciliation,all")
         assert len(self._tool_names()) == 106
 
-    def test_unknown_module_warns(self, capsys):
-        """Unknown module names should produce a warning on stderr."""
-        _apply_module_filter("core,nonexistent")
+    def test_unknown_module_fails_fast(self, capsys):
+        """Unknown module names fail-fast at startup with SystemExit.
+
+        Bookkeeper-found on PR #92 review: pre-fix, a typo'd module
+        name (e.g. ``--modules=bookeeper`` missing the 'k') printed
+        a warning to stderr and then silently partial-loaded. Claude
+        Desktop captures MCP server stderr into a log file the user
+        never sees, so the warning was effectively invisible — the
+        user observed "the tools I expected aren't there" and could
+        not tell whether it was a typo or a server bug. v1.3 fails
+        fast so configuration errors surface immediately.
+        """
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("core,nonexistent")
+        assert exc_info.value.code == 2
         captured = capsys.readouterr()
         assert "nonexistent" in captured.err
         assert "Unknown module" in captured.err
+        assert "Valid names:" in captured.err
 
-    def test_unknown_module_still_loads_core(self, capsys):
-        """Unknown modules should not prevent the ``core`` group from
-        loading."""
-        _apply_module_filter("nonexistent")
-        remaining = self._tool_names()
-        assert _core_tool_names().issubset(remaining)
+    def test_unknown_module_did_you_mean_suggestion(self, capsys):
+        """Typos close to a known name should surface a did-you-mean
+        hint so the user can self-correct on the next restart without
+        scrolling through the full valid-names list.
+        """
+        import pytest
+        with pytest.raises(SystemExit):
+            _apply_module_filter("bookeeper")  # missing 'k'
+        captured = capsys.readouterr()
+        assert "bookeeper" in captured.err
+        assert "did you mean 'bookkeeper'" in captured.err
+
+    def test_unknown_module_alongside_valid_still_fails(self, capsys):
+        """Mixed valid + invalid input fails the whole startup. No
+        partial-load mode where the valid modules quietly load and
+        the invalid one is dropped — that was the silent-failure
+        regime fail-fast replaces.
+        """
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("bookeeper,investor")
+        assert exc_info.value.code == 2
 
     def test_whitespace_in_module_names(self):
         """Whitespace around module names should be stripped."""
@@ -401,14 +431,17 @@ class TestApplyModuleFilter:
         assert result == sorted(MODULE_GROUPS["core"])
 
     def test_returns_excludes_unknown_modules(self):
-        """Unknown module names should not appear in return value.
-        The ``core`` group's sub-modules are always present even
-        when the user-supplied list contained only garbage."""
-        result = _apply_module_filter("reporting,nonexistent")
-        assert "nonexistent" not in result
-        # One representative Core sub-module is enough.
-        assert "accounts" in result
-        assert "reporting" in result
+        """Unknown module names trigger fail-fast (v1.3 behavior).
+
+        Pre-v1.3 the function returned a sorted list excluding
+        unknown names. After the fail-fast change, the function
+        raises SystemExit instead — the "excluded" behavior is now
+        "rejected at startup" so it can't surface downstream as
+        missing tools. Test repurposed to lock the new contract.
+        """
+        import pytest
+        with pytest.raises(SystemExit):
+            _apply_module_filter("reporting,nonexistent")
 
 
 class TestExtractedModuleLazyLoading:

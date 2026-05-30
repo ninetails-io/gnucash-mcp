@@ -507,16 +507,49 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
             else:
                 enabled_modules.add(name)
 
-        # Warn on names that don't resolve to a known sub-module.
+        # Fail-fast on names that don't resolve to a known sub-module
+        # or group. Pre-v1.3.0 this was a stderr warning, then partial
+        # load — silent in practice because Claude Desktop captures
+        # MCP server stderr into a log file the user never sees. A
+        # typo'd ``--modules=bookeeper`` (missing the 'k') would
+        # silently load only ``core``, leaving the user unable to
+        # tell whether the tools they wanted are missing because
+        # they typed it wrong or because the server is broken.
+        # Bookkeeper-found bug on the PR #92 review pass; same
+        # principle as ``extra="forbid"`` on tool kwargs — financial
+        # software shouldn't silently swallow typos in configuration
+        # either.
         known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
-        all_referenced = requested | enabled_modules
-        unknown = all_referenced - known - {"all"}
+        unknown = requested - known - {"all"}
         if unknown:
-            print(
-                f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
-                f"Available: {', '.join(sorted(known))}, all",
-                file=sys.stderr,
+            # Per-typo, suggest the closest known name (did-you-mean).
+            # Use simple shared-character ratio; close enough for the
+            # typo-class we're trying to catch without pulling in a
+            # Levenshtein dependency.
+            import difflib
+            lines = ["Unknown module name(s) on --modules / GNUCASH_MCP_MODULES:"]
+            for bad in sorted(unknown):
+                matches = difflib.get_close_matches(
+                    bad, sorted(known), n=1, cutoff=0.6,
+                )
+                if matches:
+                    lines.append(f"  - {bad!r}  (did you mean {matches[0]!r}?)")
+                else:
+                    lines.append(f"  - {bad!r}")
+            lines.append("")
+            lines.append(
+                f"Valid names: {', '.join(sorted(known))}, all"
             )
+            lines.append("")
+            lines.append(
+                "Fix the typo and restart the server. Partial-load "
+                "was the previous behavior; v1.3 fails fast so "
+                "configuration errors surface at startup instead "
+                "of as missing tools downstream."
+            )
+            message = "\n".join(lines)
+            print(message, file=sys.stderr)
+            raise SystemExit(2)
 
     # Keep only known sub-module names. Group expansion above may
     # have introduced names that aren't TOOL_MODULES keys if the
