@@ -1,6 +1,7 @@
 """Tests for business tools: customers, vendors, billterms, invoices, bills."""
 
 import json
+from datetime import date, timedelta
 from decimal import Decimal
 import pytest
 from gnucash_mcp.book import GnuCashBook
@@ -8410,6 +8411,333 @@ class TestPayInvoice:
                 payment_date="2026-03-20",
                 fx_account="Income:Typo Account That Does Not Exist",
             )
+
+
+# ============== Early-payment discount ==============
+
+
+class TestPayInvoiceEarlyPaymentDiscount:
+    """Verify ``pay_invoice`` honors the discount fields on
+    billterms — discount_days, discount_percent. Pre-v1.3.0
+    these fields were stored at billterm creation but ignored
+    at payment time (silent feature lie).
+
+    Validation chain rejects every failure mode loudly. Customer
+    and vendor sides both supported. Cross-currency interaction
+    composes cleanly with the existing FX gain/loss logic.
+    """
+
+    def _setup_invoice_with_terms(
+        self,
+        gb: GnuCashBook,
+        amount: str = "1000.00",
+        discount_days: int = 10,
+        discount_percent: str = "2",
+        invoice_date: date | None = None,
+    ) -> str:
+        """Create customer + billterm + posted invoice with terms."""
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(
+            name="2/10 Net 30",
+            due_days=30,
+            discount_days=discount_days,
+            discount_percent=discount_percent,
+        )
+        gb.create_invoice(
+            customer_id="000001",
+            term="2/10 Net 30",
+            date_opened=invoice_date.isoformat() if invoice_date else None,
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=invoice_date.isoformat() if invoice_date else None,
+        )
+        return "000001"
+
+    def _setup_bill_with_terms(
+        self,
+        gb: GnuCashBook,
+        amount: str = "1000.00",
+        discount_days: int = 10,
+        discount_percent: str = "2",
+        bill_date: date | None = None,
+    ) -> str:
+        gb.create_vendor(name="Supplier Co")
+        gb.create_billterm(
+            name="2/10 Net 30",
+            due_days=30,
+            discount_days=discount_days,
+            discount_percent=discount_percent,
+        )
+        gb.create_bill(
+            vendor_id="000001",
+            term="2/10 Net 30",
+            date_opened=bill_date.isoformat() if bill_date else None,
+        )
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date=bill_date.isoformat() if bill_date else None,
+        )
+        return "000001"
+
+    # ── Happy paths ───────────────────────────────────────────
+
+    def test_customer_invoice_within_window_full_discount(
+        self, business_book,
+    ):
+        """Customer pays $980 of $1000 on day 5 within 2/10 window
+        → A/R clears full $1000, $20 books to Expenses:Sales Discounts.
+        """
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980",
+            payment_date="2026-05-06",  # day 5 within window
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        assert "discount" in result
+        assert Decimal(result["discount"]["amount"]) == Decimal("20.00")
+        assert "Sales Discounts" in result["discount"]["account"]
+
+    def test_vendor_bill_within_window_full_discount(self, business_book):
+        """Vendor offers us 2/10 Net 30 on $1000 bill, we pay $980 on day 8
+        → A/P clears full $1000, $20 books to Income:Purchase Discounts Taken.
+        """
+        gb = GnuCashBook(str(business_book))
+        bill_date = date(2026, 5, 1)
+        self._setup_bill_with_terms(
+            gb, amount="1000.00", bill_date=bill_date,
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980",
+            payment_date="2026-05-09",  # day 8 within window
+            apply_discount=True,
+            owner_type="vendor",
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        assert "discount" in result
+        assert "Purchase Discounts" in result["discount"]["account"]
+
+    def test_payment_at_window_boundary_accepted(self, business_book):
+        """Payment on exactly day 10 of a 2/10 window → accepted."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980",
+            payment_date="2026-05-11",  # exactly day 10
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+
+    # ── Validation rejections ────────────────────────────────
+
+    def test_reject_no_billterm(self, business_book):
+        """apply_discount=True on invoice with no terms → error."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="X", quantity="1", price="1000",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        with pytest.raises(ValueError, match="no billterm linked"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="980",
+                apply_discount=True,
+            )
+
+    def test_reject_billterm_without_discount(self, business_book):
+        """apply_discount=True on a billterm with no discount → error."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme")
+        gb.create_billterm(
+            name="Net 30",
+            due_days=30,
+            discount_days=0,
+            discount_percent="0",
+        )
+        gb.create_invoice(customer_id="000001", term="Net 30")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="X", quantity="1", price="1000",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        with pytest.raises(ValueError, match="no early-payment discount"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="980",
+                apply_discount=True,
+            )
+
+    def test_reject_past_window(self, business_book):
+        """Payment day 11 of a 10-day window → rejected."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        with pytest.raises(ValueError, match="beyond the billterm discount window"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="980",
+                payment_date="2026-05-12",  # day 11
+                apply_discount=True,
+            )
+
+    def test_reject_wrong_amount(self, business_book):
+        """apply_discount=True with amount that doesn't match expected
+        shortfall → reject with the correct amount suggestion."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        with pytest.raises(ValueError, match="shortfall doesn't match"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="500",  # not a discount-shortfall; intended partial
+                payment_date="2026-05-06",
+                apply_discount=True,
+            )
+
+    def test_reject_credit_note(self, business_book):
+        """apply_discount=True on a credit note → loud reject."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        # Set up a posted credit note (no terms — discounting credit
+        # notes is semantically nonsensical regardless of terms).
+        gb.create_customer(name="Acme")
+        gb.create_credit_note(
+            owner_type="customer", owner_id="000001",
+            date_opened=invoice_date.isoformat(),
+        )
+        gb.add_credit_note_entry(
+            credit_note_id="000001", account="Income:Sales",
+            description="Refund", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=invoice_date.isoformat(),
+        )
+        with pytest.raises(ValueError, match="Discounts cannot be applied to credit note"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="98",
+                payment_date="2026-05-06",
+                apply_discount=True,
+            )
+
+    # ── Closing-payment-after-partials ───────────────────────
+
+    def test_partial_then_discount_settlement(self, business_book):
+        """Customer pays $500 early without discount, then $480 with
+        discount to close. Should succeed: shortfall on closing
+        payment ($500 - $480 = $20) matches expected discount on
+        original $1000 invoice."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date(2026, 5, 1)
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        # First payment: $500 without discount
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            payment_date="2026-05-03",
+        )
+        # Second payment: $480 with discount, should close
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="480",
+            payment_date="2026-05-08",  # still within window
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        assert Decimal(result["discount"]["amount"]) == Decimal("20.00")
+
+    # ── Get_invoice forward signal ────────────────────────────
+
+    def test_get_invoice_surfaces_discount_available(self, business_book):
+        """get_invoice on an invoice with active discount terms
+        should include discount_available block with eligible_until +
+        amount, so the LLM can proactively surface "save $X by Y"."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date.today()  # within window today
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        result = gb.get_invoice(invoice_id="000001")
+        assert "discount_available" in result, (
+            f"discount_available block missing: {result}"
+        )
+        assert Decimal(result["discount_available"]["amount"]) == Decimal("20.00")
+        eligible = date.fromisoformat(
+            result["discount_available"]["eligible_until"]
+        )
+        assert eligible == invoice_date + timedelta(days=10)
+
+    def test_get_invoice_marks_expired_discount(self, business_book):
+        """When the discount window has passed, get_invoice shows the
+        same fields under ``discount_expired`` rather than dropping
+        them — caller can see what was offered, audit trail intact."""
+        gb = GnuCashBook(str(business_book))
+        invoice_date = date.today() - timedelta(days=20)  # past window
+        self._setup_invoice_with_terms(
+            gb, amount="1000.00", invoice_date=invoice_date,
+        )
+        result = gb.get_invoice(invoice_id="000001")
+        assert "discount_expired" in result
+        assert "discount_available" not in result
 
 
 # ============== _compute_fx_gain_loss Unit Tests ==============

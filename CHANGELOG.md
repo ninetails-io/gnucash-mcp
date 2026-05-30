@@ -91,6 +91,37 @@ a module set" table for which modules to load for which use case.
   out of `reconcile_account` the same way it does in every other
   account-aware tool.
 
+**Early-payment discounts now actually honored.**
+
+`create_billterm` had been accepting `discount_days` and
+`discount_percent` since v1.3 launched. The fields stored
+correctly, `get_billterm` returned them correctly — and
+`pay_invoice` ignored them entirely. A freelancer with `2/10 Net
+30` terms whose customer paid $980 of $1,000 on day 5 got a
+partial-payment record with $20 still outstanding instead of
+the clean settlement they expected.
+
+The pay path now supports an explicit `apply_discount=True`
+mode that validates terms exist, the payment date is within the
+discount window, and the shortfall matches the expected discount
+on pre-tax principal (tax is collected on behalf of the
+government at the gross rate and is NOT reduced — discounting
+it would short the GST/PST remittance). Each failure mode
+rejects with a specific error; no silent downgrades to partial.
+
+The discount split routes via the same auto-resolver pattern as
+`fx_account`: explicit `discount_account=` parameter > leaf-name
+match on `INCOME`/`EXPENSE` accounts > canonical default
+(`Expenses:Sales Discounts` for customer payments,
+`Income:Purchase Discounts Taken` for vendor bill payments —
+auto-created on first use).
+
+`get_invoice` verbose mode now surfaces a `discount_available`
+block (or `discount_expired` once the window passes) with the
+eligible-until date and dollar amount, so the LLM can
+proactively offer "you can save $X by paying this by Y" without
+the freelancer having to ask.
+
 **`balance_sheet` now actually balances.**
 
 Two unrelated bugs were producing a silent A ≠ L + E identity
@@ -266,7 +297,7 @@ transaction warnings are the next correctness items on the
 backlog. The bookkeeper's daily flow remains the production
 signal.
 
-**Tests:** 1,377 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,390 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget

@@ -1069,6 +1069,8 @@ def register(mcp, get_book) -> None:
         description: str | None = None,
         owner_type: str | None = None,
         fx_account: str | None = None,
+        apply_discount: bool = False,
+        discount_account: str | None = None,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
@@ -1087,6 +1089,19 @@ def register(mcp, get_book) -> None:
         ambiguous candidates so you can pass ``fx_account``
         explicitly next time.
 
+        For invoices with early-payment-discount terms (e.g.,
+        "2/10 Net 30" = 2% off if paid within 10 days), pass
+        ``apply_discount=True`` to settle via discount. The tool
+        validates that the invoice has discount terms, the payment
+        date is within the discount window, and the shortfall
+        matches the expected discount on pre-tax principal. Each
+        failure mode rejects with a specific error rather than
+        silently downgrading to a partial payment. ``discount_account``
+        controls routing the same way ``fx_account`` does
+        (auto-resolves to ``Expenses:Sales Discounts`` for customer
+        payments, ``Income:Purchase Discounts Taken`` for vendor
+        bill payments).
+
         Args:
             id: Invoice or bill ID (e.g., "000001").
             payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
@@ -1097,6 +1112,15 @@ def register(mcp, get_book) -> None:
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
                 Accepts a full path, %short GUID, or full 32-char GUID.
+            apply_discount: When True, treat this payment as the
+                final settlement and absorb the early-payment
+                discount from the invoice's billterm. Default False
+                — explicit opt-in. Hard-rejects on credit notes
+                (refunds don't take discounts).
+            discount_account: Optional INCOME or EXPENSE account to
+                receive the discount split. Auto-resolves when
+                omitted. Accepts full path, %short GUID, or full
+                32-char GUID.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1108,6 +1132,8 @@ def register(mcp, get_book) -> None:
             description=description,
             owner_type=owner_type,
             fx_account=fx_account,
+            apply_discount=apply_discount,
+            discount_account=discount_account,
         )
         return _json(result)
 
