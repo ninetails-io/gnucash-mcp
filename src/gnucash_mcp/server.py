@@ -113,6 +113,25 @@ MODULE_GROUPS: dict[str, list[str]] = {
     "investor": [
         "tax_lots", "portfolio",
     ],
+    # ``business`` is the small-business persona alias. It expands
+    # to ``freelancer`` (the 19 customer-facing invoice tools) plus
+    # ``business_complete`` (the 29 vendor/employee/jobs/credit-
+    # notes/billing-terms tools). Pre-v1.3 ``business`` was a
+    # standalone leaf containing only the second half — a user
+    # picking ``--modules=business`` for "small business workflow"
+    # got vendor management but couldn't create or post a customer
+    # invoice. Bookkeeper-found on PR #92 review; the fix
+    # restructures business into the natural superset.
+    #
+    # The two leaves stay independently selectable for users who
+    # want a finer cut (a solo freelancer with no vendor activity
+    # uses ``--modules=freelancer``; a back-office bookkeeper
+    # managing only vendor side could pick
+    # ``--modules=business_complete`` though that's a less common
+    # carve-out).
+    "business": [
+        "freelancer", "business_complete",
+    ],
 }
 
 
@@ -156,11 +175,19 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     # surface.
     "portfolio": {"investments"},
     "tax_lots": {"investments"},
-    # ``freelancer`` (customer-facing invoicing) and ``business``
-    # (vendor + employee management, vendor bills) split the legacy
-    # ``business`` module along persona lines.
+    # ``freelancer`` (customer-facing invoicing) and
+    # ``business_complete`` (vendor + employee management, vendor
+    # bills, jobs, credit notes, billing terms) split the legacy
+    # ``business`` module along persona lines. Both back onto the
+    # same ``tools/business.py`` file — the public modules are
+    # subsets of one underlying registration.
+    #
+    # The ``business`` PUBLIC name is a MODULE_GROUPS alias that
+    # expands to both halves (see MODULE_GROUPS above); it doesn't
+    # appear here because groups never need their own backing
+    # entry — they resolve via their members' backings.
     "freelancer": {"business"},
-    "business": {"business"},
+    "business_complete": {"business"},
 }
 
 
@@ -313,7 +340,15 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_taxtable",
         "delete_taxtable",
     ],
-    "business": [
+    # ``business_complete`` — the vendor/employee/bills/credit-
+    # notes/jobs/billing-terms surface. Together with
+    # ``freelancer`` (the invoice surface), forms the full small-
+    # business toolkit. Both leaves expand together under the
+    # ``business`` group alias in MODULE_GROUPS. Pre-v1.3 this
+    # was named ``business`` and treated as a standalone — a UX
+    # trap that gave business-mode users only half the surface
+    # they expected.
+    "business_complete": [
         "create_vendor",
         "list_vendors",
         "get_vendor",
@@ -752,15 +787,17 @@ Options:
                                       regardless. 26 tools.
                          bookkeeper   Reconciliation + reporting +
                                       budgets + scheduling. 20 tools.
-                         investor    tax_lots + portfolio (cost basis
+                         investor     tax_lots + portfolio (cost basis
                                       + prices). 12 tools.
-                         freelancer  Customer invoicing + sales tax
+                         freelancer   Customer invoicing + sales tax
                                       (taxtables for GST / VAT /
                                       US state sales tax). 19 tools.
-                         business     Additive to freelancer:
-                                      vendors, employees, bills,
-                                      vouchers, credit notes, jobs,
-                                      billterms. 29 tools.
+                         business     Full small-business package:
+                                      freelancer (invoicing) +
+                                      business_complete (vendors,
+                                      employees, bills, vouchers,
+                                      credit notes, jobs, billterms).
+                                      48 tools.
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
@@ -774,11 +811,16 @@ Options:
 
                        Investor members (2): tax_lots, portfolio.
 
+                       Business members (2): freelancer,
+                       business_complete.
+
                        Example: --modules=freelancer for a solo
-                       invoicer; --modules=bookkeeper for personal
-                       finance; --modules=freelancer,business for a
-                       small business with vendor management.
-                       ``core`` is always added regardless.
+                       invoicer with no vendor activity;
+                       --modules=bookkeeper for personal finance;
+                       --modules=business for a complete small-
+                       business workflow (invoices + vendor + employee
+                       management). ``core`` is always added
+                       regardless.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message

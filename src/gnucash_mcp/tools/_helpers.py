@@ -222,23 +222,31 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     """
     from gnucash_mcp.server import is_module_enabled
 
-    if is_module_enabled("business"):
+    # ``business_complete`` is the leaf that owns vendor + employee
+    # management. The ``business`` MODULE_GROUPS alias expands to
+    # ``freelancer + business_complete`` for the small-business
+    # persona, so ``--modules=business`` enables both naturally.
+    # Gate-check the leaf directly so a user who explicitly picked
+    # only ``business_complete`` (uncommon but valid) also gets
+    # vendor/employee functionality unlocked.
+    if is_module_enabled("business_complete"):
         return owner_type  # All three halves available; no gating.
 
     if owner_type == "vendor":
         raise ValueError(
-            "owner_type='vendor' requires the Business module. "
-            "Restart the server with --modules=...,Business to access "
+            "owner_type='vendor' requires the business module. "
+            "Restart the server with --modules=business (or add "
+            "business_complete to your current selection) to access "
             "vendor bills, or omit owner_type to operate on customer "
             "invoices only."
         )
     if owner_type == "employee":
         raise ValueError(
-            "owner_type='employee' requires the Business module. "
+            "owner_type='employee' requires the business module. "
             "Employee expense vouchers live with employee "
-            "management, which the Business module owns. Restart "
-            "the server with --modules=...,Business or omit "
-            "owner_type to operate on customer invoices only."
+            "management. Restart the server with --modules=business "
+            "(or add business_complete to your current selection) "
+            "or omit owner_type to operate on customer invoices only."
         )
     # Only None and 'customer' fall through to "customer" coercion.
     # Anything else (typos like 'venddor', unknown future types) is

@@ -99,12 +99,15 @@ class TestToolModulesMapping:
             "reconciliation", "reporting", "budgets", "scheduling",
             # Investor-cluster leaves
             "portfolio", "tax_lots",
-            # Business-side
-            "freelancer", "business",
+            # Business-cluster leaves (``business`` is now a group
+            # alias expanding to these two; the standalone of the
+            # same name was the pre-v1.3 design, retired because it
+            # left small-business users without invoice tools).
+            "freelancer", "business_complete",
         }
         assert set(TOOL_MODULES.keys()) == expected
-        # Group aliases — ``core`` always-on plus the two new
-        # role groups landing in v1.3.
+        # Group aliases — ``core`` always-on plus the three role
+        # groups (bookkeeper, investor, business) landing in v1.3.
         assert set(MODULE_GROUPS["core"]) == {
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
@@ -114,6 +117,9 @@ class TestToolModulesMapping:
         }
         assert set(MODULE_GROUPS["investor"]) == {
             "tax_lots", "portfolio",
+        }
+        assert set(MODULE_GROUPS["business"]) == {
+            "freelancer", "business_complete",
         }
 
     def test_validate_tool_modules_passes(self):
@@ -622,13 +628,17 @@ class TestOwnerTypeGating:
         _LOADED_MODULES.update(original)
 
     def test_business_loaded_passes_through(self):
-        """With business enabled, _gate_owner_type returns its input
-        unchanged — both halves of the polymorphic dispatch work."""
+        """With business_complete enabled (whether explicitly or via
+        the ``business`` group alias), _gate_owner_type returns its
+        input unchanged — both halves of the polymorphic dispatch work.
+        """
         from gnucash_mcp.server import _LOADED_MODULES
         from gnucash_mcp.tools._helpers import _gate_owner_type
 
         _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer", "business"})
+        _LOADED_MODULES.update({
+            "core", "freelancer", "business_complete", "business",
+        })
         assert _gate_owner_type("customer") == "customer"
         assert _gate_owner_type("vendor") == "vendor"
         assert _gate_owner_type(None) is None
@@ -655,7 +665,7 @@ class TestOwnerTypeGating:
 
         _LOADED_MODULES.clear()
         _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the Business module"):
+        with pytest.raises(ValueError, match="requires the business module"):
             _gate_owner_type("vendor")
 
     def test_business_absent_rejects_explicit_employee(self):
@@ -670,7 +680,7 @@ class TestOwnerTypeGating:
 
         _LOADED_MODULES.clear()
         _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the Business module"):
+        with pytest.raises(ValueError, match="requires the business module"):
             _gate_owner_type("employee")
 
     def test_business_absent_rejects_typo(self):

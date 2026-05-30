@@ -1415,11 +1415,16 @@ def register(mcp, get_book) -> None:
         # handled owner_type; vendor_id needs its own check.
         if vendor_id is not None:
             from gnucash_mcp.server import is_module_enabled
-            if not is_module_enabled("business"):
+            # Check the leaf (``business_complete``) rather than the
+            # ``business`` group alias, so a user who explicitly
+            # picked the vendor-side carve-out also gets vendor_id
+            # filtering. See _gate_owner_type for the rationale.
+            if not is_module_enabled("business_complete"):
                 raise ValueError(
-                    "vendor_id filtering requires the Business module. "
-                    "Restart with --modules=...,Business to access "
-                    "vendor bills."
+                    "vendor_id filtering requires the business module. "
+                    "Restart with --modules=business (or add "
+                    "business_complete to your current selection) to "
+                    "access vendor bills."
                 )
         book = get_book()
         result = book.get_outstanding_invoices(
