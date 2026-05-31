@@ -140,19 +140,20 @@ for the full breakdown of what's in each.
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
-cd gnucash-mcp
+uv tool install --editable ./gnucash-mcp
 ```
 
-Then either:
-
-```bash
-uv sync                # if you have uv (recommended)
-# or
-pip install -e .       # if you have pip
-```
+That gives you a `gnucash-mcp` command on your PATH. `--editable`
+keeps it tracking the source, so a `git pull` shows up in the
+running server the next time it restarts. Skip `--editable` if
+you don't plan to update.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+> For developers working against multiple worktrees, plain
+> `uv sync` inside the project directory still works — see
+> [For developers](#for-developers) below.
 
 ### 2. Make a working copy of a sample book
 
@@ -162,7 +163,7 @@ repo, so copy the book somewhere outside the repo first:
 
 ```bash
 mkdir -p ~/gnucash-mcp-scratch
-cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
+cp gnucash-mcp/samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
 ### 3. Tell Claude Desktop about the server
@@ -172,22 +173,15 @@ Find your Claude Desktop config:
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this (replace the two paths with your actual paths):
+Add this (replace the `GNUCASH_BOOK_PATH` value with your actual
+path):
 
 ```json
 {
   "mcpServers": {
     "gnucash": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/gnucash-mcp",
-        "python",
-        "-m",
-        "gnucash_mcp",
-        "--modules=all"
-      ],
+      "command": "gnucash-mcp",
+      "args": ["--modules=all"],
       "env": {
         "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
@@ -195,6 +189,10 @@ Add this (replace the two paths with your actual paths):
   }
 }
 ```
+
+`--modules=all` loads every tool (106 of them) so you can poke at
+anything. Once you know what you actually use, narrow it — see
+[choosing a module set](#choosing-a-module-set) below.
 
 Quit Claude Desktop completely (not just close the window —
 quit) and reopen it. Look for the hammer 🔨 icon next to the
@@ -251,11 +249,46 @@ This is an [MCP](https://modelcontextprotocol.io/) server, so
 it works with any client that speaks MCP. Notes for non–Claude
 Desktop clients:
 
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
 - **Anything else**: set `GNUCASH_BOOK_PATH` and run
-  `uv run gnucash-mcp` (or `gnucash-mcp` if installed via pip).
+  `gnucash-mcp` directly. Any client that can spawn a command
+  and speak MCP over stdio will work.
+
+---
+
+## Choosing a module set
+
+`--modules=all` is the easy default — every tool, 106 of them.
+For day-to-day use you'll probably want less. Pick the role that
+matches how you'll talk to the server. Each role is a *group*
+that expands to the underlying tool modules; you can also pick
+the leaves individually for a finer cut.
+
+| Role | What it gives you | Tools |
+|---|---|---|
+| `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
+| `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
+| `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
+| `freelancer` | Customer invoicing + sales tax (GST, VAT, US state sales tax). The solo-consultant surface. | 19 |
+| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, credit notes, jobs, billing terms). | 48 |
+
+Pick one or more, comma-separated:
+
+```json
+"args": ["--modules=bookkeeper"]            // personal finance
+"args": ["--modules=investor"]              // self-directed investor
+"args": ["--modules=freelancer"]            // solo contractor
+"args": ["--modules=business"]              // small business (= freelancer + business_complete)
+"args": ["--modules=bookkeeper,investor,freelancer"]  // most things
+```
+
+`core` is force-added regardless; the explicit listing in the
+examples above is for clarity. The leaf modules behind each
+group (`reconciliation`, `reporting`, `budgets`, `scheduling`,
+`tax_lots`, `portfolio`, etc.) are individually selectable too —
+run `gnucash-mcp --help` for the full menu.
 
 ---
 
@@ -377,37 +410,16 @@ you which one it's doing.
 
 ## Limiting what the AI can see
 
-By default the server exposes its full toolset (87 tools as
-of v1.2.1). Each tool's description lives in the AI's system
-prompt, which costs context on every message. If you only use
-some features — say, no investments and no business module —
-you can tell the server to load only those modules:
+Each tool's description lives in the AI's system prompt, which
+costs context on every message. Narrowing the toolset to what
+you actually use makes every conversation cheaper. See
+[choosing a module set](#choosing-a-module-set) above for the
+five role-based options (`core`, `bookkeeper`, `investor`,
+`freelancer`, `business`).
 
-```json
-"args": [
-  "run", "--directory", "/path/to/gnucash-mcp",
-  "python", "-m", "gnucash_mcp",
-  "--modules=core,reporting,budgets,scheduling"
-]
-```
-
-| Module | What it gives you |
-|---|---|
-| `core` | Accounts, transactions, the dashboard. Always loaded. |
-| `reconciliation` | Bank reconciliation, void/unvoid |
-| `reporting` | Spending, income, balance sheet, net worth, cash flow, debt payoff |
-| `budgets` | Create budgets, set targets, track variance |
-| `scheduling` | Recurring transactions, upcoming bills |
-| `investments` | Stocks, mutual funds, lots, capital-gain tracking |
-| `business` | Customers, vendors, employees, invoices, bills, payments |
-| `admin` | Account-level metadata (APR, credit limit, etc.) |
-| `backup` | Manual snapshot tools |
-
-Use `--modules=all` to load everything (the default for the
-sample-book quickstart above), or list a subset to keep your
-context light. You can also set
-`GNUCASH_MCP_MODULES=core,reporting` as an environment
-variable instead.
+You can also set `GNUCASH_MCP_MODULES=core,bookkeeper` as an
+environment variable instead of `--modules=...` in the JSON
+args.
 
 ---
 
@@ -512,10 +524,16 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,044 tests as of v1.2.1
+uv run pytest                       # 1,355 tests as of v1.3.0
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
+
+For dev work the `uv run --directory PATH ...` form is the
+escape hatch — it lets you point Claude Desktop at a specific
+worktree without installing. The `uv tool install --editable`
+path from the Quick Start is generally cleaner for everyday
+use because the `gnucash-mcp` binary tracks your source.
 
 The server is built on
 [piecash](https://github.com/sdementen/piecash) (Python

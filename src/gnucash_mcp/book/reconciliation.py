@@ -247,6 +247,7 @@ class ReconciliationMixin:
         *,
         reconcile_all: bool = False,
         through_date: date | None = None,
+        except_guids: list[str] | None = None,
     ) -> dict:
         """Reconcile multiple splits against a statement balance.
 
@@ -289,6 +290,14 @@ class ReconciliationMixin:
                 included. When ``None`` (default), no date filter
                 is applied — every unreconciled split gets
                 reconciled, regardless of date.
+            except_guids: Optional list of split GUID prefixes to
+                exclude from the bulk reconcile. Useful when the
+                statement covers "everything except this one
+                pending ACH" — 2 tokens for the exclusion instead
+                of 100+ for an explicit ``split_guids`` listing.
+                Only valid with ``reconcile_all=True``. Prefixes
+                that don't resolve are silently ignored (no
+                effect on the reconcile set anyway).
 
         Returns:
             Dict with reconciliation results: ``splits_reconciled``,
@@ -312,6 +321,12 @@ class ReconciliationMixin:
                 "Must provide split_guids for targeted reconciliation, "
                 "or set reconcile_all=True for bulk mode."
             )
+        if except_guids and not reconcile_all:
+            raise ValueError(
+                "except_guids is only valid with reconcile_all=True. "
+                "For targeted reconciliation, just include the splits "
+                "you want in split_guids."
+            )
 
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
@@ -327,6 +342,19 @@ class ReconciliationMixin:
             reconciling_total = Decimal("0")
 
             if reconcile_all:
+                # Pre-resolve except_guids prefixes to full GUIDs so
+                # the per-split skip check is a fast set lookup. A
+                # prefix that doesn't resolve to any split is
+                # silently dropped — the goal is "exclude these if
+                # present", and a non-resolving entry has no effect
+                # on the reconcile set.
+                exempt_guids: set[str] = set()
+                if except_guids:
+                    for prefix in except_guids:
+                        found = self._find_split(book, prefix)
+                        if found is not None:
+                            exempt_guids.add(found.guid)
+
                 # Walk the account's own splits — by construction every
                 # entry is on this account, so no membership check
                 # needed. Apply the optional date filter only when the
@@ -336,6 +364,8 @@ class ReconciliationMixin:
                 # of when payments cleared.
                 for split in account.splits:
                     if split.reconcile_state == "y":
+                        continue
+                    if split.guid in exempt_guids:
                         continue
                     if (
                         through_date is not None

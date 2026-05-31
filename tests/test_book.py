@@ -153,10 +153,26 @@ class TestGetBookSummary:
         assert "Currency: USD" in result
 
     def test_get_book_summary_book_path(self, test_book: Path):
-        """Should include the book file path."""
+        """Should include the book filename only, no directory leak.
+
+        Privacy hardening shipped in v1.3.0: the "Book:" line used
+        to expose the full absolute path on every orientation call,
+        leaking the user's filesystem layout into every transcript.
+        Filename alone is enough for the LLM to confirm which book
+        is loaded — see ``_book_display_name``.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.get_book_summary()
-        assert f"Book: {test_book}" in result
+        # First line should be ``Book: <filename>``.
+        first_line = result.split("\n", 1)[0]
+        assert first_line == f"Book: {test_book.name}", (
+            f"unexpected Book line: {first_line!r}"
+        )
+        # And the directory components must NOT appear anywhere.
+        parent_path = str(test_book.parent)
+        assert parent_path not in result, (
+            f"directory leaked into summary: {parent_path!r}"
+        )
 
     def test_data_range_uses_transaction_dates_not_prices(
         self, test_book: Path,
@@ -2965,6 +2981,121 @@ class TestGetBookSummaryReconciliationSplitCount:
         assert "splits unreconciled since" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
+
+
+class TestGetBookSummaryBusinessSignals:
+    """Bookkeeper-asked-for additions to the summary (v1.3 blocker):
+
+      - Receivables / Payables lines append ``(N invoice(s), M
+        overdue)`` — actionable signal beyond the "USD 13,500" total.
+      - ``Jobs: N active`` line emitted conditionally when the
+        feature is in use; absent when no jobs exist.
+    """
+
+    def _setup_overdue_invoice(self, gb):
+        """Create + post one invoice dated 60 days ago with a
+        30-day term, so it lands as overdue today."""
+        from datetime import date as _date, timedelta
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(name="Net 30", due_days=30)
+        opened = _date.today() - timedelta(days=60)
+        gb.create_invoice(
+            customer_id="000001",
+            date_opened=opened.isoformat(),
+            term="Net 30",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=opened.isoformat(),
+        )
+
+    def _setup_current_bill(self, gb):
+        """Create + post one bill dated today (not overdue)."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+
+    def test_receivables_signal_shows_overdue(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_overdue_invoice(gc)
+        result = gc.get_book_summary()
+        recv = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Receivables:")
+        )
+        assert "1 invoice" in recv
+        assert "1 overdue" in recv
+
+    def test_payables_signal_shows_open_count(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_current_bill(gc)
+        result = gc.get_book_summary()
+        pay = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Payables:")
+        )
+        assert "1 bill" in pay
+        assert "0 overdue" in pay
+
+    def test_jobs_line_present_when_active(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Acme")
+        gc.create_job(
+            owner_id="000001",
+            owner_type="customer",
+            name="API Rewrite",
+        )
+        result = gc.get_book_summary()
+        # One active job — exact "1 active" since "1" pluralizes
+        # to nothing extra in the rendered line.
+        assert "Jobs: 1 active" in result
+
+    def test_jobs_line_absent_when_none(
+        self, business_book: Path,
+    ):
+        """No jobs created — the line is omitted entirely.
+        Absence is the signal (per bookkeeper: 'Jobs existing
+        doesn't need attention')."""
+        gc = GnuCashBook(str(business_book))
+        result = gc.get_book_summary()
+        assert "Jobs:" not in result
+
+    def test_no_business_no_signals(self, test_book: Path):
+        """A non-business book (no posted invoices) still produces
+        a clean summary — no spurious '0 invoices' phrase, no
+        Jobs line. The signals only appear when there's something
+        to act on."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        # No invoice/bill activity → no signal phrases.
+        assert "0 invoices" not in result
+        assert "0 bills" not in result
+        assert "Jobs:" not in result
 
 
 class TestMissingDefaultCurrency:
@@ -7301,6 +7432,88 @@ class TestReconcileAccount:
         )
         assert len(unreconciled["splits"]) >= 1
 
+    def test_except_guids_requires_reconcile_all(self, test_book: Path):
+        """``except_guids`` only makes sense with bulk mode — in
+        targeted mode the caller already controls which splits
+        get reconciled."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="only valid with reconcile_all"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+                split_guids=["deadbeef00000000"],
+                except_guids=["cafef00d00000000"],
+            )
+
+    def test_except_guids_skips_listed_splits(self, test_book: Path):
+        """The common case: reconcile everything except one
+        pending split. Bookkeeper's example was a CareCredit
+        payoff with one ACH still in flight — list it in
+        except_guids and the statement balance ties cleanly."""
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled["splits"]) >= 2, (
+            "Test setup: need at least 2 unreconciled splits."
+        )
+        # Pick one to exclude — use its short prefix to also
+        # exercise the prefix-resolution path.
+        excluded = unreconciled["splits"][0]
+        excluded_guid = excluded["guid"]
+        excluded_amt = Decimal(excluded["amount"])
+        # Statement balance = sum of everything except the excluded.
+        remaining_total = sum(
+            (
+                Decimal(s["amount"])
+                for s in unreconciled["splits"]
+                if s["guid"] != excluded_guid
+            ),
+            Decimal("0"),
+        )
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(remaining_total),
+            reconcile_all=True,
+            except_guids=[excluded_guid[:8]],
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == (
+            len(unreconciled["splits"]) - 1
+        )
+        # The excluded split is still unreconciled.
+        after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        remaining_guids = {s["guid"] for s in after["splits"]}
+        assert excluded_guid in remaining_guids
+
+    def test_except_guids_unknown_prefix_ignored(self, test_book: Path):
+        """A prefix that doesn't resolve to any split is silently
+        dropped — the goal is \"exclude these if present\", and
+        a non-matching prefix has no effect on the set."""
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        # Bogus prefix — well-formed hex but doesn't exist.
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+            except_guids=["deadbeef" * 4],
+        )
+        # All splits reconciled despite the bogus exclusion.
+        assert result["splits_reconciled"] == len(unreconciled["splits"])
+
 
 class TestVoidTransaction:
     """Tests for void_transaction method."""
@@ -7608,6 +7821,159 @@ class TestBalanceSheetNumericContract:
             assert len(balance.split(".")[-1]) == 2, (
                 f"row {row['account']!r} balance wrong precision: {balance!r}"
             )
+
+
+class TestBalanceSheetEquationCloses:
+    """Pre-v1.3.0, ``balance_sheet`` could fail the fundamental
+    accounting identity A = L + E for two unrelated reasons:
+
+    1. ``_ASSET_TYPES`` / ``_LIABILITY_TYPES`` excluded RECEIVABLE
+       and PAYABLE — outstanding invoices issued to customers were
+       invisible in the totals.
+    2. Assets render at market value (factor × quantity for
+       commodities and foreign-currency cash) while equity rolls
+       up at historical-cost split values. The gap between the
+       two views (investment market drift + FX translation
+       adjustment) had no home on the equity side.
+
+    Both fixes land together: A/R / A/P join the right buckets,
+    and a synthetic "Unrealized Gain/Loss" equity line absorbs the
+    remaining mark-to-market gap. After v1.3.0, A = L + E holds by
+    construction on every book.
+    """
+
+    def test_equation_closes_on_simple_usd_book(self, test_book: Path):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Strict equality — no rounding slop.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_equation_closes_on_multi_currency_book(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Cross-currency transfer ($1100 USD → €1000 EUR) puts the
+        # current EUR balance at a different USD value than the
+        # historical post-time rate. The synthetic equity line
+        # absorbs that translation adjustment.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_unrealized_line_present_when_book_has_market_drift(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Lock a EUR price that differs from the historical post-time
+        # rate so unrealized != 0.
+        with gc_book.open(readonly=False) as book:
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            piecash.Price(
+                commodity=eur,
+                currency=book.default_currency,
+                date=date(2024, 12, 31),
+                value=Decimal("1.20"),  # vs. historical 1.10
+                type="last",
+                source="user:price",
+            )
+            book.save()
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" in eq_names, (
+            f"missing synthetic line on book with FX drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+    def test_unrealized_line_omitted_when_no_drift(
+        self, test_book: Path,
+    ):
+        # Single-currency USD test book with no investments — market
+        # == cost trivially, so the synthetic line should be absent.
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" not in eq_names, (
+            f"synthetic line present despite no drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+
+class TestBalanceSheetIncludesReceivablePayable:
+    """RECEIVABLE and PAYABLE join the asset / liability buckets in
+    v1.3.0 so balance_sheet reflects outstanding business activity.
+    Pre-fix, every posted invoice was invisible on the balance
+    sheet by the amount of the receivable.
+    """
+
+    def _setup_book_with_invoice(self, tmp_path: Path) -> Path:
+        from decimal import Decimal
+        book_path = tmp_path / "ar.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        ar = piecash.Account(
+            name="Accounts Receivable", type="RECEIVABLE",
+            parent=assets, commodity=usd,
+        )
+        income = piecash.Account(
+            name="Consulting", type="INCOME", parent=root, commodity=usd,
+        )
+        equity_p = piecash.Account(
+            name="Equity", type="EQUITY", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity_p, commodity=usd,
+        )
+        book.save()
+        # Single posted-invoice transaction: $1500 to A/R, $1500
+        # revenue. Both sides default currency, so nothing exotic.
+        t = piecash.Transaction(
+            currency=usd,
+            description="Posted invoice",
+            post_date=date(2024, 6, 1),
+            splits=[
+                piecash.Split(account=ar, value=Decimal("1500")),
+                piecash.Split(account=income, value=Decimal("-1500")),
+            ],
+        )
+        book.session.add(t)
+        book.save()
+        return book_path
+
+    def test_receivable_appears_in_assets(self, tmp_path: Path):
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        asset_names = [a["account"] for a in result["assets"]["accounts"]]
+        assert any("Receivable" in n for n in asset_names), (
+            f"A/R missing from assets section: {asset_names}"
+        )
+
+    def test_receivable_book_balances(self, tmp_path: Path):
+        from decimal import Decimal
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        assert A == Decimal("1500.00")
+        assert A - L - E == 0
 
 
 class TestCrossToolPriceAgreement:
@@ -8377,6 +8743,374 @@ class TestMultiCurrencyBalances:
         assert result["total"] == "3000"
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
+
+    def test_spending_by_category_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Bookkeeper-found bug (v1.3 blocker): EUR-denominated
+        expense splits used to be summed as raw EUR alongside USD
+        — silent wrong totals on multi-currency books. With the
+        ``_split_in_default_currency`` conversion in place, the
+        EUR amount converts at the book's EUR/USD price."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR-denominated expense account and one EUR
+        # expense transaction, plus a EUR/USD price the converter
+        # can use.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            expenses = next(
+                a for a in bk.accounts
+                if a.fullname == "Expenses"
+            )
+            travel_eur = piecash.Account(
+                name="Travel EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add(travel_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin trip — €100",
+                post_date=date(2024, 6, 15),
+                splits=[
+                    piecash.Split(
+                        account=travel_eur,
+                        value="100", quantity="100",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="-100", quantity="-110",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD groceries: $200. New EUR travel: €100 ×
+        # 1.10 = $110. Total in default currency: $310.
+        result = gc_book.spending_by_category(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("310")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["categories"]
+        }
+        assert amounts["Expenses:Groceries"] == Decimal("200")
+        assert amounts["Expenses:Travel EUR"] == Decimal("110")
+
+    def test_income_by_source_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Mirror of the spending fix on the income side."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            income = next(
+                a for a in bk.accounts
+                if a.fullname == "Income"
+            )
+            consulting_eur = piecash.Account(
+                name="Consulting EUR", type="INCOME",
+                parent=income, commodity=eur,
+            )
+            bk.session.add(consulting_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin client — €500",
+                post_date=date(2024, 7, 1),
+                splits=[
+                    piecash.Split(
+                        account=consulting_eur,
+                        value="-500", quantity="-500",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="500", quantity="550",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD salary: $3000. New EUR consulting: €500 ×
+        # 1.10 = $550. Total in default currency: $3550.
+        result = gc_book.income_by_source(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("3550")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["sources"]
+        }
+        assert amounts["Income:Salary"] == Decimal("3000")
+        assert amounts["Income:Consulting EUR"] == Decimal("550")
+
+
+class TestMultiCurrencyDashboardHelpers:
+    """v1.3.0 follow-up to the spending/income FX-conversion fix:
+    three dashboard helpers (``_monthly_net_income``,
+    ``_daily_expense_burn``, ``_budget_headline``) and one report
+    (``vendor_spending_report``) were summing ``split.value`` /
+    ``split.quantity`` raw across currencies. Same class of bug —
+    silently wrong on any book with foreign-currency activity.
+
+    The helpers feed get_book_summary's monthly-net section, runway
+    calculation, and budget headline; vendor_spending_report is a
+    standalone tool the bookkeeper uses. After v1.3.0 each routes
+    through ``_split_in_default_currency`` / latest-rate conversion
+    so foreign-currency activity contributes the default-currency-
+    equivalent amount, not raw foreign-currency quantities.
+    """
+
+    def _add_eur_consulting_income(
+        self,
+        book_path: Path,
+        amount_eur: str,
+        on_date: date,
+        rate: str = "1.10",
+    ) -> None:
+        """Seed a EUR income transaction + EUR/USD rate."""
+        import piecash
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            income = next(a for a in bk.accounts if a.fullname == "Income")
+            consulting_eur = next(
+                (a for a in bk.accounts if a.fullname == "Income:Consulting EUR"),
+                None,
+            )
+            if consulting_eur is None:
+                consulting_eur = piecash.Account(
+                    name="Consulting EUR", type="INCOME",
+                    parent=income, commodity=eur,
+                )
+                bk.session.add(consulting_eur)
+            ar_eur = next(
+                (a for a in bk.accounts if a.fullname == "Assets:A/R EUR"),
+                None,
+            )
+            if ar_eur is None:
+                assets = next(a for a in bk.accounts if a.fullname == "Assets")
+                ar_eur = piecash.Account(
+                    name="A/R EUR", type="ASSET",
+                    parent=assets, commodity=eur,
+                )
+                bk.session.add(ar_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=on_date, value=rate, type="last",
+            ))
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description=f"EUR consulting €{amount_eur}",
+                post_date=on_date,
+                splits=[
+                    piecash.Split(
+                        account=consulting_eur,
+                        value=f"-{amount_eur}", quantity=f"-{amount_eur}",
+                    ),
+                    piecash.Split(
+                        account=ar_eur,
+                        value=amount_eur, quantity=amount_eur,
+                    ),
+                ],
+            ))
+            bk.save()
+
+    def test_monthly_net_converts_foreign_currency_income(
+        self, multi_currency_book: Path,
+    ):
+        """Pre-fix, a EUR income split for €1,000 contributed
+        Decimal('1000') to that month's net — mixing units. Post-
+        fix, it contributes €1,000 × EUR/USD rate."""
+        today = date.today()
+        first_of_month = date(today.year, today.month, 1)
+        # Seed €1,000 of EUR consulting income this month.
+        self._add_eur_consulting_income(
+            multi_currency_book,
+            amount_eur="1000",
+            on_date=first_of_month,
+            rate="1.20",
+        )
+        gc_book = GnuCashBook(str(multi_currency_book))
+        summary = gc_book.get_book_summary()
+        # Find the current-month "(MTD)" line and parse the net.
+        mtd_line = next(
+            (l for l in summary.split("\n") if "(MTD)" in l),
+            None,
+        )
+        assert mtd_line is not None, (
+            f"no MTD line in summary:\n{summary}"
+        )
+        # Net = EUR income €1,000 × 1.20 = $1,200 (in USD).
+        # Pre-fix this would have rendered as +1,000 (raw EUR).
+        assert "+1,200" in mtd_line, (
+            f"expected +1,200 in MTD line, got: {mtd_line!r}"
+        )
+
+    def test_daily_expense_burn_converts_foreign_currency_expense(
+        self, multi_currency_book: Path,
+    ):
+        """Runway's daily-burn divisor must reflect foreign-currency
+        expenses at their USD value, not raw foreign quantity."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        today = date.today()
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
+            travel_eur = piecash.Account(
+                name="Travel EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add(travel_eur)
+            checking = next(
+                a for a in bk.accounts if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=today, value="1.50", type="last",
+            ))
+            # €200 expense today.
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin trip",
+                post_date=today,
+                splits=[
+                    piecash.Split(
+                        account=travel_eur,
+                        value="200", quantity="200",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="-200", quantity="-300",
+                    ),
+                ],
+            ))
+            bk.save()
+            # _daily_expense_burn is an instance method requiring a
+            # book session — call it within an open block.
+            transactions = list(bk.transactions)
+            from datetime import timedelta
+            burn = gc_book._daily_expense_burn(
+                bk, transactions, days=30,
+            )
+            # €200 × 1.50 = $300 of expense in default currency.
+            # Without conversion it'd have been raw 200. Allow
+            # other USD expenses in the fixture to contribute too;
+            # what matters is the EUR side converts.
+            from decimal import Decimal as Dec
+            assert burn >= Dec("300") / Dec("30"), (
+                f"burn too low — EUR expense not converted: {burn}"
+            )
+
+    def test_vendor_spending_converts_foreign_currency_bills(
+        self, multi_currency_book: Path,
+    ):
+        """Each bill's grand_total is in the BILL's currency. Pre-
+        fix, EUR bills and USD bills were summed raw alongside USD
+        bills, producing meaningless grand totals. Post-fix, each
+        bill's total converts to default currency at the latest
+        market rate before summing.
+
+        Copilot PR #92 review caught that the original version of
+        this test used ``inspect.getsource`` to look for the
+        helper references — brittle against renames/refactors,
+        and didn't catch regressions where the function still
+        contained the string but applied conversion incorrectly.
+        Replaced with an end-to-end test that posts a EUR vendor
+        bill, runs the report, and asserts on the USD-converted
+        grand totals.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR vendor, an A/P account, a EUR-denominated
+        # posted bill, and a EUR/USD price. After posting we run
+        # vendor_spending_report and assert the totals come back
+        # in USD (the book default), not raw EUR.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            assets = next(a for a in bk.accounts if a.fullname == "Assets")
+            liabilities = piecash.Account(
+                name="Liabilities", type="LIABILITY", parent=bk.root_account,
+                commodity=usd, placeholder=True,
+            )
+            ap = piecash.Account(
+                name="Accounts Payable", type="PAYABLE",
+                parent=liabilities, commodity=usd,
+            )
+            expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
+            office_eur = piecash.Account(
+                name="Office Supplies EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add_all([liabilities, ap, office_eur])
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            bk.save()
+        # Create the vendor + EUR bill via the public API.
+        gc_book.create_vendor(name="Berlin Supplies", currency="EUR")
+        gc_book.create_bill(vendor_id="000001", currency="EUR")
+        gc_book.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies EUR",
+            description="EUR supplies",
+            quantity="1", price="500.00",
+        )
+        gc_book.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2024-06-15",
+        )
+        # Run the report; verify totals come back as USD-converted.
+        result = gc_book.vendor_spending_report(
+            start_date="2024-01-01", end_date="2024-12-31",
+            compact=False,
+        )
+        # €500 × 1.10 = $550. Pre-fix the report would have summed
+        # 500 raw — wrong unit.
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("550.00")
+        assert Decimal(result["totals"]["outstanding"]) == Decimal("550.00")
+        # Per-vendor row also in USD.
+        berlin = next(
+            v for v in result["vendors"] if v["vendor_name"] == "Berlin Supplies"
+        )
+        assert Decimal(berlin["total_billed"]) == Decimal("550.00")
 
 
 class TestCreateCommodity:

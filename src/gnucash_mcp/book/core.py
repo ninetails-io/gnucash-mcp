@@ -117,6 +117,114 @@ class CoreMixin:
     # pending before reconciliation makes sense.
     _LAST_ENTRY_WARN_DAYS = 14
 
+    def _business_summary_counts(self, book) -> dict:
+        """Action-signal counts for the get_book_summary business
+        lines: open invoices, open bills, how many overdue, and
+        active jobs. Returns zeros when BusinessMixin isn't loaded
+        (helpers like ``_calculate_lot_balance`` then come back
+        ``None``) — the rendering layer omits the lines anyway
+        when there's no Receivables/Payables activity.
+
+        The bookkeeper's principle for the summary: "tell the LLM
+        what needs attention, not what exists." Invoice counts
+        and overdue counts are actionable; account counts are
+        structural and already shown via the nested per-account
+        breakdown below each line.
+        """
+        out = {
+            "open_invoices": 0,
+            "overdue_invoices": 0,
+            "open_bills": 0,
+            "overdue_bills": 0,
+            "active_jobs": 0,
+        }
+        calc_lot_balance = getattr(self, "_calculate_lot_balance", None)
+        if calc_lot_balance is None:
+            return out
+        try:
+            from piecash.business.invoice import Invoice, Job
+        except ImportError:
+            return out
+
+        today = date.today()
+        resolve_due = getattr(self, "_resolve_invoice_due_date", None)
+
+        # Posted invoices/bills with non-zero lot balance = open.
+        # We rely on the Lot balance (not raw invoice total) so
+        # partially-paid invoices show as the still-owed amount,
+        # and credit notes / payments reduce the count correctly.
+        #
+        # Pre-index accounts and lots once, not per-invoice — this
+        # method runs inside get_book_summary on every dashboard
+        # call. The pre-fix loop did one SQL query per invoice to
+        # resolve the post account, then a linear scan of
+        # post_acct.lots to find the matching lot. On a book with
+        # 100 posted invoices that's 100 round-trips plus 100
+        # linear scans against potentially hundreds of lots each —
+        # noticeable latency on every summary call. Copilot
+        # flagged it; pre-indexing is the standard N+1 fix.
+        accounts_by_guid = {
+            acct.guid: acct for acct in book.accounts
+        }
+        lots_by_guid: dict[str, object] = {}
+        for acct in book.accounts:
+            for lot in acct.lots:
+                lots_by_guid[lot.guid] = lot
+
+        for inv in book.session.query(Invoice).filter(
+            Invoice.date_posted.isnot(None),
+        ).all():
+            try:
+                post_acct = accounts_by_guid.get(inv.post_acc_guid)
+                if post_acct is None:
+                    continue
+                lot_obj = lots_by_guid.get(inv.post_lot_guid)
+                if lot_obj is None:
+                    continue
+                balance = calc_lot_balance(lot_obj)
+                if balance == 0:
+                    continue
+            except Exception:
+                continue
+
+            is_overdue = False
+            if resolve_due is not None:
+                try:
+                    due_date, _ = resolve_due(book, inv)
+                    if due_date is not None and due_date < today:
+                        is_overdue = True
+                except Exception:
+                    pass
+
+            if inv.owner_type == 4:  # vendor bill
+                out["open_bills"] += 1
+                if is_overdue:
+                    out["overdue_bills"] += 1
+            else:
+                # owner_type 2 (customer), 3 (job), 5 (voucher) all
+                # render as customer-side receivables here. Voucher
+                # liabilities are A/P from the company's view but
+                # the LLM-facing count is "things the business
+                # owes employees" — folded into open_bills below
+                # when post_account.type == PAYABLE.
+                if post_acct.type == "PAYABLE":
+                    out["open_bills"] += 1
+                    if is_overdue:
+                        out["overdue_bills"] += 1
+                else:
+                    out["open_invoices"] += 1
+                    if is_overdue:
+                        out["overdue_invoices"] += 1
+
+        try:
+            out["active_jobs"] = book.session.query(Job).filter(
+                Job.active == 1,
+            ).count()
+        except Exception:
+            pass
+
+        return out
+
     def _account_reconciliation_status(
         self, book: piecash.Book, accounts: list,
     ) -> list[dict]:
@@ -246,14 +354,19 @@ class CoreMixin:
         return results
 
     # Asset-side and liability-side type sets used by the net-worth
-    # computation. Mirrors the existing in-summary breakdown — the
-    # asset section iterates these types into per-leaf rows; the
-    # liability section iterates the liability set. Receivables and
-    # payables are intentionally excluded from net worth — they live
-    # in their own dedicated sections of the summary and aren't part
-    # of the assets_total − liabilities_total convention.
-    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
-    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+    # trajectory in get_book_summary. RECEIVABLE and PAYABLE belong
+    # here despite having dedicated dashboard sections elsewhere in
+    # the summary — accounting-wise, A/R is an asset and A/P a
+    # liability, so the trajectory's "now" anchor (and every past-
+    # anchor reconstruction) must include them to agree with
+    # balance_sheet and net_worth. Pre-v1.3.0 these were excluded
+    # here while balance_sheet excluded them too; both were wrong in
+    # the same direction, so the cross-tool numbers happened to
+    # agree. Fixing balance_sheet (v1.3) forces this set to follow
+    # so the dashboard's headline net worth doesn't drift from the
+    # canonical balance-sheet identity.
+    _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
+    _NW_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 
     def _compute_net_worth_at(
         self,
@@ -1058,6 +1171,14 @@ class CoreMixin:
         # value flows for splits in budgeted accounts. INCOME is
         # stored negative; flip to a positive contribution to match
         # the spend-vs-target framing.
+        #
+        # Each split is converted to the book's default currency at
+        # the most recent market rate so foreign-currency budgeted
+        # accounts contribute their default-currency-equivalent
+        # spend, not raw quantity. Pre-v1.3.0 a EUR expense account
+        # budgeted at $X contributed raw EUR quantities to the
+        # actuals comparison, wildly miscalibrating used_pct.
+        factors = self._account_conversion_factors(book)
         actuals = Decimal("0")
         for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
@@ -1065,10 +1186,18 @@ class CoreMixin:
             for s in txn.splits:
                 if s.account.guid not in budgeted_account_guids:
                     continue
-                if s.account.type == "EXPENSE" and s.quantity > 0:
-                    actuals += s.quantity
-                elif s.account.type == "INCOME" and s.quantity < 0:
-                    actuals += -s.quantity
+                atype = s.account.type
+                if atype not in ("EXPENSE", "INCOME"):
+                    continue
+                amt = self._split_in_default_currency(
+                    s, s.account, factors.get(s.account.guid),
+                )
+                # EXPENSE: positive value = spend (count). INCOME:
+                # negative value = revenue (count as positive).
+                if atype == "EXPENSE" and amt > 0:
+                    actuals += amt
+                elif atype == "INCOME" and amt < 0:
+                    actuals += -amt
 
         # Period progression.
         total_days = (period_end - period_start).days + 1
@@ -1110,18 +1239,28 @@ class CoreMixin:
 
         Returns ``Decimal("0")`` when no expense activity in window
         — caller treats that as "no daily-burn signal."
+
+        Each EXPENSE split is converted to the book's default
+        currency at the most recent market rate. Pre-v1.3.0 this
+        summed ``split.value`` raw, mixing currencies on books with
+        foreign-currency expenses; on Lin Wei (CNY-default with
+        USD subscriptions) the burn was understated by the USD
+        component's spot-rate factor.
         """
         if days is None:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
         window_start = today - timedelta(days=days)
+        factors = self._account_conversion_factors(book)
         expenses = Decimal("0")
         for txn in transactions:
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             for s in txn.splits:
                 if s.account.type == "EXPENSE":
-                    expenses += Decimal(str(s.value))
+                    expenses += self._split_in_default_currency(
+                        s, s.account, factors.get(s.account.guid),
+                    )
         return expenses / Decimal(days)
 
     def _runway_metrics(
@@ -1295,16 +1434,16 @@ class CoreMixin:
         expense activity at all — the caller should omit the section
         entirely rather than emit six "+0" lines that say nothing.
 
-        Multi-currency caveat: ``split.value`` is in transaction
-        currency, not account commodity. For typical books where
-        income/expense accounts share the book default currency
-        (and transactions are recorded in that currency), the sum is
-        accurate. Cross-currency income/expense activity sums raw
-        without per-month FX conversion — flagged as a refinement
-        target in the spec; rare in practice for personal/household
-        books.
+        Multi-currency handling: each split is converted to the
+        book's default currency at the most recent market rate via
+        ``_split_in_default_currency``. Pre-v1.3.0 this summed
+        ``split.value`` raw across currencies — a EUR invoice
+        for €4,200 and a USD invoice for $5,000 mixed as 9,200 of
+        nothing-in-particular. Correct on USD-only books, silently
+        wrong on any book with foreign-currency income/expense.
         """
         today = date.today()
+        factors = self._account_conversion_factors(book)
 
         # Build the calendar-month windows, oldest → newest. Plain
         # arithmetic on (year, month) avoids a dateutil dependency
@@ -1357,12 +1496,18 @@ class CoreMixin:
                 continue
             for s in txn.splits:
                 atype = s.account.type
+                if atype not in ("INCOME", "EXPENSE"):
+                    continue
+                amt = self._split_in_default_currency(
+                    s, s.account, factors.get(s.account.guid),
+                )
                 if atype == "INCOME":
-                    nets[idx] += -Decimal(str(s.value))
-                    has_activity = True
-                elif atype == "EXPENSE":
-                    nets[idx] -= Decimal(str(s.value))
-                    has_activity = True
+                    # INCOME stored negative (credit-natural); flip
+                    # to positive contribution to monthly net.
+                    nets[idx] += -amt
+                else:  # EXPENSE
+                    nets[idx] -= amt
+                has_activity = True
 
         if not has_activity:
             return []
@@ -1764,18 +1909,31 @@ class CoreMixin:
             def _r2(v: Decimal) -> Decimal:
                 return v.quantize(Decimal("0.01"))
 
-            assets_total = _r2(
-                sum((v for _, v, _ in asset_leaves), Decimal("0"))
-            )
-            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
-            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
-            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
-            liabilities_total = _r2(credit_total + loan_total + other_liab_total)
+            # Receivables and payables roll into Assets / Liabilities
+            # totals (standard accounting — A/R is an asset, A/P is a
+            # liability) AND get their own dedicated dashboard
+            # sections below for at-a-glance "what's outstanding."
+            # Appearing in both places is intentional: the rolled-up
+            # totals tie to balance_sheet and the trajectory anchor;
+            # the breakout gives the bookkeeper an action lens. Pre-
+            # v1.3.0 only the breakouts existed — the headline
+            # Assets / Liabilities numbers excluded business
+            # activity, breaking cross-tool consistency.
             receivables_total = _r2(
                 sum((b for _, b in receivable_accts), Decimal("0"))
             )
             payables_total = _r2(
                 sum((b for _, b in payable_accts), Decimal("0"))
+            )
+            assets_total = _r2(
+                sum((v for _, v, _ in asset_leaves), Decimal("0"))
+                + receivables_total
+            )
+            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
+            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
+            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
+            liabilities_total = _r2(
+                credit_total + loan_total + other_liab_total + payables_total
             )
             net_worth = _r2(assets_total - liabilities_total)
 
@@ -1820,8 +1978,15 @@ class CoreMixin:
             ))
 
             # --- Build output ---
+            # Book line shows filename only — no directory leak.
+            # See _book_display_name for the privacy rationale; the
+            # filename is enough for the LLM to confirm which book
+            # is loaded ("alex.gnucash" vs "lin-wei.gnucash") while
+            # keeping the user's filesystem layout out of every
+            # transcript and screenshot.
+            from gnucash_mcp._format import _book_display_name
             lines = []
-            lines.append(f"Book: {self.book_path}")
+            lines.append(f"Book: {_book_display_name(self.book_path)}")
             lines.append(f"Currency: {currency}")
 
             if first_date and last_date:
@@ -1884,8 +2049,13 @@ class CoreMixin:
 
             lines.append(f"Accounts: {total_accounts} total")
 
-            # Assets section — leaf accounts with USD-valued balances
-            lines.append(f"Assets: {len(asset_leaves)} accounts, {currency} {assets_total}")
+            # Assets section — leaf accounts with USD-valued balances.
+            # Count includes A/R accounts (which roll into assets_total)
+            # so the headline N agrees with the total; per-account
+            # detail for A/R is shown in the Receivables section below
+            # rather than duplicated here.
+            assets_count = len(asset_leaves) + len(receivable_accts)
+            lines.append(f"Assets: {assets_count} accounts, {currency} {assets_total}")
             for name, usd_value, note in sorted(
                 asset_leaves, key=lambda x: x[1], reverse=True
             ):
@@ -1896,8 +2066,14 @@ class CoreMixin:
                         f"  {name}: {note} ({currency} {_r2(usd_value)})"
                     )
 
-            # Liabilities section — grouped subtotals + top 3
-            liab_count = len(credit_cards) + len(loan_accts) + len(other_liab_accts)
+            # Liabilities section — grouped subtotals + top 3.
+            # A/P accounts (rolled into liabilities_total) are
+            # included in the count; per-account detail lives in the
+            # Payables breakout below.
+            liab_count = (
+                len(credit_cards) + len(loan_accts)
+                + len(other_liab_accts) + len(payable_accts)
+            )
             lines.append(f"Liabilities: {liab_count} accounts, {currency} {liabilities_total}")
             if credit_cards:
                 lines.append(f"  Credit cards ({len(credit_cards)}): {currency} {credit_total}")
@@ -1910,23 +2086,51 @@ class CoreMixin:
                 top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
                 lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
 
-            # Receivables / Payables — only if non-zero
+            # Receivables / Payables — only if non-zero. The
+            # parenthesized action signal (open count + overdue)
+            # is the bookkeeper-asked-for addition: the LLM should
+            # see "2 overdue" and know to ask about collections,
+            # without us having to spell that out.
+            biz_counts = self._business_summary_counts(book)
             if receivable_accts:
+                inv_n = biz_counts["open_invoices"]
+                overdue = biz_counts["overdue_invoices"]
+                signal = (
+                    f" ({inv_n} invoice"
+                    f"{'s' if inv_n != 1 else ''}, "
+                    f"{overdue} overdue)"
+                ) if inv_n else ""
                 lines.append(
                     f"Receivables: {len(receivable_accts)} account"
                     f"{'s' if len(receivable_accts) != 1 else ''}, "
-                    f"{currency} {receivables_total}"
+                    f"{currency} {receivables_total}{signal}"
                 )
                 for name, bal in sorted(receivable_accts, key=lambda x: x[1], reverse=True):
                     lines.append(f"  {name}: {currency} {_r2(bal)}")
             if payable_accts:
+                bill_n = biz_counts["open_bills"]
+                overdue = biz_counts["overdue_bills"]
+                signal = (
+                    f" ({bill_n} bill"
+                    f"{'s' if bill_n != 1 else ''}, "
+                    f"{overdue} overdue)"
+                ) if bill_n else ""
                 lines.append(
                     f"Payables: {len(payable_accts)} account"
                     f"{'s' if len(payable_accts) != 1 else ''}, "
-                    f"{currency} {payables_total}"
+                    f"{currency} {payables_total}{signal}"
                 )
                 for name, bal in sorted(payable_accts, key=lambda x: x[1], reverse=True):
                     lines.append(f"  {name}: {currency} {_r2(bal)}")
+
+            # Jobs: one conditional line. Tells the LLM the
+            # job-grouping feature is in use on this book; absence
+            # is a stronger signal than "Jobs: 0 active". Per the
+            # bookkeeper: "Jobs existing doesn't need attention"
+            # but knowing they're in play points to the right
+            # drill-down tool (``get_job_report``).
+            if biz_counts["active_jobs"] > 0:
+                lines.append(f"Jobs: {biz_counts['active_jobs']} active")
 
             lines.append(f"Income: {income_active} active ({income_total} total)")
             lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
@@ -2241,7 +2445,25 @@ class CoreMixin:
                     lines.append(notice)
                 return "\n".join(lines)
             else:
-                return [_transaction_to_dict(t) for t in filtered]
+                # Verbose mode: emit short prefixes for transaction
+                # GUIDs, split GUIDs, and lot GUIDs so the bookkeeper
+                # workflow doesn't pay 24 wasted chars per GUID per
+                # row. Compact mode already does this; pre-v1.3.1
+                # verbose left them at full 32-char width even
+                # though every consuming tool accepts 8+ char
+                # prefixes via ``_resolve_guid``.
+                txn_prefixes = self._transaction_prefix_map(book)
+                split_prefixes = self._split_prefix_map(book)
+                lot_prefixes = self._lot_prefix_map(book)
+                return [
+                    _transaction_to_dict(
+                        t,
+                        txn_prefixes=txn_prefixes,
+                        split_prefixes=split_prefixes,
+                        lot_prefixes=lot_prefixes,
+                    )
+                    for t in filtered
+                ]
 
     @staticmethod
     def _truncation_notice(
@@ -2286,13 +2508,25 @@ class CoreMixin:
             guid: Transaction GUID (32-character hex string).
 
         Returns:
-            Transaction dict if found, None otherwise.
+            Transaction dict if found, None otherwise. The emitted
+            ``guid`` field (on the transaction and on each nested
+            split) and the ``lot_guid`` field carry collision-safe
+            short prefixes (typically 8 chars) — same format the
+            compact list_transactions emits. The full GUID is
+            redundant for caller-side use because every tool that
+            takes a GUID accepts an 8+ char prefix via
+            ``_resolve_guid``.
         """
         with self.open(readonly=True) as book:
             transaction = self._find_transaction(book, guid)
-            if transaction:
-                return _transaction_to_dict(transaction)
-            return None
+            if not transaction:
+                return None
+            return _transaction_to_dict(
+                transaction,
+                txn_prefixes=self._transaction_prefix_map(book),
+                split_prefixes=self._split_prefix_map(book),
+                lot_prefixes=self._lot_prefix_map(book),
+            )
 
     _FUNDING_ACCOUNT_TYPES = {
         "BANK", "CASH", "ASSET", "CREDIT", "LIABILITY", "EQUITY",

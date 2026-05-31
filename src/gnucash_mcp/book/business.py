@@ -22,6 +22,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _slot_value_str,
     _to_decimal,
+    _unique_prefix,
     _verify_composite_write,
     _verify_write,
 )
@@ -354,6 +355,37 @@ class BusinessMixin:
         "currency translation",
     )
 
+    # ── Early-payment discount account convention ────────────────────
+    #
+    # Standard small-business GAAP routing for early-payment discounts.
+    # Customer-side: discount given is an expense to the seller (the
+    # cost of getting paid faster). Vendor-side: discount taken on a
+    # supplier bill is income (a cost reduction).
+    #
+    # Larger businesses sometimes prefer contra-revenue / contra-
+    # expense treatment (Income:Sales Discounts Given as a negative
+    # against Revenue). The bookkeeper's call for v1.3 was the small-
+    # business convention below; the user can override via the
+    # ``discount_account`` parameter on pay_invoice if they want
+    # contra accounts instead.
+    SALES_DISCOUNTS_PATH = "Expenses:Sales Discounts"
+    PURCHASE_DISCOUNTS_PATH = "Income:Purchase Discounts Taken"
+
+    _SALES_DISCOUNT_NAME_KEYWORDS = (
+        "sales discount",
+        "sales discounts",
+        "discounts given",
+        "customer discount",
+        "customer discounts",
+    )
+    _PURCHASE_DISCOUNT_NAME_KEYWORDS = (
+        "purchase discount",
+        "purchase discounts",
+        "discounts taken",
+        "vendor discount",
+        "vendor discounts",
+    )
+
     def _get_or_create_fx_account(self, book, fx_account: str | None = None):
         """Find or lazily create the FX-gain/loss account.
 
@@ -465,6 +497,216 @@ class BusinessMixin:
             ),
         )
         return fx_acct, notice
+
+    def _get_or_create_discount_account(
+        self, book, owner_type_is_bill: bool,
+        discount_account: str | None = None,
+    ):
+        """Find or lazily create the early-payment-discount account.
+
+        Direct parallel to ``_get_or_create_fx_account`` — same three-
+        layer resolution (explicit > fuzzy match > canonical default
+        with optional auto-create).
+
+        Args:
+            owner_type_is_bill: When True, we're paying a vendor bill
+                (or refunding a customer credit note) and the discount
+                is INCOME (Purchase Discounts Taken). When False,
+                customer invoice payment and the discount is EXPENSE
+                (Sales Discounts). Same effective_is_bill the rest of
+                pay_invoice uses.
+            discount_account: Optional override (path, %short, full
+                GUID). Validated for existence and INCOME/EXPENSE
+                type.
+
+        Returns ``(account, notice)`` where ``notice`` is None unless
+        the fuzzy match found multiple candidates and we fell back to
+        the canonical default — same shape as the FX helper.
+        """
+        if owner_type_is_bill:
+            canonical_path = self.PURCHASE_DISCOUNTS_PATH
+            canonical_type = "INCOME"
+            canonical_parent_path = "Income"
+            keywords = self._PURCHASE_DISCOUNT_NAME_KEYWORDS
+            side_label = "purchase discounts taken"
+        else:
+            canonical_path = self.SALES_DISCOUNTS_PATH
+            canonical_type = "EXPENSE"
+            canonical_parent_path = "Expenses"
+            keywords = self._SALES_DISCOUNT_NAME_KEYWORDS
+            side_label = "sales discounts"
+
+        # Layer 1: caller-supplied account wins.
+        if discount_account is not None:
+            acct = self._resolve_account(book, discount_account)
+            if acct is None:
+                raise ValueError(
+                    f"discount_account not found: {discount_account!r}. "
+                    f"Pass a full path, %short GUID, or full 32-char "
+                    f"GUID of an INCOME or EXPENSE account."
+                )
+            if acct.type not in {"INCOME", "EXPENSE"}:
+                raise ValueError(
+                    f"discount_account {acct.fullname!r} is type "
+                    f"{acct.type}; must be INCOME or EXPENSE to "
+                    f"receive an early-payment-discount split."
+                )
+            return acct, None
+
+        # Layer 2: fuzzy match by leaf-name substring.
+        candidates = []
+        for account in book.accounts:
+            if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            name_lower = account.name.lower()
+            if any(kw in name_lower for kw in keywords):
+                candidates.append(account)
+
+        notice = None
+        if len(candidates) == 1:
+            return candidates[0], None
+        if len(candidates) > 1:
+            sorted_paths = sorted(c.fullname for c in candidates)
+            notice = {
+                "type": "ambiguous_discount_account",
+                "candidates": sorted_paths,
+                "message": (
+                    f"Found {len(candidates)} candidate {side_label} "
+                    f"accounts ({', '.join(sorted_paths)}). Routed to "
+                    f"{canonical_path} as the canonical default; pass "
+                    f"discount_account explicitly to disambiguate."
+                ),
+            }
+            # Fall through to canonical default below.
+
+        # Layer 3: canonical default (existing or auto-create).
+        disc_acct = self._find_account(book, canonical_path)
+        if disc_acct is not None:
+            return disc_acct, notice
+
+        parent = self._find_account(book, canonical_parent_path)
+        if parent is None:
+            raise ValueError(
+                f"Early-payment discount on this payment needs an "
+                f"{canonical_parent_path} parent account, but none "
+                f"exists. Create {canonical_parent_path} (type="
+                f"{canonical_type}, placeholder) first."
+            )
+
+        default_currency = self._require_default_currency(book)
+        # Don't flush here; the caller is still building the payment
+        # transaction. Same rationale as the FX-account auto-create.
+        leaf_name = canonical_path.split(":")[-1]
+        disc_acct = piecash.Account(
+            name=leaf_name,
+            type=canonical_type,
+            parent=parent,
+            commodity=default_currency,
+            description=(
+                f"Early-payment discounts {'taken on supplier bills' if owner_type_is_bill else 'given to customers'}, "
+                f"booked when pay_invoice is called with "
+                f"apply_discount=True and the term + window + amount "
+                f"validation passes. Auto-created on first use."
+            ),
+        )
+        return disc_acct, notice
+
+    def _get_invoice_billterm(self, book, inv):
+        """Return the piecash Billterm linked to the invoice, or None.
+
+        Reads the ``terms`` column via raw SQL — same pattern as
+        :meth:`_resolve_invoice_due_date`, because the ORM
+        ``inv.terms`` relationship has historical reliability issues
+        depending on access path. Returns the Billterm ORM object so
+        the caller can read ``.duedays``, ``.discountdays``,
+        ``.discount`` directly.
+        """
+        from sqlalchemy import text
+        from piecash.business.invoice import Billterm
+
+        terms_row = book.session.execute(
+            text("SELECT terms FROM invoices WHERE guid = :guid"),
+            {"guid": inv.guid},
+        ).first()
+        term_guid = terms_row[0] if terms_row else None
+        if not term_guid:
+            return None
+        return (
+            book.session.query(Billterm)
+            .filter_by(guid=term_guid)
+            .first()
+        )
+
+    def _compute_discount_summary(self, book, inv) -> dict | None:
+        """Return discount summary for an invoice, or None when not
+        applicable.
+
+        The summary is what ``get_invoice`` verbose mode surfaces and
+        what ``pay_invoice`` validation references. Pure read; no
+        side effects. None when:
+        - Invoice isn't posted (date_posted needed for the window
+          calculation)
+        - Invoice has no billterm linkage
+        - Billterm has no discount configured (discountdays == 0 or
+          discount == 0)
+
+        Returned dict shape::
+
+            {
+                "discount_days": int,
+                "discount_percent": Decimal,
+                "expected_discount": Decimal,  # subtotal × pct / 100,
+                                                # in invoice currency,
+                                                # quantized
+                "eligible_until": date,
+                "currency": str,                # invoice currency mnemonic
+            }
+
+        ``expected_discount`` is computed off the pre-tax ``subtotal``
+        per the bookkeeper-validated convention: GST/PST is collected
+        on behalf of the tax authority at the gross rate and is NOT
+        reduced by the discount. Discounting tax would short the
+        remittance.
+        """
+        if not _is_invoice_posted(inv):
+            return None
+        bt = self._get_invoice_billterm(book, inv)
+        if bt is None:
+            return None
+        discount_days = int(bt.discountdays) if bt.discountdays else 0
+        discount_pct = Decimal(str(bt.discount)) if bt.discount else Decimal("0")
+        if discount_days <= 0 or discount_pct <= 0:
+            return None
+
+        # Use date_opened as the discount-window anchor — that's the
+        # invoice issuance date (what's printed on the invoice the
+        # customer received). date_posted is when it hit A/R, often
+        # the same day but not guaranteed; the customer's discount
+        # eligibility is measured from when they got the invoice.
+        anchor = inv.date_opened
+        if isinstance(anchor, datetime):
+            anchor = anchor.date()
+        eligible_until = anchor + timedelta(days=discount_days)
+
+        # Pre-tax principal for discount calculation. Catch the rare
+        # corrupted-entries case the same way other callers do.
+        try:
+            totals = self._get_invoice_entries_and_total(book, inv)
+            subtotal = totals["subtotal"]
+        except (ValueError, KeyError):
+            return None
+
+        expected = (subtotal * discount_pct / Decimal(100)).quantize(
+            _commodity_quantum(inv.currency)
+        )
+
+        return {
+            "discount_days": discount_days,
+            "discount_percent": discount_pct,
+            "expected_discount": expected,
+            "eligible_until": eligible_until,
+            "currency": inv.currency.mnemonic,
+        }
 
     @staticmethod
     def _rate_from_post_transaction(post_txn, target_commodity):
@@ -908,9 +1150,16 @@ class BusinessMixin:
 
     @staticmethod
     def _customer_to_dict(customer) -> dict:
-        """Convert a piecash Customer to a serializable dict."""
+        """Convert a piecash Customer to a serializable dict.
+
+        Business-object GUIDs are deliberately omitted from the
+        response. Bookkeeper-validated finding: every consumer
+        addresses customers via ``id`` (human-readable, like
+        "000001"); the 32-char GUID is dead weight on every read.
+        Same treatment applies to vendor, employee, job, billterm,
+        taxtable, invoice, and entry response shapes.
+        """
         result = {
-            "guid": customer.guid,
             "id": customer.id,
             "name": customer.name,
             "currency": customer.currency.mnemonic if customer.currency else None,
@@ -924,9 +1173,11 @@ class BusinessMixin:
 
     @staticmethod
     def _vendor_to_dict(vendor) -> dict:
-        """Convert a piecash Vendor to a serializable dict."""
+        """Convert a piecash Vendor to a serializable dict.
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
+        """
         result = {
-            "guid": vendor.guid,
             "id": vendor.id,
             "name": vendor.name,
             "currency": vendor.currency.mnemonic if vendor.currency else None,
@@ -947,9 +1198,10 @@ class BusinessMixin:
         shape omits the ``notes`` key. Employee-specific fields
         (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
         scope for the 1.3.0 CRUD surface and are not serialized.
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
         """
         result = {
-            "guid": employee.guid,
             "id": employee.id,
             "name": employee.name,
             "currency": employee.currency.mnemonic if employee.currency else None,
@@ -984,9 +1236,11 @@ class BusinessMixin:
         human-readable ``owner_type`` string for symmetry with
         every other tool's owner-typed response. ``owner_name``
         is resolved by the caller (static-method shape can't
-        query the session)."""
+        query the session).
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
+        """
         return {
-            "guid": job.guid,
             "id": job.id,
             "name": job.name,
             "reference": job.reference or "",
@@ -1021,9 +1275,11 @@ class BusinessMixin:
 
     @staticmethod
     def _billterm_to_dict(bt) -> dict:
-        """Convert a Billterm to a serializable dict."""
+        """Convert a Billterm to a serializable dict.
+
+        ``guid`` omitted — billterms are addressed by ``name``.
+        """
         return {
-            "guid": bt.guid,
             "name": bt.name,
             "description": bt.description or "",
             "type": bt.type,
@@ -1085,8 +1341,8 @@ class BusinessMixin:
             )
             for e in tt.entries
         ]
+        # ``guid`` omitted — taxtables are addressed by ``name``.
         return {
-            "guid": tt.guid,
             "name": tt.name,
             "refcount": (
                 refcount if refcount is not None else tt.refcount
@@ -1188,8 +1444,8 @@ class BusinessMixin:
                 invoice.owner_type, "invoice",
             )
 
+        # ``guid`` omitted — invoices are addressed by ``id``.
         result = {
-            "guid": invoice.guid,
             "id": invoice.id,
             "type": type_field,
             "owner_name": owner_name,
@@ -1377,8 +1633,10 @@ class BusinessMixin:
         else:
             date_str = str(raw_date.date())
 
+        # ``guid`` omitted — entries are nested under invoices and
+        # have no standalone tool surface (no delete_entry,
+        # update_entry, etc.). Bookkeeper-validated: never used.
         result = {
-            "guid": entry_row.guid,
             "date": date_str,
             "description": entry_row.description or "",
             "quantity": str(quantity),
@@ -1842,8 +2100,10 @@ class BusinessMixin:
         )
         book.save()
 
+        # v1.3.1: business-object ``guid`` dropped from write
+        # responses (bookkeeper-validated as unused on the LLM
+        # surface). ``id`` is the working handle.
         return {
-            "guid": entity.guid,
             "id": entity.id,
             "name": entity.name,
             "currency": currency_obj.mnemonic,
@@ -2009,8 +2269,8 @@ class BusinessMixin:
 
         book.save()
 
+        # v1.3.1: ``guid`` dropped — see _create_business_person.
         return {
-            "guid": entity.guid,
             "id": entity.id,
             "status": "updated",
             **changed,
@@ -2411,8 +2671,8 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — billterms addressed by ``name``.
             return {
-                "guid": bt_guid,
                 "name": name,
                 "due_days": due_days,
                 "status": "created",
@@ -2853,8 +3113,8 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — taxtables addressed by ``name``.
             return {
-                "guid": tt_guid,
                 "name": tt_name,
                 "entry_count": len(entry_dicts),
                 "entries": entry_dicts,
@@ -3085,8 +3345,8 @@ class BusinessMixin:
             book.save()
 
             if not changed:
+                # v1.3.1: ``guid`` dropped.
                 return {
-                    "guid": tt_guid,
                     "name": name,
                     "status": "unchanged",
                 }
@@ -3652,8 +3912,9 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — invoices/bills/vouchers/
+            # credit notes addressed by ``id``.
             return {
-                "guid": inv_guid,
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
                 "date_opened": str(open_date.date()),
@@ -4431,8 +4692,9 @@ class BusinessMixin:
             book.save()
 
             total = qty * unit_price
+            # v1.3.1: entry ``guid`` dropped — no tool surface
+            # consumes a standalone entry GUID.
             return {
-                "guid": entry_guid,
                 cfg["id_param"]: doc_id,
                 "description": description,
                 "quantity": str(qty),
@@ -4857,6 +5119,37 @@ class BusinessMixin:
                 tax_summary=tax_summary,
             )
             result["total"] = str(total)
+
+            # Forward signal: when this invoice has discount terms,
+            # surface the eligible-until date and the dollar amount
+            # of discount available. Makes get_invoice actionable for
+            # the LLM as a bookkeeper — "you can save $X if you pay
+            # this by Y" — without the caller having to read the
+            # billterm separately and do the math.
+            #
+            # Three states:
+            #   - No discount terms → no block
+            #   - Discount terms + within window → ``discount_available``
+            #     block with the amount + deadline
+            #   - Discount terms + past deadline → ``discount_expired``
+            #     block with the same fields so the audit-log reader
+            #     can see what was offered
+            disc_summary = self._compute_discount_summary(book, inv)
+            if disc_summary is not None:
+                today = date.today()
+                block_key = (
+                    "discount_available"
+                    if today <= disc_summary["eligible_until"]
+                    else "discount_expired"
+                )
+                result[block_key] = {
+                    "amount": str(disc_summary["expected_discount"]),
+                    "currency": disc_summary["currency"],
+                    "percent": str(disc_summary["discount_percent"]),
+                    "eligible_until": (
+                        disc_summary["eligible_until"].isoformat()
+                    ),
+                }
             return result
 
     def post_invoice(
@@ -5136,8 +5429,19 @@ class BusinessMixin:
                 "status": "posted",
                 "total": str(grand_total),
                 "post_date": str(parsed_date),
-                "transaction_guid": txn.guid,
-                "lot_guid": lot.guid,
+                # Transaction + lot GUIDs are USED by consumers
+                # (e.g. bookkeeper passes transaction_guid to
+                # get_transaction to verify splits). Emit short
+                # prefixes via the cached prefix maps — every
+                # tool accepts 8+ char prefixes via _resolve_guid.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
+                "lot_guid": _unique_prefix(
+                    lot.guid,
+                    self._lot_prefix_map(book).keys(),
+                ),
                 "post_account": post_acct.fullname,
             }
 
@@ -5306,6 +5610,8 @@ class BusinessMixin:
         description: str | None = None,
         owner_type: str | None = None,
         fx_account: str | None = None,
+        apply_discount: bool = False,
+        discount_account: str | None = None,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
@@ -5350,16 +5656,40 @@ class BusinessMixin:
                 gain/loss (cross-currency payments only). Accepts a
                 full path, ``%short`` GUID, or full 32-char GUID.
                 Must be an INCOME or EXPENSE account.
+            apply_discount: When True, settle this invoice using the
+                early-payment discount from its billterm. The tool
+                validates that the invoice has discount terms, the
+                payment date is within the discount window, and the
+                shortfall (remaining lot balance − amount) matches
+                the expected discount on pre-tax principal. Each
+                failure mode rejects with a specific error rather
+                than silently downgrading to a partial payment.
+                Default False — explicit opt-in surfaces caller
+                intent.
+            discount_account: Optional account to receive the
+                discount split. Accepts a full path, ``%short`` GUID,
+                or full 32-char GUID. Must be INCOME or EXPENSE.
+                Auto-resolved when omitted (same pattern as
+                ``fx_account``): explicit > name-match in book >
+                canonical default
+                (``Expenses:Sales Discounts`` for customer payments,
+                ``Income:Purchase Discounts Taken`` for vendor bill
+                payments; auto-created on first use).
 
         Returns:
             Dict with payment details and remaining balance. For cross-
             currency payments also includes ``exchange_rate`` and
-            ``payment_account_amount``.
+            ``payment_account_amount``. For discount-eligible
+            payments also includes a ``discount`` block describing
+            the amount booked and the discount account it landed in.
 
         Raises:
             ValueError: If invoice not found, not posted, invalid account,
                 cross-currency payment with no exchange rate available,
-                or ``fx_account`` is supplied but invalid.
+                ``fx_account`` is supplied but invalid, or
+                ``apply_discount=True`` fails any of its validation
+                checks (no terms, no discount field, outside window,
+                amount mismatch, partial payment, credit-note target).
         """
         ot = self._parse_owner_type(owner_type)
 
@@ -5537,13 +5867,158 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
 
+            # ── Early-payment discount validation ────────────────
+            # Five rejection cases, each with a distinct error so
+            # the caller can see exactly which precondition failed.
+            # Per the spec: discount is an explicit opt-in (no
+            # auto-detect from coincidental shortfall) — when
+            # apply_discount=True, the call either honors all
+            # invariants and books the discount split, or rejects.
+            discount_split: piecash.Split | None = None
+            discount_acct = None
+            discount_notice = None
+            discount_amount_invoice_ccy = Decimal("0")
+            if apply_discount:
+                if is_credit_note:
+                    raise ValueError(
+                        "Discounts cannot be applied to credit note "
+                        "settlements. A credit note is a reversal, "
+                        "not a payment; discounting it has no "
+                        "accounting meaning."
+                    )
+                disc_summary = self._compute_discount_summary(book, inv)
+                if disc_summary is None:
+                    # Two reasons _compute_discount_summary returns
+                    # None: no billterm linked, or billterm has no
+                    # discount. Distinguish for the caller.
+                    bt = self._get_invoice_billterm(book, inv)
+                    if bt is None:
+                        raise ValueError(
+                            f"apply_discount=True on invoice "
+                            f"{invoice_id} which has no billterm "
+                            f"linked. Set terms at invoice creation "
+                            f"(via create_invoice or create_bill's "
+                            f"``term`` parameter), repost, then retry."
+                        )
+                    raise ValueError(
+                        f"apply_discount=True on invoice "
+                        f"{invoice_id} whose billterm has no early-"
+                        f"payment discount configured "
+                        f"(discount_days={int(bt.discountdays) if bt.discountdays else 0}, "
+                        f"discount_percent={Decimal(str(bt.discount)) if bt.discount else 0}). "
+                        f"Recreate the billterm with both "
+                        f"discount_days and discount_percent > 0 to "
+                        f"enable early-payment discounts on invoices "
+                        f"that use it."
+                    )
+
+                eligible_until = disc_summary["eligible_until"]
+                if parsed_date > eligible_until:
+                    anchor = inv.date_opened
+                    if isinstance(anchor, datetime):
+                        anchor = anchor.date()
+                    raise ValueError(
+                        f"Payment date {parsed_date.isoformat()} is "
+                        f"beyond the billterm discount window "
+                        f"({disc_summary['discount_days']} days "
+                        f"from {anchor.isoformat()}; deadline was "
+                        f"{eligible_until.isoformat()}). Pay without "
+                        f"apply_discount for a normal late payment, "
+                        f"or issue a credit note to formally write "
+                        f"off the would-be discount amount with an "
+                        f"audit trail."
+                    )
+
+                # Use the CURRENT remaining lot balance as the
+                # principal to settle — not the original grand_total.
+                # This makes the closing-payment-of-a-multi-pay-
+                # invoice case work naturally: customer paid $500
+                # earlier without discount, now pays $480 with
+                # apply_discount=True → remaining=$500, amount=$480,
+                # shortfall=$20, expected=$20 (on original $1000) →
+                # honored.
+                remaining_before = abs(
+                    self._calculate_lot_balance(lot_obj)
+                )
+                shortfall = remaining_before - payment_amount
+                expected = disc_summary["expected_discount"]
+                quantum = _commodity_quantum(inv.currency)
+
+                if shortfall < 0:
+                    raise ValueError(
+                        f"apply_discount=True with payment_amount "
+                        f"{payment_amount} {inv.currency.mnemonic} "
+                        f"exceeds the outstanding lot balance "
+                        f"{remaining_before} {inv.currency.mnemonic}. "
+                        f"Overpayment cannot be discount-settled."
+                    )
+
+                if abs(shortfall - expected) > quantum:
+                    raise ValueError(
+                        f"apply_discount=True but the payment "
+                        f"shortfall doesn't match the expected "
+                        f"discount. Outstanding balance: "
+                        f"{remaining_before} {inv.currency.mnemonic}; "
+                        f"amount: {payment_amount}; shortfall: "
+                        f"{shortfall}; expected discount on pre-tax "
+                        f"principal: {expected} "
+                        f"{inv.currency.mnemonic} "
+                        f"({disc_summary['discount_percent']}%). "
+                        f"Either adjust amount to "
+                        f"{(remaining_before - expected).quantize(quantum)} "
+                        f"to take the full discount, or pay without "
+                        f"apply_discount for a partial payment."
+                    )
+
+                # All validation passed — resolve the discount account
+                # and build the split. Quantize to the discount
+                # account's commodity quantum after cross-currency
+                # conversion (rare but possible — discount account
+                # commodity might differ from invoice currency).
+                discount_acct, discount_notice = (
+                    self._get_or_create_discount_account(
+                        book,
+                        owner_type_is_bill=effective_is_bill,
+                        discount_account=discount_account,
+                    )
+                )
+                disc_quantity, _disc_rate = _convert(
+                    expected, discount_acct.commodity,
+                )
+                # Customer payment: discount is EXPENSE (debit), +value
+                # Vendor bill payment: discount is INCOME (credit), -value
+                disc_value_sign = -1 if effective_is_bill else 1
+                discount_split = piecash.Split(
+                    account=discount_acct,
+                    value=disc_value_sign * expected,
+                    quantity=disc_value_sign * disc_quantity,
+                    memo="Early-payment discount",
+                )
+                discount_amount_invoice_ccy = expected
+
+                # When discount applies, the A/R/A/P side absorbs the
+                # FULL remaining_balance — not just payment_amount.
+                # The discount split makes up the difference so the
+                # transaction balances. Recompute the A/R-side
+                # quantity in the post account's commodity.
+                full_settle_amount = remaining_before
+                full_settle_post_qty, _ = _convert(
+                    full_settle_amount, post_acct.commodity,
+                )
+            else:
+                full_settle_amount = payment_amount
+                full_settle_post_qty = post_quantity
+
             if effective_is_bill:
                 # Pay vendor bill (or refund customer credit note):
-                # debit A/P (positive), credit bank (negative)
+                # debit A/P (positive), credit bank (negative). When
+                # apply_discount=True, A/P clears FULL outstanding
+                # balance (full_settle_amount); the discount split
+                # absorbs the difference.
                 ar_ap_split = piecash.Split(
                     account=post_acct,
-                    value=payment_amount,
-                    quantity=post_quantity,
+                    value=full_settle_amount,
+                    quantity=full_settle_post_qty,
                     memo="",
                     action="Payment",
                 )
@@ -5556,11 +6031,12 @@ class BusinessMixin:
             else:
                 # Receive customer payment (or refund-in from a
                 # vendor credit note): credit A/R (negative),
-                # debit bank (positive)
+                # debit bank (positive). With apply_discount=True,
+                # A/R clears FULL outstanding balance.
                 ar_ap_split = piecash.Split(
                     account=post_acct,
-                    value=-payment_amount,
-                    quantity=-post_quantity,
+                    value=-full_settle_amount,
+                    quantity=-full_settle_post_qty,
                     memo="",
                     action="Payment",
                 )
@@ -5585,6 +6061,8 @@ class BusinessMixin:
             # quadrants are testable as unit cases rather than only
             # via end-to-end ``pay_invoice``.
             splits = [ar_ap_split, bank_split]
+            if discount_split is not None:
+                splits.append(discount_split)
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
@@ -5640,7 +6118,13 @@ class BusinessMixin:
                 "status": "paid",
                 "amount_paid": str(payment_amount),
                 "remaining_balance": str(abs(remaining)),
-                "transaction_guid": txn.guid,
+                # Transaction GUID emitted as a short prefix —
+                # consumers (e.g. get_transaction lookup) accept
+                # 8+ char prefixes via _resolve_guid.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
@@ -5671,6 +6155,19 @@ class BusinessMixin:
                     }
                     if fx_result["fx_notice"] is not None:
                         result["fx_notice"] = fx_result["fx_notice"]
+            if discount_split is not None:
+                # Surface what was booked so the caller can confirm the
+                # discount applied without re-reading the transaction.
+                # ``account`` is the canonical full path (handles the
+                # case where the auto-resolver picked an account the
+                # caller didn't supply explicitly).
+                result["discount"] = {
+                    "amount": str(discount_amount_invoice_ccy),
+                    "currency": inv.currency.mnemonic,
+                    "account": discount_acct.fullname,
+                }
+                if discount_notice is not None:
+                    result["discount_notice"] = discount_notice
 
         return result
 
@@ -6014,7 +6511,12 @@ class BusinessMixin:
                 "target_remaining": str(
                     new_target_remaining.quantize(quantum)
                 ),
-                "transaction_guid": txn.guid,
+                # Short prefix for the netting transaction GUID —
+                # see pay_invoice for the rationale.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
                 "apply_date": str(parsed_date),
                 "status": "applied",
             }
@@ -6258,9 +6760,9 @@ class BusinessMixin:
             book.session.delete(entity)
             book.save()
 
+            # v1.3.1: ``guid`` dropped from delete responses too.
             return {
                 "id": entity_id,
-                "guid": entity_guid,
                 "name": entity_name,
                 "type": entity_label.lower(),
                 "status": "deleted",
@@ -6488,8 +6990,8 @@ class BusinessMixin:
                 f"Job '{name}'",
             )
 
+            # v1.3.1: ``guid`` dropped — jobs addressed by ``id``.
             return {
-                "guid": job.guid,
                 "id": job.id,
                 "name": name,
                 "reference": reference,
@@ -6692,9 +7194,9 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped from update responses.
             return {
                 "id": job.id,
-                "guid": job.guid,
                 "status": "updated",
                 **changed,
             }
@@ -6767,9 +7269,9 @@ class BusinessMixin:
                 f"Job '{job_id}'",
             )
 
+            # v1.3.1: ``guid`` dropped from delete response.
             return {
                 "id": job_id,
-                "guid": job_guid,
                 "name": job_name,
                 "reparented_count": reparented_count,
                 "status": "deleted",
@@ -7153,9 +7655,16 @@ class BusinessMixin:
             # Capture default currency for the compact formatter —
             # pre-fix the table emitted ``$`` regardless of book
             # setting.
-            default_currency_mnemonic = (
-                self._require_default_currency(book).mnemonic
-            )
+            default_currency = self._require_default_currency(book)
+            default_currency_mnemonic = default_currency.mnemonic
+
+            # Latest market rates for FX conversion. A book with
+            # USD vendors AND EUR vendors needs each bill's
+            # grand_total converted to default currency before
+            # summing — raw-sum across currencies is the same
+            # multi-currency bug spending_by_category and
+            # income_by_source carried until v1.3.0.
+            latest_rates = self._rates_as_of(book)
 
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
@@ -7232,6 +7741,27 @@ class BusinessMixin:
 
                 outstanding = abs(balance)
                 paid = total - outstanding
+
+                # Convert each per-bill total from the bill's own
+                # currency to the book default before summing. A
+                # USD-default book with a EUR bill: bill.currency
+                # is EUR, total is in EUR; we multiply by the
+                # current EUR→USD rate (or 1 if same-currency).
+                # Without conversion the grand totals mixed
+                # currencies — a EUR €2,500 bill and a USD $3,000
+                # bill summed to "5,500" of nothing in particular.
+                if bill.currency != default_currency:
+                    rate = latest_rates.get(bill.currency.guid)
+                    if rate is not None:
+                        total = total * rate
+                        paid = paid * rate
+                        outstanding = outstanding * rate
+                    # If no rate is on file, fall back to the
+                    # un-converted figures rather than dropping the
+                    # bill silently. The bookkeeper sees a mixed-
+                    # currency total that's wrong by the FX delta,
+                    # which is the same fallback the rest of the
+                    # codebase uses for unpriced commodities.
 
                 vendor_data[v_name]["total_billed"] += total
                 vendor_data[v_name]["total_paid"] += paid

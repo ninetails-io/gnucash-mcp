@@ -74,16 +74,32 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def balance_sheet(as_of_date: str) -> str:
+    def balance_sheet(as_of_date: str | None = None) -> str:
         """Generate a balance sheet as of a specific date.
 
         Shows assets, liabilities, and equity with account breakdowns.
+        A = L + E holds by construction; non-zero unrealized P&L
+        appears as a synthetic equity row.
 
         Args:
-            as_of_date: Date to calculate balances as of (YYYY-MM-DD)
+            as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to
+                today — matching ``get_book_summary``'s implicit
+                cutoff so cross-tool comparisons agree without
+                threading the same date into both calls. Pass an
+                explicit date for historical snapshots.
         """
         book = get_book()
-        result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
+        # Distinguish "not provided" (None → today) from "provided
+        # but empty/garbage" (raise). Pre-fix, an empty-string
+        # ``as_of_date=""`` silently fell back to today — a caller
+        # bug that produced silently wrong-dated reports. Copilot
+        # PR #92 review caught this; the strict-kwargs pattern
+        # extends to the value, not just the parameter name.
+        if as_of_date is None:
+            d = date.today()
+        else:
+            d = date.fromisoformat(as_of_date)
+        result = book.balance_sheet(as_of_date=d)
         return _json(result)
 
     @mcp.tool()

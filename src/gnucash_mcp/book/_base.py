@@ -360,20 +360,47 @@ def _account_to_compact_line(account: piecash.Account) -> str:
     return fullname
 
 
-def _split_to_dict(split: piecash.Split) -> dict:
-    """Convert a piecash Split to a full serializable dict."""
+def _split_to_dict(
+    split: piecash.Split,
+    split_prefixes: dict[str, str] | None = None,
+    lot_prefixes: dict[str, str] | None = None,
+) -> dict:
+    """Convert a piecash Split to a full serializable dict.
+
+    When ``split_prefixes`` / ``lot_prefixes`` are provided, the
+    emitted ``guid`` and ``lot_guid`` fields are truncated to
+    collision-safe short forms (typically 8 chars) via lookup in
+    the prefix maps. When omitted, falls back to full 32-char
+    GUIDs — preserved for any caller that hasn't migrated to the
+    prefix-aware path. v1.3.1 bookkeeper feedback drove the
+    prefix path on read tools (get_transaction, verbose
+    list_transactions) where the full GUIDs were dead-weight
+    tokens the LLM never used.
+    """
     rec_date = split.reconcile_date
     if rec_date and rec_date.year <= 1970:
         rec_date = None
+    split_guid = (
+        split_prefixes.get(split.guid, split.guid)
+        if split_prefixes is not None
+        else split.guid
+    )
+    lot_guid = None
+    if split.lot is not None:
+        lot_guid = (
+            lot_prefixes.get(split.lot.guid, split.lot.guid)
+            if lot_prefixes is not None
+            else split.lot.guid
+        )
     return {
-        "guid": split.guid,
+        "guid": split_guid,
         "account": split.account.fullname,
         "value": str(split.value),
         "quantity": str(split.quantity),
         "memo": split.memo or "",
         "reconcile_state": split.reconcile_state,
         "reconcile_date": rec_date.isoformat() if rec_date else None,
-        "lot_guid": split.lot.guid if split.lot else None,
+        "lot_guid": lot_guid,
     }
 
 
@@ -414,14 +441,42 @@ def _split_to_compact_dict(split: piecash.Split) -> dict:
     return result
 
 
-def _transaction_to_dict(transaction: piecash.Transaction) -> dict:
-    """Convert a piecash Transaction to a serializable dict."""
+def _transaction_to_dict(
+    transaction: piecash.Transaction,
+    txn_prefixes: dict[str, str] | None = None,
+    split_prefixes: dict[str, str] | None = None,
+    lot_prefixes: dict[str, str] | None = None,
+) -> dict:
+    """Convert a piecash Transaction to a serializable dict.
+
+    When the three prefix maps are provided (typically by callers
+    that have access to the BaseGnuCashBook cached prefix
+    helpers), the emitted ``guid`` field on the transaction and
+    on each nested split is truncated to its collision-safe short
+    form. When omitted, full 32-char GUIDs are emitted — a back-
+    compat fallback for any caller that hasn't been migrated.
+
+    All three maps come from the same book-mtime-keyed cache, so
+    repeated calls against an unchanged book skip the rebuild.
+    """
+    txn_guid = (
+        txn_prefixes.get(transaction.guid, transaction.guid)
+        if txn_prefixes is not None
+        else transaction.guid
+    )
     result = {
-        "guid": transaction.guid,
+        "guid": txn_guid,
         "date": transaction.post_date.isoformat(),
         "description": transaction.description,
         "currency": transaction.currency.mnemonic,
-        "splits": [_split_to_dict(s) for s in transaction.splits],
+        "splits": [
+            _split_to_dict(
+                s,
+                split_prefixes=split_prefixes,
+                lot_prefixes=lot_prefixes,
+            )
+            for s in transaction.splits
+        ],
     }
     if transaction.notes:
         result["notes"] = transaction.notes
@@ -758,6 +813,12 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         # other writer) invalidates the cache on the next request.
         # Shape: ``(mtime_ns, prefix_dict)`` or ``None`` when empty.
         self._txn_prefix_cache: tuple[int, dict[str, str]] | None = None
+        # Same cache shape for split and lot GUID prefix maps — used
+        # by get_transaction and verbose list_transactions to emit
+        # collision-safe short GUIDs alongside transaction prefixes.
+        # All three caches invalidate on book mtime change together.
+        self._split_prefix_cache: tuple[int, dict[str, str]] | None = None
+        self._lot_prefix_cache: tuple[int, dict[str, str]] | None = None
 
     def _stage_audit_before(self, state: dict | None) -> None:
         """Stage a before-state dict for the next audit-log consume.
@@ -1022,6 +1083,52 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             return self._txn_prefix_cache[1]
         prefix_map = _guid_prefix_map(t.guid for t in book.transactions)
         self._txn_prefix_cache = (mtime_ns, prefix_map)
+        return prefix_map
+
+    def _split_prefix_map(
+        self, book: piecash.Book
+    ) -> dict[str, str]:
+        """Return the full-table split-GUID prefix map, cached.
+
+        Same mtime-keyed pattern as ``_transaction_prefix_map``.
+        Used by ``get_transaction`` and verbose ``list_transactions``
+        to emit collision-safe short split GUIDs in responses. Pre-
+        v1.3.1 these surfaces emitted full 32-char split GUIDs —
+        24 wasted chars per split per call, identified by the
+        bookkeeper as token bloat in real LLM workflows.
+        """
+        mtime_ns = self.book_path.stat().st_mtime_ns
+        if (
+            self._split_prefix_cache is not None
+            and self._split_prefix_cache[0] == mtime_ns
+        ):
+            return self._split_prefix_cache[1]
+        prefix_map = _guid_prefix_map(
+            s.guid for t in book.transactions for s in t.splits
+        )
+        self._split_prefix_cache = (mtime_ns, prefix_map)
+        return prefix_map
+
+    def _lot_prefix_map(
+        self, book: piecash.Book
+    ) -> dict[str, str]:
+        """Return the full-table lot-GUID prefix map, cached.
+
+        Sibling to ``_transaction_prefix_map`` / ``_split_prefix_map``.
+        Lots are nested under accounts; same mtime invalidation
+        applies because any lot change goes through the same SQLite
+        write path.
+        """
+        mtime_ns = self.book_path.stat().st_mtime_ns
+        if (
+            self._lot_prefix_cache is not None
+            and self._lot_prefix_cache[0] == mtime_ns
+        ):
+            return self._lot_prefix_cache[1]
+        prefix_map = _guid_prefix_map(
+            lot.guid for acct in book.accounts for lot in acct.lots
+        )
+        self._lot_prefix_cache = (mtime_ns, prefix_map)
         return prefix_map
 
     def _resolve_account(

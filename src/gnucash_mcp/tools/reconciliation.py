@@ -123,6 +123,21 @@ def register(mcp, get_book) -> None:
                 default=None,
             ),
         ] = None,
+        except_guids: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Optional list of split GUID prefixes to "
+                    "exclude from the bulk reconcile. Useful for "
+                    "\"everything on the statement except this "
+                    "pending ACH\" — 2 tokens vs the 100+ a "
+                    "full split_guids listing would cost. Only "
+                    "valid with reconcile_all=true; prefixes "
+                    "that don't resolve are silently ignored."
+                ),
+                default=None,
+            ),
+        ] = None,
     ) -> str:
         """Reconcile splits against a statement balance.
 
@@ -159,6 +174,7 @@ def register(mcp, get_book) -> None:
             split_guids=split_guids,
             reconcile_all=reconcile_all,
             through_date=through,
+            except_guids=except_guids,
         )
         return _json(result)
 

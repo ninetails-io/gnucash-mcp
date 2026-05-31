@@ -12,6 +12,31 @@ from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
 
+# Strict tool-argument validation: reject unknown kwargs at the MCP
+# boundary instead of silently ignoring them.
+#
+# FastMCP generates a Pydantic model per tool from the function
+# signature, all inheriting from ``ArgModelBase``. The base class's
+# default config doesn't set ``extra``, so Pydantic falls back to
+# ``"ignore"`` — typo'd or stale-spec parameter names silently
+# no-op. Bookkeeper-found bug on PR #92 review: calling
+# ``reconcile_account`` with ``except=[...]`` (the spec's name)
+# instead of ``except_guids=[...]`` (the actual Python-safe param)
+# ran the tool with no exclusion at all, surfacing only as a
+# balance mismatch downstream.
+#
+# Patching ``ArgModelBase.model_config`` to include
+# ``extra="forbid"`` makes the dynamically-created arg models
+# reject unknown fields with a clear ``"Extra inputs are not
+# permitted"`` error. Applied at import time, before any tool
+# module loads.
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+
+ArgModelBase.model_config = {
+    **ArgModelBase.model_config,
+    "extra": "forbid",
+}
+
 from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
 from gnucash_mcp.tools._helpers import _json, safe_tool
@@ -23,57 +48,23 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "gnucash-mcp",
     instructions="""GnuCash MCP Server — Double-Entry Accounting Tools
-
 ORIENTATION:
-- Call get_book_summary first to understand the book's structure, currency, and account hierarchy.
-- Use list_accounts to find exact account paths before creating transactions.
+- Call get_book_summary first. It returns structure, currency, balances, warnings, and reconciliation status.
+- Use list_accounts to get exact paths and short GUIDs before writing.
 - Use search_transactions before creating to avoid duplicates.
-
-DOUBLE-ENTRY BASICS:
-- Every transaction has splits that MUST balance to zero.
-- Debits are positive for Asset/Expense accounts, negative for Liability/Income/Equity.
-- Credit card payment example: checking -200 (credit), credit card +200 (debit) — reduces both balances.
-- Income received: checking +3000 (debit), income -3000 (credit).
-
+- Every transaction has splits that MUST sum to zero.
 ACCOUNT REFERENCES:
-- Anywhere a tool takes an account, you can pass a full path
-  ("Expenses:Groceries"), a short GUID ("%2e78c86"), or a full
-  32-char GUID. All three resolve to the same account.
-- Short GUIDs are emitted by list_accounts at the start of each line:
-  "%2e78c86<TAB>Assets:Current Assets:Savings Account [BANK]". Reuse
-  them in subsequent calls — they're ~80% smaller than full paths.
-- Paths remain useful when you're naming a new account or when your
-  reasoning depends on the hierarchy. Short GUIDs win for everything
-  else (transactions, balances, slots, lots, invoices, budgets).
-- Paths are colon-delimited and case-sensitive.
-
-GUID PREFIXES (transactions, splits, etc.):
-- All tools accepting GUIDs also accept 8+ character prefixes.
-- Use the short prefix from list_transactions output — no need to look up full GUIDs.
-- Account short GUIDs are 7+ hex chars *with* a leading "%" marker.
-  Transaction/split GUID prefixes are bare hex (no marker).
-
-RECONCILIATION WORKFLOW:
-1. list_transactions for the account and date range
-2. Match each statement line to an existing transaction or create missing ones
-3. Verify balance matches statement with get_balance
-4. Use reconcile_account to mark splits as reconciled
-
-INVESTMENT WORKFLOW:
-1. create_lot for each purchase
-2. create_transaction with quantity (shares) and amount (cost)
-3. assign_split_to_lot to link the investment split
-4. create_price to record the share price
-5. calculate_lot_gain to check performance
-
-SLOTS (CUSTOM METADATA):
-- Use get_account_slots / set_account_slot to store per-account data like APR, credit limit, statement close day.
-- Values are stored as strings. Store numbers as strings: set_account_slot("...", "apr", "23.49").
-
-SAFETY:
-- Reconciled splits are protected. Use force=true only when intentionally modifying reconciled data.
-- void_transaction preserves audit trail. Prefer void over delete for posted transactions.
-- delete_account is blocked if account has children or transactions.
+- Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%2e78c86"), or full 32-char GUIDs.
+- list_accounts emits short GUIDs at line start: "%2e78c86\\tAssets:Savings [BANK]". Reuse them — ~80% smaller than paths.
+- Paths are colon-delimited, case-sensitive. Use paths when naming new accounts or reasoning about hierarchy; short GUIDs for everything else.
+- Account short GUIDs: 7+ hex chars with leading "%". Transaction/split GUIDs: 8+ bare hex prefix, no marker.
+DOUBLE-ENTRY SIGN CONVENTION:
+- Positive = debit (increases Asset/Expense, decreases Liability/Income/Equity).
+- Negative = credit (reverse).
+- Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
+INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
+SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,
 )
 
@@ -94,14 +85,61 @@ SAFETY:
 # add cycle detection then.
 # ---------------------------------------------------------------------------
 MODULE_GROUPS: dict[str, list[str]] = {
-    # ``core`` expands to its eight ledger sub-modules. Always-on
+    # ``core`` expands to its nine ledger sub-modules. Always-on
     # (force-added in _apply_module_filter), so a user with no
-    # --modules flag gets all eight. Users can ALSO pick individual
+    # --modules flag gets all nine. Users can ALSO pick individual
     # sub-modules — e.g. ``--modules=accounts`` is valid but doesn't
     # change the fact that core is loaded too.
+    #
+    # ``reconciliation`` joined core in v1.3.1 — bookkeeper-flagged
+    # that reconciliation touches money and every configuration
+    # touches money, so excluding it from any persona-aligned cut
+    # produced a server that couldn't reconcile statements (a hole
+    # in the "any configuration that handles ledgers" promise).
+    # Moved from the bookkeeper group to core; now always loaded.
     "core": [
         "summary", "accounts", "transactions", "slots",
         "audit", "backup", "balance_sheet", "diagnostic",
+        "reconciliation",
+    ],
+    # ``bookkeeper`` bundles the personal-finance management
+    # cluster: run reports, manage budgets, schedule recurring
+    # transactions. The three underlying modules stay separately
+    # selectable for users who want a finer cut.
+    # (Reconciliation used to live here too — moved to core in
+    # v1.3.1, see the comment above.)
+    "bookkeeper": [
+        "reporting", "budgets", "scheduling",
+    ],
+    # ``investor`` bundles the two halves of the legacy
+    # ``investments`` module: ``tax_lots`` (cost-basis tracking)
+    # and ``portfolio`` (commodities + prices, the multi-currency
+    # primitive). A user typing ``--modules=investor`` wants both
+    # because tax-lot accounting is meaningless without prices.
+    # The split is preserved at the leaf-module level so a
+    # multi-currency household without a brokerage can still
+    # pick ``portfolio`` alone.
+    "investor": [
+        "tax_lots", "portfolio",
+    ],
+    # ``business`` is the small-business persona alias. It expands
+    # to ``freelancer`` (the 19 customer-facing invoice tools) plus
+    # ``business_complete`` (the 29 vendor/employee/jobs/credit-
+    # notes/billing-terms tools). Pre-v1.3 ``business`` was a
+    # standalone leaf containing only the second half — a user
+    # picking ``--modules=business`` for "small business workflow"
+    # got vendor management but couldn't create or post a customer
+    # invoice. Bookkeeper-found on PR #92 review; the fix
+    # restructures business into the natural superset.
+    #
+    # The two leaves stay independently selectable for users who
+    # want a finer cut (a solo freelancer with no vendor activity
+    # uses ``--modules=freelancer``; a back-office bookkeeper
+    # managing only vendor side could pick
+    # ``--modules=business_complete`` though that's a less common
+    # carve-out).
+    "business": [
+        "freelancer", "business_complete",
     ],
 }
 
@@ -112,9 +150,10 @@ MODULE_GROUPS: dict[str, list[str]] = {
 #
 # Pre-restructure the mapping was 1:1 (module ``X`` → tool file
 # ``tools/X.py`` → mixin ``XMixin``). The restructure breaks that:
-# Core's 26 tools include void/unvoid (from ``reconciliation.py``),
-# the slot tools + audit log (from ``admin.py``), and the backup tools
-# (from ``backup.py``). The mixin classes still live in their original
+# Core's 29 tools include void/unvoid AND the reconciliation
+# surface (both from ``reconciliation.py``), the slot tools +
+# audit log (from ``admin.py``), and the backup tools (from
+# ``backup.py``). The mixin classes still live in their original
 # files; this dict tells ``_apply_module_filter`` which tool files to
 # lazy-load AND ``main()`` which mixins to compose for the requested
 # module set.
@@ -139,15 +178,26 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     "backup": {"backup"},
     "balance_sheet": {"reporting"},
     "diagnostic": set(),
-    # ``portfolio`` (prices / commodities) and ``investor`` (tax lots)
-    # are the two halves of what used to be the ``investments`` module.
+    # ``portfolio`` (prices / commodities) and ``tax_lots`` (cost-
+    # basis tracking) are the two halves of what used to be the
+    # ``investments`` module. The ``investor`` group alias in
+    # MODULE_GROUPS pulls them both in for users who want the full
+    # surface.
     "portfolio": {"investments"},
-    "investor": {"investments"},
-    # ``freelancer`` (customer-facing invoicing) and ``business``
-    # (vendor + employee management, vendor bills) split the legacy
-    # ``business`` module along persona lines.
+    "tax_lots": {"investments"},
+    # ``freelancer`` (customer-facing invoicing) and
+    # ``business_complete`` (vendor + employee management, vendor
+    # bills, jobs, credit notes, billing terms) split the legacy
+    # ``business`` module along persona lines. Both back onto the
+    # same ``tools/business.py`` file — the public modules are
+    # subsets of one underlying registration.
+    #
+    # The ``business`` PUBLIC name is a MODULE_GROUPS alias that
+    # expands to both halves (see MODULE_GROUPS above); it doesn't
+    # appear here because groups never need their own backing
+    # entry — they resolve via their members' backings.
     "freelancer": {"business"},
-    "business": {"business"},
+    "business_complete": {"business"},
 }
 
 
@@ -253,7 +303,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_latest_price",
         "delete_price",
     ],
-    "investor": [
+    "tax_lots": [
         "create_lot",
         "list_lots",
         "get_lot",
@@ -300,7 +350,15 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_taxtable",
         "delete_taxtable",
     ],
-    "business": [
+    # ``business_complete`` — the vendor/employee/bills/credit-
+    # notes/jobs/billing-terms surface. Together with
+    # ``freelancer`` (the invoice surface), forms the full small-
+    # business toolkit. Both leaves expand together under the
+    # ``business`` group alias in MODULE_GROUPS. Pre-v1.3 this
+    # was named ``business`` and treated as a standalone — a UX
+    # trap that gave business-mode users only half the surface
+    # they expected.
+    "business_complete": [
         "create_vendor",
         "list_vendors",
         "get_vendor",
@@ -494,16 +552,49 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
             else:
                 enabled_modules.add(name)
 
-        # Warn on names that don't resolve to a known sub-module.
+        # Fail-fast on names that don't resolve to a known sub-module
+        # or group. Pre-v1.3.0 this was a stderr warning, then partial
+        # load — silent in practice because Claude Desktop captures
+        # MCP server stderr into a log file the user never sees. A
+        # typo'd ``--modules=bookeeper`` (missing the 'k') would
+        # silently load only ``core``, leaving the user unable to
+        # tell whether the tools they wanted are missing because
+        # they typed it wrong or because the server is broken.
+        # Bookkeeper-found bug on the PR #92 review pass; same
+        # principle as ``extra="forbid"`` on tool kwargs — financial
+        # software shouldn't silently swallow typos in configuration
+        # either.
         known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
-        all_referenced = requested | enabled_modules
-        unknown = all_referenced - known - {"all"}
+        unknown = requested - known - {"all"}
         if unknown:
-            print(
-                f"Warning: Unknown module(s): {', '.join(sorted(unknown))}. "
-                f"Available: {', '.join(sorted(known))}, all",
-                file=sys.stderr,
+            # Per-typo, suggest the closest known name (did-you-mean).
+            # Use simple shared-character ratio; close enough for the
+            # typo-class we're trying to catch without pulling in a
+            # Levenshtein dependency.
+            import difflib
+            lines = ["Unknown module name(s) on --modules / GNUCASH_MCP_MODULES:"]
+            for bad in sorted(unknown):
+                matches = difflib.get_close_matches(
+                    bad, sorted(known), n=1, cutoff=0.6,
+                )
+                if matches:
+                    lines.append(f"  - {bad!r}  (did you mean {matches[0]!r}?)")
+                else:
+                    lines.append(f"  - {bad!r}")
+            lines.append("")
+            lines.append(
+                f"Valid names: {', '.join(sorted(known))}, all"
             )
+            lines.append("")
+            lines.append(
+                "Fix the typo and restart the server. Partial-load "
+                "was the previous behavior; v1.3 fails fast so "
+                "configuration errors surface at startup instead "
+                "of as missing tools downstream."
+            )
+            message = "\n".join(lines)
+            print(message, file=sys.stderr)
+            raise SystemExit(2)
 
     # Keep only known sub-module names. Group expansion above may
     # have introduced names that aren't TOOL_MODULES keys if the
@@ -648,14 +739,17 @@ def accounts_resource() -> str:
 def _get_server_config_impl() -> str:
     """Return current server configuration and runtime state.
 
-    Reports loaded modules, tool count, book path, debug mode,
+    Reports loaded modules, tool count, book filename, debug mode,
     and version so the client can verify its own tool inventory.
+    The book is shown as filename only — see
+    ``_book_display_name`` for the privacy rationale.
     """
     from gnucash_mcp import __version__
+    from gnucash_mcp._format import _book_display_name
     lines = [
         f"Modules loaded: {_server_state.get('modules', 'unknown')}",
         f"Tools available: {_server_state.get('tool_count', 'unknown')}",
-        f"Book path: {_server_state.get('book_path', 'not set')}",
+        f"Book: {_book_display_name(_server_state.get('book_path'))}",
         f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
         f"Version: {__version__}",
     ]
@@ -694,55 +788,49 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (26 tools, always-on). Use "all"
+                       Default: core (29 tools, always-on). Use "all"
                        for every module (106 tools).
 
-                       Modules (role-aligned, flat partition; pick
-                       what fits your workflow):
+                       Role-based selections (group aliases that
+                       expand to underlying modules — start here):
+                         core         Ledger primitives + reconciliation.
+                                      Always on regardless. 29 tools.
+                         bookkeeper   Reporting + budgets + scheduling.
+                                      17 tools.
+                         investor     tax_lots + portfolio (cost basis
+                                      + prices). 12 tools.
+                         freelancer   Customer invoicing + sales tax
+                                      (taxtables for GST / VAT /
+                                      US state sales tax). 19 tools.
+                         business     Full small-business package:
+                                      freelancer (invoicing) +
+                                      business_complete (vendors,
+                                      employees, bills, vouchers,
+                                      credit notes, jobs, billterms).
+                                      48 tools.
 
-                       Core sub-modules — always loaded via the
-                       ``core`` group alias; selectable individually
-                       too:
-                         summary      get_book_summary dashboard.
-                         accounts     Account CRUD + balance/list.
-                         transactions Transaction CRUD + search +
-                                      void/unvoid.
-                         slots        Per-account metadata (APR,
-                                      credit_limit, statement-close).
-                         audit        get_audit_log reader.
-                         backup       Manual backup CRUD (the
-                                      auto-snapshot hook runs
-                                      unconditionally).
-                         balance_sheet
-                                      THE canonical accounting report.
-                         diagnostic   get_server_config introspection.
+                       Leaf modules (pick individually for finer
+                       control, or as members of the groups above):
 
-                       Optional modules:
-                         budgets      Budget creation + variance.
-                         scheduling   Recurring transactions.
-                         reconciliation
-                                      Bank-statement reconciliation.
-                         reporting    Analytical reports (net_worth,
-                                      cash_flow, spending/income
-                                      breakdowns, debt_payoff_plan).
-                         portfolio    Commodities + prices —
-                                      the multi-currency primitive.
-                         investor     Tax-lot management.
-                         freelancer   Customer invoicing + sales-tax
-                                      configuration (taxtables for
-                                      GST / VAT / US state sales tax).
-                         business     Vendor + employee management,
-                                      vendor bills, jobs, credit
-                                      notes, billterms (additive to
-                                      freelancer for full business
-                                      workflow).
+                       Core sub-modules (9): summary, accounts,
+                       transactions, slots, audit, backup,
+                       balance_sheet, diagnostic, reconciliation.
+
+                       Bookkeeper members (3): reporting, budgets,
+                       scheduling.
+
+                       Investor members (2): tax_lots, portfolio.
+
+                       Business members (2): freelancer,
+                       business_complete.
 
                        Example: --modules=freelancer for a solo
-                       invoicer; --modules=budgets,scheduling,reporting
-                       for a personal-finance user;
-                       --modules=freelancer,business for a small
-                       business with vendor management. ``core`` is
-                       always added regardless.
+                       invoicer with no vendor activity;
+                       --modules=bookkeeper for personal finance;
+                       --modules=business for a complete small-
+                       business workflow (invoices + vendor + employee
+                       management). ``core`` is always added
+                       regardless.
   --debug              Enable debug logging (MCP protocol traffic, timing)
   --noaudit            Disable audit logging
   -h, --help           Show this help message

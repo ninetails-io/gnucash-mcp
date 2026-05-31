@@ -53,7 +53,7 @@ class TestToolModulesMapping:
         """Every TOOL_MODULES key must back onto extracted-module
         files. After the restructure the relationship is no longer
         ``TOOL_MODULES.keys() ⊆ extracted_modules()``: ``portfolio``
-        and ``investor`` are new public modules that don't have
+        and ``tax_lots`` are new public modules that don't have
         their own tool files (they're slices of the legacy
         ``investments`` file, mapped via MODULE_BACKED_BY).
         """
@@ -73,11 +73,15 @@ class TestToolModulesMapping:
                 assert tool not in seen, f"{tool} appears in multiple modules"
                 seen.add(tool)
 
-    def test_core_group_resolves_to_26_tools(self):
-        """The ``core`` group expands to 26 tools across its eight
+    def test_core_group_resolves_to_29_tools(self):
+        """The ``core`` group expands to 29 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 9 + slots
-        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1)."""
-        assert len(_core_tool_names()) == 26
+        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
+        reconciliation 3). Reconciliation joined core in v1.3.1
+        per the bookkeeper-driven principle that any configuration
+        which handles money must include reconciliation.
+        """
+        assert len(_core_tool_names()) == 29
 
     def test_total_tool_count(self):
         """Total tools across all sub-modules should be 106 —
@@ -88,23 +92,43 @@ class TestToolModulesMapping:
         assert total == 106
 
     def test_expected_modules_exist(self):
-        """All expected sub-module names should be present after the
-        Core-chop. ``core`` is no longer a TOOL_MODULES key — it's
-        a MODULE_GROUPS alias expanding to the eight sub-modules."""
+        """All expected leaf-module names should be present.
+        ``core``, ``bookkeeper``, and ``investor`` are group
+        aliases (in MODULE_GROUPS) — not TOOL_MODULES keys."""
         expected = {
-            # Core sub-modules
+            # Core sub-modules (reconciliation joined core in v1.3.1)
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
-            # Optional modules
-            "reconciliation", "reporting", "budgets",
-            "scheduling", "portfolio", "investor",
-            "freelancer", "business",
+            "reconciliation",
+            # Bookkeeper-cluster leaves
+            "reporting", "budgets", "scheduling",
+            # Investor-cluster leaves
+            "portfolio", "tax_lots",
+            # Business-cluster leaves (``business`` is now a group
+            # alias expanding to these two; the standalone of the
+            # same name was the pre-v1.3 design, retired because it
+            # left small-business users without invoice tools).
+            "freelancer", "business_complete",
         }
         assert set(TOOL_MODULES.keys()) == expected
-        # And ``core`` is the group alias.
+        # Group aliases — ``core`` always-on plus the three role
+        # groups (bookkeeper, investor, business) landing in v1.3.
+        # core grew to 9 in v1.3.1 — reconciliation moved here
+        # from bookkeeper so it loads in every configuration that
+        # handles money (which is all of them).
         assert set(MODULE_GROUPS["core"]) == {
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
+            "reconciliation",
+        }
+        assert set(MODULE_GROUPS["bookkeeper"]) == {
+            "reporting", "budgets", "scheduling",
+        }
+        assert set(MODULE_GROUPS["investor"]) == {
+            "tax_lots", "portfolio",
+        }
+        assert set(MODULE_GROUPS["business"]) == {
+            "freelancer", "business_complete",
         }
 
     def test_validate_tool_modules_passes(self):
@@ -129,7 +153,7 @@ class TestToolFileVsModulesMapping:
 
     Pre-restructure this was a per-module 1:1 check (each
     ``tools/<X>.py`` matched ``TOOL_MODULES[X]`` exactly). The Core
-    restructure broke that bijection — Core's 26 tools span
+    restructure broke that bijection — Core's 29 tools span
     ``tools/core.py`` + ``tools/reconciliation.py`` +
     ``tools/admin.py`` + ``tools/backup.py``. The contract is now
     bidirectional-totality: every decorated tool maps to some
@@ -270,19 +294,49 @@ class TestApplyModuleFilter:
         _apply_module_filter("scheduling,reconciliation,all")
         assert len(self._tool_names()) == 106
 
-    def test_unknown_module_warns(self, capsys):
-        """Unknown module names should produce a warning on stderr."""
-        _apply_module_filter("core,nonexistent")
+    def test_unknown_module_fails_fast(self, capsys):
+        """Unknown module names fail-fast at startup with SystemExit.
+
+        Bookkeeper-found on PR #92 review: pre-fix, a typo'd module
+        name (e.g. ``--modules=bookeeper`` missing the 'k') printed
+        a warning to stderr and then silently partial-loaded. Claude
+        Desktop captures MCP server stderr into a log file the user
+        never sees, so the warning was effectively invisible — the
+        user observed "the tools I expected aren't there" and could
+        not tell whether it was a typo or a server bug. v1.3 fails
+        fast so configuration errors surface immediately.
+        """
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("core,nonexistent")
+        assert exc_info.value.code == 2
         captured = capsys.readouterr()
         assert "nonexistent" in captured.err
         assert "Unknown module" in captured.err
+        assert "Valid names:" in captured.err
 
-    def test_unknown_module_still_loads_core(self, capsys):
-        """Unknown modules should not prevent the ``core`` group from
-        loading."""
-        _apply_module_filter("nonexistent")
-        remaining = self._tool_names()
-        assert _core_tool_names().issubset(remaining)
+    def test_unknown_module_did_you_mean_suggestion(self, capsys):
+        """Typos close to a known name should surface a did-you-mean
+        hint so the user can self-correct on the next restart without
+        scrolling through the full valid-names list.
+        """
+        import pytest
+        with pytest.raises(SystemExit):
+            _apply_module_filter("bookeeper")  # missing 'k'
+        captured = capsys.readouterr()
+        assert "bookeeper" in captured.err
+        assert "did you mean 'bookkeeper'" in captured.err
+
+    def test_unknown_module_alongside_valid_still_fails(self, capsys):
+        """Mixed valid + invalid input fails the whole startup. No
+        partial-load mode where the valid modules quietly load and
+        the invalid one is dropped — that was the silent-failure
+        regime fail-fast replaces.
+        """
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("bookeeper,investor")
+        assert exc_info.value.code == 2
 
     def test_whitespace_in_module_names(self):
         """Whitespace around module names should be stripped."""
@@ -303,11 +357,12 @@ class TestApplyModuleFilter:
         assert "list_accounts" in remaining
         assert "create_account" in remaining
 
-    def test_portfolio_and_investor_split(self):
-        """``portfolio`` (commodities + prices) and ``investor``
-        (tax lots) used to be one ``investments`` module. After the
-        split they're independently selectable: a multi-currency
-        household without a brokerage picks portfolio alone."""
+    def test_portfolio_and_tax_lots_split(self):
+        """``portfolio`` (commodities + prices) and ``tax_lots``
+        (cost-basis tracking) are the two leaves of what used to
+        be the ``investments`` module — independently selectable
+        for a finer cut. The ``investor`` group bundles them; see
+        test_investor_group_bundles_both below for that path."""
         # portfolio alone — price tools yes, lot tools no
         _apply_module_filter("portfolio")
         remaining = self._tool_names()
@@ -320,15 +375,65 @@ class TestApplyModuleFilter:
         # Non-selected modules not present
         assert "spending_by_category" not in remaining
 
-        # investor alone — lot tools yes, price tools no
+        # tax_lots alone — lot tools yes, price tools no
         _reset_lazy_load_state()
         mcp._tool_manager._tools.clear()
-        _apply_module_filter("investor")
+        _apply_module_filter("tax_lots")
         remaining = self._tool_names()
         assert "create_lot" in remaining
         assert "calculate_lot_gain" in remaining
         assert "list_commodities" not in remaining
         assert "create_price" not in remaining
+
+    def test_investor_group_bundles_both(self):
+        """``--modules=investor`` (the group alias) loads
+        tax_lots + portfolio together. Tax-lot accounting needs
+        market prices to compute gains, so the bundle is the
+        useful unit; the leaf modules exist for fine-grained
+        users."""
+        _apply_module_filter("investor")
+        remaining = self._tool_names()
+        # Both halves present.
+        assert "create_lot" in remaining
+        assert "calculate_lot_gain" in remaining
+        assert "list_commodities" in remaining
+        assert "create_price" in remaining
+
+    def test_bookkeeper_group_bundles_three_modules(self):
+        """``--modules=bookkeeper`` loads reporting + budgets +
+        scheduling — the personal-finance management cluster.
+        Reconciliation moved to core in v1.3.1 and is now
+        always-on regardless of group selection."""
+        _apply_module_filter("bookkeeper")
+        remaining = self._tool_names()
+        # One probe per bookkeeper member module.
+        assert "spending_by_category" in remaining    # reporting
+        assert "create_budget" in remaining           # budgets
+        assert "create_scheduled_transaction" in remaining
+        # reconciliation is now always-on via core.
+        assert "reconcile_account" in remaining
+        # Core always loaded; non-bookkeeper modules absent.
+        assert "list_accounts" in remaining
+        assert "create_invoice" not in remaining      # freelancer
+        assert "create_lot" not in remaining          # tax_lots
+
+    def test_reconciliation_loads_with_core_by_default(self):
+        """v1.3.1 invariant: any configuration loads reconciliation.
+
+        The bookkeeper-flagged principle: reconciliation touches
+        money and every configuration touches money. Moved from
+        the bookkeeper group to core so a freelancer / investor /
+        business persona doesn't ship without statement-
+        reconciliation tools.
+        """
+        for modules in ("freelancer", "investor", "business", None):
+            _apply_module_filter(modules)
+            remaining = self._tool_names()
+            assert "reconcile_account" in remaining, (
+                f"reconcile_account missing for --modules={modules}"
+            )
+            assert "set_reconcile_state" in remaining
+            assert "get_unreconciled_splits" in remaining
 
     def test_filter_is_subtractive(self):
         """Filtering should only remove tools, never add non-existent ones."""
@@ -361,14 +466,17 @@ class TestApplyModuleFilter:
         assert result == sorted(MODULE_GROUPS["core"])
 
     def test_returns_excludes_unknown_modules(self):
-        """Unknown module names should not appear in return value.
-        The ``core`` group's sub-modules are always present even
-        when the user-supplied list contained only garbage."""
-        result = _apply_module_filter("reporting,nonexistent")
-        assert "nonexistent" not in result
-        # One representative Core sub-module is enough.
-        assert "accounts" in result
-        assert "reporting" in result
+        """Unknown module names trigger fail-fast (v1.3 behavior).
+
+        Pre-v1.3 the function returned a sorted list excluding
+        unknown names. After the fail-fast change, the function
+        raises SystemExit instead — the "excluded" behavior is now
+        "rejected at startup" so it can't surface downstream as
+        missing tools. Test repurposed to lock the new contract.
+        """
+        import pytest
+        with pytest.raises(SystemExit):
+            _apply_module_filter("reporting,nonexistent")
 
 
 class TestExtractedModuleLazyLoading:
@@ -467,7 +575,9 @@ class TestGetServerConfig:
         output = _get_server_config_impl()
         assert "Modules loaded: core,reporting" in output
         assert "Tools available: 20" in output
-        assert "Book path: /tmp/test.gnucash" in output
+        # Book line shows filename only — see _book_display_name
+        # for the privacy rationale. Path leak hardened in v1.3.0.
+        assert "Book: test.gnucash" in output
         assert "Debug mode: true" in output
         assert "Version:" in output
 
@@ -477,8 +587,34 @@ class TestGetServerConfig:
         output = _get_server_config_impl()
         assert "Modules loaded: unknown" in output
         assert "Tools available: unknown" in output
-        assert "Book path: not set" in output
+        assert "Book: not set" in output
         assert "Debug mode: false" in output
+
+    def test_impl_does_not_leak_directory_path(self):
+        """The book directory must not appear in the response.
+
+        Privacy hardening shipped in v1.3.0: routine LLM-visible
+        responses used to include the full absolute path to the
+        GnuCash book, leaking username and home directory layout
+        into every transcript and screenshot. The filename alone is
+        sufficient for the LLM to confirm which book is loaded.
+        """
+        _server_state.update({
+            "modules": "core",
+            "tool_count": 10,
+            "book_path": "/Users/alice/Finances/personal-2026.gnucash",
+            "debug": False,
+        })
+        output = _get_server_config_impl()
+        # Username and directory must NOT appear.
+        assert "/Users/" not in output, (
+            f"directory path leaked into output:\n{output}"
+        )
+        assert "alice" not in output
+        assert "Finances" not in output
+        # But the filename SHOULD appear so the caller can verify
+        # which book is loaded.
+        assert "personal-2026.gnucash" in output
 
     def test_impl_output_is_plain_text(self):
         """Output should be plain text, not JSON."""
@@ -521,13 +657,17 @@ class TestOwnerTypeGating:
         _LOADED_MODULES.update(original)
 
     def test_business_loaded_passes_through(self):
-        """With business enabled, _gate_owner_type returns its input
-        unchanged — both halves of the polymorphic dispatch work."""
+        """With business_complete enabled (whether explicitly or via
+        the ``business`` group alias), _gate_owner_type returns its
+        input unchanged — both halves of the polymorphic dispatch work.
+        """
         from gnucash_mcp.server import _LOADED_MODULES
         from gnucash_mcp.tools._helpers import _gate_owner_type
 
         _LOADED_MODULES.clear()
-        _LOADED_MODULES.update({"core", "freelancer", "business"})
+        _LOADED_MODULES.update({
+            "core", "freelancer", "business_complete", "business",
+        })
         assert _gate_owner_type("customer") == "customer"
         assert _gate_owner_type("vendor") == "vendor"
         assert _gate_owner_type(None) is None
@@ -554,7 +694,7 @@ class TestOwnerTypeGating:
 
         _LOADED_MODULES.clear()
         _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the Business module"):
+        with pytest.raises(ValueError, match="requires the business module"):
             _gate_owner_type("vendor")
 
     def test_business_absent_rejects_explicit_employee(self):
@@ -569,7 +709,7 @@ class TestOwnerTypeGating:
 
         _LOADED_MODULES.clear()
         _LOADED_MODULES.update({"core", "freelancer"})
-        with pytest.raises(ValueError, match="requires the Business module"):
+        with pytest.raises(ValueError, match="requires the business module"):
             _gate_owner_type("employee")
 
     def test_business_absent_rejects_typo(self):

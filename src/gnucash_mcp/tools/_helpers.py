@@ -222,23 +222,31 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     """
     from gnucash_mcp.server import is_module_enabled
 
-    if is_module_enabled("business"):
+    # ``business_complete`` is the leaf that owns vendor + employee
+    # management. The ``business`` MODULE_GROUPS alias expands to
+    # ``freelancer + business_complete`` for the small-business
+    # persona, so ``--modules=business`` enables both naturally.
+    # Gate-check the leaf directly so a user who explicitly picked
+    # only ``business_complete`` (uncommon but valid) also gets
+    # vendor/employee functionality unlocked.
+    if is_module_enabled("business_complete"):
         return owner_type  # All three halves available; no gating.
 
     if owner_type == "vendor":
         raise ValueError(
-            "owner_type='vendor' requires the Business module. "
-            "Restart the server with --modules=...,Business to access "
+            "owner_type='vendor' requires the business module. "
+            "Restart the server with --modules=business (or add "
+            "business_complete to your current selection) to access "
             "vendor bills, or omit owner_type to operate on customer "
             "invoices only."
         )
     if owner_type == "employee":
         raise ValueError(
-            "owner_type='employee' requires the Business module. "
+            "owner_type='employee' requires the business module. "
             "Employee expense vouchers live with employee "
-            "management, which the Business module owns. Restart "
-            "the server with --modules=...,Business or omit "
-            "owner_type to operate on customer invoices only."
+            "management. Restart the server with --modules=business "
+            "(or add business_complete to your current selection) "
+            "or omit owner_type to operate on customer invoices only."
         )
     # Only None and 'customer' fall through to "customer" coercion.
     # Anything else (typos like 'venddor', unknown future types) is
@@ -255,6 +263,45 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
             f"Business module."
         )
     return "customer"
+
+
+def _resolve_id_alias(
+    id: str | None,
+    legacy: str | None,
+    legacy_name: str,
+) -> str:
+    """Resolve the ``id`` / ``<entity>_id`` parameter pair on
+    delete_invoice / delete_bill / delete_voucher / delete_credit_note.
+
+    The standard parameter across the invoice tool surface
+    (get_invoice, post_invoice, unpost_invoice, pay_invoice) is
+    ``id``. The delete tools historically used ``<entity>_id``.
+    To converge without breaking older callers, both names are
+    accepted on the delete tools — but exactly one must be set.
+
+    - Both omitted → ``ValueError`` (caller forgot the ID)
+    - Both provided → ``ValueError`` (ambiguous; pick one)
+    - One provided → return it
+
+    Args:
+        id: Value passed under the preferred ``id`` parameter.
+        legacy: Value passed under the legacy ``<entity>_id``
+            parameter.
+        legacy_name: The legacy parameter name (``"invoice_id"``,
+            ``"bill_id"``, etc.) — used only in the error message.
+    """
+    if id is not None and legacy is not None:
+        raise ValueError(
+            f"Pass exactly one of 'id' or {legacy_name!r}, not both. "
+            f"'id' is the standard parameter name; {legacy_name!r} is "
+            f"a legacy alias kept for back-compat."
+        )
+    if id is None and legacy is None:
+        raise ValueError(
+            f"Missing required parameter: pass 'id' (preferred) or "
+            f"{legacy_name!r} (legacy alias)."
+        )
+    return id if id is not None else legacy  # type: ignore[return-value]
 
 
 def safe_tool(func: Callable) -> Callable:
