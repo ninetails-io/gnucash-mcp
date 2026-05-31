@@ -349,15 +349,49 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_taxtable",
         "update_taxtable",
         "delete_taxtable",
+        # Billterms — payment-terms registry shared by customer
+        # invoices and vendor bills. Lives here because every
+        # invoice carries terms; a solo freelancer setting
+        # "Net 30" or "2/10 Net 30" on customer invoices needs
+        # the CRUD surface without pulling in vendor management.
+        "create_billterm",
+        "list_billterms",
+        # Jobs — project-level grouping over invoices/bills for
+        # a single customer or vendor. Polymorphic on owner_type
+        # via the same _gate_owner_type pattern as the invoice
+        # tools: a freelancer-only user can create customer jobs
+        # but vendor jobs require business_complete to be loaded.
+        # Lives here because per-client P&L is a freelancer's
+        # natural year-end view.
+        "create_job",
+        "list_jobs",
+        "get_job",
+        "update_job",
+        "delete_job",
+        "get_job_report",
+        # Credit notes — refund/return documents. Polymorphic on
+        # owner_type. A freelancer issuing a customer refund
+        # works in this surface; vendor-side credit notes
+        # require business_complete via the gate.
+        "create_credit_note",
+        "add_credit_note_entry",
+        "delete_credit_note",
+        "apply_credit_note",
     ],
-    # ``business_complete`` — the vendor/employee/bills/credit-
-    # notes/jobs/billing-terms surface. Together with
-    # ``freelancer`` (the invoice surface), forms the full small-
-    # business toolkit. Both leaves expand together under the
-    # ``business`` group alias in MODULE_GROUPS. Pre-v1.3 this
-    # was named ``business`` and treated as a standalone — a UX
-    # trap that gave business-mode users only half the surface
-    # they expected.
+    # ``business_complete`` — vendor + employee surface only.
+    # Together with ``freelancer`` (which now owns billterms,
+    # jobs, and credit notes via the v1.3.1 redistribution),
+    # forms the full small-business toolkit. Both leaves expand
+    # together under the ``business`` group alias in
+    # MODULE_GROUPS.
+    #
+    # Polymorphic tools (jobs, credit notes) live in freelancer
+    # — a freelancer-only user uses them for customer-side
+    # operations; vendor-side use requires ``business_complete``
+    # via the _gate_owner_type check. This module owns the
+    # *entities* (vendors, employees) and the *vendor-side
+    # workflows* (bills, vouchers, vendor_spending_report) that
+    # don't make sense without those entities.
     "business_complete": [
         "create_vendor",
         "list_vendors",
@@ -378,29 +412,6 @@ TOOL_MODULES: dict[str, list[str]] = {
         "create_voucher",
         "add_voucher_entry",
         "delete_voucher",
-        # Credit notes (v1.3). Customer and vendor only —
-        # employees deliberately excluded (no GnuCash desktop
-        # equivalent). Lifecycle (post / unpost / pay / apply)
-        # flows through the polymorphic invoice tools in
-        # freelancer, detecting the credit-note slot to reverse
-        # posting direction.
-        "create_credit_note",
-        "add_credit_note_entry",
-        "delete_credit_note",
-        "apply_credit_note",
-        # Jobs (v1.3). Project-level grouping over invoices/bills
-        # for a single customer or vendor. No posted state — only
-        # active/inactive. Linked invoices route through the
-        # polymorphic owner_type=3 dispatch (see create_invoice's
-        # job_id parameter).
-        "create_job",
-        "list_jobs",
-        "get_job",
-        "update_job",
-        "delete_job",
-        "get_job_report",
-        "create_billterm",
-        "list_billterms",
         "vendor_spending_report",
     ],
 }
@@ -808,15 +819,17 @@ Options:
                                       17 tools.
                          investor     tax_lots + portfolio (cost basis
                                       + prices). 12 tools.
-                         freelancer   Customer invoicing + sales tax
-                                      (taxtables for GST / VAT /
-                                      US state sales tax). 19 tools.
+                         freelancer   Customer invoicing + sales tax,
+                                      plus billterms (payment terms),
+                                      jobs (per-project P&L), and
+                                      credit notes (customer refunds).
+                                      The full solo-consultant
+                                      toolkit. 31 tools.
                          business     Full small-business package:
                                       freelancer (invoicing) +
                                       business_complete (vendors,
                                       employees, bills, vouchers,
-                                      credit notes, jobs, billterms).
-                                      48 tools.
+                                      vendor reports). 48 tools.
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):

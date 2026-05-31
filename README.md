@@ -271,8 +271,8 @@ the leaves individually for a finer cut.
 | `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
 | `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
 | `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
-| `freelancer` | Customer invoicing + sales tax (GST, VAT, US state sales tax). The solo-consultant surface. | 19 |
-| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, credit notes, jobs, billing terms). | 48 |
+| `freelancer` | Customer invoicing + sales tax, plus billterms (payment terms), jobs (per-project P&L rollups), and credit notes (customer refunds). The full solo-consultant toolkit. | 31 |
+| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, vendor reports). | 48 |
 
 Pick one or more, comma-separated:
 

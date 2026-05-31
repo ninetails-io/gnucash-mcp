@@ -338,6 +338,38 @@ class TestApplyModuleFilter:
             _apply_module_filter("bookeeper,investor")
         assert exc_info.value.code == 2
 
+    def test_freelancer_carries_jobs_credit_notes_billterms(self):
+        """v1.3.1 redistribution: billterms, jobs, and credit notes
+        moved from business_complete to freelancer.
+
+        Principle: polymorphic-on-owner_type tools + shared
+        infrastructure live in freelancer; vendor-specific surface
+        stays in business_complete. A solo freelancer setting
+        payment terms on customer invoices, running per-project
+        P&L, or issuing customer refunds needs these without
+        pulling in vendor management. The polymorphic gate in
+        _gate_owner_type still restricts vendor-side use of the
+        polymorphic tools (jobs / credit notes) to business mode.
+        """
+        _apply_module_filter("freelancer")
+        remaining = self._tool_names()
+        # Billterms (shared infrastructure).
+        assert "create_billterm" in remaining
+        assert "list_billterms" in remaining
+        # Jobs (polymorphic; customer-side usable in freelancer).
+        assert "create_job" in remaining
+        assert "list_jobs" in remaining
+        assert "get_job_report" in remaining
+        # Credit notes (polymorphic; customer refunds usable).
+        assert "create_credit_note" in remaining
+        assert "apply_credit_note" in remaining
+        # Vendor-specific surface must remain absent.
+        assert "create_vendor" not in remaining
+        assert "create_bill" not in remaining
+        assert "create_employee" not in remaining
+        assert "create_voucher" not in remaining
+        assert "vendor_spending_report" not in remaining
+
     def test_unknown_module_alongside_all_still_fails(self, capsys):
         """``all`` is a loading instruction, not a validation bypass.
 
