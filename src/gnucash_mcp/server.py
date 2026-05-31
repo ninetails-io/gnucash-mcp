@@ -85,22 +85,31 @@ SAFETY: Reconciled splits are protected (use force=true to override). Prefer voi
 # add cycle detection then.
 # ---------------------------------------------------------------------------
 MODULE_GROUPS: dict[str, list[str]] = {
-    # ``core`` expands to its eight ledger sub-modules. Always-on
+    # ``core`` expands to its nine ledger sub-modules. Always-on
     # (force-added in _apply_module_filter), so a user with no
-    # --modules flag gets all eight. Users can ALSO pick individual
+    # --modules flag gets all nine. Users can ALSO pick individual
     # sub-modules — e.g. ``--modules=accounts`` is valid but doesn't
     # change the fact that core is loaded too.
+    #
+    # ``reconciliation`` joined core in v1.3.1 — bookkeeper-flagged
+    # that reconciliation touches money and every configuration
+    # touches money, so excluding it from any persona-aligned cut
+    # produced a server that couldn't reconcile statements (a hole
+    # in the "any configuration that handles ledgers" promise).
+    # Moved from the bookkeeper group to core; now always loaded.
     "core": [
         "summary", "accounts", "transactions", "slots",
         "audit", "backup", "balance_sheet", "diagnostic",
+        "reconciliation",
     ],
     # ``bookkeeper`` bundles the personal-finance management
-    # cluster: reconcile bank statements, run reports, manage
-    # budgets, schedule recurring transactions. The four
-    # underlying modules stay separately selectable for users
-    # who want a finer cut.
+    # cluster: run reports, manage budgets, schedule recurring
+    # transactions. The three underlying modules stay separately
+    # selectable for users who want a finer cut.
+    # (Reconciliation used to live here too — moved to core in
+    # v1.3.1, see the comment above.)
     "bookkeeper": [
-        "reconciliation", "reporting", "budgets", "scheduling",
+        "reporting", "budgets", "scheduling",
     ],
     # ``investor`` bundles the two halves of the legacy
     # ``investments`` module: ``tax_lots`` (cost-basis tracking)
@@ -141,9 +150,10 @@ MODULE_GROUPS: dict[str, list[str]] = {
 #
 # Pre-restructure the mapping was 1:1 (module ``X`` → tool file
 # ``tools/X.py`` → mixin ``XMixin``). The restructure breaks that:
-# Core's 26 tools include void/unvoid (from ``reconciliation.py``),
-# the slot tools + audit log (from ``admin.py``), and the backup tools
-# (from ``backup.py``). The mixin classes still live in their original
+# Core's 29 tools include void/unvoid AND the reconciliation
+# surface (both from ``reconciliation.py``), the slot tools +
+# audit log (from ``admin.py``), and the backup tools (from
+# ``backup.py``). The mixin classes still live in their original
 # files; this dict tells ``_apply_module_filter`` which tool files to
 # lazy-load AND ``main()`` which mixins to compose for the requested
 # module set.
@@ -778,15 +788,15 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (26 tools, always-on). Use "all"
+                       Default: core (29 tools, always-on). Use "all"
                        for every module (106 tools).
 
                        Role-based selections (group aliases that
                        expand to underlying modules — start here):
-                         core         Ledger primitives. Always on
-                                      regardless. 26 tools.
-                         bookkeeper   Reconciliation + reporting +
-                                      budgets + scheduling. 20 tools.
+                         core         Ledger primitives + reconciliation.
+                                      Always on regardless. 29 tools.
+                         bookkeeper   Reporting + budgets + scheduling.
+                                      17 tools.
                          investor     tax_lots + portfolio (cost basis
                                       + prices). 12 tools.
                          freelancer   Customer invoicing + sales tax
@@ -802,12 +812,12 @@ Options:
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
 
-                       Core sub-modules (8): summary, accounts,
+                       Core sub-modules (9): summary, accounts,
                        transactions, slots, audit, backup,
-                       balance_sheet, diagnostic.
+                       balance_sheet, diagnostic, reconciliation.
 
-                       Bookkeeper members (4): reconciliation,
-                       reporting, budgets, scheduling.
+                       Bookkeeper members (3): reporting, budgets,
+                       scheduling.
 
                        Investor members (2): tax_lots, portfolio.
 

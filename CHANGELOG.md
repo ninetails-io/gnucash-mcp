@@ -50,14 +50,18 @@ exercised against the synthetic test books before release.
 (`core / admin / backup / investments / business`). The new partition
 matches how people actually use the server:
 
-- **`core`** (26 tools) — always-on ledger primitives: accounts,
-  transactions, slots, audit, backup, balance sheet, summary,
-  diagnostics. Now a group alias expanding to eight independently-
-  selectable sub-modules; you can opt into the group or pick the
-  sub-modules à la carte.
-- **`bookkeeper`** (20 tools) — personal-finance management:
-  reconciliation, reporting, budgets, scheduling. Group alias for
-  the four underlying modules.
+- **`core`** (29 tools) — always-on ledger primitives:
+  accounts, transactions, slots, audit, backup, balance sheet,
+  summary, diagnostics, reconciliation. Now a group alias
+  expanding to nine independently-selectable sub-modules; you
+  can opt into the group or pick the sub-modules à la carte.
+  *Reconciliation joined core late in the v1.3 cycle —
+  bookkeeper-flagged that reconciliation touches money and
+  every configuration touches money, so excluding it from any
+  persona produced a server that couldn't reconcile statements.*
+- **`bookkeeper`** (17 tools) — personal-finance management:
+  reporting, budgets, scheduling. Group alias for the three
+  underlying modules.
 - **`investor`** (12 tools) — group alias for `portfolio`
   (commodities + prices, the multi-currency primitive) plus
   `tax_lots` (cost basis tracking).

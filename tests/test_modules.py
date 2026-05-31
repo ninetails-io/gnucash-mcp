@@ -73,11 +73,15 @@ class TestToolModulesMapping:
                 assert tool not in seen, f"{tool} appears in multiple modules"
                 seen.add(tool)
 
-    def test_core_group_resolves_to_26_tools(self):
-        """The ``core`` group expands to 26 tools across its eight
+    def test_core_group_resolves_to_29_tools(self):
+        """The ``core`` group expands to 29 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 9 + slots
-        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1)."""
-        assert len(_core_tool_names()) == 26
+        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
+        reconciliation 3). Reconciliation joined core in v1.3.1
+        per the bookkeeper-driven principle that any configuration
+        which handles money must include reconciliation.
+        """
+        assert len(_core_tool_names()) == 29
 
     def test_total_tool_count(self):
         """Total tools across all sub-modules should be 106 —
@@ -92,11 +96,12 @@ class TestToolModulesMapping:
         ``core``, ``bookkeeper``, and ``investor`` are group
         aliases (in MODULE_GROUPS) — not TOOL_MODULES keys."""
         expected = {
-            # Core sub-modules
+            # Core sub-modules (reconciliation joined core in v1.3.1)
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
+            "reconciliation",
             # Bookkeeper-cluster leaves
-            "reconciliation", "reporting", "budgets", "scheduling",
+            "reporting", "budgets", "scheduling",
             # Investor-cluster leaves
             "portfolio", "tax_lots",
             # Business-cluster leaves (``business`` is now a group
@@ -108,12 +113,16 @@ class TestToolModulesMapping:
         assert set(TOOL_MODULES.keys()) == expected
         # Group aliases — ``core`` always-on plus the three role
         # groups (bookkeeper, investor, business) landing in v1.3.
+        # core grew to 9 in v1.3.1 — reconciliation moved here
+        # from bookkeeper so it loads in every configuration that
+        # handles money (which is all of them).
         assert set(MODULE_GROUPS["core"]) == {
             "summary", "accounts", "transactions", "slots",
             "audit", "backup", "balance_sheet", "diagnostic",
+            "reconciliation",
         }
         assert set(MODULE_GROUPS["bookkeeper"]) == {
-            "reconciliation", "reporting", "budgets", "scheduling",
+            "reporting", "budgets", "scheduling",
         }
         assert set(MODULE_GROUPS["investor"]) == {
             "tax_lots", "portfolio",
@@ -144,7 +153,7 @@ class TestToolFileVsModulesMapping:
 
     Pre-restructure this was a per-module 1:1 check (each
     ``tools/<X>.py`` matched ``TOOL_MODULES[X]`` exactly). The Core
-    restructure broke that bijection — Core's 26 tools span
+    restructure broke that bijection — Core's 29 tools span
     ``tools/core.py`` + ``tools/reconciliation.py`` +
     ``tools/admin.py`` + ``tools/backup.py``. The contract is now
     bidirectional-totality: every decorated tool maps to some
@@ -390,21 +399,41 @@ class TestApplyModuleFilter:
         assert "list_commodities" in remaining
         assert "create_price" in remaining
 
-    def test_bookkeeper_group_bundles_four_modules(self):
-        """``--modules=bookkeeper`` loads reconciliation +
-        reporting + budgets + scheduling — the personal-finance
-        management cluster."""
+    def test_bookkeeper_group_bundles_three_modules(self):
+        """``--modules=bookkeeper`` loads reporting + budgets +
+        scheduling — the personal-finance management cluster.
+        Reconciliation moved to core in v1.3.1 and is now
+        always-on regardless of group selection."""
         _apply_module_filter("bookkeeper")
         remaining = self._tool_names()
-        # One probe per member module.
-        assert "reconcile_account" in remaining       # reconciliation
+        # One probe per bookkeeper member module.
         assert "spending_by_category" in remaining    # reporting
         assert "create_budget" in remaining           # budgets
         assert "create_scheduled_transaction" in remaining
+        # reconciliation is now always-on via core.
+        assert "reconcile_account" in remaining
         # Core always loaded; non-bookkeeper modules absent.
         assert "list_accounts" in remaining
         assert "create_invoice" not in remaining      # freelancer
         assert "create_lot" not in remaining          # tax_lots
+
+    def test_reconciliation_loads_with_core_by_default(self):
+        """v1.3.1 invariant: any configuration loads reconciliation.
+
+        The bookkeeper-flagged principle: reconciliation touches
+        money and every configuration touches money. Moved from
+        the bookkeeper group to core so a freelancer / investor /
+        business persona doesn't ship without statement-
+        reconciliation tools.
+        """
+        for modules in ("freelancer", "investor", "business", None):
+            _apply_module_filter(modules)
+            remaining = self._tool_names()
+            assert "reconcile_account" in remaining, (
+                f"reconcile_account missing for --modules={modules}"
+            )
+            assert "set_reconcile_state" in remaining
+            assert "get_unreconciled_splits" in remaining
 
     def test_filter_is_subtractive(self):
         """Filtering should only remove tools, never add non-existent ones."""
