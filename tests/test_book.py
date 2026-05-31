@@ -9038,26 +9038,79 @@ class TestMultiCurrencyDashboardHelpers:
         self, multi_currency_book: Path,
     ):
         """Each bill's grand_total is in the BILL's currency. Pre-
-        fix, EUR bills and USD bills were summed without conversion,
-        producing meaningless grand totals."""
-        # multi_currency_book has no posted bills; use Alex's book
-        # as the integration anchor.
-        # Direct unit test: just verify the conversion is applied.
-        # If Alex's book had EUR vendors, their billed totals would
-        # be USD-equivalent post-fix. For now, lock the contract:
-        # vendor_spending_report invokes _rates_as_of (the lookup
-        # path that any FX-converted bill would route through).
-        import inspect
-        from gnucash_mcp.book import business
-        src = inspect.getsource(business.BusinessMixin.vendor_spending_report)
-        assert "_rates_as_of" in src or "rate" in src.lower(), (
-            "vendor_spending_report no longer references FX rate "
-            "lookup; the multi-currency fix may have regressed"
+        fix, EUR bills and USD bills were summed raw alongside USD
+        bills, producing meaningless grand totals. Post-fix, each
+        bill's total converts to default currency at the latest
+        market rate before summing.
+
+        Copilot PR #92 review caught that the original version of
+        this test used ``inspect.getsource`` to look for the
+        helper references — brittle against renames/refactors,
+        and didn't catch regressions where the function still
+        contained the string but applied conversion incorrectly.
+        Replaced with an end-to-end test that posts a EUR vendor
+        bill, runs the report, and asserts on the USD-converted
+        grand totals.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR vendor, an A/P account, a EUR-denominated
+        # posted bill, and a EUR/USD price. After posting we run
+        # vendor_spending_report and assert the totals come back
+        # in USD (the book default), not raw EUR.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            assets = next(a for a in bk.accounts if a.fullname == "Assets")
+            liabilities = piecash.Account(
+                name="Liabilities", type="LIABILITY", parent=bk.root_account,
+                commodity=usd, placeholder=True,
+            )
+            ap = piecash.Account(
+                name="Accounts Payable", type="PAYABLE",
+                parent=liabilities, commodity=usd,
+            )
+            expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
+            office_eur = piecash.Account(
+                name="Office Supplies EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add_all([liabilities, ap, office_eur])
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            bk.save()
+        # Create the vendor + EUR bill via the public API.
+        gc_book.create_vendor(name="Berlin Supplies", currency="EUR")
+        gc_book.create_bill(vendor_id="000001", currency="EUR")
+        gc_book.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies EUR",
+            description="EUR supplies",
+            quantity="1", price="500.00",
         )
-        assert "default_currency" in src, (
-            "vendor_spending_report no longer references default "
-            "currency; the multi-currency fix may have regressed"
+        gc_book.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            post_date="2024-06-15",
         )
+        # Run the report; verify totals come back as USD-converted.
+        result = gc_book.vendor_spending_report(
+            start_date="2024-01-01", end_date="2024-12-31",
+            compact=False,
+        )
+        # €500 × 1.10 = $550. Pre-fix the report would have summed
+        # 500 raw — wrong unit.
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("550.00")
+        assert Decimal(result["totals"]["outstanding"]) == Decimal("550.00")
+        # Per-vendor row also in USD.
+        berlin = next(
+            v for v in result["vendors"] if v["vendor_name"] == "Berlin Supplies"
+        )
+        assert Decimal(berlin["total_billed"]) == Decimal("550.00")
 
 
 class TestCreateCommodity:

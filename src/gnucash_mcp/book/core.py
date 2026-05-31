@@ -153,21 +153,32 @@ class CoreMixin:
         # We rely on the Lot balance (not raw invoice total) so
         # partially-paid invoices show as the still-owed amount,
         # and credit notes / payments reduce the count correctly.
+        #
+        # Pre-index accounts and lots once, not per-invoice — this
+        # method runs inside get_book_summary on every dashboard
+        # call. The pre-fix loop did one SQL query per invoice to
+        # resolve the post account, then a linear scan of
+        # post_acct.lots to find the matching lot. On a book with
+        # 100 posted invoices that's 100 round-trips plus 100
+        # linear scans against potentially hundreds of lots each —
+        # noticeable latency on every summary call. Copilot
+        # flagged it; pre-indexing is the standard N+1 fix.
+        accounts_by_guid = {
+            acct.guid: acct for acct in book.accounts
+        }
+        lots_by_guid: dict[str, object] = {}
+        for acct in book.accounts:
+            for lot in acct.lots:
+                lots_by_guid[lot.guid] = lot
+
         for inv in book.session.query(Invoice).filter(
             Invoice.date_posted.isnot(None),
         ).all():
             try:
-                post_acc_guid = inv.post_acc_guid
-                post_acct = book.session.query(
-                    piecash.Account,
-                ).filter_by(guid=post_acc_guid).first()
+                post_acct = accounts_by_guid.get(inv.post_acc_guid)
                 if post_acct is None:
                     continue
-                lot_obj = None
-                for lot in post_acct.lots:
-                    if lot.guid == inv.post_lot_guid:
-                        lot_obj = lot
-                        break
+                lot_obj = lots_by_guid.get(inv.post_lot_guid)
                 if lot_obj is None:
                     continue
                 balance = calc_lot_balance(lot_obj)

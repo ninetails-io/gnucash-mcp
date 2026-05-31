@@ -268,20 +268,20 @@ the leaves individually for a finer cut.
 
 | Role | What it gives you | Tools |
 |---|---|---|
-| `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet. **Always loaded.** | 26 |
-| `bookkeeper` | Reconcile bank statements, run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. | 20 |
+| `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
+| `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
 | `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
 | `freelancer` | Customer invoicing + sales tax (GST, VAT, US state sales tax). The solo-consultant surface. | 19 |
-| `business` | Vendors, employees, bills, vouchers, credit notes, jobs, billing terms. Additive to `freelancer` for a full small-business workflow. | 29 |
+| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, credit notes, jobs, billing terms). | 48 |
 
 Pick one or more, comma-separated:
 
 ```json
-"args": ["--modules=core,bookkeeper"]               // personal finance
-"args": ["--modules=core,investor"]                 // self-directed investor
-"args": ["--modules=core,freelancer"]               // solo contractor
-"args": ["--modules=core,freelancer,business"]     // small business
-"args": ["--modules=core,bookkeeper,investor,freelancer"]  // most things
+"args": ["--modules=bookkeeper"]            // personal finance
+"args": ["--modules=investor"]              // self-directed investor
+"args": ["--modules=freelancer"]            // solo contractor
+"args": ["--modules=business"]              // small business (= freelancer + business_complete)
+"args": ["--modules=bookkeeper,investor,freelancer"]  // most things
 ```
 
 `core` is force-added regardless; the explicit listing in the
