@@ -349,15 +349,49 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_taxtable",
         "update_taxtable",
         "delete_taxtable",
+        # Billterms — payment-terms registry shared by customer
+        # invoices and vendor bills. Lives here because every
+        # invoice carries terms; a solo freelancer setting
+        # "Net 30" or "2/10 Net 30" on customer invoices needs
+        # the CRUD surface without pulling in vendor management.
+        "create_billterm",
+        "list_billterms",
+        # Jobs — project-level grouping over invoices/bills for
+        # a single customer or vendor. Polymorphic on owner_type
+        # via the same _gate_owner_type pattern as the invoice
+        # tools: a freelancer-only user can create customer jobs
+        # but vendor jobs require business_complete to be loaded.
+        # Lives here because per-client P&L is a freelancer's
+        # natural year-end view.
+        "create_job",
+        "list_jobs",
+        "get_job",
+        "update_job",
+        "delete_job",
+        "get_job_report",
+        # Credit notes — refund/return documents. Polymorphic on
+        # owner_type. A freelancer issuing a customer refund
+        # works in this surface; vendor-side credit notes
+        # require business_complete via the gate.
+        "create_credit_note",
+        "add_credit_note_entry",
+        "delete_credit_note",
+        "apply_credit_note",
     ],
-    # ``business_complete`` — the vendor/employee/bills/credit-
-    # notes/jobs/billing-terms surface. Together with
-    # ``freelancer`` (the invoice surface), forms the full small-
-    # business toolkit. Both leaves expand together under the
-    # ``business`` group alias in MODULE_GROUPS. Pre-v1.3 this
-    # was named ``business`` and treated as a standalone — a UX
-    # trap that gave business-mode users only half the surface
-    # they expected.
+    # ``business_complete`` — vendor + employee surface only.
+    # Together with ``freelancer`` (which now owns billterms,
+    # jobs, and credit notes via the v1.3.1 redistribution),
+    # forms the full small-business toolkit. Both leaves expand
+    # together under the ``business`` group alias in
+    # MODULE_GROUPS.
+    #
+    # Polymorphic tools (jobs, credit notes) live in freelancer
+    # — a freelancer-only user uses them for customer-side
+    # operations; vendor-side use requires ``business_complete``
+    # via the _gate_owner_type check. This module owns the
+    # *entities* (vendors, employees) and the *vendor-side
+    # workflows* (bills, vouchers, vendor_spending_report) that
+    # don't make sense without those entities.
     "business_complete": [
         "create_vendor",
         "list_vendors",
@@ -378,29 +412,6 @@ TOOL_MODULES: dict[str, list[str]] = {
         "create_voucher",
         "add_voucher_entry",
         "delete_voucher",
-        # Credit notes (v1.3). Customer and vendor only —
-        # employees deliberately excluded (no GnuCash desktop
-        # equivalent). Lifecycle (post / unpost / pay / apply)
-        # flows through the polymorphic invoice tools in
-        # freelancer, detecting the credit-note slot to reverse
-        # posting direction.
-        "create_credit_note",
-        "add_credit_note_entry",
-        "delete_credit_note",
-        "apply_credit_note",
-        # Jobs (v1.3). Project-level grouping over invoices/bills
-        # for a single customer or vendor. No posted state — only
-        # active/inactive. Linked invoices route through the
-        # polymorphic owner_type=3 dispatch (see create_invoice's
-        # job_id parameter).
-        "create_job",
-        "list_jobs",
-        "get_job",
-        "update_job",
-        "delete_job",
-        "get_job_report",
-        "create_billterm",
-        "list_billterms",
         "vendor_spending_report",
     ],
 }
@@ -531,6 +542,59 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     else:
         requested = {m.strip() for m in modules_str.split(",")}
 
+    # Fail-fast on names that don't resolve to a known sub-module
+    # or group. Pre-v1.3.0 this was a stderr warning, then partial
+    # load — silent in practice because Claude Desktop captures
+    # MCP server stderr into a log file the user never sees. A
+    # typo'd ``--modules=bookeeper`` (missing the 'k') would
+    # silently load only ``core``, leaving the user unable to
+    # tell whether the tools they wanted are missing because
+    # they typed it wrong or because the server is broken.
+    # Bookkeeper-found bug on the PR #92 review pass; same
+    # principle as ``extra="forbid"`` on tool kwargs — financial
+    # software shouldn't silently swallow typos in configuration
+    # either.
+    #
+    # **Validation runs BEFORE the ``all`` check** so a typo'd
+    # name alongside ``all`` (e.g. ``--modules=bookeeper,all``)
+    # still rejects. Pre-v1.3.1 ``all`` shortcut past validation
+    # to "load everything" and any typos in the list were
+    # silently ignored — the typo would only surface later if the
+    # user removed ``all`` and got a different failure mode. v1.3
+    # treats ``all`` as a loading instruction, not a validation
+    # bypass: every supplied name must be a real module or group.
+    known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
+    unknown = requested - known - {"all"}
+    if unknown:
+        # Per-typo, suggest the closest known name (did-you-mean).
+        # Use simple shared-character ratio; close enough for the
+        # typo-class we're trying to catch without pulling in a
+        # Levenshtein dependency.
+        import difflib
+        lines = ["Unknown module name(s) on --modules / GNUCASH_MCP_MODULES:"]
+        for bad in sorted(unknown):
+            matches = difflib.get_close_matches(
+                bad, sorted(known), n=1, cutoff=0.6,
+            )
+            if matches:
+                lines.append(f"  - {bad!r}  (did you mean {matches[0]!r}?)")
+            else:
+                lines.append(f"  - {bad!r}")
+        lines.append("")
+        lines.append(
+            f"Valid names: {', '.join(sorted(known))}, all"
+        )
+        lines.append("")
+        lines.append(
+            "Fix the typo and restart the server. Partial-load "
+            "was the previous behavior; v1.3 fails fast so "
+            "configuration errors surface at startup instead "
+            "of as missing tools downstream."
+        )
+        message = "\n".join(lines)
+        print(message, file=sys.stderr)
+        raise SystemExit(2)
+
     if "all" in requested:
         enabled_modules = set(TOOL_MODULES.keys())
         groups_used: list[str] = ["all"]
@@ -551,50 +615,6 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
                 groups_used.append(name)
             else:
                 enabled_modules.add(name)
-
-        # Fail-fast on names that don't resolve to a known sub-module
-        # or group. Pre-v1.3.0 this was a stderr warning, then partial
-        # load — silent in practice because Claude Desktop captures
-        # MCP server stderr into a log file the user never sees. A
-        # typo'd ``--modules=bookeeper`` (missing the 'k') would
-        # silently load only ``core``, leaving the user unable to
-        # tell whether the tools they wanted are missing because
-        # they typed it wrong or because the server is broken.
-        # Bookkeeper-found bug on the PR #92 review pass; same
-        # principle as ``extra="forbid"`` on tool kwargs — financial
-        # software shouldn't silently swallow typos in configuration
-        # either.
-        known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
-        unknown = requested - known - {"all"}
-        if unknown:
-            # Per-typo, suggest the closest known name (did-you-mean).
-            # Use simple shared-character ratio; close enough for the
-            # typo-class we're trying to catch without pulling in a
-            # Levenshtein dependency.
-            import difflib
-            lines = ["Unknown module name(s) on --modules / GNUCASH_MCP_MODULES:"]
-            for bad in sorted(unknown):
-                matches = difflib.get_close_matches(
-                    bad, sorted(known), n=1, cutoff=0.6,
-                )
-                if matches:
-                    lines.append(f"  - {bad!r}  (did you mean {matches[0]!r}?)")
-                else:
-                    lines.append(f"  - {bad!r}")
-            lines.append("")
-            lines.append(
-                f"Valid names: {', '.join(sorted(known))}, all"
-            )
-            lines.append("")
-            lines.append(
-                "Fix the typo and restart the server. Partial-load "
-                "was the previous behavior; v1.3 fails fast so "
-                "configuration errors surface at startup instead "
-                "of as missing tools downstream."
-            )
-            message = "\n".join(lines)
-            print(message, file=sys.stderr)
-            raise SystemExit(2)
 
     # Keep only known sub-module names. Group expansion above may
     # have introduced names that aren't TOOL_MODULES keys if the
@@ -799,15 +819,17 @@ Options:
                                       17 tools.
                          investor     tax_lots + portfolio (cost basis
                                       + prices). 12 tools.
-                         freelancer   Customer invoicing + sales tax
-                                      (taxtables for GST / VAT /
-                                      US state sales tax). 19 tools.
+                         freelancer   Customer invoicing + sales tax,
+                                      plus billterms (payment terms),
+                                      jobs (per-project P&L), and
+                                      credit notes (customer refunds).
+                                      The full solo-consultant
+                                      toolkit. 31 tools.
                          business     Full small-business package:
                                       freelancer (invoicing) +
                                       business_complete (vendors,
                                       employees, bills, vouchers,
-                                      credit notes, jobs, billterms).
-                                      48 tools.
+                                      vendor reports). 48 tools.
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
