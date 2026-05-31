@@ -338,6 +338,42 @@ class TestApplyModuleFilter:
             _apply_module_filter("bookeeper,investor")
         assert exc_info.value.code == 2
 
+    def test_unknown_module_alongside_all_still_fails(self, capsys):
+        """``all`` is a loading instruction, not a validation bypass.
+
+        Bookkeeper-found bug post-PR #92 merge: when ``all`` was
+        present alongside a typo'd module name (e.g.
+        ``--modules=bookkeper,all``), the server happily loaded
+        every tool — the ``all`` branch short-circuited past the
+        unknown-name check. The typo would only surface later if
+        the user removed ``all`` and got a different failure mode.
+
+        Validation must run on every supplied name regardless of
+        whether ``all`` is also present. A typo is still a signal
+        that something's wrong — maybe the user is testing module
+        isolation and accidentally left ``all`` in, or they'll
+        later remove ``all`` and be surprised the misspelled one
+        silently does nothing.
+        """
+        import pytest
+        # Single typo + all → reject.
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("bookkeper,all")
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "bookkeper" in captured.err
+        assert "did you mean 'bookkeeper'" in captured.err
+
+    def test_multiple_typos_plus_all_still_fails(self, capsys):
+        """Even with valid modules AND all present, any typo
+        rejects."""
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            _apply_module_filter("business,bookkeper,all")
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "bookkeper" in captured.err
+
     def test_whitespace_in_module_names(self):
         """Whitespace around module names should be stripped."""
         _apply_module_filter("core , reporting")
