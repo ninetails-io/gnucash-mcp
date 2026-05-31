@@ -91,6 +91,40 @@ a module set" table for which modules to load for which use case.
   out of `reconcile_account` the same way it does in every other
   account-aware tool.
 
+**Token bloat trimmed on read tools and business responses.**
+
+Bookkeeper-found during PR #92 review. Two patterns wasted
+tokens with no callable benefit:
+
+- **`get_transaction` and `list_transactions(verbose=True)`** were
+  emitting full 32-char GUIDs for transaction, split, and lot
+  fields. The compact path of `list_transactions` already
+  emitted collision-safe 8-char prefixes via the cached
+  `_transaction_prefix_map`; verbose didn't. Every tool that
+  accepts a GUID accepts an 8+ char prefix via `_resolve_guid`,
+  so the extra 24 chars per GUID was dead weight. On a 50-
+  transaction verbose list with 2-3 splits each, that's ~6-8K
+  chars saved per call.
+- **Business-object `guid` fields** (customer, vendor, employee,
+  job, billterm, taxtable, invoice, entry) — bookkeeper-
+  validated as never used by any consumer. Every business
+  object is addressed by its human-readable handle (ID like
+  "000001" or name like "BC GST+PST 12%"). The 32-char GUID
+  on every read and write response was pure overhead.
+  Stripped entirely from response shapes.
+
+The `transaction_guid` field on business write responses
+(post_invoice, pay_invoice, apply_credit_note) is preserved —
+it's the one business-tool surface that emits a core-
+transaction GUID consumers actually use (passed to
+get_transaction to verify splits). It's now emitted as a short
+prefix too.
+
+Two new cached prefix maps in `BaseGnuCashBook`
+(`_split_prefix_map`, `_lot_prefix_map`) parallel the existing
+`_transaction_prefix_map` — same mtime-keyed invalidation,
+same collision-safety guarantees against `_resolve_guid`.
+
 **Early-payment discounts now actually honored.**
 
 `create_billterm` had been accepting `discount_days` and

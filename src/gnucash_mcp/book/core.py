@@ -2434,7 +2434,25 @@ class CoreMixin:
                     lines.append(notice)
                 return "\n".join(lines)
             else:
-                return [_transaction_to_dict(t) for t in filtered]
+                # Verbose mode: emit short prefixes for transaction
+                # GUIDs, split GUIDs, and lot GUIDs so the bookkeeper
+                # workflow doesn't pay 24 wasted chars per GUID per
+                # row. Compact mode already does this; pre-v1.3.1
+                # verbose left them at full 32-char width even
+                # though every consuming tool accepts 8+ char
+                # prefixes via ``_resolve_guid``.
+                txn_prefixes = self._transaction_prefix_map(book)
+                split_prefixes = self._split_prefix_map(book)
+                lot_prefixes = self._lot_prefix_map(book)
+                return [
+                    _transaction_to_dict(
+                        t,
+                        txn_prefixes=txn_prefixes,
+                        split_prefixes=split_prefixes,
+                        lot_prefixes=lot_prefixes,
+                    )
+                    for t in filtered
+                ]
 
     @staticmethod
     def _truncation_notice(
@@ -2479,13 +2497,25 @@ class CoreMixin:
             guid: Transaction GUID (32-character hex string).
 
         Returns:
-            Transaction dict if found, None otherwise.
+            Transaction dict if found, None otherwise. The emitted
+            ``guid`` field (on the transaction and on each nested
+            split) and the ``lot_guid`` field carry collision-safe
+            short prefixes (typically 8 chars) — same format the
+            compact list_transactions emits. The full GUID is
+            redundant for caller-side use because every tool that
+            takes a GUID accepts an 8+ char prefix via
+            ``_resolve_guid``.
         """
         with self.open(readonly=True) as book:
             transaction = self._find_transaction(book, guid)
-            if transaction:
-                return _transaction_to_dict(transaction)
-            return None
+            if not transaction:
+                return None
+            return _transaction_to_dict(
+                transaction,
+                txn_prefixes=self._transaction_prefix_map(book),
+                split_prefixes=self._split_prefix_map(book),
+                lot_prefixes=self._lot_prefix_map(book),
+            )
 
     _FUNDING_ACCOUNT_TYPES = {
         "BANK", "CASH", "ASSET", "CREDIT", "LIABILITY", "EQUITY",

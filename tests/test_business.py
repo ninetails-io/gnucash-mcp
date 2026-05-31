@@ -16,7 +16,6 @@ class TestCreateCustomer:
         assert result["status"] == "created"
         assert result["name"] == "Acme Corp"
         assert result["id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_auto_id_increments(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -103,7 +102,9 @@ class TestListCustomers:
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Acme Corp"
-        assert "guid" in result[0]
+        # v1.3.1: business-object guid field dropped (bookkeeper
+        # never used it). Customers are addressed by ``id``.
+        assert "id" in result[0]
         assert "address" in result[0]
 
 
@@ -133,7 +134,6 @@ class TestCreateVendor:
         assert result["status"] == "created"
         assert result["name"] == "Office Depot"
         assert result["id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_auto_id_increments(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -213,7 +213,6 @@ class TestCreateEmployee:
         assert result["status"] == "created"
         assert result["name"] == "Jane Smith"
         assert result["id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_auto_id_increments(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -297,7 +296,9 @@ class TestListEmployees:
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Jane Smith"
-        assert "guid" in result[0]
+        # v1.3.1: business-object guid field dropped; employees
+        # addressed by ``id``.
+        assert "id" in result[0]
         # notes key absent (schema difference)
         assert "notes" not in result[0]
 
@@ -372,7 +373,6 @@ class TestCreateJob:
         assert result["active"] is True
         # counter_job advances independently from invoice/bill
         assert result["id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_create_vendor_job(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1658,7 +1658,6 @@ class TestCreateBillterm:
         assert result["status"] == "created"
         assert result["name"] == "Net 30"
         assert result["due_days"] == 30
-        assert len(result["guid"]) == 32
 
     def test_custom_due_days(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1748,7 +1747,6 @@ class TestCreateTaxtable:
         assert result["status"] == "created"
         assert result["name"] == "GST 5%"
         assert result["entry_count"] == 1
-        assert len(result["guid"]) == 32
         assert result["entries"][0]["type"] == "percentage"
         assert result["entries"][0]["amount"] == "5"
         assert result["entries"][0]["account"] == gst
@@ -2118,10 +2116,16 @@ class TestUpdateTaxtable:
             entries=[{"type": "percentage", "amount": "5",
                       "account": gst}],
         )
-        tt = gb.get_taxtable("GST 5%")
-        # Insert a phantom Entry row referencing the taxtable so
-        # the refcount-computer reports > 0.
+        # Look up the taxtable guid via raw SQL (v1.3.1:
+        # get_taxtable no longer surfaces guid — bookkeeper-
+        # validated as unused on the LLM surface). Needed here as
+        # a foreign-key target for the phantom Entry row that
+        # exercises the refcount path.
         with gb.open(readonly=False) as book:
+            tt_guid = book.session.execute(
+                text("SELECT guid FROM taxtables WHERE name = :n"),
+                {"n": "GST 5%"},
+            ).scalar()
             book.session.execute(
                 text(
                     "INSERT INTO entries "
@@ -2144,7 +2148,7 @@ class TestUpdateTaxtable:
                 {
                     "guid": "deadbeef" * 4,
                     "now": "2026-01-01 00:00:00",
-                    "ttg": tt["guid"],
+                    "ttg": tt_guid,
                 },
             )
             book.save()
@@ -2164,8 +2168,13 @@ class TestUpdateTaxtable:
             entries=[{"type": "percentage", "amount": "5",
                       "account": gst}],
         )
-        tt = gb.get_taxtable("GST 5%")
         with gb.open(readonly=False) as book:
+            # v1.3.1: taxtable guid not on response; look up
+            # directly for the foreign-key target.
+            tt_guid = book.session.execute(
+                text("SELECT guid FROM taxtables WHERE name = :n"),
+                {"n": "GST 5%"},
+            ).scalar()
             book.session.execute(
                 text(
                     "INSERT INTO entries "
@@ -2188,7 +2197,7 @@ class TestUpdateTaxtable:
                 {
                     "guid": "deadbeef" * 4,
                     "now": "2026-01-01 00:00:00",
-                    "ttg": tt["guid"],
+                    "ttg": tt_guid,
                 },
             )
             book.save()
@@ -2233,8 +2242,13 @@ class TestDeleteTaxtable:
             entries=[{"type": "percentage", "amount": "5",
                       "account": gst}],
         )
-        tt = gb.get_taxtable("GST 5%")
         with gb.open(readonly=False) as book:
+            # v1.3.1: taxtable guid not on response; look up
+            # directly for the foreign-key target.
+            tt_guid = book.session.execute(
+                text("SELECT guid FROM taxtables WHERE name = :n"),
+                {"n": "GST 5%"},
+            ).scalar()
             book.session.execute(
                 text(
                     "INSERT INTO entries "
@@ -2257,7 +2271,7 @@ class TestDeleteTaxtable:
                 {
                     "guid": "deadbeef" * 4,
                     "now": "2026-01-01 00:00:00",
-                    "ttg": tt["guid"],
+                    "ttg": tt_guid,
                 },
             )
             book.save()
@@ -2292,12 +2306,17 @@ class TestTaxtableRefcount:
             entries=[{"type": "percentage", "amount": "5",
                       "account": gst}],
         )
-        tt = gb.get_taxtable("GST 5%")
         # Insert one i_taxtable row and one b_taxtable row.
         with gb.open(readonly=False) as book:
+            # v1.3.1: lookup the taxtable guid directly (response
+            # dict no longer surfaces it).
+            tt_guid = book.session.execute(
+                text("SELECT guid FROM taxtables WHERE name = :n"),
+                {"n": "GST 5%"},
+            ).scalar()
             for tag, payload in (
-                ("i", {"i_tt": tt["guid"], "b_tt": None}),
-                ("b", {"i_tt": None, "b_tt": tt["guid"]}),
+                ("i", {"i_tt": tt_guid, "b_tt": None}),
+                ("b", {"i_tt": None, "b_tt": tt_guid}),
             ):
                 book.session.execute(
                     text(
@@ -3326,8 +3345,9 @@ class TestTaxtableDisplay:
         )
         inv = gb.get_invoice("000001")
         assert "tax_summary" not in inv
+        # v1.3.1: entry "guid" dropped from response shape.
         assert inv["entries"][0].keys() == {
-            "guid", "date", "description",
+            "date", "description",
             "quantity", "price", "total", "account",
         }
 
@@ -3791,7 +3811,6 @@ class TestCreateInvoice:
         assert result["status"] == "created"
         assert result["id"] == "000001"
         assert result["customer_id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_auto_id_increments(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -4314,7 +4333,6 @@ class TestCreateVoucher:
         assert result["employee_id"] == "000001"
         # Voucher counter starts at 0; first auto-id is 000001.
         assert result["id"] == "000001"
-        assert len(result["guid"]) == 32
 
     def test_employee_not_found(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -4404,7 +4422,9 @@ class TestAddVoucherEntry:
             description="Client lunch",
             quantity="1", price="100.00",
         )
-        assert e1["guid"] != e2["guid"]
+        # v1.3.1: entry guid dropped; uniqueness still validated
+        # implicitly by the fact that both writes succeeded.
+        assert e1["description"] != e2["description"]
 
     def test_income_account_rejected(self, business_book):
         """Voucher entries take EXPENSE/ASSET only — same as
@@ -4657,8 +4677,13 @@ class TestCreditNoteSlotHelpers:
             cn = book.session.query(Invoice).filter_by(
                 id=credit["id"],
             ).first()
+            # v1.3.1: create_invoice no longer surfaces ``guid``;
+            # look up the source invoice's guid via the ORM.
+            source_inv = book.session.query(Invoice).filter_by(
+                id=source["id"],
+            ).first()
             BusinessMixin._set_is_credit_note(cn, True)
-            BusinessMixin._set_applies_to_invoice_guid(cn, source["guid"])
+            BusinessMixin._set_applies_to_invoice_guid(cn, source_inv.guid)
             book.save()
         with gb.open(readonly=True) as book:
             from piecash.business.invoice import Invoice
@@ -6110,7 +6135,8 @@ class TestGetInvoice:
         )
         result = gb.get_invoice("000001")
         entry = result["entries"][0]
-        assert "guid" in entry
+        # v1.3.1: entry guid dropped — no standalone tool surface
+        # consumes it.
         assert entry["description"] == "Widget"
         assert Decimal(entry["quantity"]) == Decimal("3")
         assert Decimal(entry["price"]) == Decimal("25")
@@ -6387,8 +6413,11 @@ class TestPostInvoice:
         )
         assert result["status"] == "posted"
         assert Decimal(result["total"]) == Decimal("500")
-        assert len(result["transaction_guid"]) == 32
-        assert len(result["lot_guid"]) == 32
+        # v1.3.1: transaction_guid + lot_guid emitted as short
+        # collision-safe prefixes (min 8 chars) rather than full
+        # 32-char. Consumers accept 8+ char prefixes via _resolve_guid.
+        assert len(result["transaction_guid"]) >= 8
+        assert len(result["lot_guid"]) >= 8
         assert result["post_account"] == "Assets:Accounts Receivable"
 
     def test_post_marks_invoice_posted(self, business_book):
@@ -6534,12 +6563,23 @@ class TestPostInvoice:
             post_account="Assets:Accounts Receivable",
             due_date="2026-04-01",
         )
-        txn_guid = result["transaction_guid"]
-        lot_guid = result["lot_guid"]
+        # v1.3.1: result now carries short prefixes. Resolve back
+        # to full GUIDs for the direct-sqlite3 equality queries
+        # below.
+        txn_guid_prefix = result["transaction_guid"]
+        lot_guid_prefix = result["lot_guid"]
 
         # Read slots from the database directly
         conn = sqlite3.connect(str(business_book))
         try:
+            txn_guid = conn.execute(
+                "SELECT guid FROM transactions WHERE guid LIKE ?",
+                (txn_guid_prefix + "%",),
+            ).fetchone()[0]
+            lot_guid = conn.execute(
+                "SELECT guid FROM lots WHERE guid LIKE ?",
+                (lot_guid_prefix + "%",),
+            ).fetchone()[0]
             # Transaction num should be invoice ID
             txn = conn.execute(
                 "SELECT num, description FROM transactions "
@@ -6619,10 +6659,16 @@ class TestPostInvoice:
             post_account="Liabilities:Accounts Payable",
             owner_type="vendor",
         )
-        txn_guid = result["transaction_guid"]
+        txn_guid_prefix = result["transaction_guid"]
 
         conn = sqlite3.connect(str(business_book))
         try:
+            # Resolve short prefix → full GUID for the equality
+            # queries below (v1.3.1 short-prefix change).
+            txn_guid = conn.execute(
+                "SELECT guid FROM transactions WHERE guid LIKE ?",
+                (txn_guid_prefix + "%",),
+            ).fetchone()[0]
             txn = conn.execute(
                 "SELECT description FROM transactions WHERE guid = ?",
                 (txn_guid,),
@@ -7258,10 +7304,16 @@ class TestPayInvoice:
             payment_account="Assets:Checking",
             amount="500",
         )
-        txn_guid = result["transaction_guid"]
+        txn_guid_prefix = result["transaction_guid"]
 
         conn = sqlite3.connect(str(business_book))
         try:
+            # Resolve short prefix → full GUID for the equality
+            # queries below (v1.3.1 short-prefix change).
+            txn_guid = conn.execute(
+                "SELECT guid FROM transactions WHERE guid LIKE ?",
+                (txn_guid_prefix + "%",),
+            ).fetchone()[0]
             # Description should be customer name
             txn = conn.execute(
                 "SELECT description FROM transactions WHERE guid = ?",

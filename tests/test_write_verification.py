@@ -194,9 +194,13 @@ class TestVerifyDelete:
         book_obj = GnuCashBook(str(business_book))
         book_obj.create_customer("Verify Client")
         inv = book_obj.create_invoice(customer_id="000001")
-        inv_guid = inv["guid"]
-
+        # v1.3.1: create_invoice no longer surfaces ``guid``;
+        # look up via the ORM for direct-SQL deletion below.
         with book_obj.open(readonly=False) as book:
+            inv_guid = book.session.query(Invoice).filter_by(
+                id=inv["id"],
+            ).first().guid
+
             book.session.execute(
                 Invoice.__table__.delete().where(
                     Invoice.__table__.c.guid == inv_guid

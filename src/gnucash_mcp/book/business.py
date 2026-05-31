@@ -22,6 +22,7 @@ import piecash
 from gnucash_mcp.book._base import (
     _slot_value_str,
     _to_decimal,
+    _unique_prefix,
     _verify_composite_write,
     _verify_write,
 )
@@ -1149,9 +1150,16 @@ class BusinessMixin:
 
     @staticmethod
     def _customer_to_dict(customer) -> dict:
-        """Convert a piecash Customer to a serializable dict."""
+        """Convert a piecash Customer to a serializable dict.
+
+        Business-object GUIDs are deliberately omitted from the
+        response. Bookkeeper-validated finding: every consumer
+        addresses customers via ``id`` (human-readable, like
+        "000001"); the 32-char GUID is dead weight on every read.
+        Same treatment applies to vendor, employee, job, billterm,
+        taxtable, invoice, and entry response shapes.
+        """
         result = {
-            "guid": customer.guid,
             "id": customer.id,
             "name": customer.name,
             "currency": customer.currency.mnemonic if customer.currency else None,
@@ -1165,9 +1173,11 @@ class BusinessMixin:
 
     @staticmethod
     def _vendor_to_dict(vendor) -> dict:
-        """Convert a piecash Vendor to a serializable dict."""
+        """Convert a piecash Vendor to a serializable dict.
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
+        """
         result = {
-            "guid": vendor.guid,
             "id": vendor.id,
             "name": vendor.name,
             "currency": vendor.currency.mnemonic if vendor.currency else None,
@@ -1188,9 +1198,10 @@ class BusinessMixin:
         shape omits the ``notes`` key. Employee-specific fields
         (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
         scope for the 1.3.0 CRUD surface and are not serialized.
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
         """
         result = {
-            "guid": employee.guid,
             "id": employee.id,
             "name": employee.name,
             "currency": employee.currency.mnemonic if employee.currency else None,
@@ -1225,9 +1236,11 @@ class BusinessMixin:
         human-readable ``owner_type`` string for symmetry with
         every other tool's owner-typed response. ``owner_name``
         is resolved by the caller (static-method shape can't
-        query the session)."""
+        query the session).
+
+        ``guid`` omitted — see _customer_to_dict for the rationale.
+        """
         return {
-            "guid": job.guid,
             "id": job.id,
             "name": job.name,
             "reference": job.reference or "",
@@ -1262,9 +1275,11 @@ class BusinessMixin:
 
     @staticmethod
     def _billterm_to_dict(bt) -> dict:
-        """Convert a Billterm to a serializable dict."""
+        """Convert a Billterm to a serializable dict.
+
+        ``guid`` omitted — billterms are addressed by ``name``.
+        """
         return {
-            "guid": bt.guid,
             "name": bt.name,
             "description": bt.description or "",
             "type": bt.type,
@@ -1326,8 +1341,8 @@ class BusinessMixin:
             )
             for e in tt.entries
         ]
+        # ``guid`` omitted — taxtables are addressed by ``name``.
         return {
-            "guid": tt.guid,
             "name": tt.name,
             "refcount": (
                 refcount if refcount is not None else tt.refcount
@@ -1429,8 +1444,8 @@ class BusinessMixin:
                 invoice.owner_type, "invoice",
             )
 
+        # ``guid`` omitted — invoices are addressed by ``id``.
         result = {
-            "guid": invoice.guid,
             "id": invoice.id,
             "type": type_field,
             "owner_name": owner_name,
@@ -1618,8 +1633,10 @@ class BusinessMixin:
         else:
             date_str = str(raw_date.date())
 
+        # ``guid`` omitted — entries are nested under invoices and
+        # have no standalone tool surface (no delete_entry,
+        # update_entry, etc.). Bookkeeper-validated: never used.
         result = {
-            "guid": entry_row.guid,
             "date": date_str,
             "description": entry_row.description or "",
             "quantity": str(quantity),
@@ -2083,8 +2100,10 @@ class BusinessMixin:
         )
         book.save()
 
+        # v1.3.1: business-object ``guid`` dropped from write
+        # responses (bookkeeper-validated as unused on the LLM
+        # surface). ``id`` is the working handle.
         return {
-            "guid": entity.guid,
             "id": entity.id,
             "name": entity.name,
             "currency": currency_obj.mnemonic,
@@ -2250,8 +2269,8 @@ class BusinessMixin:
 
         book.save()
 
+        # v1.3.1: ``guid`` dropped — see _create_business_person.
         return {
-            "guid": entity.guid,
             "id": entity.id,
             "status": "updated",
             **changed,
@@ -2652,8 +2671,8 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — billterms addressed by ``name``.
             return {
-                "guid": bt_guid,
                 "name": name,
                 "due_days": due_days,
                 "status": "created",
@@ -3094,8 +3113,8 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — taxtables addressed by ``name``.
             return {
-                "guid": tt_guid,
                 "name": tt_name,
                 "entry_count": len(entry_dicts),
                 "entries": entry_dicts,
@@ -3326,8 +3345,8 @@ class BusinessMixin:
             book.save()
 
             if not changed:
+                # v1.3.1: ``guid`` dropped.
                 return {
-                    "guid": tt_guid,
                     "name": name,
                     "status": "unchanged",
                 }
@@ -3893,8 +3912,9 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped — invoices/bills/vouchers/
+            # credit notes addressed by ``id``.
             return {
-                "guid": inv_guid,
                 "id": doc_id,
                 config["owner_id_key"]: owner_id,
                 "date_opened": str(open_date.date()),
@@ -4672,8 +4692,9 @@ class BusinessMixin:
             book.save()
 
             total = qty * unit_price
+            # v1.3.1: entry ``guid`` dropped — no tool surface
+            # consumes a standalone entry GUID.
             return {
-                "guid": entry_guid,
                 cfg["id_param"]: doc_id,
                 "description": description,
                 "quantity": str(qty),
@@ -5408,8 +5429,19 @@ class BusinessMixin:
                 "status": "posted",
                 "total": str(grand_total),
                 "post_date": str(parsed_date),
-                "transaction_guid": txn.guid,
-                "lot_guid": lot.guid,
+                # Transaction + lot GUIDs are USED by consumers
+                # (e.g. bookkeeper passes transaction_guid to
+                # get_transaction to verify splits). Emit short
+                # prefixes via the cached prefix maps — every
+                # tool accepts 8+ char prefixes via _resolve_guid.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
+                "lot_guid": _unique_prefix(
+                    lot.guid,
+                    self._lot_prefix_map(book).keys(),
+                ),
                 "post_account": post_acct.fullname,
             }
 
@@ -6086,7 +6118,13 @@ class BusinessMixin:
                 "status": "paid",
                 "amount_paid": str(payment_amount),
                 "remaining_balance": str(abs(remaining)),
-                "transaction_guid": txn.guid,
+                # Transaction GUID emitted as a short prefix —
+                # consumers (e.g. get_transaction lookup) accept
+                # 8+ char prefixes via _resolve_guid.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
@@ -6473,7 +6511,12 @@ class BusinessMixin:
                 "target_remaining": str(
                     new_target_remaining.quantize(quantum)
                 ),
-                "transaction_guid": txn.guid,
+                # Short prefix for the netting transaction GUID —
+                # see pay_invoice for the rationale.
+                "transaction_guid": _unique_prefix(
+                    txn.guid,
+                    self._transaction_prefix_map(book).keys(),
+                ),
                 "apply_date": str(parsed_date),
                 "status": "applied",
             }
@@ -6717,9 +6760,9 @@ class BusinessMixin:
             book.session.delete(entity)
             book.save()
 
+            # v1.3.1: ``guid`` dropped from delete responses too.
             return {
                 "id": entity_id,
-                "guid": entity_guid,
                 "name": entity_name,
                 "type": entity_label.lower(),
                 "status": "deleted",
@@ -6947,8 +6990,8 @@ class BusinessMixin:
                 f"Job '{name}'",
             )
 
+            # v1.3.1: ``guid`` dropped — jobs addressed by ``id``.
             return {
-                "guid": job.guid,
                 "id": job.id,
                 "name": name,
                 "reference": reference,
@@ -7151,9 +7194,9 @@ class BusinessMixin:
 
             book.save()
 
+            # v1.3.1: ``guid`` dropped from update responses.
             return {
                 "id": job.id,
-                "guid": job.guid,
                 "status": "updated",
                 **changed,
             }
@@ -7226,9 +7269,9 @@ class BusinessMixin:
                 f"Job '{job_id}'",
             )
 
+            # v1.3.1: ``guid`` dropped from delete response.
             return {
                 "id": job_id,
-                "guid": job_guid,
                 "name": job_name,
                 "reparented_count": reparented_count,
                 "status": "deleted",

@@ -446,10 +446,17 @@ class TestCalculateLotGain:
         book.assign_split_to_lot(
             split_guid=buy_guid, lot_guid=lot["guid"],
         )
-        # Find and void the buy transaction.
+        # Find and void the buy transaction. v1.3.1: ``buy_guid``
+        # is now a short prefix (get_transaction returns prefixes,
+        # not full GUIDs). Resolve to full guid via
+        # ``_resolve_guid("splits", ...)`` for the direct ORM
+        # equality query.
+        full_buy_guid = book._resolve_guid("splits", buy_guid)
         with book.open(readonly=True) as b:
             from piecash.core.transaction import Split
-            split = b.session.query(Split).filter_by(guid=buy_guid).first()
+            split = b.session.query(Split).filter_by(
+                guid=full_buy_guid,
+            ).first()
             buy_txn_guid = split.transaction.guid
         book.void_transaction(
             guid=buy_txn_guid, reason="Mistaken purchase",
