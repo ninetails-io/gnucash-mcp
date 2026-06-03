@@ -7,14 +7,14 @@ catalogues:
 - ``TestResolveAccountTemplateFilter`` — SB-12
 - ``TestMarketPriceFilter`` — SB-11
 - ``TestIsVoidedConsistency`` — SB-13, SB-14, HP-3
-- ``TestRatesAsOfRequiresDate`` — SB-2, SB-3, SB-4 (added in commit 4)
+- ``TestRatesAsOfRequiresDate`` — SB-2, SB-3, SB-4 (rates portion)
 - ``TestNetWorthSeriesPerBoundaryRates`` — SB-1 (added in commit 5)
 
 If any of these tests starts failing without an intentional change to
 the chokepoint, the bug class is open again.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -521,3 +521,181 @@ class TestIsVoidedConsistency:
 
         with pytest.raises(ValueError, match="voided"):
             gb.assign_split_to_lot(split_guid, lot["guid"])
+
+
+class TestRatesAsOfRequiresDate:
+    """SB-2, SB-3, SB-4 (rates portion): ``_rates_as_of`` and
+    ``_account_conversion_factors`` require an explicit ``as_of`` —
+    no default. Pre-v1.3 release both helpers defaulted ``as_of=None``
+    (no upper bound, always-latest rates). Five historical-report
+    sites passed nothing and silently used today's rates regardless
+    of the historical period being reported:
+
+    - ``balance_sheet`` at a past date (SB-2)
+    - ``vendor_spending_report`` for a past period (SB-3)
+    - ``debt_payoff_plan`` mixed-currency aggregation (SB-4 rates
+      portion, via ``_split_in_default_currency`` → factors)
+    - the period-flow reports (``cash_flow``,
+      ``spending_by_category``, ``income_by_source``)
+    - ``get_budget_report`` historical periods
+
+    Dropping the default forces every caller to declare its intent.
+    The ``_anchor_for_as_of`` helper folds now-or-future anchors to
+    ``date.max`` so the bookkeeper's intentional forecasts are still
+    included in "now" valuations — the convention locked by
+    ``TestCrossToolPriceAgreement``.
+    """
+
+    def test_rates_as_of_requires_as_of_positionally(
+        self, multi_currency_book: Path,
+    ):
+        """Calling ``_rates_as_of(book)`` with no ``as_of`` raises
+        TypeError. Pre-fix this returned today's rates silently."""
+        book = GnuCashBook(str(multi_currency_book))
+        with book.open(readonly=True) as pb:
+            with pytest.raises(TypeError):
+                book._rates_as_of(pb)
+
+    def test_account_conversion_factors_requires_as_of(
+        self, multi_currency_book: Path,
+    ):
+        """Same contract on ``_account_conversion_factors`` — pre-
+        fix this defaulted to today's rates inside the helper."""
+        book = GnuCashBook(str(multi_currency_book))
+        with book.open(readonly=True) as pb:
+            with pytest.raises(TypeError):
+                book._account_conversion_factors(pb)
+
+    def test_historical_anchor_returns_historical_rates(
+        self, multi_currency_book: Path,
+    ):
+        """A historical ``as_of`` must filter to prices ≤ that date.
+
+        Setup: ``multi_currency_book`` already has a 2024-01-20
+        EUR/USD transaction. Add an explicit older EUR rate and a
+        newer EUR rate; verify the historical anchor picks the
+        older one and the today anchor picks the newer one.
+        """
+        gb = GnuCashBook(str(multi_currency_book))
+
+        # Write two EUR/USD market quotes: an older one and a
+        # newer one. _rates_as_of with as_of between them must
+        # pick the older; with as_of >= today must pick the newer.
+        old_date = date(2024, 6, 1)
+        new_date = date(2025, 6, 1)
+        with piecash.open_book(
+            str(multi_currency_book), readonly=False, do_backup=False,
+        ) as book:
+            usd = book.default_currency
+            eur = next(
+                c for c in book.commodities if c.mnemonic == "EUR"
+            )
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=old_date, value=Decimal("1.10"),
+                type="nav", source="user:test",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=new_date, value=Decimal("1.20"),
+                type="nav", source="user:test",
+            ))
+            book.save()
+
+        with gb.open(readonly=True) as pb:
+            eur_guid = next(
+                c.guid for c in pb.commodities
+                if c.mnemonic == "EUR"
+            )
+
+            # Historical anchor between the two prices: must pick
+            # the older 1.10 rate. Pre-fix the call defaulted to
+            # today and returned 1.20 regardless of as_of.
+            mid_anchor = date(2024, 12, 1)
+            historical = gb._rates_as_of(pb, mid_anchor)
+            assert historical.get(eur_guid) == Decimal("1.10"), (
+                f"historical anchor {mid_anchor} should pick 1.10, "
+                f"got {historical.get(eur_guid)}"
+            )
+
+            # "Now" anchor: helper folds today to date.max, so the
+            # newer 1.20 wins (and any future-dated forecast would
+            # too).
+            now = gb._rates_as_of(pb, date.today())
+            assert now.get(eur_guid) == Decimal("1.20"), (
+                f"now anchor should pick 1.20, "
+                f"got {now.get(eur_guid)}"
+            )
+
+    def test_anchor_for_as_of_folds_now_or_future_to_max(
+        self, test_book: Path,
+    ):
+        """The helper's contract: anchors at or beyond today fold to
+        ``date.max`` (forecast-inclusive); past anchors stay literal
+        (historical reconstruction)."""
+        book = GnuCashBook(str(test_book))
+        today = date.today()
+        past = today - timedelta(days=30)
+        future = today + timedelta(days=30)
+
+        assert book._anchor_for_as_of(today) == date.max
+        assert book._anchor_for_as_of(future) == date.max
+        assert book._anchor_for_as_of(past) == past
+
+    def test_balance_sheet_historical_uses_historical_rates(
+        self, multi_currency_book: Path,
+    ):
+        """End-to-end: ``balance_sheet(as_of_date=<past>)`` values
+        non-default-currency holdings at the historical rate, not
+        today's. Pre-fix SB-2 used today's rates against historical
+        quantities.
+
+        Uses the same EUR-rate setup as
+        ``test_historical_anchor_returns_historical_rates``: 1.10
+        at 2024-06-01, 1.20 at 2025-06-01. The fixture's transfer
+        of 1000 EUR happens on 2024-01-20. At a historical
+        as_of_date of 2024-12-01, the EUR holding should be valued
+        at 1.10 (1100 USD), not 1.20 (1200 USD) and not the
+        cost-basis fallback (1100 USD)."""
+        # Write the same older/newer rates as the predicate test.
+        with piecash.open_book(
+            str(multi_currency_book), readonly=False, do_backup=False,
+        ) as book:
+            usd = book.default_currency
+            eur = next(
+                c for c in book.commodities if c.mnemonic == "EUR"
+            )
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1), value=Decimal("1.10"),
+                type="nav", source="user:test",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2025, 6, 1), value=Decimal("1.20"),
+                type="nav", source="user:test",
+            ))
+            book.save()
+
+        gb = GnuCashBook(str(multi_currency_book))
+
+        # Historical balance_sheet: as_of_date between the two
+        # prices. EUR row should value at 1.10.
+        bs = gb.balance_sheet(date(2024, 12, 1))
+        eur_row = next(
+            a for a in bs["assets"]["accounts"]
+            if a["account"] == "Assets:Euro Savings"
+        )
+        # 1000 EUR × 1.10 = 1100 USD. Rate string is "@ 1.1" (the
+        # display strips trailing decimal zeros). The cost-basis
+        # fallback also happens to be 1100 USD here, so we
+        # disambiguate via the rate token: cost-basis path shows
+        # "no price data", historical-rate path shows "@ <rate>".
+        assert "@ 1.1 " in eur_row["balance"], (
+            f"historical balance_sheet did not use the historical "
+            f"EUR rate (1.10); balance row: {eur_row}"
+        )
+        # Sanity check on the converted value too.
+        assert eur_row["default_currency_value"] == "1100.00", (
+            f"unexpected USD value: {eur_row}"
+        )

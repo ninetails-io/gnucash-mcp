@@ -426,10 +426,12 @@ class CoreMixin:
         # See the comment in get_book_summary's inline price loop for
         # the rationale; both paths converge on this behavior so the
         # "now" anchor agrees with balance_sheet by construction.
-        if as_of >= date.today():
-            rates = self._rates_as_of(book)
-        else:
-            rates = self._rates_as_of(book, as_of, default_currency)
+        # ``_rates_as_of`` runs ``as_of`` through ``_anchor_for_as_of``,
+        # which folds now-or-future anchors to ``date.max`` so the
+        # bookkeeper's intentional future-dated forecasts are
+        # included in "now" valuations. Past anchors stay literal
+        # for historical reconstruction.
+        rates = self._rates_as_of(book, as_of, default_currency)
 
         # is_leaf: an account with no children. Compute the parent
         # set once and check membership per account.
@@ -1184,7 +1186,10 @@ class CoreMixin:
         # spend, not raw quantity. Pre-v1.3.0 a EUR expense account
         # budgeted at $X contributed raw EUR quantities to the
         # actuals comparison, wildly miscalibrating used_pct.
-        factors = self._account_conversion_factors(book)
+        # Factors anchored to ``period_end`` so a historical budget
+        # period values its actuals at the rate of that period —
+        # not today's.
+        factors = self._account_conversion_factors(book, period_end)
         actuals = Decimal("0")
         for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
@@ -1257,7 +1262,8 @@ class CoreMixin:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
         window_start = today - timedelta(days=days)
-        factors = self._account_conversion_factors(book)
+        # "Now" burn signal — anchor factors to today.
+        factors = self._account_conversion_factors(book, today)
         expenses = Decimal("0")
         for txn in transactions:
             if txn.post_date < window_start or txn.post_date > today:
@@ -1449,7 +1455,14 @@ class CoreMixin:
         wrong on any book with foreign-currency income/expense.
         """
         today = date.today()
-        factors = self._account_conversion_factors(book)
+        # Single factors map applied uniformly across the 12-month
+        # trajectory. Strictly per-month historical rates would
+        # require the same per-boundary restructure SB-1 calls for
+        # in net_worth's time series; deferred to keep this commit
+        # focused on the dropped-default-as_of fix. Threading
+        # ``today`` here documents the current uniform behavior
+        # rather than hiding it behind the old default.
+        factors = self._account_conversion_factors(book, today)
 
         # Build the calendar-month windows, oldest → newest. Plain
         # arithmetic on (year, month) avoids a dateutil dependency
@@ -1814,14 +1827,15 @@ class CoreMixin:
                     parent_guids.add(account.parent.guid)
 
             # --- Latest-price lookup for non-default-currency commodities ---
-            # Use the same shared helper balance_sheet uses, so the
-            # two surfaces agree on which price is "current" for
-            # every commodity — including the bookkeeper's
-            # intentional future-dated yfinance forecast entries.
-            # ``_rates_as_of(book)`` (no upper bound) already excludes
-            # piecash auto-created ``type='transaction'`` prices
-            # (cross-currency placeholders, not market quotes).
-            latest_prices: dict[str, Decimal] = self._rates_as_of(book)
+            # ``_rates_as_of(book, today)`` — the convention is
+            # future TRANSACTIONS are excluded (events haven't
+            # happened) but future PRICES are included
+            # (intentional forecasts). ``_anchor_for_as_of`` folds
+            # ``today`` to ``date.max`` so every forecast is in
+            # scope; the call site reads as "the now view."
+            latest_prices: dict[str, Decimal] = self._rates_as_of(
+                book, date.today(),
+            )
 
             # --- Account stats ---
             asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}

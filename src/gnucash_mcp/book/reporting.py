@@ -266,11 +266,13 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
-            # Convert each split to the book's default currency.
-            # Without this, a EUR expense in a USD-default book
-            # contributes raw EUR to the same totals dict as USD
-            # entries — silently wrong sums on multi-currency books.
-            factors = self._account_conversion_factors(book)
+            # Convert each split to the book's default currency at
+            # rates as of the period's end. Pre-v1.3 release the
+            # factors call omitted ``as_of`` and silently used
+            # today's rates regardless of the historical period
+            # being reported — wrong for any historical multi-
+            # currency view.
+            factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
@@ -339,10 +341,10 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
-            # Convert each split to the book's default currency.
-            # Multi-currency-book correctness: see spending_by_category
-            # for the rationale — same bug, same fix.
-            factors = self._account_conversion_factors(book)
+            # Convert each split to the book's default currency at
+            # rates as of the period's end — same historical-rates
+            # rationale as spending_by_category.
+            factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
@@ -403,7 +405,11 @@ class ReportingMixin:
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
         )
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
+            # Historical balance_sheet must use rates as of the same
+            # date the balances are computed for. Pre-v1.3 release
+            # this fetched today's rates against historical
+            # quantities — SB-2.
+            factors = self._account_conversion_factors(book, as_of_date)
             rows = self._query_filtered_splits(
                 book,
                 end_date=as_of_date,
@@ -444,10 +450,13 @@ class ReportingMixin:
             default_currency = self._require_default_currency(book)
             # Latest market rates keyed by commodity guid — same data
             # ``_market_value`` in get_book_summary uses for the per-
-            # account display. ``_rates_as_of(book)`` (no date filter)
-            # already excludes piecash auto-created ``type='transaction'``
-            # prices.
-            latest_rates = self._rates_as_of(book)
+            # account display. ``_rates_as_of`` excludes piecash
+            # auto-created ``type='transaction'`` prices. ``as_of=
+            # as_of_date`` so a historical balance sheet renders
+            # each non-default-currency holding at the rate it would
+            # have been valued at on the report date — not today's
+            # rate (SB-2).
+            latest_rates = self._rates_as_of(book, as_of_date)
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
@@ -637,7 +646,14 @@ class ReportingMixin:
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
+            # Factors anchored to ``end_date``. For point-in-time
+            # this is the right answer; for the time-series branch
+            # below the same uniform factors are applied to every
+            # boundary — wrong, but symmetrically wrong to the
+            # pre-fix behavior (which used today's rates uniformly).
+            # Commit 5 of this branch restructures the boundary
+            # sweep to use per-snapshot rates and closes SB-1.
+            factors = self._account_conversion_factors(book, end_date)
 
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
@@ -772,7 +788,9 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
-            factors = self._account_conversion_factors(book)
+            # Factors anchored to ``end_date`` — same historical-
+            # rates discipline as the period breakdowns.
+            factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
             outflows = Decimal("0")
             for split, _txn, acct in rows:
