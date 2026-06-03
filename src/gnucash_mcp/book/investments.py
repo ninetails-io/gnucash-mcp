@@ -51,6 +51,26 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
 
+            # Single pass over ``book.prices`` to build a latest-
+            # market-quote map keyed by commodity GUID. Pre-fix this
+            # method iterated ``book.prices`` without the
+            # ``_is_market_price`` filter, so a ``type='transaction'``
+            # placeholder newer than the user's last ``nav`` quote
+            # would shadow it (SB-11). The fix applies the predicate
+            # in this same single pass — same chokepoint, no N+1
+            # per-commodity query (Copilot-flagged on PR #95: a
+            # per-commodity ``_find_prices`` call would issue one DB
+            # query per commodity).
+            latest_market: dict[str, tuple[date, "Price"]] = {}
+            for p in book.prices:
+                if not _is_market_price(p):
+                    continue
+                key = p.commodity.guid
+                p_date = _to_date(p.date)
+                existing = latest_market.get(key)
+                if existing is None or p_date > existing[0]:
+                    latest_market[key] = (p_date, p)
+
             for commodity in book.commodities:
                 ns = commodity.namespace
                 if ns not in by_namespace:
@@ -62,18 +82,8 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                # Latest market quote for this commodity (any currency).
-                # ``_find_prices(market_only=True)`` is the chokepoint
-                # that skips piecash's auto-created ``type='transaction'``
-                # placeholder rows. Pre-fix this iterated ``book.prices``
-                # raw, so a placeholder newer than the user's last
-                # ``nav`` quote would shadow the real price in the
-                # commodities listing.
-                recent = self._find_prices(
-                    book, commodity_guid=commodity.guid,
-                )
-                if recent:
-                    price = recent[0]
+                if commodity.guid in latest_market:
+                    _, price = latest_market[commodity.guid]
                     entry["latest_price"] = {
                         "value": str(price.value),
                         "currency": price.currency.mnemonic,

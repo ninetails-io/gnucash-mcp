@@ -88,7 +88,7 @@ class QueryMixin:
         )
         if start_date is not None:
             q = q.filter(Transaction.post_date >= start_date)
-        if end_date is not None:
+        if end_date is not None and end_date < date.max:
             # piecash's ``_DateAsDateTime`` TypeDecorator stores
             # ``post_date`` as a DateTime with a 10:59:00
             # neutral-time component (see
@@ -104,6 +104,12 @@ class QueryMixin:
             # during Branch 1 validation. Using the day after as a
             # strict upper bound includes the full as_of date
             # regardless of stored time component.
+            #
+            # ``end_date == date.max`` is treated as "no upper bound"
+            # — ``date.max + timedelta(days=1)`` overflows. A caller
+            # passing ``date.max`` semantically wants every row,
+            # which is what dropping the filter does. Copilot-flagged
+            # on PR #95.
             q = q.filter(
                 Transaction.post_date < end_date + timedelta(days=1)
             )

@@ -934,3 +934,30 @@ class TestQueryEndDateInclusive:
             f"spending_by_category excluded same-day grocery "
             f"expense; result: {result}"
         )
+
+    def test_end_date_max_does_not_overflow(
+        self, test_book: Path,
+    ):
+        """``date.max`` upper bound must not raise OverflowError.
+
+        Copilot-flagged on PR #95: the day-after strict-upper-
+        bound trick (``end_date + timedelta(days=1)``) overflows
+        when ``end_date == date.max``. A caller passing
+        ``date.max`` semantically wants every row — the fix is to
+        skip the upper-bound filter entirely in that case
+        (equivalent to ``end_date is None``).
+
+        Verified end-to-end through ``balance_sheet`` since that's
+        the public surface a user could plausibly hit with a
+        far-future ``as_of_date``."""
+        gb = GnuCashBook(str(test_book))
+        # Both calls must succeed; ``balance_sheet(date.max)``
+        # should match a post-data anchor because all of
+        # ``test_book``'s transactions are well before either.
+        bs_max = gb.balance_sheet(date.max)
+        bs_post_data = gb.balance_sheet(date(2024, 12, 31))
+        assert bs_max["assets"]["total"] == bs_post_data["assets"]["total"], (
+            f"date.max balance sheet diverged from post-data anchor: "
+            f"max={bs_max['assets']['total']}, "
+            f"post-data={bs_post_data['assets']['total']}"
+        )
