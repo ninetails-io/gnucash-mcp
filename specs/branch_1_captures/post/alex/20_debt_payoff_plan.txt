@@ -1,0 +1,8 @@
+Kill order (USD 10,000/mo → debt-free Jun 2030, USD 55,309.86 interest):
+  1. Business Amex    USD 13,090.53  24.49%  payoff: mo 2    interest:    USD 394.46
+  2. Chase Sapphire   USD 22,127.25  21.49%  payoff: mo 5    interest:  USD 1,546.74
+  3. Mortgage        USD 371,743.79   6.25%  payoff: mo 47   interest: USD 52,296.05
+  4. Auto Loan         USD 7,769.98   5.49%  payoff: mo 48   interest:  USD 1,072.61
+YETI at this budget: 1.40x (USD 1 spent costs USD 1.40 in total debt impact)
+Total interest: USD 55,309.86
+Debt-free: June 2030

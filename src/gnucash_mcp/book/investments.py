@@ -23,6 +23,7 @@ from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
     _guid_prefix_map,
     _is_market_price,
+    _is_voided,
     _lot_to_compact_line,
     _to_date,
     _to_decimal,
@@ -50,13 +51,25 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
 
-            # Build a map of latest prices by commodity
-            latest_prices: dict[str, tuple] = {}
+            # Single pass over ``book.prices`` to build a latest-
+            # market-quote map keyed by commodity GUID. Pre-fix this
+            # method iterated ``book.prices`` without the
+            # ``_is_market_price`` filter, so a ``type='transaction'``
+            # placeholder newer than the user's last ``nav`` quote
+            # would shadow it (SB-11). The fix applies the predicate
+            # in this same single pass — same chokepoint, no N+1
+            # per-commodity query (Copilot-flagged on PR #95: a
+            # per-commodity ``_find_prices`` call would issue one DB
+            # query per commodity).
+            latest_market: dict[str, tuple[date, "Price"]] = {}
             for p in book.prices:
-                key = f"{p.commodity.namespace}:{p.commodity.mnemonic}"
+                if not _is_market_price(p):
+                    continue
+                key = p.commodity.guid
                 p_date = _to_date(p.date)
-                if key not in latest_prices or p_date > latest_prices[key][0]:
-                    latest_prices[key] = (p_date, p)
+                existing = latest_market.get(key)
+                if existing is None or p_date > existing[0]:
+                    latest_market[key] = (p_date, p)
 
             for commodity in book.commodities:
                 ns = commodity.namespace
@@ -69,9 +82,8 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                key = f"{ns}:{commodity.mnemonic}"
-                if key in latest_prices:
-                    _, price = latest_prices[key]
+                if commodity.guid in latest_market:
+                    _, price = latest_market[commodity.guid]
                     entry["latest_price"] = {
                         "value": str(price.value),
                         "currency": price.currency.mnemonic,
@@ -564,6 +576,14 @@ class InvestmentsMixin:
         sale_quantity = Decimal(0)
 
         for split in lot.splits:
+            # Voided splits are zombies — preserved for audit trail
+            # with quantity/value zeroed. Skip explicitly so the
+            # intent is documented and partial-corruption cases
+            # (state=v but quantity != 0) are also excluded. Pre-fix
+            # this worked by coincidence because zeroed quantity
+            # contributes 0 to either branch below.
+            if _is_voided(split):
+                continue
             if split.quantity > 0:
                 purchase_quantity += Decimal(str(split.quantity))
                 purchase_value += Decimal(str(split.value))
@@ -830,6 +850,18 @@ class InvestmentsMixin:
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
 
+            # Reject voided splits — they're zombies (quantity=0,
+            # value=0) and would attach a zero-contribution row to
+            # the lot, then immediately trip the auto-close check
+            # ``remaining == 0`` if no other splits exist. Better
+            # to refuse than to silently produce a degenerate lot.
+            if _is_voided(split):
+                raise ValueError(
+                    f"Cannot assign voided split {split_guid} to "
+                    f"a lot. Unvoid the transaction first, or "
+                    f"assign a different (active) split."
+                )
+
             lot = self._find_lot(book, lot_guid)
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
@@ -934,26 +966,29 @@ class InvestmentsMixin:
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
-                # Look up latest price inline (we're inside an open
-                # session). Indexed by commodity so we don't iterate
-                # every price in the book.
+                # Look up latest market price for this commodity in
+                # the book's default currency. Pre-fix this walk had
+                # two bugs: no ``_is_market_price`` filter (a
+                # ``type='transaction'`` placeholder could shadow
+                # real quotes — SB-11 placeholder portion) and no
+                # currency filter (a foreign-currency quote could
+                # mis-denominate proceeds against a default-currency
+                # cost basis — SB-11 currency portion). Routing
+                # through ``_find_prices`` with both filters fixes
+                # both at one chokepoint.
                 commodity = lot.account.commodity
-                candidates = book.session.query(Price).filter_by(
+                default_ccy = self._require_default_currency(book)
+                recent = self._find_prices(
+                    book,
                     commodity_guid=commodity.guid,
-                ).all()
-                latest_price = None
-                latest_date = None
-                for p in candidates:
-                    p_date = _to_date(p.date)
-                    if latest_date is None or p_date > latest_date:
-                        latest_date = p_date
-                        latest_price = p
-                if latest_price is None:
+                    currency_guid=default_ccy.guid,
+                )
+                if not recent:
                     raise ValueError(
                         f"No price found for {commodity.mnemonic}. "
                         "Provide sale_price explicitly."
                     )
-                price = Decimal(str(latest_price.value))
+                price = Decimal(str(recent[0].value))
 
             # Prorate cost basis on shares-to-sell. Avoids the precision
             # loss of ``cost_per_share * shares`` for non-round

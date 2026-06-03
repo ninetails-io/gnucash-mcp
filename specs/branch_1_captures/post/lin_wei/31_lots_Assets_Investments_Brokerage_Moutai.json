@@ -1,0 +1,24 @@
+[
+  {
+    "cost_basis": "6800.00",
+    "cost_per_share": "1700.0000",
+    "guid": "daa25506757f497b8c02d7129b26beca",
+    "is_closed": false,
+    "notes": "",
+    "original_cost_basis": "8500.00",
+    "quantity": "4.0000",
+    "remaining_cost_basis": "6800.00",
+    "title": "\u8305\u53f0 2024 purchase"
+  },
+  {
+    "cost_basis": "3440.00",
+    "cost_per_share": "1720.0000",
+    "guid": "cb55a385c306486b90a1097e5f754a0c",
+    "is_closed": false,
+    "notes": "",
+    "original_cost_basis": "3440.00",
+    "quantity": "2.0000",
+    "remaining_cost_basis": "3440.00",
+    "title": "\u8305\u53f0 2025-03 buy"
+  }
+]

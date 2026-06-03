@@ -1,0 +1,411 @@
+{
+  "account": "Assets:Current Assets:Checking Account",
+  "as_of_date": null,
+  "cleared_total": "0",
+  "count": 50,
+  "notice": "[Showing 50 of 1580 splits \u2014 narrow filters or set limit= higher]",
+  "splits": [
+    {
+      "amount": "-7.74",
+      "date": "2025-01-01",
+      "description": "Dry Cleaner",
+      "guid": "fd76e99614e74335aa72a176ee0dec06",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2850",
+      "date": "2025-01-01",
+      "description": "Mortgage payment - Chase",
+      "guid": "18c4865789eb47d6a4e91e7e78428642",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-12.01",
+      "date": "2025-01-03",
+      "description": "Lunch Spot",
+      "guid": "e3fd273b165f463186369870ca1b99f7",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-7.5",
+      "date": "2025-01-03",
+      "description": "Corner Store",
+      "guid": "1f8d3a18451d44fa8e0759b3374b0b97",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-10.92",
+      "date": "2025-01-04",
+      "description": "Parking Meter",
+      "guid": "d27b85dd0e2545b4b05402067abc1d1e",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-7.32",
+      "date": "2025-01-05",
+      "description": "Lunch Spot",
+      "guid": "e1d8ac1f19a049d7b7fa7a61f7a62298",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-8.33",
+      "date": "2025-01-05",
+      "description": "Vending Machine",
+      "guid": "bd56a7fbf6b04be1bd59e8980b541161",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-10.7",
+      "date": "2025-01-06",
+      "description": "Lunch Spot",
+      "guid": "9f45b53737a64562a0ed44b9138c3505",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-7.01",
+      "date": "2025-01-08",
+      "description": "Dry Cleaner",
+      "guid": "f11a2da10d9043779b5eb72f98988b81",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-12.18",
+      "date": "2025-01-08",
+      "description": "Food Cart",
+      "guid": "769aa7dc163a41baae2a12d3ba2961b5",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-14.15",
+      "date": "2025-01-08",
+      "description": "Vending Machine",
+      "guid": "22b82313c9204fe7b2f594358edcd31e",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-5.97",
+      "date": "2025-01-09",
+      "description": "Food Cart",
+      "guid": "025bf50b3a544375976b62aa0325ef07",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-4.28",
+      "date": "2025-01-09",
+      "description": "Vending Machine",
+      "guid": "e54e27249b724f6fa8efec9cfe31751e",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-8.97",
+      "date": "2025-01-09",
+      "description": "Corner Store",
+      "guid": "94559fb38fbb4da19767c745e7937efa",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-11.25",
+      "date": "2025-01-09",
+      "description": "Dry Cleaner",
+      "guid": "5c2edeeadfda499e882b83f35d4d15b7",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "2141.84",
+      "date": "2025-01-10",
+      "description": "Robin's Paycheck (UW Medical)",
+      "guid": "7807641831d6402384fac1ad0e63b4af",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-5.67",
+      "date": "2025-01-10",
+      "description": "Food Cart",
+      "guid": "26514d82d87b464f91694520b0188247",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-9.28",
+      "date": "2025-01-11",
+      "description": "Corner Store",
+      "guid": "84a349e83bc84838a97099be09564961",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-3.82",
+      "date": "2025-01-11",
+      "description": "Food Cart",
+      "guid": "7a95d8b530e44ba88738382ca58b8cb4",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2.91",
+      "date": "2025-01-13",
+      "description": "Drug Store",
+      "guid": "236b1f9b2bfc475ba6b31f9756d81eb8",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-4.18",
+      "date": "2025-01-14",
+      "description": "Dry Cleaner",
+      "guid": "26aeace998b949d3b3fe6aeba16d35dd",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-4.59",
+      "date": "2025-01-14",
+      "description": "Lunch Spot",
+      "guid": "1fb2068c379a4d50a826340e83b2ddeb",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-1.7",
+      "date": "2025-01-14",
+      "description": "Parking Meter",
+      "guid": "c323ea691db7493c9066f2ab6e63490f",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-6.28",
+      "date": "2025-01-14",
+      "description": "Lunch Spot",
+      "guid": "88eef5d4cc674d12bd3c68c720841514",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-14.07",
+      "date": "2025-01-15",
+      "description": "Food Cart",
+      "guid": "4253d4a2f6874da88b608355837aec81",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2.11",
+      "date": "2025-01-15",
+      "description": "Lunch Spot",
+      "guid": "ae982095317a4df2aeb72768c55be994",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-550",
+      "date": "2025-01-15",
+      "description": "Auto loan payment - Toyota Financial",
+      "guid": "ab3919ad791b49a087f9e8e80bcd93e5",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-11.57",
+      "date": "2025-01-16",
+      "description": "Lunch Spot",
+      "guid": "5b3a8d6722644c6499ae042ca788fcde",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-6.92",
+      "date": "2025-01-17",
+      "description": "Food Cart",
+      "guid": "e7c3c12ed4584a988a20d804fa5c655f",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2.46",
+      "date": "2025-01-17",
+      "description": "Food Cart",
+      "guid": "0a851800a5a746e0af023c9ec3cbd71a",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-14.04",
+      "date": "2025-01-17",
+      "description": "Parking Meter",
+      "guid": "3a49bb8fc4fb4147ba56865494a53020",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-5.05",
+      "date": "2025-01-17",
+      "description": "Drug Store",
+      "guid": "6b16c861e7bc492dbddc434fb289cd82",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-8.28",
+      "date": "2025-01-19",
+      "description": "Parking Meter",
+      "guid": "e73ad3432eac4826a59a6c75b6261665",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2.42",
+      "date": "2025-01-19",
+      "description": "News Stand",
+      "guid": "a8f263b0abc94808a18256e528196131",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-4.5",
+      "date": "2025-01-20",
+      "description": "Drug Store",
+      "guid": "2a1db076e8ec4332a65a3b269bcf41d4",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-14.95",
+      "date": "2025-01-20",
+      "description": "Corner Store",
+      "guid": "08f6df677d6b4e62b207b55f2e815c3f",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-11.13",
+      "date": "2025-01-20",
+      "description": "Parking Meter",
+      "guid": "950139a043744e18a10a1099c512cec1",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-7.14",
+      "date": "2025-01-20",
+      "description": "Parking Meter",
+      "guid": "dfdb02f023b04fb1b4f5651d4f5c2957",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-135",
+      "date": "2025-01-20",
+      "description": "PEMCO - auto insurance",
+      "guid": "9f44e70d24604ab78dd500b55c392ce3",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-80",
+      "date": "2025-01-20",
+      "description": "ATM withdrawal - Chase in-network",
+      "guid": "f200c19559d34694a54cce6853910062",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-2.61",
+      "date": "2025-01-21",
+      "description": "News Stand",
+      "guid": "04dde512769d47878dc9afc8234c11a1",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-1.75",
+      "date": "2025-01-22",
+      "description": "Transit Pass",
+      "guid": "cca326fded8d406e832ae7bd49e2dea5",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-13.77",
+      "date": "2025-01-22",
+      "description": "Drug Store",
+      "guid": "86147b0d683c40b196d4e10bae0cfc67",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-14.1",
+      "date": "2025-01-22",
+      "description": "Food Cart",
+      "guid": "e73236b9387b4927a35fdebbbc99ee12",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-8.88",
+      "date": "2025-01-22",
+      "description": "Drug Store",
+      "guid": "a200574108b342d3b380029ae10e469e",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-7.43",
+      "date": "2025-01-23",
+      "description": "Transit Pass",
+      "guid": "fa3fb1798445414693b83197cb8b9df1",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "2141.84",
+      "date": "2025-01-24",
+      "description": "Robin's Paycheck (UW Medical)",
+      "guid": "a6923cd9db38408685b7ce2e2d7a9ad4",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-8.97",
+      "date": "2025-01-24",
+      "description": "Morning Coffee",
+      "guid": "05d21dae38234b4594b75df3f46fc4c0",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-12.25",
+      "date": "2025-01-24",
+      "description": "Food Cart",
+      "guid": "c65d40fa4ed049039695c3e8ec345971",
+      "memo": "",
+      "reconcile_state": "n"
+    },
+    {
+      "amount": "-10.74",
+      "date": "2025-01-24",
+      "description": "Lunch Spot",
+      "guid": "2dfeb7205b0c4c7995e03ba811626dba",
+      "memo": "",
+      "reconcile_state": "n"
+    }
+  ],
+  "total": 1580,
+  "uncleared_total": "-13649.01"
+}

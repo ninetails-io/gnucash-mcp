@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
+    _is_voided,
     _split_to_compact_dict,
     _to_decimal,
     _transaction_to_dict,
@@ -82,6 +83,19 @@ class ReconciliationMixin:
             split = self._find_split(book, split_guid)
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
+
+            # Reject state changes on voided splits. Pre-fix the input
+            # gate accepted any of {n, c, y} regardless of current
+            # state, so a voided split could be moved to ``y`` — which
+            # zeroed the void marker and defeated
+            # ``unvoid_transaction``'s recovery path. To re-reconcile
+            # a previously-voided split the user must unvoid first.
+            if _is_voided(split):
+                raise ValueError(
+                    f"Cannot change reconcile state of voided split "
+                    f"{split_guid}. Unvoid the transaction first "
+                    f"(unvoid_transaction), then reconcile."
+                )
 
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_split_state_dict(split))
@@ -177,22 +191,26 @@ class ReconciliationMixin:
                 if as_of_date and split.transaction.post_date > as_of_date:
                     continue
 
-                # Only include non-reconciled splits (n or c, not y)
-                if split.reconcile_state != "y":
-                    split_dict = {
-                        "guid": split.guid,
-                        "date": split.transaction.post_date.isoformat(),
-                        "description": split.transaction.description,
-                        "amount": str(split.quantity),
-                        "reconcile_state": split.reconcile_state,
-                        "memo": split.memo or "",
-                    }
-                    all_unreconciled.append(split_dict)
+                # Include splits in states ``n`` or ``c`` only.
+                # Pre-fix the filter was ``state != "y"`` which admitted
+                # voided (state=``v``) splits as if they were pending
+                # bookkeeping work. ``_is_voided`` is the chokepoint.
+                if split.reconcile_state == "y" or _is_voided(split):
+                    continue
+                split_dict = {
+                    "guid": split.guid,
+                    "date": split.transaction.post_date.isoformat(),
+                    "description": split.transaction.description,
+                    "amount": str(split.quantity),
+                    "reconcile_state": split.reconcile_state,
+                    "memo": split.memo or "",
+                }
+                all_unreconciled.append(split_dict)
 
-                    if split.reconcile_state == "c":
-                        cleared_total += split.quantity
-                    else:
-                        uncleared_total += split.quantity
+                if split.reconcile_state == "c":
+                    cleared_total += split.quantity
+                else:
+                    uncleared_total += split.quantity
 
             unreconciled, notice = _apply_limit(
                 all_unreconciled,

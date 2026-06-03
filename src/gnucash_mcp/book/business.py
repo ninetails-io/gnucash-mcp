@@ -7658,13 +7658,11 @@ class BusinessMixin:
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            # Latest market rates for FX conversion. A book with
-            # USD vendors AND EUR vendors needs each bill's
-            # grand_total converted to default currency before
-            # summing — raw-sum across currencies is the same
-            # multi-currency bug spending_by_category and
-            # income_by_source carried until v1.3.0.
-            latest_rates = self._rates_as_of(book)
+            # Latest market rates for FX conversion as of the
+            # report period's end. Pre-v1.3 release this omitted
+            # ``as_of`` and used today's rates against historical
+            # vendor periods — SB-3.
+            latest_rates = self._rates_as_of(book, parsed_end)
 
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,

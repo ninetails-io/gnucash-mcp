@@ -795,8 +795,11 @@ class BudgetsMixin:
             # EUR + 100 USD as 200 in the parent's row. The conversion
             # helpers live on the unconditionally-composed
             # :class:`CurrencyMixin`, so they're available regardless
-            # of which ``--modules`` are enabled.
-            factors = self._account_conversion_factors(book)
+            # of which ``--modules`` are enabled. Anchored to the
+            # last period's end so historical budget periods value
+            # actuals at the rate they would have been valued at
+            # then — not today's (pre-fix bug, same shape as SB-2).
+            factors = self._account_conversion_factors(book, last_end)
 
             # Calculate actuals from transactions. Date filter pushed
             # to SQL via _query_filtered_splits — pre-fix the inner

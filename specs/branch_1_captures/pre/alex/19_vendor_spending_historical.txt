@@ -1,0 +1,2 @@
+BookkeepingCo  1 bill  USD 450 billed  USD 450 paid  USD 0 outstanding
+TOTAL          1 bill  USD 450 billed  USD 450 paid  USD 0 outstanding

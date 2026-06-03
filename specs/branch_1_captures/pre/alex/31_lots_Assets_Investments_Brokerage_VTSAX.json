@@ -1,0 +1,189 @@
+[
+  {
+    "cost_basis": "21600.00",
+    "cost_per_share": "120.0000",
+    "guid": "b8cea2d70a6a48f4aab49093d629c315",
+    "is_closed": false,
+    "notes": "Opening position at 2025-01-01, $120/share",
+    "original_cost_basis": "21600.00",
+    "quantity": "180.0000",
+    "remaining_cost_basis": "21600.00",
+    "title": "VTSAX core position"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "119.9990",
+    "guid": "825a87ca20794023a7a41d5351e9b8c1",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $120.00",
+    "original_cost_basis": "500.00",
+    "quantity": "4.1667",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-01"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "121.5008",
+    "guid": "a8b525dd0aa64149b776e5bc705e6b6e",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $121.50",
+    "original_cost_basis": "500.00",
+    "quantity": "4.1152",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-02"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "122.7988",
+    "guid": "ebdda3dbd9bf42e1b3cf90d88b85f5aa",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $122.80",
+    "original_cost_basis": "500.00",
+    "quantity": "4.0717",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-03"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "123.9987",
+    "guid": "f91555f54dd0422e9327e4906691a784",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $124.00",
+    "original_cost_basis": "500.00",
+    "quantity": "4.0323",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-04"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "125.2003",
+    "guid": "9e48b61af0d74c958766f9acd95bf567",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $125.20",
+    "original_cost_basis": "500.00",
+    "quantity": "3.9936",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-05"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "125.9985",
+    "guid": "db899e308a0e429ca08622ad9160bf7a",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $126.00",
+    "original_cost_basis": "500.00",
+    "quantity": "3.9683",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-06"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "124.4989",
+    "guid": "feb2967508fa46feab641d2a9443ae53",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $124.50",
+    "original_cost_basis": "500.00",
+    "quantity": "4.0161",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-07"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "121.9988",
+    "guid": "380dad600b574a60acc7e7518c24ba2f",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $122.00",
+    "original_cost_basis": "500.00",
+    "quantity": "4.0984",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-08"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "123.7991",
+    "guid": "75d4172967e34848b3b527a03da84888",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $123.80",
+    "original_cost_basis": "500.00",
+    "quantity": "4.0388",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-09"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "125.4989",
+    "guid": "a5b345622cc648f5b1a89dbc9ae22037",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $125.50",
+    "original_cost_basis": "500.00",
+    "quantity": "3.9841",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-10"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "126.8006",
+    "guid": "e7a2a386173b4d0ca4c539748c8fa8b9",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $126.80",
+    "original_cost_basis": "500.00",
+    "quantity": "3.9432",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-11"
+  },
+  {
+    "cost_basis": "500.00",
+    "cost_per_share": "128.0016",
+    "guid": "fd6ef3170394401584270dba61113bc7",
+    "is_closed": false,
+    "notes": "Monthly DCA \u2014 $500.00 @ $128.00",
+    "original_cost_basis": "500.00",
+    "quantity": "3.9062",
+    "remaining_cost_basis": "500.00",
+    "title": "VTSAX DCA 2025-12"
+  },
+  {
+    "cost_basis": "68.00",
+    "cost_per_share": "122.8102",
+    "guid": "ff1bfdf1d9524afaa77e3cff54ac1925",
+    "is_closed": false,
+    "notes": "Reinvested dividend \u2014 $68.00 @ $122.80",
+    "original_cost_basis": "68.00",
+    "quantity": "0.5537",
+    "remaining_cost_basis": "68.00",
+    "title": "VTSAX dividend 2025-03-15"
+  },
+  {
+    "cost_basis": "73.00",
+    "cost_per_share": "125.9924",
+    "guid": "7e6b7c0ef2f74c4b97e4889252748259",
+    "is_closed": false,
+    "notes": "Reinvested dividend \u2014 $73.00 @ $126.00",
+    "original_cost_basis": "73.00",
+    "quantity": "0.5794",
+    "remaining_cost_basis": "73.00",
+    "title": "VTSAX dividend 2025-06-15"
+  },
+  {
+    "cost_basis": "79.00",
+    "cost_per_share": "123.8050",
+    "guid": "f0098eadc5e34e12bc2616424d5e1dfe",
+    "is_closed": false,
+    "notes": "Reinvested dividend \u2014 $79.00 @ $123.80",
+    "original_cost_basis": "79.00",
+    "quantity": "0.6381",
+    "remaining_cost_basis": "79.00",
+    "title": "VTSAX dividend 2025-09-15"
+  },
+  {
+    "cost_basis": "84.00",
+    "cost_per_share": "128.0098",
+    "guid": "83ead742f4a843dc896ad379a37414dd",
+    "is_closed": false,
+    "notes": "Reinvested dividend \u2014 $84.00 @ $128.00",
+    "original_cost_basis": "84.00",
+    "quantity": "0.6562",
+    "remaining_cost_basis": "84.00",
+    "title": "VTSAX dividend 2025-12-15"
+  }
+]

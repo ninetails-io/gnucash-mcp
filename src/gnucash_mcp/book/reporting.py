@@ -266,11 +266,13 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
-            # Convert each split to the book's default currency.
-            # Without this, a EUR expense in a USD-default book
-            # contributes raw EUR to the same totals dict as USD
-            # entries — silently wrong sums on multi-currency books.
-            factors = self._account_conversion_factors(book)
+            # Convert each split to the book's default currency at
+            # rates as of the period's end. Pre-v1.3 release the
+            # factors call omitted ``as_of`` and silently used
+            # today's rates regardless of the historical period
+            # being reported — wrong for any historical multi-
+            # currency view.
+            factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
@@ -339,10 +341,10 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
-            # Convert each split to the book's default currency.
-            # Multi-currency-book correctness: see spending_by_category
-            # for the rationale — same bug, same fix.
-            factors = self._account_conversion_factors(book)
+            # Convert each split to the book's default currency at
+            # rates as of the period's end — same historical-rates
+            # rationale as spending_by_category.
+            factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
@@ -403,7 +405,11 @@ class ReportingMixin:
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
         )
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
+            # Historical balance_sheet must use rates as of the same
+            # date the balances are computed for. Pre-v1.3 release
+            # this fetched today's rates against historical
+            # quantities — SB-2.
+            factors = self._account_conversion_factors(book, as_of_date)
             rows = self._query_filtered_splits(
                 book,
                 end_date=as_of_date,
@@ -444,10 +450,13 @@ class ReportingMixin:
             default_currency = self._require_default_currency(book)
             # Latest market rates keyed by commodity guid — same data
             # ``_market_value`` in get_book_summary uses for the per-
-            # account display. ``_rates_as_of(book)`` (no date filter)
-            # already excludes piecash auto-created ``type='transaction'``
-            # prices.
-            latest_rates = self._rates_as_of(book)
+            # account display. ``_rates_as_of`` excludes piecash
+            # auto-created ``type='transaction'`` prices. ``as_of=
+            # as_of_date`` so a historical balance sheet renders
+            # each non-default-currency holding at the rate it would
+            # have been valued at on the report date — not today's
+            # rate (SB-2).
+            latest_rates = self._rates_as_of(book, as_of_date)
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
@@ -637,10 +646,9 @@ class ReportingMixin:
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
-
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
+                factors = self._account_conversion_factors(book, end_date)
                 rows = self._query_filtered_splits(
                     book,
                     end_date=end_date,
@@ -661,7 +669,7 @@ class ReportingMixin:
                     "net_worth": str(total),
                 }
 
-            # --- Time series: single sweep, cumulative sum.
+            # --- Time series: single sweep, per-boundary valuation.
             if interval not in ("month", "quarter", "year"):
                 raise ValueError(
                     f"Invalid interval: {interval}. "
@@ -685,11 +693,31 @@ class ReportingMixin:
             if not boundaries or boundaries[-1] != end_date:
                 boundaries.append(end_date)
 
+            # Per-boundary factors. Pre-v1.3 (and through commit 4 of
+            # this branch) this method computed a single factors map
+            # outside the sweep and applied it uniformly to every
+            # boundary — wrong, because each historical snapshot
+            # should be valued at the rate of its own date, not
+            # today's (SB-1). Pre-computing here trades O(boundaries)
+            # extra factors-builds for correctness: each call walks
+            # ``book.prices`` once with a different upper-bound date.
+            factors_by_boundary: dict[date, dict[str, Decimal | None]] = {
+                b: self._account_conversion_factors(book, b)
+                for b in boundaries
+            }
+
             # Pull every asset/liability split up through end_date in
-            # post_date order, then sweep once: as we cross each
-            # boundary, snapshot the running total. This replaces what
-            # was previously T × N (intervals × accounts × splits) with
-            # a single O(splits + intervals) pass.
+            # post_date order. With per-boundary factors the same
+            # split contributes a different default-currency value at
+            # each boundary (factor × quantity for boundaries that
+            # have a rate on file, split.value fallback for boundaries
+            # that don't). We can't carry a single ``running`` total
+            # forward like the pre-fix algorithm did; instead we track
+            # per-account quantity AND value running totals and
+            # convert at snapshot time using that boundary's factors.
+            # Cost: O(splits + boundaries × accounts_with_splits) —
+            # still much cheaper than the original O(intervals × splits)
+            # and correct under per-boundary rates.
             rows = self._query_filtered_splits(
                 book,
                 end_date=end_date,
@@ -697,33 +725,60 @@ class ReportingMixin:
                 order_by_post_date=True,
             )
 
+            running_qty: dict[str, Decimal] = {}
+            running_value: dict[str, Decimal] = {}
+
+            def _snapshot_at(boundary: date) -> Decimal:
+                """Net worth at ``boundary`` using factors as of that
+                date. Per-account: factor × quantity when a rate is
+                on file; cost-basis fallback (split.value sum)
+                otherwise — same disambiguation
+                ``_split_in_default_currency`` uses per-split, lifted
+                to per-account so the boundary sweep stays a single
+                pass over the splits."""
+                factors_here = factors_by_boundary[boundary]
+                total = Decimal("0")
+                for acct_guid, qty in running_qty.items():
+                    factor = factors_here.get(acct_guid)
+                    if factor is not None:
+                        total += qty * factor
+                    else:
+                        total += running_value[acct_guid]
+                return total
+
             series: list[dict] = []
-            running = Decimal("0")
             b_idx = 0
 
             for split, txn, account in rows:
-                # For each boundary that sits before this split's
-                # post_date, the running total is already correct —
-                # snapshot it and advance.
+                # Snapshot every boundary strictly before this split.
                 while (
                     b_idx < len(boundaries)
                     and txn.post_date > boundaries[b_idx]
                 ):
                     series.append({
                         "date": boundaries[b_idx].isoformat(),
-                        "net_worth": str(running),
+                        "net_worth": str(_snapshot_at(boundaries[b_idx])),
                     })
                     b_idx += 1
-                running += self._split_in_default_currency(
-                    split, account, factors.get(account.guid)
+                # Accumulate per-account quantity AND value. Both are
+                # kept so ``_snapshot_at`` can pick the right view
+                # (rate-based vs cost-basis) at each boundary.
+                acct_guid = account.guid
+                running_qty[acct_guid] = (
+                    running_qty.get(acct_guid, Decimal("0"))
+                    + Decimal(str(split.quantity))
+                )
+                running_value[acct_guid] = (
+                    running_value.get(acct_guid, Decimal("0"))
+                    + Decimal(str(split.value))
                 )
 
-            # Drain any boundaries past the last split — they all see
-            # the final running total.
+            # Drain any boundaries past the last split — same running
+            # totals, but each boundary still uses its own factors.
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
-                    "net_worth": str(running),
+                    "net_worth": str(_snapshot_at(boundaries[b_idx])),
                 })
                 b_idx += 1
 
@@ -772,7 +827,9 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
-            factors = self._account_conversion_factors(book)
+            # Factors anchored to ``end_date`` — same historical-
+            # rates discipline as the period breakdowns.
+            factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
             outflows = Decimal("0")
             for split, _txn, acct in rows:

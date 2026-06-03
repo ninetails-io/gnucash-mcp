@@ -119,26 +119,58 @@ class CurrencyMixin:
             prices = [p for p in prices if _is_market_price(p)]
         return prices
 
+    @staticmethod
+    def _anchor_for_as_of(as_of: date) -> date:
+        """Translate a report's ``as_of`` into the date used for
+        market-price filtering.
+
+        The convention (locked by the cross-tool agreement test in
+        ``TestCrossToolPriceAgreement``): future-dated TRANSACTIONS
+        are excluded from "now" balances (events haven't happened
+        yet) but future-dated PRICES are INCLUDED in "now"
+        valuations — they're intentional forecasts the bookkeeper
+        wrote, the most authoritative rate they have on file. So
+        any anchor at or beyond today folds to ``date.max`` so
+        every forecast is in scope; past anchors stay literal for
+        historical reconstruction.
+
+        Every report-level caller of ``_account_conversion_factors``
+        and ``_rates_as_of`` runs its ``as_of`` through this helper
+        first so the convention is enforced exactly once. Pre-v1.3
+        release the convention was implicit in the ``as_of=None``
+        default; now that the default is gone, the helper is the
+        explicit home for it.
+        """
+        return date.max if as_of >= date.today() else as_of
+
     def _rates_as_of(
         self,
         book: piecash.Book,
-        as_of: date | None = None,
+        as_of: date,
         default_currency: piecash.Commodity | None = None,
     ) -> dict[str, Decimal]:
-        """Latest user-supplied rate per non-default-currency commodity.
+        """Latest user-supplied rate per non-default-currency commodity,
+        as of a specific date.
 
         Returns ``{commodity_guid: Decimal rate}``. Each rate is the
         most recent market price (skipping ``type='transaction'``
         auto-placeholders) of the commodity quoted in the book's
-        default currency.
+        default currency, filtered to dates per
+        :meth:`_anchor_for_as_of` — past anchors stay literal,
+        anchors at or beyond today fold to ``date.max`` so future-
+        dated forecast prices are included (convention).
 
         Args:
             book: Open piecash book.
-            as_of: When set, restrict to prices on or before this
-                date. When ``None`` (default), no upper bound — returns
-                the absolute latest rate per commodity, including
-                future-dated forecasts the bookkeeper has deliberately
-                written.
+            as_of: Upper bound on the price date. **Required** — pre-
+                v1.3 release this defaulted to ``None`` (no upper
+                bound, i.e. always-latest rates). Five historical-
+                report sites passed nothing and silently used today's
+                rates regardless of report date; the default has been
+                dropped so every caller must declare its intent. Pass
+                the report's as_of / end_date; the
+                ``_anchor_for_as_of`` helper handles the "include
+                future forecasts at now-or-future anchors" convention.
             default_currency: The book's default currency. Computed
                 via :meth:`_require_default_currency` when ``None``.
 
@@ -147,6 +179,7 @@ class CurrencyMixin:
             qualifying price don't appear; callers fall back to
             ``split.value`` (cost basis) or skip the account.
         """
+        anchor = self._anchor_for_as_of(as_of)
         if default_currency is None:
             default_currency = self._require_default_currency(book)
         latest: dict[str, tuple[date, Decimal]] = {}
@@ -156,7 +189,7 @@ class CurrencyMixin:
             if not _is_market_price(p):
                 continue
             p_date = _to_date(p.date)
-            if as_of is not None and p_date > as_of:
+            if p_date > anchor:
                 continue
             key = p.commodity.guid
             existing = latest.get(key)
@@ -167,25 +200,36 @@ class CurrencyMixin:
     def _account_conversion_factors(
         self,
         book: piecash.Book,
+        as_of: date,
     ) -> dict[str, Decimal | None]:
-        """Map ``{account_guid: factor}`` for default-currency conversion.
+        """Map ``{account_guid: factor}`` for default-currency conversion
+        as of ``as_of``.
 
         ``factor * split.quantity = amount in default currency``.
 
         - ``Decimal("1")`` — the account is already in default currency.
-        - A non-unit ``Decimal`` — the most recent market rate for the
-          account's commodity in default currency.
-        - ``None`` — no rate on file. Callers should fall back to
-          ``split.value`` (transaction-currency amount), which equals
-          cost basis for default-currency-denominated investment buys
-          and degrades gracefully for foreign-currency holdings.
+        - A non-unit ``Decimal`` — the most recent market rate ≤
+          ``as_of`` for the account's commodity in default currency.
+        - ``None`` — no qualifying rate on file. Callers should fall
+          back to ``split.value`` (transaction-currency amount), which
+          equals cost basis for default-currency-denominated
+          investment buys and degrades gracefully for foreign-currency
+          holdings.
+
+        ``as_of`` is required: pre-v1.3 release this took only
+        ``book`` and silently fetched today's rates regardless of the
+        caller's report date. Every caller now declares the date its
+        valuation is anchored to — historical reports use historical
+        rates, "now" helpers pass ``date.today()`` explicitly.
 
         Template accounts (under ``book.root_template``) are excluded
         from the map — they're scheduled-transaction scaffolding, not
         user-facing accounts.
         """
         default_currency = self._require_default_currency(book)
-        rates = self._rates_as_of(book, default_currency=default_currency)
+        rates = self._rates_as_of(
+            book, as_of, default_currency=default_currency,
+        )
         template_guids = self._template_account_guids(book)
         factors: dict[str, Decimal | None] = {}
         for acct in book.accounts:
