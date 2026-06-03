@@ -68,6 +68,43 @@ def _slot_value_str(value) -> str:
     return str(value)
 
 
+def _is_voided(split) -> bool:
+    """True iff ``split`` carries GnuCash's voided marker.
+
+    GnuCash's void operation preserves the split for audit trail
+    purposes: ``reconcile_state`` is set to ``"v"`` and both
+    ``value`` and ``quantity`` are zeroed. Code that iterates
+    splits to compute balances, surface unreconciled counts, or
+    validate lot positions must filter voided splits out — they
+    are zombies, not part of the user's active ledger.
+
+    Single source of truth for "is this split voided." Pre-v1.3
+    release five iteration sites disagreed:
+
+    - ``get_unreconciled_splits`` used ``state != "y"`` (admitting
+      voided as "unreconciled")
+    - ``get_book_summary``'s reconciliation backlog count: same bug
+    - ``set_reconcile_state`` had no state guard (could move a
+      voided split to ``"y"``, defeating ``unvoid_transaction``)
+    - ``assign_split_to_lot`` had no state guard (let voided
+      splits attach to lots)
+    - ``_lot_decimals`` had no explicit filter (worked by
+      coincidence because voided splits contribute 0 either side
+      of its branch, but didn't document the intent or guard
+      against the corruption case)
+
+    Routing every site through this predicate enforces the
+    convention exactly once. The check is intentionally state-only;
+    if a split has ``state == "v"`` but ``value != 0`` (data
+    corruption from a partially-applied void) this still returns
+    True and callers treat it as voided. The inverse — ``value ==
+    0`` with ``state != "v"`` — is treated as not voided (legitimate
+    zero-value splits exist, e.g. informational splits a user adds
+    by hand to a transaction).
+    """
+    return split.reconcile_state == "v"
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 

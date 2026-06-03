@@ -23,6 +23,7 @@ from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
     _guid_prefix_map,
     _is_market_price,
+    _is_voided,
     _lot_to_compact_line,
     _to_date,
     _to_decimal,
@@ -565,6 +566,14 @@ class InvestmentsMixin:
         sale_quantity = Decimal(0)
 
         for split in lot.splits:
+            # Voided splits are zombies — preserved for audit trail
+            # with quantity/value zeroed. Skip explicitly so the
+            # intent is documented and partial-corruption cases
+            # (state=v but quantity != 0) are also excluded. Pre-fix
+            # this worked by coincidence because zeroed quantity
+            # contributes 0 to either branch below.
+            if _is_voided(split):
+                continue
             if split.quantity > 0:
                 purchase_quantity += Decimal(str(split.quantity))
                 purchase_value += Decimal(str(split.value))
@@ -830,6 +839,18 @@ class InvestmentsMixin:
             split = self._find_split(book, split_guid)
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
+
+            # Reject voided splits — they're zombies (quantity=0,
+            # value=0) and would attach a zero-contribution row to
+            # the lot, then immediately trip the auto-close check
+            # ``remaining == 0`` if no other splits exist. Better
+            # to refuse than to silently produce a degenerate lot.
+            if _is_voided(split):
+                raise ValueError(
+                    f"Cannot assign voided split {split_guid} to "
+                    f"a lot. Unvoid the transaction first, or "
+                    f"assign a different (active) split."
+                )
 
             lot = self._find_lot(book, lot_guid)
             if not lot:

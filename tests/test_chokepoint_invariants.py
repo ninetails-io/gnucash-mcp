@@ -6,7 +6,7 @@ catalogues:
 
 - ``TestResolveAccountTemplateFilter`` — SB-12
 - ``TestMarketPriceFilter`` — SB-11
-- ``TestIsVoidedConsistency`` — SB-13, SB-14, HP-3 (added in commit 3)
+- ``TestIsVoidedConsistency`` — SB-13, SB-14, HP-3
 - ``TestRatesAsOfRequiresDate`` — SB-2, SB-3, SB-4 (added in commit 4)
 - ``TestNetWorthSeriesPerBoundaryRates`` — SB-1 (added in commit 5)
 
@@ -22,6 +22,7 @@ import piecash
 import pytest
 
 from gnucash_mcp.book import GnuCashBook
+from gnucash_mcp.book._base import _is_voided
 
 
 class TestResolveAccountTemplateFilter:
@@ -336,3 +337,187 @@ class TestMarketPriceFilter:
         assert proceeds < Decimal("5000"), (
             f"EUR-denominated quote was used for USD proceeds: {result}"
         )
+
+
+class TestIsVoidedConsistency:
+    """SB-13, SB-14, HP-3: voided splits are zombies kept for audit
+    trail (state='v', value=0, quantity=0). Five iteration sites
+    that previously disagreed on what "voided" meant now route
+    through ``_is_voided``.
+
+    Pre-fix some sites used ``state != "y"`` (admitting voided),
+    some used ``value != 0`` (excluding voided), some had no filter
+    at all. That let ``set_reconcile_state`` silently move a voided
+    split to ``y`` (defeating ``unvoid_transaction``),
+    ``get_unreconciled_splits`` and the dashboard's reconciliation
+    backlog count zombies as pending work, ``assign_split_to_lot``
+    attach a voided split to a lot, and ``_lot_decimals`` work only
+    by coincidence.
+    """
+
+    # ── Predicate unit tests ──
+
+    def test_predicate_true_for_voided_state(self):
+        """``state == "v"`` → predicate returns True."""
+        class Fake:
+            reconcile_state = "v"
+            value = Decimal("0")
+            quantity = Decimal("0")
+        assert _is_voided(Fake()) is True
+
+    def test_predicate_false_for_normal_states(self):
+        """``n`` / ``c`` / ``y`` → predicate returns False."""
+        class Fake:
+            reconcile_state = ""
+        for state in ("n", "c", "y"):
+            Fake.reconcile_state = state
+            assert _is_voided(Fake()) is False, f"state {state!r} misread"
+
+    def test_predicate_true_even_when_value_nonzero(self):
+        """Partial-corruption case: state='v' but value/quantity
+        weren't zeroed. The predicate is state-only and still
+        catches the void marker — the safer behavior, because the
+        user's intent (``void this``) is preserved as the source
+        of truth."""
+        class Fake:
+            reconcile_state = "v"
+            value = Decimal("100")
+            quantity = Decimal("50")
+        assert _is_voided(Fake()) is True
+
+    # ── Application sites ──
+
+    @pytest.fixture
+    def book_with_voided_groceries(self, test_book: Path) -> Path:
+        """Standard test_book with the 'Weekly Groceries' transaction
+        voided. test_book has 3 transactions seeded; this fixture
+        voids one so we can verify each application site filters
+        the zombie splits."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=True) as pb:
+            grocery_txn = next(
+                t for t in pb.transactions
+                if t.description == "Weekly Groceries"
+            )
+            txn_guid = grocery_txn.guid
+        gb.void_transaction(txn_guid, reason="test setup")
+        return test_book
+
+    def test_set_reconcile_state_rejects_voided(
+        self, book_with_voided_groceries,
+    ):
+        """SB-13: ``set_reconcile_state`` must refuse to change the
+        state of a voided split. Pre-fix the input validator
+        accepted ``state in {n, c, y}`` regardless of current
+        state, so a caller could clear the void marker by moving
+        the split to ``y`` — silently zeroing the recovery path
+        that ``unvoid_transaction`` depends on."""
+        gb = GnuCashBook(str(book_with_voided_groceries))
+        with gb.open(readonly=True) as pb:
+            voided_split = next(
+                s for t in pb.transactions
+                for s in t.splits
+                if _is_voided(s)
+            )
+            split_guid = voided_split.guid
+        with pytest.raises(ValueError, match="voided"):
+            gb.set_reconcile_state(split_guid, "y")
+
+    def test_get_unreconciled_splits_excludes_voided(
+        self, book_with_voided_groceries,
+    ):
+        """HP-3: ``get_unreconciled_splits`` must exclude voided
+        splits from the unreconciled list. Pre-fix the filter was
+        ``state != "y"``, which admitted voided splits as if they
+        were still pending bookkeeping work."""
+        gb = GnuCashBook(str(book_with_voided_groceries))
+        result = gb.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        for s in result["splits"]:
+            assert s["reconcile_state"] != "v", (
+                f"voided split surfaced as unreconciled: {s}"
+            )
+
+    def test_reconciliation_backlog_excludes_voided(
+        self, book_with_voided_groceries,
+    ):
+        """HP-3: the dashboard's reconciliation backlog count must
+        exclude voided splits. ``_account_reconciliation_status``
+        feeds ``get_book_summary``'s Reconciliation section.
+
+        Pre-fix the count was ``state != "y"`` and counted zombies
+        as pending work, inflating the "N splits unreconciled"
+        signal the LLM uses to plan reconciliation sessions.
+        """
+        gb = GnuCashBook(str(book_with_voided_groceries))
+        with gb.open(readonly=True) as pb:
+            results = gb._account_reconciliation_status(
+                pb, list(pb.accounts),
+            )
+
+            # Confirm the fixture produced what we expect: the
+            # voided transaction left a zombie split on Checking
+            # plus opening + salary = 3 splits, 1 voided.
+            checking = next(
+                a for a in pb.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            voided_count = sum(
+                1 for s in checking.splits if _is_voided(s)
+            )
+            assert voided_count == 1, (
+                "fixture didn't produce expected voided split"
+            )
+
+        # The Checking entry's unreconciled_count must NOT include
+        # the voided split. Two non-voided splits (opening +
+        # salary) survived the void.
+        checking_entry = next(
+            r for r in results if r["account"] == "Assets:Checking"
+        )
+        assert checking_entry["unreconciled_count"] == 2, (
+            f"voided split was counted as unreconciled: "
+            f"{checking_entry}"
+        )
+
+    def test_assign_split_to_lot_rejects_voided(
+        self, investment_book: Path,
+    ):
+        """SB-14 / HP-3: ``assign_split_to_lot`` must refuse a
+        voided split. Pre-fix no state guard existed, so a voided
+        (zero-quantity) split could attach to a lot and either
+        trip the auto-close path immediately or sit as a
+        zero-contribution row that downstream callers had to
+        special-case."""
+        gb = GnuCashBook(str(investment_book))
+        # Buy 10 VTSAX, then void the buy transaction. The buy
+        # split is left on the VTSAX account with state='v'.
+        buy = gb.create_transaction(
+            description="VTSAX buy",
+            splits=[
+                {
+                    "account": "Assets:Investments:VTSAX",
+                    "amount": "1000.00", "quantity": "10.0000",
+                },
+                {"account": "Assets:Checking", "amount": "-1000.00"},
+            ],
+            trans_date=date(2026, 1, 10),
+        )
+        gb.void_transaction(buy["guid"], reason="test")
+
+        lot = gb.create_lot(
+            "Assets:Investments:VTSAX", title="Test lot",
+        )
+        with gb.open(readonly=True) as pb:
+            vtsax = next(
+                a for a in pb.accounts
+                if a.fullname == "Assets:Investments:VTSAX"
+            )
+            voided_split = next(
+                s for s in vtsax.splits if _is_voided(s)
+            )
+            split_guid = voided_split.guid
+
+        with pytest.raises(ValueError, match="voided"):
+            gb.assign_split_to_lot(split_guid, lot["guid"])

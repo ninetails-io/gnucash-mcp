@@ -35,6 +35,7 @@ from gnucash_mcp.book._base import (
     _account_to_dict,
     _guid_prefix_map,
     _is_market_price,
+    _is_voided,
     _split_to_compact_dict,
     _split_to_dict,
     _to_decimal,
@@ -325,9 +326,13 @@ class CoreMixin:
             # month." 'c' (cleared) splits count as unreconciled
             # for this purpose; they're not finalized.
             if latest_y_date is None:
+                # Voided splits are excluded — they're zombies from
+                # void_transaction, not pending bookkeeping work. Pre-
+                # fix the filter was ``state != "y"`` which counted
+                # them; ``_is_voided`` is now the chokepoint.
                 unreconciled_count = sum(
                     1 for s in account.splits
-                    if s.reconcile_state != "y"
+                    if s.reconcile_state != "y" and not _is_voided(s)
                 )
                 results.append({
                     "account": account.fullname,
@@ -340,6 +345,7 @@ class CoreMixin:
                 unreconciled_count = sum(
                     1 for s in account.splits
                     if s.reconcile_state != "y"
+                    and not _is_voided(s)
                     and s.transaction.post_date > latest_y_date
                 )
                 results.append({
