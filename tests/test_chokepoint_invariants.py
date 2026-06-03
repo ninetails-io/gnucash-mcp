@@ -5,7 +5,7 @@ single enforcement point. They map 1:1 to the bug classes the spec
 catalogues:
 
 - ``TestResolveAccountTemplateFilter`` — SB-12
-- ``TestMarketPriceFilter`` — SB-11 (added in commit 2)
+- ``TestMarketPriceFilter`` — SB-11
 - ``TestIsVoidedConsistency`` — SB-13, SB-14, HP-3 (added in commit 3)
 - ``TestRatesAsOfRequiresDate`` — SB-2, SB-3, SB-4 (added in commit 4)
 - ``TestNetWorthSeriesPerBoundaryRates`` — SB-1 (added in commit 5)
@@ -14,8 +14,11 @@ If any of these tests starts failing without an intentional change to
 the chokepoint, the bug class is open again.
 """
 
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
+import piecash
 import pytest
 
 from gnucash_mcp.book import GnuCashBook
@@ -149,3 +152,187 @@ class TestResolveAccountTemplateFilter:
                 f"path={results[0]!r}, short={results[1]!r}, "
                 f"full={results[2]!r}"
             )
+
+
+class TestMarketPriceFilter:
+    """SB-11: ``list_commodities`` and ``calculate_lot_gain`` must
+    skip piecash's ``type='transaction'`` auto-placeholder prices,
+    and ``calculate_lot_gain`` must filter to the book's default
+    currency.
+
+    Pre-fix both methods walked ``book.prices`` raw. A placeholder
+    newer than the user's last ``nav`` quote shadowed it as the
+    "latest price", and a foreign-currency quote on the same
+    commodity could be picked to compute default-currency proceeds —
+    mis-denominating the gain. Pre-state captured in
+    ``specs/branch_1_captures/pre/*/50_list_commodities.json`` and
+    ``…/51_calculate_lot_gain.json``.
+
+    Post-fix both routes through ``CurrencyMixin._find_prices`` with
+    ``market_only=True`` (and currency filter where applicable),
+    making the chokepoint the single source of truth for "give me
+    the right prices for this commodity."
+    """
+
+    @pytest.fixture
+    def book_with_vtsax_lot(self, investment_book: Path) -> tuple[Path, str]:
+        """Investment book with a VTSAX buy and lot wired up.
+
+        Buy: 10 shares at $100 each on 2026-01-10 (cost basis $1000).
+        The fixture already has a 2026-01-15 nav price of $125, so
+        the lot's expected market value is $1250.
+        """
+        with piecash.open_book(
+            str(investment_book), readonly=False, do_backup=False,
+        ) as book:
+            usd = book.default_currency
+            vtsax_acct = next(
+                a for a in book.accounts
+                if a.fullname == "Assets:Investments:VTSAX"
+            )
+            checking = next(
+                a for a in book.accounts
+                if a.fullname == "Assets:Checking"
+            )
+
+            buy = piecash.Transaction(
+                currency=usd,
+                description="VTSAX buy",
+                post_date=date(2026, 1, 10),
+                splits=[
+                    piecash.Split(
+                        account=vtsax_acct,
+                        value=Decimal("1000.00"),
+                        quantity=Decimal("10.0000"),
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value=Decimal("-1000.00"),
+                    ),
+                ],
+            )
+            book.session.add(buy)
+            book.save()
+
+            from piecash.core.transaction import Lot
+            lot = Lot(
+                title="Test lot",
+                account=vtsax_acct,
+                is_closed=0,
+            )
+            book.session.add(lot)
+            buy_split = next(
+                s for s in buy.splits if s.account == vtsax_acct
+            )
+            buy_split.lot = lot
+            book.save()
+
+            lot_guid = lot.guid
+
+        return investment_book, lot_guid
+
+    @staticmethod
+    def _add_vtsax_price(
+        book_path: Path, value: str, p_date: date, p_type: str,
+        currency_mnemonic: str | None = None,
+    ) -> None:
+        """Insert a VTSAX price row directly via piecash.
+
+        ``currency_mnemonic=None`` uses the book default. Pass
+        ``p_type='transaction'`` to simulate piecash's auto-created
+        placeholder rows; ``'nav'`` for a real user-supplied quote.
+        """
+        with piecash.open_book(
+            str(book_path), readonly=False, do_backup=False,
+        ) as book:
+            vtsax = book.commodities.get(
+                mnemonic="VTSAX", namespace="FUND",
+            )
+            if currency_mnemonic is None:
+                ccy = book.default_currency
+            else:
+                from piecash import factories
+                ccy = factories.create_currency_from_ISO(currency_mnemonic)
+                book.session.add(ccy)
+            piecash.Price(
+                commodity=vtsax,
+                currency=ccy,
+                date=p_date,
+                value=Decimal(value),
+                type=p_type,
+                source="user:test",
+            )
+            book.save()
+
+    def test_list_commodities_skips_transaction_placeholders(
+        self, book_with_vtsax_lot,
+    ):
+        """A ``type='transaction'`` placeholder newer than the user's
+        last ``nav`` quote must NOT appear as ``latest_price`` on the
+        commodity. Pre-fix it did — the iteration over ``book.prices``
+        picked whatever was newest regardless of type."""
+        book_path, _ = book_with_vtsax_lot
+        # Placeholder dated 2026-06-01, ~5 months past the 2026-01-15
+        # nav of $125. Pre-fix the placeholder would win.
+        self._add_vtsax_price(
+            book_path, value="0.99", p_date=date(2026, 6, 1),
+            p_type="transaction",
+        )
+
+        gb = GnuCashBook(str(book_path))
+        result = gb.list_commodities(compact=False)
+        vtsax_entry = next(
+            e for entries in result["commodities"].values()
+            for e in entries if e["mnemonic"] == "VTSAX"
+        )
+        assert vtsax_entry["latest_price"]["date"] == "2026-01-15", (
+            f"placeholder shadowed real nav quote: "
+            f"{vtsax_entry['latest_price']}"
+        )
+
+    def test_calculate_lot_gain_skips_transaction_placeholders(
+        self, book_with_vtsax_lot,
+    ):
+        """``calculate_lot_gain`` must skip placeholders when picking
+        the default sale price. Pre-fix a $0.99 placeholder would
+        produce nonsense proceeds; post-fix the $125 nav wins."""
+        book_path, lot_guid = book_with_vtsax_lot
+        self._add_vtsax_price(
+            book_path, value="0.99", p_date=date(2026, 6, 1),
+            p_type="transaction",
+        )
+
+        gb = GnuCashBook(str(book_path))
+        result = gb.calculate_lot_gain(lot_guid=lot_guid)
+        # Expected proceeds: 10 shares × $125 = $1250.
+        # Placeholder-shadowed: 10 × $0.99 = $9.90.
+        proceeds = Decimal(result["sale_proceeds"])
+        assert proceeds > Decimal("1000"), (
+            f"placeholder was used for proceeds: {result}"
+        )
+
+    def test_calculate_lot_gain_filters_to_default_currency(
+        self, book_with_vtsax_lot,
+    ):
+        """A non-default-currency quote on the same commodity must
+        not be picked when computing default-currency proceeds.
+        Pre-fix any currency could win — a EUR-denominated VTSAX
+        quote would silently mis-denominate the gain."""
+        book_path, lot_guid = book_with_vtsax_lot
+        # EUR price dated newer than the USD nav. Pre-fix this would
+        # be picked (newest wins regardless of currency); post-fix
+        # the currency filter excludes it and the USD nav wins.
+        self._add_vtsax_price(
+            book_path, value="999.99", p_date=date(2026, 6, 1),
+            p_type="nav", currency_mnemonic="EUR",
+        )
+
+        gb = GnuCashBook(str(book_path))
+        result = gb.calculate_lot_gain(lot_guid=lot_guid)
+        # USD-denominated proceeds: 10 × $125 = $1250.
+        # If EUR price had been picked: 10 × €999.99 = €9999.90,
+        # surfaced as a much larger USD number.
+        proceeds = Decimal(result["sale_proceeds"])
+        assert proceeds < Decimal("5000"), (
+            f"EUR-denominated quote was used for USD proceeds: {result}"
+        )

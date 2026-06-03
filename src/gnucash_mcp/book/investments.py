@@ -50,14 +50,6 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
 
-            # Build a map of latest prices by commodity
-            latest_prices: dict[str, tuple] = {}
-            for p in book.prices:
-                key = f"{p.commodity.namespace}:{p.commodity.mnemonic}"
-                p_date = _to_date(p.date)
-                if key not in latest_prices or p_date > latest_prices[key][0]:
-                    latest_prices[key] = (p_date, p)
-
             for commodity in book.commodities:
                 ns = commodity.namespace
                 if ns not in by_namespace:
@@ -69,9 +61,18 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                key = f"{ns}:{commodity.mnemonic}"
-                if key in latest_prices:
-                    _, price = latest_prices[key]
+                # Latest market quote for this commodity (any currency).
+                # ``_find_prices(market_only=True)`` is the chokepoint
+                # that skips piecash's auto-created ``type='transaction'``
+                # placeholder rows. Pre-fix this iterated ``book.prices``
+                # raw, so a placeholder newer than the user's last
+                # ``nav`` quote would shadow the real price in the
+                # commodities listing.
+                recent = self._find_prices(
+                    book, commodity_guid=commodity.guid,
+                )
+                if recent:
+                    price = recent[0]
                     entry["latest_price"] = {
                         "value": str(price.value),
                         "currency": price.currency.mnemonic,
@@ -934,26 +935,29 @@ class InvestmentsMixin:
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
-                # Look up latest price inline (we're inside an open
-                # session). Indexed by commodity so we don't iterate
-                # every price in the book.
+                # Look up latest market price for this commodity in
+                # the book's default currency. Pre-fix this walk had
+                # two bugs: no ``_is_market_price`` filter (a
+                # ``type='transaction'`` placeholder could shadow
+                # real quotes — SB-11 placeholder portion) and no
+                # currency filter (a foreign-currency quote could
+                # mis-denominate proceeds against a default-currency
+                # cost basis — SB-11 currency portion). Routing
+                # through ``_find_prices`` with both filters fixes
+                # both at one chokepoint.
                 commodity = lot.account.commodity
-                candidates = book.session.query(Price).filter_by(
+                default_ccy = self._require_default_currency(book)
+                recent = self._find_prices(
+                    book,
                     commodity_guid=commodity.guid,
-                ).all()
-                latest_price = None
-                latest_date = None
-                for p in candidates:
-                    p_date = _to_date(p.date)
-                    if latest_date is None or p_date > latest_date:
-                        latest_date = p_date
-                        latest_price = p
-                if latest_price is None:
+                    currency_guid=default_ccy.guid,
+                )
+                if not recent:
                     raise ValueError(
                         f"No price found for {commodity.mnemonic}. "
                         "Provide sale_price explicitly."
                     )
-                price = Decimal(str(latest_price.value))
+                price = Decimal(str(recent[0].value))
 
             # Prorate cost basis on shares-to-sell. Avoids the precision
             # loss of ``cost_per_share * shares`` for non-round
