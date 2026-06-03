@@ -1,0 +1,1 @@
+ERROR: ValueError: monthly_budget (10000) is less than the sum of minimum payments (15246.08). Debt will grow indefinitely.

@@ -1,0 +1,103 @@
+{
+  "as_of_date": "2026-01-04",
+  "assets": {
+    "accounts": [
+      {
+        "account": "Assets:Current Assets:Cash",
+        "balance": "1347.50"
+      },
+      {
+        "account": "Assets:Current Assets:Checking Account",
+        "balance": "8829.73"
+      },
+      {
+        "account": "Assets:Current Assets:Savings Account",
+        "balance": "6997.92"
+      },
+      {
+        "account": "Assets:Fixed Assets:Condo",
+        "balance": "473250.00"
+      },
+      {
+        "account": "Assets:Fixed Assets:Vehicle",
+        "balance": "27845.00"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:AAPL",
+        "balance": "27.1326 AAPL @ 271.86 (USD 7,376.27)",
+        "default_currency_value": "7376.27"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:ETH",
+        "balance": "1.8625 ETH @ 2967.04 (USD 5,526.11)",
+        "default_currency_value": "5526.11"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:MSFT",
+        "balance": "20.1385 MSFT @ 483.62 (USD 9,739.38)",
+        "default_currency_value": "9739.38"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:VBTLX",
+        "balance": "725.5629 VBTLX @ 9.77 (USD 7,088.75)",
+        "default_currency_value": "7088.75"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:VTSAX",
+        "balance": "230.7620 VTSAX @ 163.2 (USD 37,660.36)",
+        "default_currency_value": "37660.36"
+      },
+      {
+        "account": "Assets:Investments:HSA",
+        "balance": "7096.90"
+      },
+      {
+        "account": "Assets:Investments:Retirement:401k",
+        "balance": "10040.46"
+      },
+      {
+        "account": "Assets:Receivables:Accounts Receivable",
+        "balance": "3500.00"
+      }
+    ],
+    "total": "606298.38"
+  },
+  "equity": {
+    "accounts": [
+      {
+        "account": "Equity:Opening Balances",
+        "balance": "170657.50"
+      },
+      {
+        "account": "Retained Earnings",
+        "balance": "10320.68"
+      },
+      {
+        "account": "Unrealized Gain/Loss",
+        "balance": "13975.87"
+      }
+    ],
+    "total": "194954.05"
+  },
+  "liabilities": {
+    "accounts": [
+      {
+        "account": "Liabilities:Credit Card:Business Amex",
+        "balance": "9919.07"
+      },
+      {
+        "account": "Liabilities:Credit Card:Chase Sapphire",
+        "balance": "17903.13"
+      },
+      {
+        "account": "Liabilities:Loans:Auto Loan",
+        "balance": "9969.98"
+      },
+      {
+        "account": "Liabilities:Loans:Mortgage",
+        "balance": "373552.15"
+      }
+    ],
+    "total": "411344.33"
+  }
+}

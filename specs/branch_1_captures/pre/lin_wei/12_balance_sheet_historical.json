@@ -1,0 +1,107 @@
+{
+  "as_of_date": "2025-06-30",
+  "assets": {
+    "accounts": [
+      {
+        "account": "Assets:Current Assets:Alipay",
+        "balance": "1295.00"
+      },
+      {
+        "account": "Assets:Current Assets:Cash",
+        "balance": "2000.00"
+      },
+      {
+        "account": "Assets:Current Assets:Checking Account",
+        "balance": "132934.00"
+      },
+      {
+        "account": "Assets:Current Assets:Savings Account",
+        "balance": "150000.00"
+      },
+      {
+        "account": "Assets:Current Assets:WeChat Pay",
+        "balance": "180.00"
+      },
+      {
+        "account": "Assets:Fixed Assets:Apartment",
+        "balance": "4200000.00"
+      },
+      {
+        "account": "Assets:Fixed Assets:Vehicle",
+        "balance": "180000.00"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:CATL",
+        "balance": "50 300750 @ 275 (CNY 13,750.00)",
+        "default_currency_value": "13750.00"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:CSI300",
+        "balance": "5000 510300 @ 4.16 (CNY 20,800.00)",
+        "default_currency_value": "20800.00"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:ChiNext",
+        "balance": "8000 159915 @ 2.4 (CNY 19,200.00)",
+        "default_currency_value": "19200.00"
+      },
+      {
+        "account": "Assets:Investments:Brokerage:Moutai",
+        "balance": "7 600519 @ 1810 (CNY 12,670.00)",
+        "default_currency_value": "12670.00"
+      },
+      {
+        "account": "Assets:Investments:Housing Fund",
+        "balance": "74600.00"
+      },
+      {
+        "account": "Assets:Receivables:Accounts Receivable USD",
+        "balance": "3000 USD @ 7.3 (CNY 21,900.00)",
+        "default_currency_value": "21900.00"
+      }
+    ],
+    "total": "4829329.00"
+  },
+  "equity": {
+    "accounts": [
+      {
+        "account": "Equity:Opening Balances",
+        "balance": "1803900.00"
+      },
+      {
+        "account": "Retained Earnings",
+        "balance": "127590.98"
+      },
+      {
+        "account": "Unrealized Gain/Loss",
+        "balance": "3193.98"
+      }
+    ],
+    "total": "1934684.96"
+  },
+  "liabilities": {
+    "accounts": [
+      {
+        "account": "Liabilities:Accounts Payable",
+        "balance": "1786.02"
+      },
+      {
+        "account": "Liabilities:Credit Card:CMB Credit Card",
+        "balance": "14275.02"
+      },
+      {
+        "account": "Liabilities:Credit Card:ICBC Credit Card",
+        "balance": "4945.00"
+      },
+      {
+        "account": "Liabilities:Loans:Auto Loan",
+        "balance": "108540.00"
+      },
+      {
+        "account": "Liabilities:Loans:Mortgage",
+        "balance": "2765098.00"
+      }
+    ],
+    "total": "2894644.04"
+  }
+}
