@@ -16,7 +16,7 @@ primitive rather than rolling its own Python-side
 ``for txn in book.transactions: if date_match`` loop.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 import piecash
 
@@ -58,8 +58,11 @@ class QueryMixin:
                 ``post_date >= start_date``. ``None`` disables the
                 lower bound.
             end_date: Include only transactions with
-                ``post_date <= end_date``. ``None`` disables the upper
-                bound.
+                ``post_date`` on or before ``end_date`` (inclusive of
+                the full as_of date). ``None`` disables the upper
+                bound. See note below on how the inclusive boundary
+                is enforced against piecash's ``_DateAsDateTime``
+                storage.
             account_types: Restrict to accounts whose
                 ``type in account_types`` (e.g., the reporting module's
                 ``_ASSET_TYPES``). ``None`` disables the filter.
@@ -86,7 +89,24 @@ class QueryMixin:
         if start_date is not None:
             q = q.filter(Transaction.post_date >= start_date)
         if end_date is not None:
-            q = q.filter(Transaction.post_date <= end_date)
+            # piecash's ``_DateAsDateTime`` TypeDecorator stores
+            # ``post_date`` as a DateTime with a 10:59:00
+            # neutral-time component (see
+            # ``piecash.sa_extra._DateAsDateTime.process_bind_param``).
+            # A bare-date upper bound coerces to midnight in the SQL
+            # comparison, so ``post_date <= as_of`` would exclude
+            # same-day transactions whose stored time is 10:59 —
+            # ``balance_sheet(2025-12-31)`` returning a balance that
+            # excluded December 31 activity, while ``get_balance``
+            # (which compares Python-side, post-``process_result_value``,
+            # where the time has already been stripped) showed the
+            # correct number. Bookkeeper-flagged on Lin Wei's book
+            # during Branch 1 validation. Using the day after as a
+            # strict upper bound includes the full as_of date
+            # regardless of stored time component.
+            q = q.filter(
+                Transaction.post_date < end_date + timedelta(days=1)
+            )
         if account_types is not None:
             q = q.filter(Account.type.in_(list(account_types)))
         if account_guids is not None:

@@ -9,6 +9,9 @@ catalogues:
 - ``TestIsVoidedConsistency`` — SB-13, SB-14, HP-3
 - ``TestRatesAsOfRequiresDate`` — SB-2, SB-3, SB-4 (rates portion)
 - ``TestNetWorthSeriesPerBoundaryRates`` — SB-1
+- ``TestQueryEndDateInclusive`` — bookkeeper-flagged off-by-one in
+  ``_query_filtered_splits`` against piecash's ``_DateAsDateTime``
+  storage
 
 If any of these tests starts failing without an intentional change to
 the chokepoint, the bug class is open again.
@@ -841,4 +844,93 @@ class TestNetWorthSeriesPerBoundaryRates:
         values = [Decimal(e["net_worth"]) for e in post_transfer]
         assert all(v > 0 for v in values), (
             f"post-transfer snapshots should be positive: {values}"
+        )
+
+
+class TestQueryEndDateInclusive:
+    """Bookkeeper-flagged off-by-one in ``_query_filtered_splits``:
+    ``balance_sheet(as_of_date=X)`` excluded transactions posted on
+    X because piecash's ``_DateAsDateTime`` TypeDecorator stores
+    ``post_date`` with a 10:59:00 neutral-time component (see
+    ``piecash.sa_extra._DateAsDateTime.process_bind_param``). The
+    SQL comparison ``post_date <= X`` coerced X to midnight,
+    excluding same-day transactions whose stored time is 10:59.
+
+    ``get_balance`` and other Python-side date comparisons were
+    unaffected — ``process_result_value`` strips the time component
+    on read, so Python comparisons against bare ``date`` objects
+    work correctly. The bug surfaced as cross-tool disagreement on
+    Lin Wei: ``balance_sheet(2025-12-31)`` returned CNY 270,704 for
+    Checking while ``get_balance`` and the dashboard "now" view
+    showed CNY 270,652 (52 CNY of December 31 activity hidden).
+
+    Fixed at the single SQL chokepoint via ``post_date < end_date +
+    1 day`` — same semantic ("inclusive of the full as_of date"),
+    correctly enforced regardless of stored time component.
+    """
+
+    def test_balance_sheet_includes_same_day_transactions(
+        self, test_book: Path,
+    ):
+        """``test_book`` has a $2000 salary deposit on 2024-01-15.
+        ``balance_sheet(2024-01-15)`` must include it — Checking
+        balance should be $3000 (opening $1000 + salary $2000),
+        not $1000 (opening only). Pre-fix the salary was excluded
+        because its stored post_date is 2024-01-15 10:59:00 and
+        the SQL upper bound was 2024-01-15 00:00:00."""
+        gb = GnuCashBook(str(test_book))
+        bs = gb.balance_sheet(date(2024, 1, 15))
+        checking_row = next(
+            a for a in bs["assets"]["accounts"]
+            if a["account"] == "Assets:Checking"
+        )
+        assert Decimal(checking_row["balance"]) == Decimal("3000.00"), (
+            f"balance_sheet excluded same-day salary deposit; "
+            f"Checking row: {checking_row}"
+        )
+
+    def test_balance_sheet_and_get_balance_agree(
+        self, test_book: Path,
+    ):
+        """Cross-tool agreement: ``balance_sheet`` and ``get_balance``
+        must return identical numbers for the same ``as_of_date``.
+        Bookkeeper's diagnostic frame — disagreement between the two
+        is the signal that surfaced this bug."""
+        gb = GnuCashBook(str(test_book))
+        for as_of in (
+            date(2024, 1, 1),   # opening only
+            date(2024, 1, 15),  # opening + salary
+            date(2024, 1, 20),  # opening + salary + groceries
+            date(2024, 1, 25),  # post-everything
+        ):
+            bs = gb.balance_sheet(as_of)
+            checking_bs = Decimal(next(
+                a for a in bs["assets"]["accounts"]
+                if a["account"] == "Assets:Checking"
+            )["balance"])
+            checking_gb = gb.get_balance("Assets:Checking", as_of)
+            assert checking_bs == checking_gb, (
+                f"cross-tool disagreement at {as_of}: "
+                f"balance_sheet={checking_bs}, "
+                f"get_balance={checking_gb}"
+            )
+
+    def test_period_breakdown_includes_end_date_transactions(
+        self, test_book: Path,
+    ):
+        """``spending_by_category`` (and the other period-flow
+        reports) also route through ``_query_filtered_splits``.
+        Same-day transactions on the end_date must be included.
+
+        test_book has a $150 grocery expense on 2024-01-20. A
+        report through 2024-01-20 must include it."""
+        gb = GnuCashBook(str(test_book))
+        result = gb.spending_by_category(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 20),
+            compact=False,
+        )
+        assert Decimal(result["total"]) == Decimal("150"), (
+            f"spending_by_category excluded same-day grocery "
+            f"expense; result: {result}"
         )
