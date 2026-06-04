@@ -664,6 +664,84 @@ class TestIsVoidedConsistency:
             f"got {result.get('transfers_excluded')}"
         )
 
+    def test_normalize_account_refs_chokepoint_on_base(
+        self, test_book: Path,
+    ):
+        """R-3: account-ref normalization mechanics live on
+        ``BaseGnuCashBook``, not in ``logging_config.py``.
+
+        The pre-R-3 shape duplicated the work alongside the audit
+        log: open a session per render, walk params, resolve
+        refs, return rewritten dict — entirely inside
+        ``logging_config._normalize_account_refs_for_audit``.
+        The chokepoint discipline this project follows
+        (``_is_voided``, ``_is_unreconciled``, ``_is_market_price``,
+        ``_resolve_account``) keeps those mechanics on
+        ``BaseGnuCashBook`` so future display surfaces compose
+        through one primitive.
+
+        This test enforces structural identity (same shape as the
+        ``_is_unreconciled`` chokepoint test): if a future
+        contributor reverses the move and re-inlines the work in
+        ``logging_config``, the lookups below fail.
+        """
+        import inspect
+        from gnucash_mcp.book._base import (
+            BaseGnuCashBook, _looks_like_guid_ref,
+        )
+
+        # 1. ``_normalize_account_refs`` is a method on
+        #    BaseGnuCashBook (so every mixin composition picks
+        #    it up via MRO).
+        assert hasattr(BaseGnuCashBook, "_normalize_account_refs"), (
+            "BaseGnuCashBook._normalize_account_refs missing — "
+            "R-3 chokepoint broken"
+        )
+
+        # 2. ``_looks_like_guid_ref`` is at the module top of
+        #    book/_base.py (importable for any display surface).
+        #    Calling it on the three input shapes confirms the
+        #    contract didn't regress with the move.
+        assert _looks_like_guid_ref("%2e78c86") is True
+        assert _looks_like_guid_ref(
+            "deadbeef0000000000000000deadbeef"
+        ) is True  # 32-hex
+        assert _looks_like_guid_ref("Assets:Checking") is False
+        assert _looks_like_guid_ref("") is False
+        assert _looks_like_guid_ref(None) is False
+        assert _looks_like_guid_ref(42) is False
+
+        # 3. The audit-log wrapper delegates to the book method
+        #    rather than reimplementing the work. Inspecting the
+        #    source proves the call lands on the chokepoint
+        #    (rather than a copy-paste of the body).
+        from gnucash_mcp import logging_config
+        audit_src = inspect.getsource(
+            logging_config._normalize_account_refs_for_audit,
+        )
+        assert "_normalize_account_refs" in audit_src, (
+            "logging_config._normalize_account_refs_for_audit "
+            "no longer calls the BaseGnuCashBook chokepoint — "
+            "R-3 was reversed"
+        )
+
+        # 4. End-to-end: a real book wrapper resolves a %short ref
+        #    in params to the canonical fullname.
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=True) as book:
+            checking = gb._find_account(book, "Assets:Checking")
+            short_guid = gb._account_short_guid(book, checking)
+        rewritten = gb._normalize_account_refs(
+            {"account": short_guid, "other_field": "untouched"},
+            frozenset({"account"}),
+        )
+        assert rewritten["account"] == "Assets:Checking", (
+            f"normalization didn't resolve %short ref: {rewritten}"
+        )
+        assert rewritten["other_field"] == "untouched", (
+            "non-account-ref field unexpectedly mutated"
+        )
+
     def test_assign_split_to_lot_rejects_voided(
         self, investment_book: Path,
     ):

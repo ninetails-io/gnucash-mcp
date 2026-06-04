@@ -1875,120 +1875,56 @@ _ACCOUNT_REF_KEYS_CONDITIONAL: dict[tuple[str, str], frozenset[str]] = {
 }
 
 
-def _looks_like_guid_ref(value) -> bool:
-    """True iff ``value`` is a string worth resolving — short GUID
-    (``%xxxxxxx``) or 32-char hex full GUID. Path strings are already
-    canonical and skipped."""
-    if not isinstance(value, str) or not value:
-        return False
-    if value.startswith("%"):
-        return True
-    if len(value) == 32:
-        try:
-            int(value, 16)
-            return True
-        except ValueError:
-            return False
-    return False
+# R-3: ``_looks_like_guid_ref`` moved to ``book/_base.py`` so it
+# sits next to ``_resolve_account`` (the chokepoint it gates) and
+# can be shared by any future display surface that wants to skip
+# already-canonical path strings before opening a session.
 
 
 def _normalize_account_refs_for_audit(
     params: dict, entity_type: str, operation: str
 ) -> dict:
-    """Resolve any short / full-GUID account refs in ``params`` to
-    canonical full paths for audit-log rendering.
+    """Audit-log-specific wrapper around
+    :meth:`BaseGnuCashBook._normalize_account_refs`.
 
-    The audit log is the one human-facing surface in the app — the LLM
-    can read short GUIDs fine, but a human reviewing the log shouldn't
-    have to look up ``%2e78c86`` to know what got reconciled. This
-    function walks ``params`` once and rewrites every known account-ref
-    key (and split-list ``account`` values) to the matching
-    ``Account.fullname``.
+    R-3 split the responsibilities:
 
-    One book open per entry, regardless of how many refs are resolved.
-    Resolution failures degrade gracefully — we leave the original
-    string in place rather than crashing log rendering.
+    - This function knows the audit-log-specific config — which
+      param keys carry account refs always, which carry them only
+      for specific ``(entity_type, operation)`` pairs.
+    - The book layer owns the actual session-open + resolve + walk
+      mechanics, alongside ``_resolve_account`` and the other
+      chokepoints it depends on.
+
+    Falls back to ``params`` unchanged when the book wrapper isn't
+    available (server not fully wired up yet, or audit log fired
+    during init) — log rendering still produces a useful line with
+    raw refs.
     """
     if not params:
         return params
+    if _get_book_func is None:
+        return params
+    try:
+        book_wrapper = _get_book_func()
+    except Exception:
+        return params
+    if book_wrapper is None:
+        return params
+    # Test-fixture / lightweight wrappers may not subclass
+    # ``BaseGnuCashBook``; degrade gracefully rather than crash
+    # audit-log rendering.
+    if not hasattr(book_wrapper, "_normalize_account_refs"):
+        return params
 
-    keys_to_normalize = set(_ACCOUNT_REF_KEYS_ALWAYS) | (
-        _ACCOUNT_REF_KEYS_CONDITIONAL.get((entity_type, operation)) or set()
+    keys_to_normalize = _ACCOUNT_REF_KEYS_ALWAYS | (
+        _ACCOUNT_REF_KEYS_CONDITIONAL.get(
+            (entity_type, operation),
+        ) or frozenset()
     )
-
-    # Pass 1: collect every unique ref string that's worth a lookup.
-    refs: set[str] = set()
-    for key, value in params.items():
-        if key in keys_to_normalize and _looks_like_guid_ref(value):
-            refs.add(value)
-        elif key == "splits" and isinstance(value, list):
-            for split in value:
-                if isinstance(split, dict):
-                    acct_ref = split.get("account")
-                    if _looks_like_guid_ref(acct_ref):
-                        refs.add(acct_ref)
-
-    if not refs:
-        # All values are paths already (or nothing to normalize).
-        return params
-
-    # Pass 2: one book open, resolve everything.
-    resolved: dict[str, str] = {}
-    if _get_book_func is not None:
-        try:
-            book_wrapper = _get_book_func()
-            if book_wrapper is not None:
-                with book_wrapper.open(readonly=True) as book:
-                    for ref in refs:
-                        try:
-                            account = book_wrapper._resolve_account(book, ref)
-                            if account is not None:
-                                resolved[ref] = account.fullname
-                        except Exception as e:
-                            # Stale, ambiguous, malformed — leave the raw
-                            # ref in place; the log line is still useful.
-                            # Surface in debug log so a post-hoc audit-log
-                            # reader who notices a raw ``%xxxxxxx`` instead
-                            # of a fullname can find the underlying cause.
-                            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
-                            debug_logger.warning(
-                                f"Audit log: could not resolve account "
-                                f"ref {ref!r} for canonical rendering "
-                                f"({type(e).__name__}: {e})"
-                            )
-                            continue
-        except Exception as e:
-            # Book unavailable: fall back to raw refs everywhere.
-            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
-            debug_logger.warning(
-                f"Audit log: book wrapper unavailable for ref "
-                f"normalization ({type(e).__name__}: {e})"
-            )
-
-    if not resolved:
-        return params
-
-    def _replace(s):
-        return resolved.get(s, s) if isinstance(s, str) else s
-
-    # Pass 3: rewrite. Non-destructive — return a new dict so the
-    # debug-log line that already captured the original params is
-    # unaffected.
-    out: dict = {}
-    for key, value in params.items():
-        if key in keys_to_normalize:
-            out[key] = _replace(value)
-        elif key == "splits" and isinstance(value, list):
-            new_splits = []
-            for split in value:
-                if isinstance(split, dict) and "account" in split:
-                    new_splits.append({**split, "account": _replace(split["account"])})
-                else:
-                    new_splits.append(split)
-            out[key] = new_splits
-        else:
-            out[key] = value
-    return out
+    return book_wrapper._normalize_account_refs(
+        params, keys_to_normalize,
+    )
 
 
 def _format_audit_entry_text(entry: dict) -> str:
