@@ -363,3 +363,331 @@ class TestBudgetHeadlineRollup:
             f"placeholder-parent budget headline shows 0% used despite "
             f"spend in descendant: {headline}"
         )
+
+
+# ── SB-7: daily_burn book-age clamp ────────────────────────────────
+
+
+class TestDailyExpenseBurnBookAgeClamp:
+    """SB-7: ``_daily_expense_burn`` must clamp the divisor to
+    ``min(180, book_age_days)``.
+
+    Pre-fix the function always divided by 180. On a 19-day-old
+    book with $3,000 of spend it reported $16.67/day instead of
+    the real $158/day — runway then over-stated 10×. This is the
+    "rationalized lie" pattern: a docstring acknowledged the
+    issue ("rare in practice for personal/household books") but
+    the code stayed wrong.
+    """
+
+    def test_clamps_to_book_age_on_young_book(self, tmp_path):
+        """Build a book with one expense 19 days ago, $50. Expected
+        burn at clamp: $50 / 19 days = ~$2.63/day. Pre-fix would
+        have been $50 / 180 = ~$0.28/day."""
+        from datetime import timedelta as _td
+
+        today = date.today()
+        first_txn = today - _td(days=19)
+        book_path = tmp_path / "young_book.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets,
+            commodity=usd,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        groceries = piecash.Account(
+            name="Groceries", type="EXPENSE", parent=expenses,
+            commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        book.save()
+
+        piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=first_txn,
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=opening, value=Decimal("-1000")),
+            ],
+        )
+        piecash.Transaction(
+            currency=usd, description="Groceries",
+            post_date=first_txn,
+            splits=[
+                piecash.Split(account=groceries, value=Decimal("50")),
+                piecash.Split(account=checking, value=Decimal("-50")),
+            ],
+        )
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=True) as pb:
+            transactions = list(pb.transactions)
+            burn = gb._daily_expense_burn(pb, transactions)
+
+        # $50 spend, 19 days of data → burn ≈ $2.63/day.
+        # Pre-fix would have been $50 / 180 ≈ $0.28/day.
+        # Assert burn > $1/day to catch the divide-by-180 regression.
+        assert burn > Decimal("1"), (
+            f"book-age clamp not applied: burn={burn} (would be "
+            f"~$0.28 under the pre-fix divide-by-180)"
+        )
+
+    def test_keeps_180_window_on_mature_book(self, tmp_path):
+        """Book with transactions older than 180 days uses the full
+        180-day window — no clamping needed when book_age > 180."""
+        from datetime import timedelta as _td
+
+        today = date.today()
+        old_txn = today - _td(days=400)  # well past 180 days
+        recent_txn = today - _td(days=30)
+        book_path = tmp_path / "mature_book.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets,
+            commodity=usd,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        groceries = piecash.Account(
+            name="Groceries", type="EXPENSE", parent=expenses,
+            commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        book.save()
+
+        piecash.Transaction(
+            currency=usd, description="Opening", post_date=old_txn,
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=opening, value=Decimal("-1000")),
+            ],
+        )
+        # $180 of expenses 30 days ago (inside the 180-day window).
+        piecash.Transaction(
+            currency=usd, description="Recent groceries",
+            post_date=recent_txn,
+            splits=[
+                piecash.Split(account=groceries, value=Decimal("180")),
+                piecash.Split(account=checking, value=Decimal("-180")),
+            ],
+        )
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=True) as pb:
+            transactions = list(pb.transactions)
+            burn = gb._daily_expense_burn(pb, transactions)
+
+        # $180 / 180 days = $1.00/day (clamp doesn't apply).
+        # The exact value depends on the today vs window math —
+        # assert the clamp didn't squeeze below $1.
+        assert burn == Decimal("1"), (
+            f"mature-book clamp wrongly applied: burn={burn} "
+            f"(expected $1.00 from $180 / 180 days)"
+        )
+
+
+# ── SB-8: balance_sheet placeholder skip ───────────────────────────
+
+
+class TestBalanceSheetSkipsPlaceholders:
+    """SB-8: ``balance_sheet`` must skip placeholder accounts so it
+    agrees with ``_compute_net_worth_at`` (which already filters
+    them at ``core.py:443``).
+
+    Pre-fix a placeholder with direct splits — rare but legal —
+    would be double-counted: once on the placeholder row, once
+    implicitly through its children's rows.
+    """
+
+    def test_placeholder_with_direct_splits_not_double_counted(
+        self, tmp_path,
+    ):
+        """Construct a book where a placeholder ``Assets:Cash`` has
+        a direct split AND a child ``Assets:Cash:Wallet`` with its
+        own split. ``balance_sheet`` should only count the
+        non-placeholder leaf — pre-fix it counted both."""
+        book_path = tmp_path / "placeholder_book.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        # NOT placeholder yet — piecash validates against
+        # posting splits to a placeholder. We post the split
+        # below first, then mark the account placeholder.
+        cash_holder = piecash.Account(
+            name="Cash", type="CASH", parent=assets,
+            commodity=usd,
+        )
+        wallet = piecash.Account(
+            name="Wallet", type="CASH", parent=cash_holder,
+            commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        book.save()
+
+        # Two transactions: one posts $100 to Cash, one posts
+        # $50 to the leaf. Cash gets marked placeholder AFTER
+        # posting — simulating the rare-but-legal case where a
+        # historical account was reclassified as a placeholder
+        # later in the book's life.
+        piecash.Transaction(
+            currency=usd, description="Direct deposit to Cash",
+            post_date=date(2026, 1, 1),
+            splits=[
+                piecash.Split(
+                    account=cash_holder, value=Decimal("100"),
+                ),
+                piecash.Split(
+                    account=opening, value=Decimal("-100"),
+                ),
+            ],
+        )
+        piecash.Transaction(
+            currency=usd, description="Leaf deposit",
+            post_date=date(2026, 1, 2),
+            splits=[
+                piecash.Split(account=wallet, value=Decimal("50")),
+                piecash.Split(account=opening, value=Decimal("-50")),
+            ],
+        )
+        book.save()
+        # Now reclassify Cash as a placeholder.
+        cash_holder.placeholder = True
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        bs = gb.balance_sheet(date(2026, 12, 31))
+        # Only Wallet (the leaf) should appear in assets, not Cash
+        # (placeholder). Pre-fix Cash would have shown $100.
+        leaf_names = {a["account"] for a in bs["assets"]["accounts"]}
+        assert "Assets:Cash:Wallet" in leaf_names, (
+            f"leaf account missing: {leaf_names}"
+        )
+        assert "Assets:Cash" not in leaf_names, (
+            f"placeholder included in balance sheet: {leaf_names}"
+        )
+        # Assets total = $50 (leaf only).
+        assert Decimal(bs["assets"]["total"]) == Decimal("50.00"), (
+            f"placeholder double-counted in totals: "
+            f"{bs['assets']['total']}"
+        )
+
+
+# ── HP-6: _collect_warnings placeholder price filter ───────────────
+
+
+class TestCollectWarningsPlaceholderFilter:
+    """HP-6: ``_collect_warnings`` must apply ``_is_market_price``
+    BEFORE adding a commodity to ``in_use``.
+
+    Pre-fix a commodity that only had piecash's auto-placeholder
+    prices (``type='transaction'``, created on cross-currency
+    transactions) was added to ``in_use``. The downstream "no
+    price on file" warning then misfired on it, claiming the
+    commodity had no quotes when in fact the placeholders weren't
+    real quotes to begin with.
+    """
+
+    def test_placeholder_only_commodity_not_marked_in_use(
+        self, tmp_path,
+    ):
+        """Set up a USD book + a transaction-type placeholder for
+        EUR. No nav prices, no accounts holding EUR. ``in_use``
+        must NOT contain EUR; the warning must not fire."""
+        from piecash import factories
+        book_path = tmp_path / "placeholder_only.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        # Minimal real accounts.
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        piecash.Account(
+            name="Checking", type="BANK", parent=assets,
+            commodity=usd,
+        )
+        book.save()
+        # ONLY a transaction-type placeholder price for EUR — no
+        # real nav, no account holding EUR.
+        piecash.Price(
+            commodity=eur, currency=usd,
+            date=date(2026, 1, 1), value=Decimal("1.10"),
+            type="transaction", source="user:split-register",
+        )
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=True) as pb:
+            transactions = list(pb.transactions)
+            accounts = list(pb.accounts)
+            warnings = gb._collect_warnings(
+                pb, transactions, accounts,
+            )
+
+        # The stale_prices list (under whichever key
+        # _collect_warnings uses) must not flag EUR.
+        # Stringify to be tolerant of the exact key shape.
+        flat = str(warnings)
+        assert "EUR no price on file" not in flat, (
+            f"placeholder-only commodity wrongly flagged as "
+            f"missing nav price; warnings: {warnings}"
+        )

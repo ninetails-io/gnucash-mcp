@@ -921,12 +921,21 @@ class CoreMixin:
             # iterated ``book.prices`` twice — once for ``in_use``,
             # once for ``by_commodity_latest`` — paying the ORM
             # hydration cost twice on a book with hundreds of prices.
+            #
+            # HP-6: ``in_use.add`` runs AFTER the
+            # ``_is_market_price`` filter. Pre-fix a commodity that
+            # only had piecash auto-placeholder prices (created on
+            # cross-currency transactions) was marked in_use, and
+            # the downstream "no price on file" warning misfired:
+            # the placeholder isn't a real quote, the commodity
+            # has no market price, but in_use says it's tracked.
+            # Filter first, then mark.
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
             for p in book.prices:
-                in_use.add(p.commodity.guid)
                 if not _is_market_price(p):
                     continue
+                in_use.add(p.commodity.guid)
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
                     p_date = p_date.date()
@@ -1288,6 +1297,19 @@ class CoreMixin:
         if days is None:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
+        # SB-7 book-age clamp. The 180-day window is a MAX, not a
+        # fixed denominator: dividing recent spend by 180 days on
+        # a 19-day-old book over-stated runway by ~10×. Use the
+        # actual book age when smaller. ``transactions`` is the
+        # pre-materialized list ``get_book_summary`` builds; if
+        # it's empty the function returns 0 below regardless, so
+        # the fallback of 1 day avoids divide-by-zero.
+        if transactions:
+            first_txn_date = min(
+                t.post_date for t in transactions
+            )
+            book_age_days = max(1, (today - first_txn_date).days)
+            days = min(days, book_age_days)
         window_start = today - timedelta(days=days)
         # "Now" burn signal — anchor factors to today.
         factors = self._account_conversion_factors(book, today)
