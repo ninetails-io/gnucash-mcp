@@ -424,6 +424,15 @@ class ReportingMixin:
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
+                # Skip placeholder accounts so the balance sheet
+                # matches ``_compute_net_worth_at``'s convention
+                # (which already filters ``account.placeholder``
+                # before its balance loop). Pre-fix a placeholder
+                # with direct splits — rare but legal — was double-
+                # counted: once on the placeholder line, once on the
+                # implicit roll-up through its children. SB-8.
+                if account.placeholder:
+                    continue
                 # Value the split in the book's default currency so
                 # investment shares (VTSAX @ $128, etc.) and foreign-
                 # currency holdings contribute their market/USD value

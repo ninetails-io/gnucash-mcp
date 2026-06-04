@@ -921,12 +921,21 @@ class CoreMixin:
             # iterated ``book.prices`` twice — once for ``in_use``,
             # once for ``by_commodity_latest`` — paying the ORM
             # hydration cost twice on a book with hundreds of prices.
+            #
+            # HP-6: ``in_use.add`` runs AFTER the
+            # ``_is_market_price`` filter. Pre-fix a commodity that
+            # only had piecash auto-placeholder prices (created on
+            # cross-currency transactions) was marked in_use, and
+            # the downstream "no price on file" warning misfired:
+            # the placeholder isn't a real quote, the commodity
+            # has no market price, but in_use says it's tracked.
+            # Filter first, then mark.
             cutoff = today - timedelta(days=self._STALE_PRICE_DAYS)
             by_commodity_latest: dict[str, date] = {}
             for p in book.prices:
-                in_use.add(p.commodity.guid)
                 if not _is_market_price(p):
                     continue
+                in_use.add(p.commodity.guid)
                 p_date = p.date
                 if hasattr(p_date, "date") and callable(p_date.date):
                     p_date = p_date.date()
@@ -1104,14 +1113,17 @@ class CoreMixin:
           spending ahead of pace; caller renders + sign and ⚠
           marker at the configured threshold).
 
-        Actuals come straight from EXPENSE / INCOME splits in the
-        budgeted accounts themselves (no parent rollup). The full
-        budget report — which does roll children up to budgeted
-        ancestors — is a separate tool the LLM can call for
-        category-level detail. The headline trades that detail for
-        a single-line summary the LLM can reference proactively
-        ("you're 11% over pace; want me to identify which
-        categories are driving it?").
+        Actuals come from EXPENSE / INCOME splits in the budgeted
+        accounts AND their descendants — children of a placeholder-
+        budgeted parent roll up to that parent for actuals
+        accumulation. A descendant that's separately budgeted on
+        its own line stays out of the rollup so its actuals aren't
+        double-counted (matches ``get_budget_report`` behavior;
+        SB-9). The full budget report is a separate tool the LLM
+        can call for category-level detail; the headline trades
+        that detail for a single-line summary the LLM can reference
+        proactively ("you're 11% over pace; want me to identify
+        which categories are driving it?").
         """
         from piecash.budget import Budget
 
@@ -1163,22 +1175,50 @@ class CoreMixin:
         period_start = candidate["start"]
         period_end = candidate["end"]
 
-        # Sum budget targets across all (account, period) pairs.
-        # BudgetAmount.amount is a Decimal already.
+        # Sum budget targets across all (account, period) pairs and
+        # also FX-convert each target to default currency at the
+        # period-end rate. Pre-fix targets were summed raw — apples-
+        # to-oranges against default-currency actuals on multi-
+        # currency budgets (SB-6, mirroring the get_budget_report
+        # fix in budgets.py).
+        factors = self._account_conversion_factors(book, period_end)
         total_budgeted = Decimal("0")
+        budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
         for ba in budget.amounts:
-            total_budgeted += Decimal(str(ba.amount))
+            ba_amount = Decimal(str(ba.amount))
+            factor = factors.get(ba.account.guid)
+            if factor is not None:
+                ba_amount = ba_amount * factor
+            total_budgeted += ba_amount
+            budgeted_accounts.append(ba.account)
             budgeted_account_guids.add(ba.account.guid)
 
         if total_budgeted <= 0:
             return None
 
+        # SB-9: roll descendants of placeholder-budgeted parents
+        # into the rollup set so their splits contribute to actuals.
+        # PR #46 fixed this in ``get_budget_report``; the dashboard
+        # headline was left behind. A descendant that's separately
+        # budgeted on its own line stays out of the rollup so its
+        # actuals aren't double-counted toward both its own line
+        # and its ancestor's line.
+        rollup_guids: set[str] = set(budgeted_account_guids)
+        for budgeted_acct in budgeted_accounts:
+            descendants: set = set()
+            self._collect_descendants(budgeted_acct, descendants)
+            for desc in descendants:
+                if desc.guid in budgeted_account_guids:
+                    continue  # separately budgeted — don't roll up
+                rollup_guids.add(desc.guid)
+
         # Actuals: iterate transactions in the budget's date range
         # once, accumulating EXPENSE positives and INCOME absolute-
-        # value flows for splits in budgeted accounts. INCOME is
-        # stored negative; flip to a positive contribution to match
-        # the spend-vs-target framing.
+        # value flows for splits in budgeted accounts (or their
+        # rolled-up descendants). INCOME is stored negative; flip
+        # to a positive contribution to match the spend-vs-target
+        # framing.
         #
         # Each split is converted to the book's default currency at
         # the most recent market rate so foreign-currency budgeted
@@ -1189,13 +1229,12 @@ class CoreMixin:
         # Factors anchored to ``period_end`` so a historical budget
         # period values its actuals at the rate of that period —
         # not today's.
-        factors = self._account_conversion_factors(book, period_end)
         actuals = Decimal("0")
         for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
                 continue
             for s in txn.splits:
-                if s.account.guid not in budgeted_account_guids:
+                if s.account.guid not in rollup_guids:
                     continue
                 atype = s.account.type
                 if atype not in ("EXPENSE", "INCOME"):
@@ -1261,6 +1300,19 @@ class CoreMixin:
         if days is None:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
+        # SB-7 book-age clamp. The 180-day window is a MAX, not a
+        # fixed denominator: dividing recent spend by 180 days on
+        # a 19-day-old book over-stated runway by ~10×. Use the
+        # actual book age when smaller. ``transactions`` is the
+        # pre-materialized list ``get_book_summary`` builds; if
+        # it's empty the function returns 0 below regardless, so
+        # the fallback of 1 day avoids divide-by-zero.
+        if transactions:
+            first_txn_date = min(
+                t.post_date for t in transactions
+            )
+            book_age_days = max(1, (today - first_txn_date).days)
+            days = min(days, book_age_days)
         window_start = today - timedelta(days=days)
         # "Now" burn signal — anchor factors to today.
         factors = self._account_conversion_factors(book, today)

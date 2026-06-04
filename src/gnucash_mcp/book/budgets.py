@@ -751,7 +751,19 @@ class BudgetsMixin:
             else:
                 target_accounts = None
 
-            # Gather budgeted amounts
+            # Pre-compute conversion factors so both targets (this
+            # loop) and actuals (the loop further down) value at the
+            # same period-end anchor. Pre-fix factors were built
+            # only for actuals — budget *targets* were summed raw
+            # in their stored account commodity, so ``used_pct`` was
+            # meaningless on multi-currency budgets where the actuals
+            # were in the book's default currency but the targets
+            # weren't (SB-6).
+            factors = self._account_conversion_factors(book, last_end)
+
+            # Gather budgeted amounts (FX-converted to default
+            # currency so the comparison with default-currency
+            # actuals further down is apples-to-apples).
             budgeted: dict[str, Decimal] = {}
             # Keep a handle to each budgeted account for descendant walking.
             budgeted_accounts: dict[str, object] = {}
@@ -761,9 +773,20 @@ class BudgetsMixin:
                 acct_name = ba.account.fullname
                 if target_accounts is not None and ba.account not in target_accounts:
                     continue
+                # Convert target amount to default currency at the
+                # period-end rate. ``None`` factor → no rate on
+                # file; fall back to the raw amount (cost-basis
+                # convention), matching how actuals degrade in the
+                # same scenario via ``_split_in_default_currency``.
+                factor = factors.get(ba.account.guid)
+                ba_amount = Decimal(str(ba.amount))
+                if factor is not None:
+                    target_in_default = ba_amount * factor
+                else:
+                    target_in_default = ba_amount
                 budgeted[acct_name] = budgeted.get(
                     acct_name, Decimal("0")
-                ) + ba.amount
+                ) + target_in_default
                 budgeted_accounts[acct_name] = ba.account
 
             # Roll-up map: descendant-account-fullname → nearest-ancestor-
@@ -782,24 +805,17 @@ class BudgetsMixin:
                         continue  # separately budgeted — don't roll up
                     # If multiple budgeted ancestors cover this descendant
                     # (nested parents), keep the nearest one (the deepest
-                    # budgeted ancestor). A simple proxy: prefer the longer
-                    # ancestor path.
+                    # budgeted ancestor). Pre-fix used ``len(name)`` as a
+                    # depth proxy — broke under pathological naming where
+                    # a shallower path with longer leaf names would
+                    # incorrectly win over a deeper path. ``count(":")``
+                    # is the real depth (HP-7).
                     existing = rollup_map.get(desc.fullname)
-                    if existing is None or len(acct_name) > len(existing):
+                    if (
+                        existing is None
+                        or acct_name.count(":") > existing.count(":")
+                    ):
                         rollup_map[desc.fullname] = acct_name
-
-            # Cross-currency conversion: when a budgeted account
-            # parent has children in non-default-currency commodities
-            # (e.g., USD-default book with a EUR ``Expenses:Travel``
-            # leaf), summing raw ``split.quantity`` would treat 100
-            # EUR + 100 USD as 200 in the parent's row. The conversion
-            # helpers live on the unconditionally-composed
-            # :class:`CurrencyMixin`, so they're available regardless
-            # of which ``--modules`` are enabled. Anchored to the
-            # last period's end so historical budget periods value
-            # actuals at the rate they would have been valued at
-            # then — not today's (pre-fix bug, same shape as SB-2).
-            factors = self._account_conversion_factors(book, last_end)
 
             # Calculate actuals from transactions. Date filter pushed
             # to SQL via _query_filtered_splits — pre-fix the inner
