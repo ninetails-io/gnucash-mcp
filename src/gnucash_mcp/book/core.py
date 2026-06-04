@@ -99,6 +99,52 @@ class _CreateSignals:
         return any(d["confidence"] == "HIGH" for d in self.duplicates)
 
 
+@dataclass
+class _SummaryData:
+    """Categorized account-balance + roll-up data for
+    ``get_book_summary``.
+
+    Populated in one walk over ``book.accounts`` by
+    ``_collect_summary_balance_sheet`` so the multi-pass shape that
+    ``get_book_summary`` previously used inline collapses into a
+    single collector → many renderers pipeline.
+
+    All ``Decimal`` totals are pre-rounded to 2 dp (consistent with
+    every place ``get_book_summary`` displays them); per-leaf
+    balances are stored at native precision so renderers can
+    re-round if they want.
+
+    R-1: the dataclass is internal — no caller outside
+    ``get_book_summary`` and its renderers should depend on the
+    field shape, since the renderers will continue evolving as
+    the bookkeeper review surfaces new section requirements.
+    """
+
+    # Account categorization (per-leaf rows the section renderers iterate).
+    asset_leaves: list[tuple[str, Decimal, str | None]] = field(default_factory=list)
+    credit_cards: list[tuple[str, Decimal]] = field(default_factory=list)
+    loan_accts: list[tuple[str, Decimal]] = field(default_factory=list)
+    other_liab_accts: list[tuple[str, Decimal]] = field(default_factory=list)
+    receivable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
+    payable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
+
+    # Totals (pre-rounded to 2dp).
+    assets_total: Decimal = Decimal("0")
+    liabilities_total: Decimal = Decimal("0")
+    receivables_total: Decimal = Decimal("0")
+    payables_total: Decimal = Decimal("0")
+    credit_total: Decimal = Decimal("0")
+    loan_total: Decimal = Decimal("0")
+    other_liab_total: Decimal = Decimal("0")
+
+    # Counts.
+    total_accounts: int = 0
+    income_active: int = 0
+    income_total: int = 0
+    expense_active: int = 0
+    expense_total: int = 0
+
+
 class CoreMixin:
     """Accounts, transactions, and the book-summary view. Always loaded."""
 
@@ -1862,6 +1908,415 @@ class CoreMixin:
             f"{currency} {burn:,}/day burn)"
         ]
 
+    # ── Summary collector / section renderers ────────────────────
+    #
+    # R-1: ``get_book_summary`` used to inline every section's data
+    # collection and rendering — ~480 lines, mostly a long sequence
+    # of ``lines.append(...)`` calls with intermixed totals work.
+    # Decomposed so each section has a single owner.
+    #
+    # The pattern matches the already-extracted helpers
+    # (``_render_reconciliation`` / ``_render_runway`` / etc.):
+    # collector returns the data, renderer turns it into ``list[str]``
+    # (or ``[]`` to omit the section). New sections become a single
+    # method addition + one ``lines.extend(...)`` call.
+
+    def _collect_summary_balance_sheet(
+        self,
+        accounts: list,
+        template_guids: set[str],
+        parent_guids: set[str],
+        latest_prices: dict,
+        default_currency,
+        today: date,
+    ) -> _SummaryData:
+        """Single-pass account walker for ``get_book_summary``.
+
+        Walks ``accounts`` once, building the categorized lists and
+        running counters the renderers need. Pre-fix the same walk
+        was inline in ``get_book_summary``; extracting it keeps the
+        renderer signatures focused on what they consume rather
+        than threading 15 collection variables through.
+
+        Returns a ``_SummaryData`` with pre-rounded totals so
+        renderers can format directly.
+        """
+        asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
+        data = _SummaryData()
+
+        for account in accounts:
+            if account.type == "ROOT":
+                continue
+            if account.guid in template_guids:
+                continue
+            data.total_accounts += 1
+
+            has_activity = len(account.splits) > 0
+            is_leaf = account.guid not in parent_guids
+
+            # Balance in the account's own commodity, today-filtered
+            # (future-dated transactions excluded so the snapshot
+            # agrees with trajectory's "now" anchor).
+            balance = Decimal("0")
+            for split in account.splits:
+                if split.transaction.post_date <= today:
+                    balance += split.quantity
+
+            leaf = account.fullname.split(":")[-1]
+
+            if account.type in asset_types:
+                if is_leaf and balance != 0:
+                    usd_value, note = self._market_value(
+                        account, balance,
+                        rates=latest_prices,
+                        default_currency=default_currency,
+                        today=today,
+                    )
+                    data.asset_leaves.append((leaf, usd_value, note))
+            elif account.type == "CREDIT":
+                if is_leaf:
+                    data.credit_cards.append((leaf, -balance))
+            elif account.type == "LIABILITY":
+                if is_leaf:
+                    neg_balance = -balance
+                    if "loan" in account.fullname.lower():
+                        data.loan_accts.append((leaf, neg_balance))
+                    else:
+                        data.other_liab_accts.append(
+                            (leaf, neg_balance)
+                        )
+            elif account.type == "RECEIVABLE":
+                if is_leaf and balance != 0:
+                    # A/R is debit-natural: positive balance = owed to us.
+                    usd_value, _ = self._market_value(
+                        account, balance,
+                        rates=latest_prices,
+                        default_currency=default_currency,
+                        today=today,
+                    )
+                    data.receivable_accts.append((leaf, usd_value))
+            elif account.type == "PAYABLE":
+                if is_leaf and balance != 0:
+                    # A/P is credit-natural: negate for "what we owe".
+                    usd_value, _ = self._market_value(
+                        account, -balance,
+                        rates=latest_prices,
+                        default_currency=default_currency,
+                        today=today,
+                    )
+                    data.payable_accts.append((leaf, usd_value))
+            elif account.type == "INCOME":
+                data.income_total += 1
+                if has_activity:
+                    data.income_active += 1
+            elif account.type == "EXPENSE":
+                data.expense_total += 1
+                if has_activity:
+                    data.expense_active += 1
+
+        # Pre-round all totals once so renderers format directly.
+        def _r2(v: Decimal) -> Decimal:
+            return v.quantize(Decimal("0.01"))
+
+        data.receivables_total = _r2(
+            sum((b for _, b in data.receivable_accts), Decimal("0"))
+        )
+        data.payables_total = _r2(
+            sum((b for _, b in data.payable_accts), Decimal("0"))
+        )
+        data.assets_total = _r2(
+            sum((v for _, v, _ in data.asset_leaves), Decimal("0"))
+            + data.receivables_total
+        )
+        data.credit_total = _r2(
+            sum(b for _, b in data.credit_cards)
+            if data.credit_cards else Decimal(0)
+        )
+        data.loan_total = _r2(
+            sum(b for _, b in data.loan_accts)
+            if data.loan_accts else Decimal(0)
+        )
+        data.other_liab_total = _r2(
+            sum(b for _, b in data.other_liab_accts)
+            if data.other_liab_accts else Decimal(0)
+        )
+        data.liabilities_total = _r2(
+            data.credit_total + data.loan_total
+            + data.other_liab_total + data.payables_total
+        )
+        return data
+
+    def _render_book_metadata(
+        self,
+        currency: str,
+        first_date: date | None,
+        last_date: date | None,
+    ) -> list[str]:
+        """Render Book / Currency / Data range / Last entry header.
+
+        ``Last entry`` carries a staleness signal — bookkeeper-asked-for
+        because the answer to "let's reconcile" vs "let's enter 200
+        transactions first" pivots on it. Four cases keyed on
+        ``(today - last_date).days``:
+
+        - ``< 0``  → future-dated (normal for scheduled-txn ahead-of-
+          today posting). ``(future-dated, N days ahead)``.
+        - ``= 0``  → today.
+        - ``= 1``  → yesterday.
+        - ``> 1``  → N days behind. ⚠ past ``_LAST_ENTRY_WARN_DAYS``.
+        """
+        from gnucash_mcp._format import _book_display_name
+
+        lines = [
+            f"Book: {_book_display_name(self.book_path)}",
+            f"Currency: {currency}",
+        ]
+        if first_date and last_date:
+            lines.append(
+                f"Data range: {first_date.isoformat()} "
+                f"to {last_date.isoformat()}"
+            )
+        if last_date is not None:
+            today = date.today()
+            days_behind = (today - last_date).days
+            if days_behind < 0:
+                lines.append(
+                    f"Last entry: {last_date.isoformat()} "
+                    f"(future-dated, {-days_behind} days ahead)"
+                )
+            elif days_behind == 0:
+                lines.append(
+                    f"Last entry: {last_date.isoformat()} (today)"
+                )
+            elif days_behind == 1:
+                lines.append(
+                    f"Last entry: {last_date.isoformat()} (yesterday)"
+                )
+            else:
+                warn = (
+                    " ⚠"
+                    if days_behind > self._LAST_ENTRY_WARN_DAYS
+                    else ""
+                )
+                lines.append(
+                    f"Last entry: {last_date.isoformat()} "
+                    f"({days_behind} days behind){warn}"
+                )
+        return lines
+
+    @staticmethod
+    def _render_assets_section(
+        data: _SummaryData,
+        currency: str,
+    ) -> list[str]:
+        """Render the Assets section: header + per-leaf lines
+        sorted by USD value descending.
+
+        Count includes A/R accounts (which roll into
+        ``assets_total``) so the headline N agrees with the total;
+        per-account A/R detail lives in
+        ``_render_receivables_payables``.
+        """
+        assets_count = len(data.asset_leaves) + len(data.receivable_accts)
+        lines = [
+            f"Assets: {assets_count} accounts, "
+            f"{currency} {data.assets_total}"
+        ]
+        for name, usd_value, note in sorted(
+            data.asset_leaves, key=lambda x: x[1], reverse=True
+        ):
+            rounded = usd_value.quantize(Decimal("0.01"))
+            if note is None:
+                lines.append(f"  {name}: {currency} {rounded}")
+            else:
+                lines.append(
+                    f"  {name}: {note} ({currency} {rounded})"
+                )
+        return lines
+
+    @staticmethod
+    def _render_liabilities_section(
+        data: _SummaryData,
+        currency: str,
+    ) -> list[str]:
+        """Render Liabilities: header + grouped subtotals + top 3.
+
+        A/P accounts (rolled into ``liabilities_total``) are
+        included in the headline count; per-account A/P detail
+        lives in ``_render_receivables_payables``.
+        """
+        liab_count = (
+            len(data.credit_cards) + len(data.loan_accts)
+            + len(data.other_liab_accts) + len(data.payable_accts)
+        )
+        lines = [
+            f"Liabilities: {liab_count} accounts, "
+            f"{currency} {data.liabilities_total}"
+        ]
+        if data.credit_cards:
+            lines.append(
+                f"  Credit cards ({len(data.credit_cards)}): "
+                f"{currency} {data.credit_total}"
+            )
+        if data.loan_accts:
+            lines.append(
+                f"  Loans ({len(data.loan_accts)}): "
+                f"{currency} {data.loan_total}"
+            )
+        if data.other_liab_accts:
+            lines.append(
+                f"  Other ({len(data.other_liab_accts)}): "
+                f"{currency} {data.other_liab_total}"
+            )
+        all_liab_leaves = (
+            data.credit_cards + data.loan_accts + data.other_liab_accts
+        )
+        if len(all_liab_leaves) > 1:
+            all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
+            top_n = all_liab_leaves[:3]
+            top_parts = [
+                f"{n} {currency} {b.quantize(Decimal('0.01'))}"
+                for n, b in top_n
+            ]
+            lines.append(
+                f"  Top {len(top_n)}: {', '.join(top_parts)}"
+            )
+        return lines
+
+    @staticmethod
+    def _render_receivables_payables(
+        data: _SummaryData,
+        biz_counts: dict,
+        currency: str,
+    ) -> list[str]:
+        """Render Receivables + Payables breakouts.
+
+        Each section is conditional on the breakout having any
+        accounts. The action-signal suffix (``N invoice(s),
+        M overdue``) lets the LLM see "2 overdue" and ask about
+        collections without us having to spell that out
+        explicitly.
+        """
+        lines: list[str] = []
+        if data.receivable_accts:
+            inv_n = biz_counts["open_invoices"]
+            overdue = biz_counts["overdue_invoices"]
+            signal = (
+                f" ({inv_n} invoice"
+                f"{'s' if inv_n != 1 else ''}, "
+                f"{overdue} overdue)"
+            ) if inv_n else ""
+            lines.append(
+                f"Receivables: {len(data.receivable_accts)} "
+                f"account"
+                f"{'s' if len(data.receivable_accts) != 1 else ''}, "
+                f"{currency} {data.receivables_total}{signal}"
+            )
+            for name, bal in sorted(
+                data.receivable_accts, key=lambda x: x[1],
+                reverse=True,
+            ):
+                lines.append(
+                    f"  {name}: {currency} "
+                    f"{bal.quantize(Decimal('0.01'))}"
+                )
+        if data.payable_accts:
+            bill_n = biz_counts["open_bills"]
+            overdue = biz_counts["overdue_bills"]
+            signal = (
+                f" ({bill_n} bill"
+                f"{'s' if bill_n != 1 else ''}, "
+                f"{overdue} overdue)"
+            ) if bill_n else ""
+            lines.append(
+                f"Payables: {len(data.payable_accts)} "
+                f"account"
+                f"{'s' if len(data.payable_accts) != 1 else ''}, "
+                f"{currency} {data.payables_total}{signal}"
+            )
+            for name, bal in sorted(
+                data.payable_accts, key=lambda x: x[1],
+                reverse=True,
+            ):
+                lines.append(
+                    f"  {name}: {currency} "
+                    f"{bal.quantize(Decimal('0.01'))}"
+                )
+        return lines
+
+    def _render_transactions_scheduled(
+        self,
+        book,
+        total_txns: int,
+        enabled_sx: int,
+        currency: str,
+    ) -> list[str]:
+        """Render the Transactions count + Scheduled line.
+
+        Scheduled folds in the "due in next 7 days" stat — turns
+        the dashboard from "what is the state" into "what do I
+        need to do next" without a second tool call. Uses
+        ``hasattr`` to skip the upcoming-line render cleanly on
+        book classes built without scheduling.
+        """
+        lines = [f"Transactions: {total_txns}"]
+        if enabled_sx > 0:
+            line = f"Scheduled: {enabled_sx} recurring"
+            if hasattr(self, "_upcoming_within_days"):
+                upcoming = self._upcoming_within_days(book, days=7)
+                if upcoming["count"] > 0:
+                    plural = (
+                        "s" if upcoming["count"] != 1 else ""
+                    )
+                    total_int = int(upcoming["total"])
+                    line += (
+                        f", {upcoming['count']} due in next "
+                        f"7 days ({currency} {total_int:,})"
+                    )
+                else:
+                    line += ", none due in next 7 days"
+            lines.append(line)
+        return lines
+
+    @staticmethod
+    def _render_business_summary(
+        n_customers: int,
+        n_vendors: int,
+        n_employees: int,
+        n_budgets: int,
+        commodity_mnemonics: list[str],
+    ) -> list[str]:
+        """Render Business / Budgets / Commodities one-liners.
+
+        Each is conditional: only emitted when there's at least
+        one entity to mention (absence-as-signal). Commodities
+        always emits — the mnemonic list is the at-a-glance
+        confirmation of which currencies the book exercises.
+        """
+        lines: list[str] = []
+        if n_customers or n_vendors or n_employees:
+            parts: list[str] = []
+            if n_customers:
+                parts.append(
+                    f"{n_customers} customer"
+                    f"{'s' if n_customers != 1 else ''}"
+                )
+            if n_vendors:
+                parts.append(
+                    f"{n_vendors} vendor"
+                    f"{'s' if n_vendors != 1 else ''}"
+                )
+            if n_employees:
+                parts.append(
+                    f"{n_employees} employee"
+                    f"{'s' if n_employees != 1 else ''}"
+                )
+            lines.append(f"Business: {', '.join(parts)}")
+        if n_budgets:
+            lines.append(f"Budgets: {n_budgets}")
+        lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
+        return lines
+
     def _render_budget(self, budget: dict | None) -> list[str]:
         """Render the Budget headline line.
 
@@ -1902,6 +2357,12 @@ class CoreMixin:
         file, cost basis (sum of split values in the transaction currency)
         is used as a fallback and the line is tagged accordingly.
 
+        R-1: orchestrator only. Data collection and per-section
+        rendering live in dedicated helpers (``_collect_*`` /
+        ``_render_*``); see the section-renderers block above.
+        Adding a new section is a single method addition plus one
+        ``lines.extend(...)`` call here.
+
         Returns:
             Pre-formatted text summary string.
         """
@@ -1931,173 +2392,48 @@ class CoreMixin:
             # anchor agrees here too.
             today = date.today()
 
-            # Identify template accounts (scheduled-transaction scaffolding).
-            # Shared helper on BaseGnuCashBook walks the whole subtree; the
-            # old inline version only captured root_template + direct
-            # children, which worked because create_scheduled_transaction
-            # creates flat templates — but tolerates deeper nesting now.
+            # Identify template accounts (scheduled-transaction
+            # scaffolding). Shared helper on BaseGnuCashBook walks
+            # the whole subtree.
             template_guids = self._template_account_guids(book)
 
-            # Materialize the account list once. CODE_REVIEW noted 7-10
-            # passes over ``book.accounts`` between this method and the
-            # sub-helpers it calls; threading the in-memory list collapses
-            # each pass from "hydrate the ORM collection then iterate" to
-            # "iterate the already-hydrated Python list."
+            # Materialize the account list once. CODE_REVIEW noted
+            # 7-10 passes over ``book.accounts`` between this method
+            # and the sub-helpers it calls; threading the in-memory
+            # list collapses each pass.
             accounts = list(book.accounts)
 
-            # --- Collect parent GUIDs (placeholder containers) ---
-            parent_guids = set()
+            # Parent GUIDs (placeholder containers) — the collector
+            # needs this to identify leaf accounts.
+            parent_guids: set[str] = set()
             for account in accounts:
                 if account.parent and account.parent.type != "ROOT":
                     parent_guids.add(account.parent.guid)
 
-            # --- Latest-price lookup for non-default-currency commodities ---
-            # ``_rates_as_of(book, today)`` — the convention is
-            # future TRANSACTIONS are excluded (events haven't
-            # happened) but future PRICES are included
-            # (intentional forecasts). ``_anchor_for_as_of`` folds
-            # ``today`` to ``date.max`` so every forecast is in
-            # scope; the call site reads as "the now view."
-            latest_prices: dict[str, Decimal] = self._rates_as_of(
-                book, date.today(),
+            # ``_rates_as_of(book, today)`` — future TRANSACTIONS
+            # are excluded but future PRICES are included.
+            # ``_anchor_for_as_of`` folds ``today`` to ``date.max``
+            # so every forecast price is in scope.
+            latest_prices = self._rates_as_of(book, today)
+
+            # Single-pass account walker: categorized lists + totals.
+            data = self._collect_summary_balance_sheet(
+                accounts=accounts,
+                template_guids=template_guids,
+                parent_guids=parent_guids,
+                latest_prices=latest_prices,
+                default_currency=default_currency,
+                today=today,
             )
 
-            # --- Account stats ---
-            asset_types = {"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"}
-
-            # Assets: (leaf_name, usd_value, note) for non-placeholder leaf accounts
-            asset_leaves: list[tuple[str, Decimal, str | None]] = []
-            # Liabilities: (leaf_name, positive_balance) grouped by category
-            credit_cards: list[tuple[str, Decimal]] = []
-            loan_accts: list[tuple[str, Decimal]] = []
-            other_liab_accts: list[tuple[str, Decimal]] = []
-            # Receivables / Payables (separate sections, per Abe's spec)
-            receivable_accts: list[tuple[str, Decimal]] = []
-            payable_accts: list[tuple[str, Decimal]] = []
-
-            income_active = 0
-            income_total = 0
-            expense_active = 0
-            expense_total = 0
-            total_accounts = 0
-
-            for account in accounts:
-                if account.type == "ROOT":
-                    continue
-                if account.guid in template_guids:
-                    continue
-                total_accounts += 1
-
-                has_activity = len(account.splits) > 0
-                is_leaf = account.guid not in parent_guids
-
-                # Calculate balance in the account's own commodity.
-                # Date filter excludes future-dated transactions so
-                # trajectory's "now" anchor agrees with the
-                # displayed Assets / Liabilities totals.
-                balance = Decimal("0")
-                for split in account.splits:
-                    if split.transaction.post_date <= today:
-                        balance += split.quantity
-
-                leaf = account.fullname.split(":")[-1]
-
-                if account.type in asset_types:
-                    if is_leaf and balance != 0:
-                        usd_value, note = self._market_value(
-                            account, balance,
-                            rates=latest_prices,
-                            default_currency=default_currency,
-                            today=today,
-                        )
-                        asset_leaves.append((leaf, usd_value, note))
-                elif account.type == "CREDIT":
-                    if is_leaf:
-                        credit_cards.append((leaf, -balance))
-                elif account.type == "LIABILITY":
-                    if is_leaf:
-                        neg_balance = -balance
-                        if "loan" in account.fullname.lower():
-                            loan_accts.append((leaf, neg_balance))
-                        else:
-                            other_liab_accts.append((leaf, neg_balance))
-                elif account.type == "RECEIVABLE":
-                    if is_leaf and balance != 0:
-                        # A/R is debit-natural: positive balance = owed to us.
-                        usd_value, _ = self._market_value(
-                            account, balance,
-                            rates=latest_prices,
-                            default_currency=default_currency,
-                            today=today,
-                        )
-                        receivable_accts.append((leaf, usd_value))
-                elif account.type == "PAYABLE":
-                    if is_leaf and balance != 0:
-                        # A/P is credit-natural: negate for "what we owe".
-                        usd_value, _ = self._market_value(
-                            account, -balance,
-                            rates=latest_prices,
-                            default_currency=default_currency,
-                            today=today,
-                        )
-                        payable_accts.append((leaf, usd_value))
-                elif account.type == "INCOME":
-                    income_total += 1
-                    if has_activity:
-                        income_active += 1
-                elif account.type == "EXPENSE":
-                    expense_total += 1
-                    if has_activity:
-                        expense_active += 1
-
-            # Compute totals from leaf accounts
-            def _r2(v: Decimal) -> Decimal:
-                return v.quantize(Decimal("0.01"))
-
-            # Receivables and payables roll into Assets / Liabilities
-            # totals (standard accounting — A/R is an asset, A/P is a
-            # liability) AND get their own dedicated dashboard
-            # sections below for at-a-glance "what's outstanding."
-            # Appearing in both places is intentional: the rolled-up
-            # totals tie to balance_sheet and the trajectory anchor;
-            # the breakout gives the bookkeeper an action lens. Pre-
-            # v1.3.0 only the breakouts existed — the headline
-            # Assets / Liabilities numbers excluded business
-            # activity, breaking cross-tool consistency.
-            receivables_total = _r2(
-                sum((b for _, b in receivable_accts), Decimal("0"))
-            )
-            payables_total = _r2(
-                sum((b for _, b in payable_accts), Decimal("0"))
-            )
-            assets_total = _r2(
-                sum((v for _, v, _ in asset_leaves), Decimal("0"))
-                + receivables_total
-            )
-            credit_total = _r2(sum(b for _, b in credit_cards) if credit_cards else Decimal(0))
-            loan_total = _r2(sum(b for _, b in loan_accts) if loan_accts else Decimal(0))
-            other_liab_total = _r2(sum(b for _, b in other_liab_accts) if other_liab_accts else Decimal(0))
-            liabilities_total = _r2(
-                credit_total + loan_total + other_liab_total + payables_total
-            )
-            net_worth = _r2(assets_total - liabilities_total)
-
-            # All liability leaves sorted by balance descending for top-N
-            all_liab_leaves = credit_cards + loan_accts + other_liab_accts
-            all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
-
-            # --- Transaction stats ---
-            # Per-split unreconciled counting was dropped — the old
-            # "Transactions: N (M unreconciled)" suffix included
-            # income/expense/equity splits that can't be reconciled,
-            # so the count was operationally useless. The new
-            # Reconciliation section below (per-account, per-status)
-            # is the actionable replacement.
+            # Transaction stats. Per-split unreconciled counting
+            # was dropped from this surface — the Reconciliation
+            # section below (per-account) is the actionable
+            # replacement.
             transactions = list(book.transactions)
             total_txns = len(transactions)
-            first_date = None
-            last_date = None
-
+            first_date: date | None = None
+            last_date: date | None = None
             for txn in transactions:
                 d = txn.post_date
                 if first_date is None or d < first_date:
@@ -2105,276 +2441,112 @@ class CoreMixin:
                 if last_date is None or d > last_date:
                     last_date = d
 
-            # --- Scheduled transactions ---
+            # Cross-mixin stats.
             all_sx = book.session.query(ScheduledTransaction).all()
             enabled_sx = sum(1 for sx in all_sx if sx.enabled)
-
-            # --- Business entities ---
             n_customers = len(list(book.customers))
             n_vendors = len(list(book.vendors))
             n_employees = len(list(book.employees))
-
-            # --- Budgets ---
             n_budgets = book.session.query(Budget).count()
-
-            # --- Commodities ---
             commodity_mnemonics = sorted(set(
                 c.mnemonic for c in book.commodities
             ))
+            biz_counts = self._business_summary_counts(book)
 
-            # --- Build output ---
-            # Book line shows filename only — no directory leak.
-            # See _book_display_name for the privacy rationale; the
-            # filename is enough for the LLM to confirm which book
-            # is loaded ("alex.gnucash" vs "lin-wei.gnucash") while
-            # keeping the user's filesystem layout out of every
-            # transcript and screenshot.
-            from gnucash_mcp._format import _book_display_name
-            lines = []
-            lines.append(f"Book: {_book_display_name(self.book_path)}")
-            lines.append(f"Currency: {currency}")
+            # Assemble the output by chaining section renderers.
+            # Each one returns ``list[str]`` (empty to omit). The
+            # order here IS the output order — sections shift via
+            # reordering, not template editing.
+            lines: list[str] = []
+            lines.extend(
+                self._render_book_metadata(
+                    currency, first_date, last_date,
+                )
+            )
 
-            if first_date and last_date:
-                lines.append(f"Data range: {first_date.isoformat()} to {last_date.isoformat()}")
-
-            # Last entry: how stale are the books? The data range
-            # tells the LLM what's covered; this line tells it
-            # whether the books are caught up (entered through
-            # yesterday) or whether there's a backlog of
-            # transactions to enter before reconciliation makes
-            # sense. The bookkeeper's framing: "let's reconcile"
-            # vs. "let's enter 200 transactions first" — the
-            # answer pivots on this number.
-            #
-            # Four cases keyed on (today − last_date).days:
-            #   < 0  — future-dated. Normal for scheduled-txn
-            #          instantiation that posts ahead of time.
-            #          NOT a "behind" signal; render as
-            #          "(future-dated, N days ahead)".
-            #   = 0  — today.
-            #   = 1  — yesterday.
-            #   > 1  — N days behind. ⚠ past
-            #          _LAST_ENTRY_WARN_DAYS (14) — catch-up is
-            #          usually pending before reconciliation.
-            if last_date is not None:
-                today = date.today()
-                days_behind = (today - last_date).days
-                if days_behind < 0:
-                    days_ahead = -days_behind
-                    lines.append(
-                        f"Last entry: {last_date.isoformat()} "
-                        f"(future-dated, {days_ahead} days ahead)"
-                    )
-                elif days_behind == 0:
-                    lines.append(
-                        f"Last entry: {last_date.isoformat()} (today)"
-                    )
-                elif days_behind == 1:
-                    lines.append(
-                        f"Last entry: {last_date.isoformat()} (yesterday)"
-                    )
-                else:
-                    warn = (
-                        " ⚠"
-                        if days_behind > self._LAST_ENTRY_WARN_DAYS
-                        else ""
-                    )
-                    lines.append(
-                        f"Last entry: {last_date.isoformat()} "
-                        f"({days_behind} days behind){warn}"
-                    )
-
-            # Warnings: scan-first section. Lives near the top of
-            # the output (right after book metadata) because if
-            # there's data integrity trouble or stale prices
-            # informing the rest of the summary, the LLM should see
-            # that BEFORE reading numbers that depend on them.
-            # L-1: inlined ``_render_warnings`` — single caller.
-            # Section absent when there are no warnings (the spec
-            # explicitly calls out not printing "Warnings: none.").
-            warnings = self._collect_warnings(book, transactions, accounts)
+            # Warnings: scan-first section. Lives near the top
+            # because data-integrity / stale-price warnings inform
+            # the rest of the summary, so the LLM sees them before
+            # reading numbers that depend on them.
+            warnings = self._collect_warnings(
+                book, transactions, accounts,
+            )
             if warnings:
                 lines.append("Warnings:")
                 for msg in warnings:
                     lines.append(f"  ⚠ {msg}")
 
-            lines.append(f"Accounts: {total_accounts} total")
-
-            # Assets section — leaf accounts with USD-valued balances.
-            # Count includes A/R accounts (which roll into assets_total)
-            # so the headline N agrees with the total; per-account
-            # detail for A/R is shown in the Receivables section below
-            # rather than duplicated here.
-            assets_count = len(asset_leaves) + len(receivable_accts)
-            lines.append(f"Assets: {assets_count} accounts, {currency} {assets_total}")
-            for name, usd_value, note in sorted(
-                asset_leaves, key=lambda x: x[1], reverse=True
-            ):
-                if note is None:
-                    lines.append(f"  {name}: {currency} {_r2(usd_value)}")
-                else:
-                    lines.append(
-                        f"  {name}: {note} ({currency} {_r2(usd_value)})"
-                    )
-
-            # Liabilities section — grouped subtotals + top 3.
-            # A/P accounts (rolled into liabilities_total) are
-            # included in the count; per-account detail lives in the
-            # Payables breakout below.
-            liab_count = (
-                len(credit_cards) + len(loan_accts)
-                + len(other_liab_accts) + len(payable_accts)
+            lines.append(f"Accounts: {data.total_accounts} total")
+            lines.extend(
+                self._render_assets_section(data, currency)
             )
-            lines.append(f"Liabilities: {liab_count} accounts, {currency} {liabilities_total}")
-            if credit_cards:
-                lines.append(f"  Credit cards ({len(credit_cards)}): {currency} {credit_total}")
-            if loan_accts:
-                lines.append(f"  Loans ({len(loan_accts)}): {currency} {loan_total}")
-            if other_liab_accts:
-                lines.append(f"  Other ({len(other_liab_accts)}): {currency} {other_liab_total}")
-            if len(all_liab_leaves) > 1:
-                top_n = all_liab_leaves[:3]
-                top_parts = [f"{n} {currency} {_r2(b)}" for n, b in top_n]
-                lines.append(f"  Top {len(top_n)}: {', '.join(top_parts)}")
-
-            # Receivables / Payables — only if non-zero. The
-            # parenthesized action signal (open count + overdue)
-            # is the bookkeeper-asked-for addition: the LLM should
-            # see "2 overdue" and know to ask about collections,
-            # without us having to spell that out.
-            biz_counts = self._business_summary_counts(book)
-            if receivable_accts:
-                inv_n = biz_counts["open_invoices"]
-                overdue = biz_counts["overdue_invoices"]
-                signal = (
-                    f" ({inv_n} invoice"
-                    f"{'s' if inv_n != 1 else ''}, "
-                    f"{overdue} overdue)"
-                ) if inv_n else ""
-                lines.append(
-                    f"Receivables: {len(receivable_accts)} account"
-                    f"{'s' if len(receivable_accts) != 1 else ''}, "
-                    f"{currency} {receivables_total}{signal}"
+            lines.extend(
+                self._render_liabilities_section(data, currency)
+            )
+            lines.extend(
+                self._render_receivables_payables(
+                    data, biz_counts, currency,
                 )
-                for name, bal in sorted(receivable_accts, key=lambda x: x[1], reverse=True):
-                    lines.append(f"  {name}: {currency} {_r2(bal)}")
-            if payable_accts:
-                bill_n = biz_counts["open_bills"]
-                overdue = biz_counts["overdue_bills"]
-                signal = (
-                    f" ({bill_n} bill"
-                    f"{'s' if bill_n != 1 else ''}, "
-                    f"{overdue} overdue)"
-                ) if bill_n else ""
-                lines.append(
-                    f"Payables: {len(payable_accts)} account"
-                    f"{'s' if len(payable_accts) != 1 else ''}, "
-                    f"{currency} {payables_total}{signal}"
-                )
-                for name, bal in sorted(payable_accts, key=lambda x: x[1], reverse=True):
-                    lines.append(f"  {name}: {currency} {_r2(bal)}")
+            )
 
-            # Jobs: one conditional line. Tells the LLM the
-            # job-grouping feature is in use on this book; absence
-            # is a stronger signal than "Jobs: 0 active". Per the
-            # bookkeeper: "Jobs existing doesn't need attention"
-            # but knowing they're in play points to the right
-            # drill-down tool (``get_job_report``).
+            # Jobs: single conditional line. Absence-as-signal —
+            # the bookkeeper said "jobs existing doesn't need
+            # attention but knowing they're in play points to the
+            # right drill-down tool."
             if biz_counts["active_jobs"] > 0:
-                lines.append(f"Jobs: {biz_counts['active_jobs']} active")
+                lines.append(
+                    f"Jobs: {biz_counts['active_jobs']} active"
+                )
 
-            lines.append(f"Income: {income_active} active ({income_total} total)")
-            lines.append(f"Expenses: {expense_active} active ({expense_total} total)")
+            lines.append(
+                f"Income: {data.income_active} active "
+                f"({data.income_total} total)"
+            )
+            lines.append(
+                f"Expenses: {data.expense_active} active "
+                f"({data.expense_total} total)"
+            )
 
-            # Reconciliation, trajectory, monthly net, runway, budget:
-            # each section's data collector lives in its own method;
-            # the matching ``_render_*`` helper renders the section
-            # (or returns ``[]`` to omit it — absence-as-signal). See
-            # the helpers for the per-section spec and warning
-            # thresholds.
+            # Reconciliation, trajectory, monthly net, runway,
+            # budget: each section's data collector lives in its
+            # own method; the matching ``_render_*`` helper turns
+            # it into text or omits the section.
             reconciliation = self._account_reconciliation_status(
                 book, accounts,
             )
-            lines.extend(self._render_reconciliation(reconciliation))
-
+            lines.extend(
+                self._render_reconciliation(reconciliation)
+            )
             trajectory = self._net_worth_trajectory(
                 book, first_date, accounts,
             )
             lines.extend(
-                self._render_net_worth_trajectory(trajectory, currency)
+                self._render_net_worth_trajectory(
+                    trajectory, currency,
+                )
             )
-
-            monthly = self._monthly_net_income(book, transactions, months=6)
+            monthly = self._monthly_net_income(
+                book, transactions, months=6,
+            )
             lines.extend(self._render_monthly_net(monthly))
-
             runway = self._runway_metrics(
                 book, default_currency, transactions, accounts,
             )
             lines.extend(self._render_runway(runway, currency))
-
             budget = self._budget_headline(book, transactions)
             lines.extend(self._render_budget(budget))
 
-            lines.append(f"Transactions: {total_txns}")
-
-            if enabled_sx > 0:
-                # Roll the "due in next 7 days" stat into the
-                # Scheduled line so the LLM sees the immediate
-                # to-do list at orientation time, no second tool
-                # call needed. The bookkeeper's framing: the
-                # dashboard answers "what is the state"; this
-                # turns it into "what do I need to do next."
-                #
-                # ``_upcoming_within_days`` lives on
-                # SchedulingMixin; ``hasattr`` lets a book class
-                # built without scheduling skip the upcoming-line
-                # render cleanly. Cross-mixin call avoided in
-                # favor of opportunistic inclusion.
-                line = f"Scheduled: {enabled_sx} recurring"
-                if hasattr(self, "_upcoming_within_days"):
-                    upcoming = self._upcoming_within_days(
-                        book, days=7,
-                    )
-                    if upcoming["count"] > 0:
-                        plural = (
-                            "s" if upcoming["count"] != 1 else ""
-                        )
-                        # Whole-currency-unit total — this is a
-                        # planning number, not an accounting line.
-                        total_int = int(upcoming["total"])
-                        line += (
-                            f", {upcoming['count']} due in next "
-                            f"7 days ({currency} {total_int:,})"
-                        )
-                    else:
-                        line += ", none due in next 7 days"
-                lines.append(line)
-
-            # Business + budgets — one line each, only if present
-            if n_customers or n_vendors or n_employees:
-                parts = []
-                if n_customers:
-                    parts.append(f"{n_customers} customer"
-                                 f"{'s' if n_customers != 1 else ''}")
-                if n_vendors:
-                    parts.append(f"{n_vendors} vendor"
-                                 f"{'s' if n_vendors != 1 else ''}")
-                if n_employees:
-                    parts.append(f"{n_employees} employee"
-                                 f"{'s' if n_employees != 1 else ''}")
-                lines.append(f"Business: {', '.join(parts)}")
-            if n_budgets:
-                lines.append(f"Budgets: {n_budgets}")
-
-            lines.append(f"Commodities: {', '.join(commodity_mnemonics)}")
-
-            # Bottom-line "Net worth: USD X" line removed. The
-            # trajectory section's "now" anchor is now the
-            # authoritative net-worth number, computed via
-            # _compute_net_worth_at — the user sees one number,
-            # by construction matching the per-leaf
-            # assets_total − liabilities_total semantics that
-            # used to render here.
+            lines.extend(
+                self._render_transactions_scheduled(
+                    book, total_txns, enabled_sx, currency,
+                )
+            )
+            lines.extend(
+                self._render_business_summary(
+                    n_customers, n_vendors, n_employees,
+                    n_budgets, commodity_mnemonics,
+                )
+            )
 
             return "\n".join(lines)
 
