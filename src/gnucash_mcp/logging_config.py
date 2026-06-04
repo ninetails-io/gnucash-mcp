@@ -1226,6 +1226,52 @@ def _fmt_invoice_post(entry: dict) -> list[str]:
     return lines
 
 
+# ── Investment handlers ───────────────────────────────────────────
+
+
+def _fmt_commodity_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    ns = after.get("namespace", params.get("namespace", ""))
+    mnem = after.get("mnemonic", params.get("mnemonic", ""))
+    lines = [f"{time_part}  CREATE COMMODITY  {ns}:{mnem}"]
+    fullname = after.get("fullname", params.get("fullname", ""))
+    if fullname:
+        lines.append(f'{_INDENT}fullname: "{fullname}"')
+    fraction = after.get("fraction", params.get("fraction"))
+    if fraction is not None:
+        lines.append(f"{_INDENT}fraction: {fraction}")
+    return lines
+
+
+def _fmt_price_create(entry: dict) -> list[str]:
+    """``create_price`` returns ``status="updated"`` when a price at
+    the same (commodity, currency, date, source) already existed and
+    was overwritten; ``"created"`` otherwise. Surface that in the
+    header verb so a human reading the log can tell a fresh write
+    from an overwrite."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    ns = after.get("namespace", params.get("namespace", ""))
+    comm = after.get("commodity", params.get("commodity", ""))
+    status = after.get("status", "")
+    verb = "UPDATE" if status == "updated" else "CREATE"
+    lines = [f"{time_part}  {verb} PRICE  {ns}:{comm}"]
+    date_str = after.get("date", params.get("price_date", "") or "")
+    value = after.get("value", params.get("value", ""))
+    currency = after.get("currency", params.get("currency", "") or "")
+    if date_str or value:
+        parts = []
+        if date_str:
+            parts.append(f"date: {date_str}")
+        if value:
+            parts.append(f"value: {value}{' ' + currency if currency else ''}")
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    return lines
+
+
 def _fmt_price_delete(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1243,6 +1289,53 @@ def _fmt_price_delete(entry: dict) -> list[str]:
             f"{_INDENT}date: {date_str}  value: {value}  source: {source}",
         ]
     return [head]
+
+
+def _fmt_lot_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    title = after.get("title", params.get("title", ""))
+    lines = [f'{time_part}  CREATE LOT  "{title}"']
+    account = after.get("account", params.get("account", ""))
+    if account:
+        lines.append(f"{_INDENT}account: {account}")
+    notes = after.get("notes", params.get("notes", ""))
+    if notes:
+        lines.append(f'{_INDENT}notes: "{notes}"')
+    return lines
+
+
+def _fmt_lot_update(entry: dict) -> list[str]:
+    """Two operations register as ``lot:UPDATE`` —
+    ``assign_split_to_lot`` (status=``"assigned"``) and
+    ``close_lot`` (status=``"closed"``). The header verb branches on
+    response status so the human reader can tell them apart at a
+    glance."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    status = after.get("status", "")
+
+    if status == "closed":
+        title = after.get("title", "")
+        if title:
+            return [f'{time_part}  CLOSE LOT  "{title}"']
+        return [f"{time_part}  CLOSE LOT  {params.get('guid', '')}"]
+
+    # Default: assign_split_to_lot
+    lines = [f"{time_part}  ASSIGN SPLIT TO LOT"]
+    split_guid = params.get("split_guid", "")
+    lot_guid = params.get("lot_guid", "")
+    if split_guid:
+        lines.append(f"{_INDENT}split: {split_guid}")
+    if lot_guid:
+        lines.append(f"{_INDENT}lot: {lot_guid}")
+    if after.get("is_closed"):
+        lines.append(
+            f"{_INDENT}lot auto-closed (quantity reached zero)"
+        )
+    return lines
 
 
 def _fmt_invoice_unpost(entry: dict) -> list[str]:
@@ -1543,6 +1636,30 @@ def _fmt_entry_create(entry: dict) -> list[str]:
 # ── Budget handlers ────────────────────────────────────────────────
 
 
+def _fmt_budget_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    lines = [f'{time_part}  CREATE BUDGET  "{name}"']
+    info_parts = []
+    num_periods = params.get("num_periods")
+    if num_periods is not None:
+        info_parts.append(f"periods: {num_periods}")
+    period_type = params.get("period_type")
+    if period_type:
+        info_parts.append(f"type: {period_type}")
+    year = params.get("year")
+    if year is not None:
+        info_parts.append(f"year: {year}")
+    if info_parts:
+        lines.append(f"{_INDENT}{'  '.join(info_parts)}")
+    desc = params.get("description", "")
+    if desc:
+        lines.append(f'{_INDENT}description: "{desc}"')
+    return lines
+
+
 def _fmt_budget_update(entry: dict) -> list[str]:
     """``set_budget_amount`` is logged as ``budget UPDATE``. Renders
     the per-period before/after diff captured by the staged
@@ -1591,6 +1708,30 @@ def _fmt_budget_delete(entry: dict) -> list[str]:
 
 
 # ── Scheduled-transaction handlers ─────────────────────────────────
+
+
+def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    lines = [f'{time_part}  CREATE SCHEDULED  "{name}"']
+    freq = after.get("frequency", params.get("frequency", ""))
+    start = params.get("start_date", "")
+    end = params.get("end_date", "")
+    parts = []
+    if freq:
+        parts.append(f"frequency: {freq}")
+    if start:
+        parts.append(f"start: {start}")
+    if end:
+        parts.append(f"end: {end}")
+    if parts:
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    next_occ = after.get("next_occurrence")
+    if next_occ:
+        lines.append(f"{_INDENT}next: {next_occ}")
+    return lines
 
 
 def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
@@ -1700,9 +1841,15 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("credit_note", "PAY"): _fmt_credit_note_pay,
     ("credit_note", "APPLY"): _fmt_credit_note_apply,
     ("entry", "CREATE"): _fmt_entry_create,
+    ("commodity", "CREATE"): _fmt_commodity_create,
+    ("price", "CREATE"): _fmt_price_create,
     ("price", "DELETE"): _fmt_price_delete,
+    ("lot", "CREATE"): _fmt_lot_create,
+    ("lot", "UPDATE"): _fmt_lot_update,
+    ("budget", "CREATE"): _fmt_budget_create,
     ("budget", "UPDATE"): _fmt_budget_update,
     ("budget", "DELETE"): _fmt_budget_delete,
+    ("scheduled_transaction", "CREATE"): _fmt_scheduled_transaction_create,
     ("scheduled_transaction", "UPDATE"): _fmt_scheduled_transaction_update,
     ("scheduled_transaction", "DELETE"): _fmt_scheduled_transaction_delete,
 }
