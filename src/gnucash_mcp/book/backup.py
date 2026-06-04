@@ -35,6 +35,8 @@ from pathlib import Path
 
 import piecash
 
+from gnucash_mcp.logging_config import redact_paths
+
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
@@ -457,24 +459,32 @@ class BackupMixin:
             )
 
         size_bytes = backup_path.stat().st_size
+
+        # MP-4: route path-bearing fields through ``redact_paths``
+        # (imported at module top). Pass-through unless
+        # ``GNUCASH_REDACT_PATHS=1``; when set, paths collapse to
+        # basename so responses are safe to share externally
+        # without leaking filesystem layout.
+
+        # L-5: shell-quote interpolated paths. Paths with spaces
+        # or shell metachars would otherwise break the command —
+        # and if a future code path ever passes a user-influenced
+        # path component, an unquoted f-string is a latent
+        # injection.
+        restore_hint = (
+            "Restore by stopping the server, then: "
+            f"mv {shlex.quote(str(self.book_path))} "
+            f"{shlex.quote(str(self.book_path) + '.broken')} && "
+            f"cp {shlex.quote(str(backup_path))} "
+            f"{shlex.quote(str(self.book_path))}"
+        )
         return {
             "status": "created",
             "stage": stage,
-            "path": str(backup_path),
+            "path": redact_paths(str(backup_path)),
             "size_bytes": size_bytes,
             "integrity": integrity,
-            "restore_hint": (
-                # L-5: shell-quote interpolated paths. Paths with
-                # spaces or shell metachars would otherwise break
-                # the command — and if a future code path ever
-                # passes a user-influenced path component, an
-                # unquoted f-string is a latent injection.
-                "Restore by stopping the server, then: "
-                f"mv {shlex.quote(str(self.book_path))} "
-                f"{shlex.quote(str(self.book_path) + '.broken')} && "
-                f"cp {shlex.quote(str(backup_path))} "
-                f"{shlex.quote(str(self.book_path))}"
-            ),
+            "restore_hint": redact_paths(restore_hint),
         }
 
     # ── Listing ──────────────────────────────────────────────────
@@ -515,7 +525,8 @@ class BackupMixin:
                 "age": _describe_age(ts, now),
                 "size_bytes": size,
                 "label": label,
-                "path": str(path),
+                # MP-4: opt-in path redaction.
+                "path": redact_paths(str(path)),
             })
 
         entries.sort(key=lambda e: e["timestamp"], reverse=True)

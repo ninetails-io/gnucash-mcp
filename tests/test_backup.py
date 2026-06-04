@@ -754,3 +754,53 @@ class TestAuditHookIntegration:
         # Flag never toggled; no backups exist
         assert book._backup_checked_in_process is False
         assert book.list_backups() == []
+
+
+class TestBackupPathRedaction:
+    """MP-4: backup tool responses must honor
+    ``GNUCASH_REDACT_PATHS=1`` so absolute paths can collapse to
+    basenames before the response leaves the server. Default off
+    (paths are useful debugging signal locally); opt-in via the
+    same env var the error-message redaction uses.
+    """
+
+    def test_create_backup_path_redacted_when_env_set(
+        self, test_book: Path, monkeypatch,
+    ):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        book = GnuCashBook(str(test_book))
+        result = book.create_backup(stage="manual", label="test")
+        # path collapses to basename — no directory components.
+        assert "/" not in result["path"], result["path"]
+        # restore_hint should not embed any absolute paths
+        # either.
+        assert " /" not in result["restore_hint"], result["restore_hint"]
+        # The book filename is preserved (so the user knows what
+        # they're restoring).
+        assert test_book.name in result["restore_hint"]
+
+    def test_create_backup_path_intact_by_default(
+        self, test_book: Path, monkeypatch,
+    ):
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        book = GnuCashBook(str(test_book))
+        result = book.create_backup(stage="manual", label="test")
+        # Default behavior emits full absolute paths.
+        assert str(test_book.parent) in result["restore_hint"], (
+            "default behavior should embed full paths for actionable "
+            f"restore hint; got: {result['restore_hint']!r}"
+        )
+
+    def test_list_backups_paths_redacted_when_env_set(
+        self, test_book: Path, monkeypatch,
+    ):
+        # Create with redaction off so the file lands at a real
+        # absolute path, then re-list with redaction on.
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="redaction-test")
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        listed = book.list_backups()
+        assert listed, "fixture failed: backup not created"
+        for entry in listed:
+            assert "/" not in entry["path"], entry
