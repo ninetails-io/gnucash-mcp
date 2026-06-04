@@ -21,7 +21,7 @@ Depends on shared helpers from BaseGnuCashBook:
   - self.open, self._find_account
 """
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 import piecash
@@ -803,16 +803,37 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
         account: str | None = None,
+        include_transfers: bool = False,
     ) -> dict:
         """Calculate cash flow (inflows and outflows) for a period.
+
+        By default, internal transfers between cash/bank/credit/
+        asset accounts are filtered out. A transaction with no
+        INCOME or EXPENSE leg is a pure rearrangement — transfer
+        to savings, credit-card payoff, currency wallet shuffle —
+        neither inflow nor outflow in cash-flow terms. Filtering
+        that noise is what makes the totals answer "where did
+        money come from and where did it go?" rather than "every
+        debit and credit that touched a cash account, including
+        same-pocket reshuffling." SB-5.
 
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
-            account: Optional account to filter (e.g., specific bank account).
+            account: Optional account to filter to a single
+                cash/bank account.
+            include_transfers: When ``False`` (default), skip
+                transactions with no INCOME or EXPENSE split. When
+                ``True``, include every cash/bank movement — useful
+                for reconciliation against a bank statement, which
+                shows every debit and credit regardless of category.
 
         Returns:
-            Dict with inflows, outflows, and net cash flow.
+            Dict with ``account``, ``inflows``, ``outflows``, and —
+            when any transfers were filtered — ``transfers_excluded``
+            (count of distinct transactions skipped, surfaced so the
+            LLM can mention the ``include_transfers=true`` escape
+            hatch when relevant).
         """
         with self.open(readonly=True) as book:
             # Two filter modes: a named account (one-GUID IN() clause)
@@ -836,12 +857,31 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
+            # SB-5: build the set of transaction GUIDs in the
+            # period that have at least one INCOME or EXPENSE
+            # split — the "real" cash flow events. Transactions
+            # outside this set are internal transfers (pure
+            # asset/liability/equity rearrangement) and get
+            # filtered unless include_transfers is True. One
+            # indexed SQL query — no N+1 over txn.splits.
+            if not include_transfers:
+                cashflow_txn_guids = self._cashflow_txn_guids(
+                    book, start_date, end_date
+                )
+            else:
+                cashflow_txn_guids = None  # don't filter
+
             # Factors anchored to ``end_date`` — same historical-
             # rates discipline as the period breakdowns.
             factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
             outflows = Decimal("0")
-            for split, _txn, acct in rows:
+            transfers_excluded: set[str] = set()
+            for split, txn, acct in rows:
+                if cashflow_txn_guids is not None \
+                        and txn.guid not in cashflow_txn_guids:
+                    transfers_excluded.add(txn.guid)
+                    continue
                 amt = self._split_in_default_currency(
                     split, acct, factors.get(acct.guid)
                 )
@@ -856,7 +896,7 @@ class ReportingMixin:
             # Echo the canonical fullname rather than the raw input —
             # so callers passing %short or full-GUID input always see
             # a readable account name in the response.
-            return {
+            result = {
                 "account": (
                     target_account.fullname if account
                     else "All cash/bank accounts"
@@ -864,6 +904,44 @@ class ReportingMixin:
                 "inflows": str(inflows),
                 "outflows": str(outflows),
             }
+            if transfers_excluded:
+                result["transfers_excluded"] = len(transfers_excluded)
+            return result
+
+    def _cashflow_txn_guids(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> set[str]:
+        """Set of transaction GUIDs in the period that have at
+        least one INCOME or EXPENSE split.
+
+        Used by ``cash_flow`` to filter "internal transfer" noise
+        from the default report — see that method's docstring
+        for the rationale (SB-5).
+
+        Indexed SQL with the same date-upper-bound handling as
+        ``_query_filtered_splits`` (``post_date < end_date + 1 day``
+        to include the full inclusive end date past piecash's
+        neutral-time DateTime storage).
+        """
+        from piecash.core.account import Account
+        from piecash.core.transaction import Split, Transaction
+
+        q = (
+            book.session.query(Transaction.guid)
+            .join(Split, Split.transaction_guid == Transaction.guid)
+            .join(Account, Split.account_guid == Account.guid)
+            .filter(Transaction.post_date >= start_date)
+            .filter(Account.type.in_(("INCOME", "EXPENSE")))
+            .distinct()
+        )
+        if end_date < date.max:
+            q = q.filter(
+                Transaction.post_date < end_date + timedelta(days=1)
+            )
+        return {g for (g,) in q.all()}
 
     # ── Debt Payoff ───────────────────────────────────────────────
 

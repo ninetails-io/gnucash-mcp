@@ -8365,6 +8365,92 @@ class TestCashFlow:
             )
 
 
+class TestCashFlowInternalTransferFilter:
+    """SB-5: cash_flow's default report filters out internal
+    transfers — transactions with no INCOME or EXPENSE leg.
+
+    The multi_currency fixture is ideal: t1 (opening balance,
+    equity-side) and t3 (cross-currency wallet shuffle) are both
+    pure rearrangements; t2 (salary, INCOME leg) and t4 (groceries,
+    EXPENSE leg) are real cash flow events. Default = only t2 and
+    t4 counted; ``include_transfers=True`` = all four counted.
+    """
+
+    def test_default_filters_internal_transfers(
+        self, multi_currency_book: Path,
+    ):
+        """Default report excludes equity-side opening balance and
+        the cross-currency wallet shuffle. Inflows = salary only;
+        outflows = groceries only.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+        # Salary inflow only (t2): 3000. Opening (t1, equity) and
+        # cross-currency transfer (t3) filtered.
+        assert Decimal(result["inflows"]) == Decimal("3000")
+        # Groceries outflow only (t4): 200.
+        assert Decimal(result["outflows"]) == Decimal("200")
+        # Two transactions were filtered as transfers (t1 + t3).
+        assert result["transfers_excluded"] == 2
+
+    def test_include_transfers_restores_gross(
+        self, multi_currency_book: Path,
+    ):
+        """With ``include_transfers=True`` the totals match the
+        pre-SB-5 behavior — useful for bank statement reconciliation
+        where every debit/credit matters regardless of category.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            include_transfers=True,
+        )
+        assert Decimal(result["inflows"]) == Decimal("9100")
+        assert Decimal(result["outflows"]) == Decimal("1300")
+        # No transfers filtered → field omitted.
+        assert "transfers_excluded" not in result
+
+    def test_transfers_excluded_omitted_when_zero(
+        self, test_book: Path,
+    ):
+        """The ``transfers_excluded`` field only appears when at
+        least one transaction was filtered. Keeps the response
+        compact when there's nothing to surface.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        # Empty range — no transactions touched, nothing filtered.
+        result = gc_book.cash_flow(
+            start_date=date(2030, 1, 1),
+            end_date=date(2030, 1, 31),
+        )
+        assert "transfers_excluded" not in result
+
+    def test_account_filter_with_transfer_filter(
+        self, multi_currency_book: Path,
+    ):
+        """When ``account`` is specified, transfer filtering still
+        applies. Running on Checking alone with the default: the
+        salary deposit counts (INCOME leg present), but the cross-
+        currency outflow to EUR Savings does not (no INCOME/EXPENSE
+        leg on that transaction).
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account="Assets:Checking",
+        )
+        # Salary +3000 = inflow. Groceries -200 = outflow.
+        # Opening +5000 and cross-currency -1100 both filtered.
+        assert Decimal(result["inflows"]) == Decimal("3000")
+        assert Decimal(result["outflows"]) == Decimal("200")
+        assert result["transfers_excluded"] == 2
+
+
 class TestListCommodities:
     """Tests for list_commodities method."""
 
@@ -8706,11 +8792,16 @@ class TestMultiCurrencyBalances:
         """Cash flow aggregates USD-equivalent amounts across cash
         and bank accounts (using cost basis as fallback when no
         market rate is on file).
+
+        Asserts the gross numbers via ``include_transfers=True`` so
+        the test exercises the FX-conversion path without being
+        coupled to the default transfer-filter (SB-5).
         """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.cash_flow(
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
+            include_transfers=True,
         )
         inflows = Decimal(result["inflows"])
         outflows = Decimal(result["outflows"])
