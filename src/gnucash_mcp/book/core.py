@@ -1163,22 +1163,50 @@ class CoreMixin:
         period_start = candidate["start"]
         period_end = candidate["end"]
 
-        # Sum budget targets across all (account, period) pairs.
-        # BudgetAmount.amount is a Decimal already.
+        # Sum budget targets across all (account, period) pairs and
+        # also FX-convert each target to default currency at the
+        # period-end rate. Pre-fix targets were summed raw — apples-
+        # to-oranges against default-currency actuals on multi-
+        # currency budgets (SB-6, mirroring the get_budget_report
+        # fix in budgets.py).
+        factors = self._account_conversion_factors(book, period_end)
         total_budgeted = Decimal("0")
+        budgeted_accounts: list = []
         budgeted_account_guids: set[str] = set()
         for ba in budget.amounts:
-            total_budgeted += Decimal(str(ba.amount))
+            ba_amount = Decimal(str(ba.amount))
+            factor = factors.get(ba.account.guid)
+            if factor is not None:
+                ba_amount = ba_amount * factor
+            total_budgeted += ba_amount
+            budgeted_accounts.append(ba.account)
             budgeted_account_guids.add(ba.account.guid)
 
         if total_budgeted <= 0:
             return None
 
+        # SB-9: roll descendants of placeholder-budgeted parents
+        # into the rollup set so their splits contribute to actuals.
+        # PR #46 fixed this in ``get_budget_report``; the dashboard
+        # headline was left behind. A descendant that's separately
+        # budgeted on its own line stays out of the rollup so its
+        # actuals aren't double-counted toward both its own line
+        # and its ancestor's line.
+        rollup_guids: set[str] = set(budgeted_account_guids)
+        for budgeted_acct in budgeted_accounts:
+            descendants: set = set()
+            self._collect_descendants(budgeted_acct, descendants)
+            for desc in descendants:
+                if desc.guid in budgeted_account_guids:
+                    continue  # separately budgeted — don't roll up
+                rollup_guids.add(desc.guid)
+
         # Actuals: iterate transactions in the budget's date range
         # once, accumulating EXPENSE positives and INCOME absolute-
-        # value flows for splits in budgeted accounts. INCOME is
-        # stored negative; flip to a positive contribution to match
-        # the spend-vs-target framing.
+        # value flows for splits in budgeted accounts (or their
+        # rolled-up descendants). INCOME is stored negative; flip
+        # to a positive contribution to match the spend-vs-target
+        # framing.
         #
         # Each split is converted to the book's default currency at
         # the most recent market rate so foreign-currency budgeted
@@ -1189,13 +1217,12 @@ class CoreMixin:
         # Factors anchored to ``period_end`` so a historical budget
         # period values its actuals at the rate of that period —
         # not today's.
-        factors = self._account_conversion_factors(book, period_end)
         actuals = Decimal("0")
         for txn in transactions:
             if txn.post_date < period_start or txn.post_date > period_end:
                 continue
             for s in txn.splits:
-                if s.account.guid not in budgeted_account_guids:
+                if s.account.guid not in rollup_guids:
                     continue
                 atype = s.account.type
                 if atype not in ("EXPENSE", "INCOME"):
