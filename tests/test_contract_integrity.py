@@ -380,3 +380,98 @@ class TestNewAuditFormatters:
                 f"empty output — the emitter would drop this entry "
                 f"from the audit log."
             )
+
+
+# ── HP-1: write-verification contract ──────────────────────────────
+
+
+class TestWriteVerificationCoverage:
+    """HP-1: the codebase claimed "every write is verified" but the
+    actual contract is two-tier:
+
+    - **ORM writes** (``book.session.add(obj)``, attribute mutation,
+      ``book.session.delete(obj)``) rely on SQLAlchemy's commit-side
+      verification — any constraint violation, missing FK, or
+      stale-object failure raises during ``book.save()``. Explicit
+      ``_verify_*`` would be redundant.
+    - **Raw-SQL writes** (``book.session.execute(Table.__table__
+      .insert/update/delete(...))``) need explicit verification —
+      SQLAlchemy executes the SQL but can't tell whether the WHERE
+      clause matched any rows or the INSERT actually landed.
+
+    This class locks the second tier. Every raw-SQL DML site in
+    ``book/*.py`` must have a paired ``_verify_*`` call within a
+    short window. The contract test catches the regression class
+    where someone adds a new ``book.session.execute(Table.insert())``
+    without the matching verify (or accidentally drops a verify
+    during a refactor) — the audit identified this happening five
+    times in the codebase's history before the contract was
+    codified.
+    """
+
+    # Window size: 40 lines. The existing call sites all verify
+    # within ~30 lines; 40 leaves headroom for slightly longer
+    # insert payloads without becoming so generous the test misses
+    # a real gap.
+    _VERIFY_WINDOW = 40
+
+    def _scan_dml_sites(self) -> list[tuple[Path, int, str, str]]:
+        """Yield ``(path, line, table, op)`` for every raw-SQL DML
+        site in ``book/*.py``."""
+        import re
+        dml = re.compile(
+            r"(\w+)\.__table__\.(insert|delete|update)\(\)"
+        )
+        out: list[tuple[Path, int, str, str]] = []
+        for py_file in sorted(_BOOK_DIR.glob("*.py")):
+            lines = py_file.read_text().splitlines()
+            for i, line in enumerate(lines, 1):
+                m = dml.search(line)
+                if not m:
+                    continue
+                out.append((py_file, i, m.group(1), m.group(2)))
+        return out
+
+    def test_every_raw_sql_dml_site_has_paired_verify(self):
+        import re
+        verify_pattern = re.compile(
+            r"_verify_(write|composite_write|delete)\b"
+        )
+        missing: list[str] = []
+        for path, line_no, table, op in self._scan_dml_sites():
+            lines = path.read_text().splitlines()
+            window = "\n".join(
+                lines[line_no:line_no + self._VERIFY_WINDOW]
+            )
+            if not verify_pattern.search(window):
+                missing.append(
+                    f"{path.name}:{line_no}: "
+                    f"{table}.__table__.{op}()  → no _verify_* "
+                    f"within {self._VERIFY_WINDOW} lines"
+                )
+        assert not missing, (
+            "Raw-SQL DML sites without a paired _verify_* helper. "
+            "SQLAlchemy can't tell whether the SQL changed any rows; "
+            "the verify reads back the affected key and raises if "
+            "the round-trip doesn't match.\n"
+            + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_dml_site_scan_finds_known_sites(self):
+        """Sanity check on the scanner itself — ensure it actually
+        finds the call sites we know exist. Catches a future
+        refactor that hides DML behind a wrapper the regex doesn't
+        recognize, which would silently make the previous test
+        vacuous (no sites → no failures)."""
+        sites = self._scan_dml_sites()
+        # Known invariants of the current codebase: budgets,
+        # business, and scheduling all do raw-SQL DML.
+        files_with_dml = {p.name for p, _, _, _ in sites}
+        assert "budgets.py" in files_with_dml
+        assert "business.py" in files_with_dml
+        assert "scheduling.py" in files_with_dml
+        # Should be more than a handful of sites total.
+        assert len(sites) >= 10, (
+            f"Scanner found only {len(sites)} DML sites — "
+            f"likely the regex regressed or a refactor hid them"
+        )

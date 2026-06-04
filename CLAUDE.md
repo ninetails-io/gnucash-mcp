@@ -128,9 +128,22 @@ module contributes zero tools to the MCP surface.
   `type='transaction'` auto-defaults created by piecash on
   cross-currency transactions are skipped — they'd shadow user-
   supplied market prices.
-- **Every write is verified.** `_verify_write` /
-  `_verify_composite_write` read back what was written and raise if
-  the round-trip doesn't match.
+- **Every raw-SQL write is verified.** Two-tier contract:
+  - **ORM writes** (`book.session.add(obj)`, attribute mutation,
+    `book.session.delete(obj)`) rely on SQLAlchemy's commit-side
+    verification — constraint violations, missing FKs, and stale-
+    object failures raise during `book.save()`. Explicit
+    `_verify_*` would be redundant.
+  - **Raw-SQL writes** (`book.session.execute(Table.__table__.
+    insert/update/delete(...))`) need explicit verification —
+    SQLAlchemy executes the SQL but can't tell whether the WHERE
+    clause matched any rows or the INSERT actually landed.
+    `_verify_write` / `_verify_composite_write` / `_verify_delete`
+    read back the affected row and raise if the round-trip doesn't
+    match.
+  Locked by `tests/test_contract_integrity.py::TestWriteVerificationCoverage`
+  — every raw-SQL DML site in `book/*.py` must have a paired
+  `_verify_*` call within 40 lines.
 - **Template accounts filtered everywhere they shouldn't appear.**
   `book.root_template` and its descendants are real Account rows in
   `book.accounts`. Any iteration that aggregates balances, surfaces
