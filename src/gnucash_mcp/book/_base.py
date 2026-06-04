@@ -125,6 +125,19 @@ def _is_unreconciled(split) -> bool:
     tool returned all non-y). The fix landed at both sites by
     hand-aligning the predicate; this helper chokepoints it so a
     future change can't recreate HP-8 in a new shape.
+
+    Scope: this is the **as-of-today** predicate. The dashboard
+    surface (``_account_reconciliation_status`` →
+    ``get_book_summary``) is the morning-check view and
+    intentionally has no historical-tie-out parameter. The detail
+    tool (``get_unreconciled_splits``) accepts a separate
+    ``as_of_date`` arg that filters out post-``as_of`` splits — a
+    different scoping concern layered ON TOP of this predicate, not
+    a reason to thread date into the chokepoint. Counts at the two
+    surfaces agree by construction when ``as_of_date`` is unset;
+    they're expected to diverge when it's used, and that's the
+    detail tool's contract — the morning-check view doesn't reach
+    into history.
     """
     return split.reconcile_state != "y" and not _is_voided(split)
 

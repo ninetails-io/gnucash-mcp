@@ -138,9 +138,14 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Calculate cash flow (inflows and outflows) for a period.
 
-        By default, internal transfers between cash/bank/credit/asset
-        accounts are filtered out — a transaction with no INCOME or
-        EXPENSE leg is a pure rearrangement, not real cash flow. The
+        Scope is BANK and CASH accounts by default. Credit-card and
+        investment movements are not cash flow (they're liability /
+        asset changes — use balance_sheet). An explicit ``account=``
+        of any type works but the default scope is narrow.
+
+        Internal transfers (transactions with no INCOME or EXPENSE
+        leg — transfer to savings, currency wallet shuffle, paying
+        a credit card from checking) are filtered by default. The
         default totals answer "where did money come from and where
         did it go?" rather than "every debit and credit." Pass
         ``include_transfers=true`` for the gross flow (e.g. for

@@ -354,6 +354,35 @@ class TestGetBookSummaryReconciliation:
                     s.reconcile_date = _dt.combine(on_date, _dt.min.time())
             book.save()
 
+    def _reconcile_all_unreconciled(
+        self,
+        gc: GnuCashBook,
+        account: str,
+        as_of: date | None = None,
+    ) -> None:
+        """Mark every currently-unreconciled split on the account as
+        reconciled. Used to clear the test_book fixture's pre-seeded
+        Jan 2024 activity so bucket-behavior tests exercise the
+        scenario their name describes — without the leftover
+        unreconciled clutter inflating the dashboard lag.
+
+        Under the post-self-review semantics (lag from OLDEST
+        unreconciled), the fixture's Jan 2024 splits would push
+        Checking permanently into the "stale" bucket regardless of
+        any later reconciliation — correct behavior in real life,
+        but it overrides what these tests are scoped to verify.
+        """
+        from datetime import datetime as _dt
+        anchor = as_of or date.today()
+        with gc.open(readonly=False) as book:
+            acct = gc._find_account(book, account)
+            assert acct is not None, account
+            for s in acct.splits:
+                if s.reconcile_state != "y":
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(anchor, _dt.min.time())
+            book.save()
+
     def test_unreconciled_count_removed_from_transactions_line(
         self, test_book: Path,
     ):
@@ -392,6 +421,12 @@ class TestGetBookSummaryReconciliation:
         marker on that line; current accounts are by definition
         not behind."""
         gc = GnuCashBook(str(test_book))
+        # Clear the fixture's Jan 2024 unreconciled splits — under
+        # the post-self-review semantics they'd push Checking to
+        # stale via the oldest-unreconciled lag regardless of
+        # later activity. This test exercises bucket logic, not
+        # backlog reporting; we want a clean baseline.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         recent = date.today() - timedelta(days=10)
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
@@ -428,9 +463,20 @@ class TestGetBookSummaryReconciliation:
         self, test_book: Path,
     ):
         """Account whose last reconcile is well past 45 days shows
-        '(N months behind) ⚠'."""
+        '(N months behind) ⚠'. With no unreconciled work hanging,
+        the lag falls back to the latest_y_date — the original
+        pre-self-review semantics for the fully-caught-up case."""
         gc = GnuCashBook(str(test_book))
         old = date.today() - timedelta(days=120)
+        # Reconcile the fixture's Jan 2024 splits back-dated to the
+        # same OLD reference date so latest_y_date stays at ``old``
+        # and unreconciled_count = 0 (fully caught up). Without
+        # this, the new test transaction's reconciled split would
+        # NOT dominate latest_y_date over a fresher fixture state,
+        # and the Jan 2024 splits would push the lag to years.
+        self._reconcile_all_unreconciled(
+            gc, "Assets:Checking", as_of=old,
+        )
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
             opening = gc._find_account(book, "Equity:Opening Balance")
@@ -456,9 +502,15 @@ class TestGetBookSummaryReconciliation:
         self, test_book: Path,
     ):
         """The 45-59 day window uses days, not months — months
-        scale only kicks in at 60+."""
+        scale only kicks in at 60+. Tests the fully-caught-up-but-
+        stale-by-latest_y path."""
         gc = GnuCashBook(str(test_book))
         d50 = date.today() - timedelta(days=50)
+        # Reconcile fixture splits back-dated to d50 so unreconciled
+        # count is 0 and latest_y_date drives the lag (50 days).
+        self._reconcile_all_unreconciled(
+            gc, "Assets:Checking", as_of=d50,
+        )
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
             opening = gc._find_account(book, "Equity:Opening Balance")
@@ -549,6 +601,10 @@ class TestGetBookSummaryReconciliation:
         Per-account-distinct info stays per-account; identical-
         across-accounts info collapses to a count."""
         gc = GnuCashBook(str(test_book))
+        # Clear fixture's pre-seeded Jan 2024 unreconciled splits on
+        # Checking so the "Current bucket" assertion below holds —
+        # otherwise oldest-unreconciled lag pushes Checking to stale.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         # Never-reconciled bucket: add Visa with activity, no recon.
         gc.create_account(
             name="Visa", account_type="CREDIT", parent="Liabilities",
@@ -619,6 +675,10 @@ class TestGetBookSummaryReconciliation:
         plural 's'. Symmetric grammar with the never-reconciled
         bucket."""
         gc = GnuCashBook(str(test_book))
+        # Clear fixture's pre-seeded Jan 2024 unreconciled splits on
+        # Checking so it can land in the current bucket alongside
+        # the newly-added Savings account.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         # Add a second BANK account.
         gc.create_account(
             name="Savings", account_type="BANK", parent="Assets",
@@ -2919,13 +2979,19 @@ class TestGetBookSummaryUpcomingScheduled:
 
 
 class TestGetBookSummaryReconciliationSplitCount:
-    """Stale reconciliation lines carry "47 splits unreconciled,
-    last reconciled DATE" — the count tells the LLM the *scope* of
-    the work (12 splits is one sitting; 400 is "let's narrow by
-    month"), and the reconciled date provides supplementary context.
-    HP-8 reworded the line from "unreconciled since DATE" to "last
-    reconciled DATE" because the count is total outstanding (matches
-    ``get_unreconciled_splits``), not "splits after this date".
+    """Stale reconciliation lines carry "47 splits unreconciled
+    (4 months behind, oldest: 2020-03-15)" — the count tells the
+    LLM the *scope* of the work (12 splits is one sitting; 400 is
+    "let's narrow by month"), and the lag is computed from the
+    OLDEST unreconciled split so "behind" measures the true scope
+    of work, not just time-since-last-reconcile.
+
+    Pre-self-review the lag was computed from ``latest_y_date``,
+    which could understate scope by years: an account reconciled
+    through 2025-12-30 with 40 unreconciled splits from 2020
+    rendered as "(4 months behind)" — the bookkeeper would plan
+    for a one-session catch-up and discover they need six years of
+    statements.
     """
 
     def test_stale_account_shows_split_count(
@@ -2933,8 +2999,7 @@ class TestGetBookSummaryReconciliationSplitCount:
     ):
         """Reconcile a checking-account split partway, then add new
         unreconciled activity. The summary should show the count of
-        unreconciled splits with the new "last reconciled DATE"
-        phrasing."""
+        unreconciled splits with the "(lag, oldest: DATE)" suffix."""
         from datetime import date as _date, timedelta
         gc = GnuCashBook(str(multi_currency_book))
 
@@ -2973,19 +3038,104 @@ class TestGetBookSummaryReconciliationSplitCount:
         recon_line = next(
             (
                 l for l in result.splitlines()
-                if "Checking" in l and "last reconciled" in l
+                if "Checking" in l and "oldest:" in l
             ),
             None,
         )
         assert recon_line is not None, (
-            f"Expected 'last reconciled' line for Checking; "
+            f"Expected 'oldest:' line for Checking; "
             f"got summary:\n{result}"
         )
         # Count appears in the line.
         assert "splits unreconciled" in recon_line
-        assert "last reconciled" in recon_line
+        assert "oldest:" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
+
+
+class TestReconciliationLagFromOldestUnreconciled:
+    """The lag rendered for an account with pending reconciliation
+    work must reflect the OLDEST unreconciled split, not the
+    LATEST reconciled split. The bookkeeper plans against the
+    scope of work — "4 months behind" implies one sitting; "6
+    years behind" implies six years of statements. Misreporting
+    the lag costs a day of mismatched expectations.
+    """
+
+    def test_lag_reflects_oldest_unreconciled_not_latest_y(
+        self, test_book: Path,
+    ):
+        """Reconcile a RECENT split; leave an OLD split unreconciled.
+        The dashboard lag should describe the old gap, not the
+        recent reconciliation date.
+        """
+        from datetime import date as _date, timedelta, datetime as _dt
+        gc = GnuCashBook(str(test_book))
+
+        # Add an OLD unreconciled split (5 years ago).
+        old_date = _date.today() - timedelta(days=5 * 365)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Old skipped deposit",
+                post_date=old_date,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            ))
+            book.save()
+
+        # Reconcile a RECENT split (10 days ago) on Checking.
+        recent_date = _date.today() - timedelta(days=10)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Recent reconciled deposit",
+                post_date=recent_date,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("50")),
+                    piecash.Split(account=opening, value=Decimal("-50")),
+                ],
+            ))
+            book.save()
+            for s in checking.splits:
+                if s.transaction.post_date == recent_date:
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(
+                        recent_date, _dt.min.time(),
+                    )
+            book.save()
+
+        result = gc.get_book_summary()
+        recon_line = next(
+            l for l in result.splitlines()
+            if "Checking" in l and "oldest:" in l
+        )
+        # Lag must NOT be "10 days behind" / "1 week behind" — that
+        # would describe the gap to ``latest_y_date``, not the real
+        # scope of work.
+        assert "10 days behind" not in recon_line, (
+            f"lag computed from latest_y_date instead of oldest "
+            f"unreconciled: {recon_line!r}"
+        )
+        # It should land in the "years" branch — 5 years ago.
+        assert (
+            "5 years behind" in recon_line
+            or "4 years behind" in recon_line
+        ), (
+            f"expected years-scale lag from oldest unreconciled; "
+            f"got: {recon_line!r}"
+        )
+        # And the oldest date itself appears in the line.
+        assert old_date.isoformat() in recon_line, (
+            f"oldest date {old_date} not surfaced in line: "
+            f"{recon_line!r}"
+        )
 
 
 class TestGetBookSummaryBusinessSignals:

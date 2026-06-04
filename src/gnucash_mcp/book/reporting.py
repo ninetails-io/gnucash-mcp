@@ -807,15 +807,24 @@ class ReportingMixin:
     ) -> dict:
         """Calculate cash flow (inflows and outflows) for a period.
 
-        By default, internal transfers between cash/bank/credit/
-        asset accounts are filtered out. A transaction with no
-        INCOME or EXPENSE leg is a pure rearrangement — transfer
-        to savings, credit-card payoff, currency wallet shuffle —
+        Scope: aggregates over BANK and CASH accounts only (the
+        ``_CASH_TYPES`` set). Credit-card movements are liability
+        changes, investment movements are asset rearrangements —
+        neither is "cash flow" in the bookkeeper's sense and they
+        belong on balance-sheet-style reports, not here. A caller
+        passing an explicit ``account=`` of any type still works
+        (that's their choice), but the default scope is intentionally
+        narrow.
+
+        By default, internal transfers between cash/bank accounts
+        are filtered out. A transaction with no INCOME or EXPENSE
+        leg is a pure rearrangement — transfer to savings, currency
+        wallet shuffle, paying down a credit card from checking —
         neither inflow nor outflow in cash-flow terms. Filtering
-        that noise is what makes the totals answer "where did
-        money come from and where did it go?" rather than "every
-        debit and credit that touched a cash account, including
-        same-pocket reshuffling." SB-5.
+        that noise is what makes the totals answer "where did money
+        come from and where did it go?" rather than "every debit
+        and credit that touched a cash account, including same-
+        pocket reshuffling." SB-5.
 
         Args:
             start_date: Start of period (inclusive).
@@ -830,10 +839,15 @@ class ReportingMixin:
 
         Returns:
             Dict with ``account``, ``inflows``, ``outflows``, and —
-            when any transfers were filtered — ``transfers_excluded``
-            (count of distinct transactions skipped, surfaced so the
+            when any transfers were filtered —
+            ``transfers_excluded``: the count of distinct
+            cash-touching transactions skipped as transfers (each
+            counted once regardless of how many cash-side splits it
+            has; pure-rearrangement transactions that don't touch a
+            BANK/CASH account aren't reachable from this report and
+            therefore can't appear in the count). Surfaced so the
             LLM can mention the ``include_transfers=true`` escape
-            hatch when relevant).
+            hatch when relevant.
         """
         with self.open(readonly=True) as book:
             # Two filter modes: a named account (one-GUID IN() clause)
