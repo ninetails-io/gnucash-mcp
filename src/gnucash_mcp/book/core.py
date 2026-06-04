@@ -288,17 +288,17 @@ class CoreMixin:
             #   - latest_y_date (most recent reconciled split)
             #   - has_yc (any 'y' or 'c' for the ASSET gate)
             #   - any_splits (used vs. unused account)
-            # Pre-fix this method walked ``account.splits`` twice:
-            # once for the ASSET-passes-only-with-yc check, once
-            # for the latest-y_date scan, and (in some branches)
-            # a third time for the unreconciled count. One sweep
-            # collects everything; the count itself can't be
-            # computed up front because it depends on
-            # latest_y_date, but we capture all the inputs in the
-            # single pass and run the count after.
+            #   - unreconciled_count (total non-y, non-voided)
+            # Post-HP-8 the count is state-only (doesn't depend on
+            # ``latest_y_date``), so it folds into the existing
+            # sweep — half the splits work per dashboard call.
+            # ``_is_unreconciled`` is the chokepoint shared with
+            # ``get_unreconciled_splits`` so the dashboard count
+            # and the detail tool agree by construction.
             latest_y_date = None
             has_yc = False
             any_splits = False
+            unreconciled_count = 0
             for s in account.splits:
                 any_splits = True
                 rstate = s.reconcile_state
@@ -308,6 +308,8 @@ class CoreMixin:
                     pd = s.transaction.post_date
                     if latest_y_date is None or pd > latest_y_date:
                         latest_y_date = pd
+                if _is_unreconciled(s):
+                    unreconciled_count += 1
 
             # ASSET passes only when it has reconcilable history.
             # Investment positions / real estate / vehicles carry
@@ -319,29 +321,6 @@ class CoreMixin:
                 # No activity at all — not "behind," just unused.
                 continue
 
-            # Count unreconciled splits — total non-y, non-voided.
-            # Same ground-truth definition as
-            # ``get_unreconciled_splits``. The LLM uses the count to
-            # plan the reconciliation pass: 12 splits is a single
-            # sitting, 400 is "let's narrow by month." 'c' (cleared)
-            # splits count as unreconciled for this purpose; they're
-            # not finalized. Voided ('v') splits are excluded —
-            # they're zombies from void_transaction, not pending
-            # bookkeeping work.
-            #
-            # HP-8: pre-fix the "has latest_y_date" branch added
-            # ``s.transaction.post_date > latest_y_date`` which
-            # silently dropped old unreconciled splits predating the
-            # last reconciliation — skipped during partial passes,
-            # opening balances never stamped, edge cases that fell
-            # through. Those are exactly the ones that tend to be
-            # problems. Pre-fix the dashboard NOT counting them while
-            # ``get_unreconciled_splits`` DID broke the bookkeeper's
-            # first instinct that the dashboard summary equals the
-            # detail-tool truth. One rule now, both surfaces.
-            unreconciled_count = sum(
-                1 for s in account.splits if _is_unreconciled(s)
-            )
             if latest_y_date is None:
                 results.append({
                     "account": account.fullname,
