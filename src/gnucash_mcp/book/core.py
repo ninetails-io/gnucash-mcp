@@ -35,6 +35,7 @@ from gnucash_mcp.book._base import (
     _account_to_dict,
     _guid_prefix_map,
     _is_market_price,
+    _is_unreconciled,
     _is_voided,
     _split_to_compact_dict,
     _split_to_dict,
@@ -339,8 +340,7 @@ class CoreMixin:
             # first instinct that the dashboard summary equals the
             # detail-tool truth. One rule now, both surfaces.
             unreconciled_count = sum(
-                1 for s in account.splits
-                if s.reconcile_state != "y" and not _is_voided(s)
+                1 for s in account.splits if _is_unreconciled(s)
             )
             if latest_y_date is None:
                 results.append({

@@ -21,12 +21,12 @@ Depends on shared helpers from BaseGnuCashBook:
   - self.open, self._find_account
 """
 
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import piecash
 
-from gnucash_mcp.book._base import _to_decimal
+from gnucash_mcp.book._base import _is_voided, _to_decimal
 from gnucash_mcp._format import _format_number
 
 # Account-type groups used across the reports. Defined at module level
@@ -878,6 +878,15 @@ class ReportingMixin:
             outflows = Decimal("0")
             transfers_excluded: set[str] = set()
             for split, txn, acct in rows:
+                # Voided splits (state='v', value=quantity=0) are
+                # zombies, not active cash flow. Skip before the
+                # transfer-vs-real classification so they don't
+                # inflate ``transfers_excluded`` for voided-transfer
+                # txns or pollute the inflow/outflow accumulators
+                # for voided-income/expense txns — symmetric
+                # treatment regardless of which leg type was voided.
+                if _is_voided(split):
+                    continue
                 if cashflow_txn_guids is not None \
                         and txn.guid not in cashflow_txn_guids:
                     transfers_excluded.add(txn.guid)
@@ -915,33 +924,29 @@ class ReportingMixin:
         end_date: date,
     ) -> set[str]:
         """Set of transaction GUIDs in the period that have at
-        least one INCOME or EXPENSE split.
+        least one non-voided INCOME or EXPENSE split.
 
         Used by ``cash_flow`` to filter "internal transfer" noise
         from the default report — see that method's docstring
         for the rationale (SB-5).
 
-        Indexed SQL with the same date-upper-bound handling as
-        ``_query_filtered_splits`` (``post_date < end_date + 1 day``
-        to include the full inclusive end date past piecash's
-        neutral-time DateTime storage).
+        Routes through ``_query_filtered_splits`` to inherit the
+        date-bound fix, template-account exclusion, and null-
+        post_date filter — the chokepoint discipline this project
+        adopted in Branch 1. The voided-split filter is applied
+        Python-side so a voided salary or expense doesn't
+        rescue a zombie transaction from the transfer filter.
         """
-        from piecash.core.account import Account
-        from piecash.core.transaction import Split, Transaction
-
-        q = (
-            book.session.query(Transaction.guid)
-            .join(Split, Split.transaction_guid == Transaction.guid)
-            .join(Account, Split.account_guid == Account.guid)
-            .filter(Transaction.post_date >= start_date)
-            .filter(Account.type.in_(("INCOME", "EXPENSE")))
-            .distinct()
+        rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=_NET_INCOME_TYPES,
         )
-        if end_date < date.max:
-            q = q.filter(
-                Transaction.post_date < end_date + timedelta(days=1)
-            )
-        return {g for (g,) in q.all()}
+        return {
+            txn.guid for split, txn, _acct in rows
+            if not _is_voided(split)
+        }
 
     # ── Debt Payoff ───────────────────────────────────────────────
 

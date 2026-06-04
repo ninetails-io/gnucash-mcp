@@ -25,7 +25,7 @@ import piecash
 import pytest
 
 from gnucash_mcp.book import GnuCashBook
-from gnucash_mcp.book._base import _is_voided
+from gnucash_mcp.book._base import _is_unreconciled, _is_voided
 
 
 class TestResolveAccountTemplateFilter:
@@ -554,6 +554,114 @@ class TestIsVoidedConsistency:
         assert detail_count >= 1, (
             "fixture didn't produce the pre-latest_y_date "
             "unreconciled scenario this test is meant to lock"
+        )
+
+    def test_is_unreconciled_chokepoint_at_both_count_sites(
+        self, test_book: Path,
+    ):
+        """HP-8 chokepoint: the predicate that determines whether a
+        split counts as pending bookkeeping work must live in ONE
+        place (``_is_unreconciled`` in ``_base.py``) — not duplicated
+        at the dashboard count site and the detail-tool site.
+
+        This test enforces structural identity, not just behavioral
+        equality: if a future change adds a state guard at only one
+        of the two predicate sites, the chokepoint discipline broke
+        and the dashboard-vs-detail divergence bug class HP-8 closed
+        can reopen in a new shape.
+
+        We probe via inputs hand-picked to exercise each state value
+        the predicate cares about: 'y' (skip), 'c' (count), 'n'
+        (count), 'v' (skip). Both surfaces must agree on each.
+        """
+        # Sanity: helper returns the right answer for each state.
+        class _FakeSplit:
+            def __init__(self, state):
+                self.reconcile_state = state
+
+        assert _is_unreconciled(_FakeSplit("n")) is True
+        assert _is_unreconciled(_FakeSplit("c")) is True
+        assert _is_unreconciled(_FakeSplit("y")) is False
+        assert _is_unreconciled(_FakeSplit("v")) is False
+
+        # Structural lock: both call sites must call the helper.
+        # Reading the source is the right test here — a future
+        # contributor inlining ``s.reconcile_state != "y" and not
+        # _is_voided(s)`` at either site would silently undo the
+        # chokepoint. Searching for the helper at each site catches
+        # the regression without depending on book state.
+        import inspect
+        from gnucash_mcp.book import core, reconciliation
+
+        dashboard_src = inspect.getsource(
+            core.CoreMixin._account_reconciliation_status
+        )
+        detail_src = inspect.getsource(
+            reconciliation.ReconciliationMixin.get_unreconciled_splits
+        )
+        assert "_is_unreconciled" in dashboard_src, (
+            "_account_reconciliation_status doesn't route through "
+            "_is_unreconciled — HP-8 chokepoint broken"
+        )
+        assert "_is_unreconciled" in detail_src, (
+            "get_unreconciled_splits doesn't route through "
+            "_is_unreconciled — HP-8 chokepoint broken"
+        )
+
+    def test_cash_flow_voided_transactions_treated_symmetrically(
+        self, multi_currency_book: Path,
+    ):
+        """SB-5 follow-up: a voided transaction should be skipped
+        entirely in cash_flow — neither contributing to inflows/
+        outflows nor inflating transfers_excluded — regardless of
+        whether its legs are INCOME/EXPENSE or pure cash/bank.
+
+        Pre-fix asymmetry: a voided INCOME/EXPENSE txn was
+        classified as a 'real cash event' (its INCOME split was
+        found by the type-only filter) while a voided pure-transfer
+        was counted in ``transfers_excluded``. The fix added an
+        early ``_is_voided`` filter at both the helper site and
+        the row loop.
+        """
+        from datetime import date as _date
+        gc = GnuCashBook(str(multi_currency_book))
+
+        # Void the salary transaction (Income split) AND the
+        # cross-currency transfer (pure cash). After voiding both,
+        # the resulting cash_flow should treat each symmetrically:
+        # neither contributes to the inflows/outflows totals, and
+        # neither is counted in transfers_excluded.
+        with gc.open(readonly=False) as book:
+            for txn in list(book.transactions):
+                if txn.description in (
+                    "Salary",
+                    "Transfer to EUR savings",
+                ):
+                    for s in txn.splits:
+                        s.reconcile_state = "v"
+                        s.value = Decimal("0")
+                        s.quantity = Decimal("0")
+            book.save()
+
+        result = gc.cash_flow(
+            start_date=_date(2024, 1, 1),
+            end_date=_date(2024, 12, 31),
+        )
+        # Remaining real activity: opening balance (equity-side,
+        # filtered as transfer) + groceries (real expense).
+        assert Decimal(result["outflows"]) == Decimal("200"), (
+            "groceries should still contribute its $200 outflow"
+        )
+        assert Decimal(result["inflows"]) == Decimal("0"), (
+            "voided salary should NOT contribute to inflows"
+        )
+        # transfers_excluded counts only LIVE rearrangement txns —
+        # the voided cross-currency transfer must not be counted.
+        # Only the opening balance (equity-side, no INCOME/EXPENSE
+        # leg, not voided) should remain.
+        assert result["transfers_excluded"] == 1, (
+            f"voided pure-transfer should not be in transfers_excluded; "
+            f"got {result.get('transfers_excluded')}"
         )
 
     def test_assign_split_to_lot_rejects_voided(

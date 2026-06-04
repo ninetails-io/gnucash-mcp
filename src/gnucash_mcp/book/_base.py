@@ -105,6 +105,30 @@ def _is_voided(split) -> bool:
     return split.reconcile_state == "v"
 
 
+def _is_unreconciled(split) -> bool:
+    """True iff ``split`` counts as pending reconciliation work.
+
+    Single source of truth for "is this split unreconciled" — the
+    same predicate ``get_unreconciled_splits`` (the detail tool)
+    and ``_account_reconciliation_status`` (the dashboard count)
+    both consult. Routing both sites through this helper enforces
+    HP-8's convergence structurally instead of by docstring promise.
+
+    ``state == "n"`` (new) and ``state == "c"`` (cleared) both
+    count — cleared splits are not finalized; they're the
+    bookkeeper's tentative state before a final ``"y"`` mark.
+    ``state == "y"`` (reconciled) and voided zombies are excluded.
+
+    Pre-HP-8 the dashboard count and the detail tool disagreed on
+    pre-``latest_y_date`` unreconciled splits (the dashboard scoped
+    its count to splits AFTER the most recent ``y``; the detail
+    tool returned all non-y). The fix landed at both sites by
+    hand-aligning the predicate; this helper chokepoints it so a
+    future change can't recreate HP-8 in a new shape.
+    """
+    return split.reconcile_state != "y" and not _is_voided(split)
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 

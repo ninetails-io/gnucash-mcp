@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from gnucash_mcp.book._base import (
     _guid_prefix_map,
+    _is_unreconciled,
     _is_voided,
     _split_to_compact_dict,
     _to_decimal,
@@ -191,11 +192,14 @@ class ReconciliationMixin:
                 if as_of_date and split.transaction.post_date > as_of_date:
                     continue
 
-                # Include splits in states ``n`` or ``c`` only.
-                # Pre-fix the filter was ``state != "y"`` which admitted
-                # voided (state=``v``) splits as if they were pending
-                # bookkeeping work. ``_is_voided`` is the chokepoint.
-                if split.reconcile_state == "y" or _is_voided(split):
+                # Skip reconciled and voided splits — only states
+                # ``n`` (new) and ``c`` (cleared) count as pending
+                # bookkeeping work. ``_is_unreconciled`` is the
+                # chokepoint shared with the dashboard count
+                # (``_account_reconciliation_status``) so HP-8
+                # convergence is structural rather than
+                # docstring-promised.
+                if not _is_unreconciled(split):
                     continue
                 split_dict = {
                     "guid": split.guid,
