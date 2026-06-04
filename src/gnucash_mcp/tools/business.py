@@ -3,8 +3,6 @@
 Registered only when the 'business' module is enabled via --modules.
 """
 
-import json
-
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import _gate_owner_type, _json, _resolve_id_alias, safe_tool
 
@@ -56,7 +54,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.list_customers(active_only=active_only, compact=not verbose)
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -119,7 +117,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.list_vendors(active_only=active_only, compact=not verbose)
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -183,7 +181,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.list_employees(active_only=active_only, compact=not verbose)
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -342,7 +340,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.list_billterms(compact=not verbose)
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -406,7 +404,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.list_taxtables(compact=not verbose)
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -967,7 +965,7 @@ def register(mcp, get_book) -> None:
             job_id=job_id,
         )
         if verbose:
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()
@@ -1307,13 +1305,13 @@ def register(mcp, get_book) -> None:
             active_only=active_only,
             compact=not verbose,
         )
-        # Match the other list_* tools' verbose pattern
-        # (json.dumps indent=2 preserves empty strings; _json
-        # strips them, which Copilot flagged as a shape
-        # divergence on PR #88).
+        # Match the other list_* tools' verbose pattern. HP-4
+        # sweep (v1.3) routed all list_* verbose returns through
+        # _json so the response shape is uniform; the previous
+        # ``json.dumps(indent=2)`` form added 40-60% bloat from
+        # indentation and skipped the ``_strip_noise`` pass.
         if verbose:
-            import json
-            return json.dumps(result, indent=2)
+            return _json(result)
         return result
 
     @mcp.tool()

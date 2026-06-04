@@ -861,15 +861,18 @@ class BusinessMixin:
                 as_of=parsed_date,
             )
             if pay_to_default_rate is None:
-                raise ValueError(
-                    f"Realized FX gain/loss needs an exchange rate "
-                    f"from {pay_acct.commodity.mnemonic} to "
-                    f"{default_currency.mnemonic} on or near "
-                    f"{parsed_date} to convert the FX delta to the "
-                    f"book's default currency (the FX account's "
-                    f"commodity). Add a price with create_price, then "
-                    f"retry."
-                )
+                # HP-5: missing third-currency rate. Mirror the
+                # ``rate_at_post`` branch above (which returns
+                # None when no rate is available) — skip the FX
+                # booking gracefully instead of raising. The
+                # payment itself still records correctly; only
+                # the realized FX delta is not surfaced. Raising
+                # here blocked the entire payment write path for
+                # the rare triple-currency case (book=USD,
+                # invoice=EUR, pay=GBP, no GBP→USD rate on file)
+                # which is worse than silently omitting the
+                # gain/loss split.
+                return None
             fx_diff_default = (
                 fx_diff_pay * pay_to_default_rate
             ).quantize(_commodity_quantum(default_currency))
