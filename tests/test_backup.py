@@ -457,6 +457,62 @@ class TestPruneBackups:
         # Plan shows the 1 manual would be deleted.
         assert len(result["would_delete"]) == 1
 
+    def test_prune_refuses_to_wipe_all_auto_backups(self, test_book: Path):
+        """MP-3 symmetric guard: ``prune_backups(keep_last_n=0,
+        dry_run=False)`` without an explicit ``stage`` must raise
+        rather than wipe every auto backup across all auto stages.
+
+        Auto backups rebuild over time (sessions on next write,
+        weekly on next Monday, monthly on next 1st), but in the
+        interim the user has no way to recover backups they didn't
+        realize they were deleting. Mirrors the manual-stage guard
+        — same shape of footgun, different stage scope.
+        """
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto-1")
+        book.create_backup(stage="session", label="auto-2")
+
+        with pytest.raises(
+            ValueError,
+            match="Refusing to delete every auto backup at once",
+        ):
+            book.prune_backups(keep_last_n=0, dry_run=False)
+
+        # Auto backups still on disk after the refusal.
+        session_count = sum(
+            1 for e in book.list_backups() if e["stage"] == "session"
+        )
+        assert session_count == 2
+
+    def test_prune_dry_run_with_zero_auto_still_allowed(
+        self, test_book: Path,
+    ):
+        """``dry_run=True`` with implicit-auto + keep_last_n=0
+        must still produce a plan (matches the manual-stage
+        symmetric behavior — review-before-act is always
+        permitted)."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto")
+
+        result = book.prune_backups(keep_last_n=0, dry_run=True)
+        assert result["dry_run"] is True
+
+    def test_prune_explicit_auto_stage_with_zero_allowed(
+        self, test_book: Path,
+    ):
+        """An explicit ``stage='session'`` with ``keep_last_n=0``
+        is intentional and permitted — the user opted in to
+        zero-retention for that specific stage. The guard only
+        catches the implicit-all-auto-stages case."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto")
+
+        result = book.prune_backups(
+            keep_last_n=0, stage="session", dry_run=False,
+        )
+        # At least one auto-stage backup was deleted.
+        assert len(result["deleted"]) >= 1
+
     def test_prune_explicit_manual_stage_works(self, test_book: Path):
         """Explicit stage='manual' DOES prune manual backups."""
         book = GnuCashBook(str(test_book))

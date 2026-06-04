@@ -783,6 +783,20 @@ def _get_server_config_impl() -> str:
 # survives _apply_module_filter's keep-set pass (Core's tool list
 # includes it). Previously gated behind --debug; now always
 # available as a diagnostic surface.
+#
+# MP-1: deliberately omits ``@audit_log``. Every other read tool
+# carries the decorator, but this one is a zero-side-effect config
+# inspection that the LLM calls reflexively as part of its
+# orientation pass (see the MCP server instructions and
+# ``get_book_summary``'s docstring referrals). Logging every
+# get_server_config call adds noise without signal — there's no
+# bookkeeping question the audit log answers about who looked at
+# the module list — and would clutter the human-readable trail the
+# bookkeeper depends on for forensic review of real activity.
+# The exception is documented here rather than enforced by a
+# contract test because the omission is the contract: a future
+# contributor adding @audit_log to this tool should read this
+# comment first and confirm they have a real reason to override.
 @mcp.tool()
 @safe_tool
 def get_server_config() -> str:
