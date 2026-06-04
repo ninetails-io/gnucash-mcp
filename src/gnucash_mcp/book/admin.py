@@ -24,6 +24,15 @@ from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported f
 # USER input only.
 _SLOT_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+# Upper bound on slot value length. 64 KiB is generous for any
+# legitimate per-account metadata (APR strings, credit limits,
+# statement-close-day, structured JSON config blobs) — well past
+# what real bookkeeping needs but short enough that a malicious
+# or runaway caller can't exhaust the book file with a single
+# slot write. Pre-fix slot values were unbounded; HP-9 from
+# specs/CODE_REVIEW_v1_3.md.
+_SLOT_VALUE_MAX_BYTES = 64 * 1024
+
 
 class AdminMixin:
     """Account slot operations.
@@ -96,6 +105,17 @@ class AdminMixin:
                 f"Invalid slot key {key!r}: must match [A-Za-z0-9_.-]+. "
                 f"Embedded '/' would create hierarchical sub-slots; "
                 f"use flat keys."
+            )
+        # HP-9 length cap. Encode to UTF-8 to count bytes (so a
+        # multi-byte unicode payload can't sneak past a char-count
+        # check). 64 KiB is generous for any real per-account
+        # metadata.
+        if len(value.encode("utf-8")) > _SLOT_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"Slot value too long: "
+                f"{len(value.encode('utf-8'))} bytes exceeds the "
+                f"{_SLOT_VALUE_MAX_BYTES}-byte cap. Store large "
+                f"structured data outside the book."
             )
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)

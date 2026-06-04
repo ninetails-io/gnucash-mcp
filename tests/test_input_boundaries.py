@@ -272,3 +272,160 @@ class TestDeleteAccountSlotKeyValidation:
             assert not _SLOT_KEY_RE.fullmatch(k), (
                 f"regex regression: {k!r} should be rejected"
             )
+
+
+# ── HP-9: input length caps ────────────────────────────────────────
+
+
+class TestInputLengthCaps:
+    """HP-9: ``set_account_slot(value)`` and
+    ``void_transaction(reason)`` capped at sensible upper bounds.
+
+    Pre-fix both accepted arbitrary-length strings. A malicious or
+    runaway caller could exhaust the book file with a single write
+    by passing megabytes of payload. The caps are byte-count (UTF-8)
+    so a multi-byte unicode payload can't sneak past a char-count
+    check: 64 KiB for slot values (generous for any real per-account
+    metadata), 4 KiB for void reasons (generous for any realistic
+    audit explanation).
+    """
+
+    def test_set_account_slot_accepts_value_at_cap(self, test_book):
+        """A value exactly at the byte cap is accepted — the cap is
+        the inclusive boundary."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.admin import _SLOT_VALUE_MAX_BYTES
+        gb = GnuCashBook(str(test_book))
+        # Exactly at cap (ASCII payload — bytes == chars).
+        payload = "x" * _SLOT_VALUE_MAX_BYTES
+        result = gb.set_account_slot(
+            account_name="Assets:Checking",
+            key="big_blob",
+            value=payload,
+        )
+        assert result["status"] == "created"
+
+    def test_set_account_slot_rejects_oversize_value(self, test_book):
+        """One byte past the cap rejects with a clear error."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.admin import _SLOT_VALUE_MAX_BYTES
+        gb = GnuCashBook(str(test_book))
+        payload = "x" * (_SLOT_VALUE_MAX_BYTES + 1)
+        with pytest.raises(ValueError, match="too long"):
+            gb.set_account_slot(
+                account_name="Assets:Checking",
+                key="too_big",
+                value=payload,
+            )
+
+    def test_set_account_slot_counts_utf8_bytes_not_chars(self, test_book):
+        """A multi-byte UTF-8 payload that fits in chars but blows
+        the byte cap must reject. Catches the bug class where a
+        char-count check would let a 32 KiB string of CJK characters
+        (96 KiB in UTF-8) past a 64 KiB byte cap."""
+        from gnucash_mcp.book import GnuCashBook
+        from gnucash_mcp.book.admin import _SLOT_VALUE_MAX_BYTES
+        gb = GnuCashBook(str(test_book))
+        # "贵" is 3 bytes in UTF-8. Construct a payload that's
+        # 1/3 the byte cap in chars but over the byte cap in bytes.
+        char_count = (_SLOT_VALUE_MAX_BYTES // 3) + 1
+        payload = "贵" * char_count
+        assert len(payload) < _SLOT_VALUE_MAX_BYTES, (
+            "fixture math wrong: char count should be below cap"
+        )
+        assert len(payload.encode("utf-8")) > _SLOT_VALUE_MAX_BYTES, (
+            "fixture math wrong: byte count should be above cap"
+        )
+        with pytest.raises(ValueError, match="too long"):
+            gb.set_account_slot(
+                account_name="Assets:Checking",
+                key="unicode_blob",
+                value=payload,
+            )
+
+    def test_void_transaction_rejects_oversize_reason(self, test_book):
+        """``void_transaction(reason)`` cap is 4 KiB."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        # Find a transaction to void.
+        with gb.open(readonly=True) as pb:
+            txn = next(iter(pb.transactions))
+            txn_guid = txn.guid
+        # 4 KiB + 1 byte.
+        oversize_reason = "x" * (4 * 1024 + 1)
+        with pytest.raises(ValueError, match="too long"):
+            gb.void_transaction(guid=txn_guid, reason=oversize_reason)
+
+    def test_void_transaction_accepts_reasonable_reason(self, test_book):
+        """A normal-length reason still works end-to-end."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=True) as pb:
+            txn = next(iter(pb.transactions))
+            txn_guid = txn.guid
+        reason = (
+            "Voided after reconciliation found duplicate posting "
+            "from the imported OFX file. Original entry retained "
+            "for audit trail; new entry posted under " * 5
+        )
+        # ~700 chars — well under 4 KiB.
+        result = gb.void_transaction(guid=txn_guid, reason=reason)
+        assert result["status"] == "voided"
+
+
+# ── HP-10: SplitInput extra="forbid" ──────────────────────────────
+
+
+class TestSplitInputExtraForbid:
+    """HP-10: ``SplitInput`` must reject unknown kwargs.
+
+    Pre-fix ``model_config = ConfigDict(extra="ignore")`` silently
+    dropped typo'd keys: ``{"account": "...", "quantitiy": "10"}``
+    would discard the misspelled ``quantitiy`` entirely. With
+    ``extra="forbid"`` the typo raises a Pydantic validation error
+    at the boundary instead of corrupting the transaction shape
+    downstream. Matches the server-global ``ArgModelBase`` setting
+    PR #92 shipped.
+    """
+
+    def test_typo_in_quantity_raises(self):
+        """The canonical bug shape from the spec: ``quantitiy``
+        instead of ``quantity``."""
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import SplitInput
+        with pytest.raises(ValidationError) as exc:
+            SplitInput(
+                account="Assets:Checking",
+                amount="10.00",
+                quantitiy="10",  # typo
+            )
+        # The error message should name the unknown field so the
+        # caller can identify the typo.
+        assert "quantitiy" in str(exc.value)
+
+    def test_known_fields_still_accepted(self):
+        """The legitimate field set still works end-to-end."""
+        from gnucash_mcp.tools._helpers import SplitInput
+        s = SplitInput(
+            account="Assets:Checking",
+            amount="10.00",
+            quantity="10.0000",
+            memo="test",
+        )
+        assert s.account == "Assets:Checking"
+        assert s.amount == "10.00"
+        assert s.quantity == "10.0000"
+        assert s.memo == "test"
+
+    def test_arbitrary_unknown_field_raises(self):
+        """Any field outside the declared set rejects — catches the
+        regression class where a future renamed-but-forgotten field
+        would silently drop."""
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import SplitInput
+        with pytest.raises(ValidationError):
+            SplitInput(
+                account="Assets:Checking",
+                amount="10.00",
+                bogus_field="anything",
+            )

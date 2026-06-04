@@ -495,6 +495,20 @@ class ReconciliationMixin:
         """
         if not reason or not reason.strip():
             raise ValueError("Void reason is required")
+        # HP-9 length cap. 4 KiB covers any realistic void
+        # explanation — multi-paragraph context, audit trail
+        # notes, references to ticket numbers — while keeping a
+        # malicious or runaway caller from exhausting the book
+        # file with a single void. Byte-count (not char-count)
+        # so unicode payloads can't sneak past.
+        _VOID_REASON_MAX_BYTES = 4 * 1024
+        if len(reason.encode("utf-8")) > _VOID_REASON_MAX_BYTES:
+            raise ValueError(
+                f"Void reason too long: "
+                f"{len(reason.encode('utf-8'))} bytes exceeds the "
+                f"{_VOID_REASON_MAX_BYTES}-byte cap. Summarize the "
+                f"reason; keep detailed context outside the book."
+            )
 
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)

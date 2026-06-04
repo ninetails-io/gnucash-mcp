@@ -95,13 +95,19 @@ class TestSplitInputCoercion:
         assert split.quantity == "100.0"
         assert Decimal(split.quantity) == Decimal("100.0")
 
-    def test_extras_ignored(self):
-        # Passing an unexpected key doesn't raise — existing callers
-        # that emit extra fields keep working.
-        split = SplitInput(
-            account="Assets:Checking", amount="1.00", unknown_key="x",
-        )
-        assert not hasattr(split, "unknown_key")
+    def test_extras_forbidden(self):
+        # HP-10: unknown keys now raise a ValidationError instead of
+        # silently dropping. Pre-Branch-3 the config was
+        # extra="ignore" — a typo like ``quantitiy`` would be
+        # silently discarded, leaving the transaction with a
+        # cross-currency value/quantity mismatch. extra="forbid"
+        # matches the server-global ArgModelBase config and
+        # surfaces typos as boundary errors.
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            SplitInput(
+                account="Assets:Checking", amount="1.00", unknown_key="x",
+            )
 
     def test_splits_to_dicts_converts_list(self):
         inputs = [
