@@ -42,16 +42,30 @@ _TOOLS_DIR = _REPO_ROOT / "src" / "gnucash_mcp" / "tools"
 _BOOK_DIR = _REPO_ROOT / "src" / "gnucash_mcp" / "book"
 
 
-def _audit_log_decorators_in(path: Path) -> list[tuple[str, str, str]]:
-    """Parse ``path`` and yield every
-    ``(classification, entity_type, operation_uppercase)`` triple
-    advertised by an ``@audit_log(...)`` decorator.
+def _audit_log_decorators_in(
+    path: Path,
+) -> tuple[list[tuple[str, str, str]], list[tuple[int, dict[str, str]]]]:
+    """Parse ``path`` and return two lists:
+
+    1. ``valid``: ``(classification, entity_type, operation_uppercase)``
+       triples for every well-formed ``@audit_log(...)`` decorator.
+       Read decorators are included with empty entity/op; write
+       decorators only appear here when both ``entity_type`` and
+       ``operation`` are present and non-empty.
+    2. ``malformed``: ``(line_number, kwargs_dict)`` for every
+       ``classification="write"`` decorator that's MISSING
+       ``entity_type`` or ``operation``. The dispatcher would
+       silently drop those entries — a contract violation we want
+       the test layer to surface loudly. Silently filtering them
+       out here (the pre-Copilot-review behavior) made the
+       coverage check vacuously pass on malformed input.
 
     Uses ``ast`` instead of regex so multi-line decorator calls and
     string interpolation in adjacent code don't trip it up.
     """
     tree = ast.parse(path.read_text(), filename=str(path))
-    out: list[tuple[str, str, str]] = []
+    valid: list[tuple[str, str, str]] = []
+    malformed: list[tuple[int, dict[str, str]]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -70,11 +84,20 @@ def _audit_log_decorators_in(path: Path) -> list[tuple[str, str, str]]:
         classification = kwargs.get("classification", "")
         entity = kwargs.get("entity_type", "")
         op = kwargs.get("operation", "")
-        # Read-classification decorators don't take entity_type / op;
-        # only write decorators matter for the dispatcher contract.
-        if classification == "write" and entity and op:
-            out.append((classification, entity, op.upper()))
-    return out
+        if classification == "write":
+            if entity and op:
+                valid.append((classification, entity, op.upper()))
+            else:
+                # ``@audit_log(classification="write")`` without
+                # entity_type/operation passes the type checker but
+                # silently drops from the dispatcher. Surface it.
+                malformed.append((node.lineno, dict(kwargs)))
+        else:
+            # Read decorators or any other shape — pass through with
+            # empty entity/op so the caller can still ignore them in
+            # the contract checks (they don't gate on entity/op).
+            valid.append((classification, entity, op.upper() if op else ""))
+    return valid, malformed
 
 
 # ── HP-2: dispatcher coverage ──────────────────────────────────────
@@ -90,14 +113,48 @@ class TestAuditLogDispatcherCoverage:
     time the code review caught it.
     """
 
+    def test_no_malformed_write_decorators(self):
+        """``@audit_log(classification="write")`` without
+        ``entity_type`` or ``operation`` passes Python type-check
+        (the decorator's kwargs default to optional) but silently
+        drops from the dispatcher — there's no ``(None, None)`` key
+        in ``_AUDIT_HANDLERS``. The contract test below uses the
+        decorator triple to look up handlers; pre-Copilot-review
+        the helper silently filtered malformed decorators out,
+        making the coverage check vacuously pass on them.
+
+        Fails loud here so the regression class is caught at the
+        test layer, before downstream tests would have missed it.
+        """
+        all_malformed: list[str] = []
+        for py_file in sorted(_TOOLS_DIR.glob("*.py")):
+            _valid, malformed = _audit_log_decorators_in(py_file)
+            for line_no, kwargs in malformed:
+                missing_fields = [
+                    f for f in ("entity_type", "operation")
+                    if not kwargs.get(f)
+                ]
+                all_malformed.append(
+                    f"{py_file.name}:{line_no}: "
+                    f"@audit_log(classification=\"write\") missing "
+                    f"{', '.join(missing_fields)} "
+                    f"(would silently drop from audit log)"
+                )
+        assert not all_malformed, (
+            "Malformed write decorators (missing entity_type or "
+            "operation — would silently drop from the dispatcher):\n"
+            + "\n".join(f"  {m}" for m in all_malformed)
+        )
+
     def test_every_write_decorator_has_a_dispatcher_entry(self):
         from gnucash_mcp.logging_config import _AUDIT_HANDLERS
 
-        missing: list[tuple[Path, tuple[str, str]]] = []
+        missing: list[tuple[str, tuple[str, str]]] = []
         for py_file in sorted(_TOOLS_DIR.glob("*.py")):
-            for _classification, entity, op in _audit_log_decorators_in(
-                py_file,
-            ):
+            valid, _malformed = _audit_log_decorators_in(py_file)
+            for classification, entity, op in valid:
+                if classification != "write":
+                    continue
                 if (entity, op) not in _AUDIT_HANDLERS:
                     missing.append((py_file.name, (entity, op)))
         assert not missing, (
@@ -113,38 +170,42 @@ class TestAuditLogDispatcherCoverage:
         correspond to a write decorator that actually exists. Catches
         stale handlers left behind after a tool rename / deletion.
 
-        Three handlers are exempt because their dispatch happens
-        through the polymorphic entity-type swap in the audit
-        emitter (an ``invoice``-decorated tool routes to a
-        ``bill`` / ``voucher`` / ``credit_note`` handler at log
-        time, based on the response ``type`` field). So the
-        ``bill:*``, ``voucher:*``, ``credit_note:POST`` /
-        ``UNPOST`` / ``PAY`` entries don't appear as direct
-        decorator targets.
+        Nine dispatcher pairs are reached through runtime entity-
+        type / operation remaps rather than direct decorator
+        lookup — they're exempted below. The remaps live in two
+        places: the invoice→bill/voucher/credit_note swap is in
+        the ``audit_log`` decorator wrapper itself (around the
+        ``entity_type == "invoice" and result_data.get("type") in
+        {"bill", ...}`` check), while the account UPDATE→MOVE
+        remap is in ``_format_audit_entry_text``.
         """
         from gnucash_mcp.logging_config import _AUDIT_HANDLERS
 
         declared: set[tuple[str, str]] = set()
         for py_file in sorted(_TOOLS_DIR.glob("*.py")):
-            for _classification, entity, op in _audit_log_decorators_in(
-                py_file,
-            ):
-                declared.add((entity, op))
+            valid, _malformed = _audit_log_decorators_in(py_file)
+            for classification, entity, op in valid:
+                if classification == "write":
+                    declared.add((entity, op))
 
-        # Dispatcher entries reached through runtime remaps in
-        # ``_format_audit_entry_text`` rather than direct decorator
-        # lookup. Two patterns:
+        # Dispatcher entries reached through runtime remaps (the
+        # decorated entity_type / operation gets rewritten before
+        # the dispatcher lookup, so the literal pair never appears
+        # as a decorator target). Two patterns, 3+3+3 = 9 pairs:
         #
-        # 1. Invoice → bill / voucher / credit_note polymorphism.
-        #    The shared lifecycle tools (post / unpost / pay)
-        #    decorate as ``entity_type="invoice"``; the emitter
-        #    rewrites entity_type from the response's ``type``
-        #    field.
+        # 1. Invoice → bill / voucher / credit_note polymorphism
+        #    for POST / UNPOST / PAY. The shared lifecycle tools
+        #    decorate as ``entity_type="invoice"``; the ``audit_log``
+        #    decorator wrapper (NOT _format_audit_entry_text)
+        #    rewrites entity_type when the response's ``type``
+        #    field is bill / voucher / credit_note. See the
+        #    ``entity_type == "invoice" and result_data.get("type")``
+        #    block in the decorator's success path.
         # 2. Account update with ``new_parent`` in params → MOVE.
         #    ``move_account`` decorates as ``operation="update"``;
-        #    the emitter rewrites the op when ``new_parent`` is
-        #    present (see the dispatch logic in
-        #    ``_format_audit_entry_text``).
+        #    the operation is rewritten inside
+        #    ``_format_audit_entry_text`` when ``new_parent`` is
+        #    present in params.
         POLYMORPHIC_TARGETS: set[tuple[str, str]] = set()
         for entity in ("bill", "voucher", "credit_note"):
             for op in ("POST", "UNPOST", "PAY"):
