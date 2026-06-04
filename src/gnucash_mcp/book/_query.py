@@ -86,6 +86,18 @@ class QueryMixin:
             .join(Account, Split.account_guid == Account.guid)
             .filter(Transaction.post_date.isnot(None))
         )
+        # HP-12 defense-in-depth: exclude template-subtree accounts.
+        # Currently dormant — ``Transaction.post_date.isnot(None)``
+        # above already filters SX templates (their splits live on
+        # transactions with null post_date). But making the account-
+        # level exclusion explicit closes a latent path where a
+        # future codepath posts to a template account, and matches
+        # the convention applied at every other report iteration
+        # site that filters templates via
+        # ``_template_account_guids``.
+        template_guids = self._template_account_guids(book)
+        if template_guids:
+            q = q.filter(Account.guid.notin_(list(template_guids)))
         if start_date is not None:
             q = q.filter(Transaction.post_date >= start_date)
         if end_date is not None and end_date < date.max:

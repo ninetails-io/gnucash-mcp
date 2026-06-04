@@ -841,3 +841,88 @@ class TestFxGainLossThirdCurrencyFallback:
             f"triple-currency case (book=USD, invoice=EUR, "
             f"pay=GBP, no GBP/USD on file)."
         )
+
+
+# ── HP-12: query template defense-in-depth ─────────────────────────
+
+
+class TestQueryFilteredSplitsTemplateFilter:
+    """HP-12: ``_query_filtered_splits`` must explicitly exclude
+    template-subtree accounts.
+
+    Currently dormant: ``Transaction.post_date.isnot(None)``
+    already filters SX template transactions (their splits live
+    on transactions with null post_date). But the account-level
+    filter closes a latent path where a future codepath might
+    post to a template account, and matches the convention
+    applied at every other template-aware iteration site in the
+    codebase.
+    """
+
+    def test_template_subtree_accounts_excluded_from_query(
+        self, scheduled_book,
+    ):
+        """A book with a scheduled transaction (which creates a
+        template account under ``root_template``) must not return
+        any splits FROM the template-subtree accounts via
+        ``_query_filtered_splits``. The currently-dormant gate is
+        the explicit ``Account.guid.notin_(template_guids)``
+        filter we just added."""
+        gb = GnuCashBook(str(scheduled_book))
+        # Create a scheduled transaction (creates a template
+        # account as a side effect).
+        gb.create_scheduled_transaction(
+            name="Test SX",
+            description="Test recurring",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "100"},
+                {"account": "Assets:Checking", "amount": "-100"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+
+        with gb.open(readonly=True) as pb:
+            template_guids = gb._template_account_guids(pb)
+            assert template_guids, (
+                "fixture sanity: scheduled transaction didn't "
+                "produce any template accounts"
+            )
+
+            rows = gb._query_filtered_splits(pb)
+            offending = [
+                (split, txn, acct) for split, txn, acct in rows
+                if acct.guid in template_guids
+            ]
+            assert not offending, (
+                f"_query_filtered_splits returned splits from "
+                f"template-subtree accounts despite HP-12 "
+                f"defense-in-depth filter. Offenders: "
+                f"{[(a.fullname, str(t.post_date)) for _, t, a in offending]}"
+            )
+
+    def test_query_static_check_filter_present(self):
+        """Source-level check that the filter clause is in place.
+        Catches the regression where a refactor removes the
+        defense-in-depth without realizing it was load-bearing
+        for HP-12."""
+        import re
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "gnucash_mcp" / "book" / "_query.py"
+        )
+        src = path.read_text()
+        assert re.search(
+            r"_template_account_guids\(book\)", src,
+        ), (
+            "_query_filtered_splits no longer references "
+            "_template_account_guids — HP-12 defense-in-depth "
+            "filter removed"
+        )
+        assert re.search(
+            r"Account\.guid\.notin_", src,
+        ), (
+            "_query_filtered_splits no longer applies "
+            "Account.guid.notin_(template_guids) — HP-12 "
+            "defense-in-depth filter removed"
+        )
