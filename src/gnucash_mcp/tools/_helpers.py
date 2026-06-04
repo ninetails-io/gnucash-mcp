@@ -7,12 +7,32 @@ tool-registration module under gnucash_mcp/tools/.
 import json
 import logging
 import traceback
+from datetime import date
 from functools import wraps
 from typing import Annotated, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from gnucash_mcp.book import GnuCashLockError
+
+
+def _parse_iso_date(s: str | None) -> date | None:
+    """Parse an optional ISO-format date string.
+
+    Returns ``None`` for falsy input (``None`` / ``""``); otherwise
+    delegates to ``date.fromisoformat`` whose error is good enough
+    to surface at the MCP boundary unchanged
+    (``ValueError: Invalid isoformat string: '2025-01-XX'``).
+
+    R-4: chokepoints the ``date.fromisoformat(x) if x else None``
+    pattern that recurred at ~21 tool-wrapper sites. Required
+    dates (where the caller has already guaranteed non-None) keep
+    calling ``date.fromisoformat`` directly — the distinction is
+    explicit at the call site.
+    """
+    if not s:
+        return None
+    return date.fromisoformat(s)
 
 # Re-exports from the layer-neutral format module. Tool wrappers can
 # keep importing from ``tools._helpers`` (the historical home) without
