@@ -13,21 +13,20 @@ what's been decided, what still needs the user's call.
 
 ## Status snapshot
 
-**Branch 4 in progress on `feat/math-ux-correctness`.** Scope: 9 of
-the 11 Branch 4 items (SB-5 and HP-8 deferred as design calls
-needing the user awake — see "Open decisions" below). One PR
-planned, four thematic commits matching Groups A/B'/C'/D from
-this doc.
+**26 of the 27 substantive review items are closed.** Branches 1-5
+all merged to develop. The two deferred design calls (SB-5, HP-8)
+were resolved on Stephen's call and shipped in PR #99 on
+`feat/design-call-resolutions`. Only MP-1 remains — design call on
+whether `get_server_config` needs an `@audit_log` decorator (default
+keep deferred, formally documented).
 
-15 of the 27 substantive review items are closed across three PRs.
-Every SB-* in scope of Branches 1-3 is done. The bookkeeper-found
-off-by-one (not in the original review) was also closed in Branch 1.
-
-| Branch | PR  | Status   | Items closed                                                                                  |
-| ------ | --- | -------- | --------------------------------------------------------------------------------------------- |
-| 1      | #95 | ✅ merged | SB-1, SB-2, SB-3, SB-4 (rates), SB-11, SB-12, SB-13, SB-14, HP-3, bookkeeper off-by-one      |
-| 2      | #96 | ✅ merged | HP-1, HP-2                                                                                    |
-| 3      | #97 | ✅ merged | SB-15, SB-10, HP-9, HP-10, HP-11                                                              |
+| Branch | PR   | Status   | Items closed                                                                                  |
+| ------ | ---- | -------- | --------------------------------------------------------------------------------------------- |
+| 1      | #95  | ✅ merged | SB-1, SB-2, SB-3, SB-4 (rates), SB-11, SB-12, SB-13, SB-14, HP-3, bookkeeper off-by-one      |
+| 2      | #96  | ✅ merged | HP-1, HP-2                                                                                    |
+| 3      | #97  | ✅ merged | SB-15, SB-10, HP-9, HP-10, HP-11                                                              |
+| 4      | #98  | ✅ merged | SB-6, SB-7, SB-8, SB-9, HP-4, HP-5, HP-6, HP-7, HP-12 (+ Copilot docs cleanup, bookkeeper signoff) |
+| 5      | #99  | ✅ in branch | SB-5 (cash_flow transfer filter), HP-8 (reconciliation backlog count unification)        |
 
 The per-branch capture rigs (Branch 1's `scripts/branch_1/capture.py`
 + `specs/branch_1_captures/`) document the behavioral evidence.
@@ -198,6 +197,27 @@ before release:**
   UPDATE→MOVE remap lives in `_format_audit_entry_text`. Tests
   document this attribution.
 
+- **SB-5 (`cash_flow` internal transfer filter):** filter by
+  default. Stephen's home-book example: when running `cash_flow`
+  to analyze credit-card payments, double-counting every internal
+  transfer (Checking → Cash App → Card → ...) inflated inflows and
+  outflows by every funding hop. That's not cash flow; that's
+  moving money between pockets. The cash-flow framing answers
+  "where did money come from and where did it go?" — transfers
+  are noise. New `include_transfers: bool = False` param restores
+  the gross flow for bank-statement reconciliation. "No amount of
+  loud documentation fixes a default that gives the wrong answer."
+
+- **HP-8 (reconciliation backlog count):** unify on the
+  `get_unreconciled_splits` rule (all non-y, non-voided splits).
+  The summary is the dashboard. If the dashboard says 47 and the
+  detail tool says 63, the bookkeeper's first instinct is "the
+  book is wrong" — not "oh, these tools count differently." Old
+  unreconciled splits predating `latest_y_date` (skipped during a
+  partial reconciliation, opening balances never stamped) are
+  exactly the ones that tend to be problems and must be visible
+  in both surfaces.
+
 ---
 
 ## Open decisions worth surfacing
@@ -207,12 +227,6 @@ before release:**
   Stage 3 features (taxtables, credit_notes, vouchers, jobs) have
   realistic exposure on both books. This affects which branch L-7
   lands in (could be its own pre-release branch).
-
-- **Branch 4 vs split:** Group A/B/C/D as one PR (four commits)
-  vs. two PRs (A+B as "correctness," C+D as "polish + sweep").
-  Lean toward one — the dependencies are loose but the theme
-  ("review-fallout cleanup") is coherent. Could split if Copilot
-  review surfaces dimension-specific concerns.
 
 - **`samples/lin-wei.gnucash` drift:** three options listed above.
   The "extend" option pairs cleanly with L-7.
