@@ -35,6 +35,7 @@ from gnucash_mcp.book._base import (
     _account_to_dict,
     _guid_prefix_map,
     _is_market_price,
+    _is_unreconciled,
     _is_voided,
     _split_to_compact_dict,
     _split_to_dict,
@@ -287,17 +288,26 @@ class CoreMixin:
             #   - latest_y_date (most recent reconciled split)
             #   - has_yc (any 'y' or 'c' for the ASSET gate)
             #   - any_splits (used vs. unused account)
-            # Pre-fix this method walked ``account.splits`` twice:
-            # once for the ASSET-passes-only-with-yc check, once
-            # for the latest-y_date scan, and (in some branches)
-            # a third time for the unreconciled count. One sweep
-            # collects everything; the count itself can't be
-            # computed up front because it depends on
-            # latest_y_date, but we capture all the inputs in the
-            # single pass and run the count after.
+            #   - unreconciled_count (total non-y, non-voided)
+            #   - oldest_unreconciled_date (oldest pending work)
+            # Post-HP-8 the count is state-only (doesn't depend on
+            # ``latest_y_date``), so it folds into the existing
+            # sweep — half the splits work per dashboard call.
+            # ``_is_unreconciled`` is the chokepoint shared with
+            # ``get_unreconciled_splits`` so the dashboard count
+            # and the detail tool agree by construction.
+            #
+            # Chokepoint scope note: ``_is_unreconciled`` is the
+            # as-of-today predicate. ``get_unreconciled_splits``
+            # accepts a separate ``as_of_date`` arg for historical
+            # tie-outs; the dashboard intentionally has no such
+            # parameter (it's the morning-check surface, not the
+            # reporting surface). Documented at the helper.
             latest_y_date = None
             has_yc = False
             any_splits = False
+            unreconciled_count = 0
+            oldest_unreconciled_date = None
             for s in account.splits:
                 any_splits = True
                 rstate = s.reconcile_state
@@ -307,6 +317,12 @@ class CoreMixin:
                     pd = s.transaction.post_date
                     if latest_y_date is None or pd > latest_y_date:
                         latest_y_date = pd
+                if _is_unreconciled(s):
+                    unreconciled_count += 1
+                    pd = s.transaction.post_date
+                    if (oldest_unreconciled_date is None
+                            or pd < oldest_unreconciled_date):
+                        oldest_unreconciled_date = pd
 
             # ASSET passes only when it has reconcilable history.
             # Investment positions / real estate / vehicles carry
@@ -318,22 +334,7 @@ class CoreMixin:
                 # No activity at all — not "behind," just unused.
                 continue
 
-            # Count unreconciled splits past the last 'y' date (or
-            # all of them when never reconciled). This becomes the
-            # "47 splits unreconciled since DATE" payload — the LLM
-            # uses the count to plan the reconciliation pass: 12
-            # splits is a single sitting, 400 is "let's narrow by
-            # month." 'c' (cleared) splits count as unreconciled
-            # for this purpose; they're not finalized.
             if latest_y_date is None:
-                # Voided splits are excluded — they're zombies from
-                # void_transaction, not pending bookkeeping work. Pre-
-                # fix the filter was ``state != "y"`` which counted
-                # them; ``_is_voided`` is now the chokepoint.
-                unreconciled_count = sum(
-                    1 for s in account.splits
-                    if s.reconcile_state != "y" and not _is_voided(s)
-                )
                 results.append({
                     "account": account.fullname,
                     "status": "never reconciled",
@@ -341,20 +342,36 @@ class CoreMixin:
                     "unreconciled_count": unreconciled_count,
                 })
             else:
-                days_behind = (today - latest_y_date).days
-                unreconciled_count = sum(
-                    1 for s in account.splits
-                    if s.reconcile_state != "y"
-                    and not _is_voided(s)
-                    and s.transaction.post_date > latest_y_date
-                )
-                results.append({
-                    "account": account.fullname,
-                    "status": f"through {latest_y_date.isoformat()}",
-                    "days_behind": days_behind,
-                    "unreconciled_count": unreconciled_count,
-                    "latest_y_date": latest_y_date.isoformat(),
-                })
+                # Lag is computed from the OLDEST unreconciled split
+                # when there's pending work — the honest scope-of-
+                # work signal the bookkeeper plans against. "4 months
+                # behind" on an account whose oldest unreconciled
+                # split is from 2020 would cost a day of mismatched
+                # expectations ("one-sitting catch-up" vs "gather six
+                # years of statements"). Fully-caught-up accounts
+                # (unreconciled_count == 0) fall back to
+                # latest_y_date as the staleness signal.
+                if unreconciled_count > 0 \
+                        and oldest_unreconciled_date is not None:
+                    days_behind = (today - oldest_unreconciled_date).days
+                    results.append({
+                        "account": account.fullname,
+                        "status": f"through {latest_y_date.isoformat()}",
+                        "days_behind": days_behind,
+                        "unreconciled_count": unreconciled_count,
+                        "latest_y_date": latest_y_date.isoformat(),
+                        "oldest_unreconciled_date":
+                            oldest_unreconciled_date.isoformat(),
+                    })
+                else:
+                    days_behind = (today - latest_y_date).days
+                    results.append({
+                        "account": account.fullname,
+                        "status": f"through {latest_y_date.isoformat()}",
+                        "days_behind": days_behind,
+                        "unreconciled_count": unreconciled_count,
+                        "latest_y_date": latest_y_date.isoformat(),
+                    })
 
         results.sort(key=lambda r: r["account"])
         return results
@@ -1606,9 +1623,11 @@ class CoreMixin:
 
 
     @staticmethod
-    def _format_reconciliation_lag(days_behind: int) -> str:
-        """Render a parenthesized "(N months behind)" / "(N days
-        behind)" suffix for a reconciliation status warning.
+    def _format_reconciliation_lag(
+        days_behind: int, with_parens: bool = True,
+    ) -> str:
+        """Render a "(N years behind)" / "(N months behind)" /
+        "(N days behind)" suffix for a reconciliation status warning.
 
         Months scale once we're past 60 days because that's how users
         think about reconciliation lag — "two months behind" reads
@@ -1622,11 +1641,24 @@ class CoreMixin:
         off-by-one nudge that ``// 30`` produced (90 → 3 vs 91 → 3,
         but 30 → 1 vs 60 → 2 was sharp; reasonable enough most of
         the time but humans round to nearest unit, not floor).
+
+        Past 24 months we shift to years for the same reason — "6
+        years behind" is the bookkeeper's planning number; "72
+        months behind" reads as a typo.
+
+        ``with_parens=False`` returns the bare phrase so callers
+        composing larger strings ("(6 years behind, oldest: ...)" )
+        can join without double-paren artifacts.
         """
-        if days_behind >= 60:
+        if days_behind >= 730:  # 24 months in days
+            years = round(days_behind / 365.25)
+            inner = f"{years} year{'s' if years != 1 else ''} behind"
+        elif days_behind >= 60:
             months = round(days_behind / 30.44)
-            return f"({months} months behind)"
-        return f"({days_behind} days behind)"
+            inner = f"{months} months behind"
+        else:
+            inner = f"{days_behind} days behind"
+        return f"({inner})" if with_parens else inner
 
     # ── Section renderers ─────────────────────────────────────────────
     #
@@ -1697,18 +1729,33 @@ class CoreMixin:
         for entry in stale:
             leaf = entry["account"].split(":")[-1]
             lag = self._format_reconciliation_lag(entry["days_behind"])
-            # Sub-line shape: "47 splits unreconciled since
-            # 2025-12-30 (4 months behind) ⚠". The split count
-            # tells the LLM the *scope* of the reconciliation
-            # work — 12 splits is one sitting; 400 needs a
-            # month-by-month strategy.
+            # Sub-line shape: "47 splits unreconciled (6 years
+            # behind, oldest: 2020-03-15) ⚠". The split count
+            # tells the LLM the *scope* of the work — 12 splits
+            # is one sitting; 400 needs a month-by-month strategy
+            # — and the lag is computed from the OLDEST
+            # unreconciled split (set in
+            # ``_account_reconciliation_status``) so "behind"
+            # measures the true scope, not just time-since-last-
+            # reconcile. A bookkeeper looking at "4 months
+            # behind" expects a one-session catch-up; the new
+            # phrasing surfaces "6 years behind" when that's the
+            # honest scope, so they bring six years of statements
+            # instead of one quarter's.
+            #
+            # The "oldest: DATE" suffix carries the exact anchor
+            # — useful when the bookkeeper is deciding which
+            # source documents to pull.
             n = entry["unreconciled_count"]
-            if n > 0 and "latest_y_date" in entry:
+            if n > 0 and "oldest_unreconciled_date" in entry:
                 plural = "s" if n != 1 else ""
-                since = entry["latest_y_date"]
+                oldest = entry["oldest_unreconciled_date"]
+                lag_inner = self._format_reconciliation_lag(
+                    entry["days_behind"], with_parens=False,
+                )
                 out.append(
-                    f"  {leaf}: {n} split{plural} "
-                    f"unreconciled since {since} {lag} ⚠"
+                    f"  {leaf}: {n} split{plural} unreconciled "
+                    f"({lag_inner}, oldest: {oldest}) ⚠"
                 )
             else:
                 out.append(

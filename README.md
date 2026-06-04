@@ -49,7 +49,7 @@ Receivables: 3 accounts, USD 10246.46
   Accounts Receivable: USD 3500.00
   Accounts Receivable CAD: USD 1837.50
 Reconciliation:
-  Checking Account: 174 splits unreconciled since 2025-12-30 (4 months behind) ⚠
+  Checking Account: 174 splits unreconciled (4 months behind, oldest: 2025-12-30) ⚠
   7 accounts never reconciled ⚠
 Net worth trajectory:
   12mo ago: USD 187,925

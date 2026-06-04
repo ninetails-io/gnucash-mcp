@@ -408,9 +408,11 @@ books" into "what do I need to do next":
 - **Budget headline** — *"41% used / 33% elapsed (+8% over pace)"*
   for the current period.
 - **Reconciliation backlog with split counts** —
-  *"Checking: 47 splits unreconciled since 2025-12-30 (4 months
-  behind) ⚠"*. Scope, not just staleness. 12 splits is a single
-  sitting; 400 is "let's narrow by month."
+  *"Checking: 47 splits unreconciled (4 months behind, oldest:
+  2025-12-30) ⚠"*. Scope, not just staleness. 12 splits is a single
+  sitting; 400 is "let's narrow by month." The lag is computed from
+  the OLDEST unreconciled split so "behind" tells you the planning
+  number — not how long ago the last reconciliation closed.
 - **Upcoming scheduled** rolled into the Scheduled line —
   *"Scheduled: 13 recurring, 3 due in next 7 days (CNY 15,650)"*.
   No second tool call needed.

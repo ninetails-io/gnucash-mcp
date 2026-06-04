@@ -134,19 +134,38 @@ def register(mcp, get_book) -> None:
         start_date: str,
         end_date: str,
         account: str | None = None,
+        include_transfers: bool = False,
     ) -> str:
         """Calculate cash flow (inflows and outflows) for a period.
+
+        Scope is BANK and CASH accounts by default. Credit-card and
+        investment movements are not cash flow (they're liability /
+        asset changes — use balance_sheet). An explicit ``account=``
+        of any type works but the default scope is narrow.
+
+        Internal transfers (transactions with no INCOME or EXPENSE
+        leg — transfer to savings, currency wallet shuffle, paying
+        a credit card from checking) are filtered by default. The
+        default totals answer "where did money come from and where
+        did it go?" rather than "every debit and credit." Pass
+        ``include_transfers=true`` for the gross flow (e.g. for
+        reconciling against a bank statement).
 
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
-            account: Optional specific account to analyze (defaults to all cash/bank accounts)
+            account: Optional specific account to analyze (defaults
+                to all cash/bank accounts)
+            include_transfers: When False (default), filter internal
+                transfers. When True, include every cash/bank
+                movement regardless of category.
         """
         book = get_book()
         result = book.cash_flow(
             start_date=date.fromisoformat(start_date),
             end_date=date.fromisoformat(end_date),
             account=account,
+            include_transfers=include_transfers,
         )
         return _json(result)
 
