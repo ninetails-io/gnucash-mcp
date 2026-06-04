@@ -426,11 +426,11 @@ class ReportingMixin:
             for split, _txn, account in rows:
                 # Skip placeholder accounts so the balance sheet
                 # matches ``_compute_net_worth_at``'s convention
-                # (which already filters them at ``core.py:443``).
-                # Pre-fix a placeholder with direct splits — rare
-                # but legal — was double-counted: once on the
-                # placeholder line, once on the implicit roll-up
-                # through its children. SB-8.
+                # (which already filters ``account.placeholder``
+                # before its balance loop). Pre-fix a placeholder
+                # with direct splits — rare but legal — was double-
+                # counted: once on the placeholder line, once on the
+                # implicit roll-up through its children. SB-8.
                 if account.placeholder:
                     continue
                 # Value the split in the book's default currency so

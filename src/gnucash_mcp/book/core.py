@@ -1113,14 +1113,17 @@ class CoreMixin:
           spending ahead of pace; caller renders + sign and ⚠
           marker at the configured threshold).
 
-        Actuals come straight from EXPENSE / INCOME splits in the
-        budgeted accounts themselves (no parent rollup). The full
-        budget report — which does roll children up to budgeted
-        ancestors — is a separate tool the LLM can call for
-        category-level detail. The headline trades that detail for
-        a single-line summary the LLM can reference proactively
-        ("you're 11% over pace; want me to identify which
-        categories are driving it?").
+        Actuals come from EXPENSE / INCOME splits in the budgeted
+        accounts AND their descendants — children of a placeholder-
+        budgeted parent roll up to that parent for actuals
+        accumulation. A descendant that's separately budgeted on
+        its own line stays out of the rollup so its actuals aren't
+        double-counted (matches ``get_budget_report`` behavior;
+        SB-9). The full budget report is a separate tool the LLM
+        can call for category-level detail; the headline trades
+        that detail for a single-line summary the LLM can reference
+        proactively ("you're 11% over pace; want me to identify
+        which categories are driving it?").
         """
         from piecash.budget import Budget
 
