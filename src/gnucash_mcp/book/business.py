@@ -5216,6 +5216,79 @@ class BusinessMixin:
                 }
             return result
 
+    def _convert_invoice_amount(
+        self,
+        book,
+        *,
+        amount: Decimal,
+        invoice_currency,
+        target_commodity,
+        as_of: date,
+        context: str,
+    ) -> tuple[Decimal, Decimal | None]:
+        """Convert ``amount`` (in invoice currency) to the target
+        commodity, quantized to that commodity's smallest fraction.
+
+        R-2: shared chokepoint for the cross-currency math that
+        ``post_invoice`` and ``pay_invoice`` previously did with
+        nearly-identical inline closures (``_qty_for_split`` and
+        ``_convert``). One helper, two callers, same error shape
+        — so a future fix to the rate-lookup or quantization
+        cascade hits both paths without re-derivation.
+
+        Args:
+            book: Open piecash session (passed through to
+                ``_find_exchange_rate``).
+            amount: The value in invoice currency.
+            invoice_currency: The invoice's currency commodity.
+            target_commodity: The commodity to convert TO (e.g.
+                an A/R or bank account's commodity).
+            as_of: Date for the rate lookup (post_date or
+                payment_date).
+            context: ``"posting"`` or ``"payment"`` — embedded in
+                the no-rate-found error so the LLM sees which
+                operation needs the rate created.
+
+        Returns:
+            ``(quantized_amount, rate)`` where ``rate`` is the
+            applied exchange rate, or ``None`` when the source
+            and target are the same currency (no conversion
+            needed). Same-currency returns the input ``amount``
+            untouched — no quantize, no rate.
+
+        Raises:
+            ValueError: When the currencies differ and no
+                exchange rate is on file for the given date.
+                Message names both currencies, the date, and the
+                operation context.
+        """
+        if target_commodity == invoice_currency:
+            return amount, None
+        rate = self._find_exchange_rate(
+            book,
+            from_commodity=invoice_currency,
+            to_commodity=target_commodity,
+            as_of=as_of,
+        )
+        if rate is None:
+            raise ValueError(
+                f"Cross-currency {context} requires an exchange "
+                f"rate: invoice currency "
+                f"{invoice_currency.mnemonic} differs from "
+                f"target commodity {target_commodity.mnemonic}, "
+                f"and no matching price was found in the book "
+                f"for {invoice_currency.mnemonic}/"
+                f"{target_commodity.mnemonic} on or near "
+                f"{as_of}. Add a price with create_price, then "
+                f"retry."
+            )
+        return (
+            (amount * rate).quantize(
+                _commodity_quantum(target_commodity)
+            ),
+            rate,
+        )
+
     def post_invoice(
         self,
         invoice_id: str,
@@ -5358,34 +5431,21 @@ class BusinessMixin:
             )
 
             # Helper: convert a value in invoice currency to the
-            # equivalent quantity in the given account's commodity,
-            # using book.prices at parsed_date. Returns the value
-            # unchanged when currencies match.
+            # equivalent quantity in the given account's commodity.
+            # R-2: routes through ``_convert_invoice_amount`` so
+            # post and pay share one rate-lookup + quantization
+            # chokepoint. The rate is unused here (post doesn't
+            # need it for downstream FX-gain math).
             def _qty_for_split(acct, value_in_invoice_ccy):
-                if acct.commodity == inv.currency:
-                    return value_in_invoice_ccy
-                rate = self._find_exchange_rate(
+                qty, _rate = self._convert_invoice_amount(
                     book,
-                    from_commodity=inv.currency,
-                    to_commodity=acct.commodity,
+                    amount=value_in_invoice_ccy,
+                    invoice_currency=inv.currency,
+                    target_commodity=acct.commodity,
                     as_of=parsed_date,
+                    context="posting",
                 )
-                if rate is None:
-                    raise ValueError(
-                        f"Cross-currency posting requires an exchange "
-                        f"rate: invoice currency "
-                        f"{inv.currency.mnemonic} differs from "
-                        f"account commodity {acct.commodity.mnemonic} "
-                        f"({acct.fullname}), and no matching price was "
-                        f"found for "
-                        f"{inv.currency.mnemonic}/"
-                        f"{acct.commodity.mnemonic} on or near "
-                        f"{parsed_date}. Add a price with "
-                        f"create_price, then retry."
-                    )
-                return (value_in_invoice_ccy * rate).quantize(
-                    _commodity_quantum(acct.commodity)
-                )
+                return qty
 
             # Build transaction splits
             # For customer invoice: A/R debit (positive), income credit (negative)
@@ -5867,35 +5927,20 @@ class BusinessMixin:
             # side via ``_qty_for_split(post_acct, ...)``; the pay
             # path didn't, so a USD A/R holding a EUR invoice was
             # liquidated in EUR-as-USD on payment.
+            # R-2: ``post_invoice`` and ``pay_invoice`` share
+            # the cross-currency rate-lookup + quantization
+            # chokepoint via ``_convert_invoice_amount``. Pay
+            # consumes both the converted quantity AND the
+            # rate (the rate feeds ``_compute_fx_gain_loss``
+            # below).
             def _convert(amount, target_commodity):
-                """Convert invoice-currency amount to target commodity,
-                quantized to the target's smallest fraction (so JPY
-                stores whole yen, BHD stores 3 decimals, etc.)."""
-                if target_commodity == inv.currency:
-                    return amount, None
-                rate = self._find_exchange_rate(
+                return self._convert_invoice_amount(
                     book,
-                    from_commodity=inv.currency,
-                    to_commodity=target_commodity,
+                    amount=amount,
+                    invoice_currency=inv.currency,
+                    target_commodity=target_commodity,
                     as_of=parsed_date,
-                )
-                if rate is None:
-                    raise ValueError(
-                        f"Cross-currency payment requires an exchange "
-                        f"rate: invoice currency "
-                        f"{inv.currency.mnemonic} differs from account "
-                        f"commodity {target_commodity.mnemonic}, and "
-                        f"no matching price was found in the book for "
-                        f"{inv.currency.mnemonic}/"
-                        f"{target_commodity.mnemonic} on or near "
-                        f"{parsed_date}. Add a price with "
-                        f"create_price, then retry."
-                    )
-                return (
-                    (amount * rate).quantize(
-                        _commodity_quantum(target_commodity)
-                    ),
-                    rate,
+                    context="payment",
                 )
 
             pay_quantity, exchange_rate = _convert(
