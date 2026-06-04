@@ -80,9 +80,17 @@ class SplitInput(BaseModel):
     currency), and ``memo`` (optional).
     """
 
+    # ``extra="forbid"`` matches the server-global setting on
+    # ``ArgModelBase`` (set in server.py at import time). Pre-fix
+    # this used ``extra="ignore"``, which silently dropped typo'd
+    # keys: ``{"quantitiy": "10"}`` instead of ``{"quantity": "10"}``
+    # would discard the quantity entirely and the transaction would
+    # post with cross-currency value/quantity mismatch (or with the
+    # default-zero behavior, depending on the path). HP-10 from
+    # specs/CODE_REVIEW_v1_3.md.
     model_config = ConfigDict(
         coerce_numbers_to_str=True,
-        extra="ignore",
+        extra="forbid",
     )
 
     account: Annotated[

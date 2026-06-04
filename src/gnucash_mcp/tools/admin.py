@@ -3,6 +3,7 @@
 Registered only when the 'admin' module is enabled via --modules.
 """
 
+import re
 from datetime import datetime
 
 from gnucash_mcp.logging_config import (
@@ -10,6 +11,16 @@ from gnucash_mcp.logging_config import (
     get_log_dir,
 )
 from gnucash_mcp.tools._helpers import _json, safe_tool
+
+
+# Audit log filenames are exactly ``YYYY-MM-DD.txt``. Validate
+# ``log_date`` against this shape before constructing the path —
+# pre-fix, ``Path(audit_dir) / f"{log_date}.txt"`` would happily
+# interpolate ``../../../../etc/passwd`` and read arbitrary
+# ``*.txt`` files. Prompt injection through any free-text field
+# that surfaces into the audit log was the attack vector
+# (SB-15 from specs/CODE_REVIEW_v1_3.md).
+_LOG_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 def register(mcp, get_book) -> None:
@@ -110,6 +121,24 @@ def register(mcp, get_book) -> None:
 
         audit_dir = log_dir / "audit"
         target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
+        # SB-15 path-traversal gate. ``target_date`` is
+        # interpolated into the log path; reject anything that
+        # isn't a literal ``YYYY-MM-DD`` before the join so
+        # ``../../../../etc/passwd`` style inputs can't escape
+        # the audit directory.
+        #
+        # Raise rather than build the JSON envelope inline so
+        # ``safe_tool`` handles the rejection through its standard
+        # path: same JSON shape, plus the boundary-layer logger
+        # warning AND path redaction applied to the error message
+        # (``redact_paths`` in safe_tool's ValueError branch).
+        # Copilot-flagged on PR #97 — inline envelope duplicated
+        # the shape and skipped redaction.
+        if not _LOG_DATE_RE.fullmatch(target_date):
+            raise ValueError(
+                f"Invalid log_date {target_date!r}: must be "
+                f"YYYY-MM-DD (e.g. 2026-06-04)."
+            )
         log_file = audit_dir / f"{target_date}.txt"
 
         if not log_file.exists():

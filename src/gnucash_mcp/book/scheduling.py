@@ -603,8 +603,32 @@ class SchedulingMixin:
     ) -> dict:
         """Create an actual transaction from a scheduled template.
 
-        Note: calls self.create_transaction (core, resolved via MRO)
-        in a separate session after the schedule update commits.
+        Three-phase write to keep the schedule advance and the
+        transaction in lockstep (SB-10):
+
+        1. **Read-only** session: resolve the scheduled-transaction
+           row, compute the target ``txn_date``, validate
+           preflight (frequency known, date past ``last_occur``,
+           splits non-empty). Captures everything needed for the
+           write without mutating anything.
+        2. ``self.create_transaction(...)`` runs in its own session.
+           On success this lands a transaction; on a raise the
+           schedule has not advanced and the caller's retry is
+           safe; on ``status="rejected"`` the duplicate detector
+           found an equivalent prior transaction (so an
+           equivalent transaction DOES exist for this period —
+           we treat that as a successful no-op and still advance
+           the schedule).
+        3. **Read-write** session: advance ``last_occur`` and
+           ``instance_count``. Reached only when phase 2 returned
+           without raising — so the schedule-advance-vs-transaction-
+           existence invariant holds in both the success and
+           duplicate-detected branches.
+
+        Pre-fix the schedule advanced BEFORE the transaction call;
+        any raise in phase 2 left the schedule moved with no
+        transaction posted, and a re-run would skip the period
+        entirely.
 
         Args:
             guid: Scheduled transaction GUID.
@@ -612,12 +636,24 @@ class SchedulingMixin:
                             Defaults to next occurrence date.
 
         Returns:
-            Dict with created transaction guid and updated schedule.
+            Dict with ``transaction_guid``, ``scheduled_transaction``
+            name, ``transaction_date``, ``instance_count``, and
+            ``status``. When the duplicate detector caught an
+            equivalent transaction, ``status="rejected"`` and a
+            ``reason="duplicate_exists"`` field is included so
+            downstream LLMs have explicit evidence to stop and
+            move on rather than retry the call. The duplicate
+            detector's ``duplicates`` TSV is forwarded too when
+            present, naming the matching prior transaction(s).
 
         Raises:
-            ValueError: If scheduled transaction not found or disabled.
+            ValueError: If scheduled transaction not found,
+                disabled, no upcoming occurrence, txn_date not
+                past last_occur, or splits empty. None of these
+                paths advance the schedule.
         """
-        with self.open(readonly=False) as book:
+        # ── Phase 1: read-only resolution. No mutation. ─────────
+        with self.open(readonly=True) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:
                 raise ValueError(
@@ -662,10 +698,11 @@ class SchedulingMixin:
                         "No upcoming occurrence (past end date)"
                     )
 
-            # Preflight: refuse to instantiate an occurrence on or before
-            # last_occur. GnuCash desktop's "Since Last Run" updates
-            # last_occur when it auto-creates transactions; running this
-            # tool with a prior date would silently create a duplicate.
+            # Preflight: refuse to instantiate an occurrence on or
+            # before last_occur. GnuCash desktop's "Since Last Run"
+            # updates last_occur when it auto-creates transactions;
+            # running this tool with a prior date would silently
+            # create a duplicate.
             if last and txn_date <= last:
                 raise ValueError(
                     f"Transaction date {txn_date.isoformat()} is not "
@@ -681,30 +718,86 @@ class SchedulingMixin:
                     "transaction"
                 )
 
-            # Never rewind last_occur. If desktop pre-created ahead and
-            # we're backfilling an earlier gap, keep the later marker.
-            sx.last_occur = max(last, txn_date) if last else txn_date
-            sx.instance_count += 1
-
+            # Capture the few fields the later phases need so we
+            # don't have to re-resolve.
             sx_name = sx.name
-            instance_count = sx.instance_count
 
-            book.save()
-
-        # Create the actual transaction (separate session)
+        # ── Phase 2: create the transaction. ────────────────────
+        # On raise: schedule is unchanged (phase 3 not reached).
+        # On status="rejected": duplicate detector caught an
+        # equivalent prior transaction — for SB-10 purposes that
+        # transaction IS the one for this period, so we proceed
+        # to advance the schedule and forward the rejection signal
+        # to the caller in the response.
         txn_result = self.create_transaction(
             description=sx_name,
             splits=splits,
             trans_date=txn_date,
         )
 
-        return {
-            "transaction_guid": txn_result["guid"],
+        # ── Phase 3: advance the schedule. ──────────────────────
+        # Re-resolve under a read-write session and apply both
+        # mutations in one commit. We re-find by guid (the prior
+        # ORM object was detached when phase-1's session closed).
+        with self.open(readonly=False) as book:
+            sx = self._find_scheduled_transaction(book, guid)
+            if not sx:
+                # Edge case: schedule deleted concurrently between
+                # phases 1 and 3. The transaction exists; we
+                # surface a clean response noting the orphan
+                # rather than crash. Single-threaded MCP makes
+                # this practically unreachable but the defense
+                # is cheap.
+                instance_count = None
+            else:
+                # ``last`` was captured under the readonly session;
+                # if desktop pre-created ahead while phase 2 ran,
+                # use whatever's current. Never rewind.
+                current_last = sx.last_occur
+                if isinstance(current_last, datetime):
+                    current_last = current_last.date()
+                # Only advance + increment when ``txn_date`` is
+                # actually beyond the current marker. If a
+                # concurrent writer covered this period between
+                # phases 2 and 3 (desktop's "Since Last Run", or
+                # another tool invocation), the schedule already
+                # registered the period — incrementing
+                # ``instance_count`` again would double-count.
+                # Copilot-flagged on PR #97. The MCP server runs
+                # single-threaded so this is practically
+                # unreachable today, but the gate is cheap and the
+                # invariant ("instance_count equals the number of
+                # distinct periods this schedule has produced")
+                # holds under any future multi-writer scenario.
+                if current_last is None or txn_date > current_last:
+                    sx.last_occur = txn_date
+                    sx.instance_count += 1
+                    book.save()
+                instance_count = sx.instance_count
+
+        # ── Build response. ─────────────────────────────────────
+        # Not a write phase — the docstring describes three
+        # write phases; this is the response-shaping step.
+        response = {
+            "transaction_guid": txn_result.get("guid"),
             "scheduled_transaction": sx_name,
             "transaction_date": txn_date.isoformat(),
             "instance_count": instance_count,
-            "status": "created",
+            "status": txn_result.get("status", "created"),
         }
+        if txn_result.get("status") == "rejected":
+            # Explicit evidence for downstream LLMs (including
+            # dumber models that might retry status="rejected"
+            # by default) that the rejection is the *correct*
+            # outcome — a transaction for this period already
+            # exists. Without this, the natural retry instinct
+            # would either re-trigger the dupe detector (best
+            # case) or, with --force_create, create the very
+            # duplicate the detector was preventing.
+            response["reason"] = "duplicate_exists"
+            if "duplicates" in txn_result:
+                response["duplicates"] = txn_result["duplicates"]
+        return response
 
     def update_scheduled_transaction(
         self,
