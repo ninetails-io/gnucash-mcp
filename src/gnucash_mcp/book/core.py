@@ -1635,16 +1635,6 @@ class CoreMixin:
         return result
 
     @staticmethod
-    def _format_monthly_net(net: Decimal) -> str:
-        """Render a monthly net value as ``+1,247`` / ``-234`` / ``+0``.
-
-        Always shows an explicit sign; thousands separator. Whole
-        dollars (the spec's example output is whole-number; cents
-        would noise up the summary view without adding signal).
-        """
-        return f"{int(net):+,}"
-
-
     @staticmethod
     def _format_reconciliation_lag(
         days_behind: int, with_parens: bool = True,
@@ -1698,21 +1688,6 @@ class CoreMixin:
     # through the render block. Each helper is self-contained — no
     # cross-section state — so the rendering order in
     # ``get_book_summary`` becomes a one-glance read.
-
-    @staticmethod
-    def _render_warnings(warnings: list[str]) -> list[str]:
-        """Render the Warnings section.
-
-        Section is omitted when there are no warnings — the spec
-        explicitly calls out not printing "Warnings: none." Empty
-        list signals "section absent" to the caller.
-        """
-        if not warnings:
-            return []
-        out = ["Warnings:"]
-        for msg in warnings:
-            out.append(f"  ⚠ {msg}")
-        return out
 
     def _render_reconciliation(
         self, reconciliation: list[dict],
@@ -1829,9 +1804,10 @@ class CoreMixin:
             label = entry["label"]
             if entry["is_mtd"]:
                 label += " (MTD)"
-            out.append(
-                f"  {label}: {self._format_monthly_net(entry['net'])}"
-            )
+            # L-1: inlined ``_format_monthly_net`` — single caller.
+            # Always shows explicit sign + thousands separator;
+            # whole dollars (cents would noise up the summary).
+            out.append(f"  {label}: {int(entry['net']):+,}")
         return out
 
     def _render_runway(
@@ -2186,8 +2162,14 @@ class CoreMixin:
             # there's data integrity trouble or stale prices
             # informing the rest of the summary, the LLM should see
             # that BEFORE reading numbers that depend on them.
+            # L-1: inlined ``_render_warnings`` — single caller.
+            # Section absent when there are no warnings (the spec
+            # explicitly calls out not printing "Warnings: none.").
             warnings = self._collect_warnings(book, transactions, accounts)
-            lines.extend(self._render_warnings(warnings))
+            if warnings:
+                lines.append("Warnings:")
+                for msg in warnings:
+                    lines.append(f"  ⚠ {msg}")
 
             lines.append(f"Accounts: {total_accounts} total")
 

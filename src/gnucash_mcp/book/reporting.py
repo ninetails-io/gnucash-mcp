@@ -246,10 +246,22 @@ class ReportingMixin:
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
+        Internal transfers are NOT filtered here (unlike
+        ``cash_flow``): every EXPENSE split is real spending by
+        definition. The cash-flow framing's transfer concept
+        doesn't apply.
+
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+            depth: Hierarchy depth for grouping. ``1`` returns the
+                top-level expense buckets (``Expenses:Food``,
+                ``Expenses:Transport``); ``2`` adds one level of
+                children (``Expenses:Food:Groceries``,
+                ``Expenses:Food:Restaurants``). Deeper values
+                surface progressively finer leaves; values greater
+                than the account-tree depth are clamped to the leaf
+                level.
             compact: If True (default), return an aligned text table
                      suitable for direct LLM consumption (Phase 4C).
                      Verbose mode returns the structured dict.
@@ -390,11 +402,37 @@ class ReportingMixin:
     def balance_sheet(self, as_of_date: date) -> dict:
         """Generate a balance sheet as of a specific date.
 
+        Equity includes a computed **Unrealized gain/loss** line —
+        the residual that makes ``A = L + E`` hold by construction.
+        Assets render at market value (factor × quantity for
+        commodities and foreign-currency cash) while equity rolls
+        up from raw split values (historical cost). The residual
+        captures two effects under one heading:
+
+        - Investment market drift on STOCK/MUTUAL holdings
+          (shares × current_price vs. cost basis recorded as
+          split.value).
+        - FX translation adjustment on foreign-currency accounts
+          (current default-currency value vs. historical default-
+          currency equivalent at post time).
+
+        Both are accumulated-other-comprehensive-income items
+        under GAAP. Surfacing the decomposition is a future
+        feature; the single line preserves the balance-sheet
+        identity for any mix.
+
         Args:
-            as_of_date: Date to calculate balances as of.
+            as_of_date: Date to calculate balances as of. The
+                inclusive upper bound — transactions posted on
+                ``as_of_date`` are included. FX rates and
+                commodity prices are anchored to the same date for
+                a coherent historical view.
 
         Returns:
-            Dict with assets, liabilities, equity sections and totals.
+            Dict with ``assets``, ``liabilities``, ``equity``
+            sections (each a list of account rows) and ``totals``
+            (assets, liabilities, equity, with ``equity`` already
+            including the Unrealized line so totals balance).
         """
         # Sum splits across every relevant type in one SQL-filtered
         # pass. The old code opened Python loops per account; now we

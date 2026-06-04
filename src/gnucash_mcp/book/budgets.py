@@ -681,10 +681,24 @@ class BudgetsMixin:
         Args:
             budget_name: Name of the budget.
             period: Which period to report:
-                - None: Current period based on today's date (default)
-                - Integer 0-N: Specific period
-                - "ytd": Year to date (all periods up to current)
-                - "all": All periods
+                - ``None``: Current period (based on today's date).
+                  Default.
+                - Integer ``0..num_periods-1``: A specific period
+                  by index (period 0 is the first; ``num_periods``
+                  out of range raises).
+                - ``"q1"`` / ``"q2"`` / ``"q3"`` / ``"q4"``:
+                  Quarter aliases. Maps each quarter to its three
+                  contributing periods on a monthly budget; raises
+                  on non-monthly budgets where the mapping isn't
+                  defined.
+                - ``"ytd"``: Year-to-date. Includes every period
+                  from the budget's start through the period
+                  covering today (or through the last period if
+                  today is past the budget's end). Raises if
+                  today's date is BEFORE the budget's start.
+                - ``"all"``: Every period in the budget — useful
+                  for comparing budget vs actual across the full
+                  authored range.
             account: Optional filter to specific account or parent.
             include_children: If True and account specified, include
                             child accounts. Default True.

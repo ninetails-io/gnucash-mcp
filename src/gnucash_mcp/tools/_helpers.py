@@ -154,7 +154,7 @@ def _splits_to_dicts(
     return result
 
 
-def _strip_noise(obj):
+def _strip_noise(obj: object) -> object:
     """Recursively remove keys with None or empty-string values from dicts.
 
     Empty strings are treated as absent — the convention across the

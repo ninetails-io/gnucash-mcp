@@ -423,46 +423,79 @@ args.
 
 ---
 
-## What's in v1.2.1
+## What's in v1.3.0
 
-This release is the long-tail completion of the v1.2 business-
-module promise — what v1.2 should have been at first ship,
-plus a generous correctness sweep on every non-USD-default
-path the test books surfaced.
+This release fills in the business-feature complement promised
+since v1.2 and lands a deep correctness pass on the surfaces
+that were left rough — backed by an adversarial review of the
+whole codebase before the release branch opened.
 
-**Major:**
+**Stage 3 business features:**
 
-- **Multi-currency, end-to-end.** Foreign-currency invoices
-  post and pay against the right exchange rates from your
-  price table; rate drift between post-date and pay-date is
-  recognized as realized FX gain/loss in a dedicated income
-  account (or one you specify).
-- **A complete first-call dashboard.** `get_book_summary` now
-  shows net-worth trajectory, runway, monthly net income,
-  budget pacing, reconciliation backlog with split counts,
-  upcoming bills, and warnings — turning the LLM's first call
-  from "what is the state of the books" into "what do I need
-  to do next."
-- **Customer / vendor / employee CRUD complete.** Create,
-  list, get, update (new in 1.2.1), and delete. No more
-  needing to open GnuCash itself just to fix a typo on an
-  address.
-- **Posting workflow lifecycle complete.** `post_invoice` and
-  `pay_invoice` joined by `unpost_invoice` (new) so a posted
-  invoice can be reversed cleanly without SQL surgery.
-  `delete_transaction` refuses to break the lifecycle by
-  removing posting records directly.
-- **Automatic backups.** First write of each session snapshots
-  the book; staged retention (7 session / 4 weekly / 6
-  monthly) keeps you covered without filling your disk.
+- **Taxtables** — per-line-item sales-tax templates that flow
+  through invoice, bill, voucher, and credit-note posting.
+- **Jobs** — multi-invoice project containers so a freelancer
+  can group all the invoices on one engagement under a single
+  client deliverable.
+- **Credit notes** — refund instruments with explicit
+  apply-to-invoice linkage, recognized as negative invoices
+  through the same posting machinery.
+- **Employee expense vouchers** — full lifecycle (`create_voucher`,
+  `add_voucher_entry`, `post_invoice`, `pay_invoice`) for
+  reimbursement workflows.
 
-**Plus a thousand smaller fixes** from intensive testing on
-two real-shape books — multi-currency reporting, debt-payoff
-amortization for mortgages, voided-payment handling, employee-
-expense-voucher hooks, and many more. See
-[specs/NEXT_STEPS_1_3.md](specs/NEXT_STEPS_1_3.md) for the 1.3
-roadmap (taxtables, jobs, credit notes, employee expense
-vouchers).
+**Role-aligned `--modules` partition:**
+
+- `--modules=core` always-on (the ledger primitives plus
+  reconciliation, backups, and slot-based metadata).
+- Add `bookkeeper`, `investor`, or `business` to pick the
+  persona you're serving. Each is a transparent group alias
+  over leaf modules so `--modules=freelancer` or `--modules=portfolio`
+  picks a finer cut when you want one. `get_server_config`
+  shows the exact expansion at startup.
+
+**Honesty pass on every report:**
+
+- Reconciliation backlog lag is computed from the OLDEST
+  unreconciled split, not the latest reconcile date — so
+  `'47 splits unreconciled (6 years behind, oldest: 2020-03-15) ⚠'`
+  tells you the real scope of the work. Pre-1.3 it would say
+  "4 months behind" on the same account.
+- `cash_flow` filters internal transfers by default — the
+  totals answer "where did money come from and where did it
+  go?" instead of "every debit and credit that touched a cash
+  account." Pass `include_transfers=true` for the gross flow
+  if you're reconciling against a bank statement.
+- Multi-currency budget targets render in the book's default
+  currency at period-end rates — no more apples-to-oranges
+  totals on books with EUR / CNY / mixed targets.
+- `balance_sheet` now closes the accounting identity — a
+  computed Unrealized gain/loss line absorbs the residual
+  between market-value assets and cost-basis equity (both
+  investment drift and FX translation under one heading).
+- Multi-currency FX bug-class swept across `spending_by_category`,
+  `income_by_source`, `cash_flow`, dashboard monthly net,
+  daily expense burn, and vendor spending. Aggregations now
+  convert quantities through the historical FX rate; pre-1.3
+  several sites summed raw quantities across currencies.
+
+**Hardening:**
+
+- Defense-in-depth input gates on `create_account`,
+  `create_commodity`, business-entity notes and addresses,
+  audit-log date queries, slot values, void reasons.
+- Symmetric footgun guards on `prune_backups` — neither manual
+  nor auto stages can be wiped in a single call without
+  explicit opt-in.
+- Backup tool with staged retention (7 session / 4 weekly / 6
+  monthly), automatic snapshot on first write of each day, and
+  catastrophic-loss-safe defaults.
+
+**Plus a meaningful test-coverage step** — every chokepoint
+the release-prep arc introduced is locked with a regression
+test, including the structural `_is_unreconciled` /
+`_is_voided` predicates and the audit-dispatcher coverage
+contract.
 
 A condensed changelog of major releases lives in
 [CHANGELOG.md](CHANGELOG.md).

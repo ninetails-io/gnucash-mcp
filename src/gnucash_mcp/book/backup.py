@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -463,9 +464,16 @@ class BackupMixin:
             "size_bytes": size_bytes,
             "integrity": integrity,
             "restore_hint": (
+                # L-5: shell-quote interpolated paths. Paths with
+                # spaces or shell metachars would otherwise break
+                # the command — and if a future code path ever
+                # passes a user-influenced path component, an
+                # unquoted f-string is a latent injection.
                 "Restore by stopping the server, then: "
-                f"mv {self.book_path} {self.book_path}.broken && "
-                f"cp {backup_path} {self.book_path}"
+                f"mv {shlex.quote(str(self.book_path))} "
+                f"{shlex.quote(str(self.book_path) + '.broken')} && "
+                f"cp {shlex.quote(str(backup_path))} "
+                f"{shlex.quote(str(self.book_path))}"
             ),
         }
 
