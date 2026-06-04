@@ -143,6 +143,7 @@ report shape reads well on Lin Wei).
 - **Price-update tool with yfinance.** Spec at `specs/PRICE_UPDATE_SPEC.md`. ~500-700 LOC + new dependency. Separate effort from the review-fix arc.
 - **Comment-bloat cleanup sweep.** Stephen deferred this for "before merging develop to main" — its own branch, focused diff.
 - **README content updates.** Real `get_book_summary` output example using Alex's book.
+- **`create_budget` `start_date` parameter — retroactive budgets.** Bookkeeper-flagged after PR #98 signoff (2026-06-04). Today `create_budget` anchors to the current month/period; no way to create a budget that begins in the past, which blocks comparing a freshly-authored budget against historical actuals. Feature gap, not a bug. Touches `book/budgets.py::create_budget` + the corresponding tool wrapper + a test. Small (1-2 hour) item; reasonable to fold into a future budget-related PR or pick up standalone.
 
 ### Working-tree drift
 
