@@ -13,6 +13,12 @@ what's been decided, what still needs the user's call.
 
 ## Status snapshot
 
+**Branch 4 in progress on `feat/math-ux-correctness`.** Scope: 9 of
+the 11 Branch 4 items (SB-5 and HP-8 deferred as design calls
+needing the user awake — see "Open decisions" below). One PR
+planned, four thematic commits matching Groups A/B'/C'/D from
+this doc.
+
 15 of the 27 substantive review items are closed across three PRs.
 Every SB-* in scope of Branches 1-3 is done. The bookkeeper-found
 off-by-one (not in the original review) was also closed in Branch 1.
