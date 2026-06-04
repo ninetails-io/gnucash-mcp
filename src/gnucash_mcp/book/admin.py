@@ -109,11 +109,14 @@ class AdminMixin:
         # HP-9 length cap. Encode to UTF-8 to count bytes (so a
         # multi-byte unicode payload can't sneak past a char-count
         # check). 64 KiB is generous for any real per-account
-        # metadata.
-        if len(value.encode("utf-8")) > _SLOT_VALUE_MAX_BYTES:
+        # metadata. Compute the byte length once; reusing
+        # ``value.encode(...)`` would allocate a fresh copy of the
+        # already-large string.
+        value_bytes = len(value.encode("utf-8"))
+        if value_bytes > _SLOT_VALUE_MAX_BYTES:
             raise ValueError(
                 f"Slot value too long: "
-                f"{len(value.encode('utf-8'))} bytes exceeds the "
+                f"{value_bytes} bytes exceeds the "
                 f"{_SLOT_VALUE_MAX_BYTES}-byte cap. Store large "
                 f"structured data outside the book."
             )

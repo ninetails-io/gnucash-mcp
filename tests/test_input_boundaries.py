@@ -609,3 +609,66 @@ class TestScheduledTransactionAtomicity:
             "reason field should only appear on rejected responses"
         )
         assert result["transaction_guid"]
+
+    def test_no_double_increment_under_concurrent_advance(
+        self, gb_with_schedule, monkeypatch,
+    ):
+        """Defense-in-depth: if a concurrent writer advances the
+        schedule between phases 1 and 3, phase 3 must not double-
+        count. The single-threaded MCP server makes this nearly
+        unreachable today, but the invariant ("instance_count
+        equals the number of distinct periods this schedule has
+        produced") must hold under any future multi-writer
+        scenario.
+
+        Simulated by monkeypatching ``create_transaction`` to
+        advance the schedule from inside phase 2 — the same
+        effect a concurrent ``create_transaction_from_scheduled``
+        or GnuCash desktop's "Since Last Run" would produce.
+        Copilot-flagged on PR #97."""
+        from datetime import date as _date
+        from gnucash_mcp.book import GnuCashBook
+        gb, sx_guid = gb_with_schedule
+        last_before, count_before = self._read_schedule_state(
+            gb, sx_guid,
+        )
+
+        real_create = GnuCashBook.create_transaction
+
+        def _create_then_concurrent_advance(self, *args, **kwargs):
+            # Run the real create_transaction first so the
+            # transaction lands as it normally would.
+            result = real_create(self, *args, **kwargs)
+            # Now simulate a concurrent writer advancing the
+            # schedule. Phase 3 will see this state when it
+            # re-resolves.
+            with self.open(readonly=False) as book:
+                sx = self._find_scheduled_transaction(book, sx_guid)
+                sx.last_occur = _date(2026, 1, 1)
+                sx.instance_count += 1
+                book.save()
+            return result
+
+        monkeypatch.setattr(
+            GnuCashBook, "create_transaction",
+            _create_then_concurrent_advance, raising=True,
+        )
+
+        gb.create_transaction_from_scheduled(
+            guid=sx_guid, transaction_date="2026-01-01",
+        )
+
+        last_after, count_after = self._read_schedule_state(
+            gb, sx_guid,
+        )
+        # Concurrent writer advanced once; phase 3's monotonic
+        # gate detected ``txn_date <= current_last`` and skipped
+        # the second increment.
+        assert count_after == count_before + 1, (
+            f"instance_count double-incremented under concurrent "
+            f"advance: {count_before} → {count_after} "
+            f"(expected {count_before + 1})"
+        )
+        # last_occur stays at the concurrent writer's value —
+        # never rewound.
+        assert last_after == _date(2026, 1, 1)

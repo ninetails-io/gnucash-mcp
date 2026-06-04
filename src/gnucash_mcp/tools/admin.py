@@ -126,14 +126,19 @@ def register(mcp, get_book) -> None:
         # isn't a literal ``YYYY-MM-DD`` before the join so
         # ``../../../../etc/passwd`` style inputs can't escape
         # the audit directory.
+        #
+        # Raise rather than build the JSON envelope inline so
+        # ``safe_tool`` handles the rejection through its standard
+        # path: same JSON shape, plus the boundary-layer logger
+        # warning AND path redaction applied to the error message
+        # (``redact_paths`` in safe_tool's ValueError branch).
+        # Copilot-flagged on PR #97 — inline envelope duplicated
+        # the shape and skipped redaction.
         if not _LOG_DATE_RE.fullmatch(target_date):
-            return _json({
-                "error": (
-                    f"Invalid log_date {target_date!r}: must be "
-                    f"YYYY-MM-DD (e.g. 2026-06-04)."
-                ),
-                "error_type": "validation_error",
-            })
+            raise ValueError(
+                f"Invalid log_date {target_date!r}: must be "
+                f"YYYY-MM-DD (e.g. 2026-06-04)."
+            )
         log_file = audit_dir / f"{target_date}.txt"
 
         if not log_file.exists():

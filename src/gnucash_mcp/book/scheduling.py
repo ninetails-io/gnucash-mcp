@@ -756,15 +756,28 @@ class SchedulingMixin:
                 current_last = sx.last_occur
                 if isinstance(current_last, datetime):
                     current_last = current_last.date()
-                sx.last_occur = (
-                    max(current_last, txn_date)
-                    if current_last else txn_date
-                )
-                sx.instance_count += 1
+                # Only advance + increment when ``txn_date`` is
+                # actually beyond the current marker. If a
+                # concurrent writer covered this period between
+                # phases 2 and 3 (desktop's "Since Last Run", or
+                # another tool invocation), the schedule already
+                # registered the period — incrementing
+                # ``instance_count`` again would double-count.
+                # Copilot-flagged on PR #97. The MCP server runs
+                # single-threaded so this is practically
+                # unreachable today, but the gate is cheap and the
+                # invariant ("instance_count equals the number of
+                # distinct periods this schedule has produced")
+                # holds under any future multi-writer scenario.
+                if current_last is None or txn_date > current_last:
+                    sx.last_occur = txn_date
+                    sx.instance_count += 1
+                    book.save()
                 instance_count = sx.instance_count
-                book.save()
 
-        # ── Phase 4: build response. ────────────────────────────
+        # ── Build response. ─────────────────────────────────────
+        # Not a write phase — the docstring describes three
+        # write phases; this is the response-shaping step.
         response = {
             "transaction_guid": txn_result.get("guid"),
             "scheduled_transaction": sx_name,
