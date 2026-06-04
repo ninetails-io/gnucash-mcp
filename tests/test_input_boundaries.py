@@ -429,3 +429,183 @@ class TestSplitInputExtraForbid:
                 amount="10.00",
                 bogus_field="anything",
             )
+
+
+# ── SB-10: scheduled transaction atomicity ────────────────────────
+
+
+class TestScheduledTransactionAtomicity:
+    """SB-10: ``create_transaction_from_scheduled`` must not advance
+    the schedule unless an equivalent transaction exists.
+
+    Pre-fix the two-session order was: schedule advance commits FIRST,
+    then transaction create runs. If create raised — splits don't
+    balance, account got deleted, anything — the schedule had moved
+    but no transaction posted. Re-running advanced the schedule
+    again and skipped the period entirely.
+
+    Post-fix the order is reversed: transaction create runs first
+    (its own session), then the schedule advance runs in a second
+    session that's reached only if create returned without raising.
+    A raise leaves the schedule unchanged.
+
+    A ``status="rejected"`` return from the dupe detector counts as
+    "transaction exists for this period" (option (b) per the live-
+    tester discussion), so the schedule still advances — but the
+    response gains a ``reason="duplicate_exists"`` field so dumber
+    downstream LLMs don't reflexively retry the call (Gemini-style
+    retry would either re-trigger the dupe detector or, worse,
+    pass --force_create and post the very duplicate we were
+    preventing).
+    """
+
+    @pytest.fixture
+    def gb_with_schedule(self, scheduled_book):
+        """``scheduled_book`` with a monthly rent schedule already
+        created. Returns ``(gb, sx_guid)``."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(scheduled_book))
+        sx = gb.create_scheduled_transaction(
+            name="Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        return gb, sx["guid"]
+
+    def _read_schedule_state(self, gb, sx_guid: str) -> tuple:
+        """Return ``(last_occur, instance_count)`` for the named
+        schedule. Returns a tuple of plain values (date-or-None
+        and int) so callers can compare cleanly."""
+        from datetime import datetime as _datetime
+        with gb.open(readonly=True) as book:
+            sx = gb._find_scheduled_transaction(book, sx_guid)
+            assert sx is not None, "schedule disappeared mid-test"
+            last = sx.last_occur
+            if isinstance(last, _datetime):
+                last = last.date()
+            return last, sx.instance_count
+
+    def test_create_raise_leaves_schedule_unchanged(
+        self, gb_with_schedule, monkeypatch,
+    ):
+        """If ``create_transaction`` raises (e.g. account got
+        deleted, splits malformed, etc.) the schedule must not
+        advance. Pre-fix this was the data-loss path — schedule
+        moved, transaction never landed.
+
+        We monkeypatch ``create_transaction`` to force a raise;
+        any raise shape exercises the same atomicity boundary."""
+        from gnucash_mcp.book import GnuCashBook
+        gb, sx_guid = gb_with_schedule
+
+        last_before, count_before = self._read_schedule_state(
+            gb, sx_guid,
+        )
+
+        def _boom(*args, **kwargs):
+            raise ValueError("simulated downstream failure")
+
+        monkeypatch.setattr(
+            GnuCashBook, "create_transaction", _boom, raising=True,
+        )
+
+        with pytest.raises(ValueError, match="simulated downstream"):
+            gb.create_transaction_from_scheduled(
+                guid=sx_guid, transaction_date="2026-01-01",
+            )
+
+        last_after, count_after = self._read_schedule_state(
+            gb, sx_guid,
+        )
+        assert last_after == last_before, (
+            f"last_occur advanced on raise: {last_before} → "
+            f"{last_after}"
+        )
+        assert count_after == count_before, (
+            f"instance_count advanced on raise: {count_before} → "
+            f"{count_after}"
+        )
+
+    def test_rejected_advances_schedule_with_reason(
+        self, gb_with_schedule, monkeypatch,
+    ):
+        """When ``create_transaction`` returns ``status="rejected"``
+        the dupe detector caught an equivalent prior transaction —
+        we treat that as a successful no-op (the duplicate IS the
+        transaction for this period) and advance the schedule.
+        The response gains ``reason="duplicate_exists"`` so
+        downstream LLMs see explicit evidence to stop and move on
+        rather than retry."""
+        from gnucash_mcp.book import GnuCashBook
+        gb, sx_guid = gb_with_schedule
+
+        last_before, count_before = self._read_schedule_state(
+            gb, sx_guid,
+        )
+
+        fake_duplicates = (
+            "HIGH\t12345678\t2026-01-01\t1850.00\tRent\tDAD"
+        )
+
+        def _rejected(*args, **kwargs):
+            return {
+                "status": "rejected",
+                "duplicates": fake_duplicates,
+            }
+
+        monkeypatch.setattr(
+            GnuCashBook, "create_transaction", _rejected,
+            raising=True,
+        )
+
+        result = gb.create_transaction_from_scheduled(
+            guid=sx_guid, transaction_date="2026-01-01",
+        )
+
+        # Schedule advanced — the duplicate IS the transaction
+        # for this period, so this counts as a completed period.
+        last_after, count_after = self._read_schedule_state(
+            gb, sx_guid,
+        )
+        from datetime import date as _date
+        assert last_after == _date(2026, 1, 1)
+        assert count_after == count_before + 1
+
+        # Response carries the rejection signal AND the reason
+        # field so a dumber LLM has explicit evidence to stop.
+        assert result["status"] == "rejected"
+        assert result["reason"] == "duplicate_exists"
+        assert result["duplicates"] == fake_duplicates
+
+    def test_success_path_advances_schedule_and_returns_created(
+        self, gb_with_schedule,
+    ):
+        """The happy path: real ``create_transaction`` call,
+        schedule advances, response says ``status="created"``.
+        Locks the contract that the refactor didn't change the
+        success-path semantics."""
+        gb, sx_guid = gb_with_schedule
+        last_before, count_before = self._read_schedule_state(
+            gb, sx_guid,
+        )
+
+        result = gb.create_transaction_from_scheduled(
+            guid=sx_guid, transaction_date="2026-01-01",
+        )
+
+        last_after, count_after = self._read_schedule_state(
+            gb, sx_guid,
+        )
+        from datetime import date as _date
+        assert last_after == _date(2026, 1, 1)
+        assert count_after == count_before + 1
+        assert result["status"] == "created"
+        assert "reason" not in result, (
+            "reason field should only appear on rejected responses"
+        )
+        assert result["transaction_guid"]
