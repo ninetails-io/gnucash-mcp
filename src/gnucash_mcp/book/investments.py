@@ -725,7 +725,11 @@ class InvestmentsMixin:
                 notes=notes,
                 is_closed=0,
             )
-            book.session.add(lot)
+            # MP-11: ``book.session.add(lot)`` is redundant —
+            # piecash's Lot.__init__ assigns ``self.account``,
+            # which back-populates through Account.lots and
+            # auto-registers the Lot with the session. Verified
+            # against piecash/core/transaction.py:514.
             book.save()
 
             all_lot_guids = [

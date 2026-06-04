@@ -87,11 +87,55 @@ class TestDebtPayoffPlan:
         true_cost = Decimal(yeti["true_cost"])
         assert true_cost > Decimal("100")
 
-    def test_no_debt_accounts(self, test_book: Path):
-        """Should raise ValueError when no accounts have APR slot set."""
+    def test_no_debt_accounts_with_apr(self, test_book: Path):
+        """Should raise the MP-9 "Found N but no apr" branch.
+
+        The test_book fixture has a Liabilities placeholder
+        account (debt-typed) but no APR slot set anywhere, so the
+        error explains that fixing the slot is the right next
+        action — NOT "create a debt account first."
+        """
         gc_book = GnuCashBook(str(test_book))
 
-        with pytest.raises(ValueError, match="No debt accounts found"):
+        with pytest.raises(
+            ValueError,
+            match=r"Found \d+ CREDIT/LIABILITY account",
+        ):
+            gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
+
+    def test_no_debt_accounts_at_all(self, tmp_path: Path):
+        """Should raise the MP-9 "no debt accounts" branch on a
+        chart with zero CREDIT/LIABILITY accounts.
+
+        Build a minimal book with only Assets/Income/Expenses/
+        Equity so the "no debt-typed accounts at all" path fires.
+        """
+        import piecash
+        from decimal import Decimal
+
+        book_path = tmp_path / "no_liabilities.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        # Only non-debt types.
+        piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        piecash.Account(
+            name="Income", type="INCOME", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        book.save()
+        book.close()
+
+        gc_book = GnuCashBook(str(book_path))
+        with pytest.raises(
+            ValueError,
+            match="No CREDIT or LIABILITY accounts",
+        ):
             gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
 
     def test_budget_less_than_minimums(self, debt_book: Path):
@@ -186,8 +230,12 @@ class TestDebtPayoffPlan:
         )
         gc_book.set_account_slot("Liabilities:Empty Card", "apr", "22.00")
 
-        # Should fail because no debt accounts with positive balance
-        with pytest.raises(ValueError, match="No debt accounts found"):
+        # Should fail because the CREDIT account exists but has
+        # zero balance — MP-9's "Found N accounts but ..." branch.
+        with pytest.raises(
+            ValueError,
+            match=r"Found \d+ CREDIT/LIABILITY account",
+        ):
             gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
 
     def test_credit_limit_included(self, debt_book: Path):

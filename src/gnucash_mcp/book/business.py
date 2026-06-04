@@ -5332,7 +5332,9 @@ class BusinessMixin:
                 account=post_acct,
                 is_closed=0,
             )
-            book.session.add(lot)
+            # MP-11: see investments.py — Lot auto-registers via
+            # the account back-pop; the explicit session.add was
+            # redundant.
 
             # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
             if is_bill:

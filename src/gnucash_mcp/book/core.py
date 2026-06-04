@@ -748,7 +748,21 @@ class CoreMixin:
         default_currency = self._require_default_currency(book)
 
         # ── 1. Data integrity: Imbalance / Orphan accounts ──
-        integrity: list[str] = []
+        # MP-2: each Imbalance-{ccy}/Orphan-{ccy} account is its
+        # own commodity, so the per-account balance is correct in
+        # its own currency — that's the right display unit
+        # ("Imbalance-EUR: 234.56" tells the user the defect is
+        # 234.56 EUR). But the sort across DIFFERENT Imbalance
+        # accounts compared raw quantities, which is wrong on a
+        # multi-currency book — a 5 USD defect could sort above
+        # a 200 CNY defect (raw 200 > 5) even though 200 CNY is
+        # materially larger in USD terms. Sort key now goes
+        # through default-currency conversion so the biggest
+        # *defect* surfaces first regardless of denomination.
+        rates_for_sort = self._rates_as_of(
+            book, today, default_currency,
+        )
+        integrity: list[tuple[Decimal, str]] = []
         for account in accounts:
             if account.type == "ROOT":
                 continue
@@ -759,17 +773,30 @@ class CoreMixin:
             for split in account.splits:
                 balance += split.quantity
             if balance != 0:
-                integrity.append(
-                    f"{name}: {balance} (data integrity issue)"
+                acct_commodity = (
+                    account.commodity if account.commodity
+                    else default_currency
                 )
-        # Sort by absolute magnitude descending — biggest defects
-        # first within the integrity bucket.
-        integrity.sort(
-            key=lambda msg: abs(
-                Decimal(msg.split(":")[1].split("(")[0].strip())
-            ),
-            reverse=True,
-        )
+                if acct_commodity.guid == default_currency.guid:
+                    sort_magnitude = abs(balance)
+                else:
+                    rate = rates_for_sort.get(acct_commodity.guid)
+                    if rate is None:
+                        # No FX on file — fall back to raw
+                        # magnitude rather than dropping the
+                        # warning. Surfacing a defect with an
+                        # imperfect sort order beats hiding it.
+                        sort_magnitude = abs(balance)
+                    else:
+                        sort_magnitude = abs(balance * rate)
+                integrity.append((
+                    sort_magnitude,
+                    f"{name}: {balance} (data integrity issue)",
+                ))
+        # Sort by default-currency-equivalent magnitude descending
+        # — biggest defects first within the integrity bucket.
+        integrity.sort(key=lambda pair: pair[0], reverse=True)
+        integrity = [msg for _, msg in integrity]
 
         # ── 2. Critically low cash ──
         # Per-account threshold: positive balance below 1 day of

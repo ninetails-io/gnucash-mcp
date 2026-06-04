@@ -797,7 +797,20 @@ class ReportingMixin:
             b_idx = 0
 
             for split, txn, account in rows:
-                # Snapshot every boundary strictly before this split.
+                # MP-8: snapshot every boundary STRICTLY BEFORE
+                # this split. The strict ``>`` is correct and
+                # deliberate: a boundary equal to a split's
+                # post_date includes that split in its snapshot
+                # (the boundary is "end of day", so a transaction
+                # posted that day has happened by then). The
+                # cumulative running totals above this loop
+                # advance after the snapshot is taken, so the
+                # snapshot reflects every prior split AND every
+                # split posted on the boundary date — matching
+                # the inclusive-end semantics ``_query_filtered_splits``
+                # enforces at the SQL boundary. A ``>=`` here
+                # would exclude same-day splits, silently breaking
+                # the trajectory's tie to ``balance_sheet(as_of)``.
                 while (
                     b_idx < len(boundaries)
                     and txn.post_date > boundaries[b_idx]
@@ -1135,6 +1148,12 @@ class ReportingMixin:
             )
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
+            # MP-9: track whether ANY debt-typed account exists, so
+            # the no-debts error can distinguish "no CREDIT/LIABILITY
+            # accounts at all" from "they exist but lack the apr
+            # slot" — the user's next action differs sharply
+            # between those cases.
+            debt_typed_account_count = 0
 
             # Template accounts (scheduled-transaction
             # scaffolding) inherit type=CREDIT/LIABILITY from
@@ -1150,6 +1169,7 @@ class ReportingMixin:
                     continue
                 if account.type not in debt_types:
                     continue
+                debt_typed_account_count += 1
 
                 # Materialize ``account.slots`` into a dict once. Pre-fix,
                 # each ``account[key]`` access (apr, minimum_payment,
@@ -1257,9 +1277,22 @@ class ReportingMixin:
                 })
 
         if not debts:
+            # MP-9: distinguish the two failure modes so the LLM's
+            # next action is right.
+            if debt_typed_account_count == 0:
+                raise ValueError(
+                    "No CREDIT or LIABILITY accounts found in the "
+                    "chart of accounts. Create the debt account(s) "
+                    "first via create_account, then set their APR "
+                    "via set_account_slot."
+                )
             raise ValueError(
-                "No debt accounts found with 'apr' slot set. "
-                "Use set_account_slot to set APR on your CREDIT/LIABILITY accounts."
+                f"Found {debt_typed_account_count} CREDIT/LIABILITY "
+                f"account(s) but none have an 'apr' slot set "
+                f"(or every APR is <= 0, or every balance is "
+                f"<= 0). Use set_account_slot to set 'apr' on the "
+                f"debt accounts you want included in the payoff "
+                f"plan."
             )
 
         total_minimums = sum(d["min_payment"] for d in debts)
