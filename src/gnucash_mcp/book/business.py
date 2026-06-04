@@ -2070,6 +2070,12 @@ class BusinessMixin:
         """
         from piecash.business.person import Address
 
+        # MP-5: cap free-text byte lengths up front.
+        notes_kwarg = extra_kwargs.get("notes")
+        self._validate_business_freetext(
+            notes=notes_kwarg, address=address,
+        )
+
         if currency:
             currency_obj = None
             for c in book.currencies:
@@ -2120,6 +2126,57 @@ class BusinessMixin:
         "name", "addr1", "addr2", "addr3", "addr4",
         "phone", "fax", "email",
     )
+
+    # MP-5: free-text caps on business-entity fields. Same shape as
+    # HP-9's caps on ``void_transaction(reason)`` and
+    # ``set_account_slot(value)`` — prevents a misbehaving LLM (or
+    # a user copy-pasting a multi-MB blob) from bloating the
+    # business-entity rows. Notes can be paragraphs; address sub-
+    # fields are typically one-liners; the bounds reflect that.
+    _NOTES_MAX_BYTES = 4 * 1024
+    _ADDRESS_FIELD_MAX_BYTES = 1024
+
+    @classmethod
+    def _validate_business_freetext(
+        cls,
+        *,
+        notes: str | None = None,
+        address: dict | None = None,
+    ) -> None:
+        """MP-5: validate notes / address sub-field byte lengths
+        before they reach the ORM. UTF-8 byte length, not character
+        length — the storage backing is SQLite TEXT and the byte
+        cap is what matters for serialization.
+
+        Raises ValueError naming the offending field so the LLM
+        can shorten and retry. Empty / missing values pass through.
+        """
+        if notes is not None:
+            byte_len = len(notes.encode("utf-8"))
+            if byte_len > cls._NOTES_MAX_BYTES:
+                raise ValueError(
+                    f"notes exceeds {cls._NOTES_MAX_BYTES}-byte cap "
+                    f"({byte_len} bytes supplied). Shorten the value "
+                    f"and retry."
+                )
+        if address:
+            for key in cls._ADDRESS_FIELDS:
+                value = address.get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"address.{key} must be a string (got "
+                        f"{type(value).__name__})."
+                    )
+                byte_len = len(value.encode("utf-8"))
+                if byte_len > cls._ADDRESS_FIELD_MAX_BYTES:
+                    raise ValueError(
+                        f"address.{key} exceeds "
+                        f"{cls._ADDRESS_FIELD_MAX_BYTES}-byte cap "
+                        f"({byte_len} bytes supplied). Shorten and "
+                        f"retry."
+                    )
 
     def _update_business_person(
         self,
@@ -2234,6 +2291,8 @@ class BusinessMixin:
                     f"{entity_label} has no notes field — drop "
                     f"``notes=`` from the update call."
                 )
+            # MP-5: cap notes byte length up front.
+            self._validate_business_freetext(notes=notes)
             current_notes = entity.notes or ""
             if current_notes != notes:
                 entity.notes = notes
@@ -2244,6 +2303,8 @@ class BusinessMixin:
             changed["active"] = bool(active)
 
         if address is not None:
+            # MP-5: cap address-field byte lengths up front.
+            self._validate_business_freetext(address=address)
             # piecash's ``Address`` is a composite view over raw
             # ``addr_*`` columns on the Customer / Vendor / Employee
             # row. Mutation through the composite (``entity.address

@@ -417,6 +417,37 @@ TOOL_MODULES: dict[str, list[str]] = {
 }
 
 
+def _validate_module_groups() -> None:
+    """MP-10: every member of a MODULE_GROUPS expansion must exist
+    in TOOL_MODULES.
+
+    Pre-fix the group definitions referenced module names by
+    convention only — a typo (``"reconcilation"`` vs
+    ``"reconciliation"``) would silently produce an empty expansion
+    at runtime: ``--modules=core`` would just not load the
+    misspelled member, and the user would see "tool X not
+    available" with no indication that the alias was the cause.
+
+    This check fires at import time alongside ``_validate_tool_modules``
+    so the developer feedback is immediate and loud.
+    """
+    known = set(TOOL_MODULES.keys())
+    bad: dict[str, list[str]] = {}
+    for group, members in MODULE_GROUPS.items():
+        missing = [m for m in members if m not in known]
+        if missing:
+            bad[group] = missing
+    if bad:
+        report = "; ".join(
+            f"{g}={sorted(ms)}" for g, ms in sorted(bad.items())
+        )
+        raise RuntimeError(
+            f"MODULE_GROUPS references unknown module(s) in "
+            f"TOOL_MODULES: {report}. Add the modules to "
+            f"TOOL_MODULES or correct the group definition."
+        )
+
+
 def _validate_tool_modules() -> None:
     """Verify every registered tool belongs to a module in TOOL_MODULES.
 
@@ -920,6 +951,7 @@ Logs are stored alongside the book file:
                 debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}")
 
     # Validate and apply module filter (also lazy-loads extracted modules)
+    _validate_module_groups()
     _validate_tool_modules()
     loaded_modules = _apply_module_filter(modules_value)
 

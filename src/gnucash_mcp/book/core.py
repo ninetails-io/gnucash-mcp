@@ -24,11 +24,16 @@ self.create_transaction (defined here), resolved via MRO — that is
 the one extracted-to-core dependency in the whole tree.
 """
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import piecash
+
+from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
+
+_debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
     _account_to_compact_line,
@@ -187,6 +192,14 @@ class CoreMixin:
                 if balance == 0:
                     continue
             except Exception:
+                # MP-12: swallow ORM hiccups (detached instance,
+                # missing account/lot) so summary signals survive
+                # partial corruption; log so the underlying cause
+                # can be investigated when --debug is on.
+                _debug_logger.debug(
+                    "summary signals: invoice eval failed; skipping",
+                    exc_info=True,
+                )
                 continue
 
             is_overdue = False
@@ -196,7 +209,12 @@ class CoreMixin:
                     if due_date is not None and due_date < today:
                         is_overdue = True
                 except Exception:
-                    pass
+                    # MP-12: due-date resolution can fail on
+                    # corrupt term records; surface in debug log.
+                    _debug_logger.debug(
+                        "summary signals: due date resolve failed",
+                        exc_info=True,
+                    )
 
             if inv.owner_type == 4:  # vendor bill
                 out["open_bills"] += 1
@@ -223,7 +241,12 @@ class CoreMixin:
                 Job.active == 1,
             ).count()
         except Exception:
-            pass
+            # MP-12: jobs table may not exist on very old books;
+            # log and continue.
+            _debug_logger.debug(
+                "summary signals: active jobs query failed",
+                exc_info=True,
+            )
 
         return out
 
@@ -3590,6 +3613,29 @@ class CoreMixin:
             raise ValueError(
                 f"Invalid account type: {account_type}. "
                 f"Valid types: {', '.join(sorted(self.VALID_ACCOUNT_TYPES))}"
+            )
+
+        # MP-14: validate account name up front. ``:`` is the path
+        # separator (``Expenses:Groceries``); a name containing it
+        # corrupts every downstream lookup that does a
+        # ``fullname.split(":")`` traversal. Control characters
+        # (\x00-\x1f, \x7f) round-trip badly through SQLite text
+        # storage and the audit log's text rendering. Empty /
+        # whitespace-only names are not user-meaningful even if
+        # piecash would accept them.
+        if not name or not name.strip():
+            raise ValueError("Account name cannot be empty")
+        if ":" in name:
+            raise ValueError(
+                f"Account name cannot contain ':' (path separator). "
+                f"Got: {name!r}. To create a nested account, pass the "
+                f"leaf name as ``name`` and the full parent path as "
+                f"``parent``."
+            )
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
+            raise ValueError(
+                f"Account name contains control characters. "
+                f"Got: {name!r}."
             )
 
         with self.open(readonly=False) as book:
