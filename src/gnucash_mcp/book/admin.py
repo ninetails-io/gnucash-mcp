@@ -126,8 +126,20 @@ class AdminMixin:
             log captures them from tool params.
 
         Raises:
-            ValueError: If account not found or key not found.
+            ValueError: If account not found, key contains disallowed
+                characters, or key not found.
         """
+        # Same regex gate as ``set_account_slot``. Pre-fix delete
+        # skipped the validator, so a user could target internal
+        # namespaced slots (``gnc-mcp/applies-to-invoice``, etc.)
+        # that the credit-note linkage and other internal features
+        # depend on. HP-11 from specs/CODE_REVIEW_v1_3.md.
+        if not _SLOT_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"Invalid slot key {key!r}: must match [A-Za-z0-9_.-]+. "
+                f"Embedded '/' would target hierarchical sub-slots "
+                f"(internal namespaced state); use flat keys."
+            )
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
             if not account:

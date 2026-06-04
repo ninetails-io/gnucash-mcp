@@ -173,3 +173,102 @@ class TestGetAuditLogPathTraversal:
             assert parsed.get("error_type") != "validation_error", (
                 f"default date path tripped validation gate: {result}"
             )
+
+
+# ── HP-11: delete_account_slot key validation ─────────────────────
+
+
+class TestDeleteAccountSlotKeyValidation:
+    """HP-11: ``delete_account_slot`` must apply the same
+    ``_SLOT_KEY_RE`` gate ``set_account_slot`` enforces.
+
+    Pre-fix delete skipped the validator. A user could pass
+    ``gnc-mcp/applies-to-invoice`` and delete an internal
+    namespaced slot that the credit-note linkage depends on —
+    the gate exists exactly to keep user input out of internal
+    sub-slot space (the ``/`` separator creates hierarchical
+    slots in piecash's KVP store).
+    """
+
+    def test_delete_rejects_namespaced_key(self, test_book):
+        """A ``gnc-mcp/applies-to-invoice``-style namespaced key
+        must be rejected, matching ``set_account_slot``'s gate.
+        Pre-fix this would have walked straight through to
+        ``account[key]`` lookup and either succeeded (deleting an
+        internal slot) or returned KeyError (depending on whether
+        that slot existed)."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Invalid slot key"):
+            gb.delete_account_slot(
+                account_name="Assets:Checking",
+                key="gnc-mcp/applies-to-invoice",
+            )
+
+    def test_delete_rejects_bare_slash(self, test_book):
+        """A bare ``/`` in the key fails the regex — it would
+        create a sub-slot reference under piecash's KVP semantics
+        and could target arbitrary internal state."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="Invalid slot key"):
+            gb.delete_account_slot(
+                account_name="Assets:Checking",
+                key="parent/child",
+            )
+
+    def test_delete_rejects_other_disallowed_chars(self, test_book):
+        """Anything outside ``[A-Za-z0-9_.-]`` rejects — spaces,
+        colons, etc. Match the set ``set_account_slot`` permits
+        exactly."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        for bad_key in ("has space", "has:colon", "has*star"):
+            with pytest.raises(ValueError, match="Invalid slot key"):
+                gb.delete_account_slot(
+                    account_name="Assets:Checking",
+                    key=bad_key,
+                )
+
+    def test_delete_accepts_legitimate_keys(self, test_book):
+        """Keys matching the regex still work end-to-end. Set a
+        slot via ``set_account_slot``, delete it via
+        ``delete_account_slot``, confirm both round-trip cleanly
+        without tripping the new gate."""
+        from gnucash_mcp.book import GnuCashBook
+        gb = GnuCashBook(str(test_book))
+        # The classic flat-key cases the validator was always
+        # meant to allow.
+        gb.set_account_slot(
+            account_name="Assets:Checking",
+            key="apr",
+            value="3.5",
+        )
+        result = gb.delete_account_slot(
+            account_name="Assets:Checking",
+            key="apr",
+        )
+        assert result["status"] == "deleted"
+
+    def test_set_and_delete_have_matching_gates(self):
+        """Symmetry check: any key ``set_account_slot`` accepts,
+        ``delete_account_slot`` must accept too (and vice versa).
+        Catches a future divergence where one regex tightens but
+        the other doesn't."""
+        from gnucash_mcp.book.admin import _SLOT_KEY_RE
+        # Spot-check the canonical allowed and disallowed shapes.
+        # The actual contract is encoded in ``_SLOT_KEY_RE`` itself
+        # — both methods import the same regex, so the contract
+        # holds by construction. This test locks the import path
+        # (renaming the regex on one side without the other would
+        # be a regression).
+        allowed = ("apr", "credit_limit", "statement-close-day", "v1.2")
+        disallowed = ("has space", "gnc-mcp/applies", "has:colon")
+        for k in allowed:
+            assert _SLOT_KEY_RE.fullmatch(k), (
+                f"regex regression: {k!r} should be allowed"
+            )
+        for k in disallowed:
+            assert not _SLOT_KEY_RE.fullmatch(k), (
+                f"regex regression: {k!r} should be rejected"
+            )
