@@ -484,6 +484,78 @@ class TestIsVoidedConsistency:
             f"{checking_entry}"
         )
 
+    def test_reconciliation_backlog_counts_pre_latest_y_date(
+        self, test_book: Path,
+    ):
+        """HP-8: the dashboard's reconciliation backlog count must
+        include unreconciled splits that PREDATE the last
+        reconciled ('y') split — they're the ones most likely to
+        be problems (skipped during a partial reconciliation,
+        opening balances never stamped, edge cases that fell
+        through). Pre-fix the count was scoped to "splits after
+        latest_y_date" which silently dropped them, breaking the
+        invariant that the dashboard count equals
+        ``get_unreconciled_splits``'s count.
+        """
+        from datetime import datetime as _dt
+        gb = GnuCashBook(str(test_book))
+
+        # Fixture's Checking has opening + recent transactions, none
+        # reconciled. Reconcile a NEWER split, leaving the older one
+        # unreconciled — pre-fix this older split would be invisible
+        # to the dashboard count but visible to
+        # get_unreconciled_splits.
+        with gb.open(readonly=False) as book:
+            checking = gb._find_account(book, "Assets:Checking")
+            opening = gb._find_account(book, "Equity:Opening Balance")
+            recent_date = date.today() - timedelta(days=3)
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Recent reconciled deposit",
+                post_date=recent_date,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            ))
+            book.save()
+            # Mark only the recent Checking split as 'y'.
+            for s in checking.splits:
+                if s.transaction.post_date == recent_date:
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(
+                        recent_date, _dt.min.time()
+                    )
+            book.save()
+
+        # Detail-tool ground truth.
+        detail = gb.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        detail_count = detail["total"]
+
+        # Dashboard count from the same source.
+        with gb.open(readonly=True) as pb:
+            results = gb._account_reconciliation_status(
+                pb, list(pb.accounts),
+            )
+        checking_entry = next(
+            r for r in results if r["account"] == "Assets:Checking"
+        )
+
+        assert checking_entry["unreconciled_count"] == detail_count, (
+            f"dashboard ({checking_entry['unreconciled_count']}) "
+            f"disagrees with get_unreconciled_splits ({detail_count}) "
+            f"— bookkeeper's first instinct will be 'the book is "
+            f"wrong'"
+        )
+        # And confirm the pre-fix bug-shape: at least one
+        # unreconciled split predates ``latest_y_date``.
+        assert detail_count >= 1, (
+            "fixture didn't produce the pre-latest_y_date "
+            "unreconciled scenario this test is meant to lock"
+        )
+
     def test_assign_split_to_lot_rejects_voided(
         self, investment_book: Path,
     ):

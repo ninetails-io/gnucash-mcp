@@ -318,22 +318,31 @@ class CoreMixin:
                 # No activity at all — not "behind," just unused.
                 continue
 
-            # Count unreconciled splits past the last 'y' date (or
-            # all of them when never reconciled). This becomes the
-            # "47 splits unreconciled since DATE" payload — the LLM
-            # uses the count to plan the reconciliation pass: 12
-            # splits is a single sitting, 400 is "let's narrow by
-            # month." 'c' (cleared) splits count as unreconciled
-            # for this purpose; they're not finalized.
+            # Count unreconciled splits — total non-y, non-voided.
+            # Same ground-truth definition as
+            # ``get_unreconciled_splits``. The LLM uses the count to
+            # plan the reconciliation pass: 12 splits is a single
+            # sitting, 400 is "let's narrow by month." 'c' (cleared)
+            # splits count as unreconciled for this purpose; they're
+            # not finalized. Voided ('v') splits are excluded —
+            # they're zombies from void_transaction, not pending
+            # bookkeeping work.
+            #
+            # HP-8: pre-fix the "has latest_y_date" branch added
+            # ``s.transaction.post_date > latest_y_date`` which
+            # silently dropped old unreconciled splits predating the
+            # last reconciliation — skipped during partial passes,
+            # opening balances never stamped, edge cases that fell
+            # through. Those are exactly the ones that tend to be
+            # problems. Pre-fix the dashboard NOT counting them while
+            # ``get_unreconciled_splits`` DID broke the bookkeeper's
+            # first instinct that the dashboard summary equals the
+            # detail-tool truth. One rule now, both surfaces.
+            unreconciled_count = sum(
+                1 for s in account.splits
+                if s.reconcile_state != "y" and not _is_voided(s)
+            )
             if latest_y_date is None:
-                # Voided splits are excluded — they're zombies from
-                # void_transaction, not pending bookkeeping work. Pre-
-                # fix the filter was ``state != "y"`` which counted
-                # them; ``_is_voided`` is now the chokepoint.
-                unreconciled_count = sum(
-                    1 for s in account.splits
-                    if s.reconcile_state != "y" and not _is_voided(s)
-                )
                 results.append({
                     "account": account.fullname,
                     "status": "never reconciled",
@@ -342,12 +351,6 @@ class CoreMixin:
                 })
             else:
                 days_behind = (today - latest_y_date).days
-                unreconciled_count = sum(
-                    1 for s in account.splits
-                    if s.reconcile_state != "y"
-                    and not _is_voided(s)
-                    and s.transaction.post_date > latest_y_date
-                )
                 results.append({
                     "account": account.fullname,
                     "status": f"through {latest_y_date.isoformat()}",
@@ -1697,18 +1700,23 @@ class CoreMixin:
         for entry in stale:
             leaf = entry["account"].split(":")[-1]
             lag = self._format_reconciliation_lag(entry["days_behind"])
-            # Sub-line shape: "47 splits unreconciled since
-            # 2025-12-30 (4 months behind) ⚠". The split count
-            # tells the LLM the *scope* of the reconciliation
-            # work — 12 splits is one sitting; 400 needs a
-            # month-by-month strategy.
+            # Sub-line shape: "47 splits unreconciled, last
+            # reconciled 2025-12-30 (4 months behind) ⚠". The
+            # split count tells the LLM the *scope* of the
+            # reconciliation work — 12 splits is one sitting;
+            # 400 needs a month-by-month strategy. HP-8: the
+            # count is total outstanding (matches
+            # ``get_unreconciled_splits``), so the previous
+            # "since DATE" phrasing — which implied "only splits
+            # after this date" — was reworded to "last
+            # reconciled DATE" as supplementary context.
             n = entry["unreconciled_count"]
             if n > 0 and "latest_y_date" in entry:
                 plural = "s" if n != 1 else ""
                 since = entry["latest_y_date"]
                 out.append(
-                    f"  {leaf}: {n} split{plural} "
-                    f"unreconciled since {since} {lag} ⚠"
+                    f"  {leaf}: {n} split{plural} unreconciled, "
+                    f"last reconciled {since} {lag} ⚠"
                 )
             else:
                 out.append(

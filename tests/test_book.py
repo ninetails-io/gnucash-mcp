@@ -2919,18 +2919,22 @@ class TestGetBookSummaryUpcomingScheduled:
 
 
 class TestGetBookSummaryReconciliationSplitCount:
-    """Stale reconciliation lines now carry "47 splits unreconciled
-    since DATE" instead of just "through DATE". The split count
-    tells the LLM the *scope* of the work — 12 splits is one
-    sitting; 400 is "let's narrow by month."
+    """Stale reconciliation lines carry "47 splits unreconciled,
+    last reconciled DATE" — the count tells the LLM the *scope* of
+    the work (12 splits is one sitting; 400 is "let's narrow by
+    month"), and the reconciled date provides supplementary context.
+    HP-8 reworded the line from "unreconciled since DATE" to "last
+    reconciled DATE" because the count is total outstanding (matches
+    ``get_unreconciled_splits``), not "splits after this date".
     """
 
     def test_stale_account_shows_split_count(
         self, multi_currency_book: Path,
     ):
         """Reconcile a checking-account split partway, then add new
-        unreconciled activity in the future. The summary should
-        show the count of unreconciled splits."""
+        unreconciled activity. The summary should show the count of
+        unreconciled splits with the new "last reconciled DATE"
+        phrasing."""
         from datetime import date as _date, timedelta
         gc = GnuCashBook(str(multi_currency_book))
 
@@ -2969,16 +2973,17 @@ class TestGetBookSummaryReconciliationSplitCount:
         recon_line = next(
             (
                 l for l in result.splitlines()
-                if "Checking" in l and "unreconciled since" in l
+                if "Checking" in l and "last reconciled" in l
             ),
             None,
         )
         assert recon_line is not None, (
-            f"Expected 'unreconciled since' line for Checking; "
+            f"Expected 'last reconciled' line for Checking; "
             f"got summary:\n{result}"
         )
         # Count appears in the line.
-        assert "splits unreconciled since" in recon_line
+        assert "splits unreconciled" in recon_line
+        assert "last reconciled" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
 
