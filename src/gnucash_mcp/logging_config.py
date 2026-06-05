@@ -1201,7 +1201,12 @@ def _fmt_invoice_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
-    lines = [f"{time_part}  DELETE INVOICE  id:{params.get('invoice_id', '')}"]
+    # Plumb Bob bookkeeper-flagged: delete_invoice accepts ``id`` as
+    # the preferred alias OR ``invoice_id`` for back-compat. Prefer
+    # whichever the caller supplied; fall back to empty string so
+    # the formatter never renders ``id:None``.
+    inv_id = params.get("id") or params.get("invoice_id") or ""
+    lines = [f"{time_part}  DELETE INVOICE  id:{inv_id}"]
     if after:
         entries = after.get("entries_deleted", 0)
         if entries:
@@ -1416,7 +1421,9 @@ def _fmt_bill_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
-    lines = [f"{time_part}  DELETE BILL  id:{params.get('bill_id', '')}"]
+    # See _fmt_invoice_delete — same id/bill_id alias issue.
+    bill_id = params.get("id") or params.get("bill_id") or ""
+    lines = [f"{time_part}  DELETE BILL  id:{bill_id}"]
     if after:
         entries = after.get("entries_deleted", 0)
         if entries:
@@ -1471,9 +1478,11 @@ def _fmt_voucher_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
+    # See _fmt_invoice_delete — same id/voucher_id alias issue.
+    voucher_id = params.get("id") or params.get("voucher_id") or ""
     lines = [
         f"{time_part}  DELETE VOUCHER  "
-        f"id:{params.get('voucher_id', '')}"
+        f"id:{voucher_id}"
     ]
     if after:
         entries = after.get("entries_deleted", 0)
@@ -1600,9 +1609,11 @@ def _fmt_credit_note_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
+    # See _fmt_invoice_delete — same id/credit_note_id alias issue.
+    cn_id = params.get("id") or params.get("credit_note_id") or ""
     lines = [
         f"{time_part}  DELETE CREDIT NOTE  "
-        f"id:{params.get('credit_note_id', '')}"
+        f"id:{cn_id}"
     ]
     if after:
         entries = after.get("entries_deleted", 0)

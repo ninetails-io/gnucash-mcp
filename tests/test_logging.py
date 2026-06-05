@@ -421,6 +421,67 @@ class TestTextFormat:
         assert "Dining" in content  # New split (formatted as leaf name)
 
 
+class TestDeleteDocFormattersHandleIdAlias:
+    """Plumb Bob bookkeeper-flagged: the four delete-document
+    formatters (``_fmt_invoice_delete``, ``_fmt_bill_delete``,
+    ``_fmt_voucher_delete``, ``_fmt_credit_note_delete``) used to
+    look up only the legacy ``<entity>_id`` key in ``params``.
+    The tool layer accepts ``id`` as the preferred alias —
+    callers using ``id=...`` produced audit lines like
+    ``DELETE INVOICE id:None``. Formatters now prefer ``id``
+    falling back to the legacy alias, falling back to ``""``.
+    """
+
+    def test_invoice_delete_with_id_alias(self):
+        from gnucash_mcp.logging_config import _fmt_invoice_delete
+        entry = {
+            "timestamp": "2026-06-04T10:00:00",
+            "params": {"id": "000040"},
+        }
+        lines = _fmt_invoice_delete(entry)
+        assert "DELETE INVOICE  id:000040" in lines[0]
+        assert "None" not in lines[0]
+
+    def test_invoice_delete_with_legacy_invoice_id(self):
+        from gnucash_mcp.logging_config import _fmt_invoice_delete
+        entry = {
+            "timestamp": "2026-06-04T10:00:00",
+            "params": {"invoice_id": "000041"},
+        }
+        lines = _fmt_invoice_delete(entry)
+        assert "DELETE INVOICE  id:000041" in lines[0]
+
+    def test_bill_delete_with_id_alias(self):
+        from gnucash_mcp.logging_config import _fmt_bill_delete
+        entry = {
+            "timestamp": "2026-06-04T10:00:00",
+            "params": {"id": "000050"},
+        }
+        lines = _fmt_bill_delete(entry)
+        assert "DELETE BILL  id:000050" in lines[0]
+        assert "None" not in lines[0]
+
+    def test_voucher_delete_with_id_alias(self):
+        from gnucash_mcp.logging_config import _fmt_voucher_delete
+        entry = {
+            "timestamp": "2026-06-04T10:00:00",
+            "params": {"id": "000010"},
+        }
+        lines = _fmt_voucher_delete(entry)
+        assert "DELETE VOUCHER  id:000010" in lines[0]
+        assert "None" not in lines[0]
+
+    def test_credit_note_delete_with_id_alias(self):
+        from gnucash_mcp.logging_config import _fmt_credit_note_delete
+        entry = {
+            "timestamp": "2026-06-04T10:00:00",
+            "params": {"id": "000005"},
+        }
+        lines = _fmt_credit_note_delete(entry)
+        assert "DELETE CREDIT NOTE  id:000005" in lines[0]
+        assert "None" not in lines[0]
+
+
 class TestResolveEntryField:
     """Unit tests for the ``_resolve_entry_field`` fallback helper.
 

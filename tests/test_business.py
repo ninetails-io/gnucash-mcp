@@ -3,7 +3,10 @@
 import json
 from datetime import date, timedelta
 from decimal import Decimal
+from pathlib import Path
+
 import pytest
+
 from gnucash_mcp.book import GnuCashBook
 
 
@@ -9896,3 +9899,93 @@ class TestCnyBugReportFollowups:
                 gb._get_or_create_fx_account(
                     book, fx_account="Assets:Checking",
                 )
+
+
+class TestBusinessFreeTextCaps:
+    """MP-5: business entity free-text byte caps.
+
+    Two layers of defense, exercised separately:
+
+    1. **Tool layer** — Pydantic ``Field(max_length=N)`` on
+       ``notes`` and a ``BusinessAddressInput`` model with per-
+       field ``max_length`` on the address dict. FastMCP rejects
+       at the schema layer BEFORE ``@audit_log`` runs auto-backup,
+       so an oversize value rejects in milliseconds rather than
+       hanging on the backup (Plumb Bob's blocker on PR validation).
+
+    2. **Book layer** — ``_validate_business_freetext`` runs UTF-8
+       byte-length checks inside the create/update path. Belt-and-
+       suspenders for direct callers (scripts, tests) that bypass
+       the MCP boundary; also catches the pathological multi-byte
+       UTF-8 case where character length is under the schema cap
+       but byte length exceeds the storage cap.
+    """
+
+    def test_book_layer_rejects_oversize_notes(self, test_book: Path):
+        """Direct ``GnuCashBook.create_customer`` call with 5000-byte
+        notes should raise immediately — bypasses MCP boundary."""
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+            gb.create_customer(name="Test", notes="X" * 5000)
+
+    def test_book_layer_rejects_oversize_address_field(
+        self, test_book: Path,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(
+            ValueError, match=r"address\.addr1 exceeds 1024-byte cap",
+        ):
+            gb.create_customer(
+                name="Test",
+                address={"addr1": "X" * 2000},
+            )
+
+    def test_book_layer_accepts_under_cap(self, test_book: Path):
+        gb = GnuCashBook(str(test_book))
+        result = gb.create_customer(
+            name="UnderCap", notes="X" * 4096,
+            address={"addr1": "Y" * 1024},
+        )
+        assert result["status"] == "created"
+
+    def test_pydantic_model_rejects_oversize_notes_before_book(
+        self, test_book: Path,
+    ):
+        """The tool-layer Pydantic constraint on ``notes`` should
+        reject oversize input WITHOUT triggering any book-layer
+        work. Verified by importing the annotation and asking
+        Pydantic to validate directly.
+        """
+        from pydantic import BaseModel, ValidationError
+        from gnucash_mcp.tools._helpers import BusinessNotes
+
+        class _Probe(BaseModel):
+            notes: BusinessNotes = ""
+
+        # 5000 chars — same as Plumb Bob's failing case.
+        with pytest.raises(ValidationError) as exc:
+            _Probe(notes="X" * 5000)
+        # Pydantic's message includes the max_length constraint.
+        msg = str(exc.value)
+        assert "4096" in msg, msg
+
+    def test_pydantic_model_rejects_oversize_address_field(
+        self, test_book: Path,
+    ):
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import BusinessAddressInput
+
+        with pytest.raises(ValidationError) as exc:
+            BusinessAddressInput(addr1="X" * 2000)
+        assert "1024" in str(exc.value)
+
+    def test_pydantic_address_model_forbids_unknown_keys(self):
+        """``BusinessAddressInput`` uses ``extra='forbid'`` so typo
+        keys (``adr1`` instead of ``addr1``) reject rather than
+        silently drop."""
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import BusinessAddressInput
+
+        with pytest.raises(ValidationError) as exc:
+            BusinessAddressInput(adr1="oops")
+        assert "extra" in str(exc.value).lower() or "forbid" in str(exc.value).lower()

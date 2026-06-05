@@ -4,7 +4,15 @@ Registered only when the 'business' module is enabled via --modules.
 """
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _gate_owner_type, _json, _resolve_id_alias, safe_tool
+from gnucash_mcp.tools._helpers import (
+    BusinessAddressInput,
+    BusinessNotes,
+    BusinessNotesOptional,
+    _gate_owner_type,
+    _json,
+    _resolve_id_alias,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -16,8 +24,8 @@ def register(mcp, get_book) -> None:
     def create_customer(
         name: str,
         currency: str | None = None,
-        notes: str = "",
-        address: dict | None = None,
+        notes: BusinessNotes = "",
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new customer.
 
@@ -25,13 +33,15 @@ def register(mcp, get_book) -> None:
             name: Customer name (e.g., "Acme Corp").
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
-            notes: Optional notes.
+            notes: Optional notes (max 4096 characters).
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_customer(
-            name=name, currency=currency, notes=notes, address=address,
+            name=name, currency=currency, notes=notes,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -79,8 +89,8 @@ def register(mcp, get_book) -> None:
     def create_vendor(
         name: str,
         currency: str | None = None,
-        notes: str = "",
-        address: dict | None = None,
+        notes: BusinessNotes = "",
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new vendor.
 
@@ -88,13 +98,15 @@ def register(mcp, get_book) -> None:
             name: Vendor name (e.g., "Office Depot").
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
-            notes: Optional notes.
+            notes: Optional notes (max 4096 characters).
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_vendor(
-            name=name, currency=currency, notes=notes, address=address,
+            name=name, currency=currency, notes=notes,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -142,7 +154,7 @@ def register(mcp, get_book) -> None:
     def create_employee(
         name: str,
         currency: str | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new employee.
 
@@ -154,11 +166,13 @@ def register(mcp, get_book) -> None:
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_employee(
-            name=name, currency=currency, address=address,
+            name=name, currency=currency,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -207,9 +221,9 @@ def register(mcp, get_book) -> None:
         id: str,
         name: str | None = None,
         currency: str | None = None,
-        notes: str | None = None,
+        notes: BusinessNotesOptional = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing customer.
 
@@ -234,7 +248,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_customer(
             customer_id=id, name=name, currency=currency,
-            notes=notes, active=active, address=address,
+            notes=notes, active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -245,9 +260,9 @@ def register(mcp, get_book) -> None:
         id: str,
         name: str | None = None,
         currency: str | None = None,
-        notes: str | None = None,
+        notes: BusinessNotesOptional = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing vendor.
 
@@ -264,7 +279,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_vendor(
             vendor_id=id, name=name, currency=currency,
-            notes=notes, active=active, address=address,
+            notes=notes, active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -276,7 +292,7 @@ def register(mcp, get_book) -> None:
         name: str | None = None,
         currency: str | None = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing employee.
 
@@ -293,7 +309,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_employee(
             employee_id=id, name=name, currency=currency,
-            active=active, address=address,
+            active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
