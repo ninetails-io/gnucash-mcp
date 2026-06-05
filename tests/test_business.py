@@ -8159,6 +8159,89 @@ class TestPayInvoice:
             )
             assert rate is None
 
+    def test_find_exchange_rate_respects_staleness_cap(
+        self, business_book, monkeypatch,
+    ):
+        """Plumb Bob bookkeeper-flagged: pre-fix the function
+        would silently use a stale price regardless of distance
+        from ``as_of``. The 90-day default cap (overridable via
+        GNUCASH_FX_STALENESS_DAYS) now refuses prices outside
+        the window — surfacing the "Add a price with
+        create_price" error the docstring promised.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        # Insert a fresh EUR/USD price and a stale one.
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # A "fresh" price 30 days before our as_of.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 5, 1), value="1.10",
+                source="user:price", type="nav",
+            ))
+            # A "stale" price 5 years before our as_of (will be
+            # the only candidate when we drop the fresh one).
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2021, 1, 1), value="1.05",
+                source="user:price", type="nav",
+            ))
+            book.save()
+
+        # Default 90-day cap: fresh price (30 days back) is within
+        # window, stale price (years back) is outside. We get the
+        # fresh one.
+        monkeypatch.delenv("GNUCASH_FX_STALENESS_DAYS", raising=False)
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 5, 31),
+            )
+            assert rate == Decimal("1.10")
+
+        # Tighten the cap to 10 days: both prices fall outside.
+        # No usable rate → None → caller raises with the
+        # "Add a price" hint.
+        monkeypatch.setenv("GNUCASH_FX_STALENESS_DAYS", "10")
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 5, 31),
+            )
+            assert rate is None, (
+                "Both prices are >10 days from as_of; cap should "
+                "refuse them"
+            )
+
+        # Cap=0 disables the window — original pre-fix behavior.
+        # The stale 2021 price is now usable on a 2026 query.
+        monkeypatch.setenv("GNUCASH_FX_STALENESS_DAYS", "0")
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                # 6 years past the only "fresh" rate; default cap
+                # would refuse this, but the disable lets the
+                # nearest-available (the 2026-05-01 price) win.
+                as_of=_date(2032, 1, 1),
+            )
+            # 2026-05-01 is closer to 2032-01-01 than 2021-01-01.
+            assert rate == Decimal("1.10")
+
     def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
         self, business_book,
     ):

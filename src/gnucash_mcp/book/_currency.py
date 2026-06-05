@@ -31,10 +31,52 @@ helpers above still walk ``book.prices`` directly today (the v1.3
 performance sweep replaces those walks).
 """
 
+import os
 from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
+
+
+# ── FX staleness cap (Plumb Bob validation, 2026-06-04) ───────────
+#
+# Pre-fix ``_find_exchange_rate`` would happily use the temporally-
+# closest price regardless of distance from ``as_of`` — a 2027
+# invoice could silently use a 2026 rate, a 2020 invoice could
+# silently use a 2025 rate. The error message promised a price "on
+# or near DATE" but the function had no proximity bound, so the
+# error was effectively unreachable for any currency with at least
+# one price on file.
+#
+# The cap below filters candidates to ``|days_offset| <=
+# _FX_STALENESS_DAYS``. When no price within the window exists,
+# the function returns ``None`` and the caller's existing
+# "Add a price with create_price, then retry" error fires correctly
+# (now with a real chance to fire).
+#
+# Default 90 days matches a typical bookkeeping cadence (monthly
+# statement close + a grace period). The
+# ``GNUCASH_FX_STALENESS_DAYS`` env var overrides it; ``0`` or
+# negative disables the cap entirely (pre-fix behavior).
+
+
+def _fx_staleness_days() -> int:
+    """Read the FX staleness cap from the environment.
+
+    Resolved per-call rather than cached because the env var can
+    change between server starts (and tests need to monkey-patch
+    it). The lookup is O(1) so the cost is negligible.
+    """
+    raw = os.environ.get("GNUCASH_FX_STALENESS_DAYS")
+    if raw is None:
+        return 90
+    try:
+        return int(raw)
+    except ValueError:
+        # Malformed value falls back to the default. We don't
+        # want a startup typo to silently disable the cap (which
+        # would happen if we returned 0).
+        return 90
 
 
 def _to_date(dt: date | datetime) -> date:
@@ -332,6 +374,14 @@ class CurrencyMixin:
         3. Direct after ``as_of``, closest.
         4. Inverse after ``as_of``, closest.
 
+        **Staleness cap (Plumb Bob, 2026-06-04):** candidates more
+        than ``GNUCASH_FX_STALENESS_DAYS`` (default 90) from
+        ``as_of`` are excluded. Pre-fix the function would happily
+        return a 5-year-old rate on a 2027 invoice; the documented
+        "on or near DATE" promise was effectively unreachable.
+        Setting the env var to ``0`` or a negative value disables
+        the cap (restores pre-fix behavior).
+
         Skips piecash's auto-created ``type='transaction'`` rows —
         those are 1.0 placeholders generated on cross-currency invoice
         post and would mask the absence of a real market rate.
@@ -342,10 +392,14 @@ class CurrencyMixin:
 
         Returns:
             Decimal rate, or ``None`` when no usable price exists in
-            either direction.
+            either direction WITHIN the staleness window.
         """
         if from_commodity == to_commodity:
             return Decimal("1")
+
+        cap = _fx_staleness_days()
+        # cap <= 0 disables the staleness window (pre-fix behavior).
+        cap_enabled = cap > 0
 
         best_before_direct: tuple[int, Decimal] | None = None
         best_after_direct: tuple[int, Decimal] | None = None
@@ -358,6 +412,8 @@ class CurrencyMixin:
             p_date = _to_date(p.date)
             if p.commodity == from_commodity and p.currency == to_commodity:
                 days = (as_of - p_date).days
+                if cap_enabled and abs(days) > cap:
+                    continue
                 rate = Decimal(str(p.value))
                 if rate <= 0:
                     continue
@@ -369,6 +425,8 @@ class CurrencyMixin:
                         best_after_direct = (-days, rate)
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
+                if cap_enabled and abs(days) > cap:
+                    continue
                 if Decimal(str(p.value)) <= 0:
                     continue
                 rate = Decimal("1") / Decimal(str(p.value))

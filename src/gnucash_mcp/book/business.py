@@ -5271,6 +5271,12 @@ class BusinessMixin:
             as_of=as_of,
         )
         if rate is None:
+            from gnucash_mcp.book._currency import _fx_staleness_days
+            cap = _fx_staleness_days()
+            staleness_note = (
+                f" within ±{cap} days"
+                if cap > 0 else ""
+            )
             raise ValueError(
                 f"Cross-currency {context} requires an exchange "
                 f"rate: invoice currency "
@@ -5278,9 +5284,10 @@ class BusinessMixin:
                 f"target commodity {target_commodity.mnemonic}, "
                 f"and no matching price was found in the book "
                 f"for {invoice_currency.mnemonic}/"
-                f"{target_commodity.mnemonic} on or near "
+                f"{target_commodity.mnemonic}{staleness_note} of "
                 f"{as_of}. Add a price with create_price, then "
-                f"retry."
+                f"retry. (Override the staleness window via "
+                f"GNUCASH_FX_STALENESS_DAYS env var; 0 disables.)"
             )
         return (
             (amount * rate).quantize(
