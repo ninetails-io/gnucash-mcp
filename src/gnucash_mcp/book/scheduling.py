@@ -506,6 +506,16 @@ class SchedulingMixin:
                 continue
 
             count += 1
+            # splits-json amounts are in the book default currency by
+            # construction: create_scheduled_transaction pins the
+            # template transaction to the default currency, and
+            # create_transaction_from_scheduled instantiates with no
+            # currency override — so every stored amount is a default-
+            # currency value. Summing them needs no FX conversion, and
+            # get_book_summary's single "{default_currency} N" label is
+            # correct. (A foreign-currency SX would require a native-
+            # GnuCash template, which carries no splits-json slot and so
+            # contributes nothing here.)
             for s in self._get_sx_splits(book, sx):
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
