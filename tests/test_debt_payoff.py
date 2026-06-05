@@ -103,6 +103,83 @@ class TestDebtPayoffPlan:
         ):
             gc_book.debt_payoff_plan(compact=False, monthly_budget="500")
 
+    def test_foreign_currency_debt_balance_is_converted(
+        self, tmp_path: Path,
+    ):
+        """M1 regression: a foreign-currency debt balance must be
+        valued in the book default currency (rate × quantity), not
+        summed as raw foreign units. Pre-fix debt_payoff_plan summed
+        raw split.quantity — the one reporting-layer method that
+        bypassed the FX helper.
+        """
+        import piecash
+        from piecash import factories
+
+        book_path = tmp_path / "fx_debt.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        root = book.root_account
+
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        euro_loan = piecash.Account(
+            name="Euro Loan", type="LIABILITY", parent=liabilities,
+            commodity=eur,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=eur, placeholder=True,
+        )
+        spent = piecash.Account(
+            name="Spent", type="EXPENSE", parent=expenses, commodity=eur,
+        )
+        book.save()
+
+        euro_loan["apr"] = "10.00"
+        euro_loan["minimum_payment"] = "100"
+        book.save()
+
+        # Draw 1000 EUR on the loan (EUR transaction; value==quantity).
+        book.session.add(piecash.Transaction(
+            currency=eur, description="Loan draw",
+            post_date=date(2026, 1, 1),
+            splits=[
+                piecash.Split(
+                    account=euro_loan,
+                    value=Decimal("-1000"), quantity=Decimal("-1000"),
+                ),
+                piecash.Split(
+                    account=spent,
+                    value=Decimal("1000"), quantity=Decimal("1000"),
+                ),
+            ],
+        ))
+        # EUR/USD = 1.25 → 1000 EUR owed == 1250 USD.
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2026, 2, 1),
+            value="1.25", source="user:test", type="nav",
+        ))
+        book.save()
+
+        gc_book = GnuCashBook(str(book_path))
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="1000",
+        )
+
+        loan = next(
+            d for d in result["debts"]
+            if d["account"] == "Liabilities:Euro Loan"
+        )
+        # Converted (1000 × 1.25), not the raw foreign 1000.
+        assert Decimal(loan["balance"]) == Decimal("1250.00")
+        assert Decimal(result["total_balance"]) == Decimal("1250.00")
+
     def test_no_debt_accounts_at_all(self, tmp_path: Path):
         """Should raise the MP-9 "no debt accounts" branch on a
         chart with zero CREDIT/LIABILITY accounts.

@@ -1174,6 +1174,17 @@ class ReportingMixin:
             # template balances. Defense-in-depth, not a bug fix.
             template_guids = self._template_account_guids(book)
 
+            # FX chokepoint: per-account conversion factors so a
+            # foreign-currency debt is valued in the book default
+            # currency (rate × quantity, cost-basis fallback) instead
+            # of summing raw foreign units. "Now" report → today's
+            # rates. Pre-fix this summed raw split.quantity, the lone
+            # reporting-layer method that bypassed the FX helper used by
+            # balance_sheet / net_worth / cash_flow.
+            debt_factors = self._account_conversion_factors(
+                book, date.today()
+            )
+
             for account in book.accounts:
                 if account.guid in template_guids:
                     continue
@@ -1201,10 +1212,13 @@ class ReportingMixin:
                 if apr <= 0:
                     continue
 
-                # Calculate current balance (negate because liabilities are stored negative)
+                # Calculate current balance in the book default currency
+                # (negate because liabilities are stored negative).
                 balance = Decimal("0")
                 for split in account.splits:
-                    balance += split.quantity
+                    balance += self._split_in_default_currency(
+                        split, account, debt_factors.get(account.guid)
+                    )
                 balance = -balance  # Convert to positive amount owed
 
                 if balance <= 0:
