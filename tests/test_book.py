@@ -9341,7 +9341,9 @@ class TestMultiCurrencyDashboardHelpers:
             invoice_id="000001",
             post_account="Liabilities:Accounts Payable",
             owner_type="vendor",
-            post_date="2024-06-15",
+            # Pin to the rate date — this test checks report-time
+            # currency conversion, not FX freshness at posting.
+            post_date="2024-06-01",
         )
         # Run the report; verify totals come back as USD-converted.
         result = gc_book.vendor_spending_report(
@@ -10313,3 +10315,230 @@ class TestShortGuidRoundTripClosure:
         # downstream resolver path that powers all write tools.
         baseline = gc_book.get_balance(short_acct)
         assert baseline is not None
+
+
+class TestIssue94IntermediateCurrencyChain:
+    """balance_sheet (and every report via ``_rates_as_of``) must value
+    a commodity reachable only through an intermediate currency —
+    issue #94. Covers the whole class:
+
+      A. security → foreign ccy → default       (fund priced USD)
+      B. foreign ccy → pivot → default          (GBP via USD)
+      C. security → foreign ccy → pivot → default (fund priced GBP)
+
+    plus a direct-priced control and an unreachable control, and the
+    ``type='transaction'`` trap (the cross-currency GBP funding stamps
+    a non-market GBP/AED rate of 5.0 that the chain must ignore in
+    favour of the GBP→USD→AED market legs = 4.664075).
+    """
+
+    def _build(self, tmp_path) -> GnuCashBook:
+        from datetime import date as d
+        path = tmp_path / "issue94.gnucash"
+        book = piecash.create_book(
+            str(path), currency="AED", overwrite=True,
+        )
+        root = book.root_account
+        aed = book.default_currency
+
+        def ccy(m, n):
+            c = piecash.Commodity(
+                namespace="CURRENCY", mnemonic=m, fullname=n, fraction=100,
+            )
+            book.session.add(c)
+            return c
+
+        usd, gbp, jpy = ccy("USD", "US Dollar"), ccy("GBP", "Pound"), ccy("JPY", "Yen")
+
+        def fund(m, n):
+            c = piecash.Commodity(
+                namespace="FUND", mnemonic=m, fullname=n, fraction=10000,
+            )
+            book.session.add(c)
+            return c
+
+        gfund = fund("GLOBALFUND", "Global")   # A: priced USD
+        ufund = fund("UKFUND", "UK")           # C: priced GBP
+        lfund = fund("LOCALFUND", "Local")     # D: priced AED (direct)
+        ofund = fund("ORPHANFUND", "Orphan")   # E: priced JPY (unreachable)
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=aed, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=aed,
+        )
+        gbpcash = piecash.Account(
+            name="GBP Cash", type="BANK", parent=assets, commodity=gbp,
+        )
+        hg = piecash.Account(
+            name="Global Holding", type="STOCK", parent=assets, commodity=gfund,
+        )
+        hu = piecash.Account(
+            name="UK Holding", type="STOCK", parent=assets, commodity=ufund,
+        )
+        hl = piecash.Account(
+            name="Local Holding", type="STOCK", parent=assets, commodity=lfund,
+        )
+        ho = piecash.Account(
+            name="Orphan Holding", type="STOCK", parent=assets, commodity=ofund,
+        )
+        eq = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=aed, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=eq, commodity=aed,
+        )
+        book.session.add_all(
+            [assets, checking, gbpcash, hg, hu, hl, ho, eq, opening]
+        )
+        book.save()
+
+        book.session.add(piecash.Transaction(
+            currency=aed, description="open", post_date=d(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("100000")),
+                piecash.Split(account=opening, value=Decimal("-100000")),
+            ],
+        ))
+        book.save()
+
+        def buy(holding, shares, cost):
+            book.session.add(piecash.Transaction(
+                currency=aed, description="buy", post_date=d(2024, 3, 1),
+                splits=[
+                    piecash.Split(
+                        account=checking,
+                        value=Decimal(str(-cost)), quantity=Decimal(str(-cost)),
+                    ),
+                    piecash.Split(
+                        account=holding,
+                        value=Decimal(str(cost)), quantity=Decimal(str(shares)),
+                    ),
+                ],
+            ))
+
+        buy(hg, 100, 5500)
+        buy(hu, 90, 8000)
+        buy(hl, 50, 2500)
+        buy(ho, 10, 1000)
+        book.save()
+
+        # GBP funded cross-currency at an effective 5.0 AED/GBP →
+        # piecash stamps a type='transaction' GBP/AED price of 5.0.
+        book.session.add(piecash.Transaction(
+            currency=aed, description="gbp", post_date=d(2024, 3, 1),
+            splits=[
+                piecash.Split(
+                    account=checking,
+                    value=Decimal("-4000"), quantity=Decimal("-4000"),
+                ),
+                piecash.Split(
+                    account=gbpcash,
+                    value=Decimal("4000"), quantity=Decimal("800"),
+                ),
+            ],
+        ))
+        book.save()
+
+        def price(c, cur, v):
+            book.session.add(piecash.Price(
+                commodity=c, currency=cur, date=d(2024, 6, 1),
+                value=v, type="last",
+            ))
+
+        price(usd, aed, "3.6725")    # pivot leg
+        price(gbp, usd, "1.27")      # triangulation leg
+        price(gfund, usd, "15")      # A
+        price(ufund, gbp, "20")      # C
+        price(lfund, aed, "50")      # D direct
+        price(ofund, jpy, "1000")    # E unreachable
+        book.save()
+        book.close()
+        return GnuCashBook(str(path))
+
+    def _holdings(self, gb: GnuCashBook) -> dict:
+        bs = gb.balance_sheet(date(2024, 6, 30))
+        return {
+            a["account"].split(":")[-1]: a
+            for a in bs["assets"]["accounts"]
+        }
+
+    def test_case_a_security_via_pivot(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Global Holding"]
+        assert h["default_currency_value"] == "5508.75"  # 100×15×3.6725
+        assert "no price data" not in h["balance"]
+        # Provenance: derived through USD, flagged for the reader.
+        assert "via USD" in h["balance"]
+
+    def test_case_b_triangulation_ignores_transaction_price(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["GBP Cash"]
+        # 800 × 1.27 × 3.6725 = 3731.26 — NOT 4000 (the 5.0 txn rate).
+        assert h["default_currency_value"] == "3731.26"
+        assert "via USD" in h["balance"]
+
+    def test_case_c_three_hop(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["UK Holding"]
+        assert h["default_currency_value"] == "8395.34"  # 90×20×1.27×3.6725
+        # 3-hop provenance names both legs.
+        assert "via GBP→USD" in h["balance"]
+
+    def test_direct_priced_control_unchanged(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Local Holding"]
+        assert h["default_currency_value"] == "2500.00"  # 50×50 direct
+        # Direct rate — no provenance annotation.
+        assert "via" not in h["balance"]
+
+    def test_unreachable_falls_back_to_cost_basis(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Orphan Holding"]
+        assert h["default_currency_value"] == "1000.00"
+        assert "no price data" in h["balance"]
+
+    def test_cross_rate_direct_and_triangulated(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            usd = next(c for c in bk.commodities if c.mnemonic == "USD")
+            gbp = next(c for c in bk.commodities if c.mnemonic == "GBP")
+            jpy = next(c for c in bk.commodities if c.mnemonic == "JPY")
+            as_of = date(2024, 6, 30)
+            assert gb._cross_rate(bk, usd, aed, as_of) == Decimal("3.6725")
+            assert gb._cross_rate(bk, gbp, aed, as_of) == (
+                Decimal("1.27") * Decimal("3.6725")
+            )
+            # JPY has no leg to AED → no cross rate.
+            assert gb._cross_rate(bk, jpy, aed, as_of) is None
+
+    def test_market_rate_none_for_unreachable(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            ofund = next(
+                c for c in bk.commodities if c.mnemonic == "ORPHANFUND"
+            )
+            assert gb._market_rate_to_default(
+                bk, ofund, aed, date(2024, 6, 30),
+            ) is None
+
+    def test_format_via(self, tmp_path):
+        gb = self._build(tmp_path)
+        assert gb._format_via([]) is None              # direct → no note
+        assert gb._format_via(["USD"]) == "via USD"
+        assert gb._format_via(["GBP", "USD"]) == "via GBP→USD"
+
+    def test_rate_provenance_map(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            prov = gb._rate_provenance(bk, date(2024, 6, 30), aed)
+            by_mnem = {
+                c.mnemonic: prov.get(c.guid)
+                for c in bk.commodities
+            }
+            assert by_mnem["GLOBALFUND"] == "via USD"      # A
+            assert by_mnem["GBP"] == "via USD"             # B
+            assert by_mnem["UKFUND"] == "via GBP→USD"      # C
+            assert by_mnem["LOCALFUND"] is None            # D direct
+            assert by_mnem["ORPHANFUND"] is None           # E unreachable

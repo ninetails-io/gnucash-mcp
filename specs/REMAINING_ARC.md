@@ -13,12 +13,13 @@ what's been decided, what still needs the user's call.
 
 ## Status snapshot
 
-**26 of the 27 substantive review items are closed.** Branches 1-5
-all merged to develop. The two deferred design calls (SB-5, HP-8)
-were resolved on Stephen's call and shipped in PR #99 on
-`feat/design-call-resolutions`. Only MP-1 remains — design call on
-whether `get_server_config` needs an `@audit_log` decorator (default
-keep deferred, formally documented).
+**27 of 27 substantive review items closed.** Branches 1-5 plus
+the Branch 5 follow-up `feat/release-prep` (MP-1 documented,
+MP-3/5/10/12/13/14 implemented, L-1 through L-7 done) all merged
+to develop. The two deferred design calls (SB-5, HP-8) resolved
+on Stephen's call and shipped in PR #99; the self-review on PR
+#99 surfaced 10 more findings and all are closed. v1.3.0 ready
+for release once the version bump lands.
 
 | Branch | PR   | Status   | Items closed                                                                                  |
 | ------ | ---- | -------- | --------------------------------------------------------------------------------------------- |

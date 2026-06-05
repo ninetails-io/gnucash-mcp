@@ -13,6 +13,7 @@ from gnucash_mcp.tools._helpers import (
     SplitInput,
     TransactionGuid,
     _json,
+    _parse_iso_date,
     _splits_to_dicts,
     safe_tool,
 )
@@ -87,12 +88,24 @@ def register(mcp, get_book) -> None:
             as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
         """
         book = get_book()
-        date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+        date_obj = _parse_iso_date(as_of_date)
         # Resolve once to capture the canonical fullname for the
         # response. Echoing the path the caller passed in (or, when
         # they passed a %short, resolving to the readable form they'd
         # rather see back) gives a uniform contract: every tool that
         # echoes an account responds with the canonical full path.
+        #
+        # MP-6: this double-fetch (get_account here + get_balance
+        # below) is a deliberate trade-off. Dropping the get_account
+        # call would shave one indexed query per ``get_balance`` —
+        # cheap on its own — but it would also break the "every
+        # tool echoes canonical paths" contract that
+        # ``TestCanonicalAccountEcho`` locks in PR #56's bookkeeper
+        # work. The contract wins: a caller who passed ``%2e78c86``
+        # gets back ``Assets:Current Assets:Savings`` and instantly
+        # confirms which account they were asking about, with zero
+        # ambiguity if they fat-fingered the prefix. The extra
+        # query is the cost of that disambiguation.
         account_dict = book.get_account(account_name)
         if account_dict is None:
             raise ValueError(f"Account not found: {account_name}")
@@ -137,8 +150,8 @@ def register(mcp, get_book) -> None:
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
-        start = date.fromisoformat(start_date) if start_date else None
-        end = date.fromisoformat(end_date) if end_date else None
+        start = _parse_iso_date(start_date)
+        end = _parse_iso_date(end_date)
         result = book.list_transactions(account, start, end, limit, compact=not verbose)
         if verbose:
             return _json(result)
@@ -207,7 +220,7 @@ def register(mcp, get_book) -> None:
             dry_run: Validate + dupe check only; don't write.
         """
         book = get_book()
-        trans_date = date.fromisoformat(transaction_date) if transaction_date else None
+        trans_date = _parse_iso_date(transaction_date)
         result = book.create_transaction(
             description=description,
             splits=_splits_to_dicts(splits),
@@ -397,7 +410,7 @@ def register(mcp, get_book) -> None:
             force: Allow modifying transactions with reconciled splits
         """
         book = get_book()
-        trans_date = date.fromisoformat(transaction_date) if transaction_date else None
+        trans_date = _parse_iso_date(transaction_date)
         result = book.update_transaction(
             guid=guid,
             description=description,

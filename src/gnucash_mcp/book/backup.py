@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import piecash
+
+from gnucash_mcp.logging_config import redact_paths
 
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
@@ -456,17 +459,32 @@ class BackupMixin:
             )
 
         size_bytes = backup_path.stat().st_size
+
+        # MP-4: route path-bearing fields through ``redact_paths``
+        # (imported at module top). Pass-through unless
+        # ``GNUCASH_REDACT_PATHS=1``; when set, paths collapse to
+        # basename so responses are safe to share externally
+        # without leaking filesystem layout.
+
+        # L-5: shell-quote interpolated paths. Paths with spaces
+        # or shell metachars would otherwise break the command —
+        # and if a future code path ever passes a user-influenced
+        # path component, an unquoted f-string is a latent
+        # injection.
+        restore_hint = (
+            "Restore by stopping the server, then: "
+            f"mv {shlex.quote(str(self.book_path))} "
+            f"{shlex.quote(str(self.book_path) + '.broken')} && "
+            f"cp {shlex.quote(str(backup_path))} "
+            f"{shlex.quote(str(self.book_path))}"
+        )
         return {
             "status": "created",
             "stage": stage,
-            "path": str(backup_path),
+            "path": redact_paths(str(backup_path)),
             "size_bytes": size_bytes,
             "integrity": integrity,
-            "restore_hint": (
-                "Restore by stopping the server, then: "
-                f"mv {self.book_path} {self.book_path}.broken && "
-                f"cp {backup_path} {self.book_path}"
-            ),
+            "restore_hint": redact_paths(restore_hint),
         }
 
     # ── Listing ──────────────────────────────────────────────────
@@ -507,7 +525,8 @@ class BackupMixin:
                 "age": _describe_age(ts, now),
                 "size_bytes": size,
                 "label": label,
-                "path": str(path),
+                # MP-4: opt-in path redaction.
+                "path": redact_paths(str(path)),
             })
 
         entries.sort(key=lambda e: e["timestamp"], reverse=True)
@@ -555,9 +574,13 @@ class BackupMixin:
         # against data loss. Refuse to wipe them all in one call;
         # require the caller to step through deliberately (small
         # keep_last_n + a label filter, or use ``dry_run=True`` to
-        # see the plan first). Auto-stage zero-retention is still
-        # allowed because those have policy-driven retention and
-        # the user can always rebuild them.
+        # see the plan first). Per-stage auto zero-retention is
+        # still allowed because those have policy-driven retention
+        # and the user can always rebuild them; the symmetric
+        # guard below catches the "all auto stages at once" case
+        # which is a different shape of footgun (the user typed
+        # ``keep_last_n=0`` to free disk space, not realizing the
+        # default scope is every auto stage).
         if (
             stage == _MANUAL_STAGE_NAME
             and keep_last_n == 0
@@ -571,6 +594,35 @@ class BackupMixin:
                 "Use dry_run=True to review the plan, or pass a "
                 "non-zero keep_last_n (e.g. keep_last_n=5 to keep "
                 "the 5 most recent manual backups)."
+            )
+
+        # MP-3: symmetric footgun guard for the auto stages.
+        # ``prune_backups(keep_last_n=0)`` without an explicit
+        # ``stage`` deletes every session / weekly / monthly
+        # backup in one call. The user typed it intending "free up
+        # disk space"; the intent was almost certainly per-stage,
+        # not "wipe all auto backups." Auto backups rebuild over
+        # time (sessions on next write, weekly on next Monday,
+        # monthly on next 1st), but until then the recoverability
+        # window is gone — and the user has no way to recover
+        # backups they didn't realize they were deleting. Mirror
+        # the manual-stage guard: require the caller to opt in
+        # explicitly by naming the stage.
+        if (
+            stage is None
+            and keep_last_n == 0
+            and not dry_run
+        ):
+            raise ValueError(
+                "Refusing to delete every auto backup at once. "
+                "``prune_backups(keep_last_n=0)`` without an "
+                "explicit ``stage`` wipes session, weekly, AND "
+                "monthly auto backups in a single call — the "
+                "recoverability window is gone until each stage's "
+                "next scheduled rebuild. Use dry_run=True to "
+                "review the plan, pass an explicit ``stage`` "
+                "(e.g. ``stage='session'``) to scope the delete, "
+                "or pass a non-zero ``keep_last_n``."
             )
 
         all_backups = self.list_backups()

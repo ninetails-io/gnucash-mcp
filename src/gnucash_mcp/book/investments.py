@@ -135,6 +135,43 @@ class InvestmentsMixin:
         Raises:
             ValueError: If commodity already exists in that namespace.
         """
+        # MP-13: validate inputs up front. Mirrors HP-11's
+        # symmetric-gate principle — bad inputs reject before
+        # the ORM round-trip, with a useful error rather than
+        # IntegrityError / silent corruption downstream.
+        if not mnemonic or not mnemonic.strip():
+            raise ValueError("Commodity mnemonic cannot be empty")
+        if not fullname or not fullname.strip():
+            raise ValueError("Commodity fullname cannot be empty")
+        if not namespace or not namespace.strip():
+            raise ValueError("Commodity namespace cannot be empty")
+        for label, value in (
+            ("mnemonic", mnemonic),
+            ("fullname", fullname),
+            ("namespace", namespace),
+        ):
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+                raise ValueError(
+                    f"Commodity {label} contains control characters. "
+                    f"Got: {value!r}."
+                )
+        if cusip is not None and any(
+            ord(ch) < 0x20 or ord(ch) == 0x7f for ch in cusip
+        ):
+            raise ValueError(
+                f"Commodity cusip contains control characters. "
+                f"Got: {cusip!r}."
+            )
+        # fraction is the smallest representable subunit — must be
+        # a positive power-of-10 style integer per piecash's
+        # Decimal-from-num/denom encoding. Zero or negative
+        # breaks every quantity computation that divides by it.
+        if not isinstance(fraction, int) or fraction <= 0:
+            raise ValueError(
+                f"Commodity fraction must be a positive integer. "
+                f"Got: {fraction!r}."
+            )
+
         with self.open(readonly=False) as book:
             existing = self._find_commodity(book, mnemonic, namespace)
             if existing:
@@ -688,7 +725,11 @@ class InvestmentsMixin:
                 notes=notes,
                 is_closed=0,
             )
-            book.session.add(lot)
+            # MP-11: ``book.session.add(lot)`` is redundant —
+            # piecash's Lot.__init__ assigns ``self.account``,
+            # which back-populates through Account.lots and
+            # auto-registers the Lot with the session. Verified
+            # against piecash/core/transaction.py:514.
             book.save()
 
             all_lot_guids = [

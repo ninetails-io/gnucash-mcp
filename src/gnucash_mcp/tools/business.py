@@ -4,7 +4,15 @@ Registered only when the 'business' module is enabled via --modules.
 """
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _gate_owner_type, _json, _resolve_id_alias, safe_tool
+from gnucash_mcp.tools._helpers import (
+    BusinessAddressInput,
+    BusinessNotes,
+    BusinessNotesOptional,
+    _gate_owner_type,
+    _json,
+    _resolve_id_alias,
+    safe_tool,
+)
 
 
 def register(mcp, get_book) -> None:
@@ -16,8 +24,8 @@ def register(mcp, get_book) -> None:
     def create_customer(
         name: str,
         currency: str | None = None,
-        notes: str = "",
-        address: dict | None = None,
+        notes: BusinessNotes = "",
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new customer.
 
@@ -25,13 +33,15 @@ def register(mcp, get_book) -> None:
             name: Customer name (e.g., "Acme Corp").
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
-            notes: Optional notes.
+            notes: Optional notes (max 4096 characters).
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_customer(
-            name=name, currency=currency, notes=notes, address=address,
+            name=name, currency=currency, notes=notes,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -79,8 +89,8 @@ def register(mcp, get_book) -> None:
     def create_vendor(
         name: str,
         currency: str | None = None,
-        notes: str = "",
-        address: dict | None = None,
+        notes: BusinessNotes = "",
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new vendor.
 
@@ -88,13 +98,15 @@ def register(mcp, get_book) -> None:
             name: Vendor name (e.g., "Office Depot").
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
-            notes: Optional notes.
+            notes: Optional notes (max 4096 characters).
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_vendor(
-            name=name, currency=currency, notes=notes, address=address,
+            name=name, currency=currency, notes=notes,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -142,7 +154,7 @@ def register(mcp, get_book) -> None:
     def create_employee(
         name: str,
         currency: str | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Create a new employee.
 
@@ -154,11 +166,13 @@ def register(mcp, get_book) -> None:
             currency: ISO currency code (e.g., "USD", "EUR").
                       Defaults to book's default currency.
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email.
+                     addr3, addr4, phone, fax, email. Each sub-field
+                     capped at 1024 characters.
         """
         book = get_book()
         result = book.create_employee(
-            name=name, currency=currency, address=address,
+            name=name, currency=currency,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -207,9 +221,9 @@ def register(mcp, get_book) -> None:
         id: str,
         name: str | None = None,
         currency: str | None = None,
-        notes: str | None = None,
+        notes: BusinessNotesOptional = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing customer.
 
@@ -234,7 +248,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_customer(
             customer_id=id, name=name, currency=currency,
-            notes=notes, active=active, address=address,
+            notes=notes, active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -245,9 +260,9 @@ def register(mcp, get_book) -> None:
         id: str,
         name: str | None = None,
         currency: str | None = None,
-        notes: str | None = None,
+        notes: BusinessNotesOptional = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing vendor.
 
@@ -264,7 +279,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_vendor(
             vendor_id=id, name=name, currency=currency,
-            notes=notes, active=active, address=address,
+            notes=notes, active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -276,7 +292,7 @@ def register(mcp, get_book) -> None:
         name: str | None = None,
         currency: str | None = None,
         active: bool | None = None,
-        address: dict | None = None,
+        address: BusinessAddressInput | None = None,
     ) -> str:
         """Update an existing employee.
 
@@ -293,7 +309,8 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.update_employee(
             employee_id=id, name=name, currency=currency,
-            active=active, address=address,
+            active=active,
+            address=address.model_dump() if address else None,
         )
         return _json(result)
 
@@ -1002,11 +1019,22 @@ def register(mcp, get_book) -> None:
         due_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
+        force: bool = False,
     ) -> str:
         """Post a customer invoice or vendor bill.
 
         Posting creates a transaction in the A/R or A/P account and makes
         the invoice official. Once posted, entries cannot be added.
+
+        For a foreign-currency document, the exchange rate is etched
+        at posting and cannot be updated retroactively. If the latest
+        price for the invoice currency is more than 7 days from the
+        post date (the ``GNUCASH_FX_GUARD_DAYS`` window), posting is
+        refused with a ``stale_fx_rate`` error — run ``create_price``
+        for a rate near the post date, then retry, or pass
+        ``force=True`` to post with the stale rate (recorded in the
+        response and audit log as ``fx_stale``/"forced"). A rate
+        beyond the 90-day staleness cap cannot be forced.
 
         Args:
             id: Invoice or bill ID (e.g., "000001").
@@ -1015,6 +1043,8 @@ def register(mcp, get_book) -> None:
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
             owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+            force: Override the stale-FX-rate guard and post with a
+                7–90 day stale rate. Default False.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1025,6 +1055,7 @@ def register(mcp, get_book) -> None:
             due_date=due_date,
             description=description,
             owner_type=owner_type,
+            force=force,
         )
         return _json(result)
 
@@ -1069,6 +1100,7 @@ def register(mcp, get_book) -> None:
         fx_account: str | None = None,
         apply_discount: bool = False,
         discount_account: str | None = None,
+        force: bool = False,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
@@ -1119,6 +1151,12 @@ def register(mcp, get_book) -> None:
                 receive the discount split. Auto-resolves when
                 omitted. Accepts full path, %short GUID, or full
                 32-char GUID.
+            force: Override the stale-FX-rate guard. A cross-currency
+                payment etches the rate at pay time; if the latest
+                price is 7–90 days from the payment date the payment
+                is refused with ``stale_fx_rate`` unless ``force=True``
+                (the override is recorded as ``fx_stale``/"forced").
+                A rate beyond the 90-day cap cannot be forced.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1132,6 +1170,7 @@ def register(mcp, get_book) -> None:
             fx_account=fx_account,
             apply_discount=apply_discount,
             discount_account=discount_account,
+            force=force,
         )
         return _json(result)
 

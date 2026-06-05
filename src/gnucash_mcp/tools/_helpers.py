@@ -7,12 +7,32 @@ tool-registration module under gnucash_mcp/tools/.
 import json
 import logging
 import traceback
+from datetime import date
 from functools import wraps
 from typing import Annotated, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from gnucash_mcp.book import GnuCashLockError
+from gnucash_mcp.book import GnuCashLockError, StaleFXRateError
+
+
+def _parse_iso_date(s: str | None) -> date | None:
+    """Parse an optional ISO-format date string.
+
+    Returns ``None`` for falsy input (``None`` / ``""``); otherwise
+    delegates to ``date.fromisoformat`` whose error is good enough
+    to surface at the MCP boundary unchanged
+    (``ValueError: Invalid isoformat string: '2025-01-XX'``).
+
+    R-4: chokepoints the ``date.fromisoformat(x) if x else None``
+    pattern that recurred at ~21 tool-wrapper sites. Required
+    dates (where the caller has already guaranteed non-None) keep
+    calling ``date.fromisoformat`` directly — the distinction is
+    explicit at the call site.
+    """
+    if not s:
+        return None
+    return date.fromisoformat(s)
 
 # Re-exports from the layer-neutral format module. Tool wrappers can
 # keep importing from ``tools._helpers`` (the historical home) without
@@ -45,6 +65,82 @@ ScheduledTransactionGuid = Annotated[
     str,
     Field(description="Scheduled transaction GUID (32-char hex or 8+ char prefix)"),
 ]
+
+
+# ── Business-entity free-text caps (MP-5) ─────────────────────────
+#
+# The book-layer ``_validate_business_freetext`` chokepoint rejects
+# oversize input correctly — but it runs INSIDE the tool body,
+# AFTER ``@audit_log`` fires ``_maybe_auto_backup``. On the first
+# write of a session against a large book, that backup can take
+# seconds-to-minutes; from the caller's seat, a 5000-byte ``notes``
+# value looks like a hang before the validation rejects.
+#
+# Plumb Bob (bookkeeper validation, 2026-06-04) flagged this:
+# "for a defense-in-depth input gate, a hang is worse than the
+# unbounded write it was meant to prevent." Pydantic Field
+# constraints validate at the FastMCP schema layer — BEFORE any
+# decorator runs, including auto-backup — so an oversize value
+# rejects in milliseconds with the correct error shape.
+#
+# Cap is in characters (Pydantic's ``max_length`` semantics);
+# UTF-8 byte length is at most ~4× character length for the
+# pathological multi-byte case, so the effective byte ceiling is
+# ~16 KiB even for the worst-case input. Book-layer byte check
+# stays as belt-and-suspenders for direct callers (scripts,
+# tests) that bypass the MCP boundary.
+
+BusinessNotes = Annotated[
+    str,
+    Field(
+        default="",
+        max_length=4096,
+        description=(
+            "Optional notes. Capped at 4096 characters at the MCP "
+            "boundary; oversize input rejects with a clear error."
+        ),
+    ),
+]
+
+BusinessNotesOptional = Annotated[
+    str | None,
+    Field(
+        default=None,
+        max_length=4096,
+        description=(
+            "New notes value (capped at 4096 characters). Pass "
+            "``None`` (default) to leave existing notes unchanged; "
+            "pass ``\"\"`` to clear."
+        ),
+    ),
+]
+
+
+class BusinessAddressInput(BaseModel):
+    """Address sub-fields for business entities (customer / vendor /
+    employee). All sub-fields are optional strings capped at 1024
+    characters at the MCP boundary.
+
+    Same MP-5 rationale as ``BusinessNotes``: the cap fires at the
+    schema layer so an oversize value rejects fast without auto-
+    backup running first.
+    """
+
+    model_config = ConfigDict(
+        # Match the server-global ``extra="forbid"`` on
+        # ``ArgModelBase`` — typo'd address keys (``adr1`` instead of
+        # ``addr1``) should reject rather than silently drop.
+        extra="forbid",
+    )
+
+    name: Annotated[str, Field(default="", max_length=1024)] = ""
+    addr1: Annotated[str, Field(default="", max_length=1024)] = ""
+    addr2: Annotated[str, Field(default="", max_length=1024)] = ""
+    addr3: Annotated[str, Field(default="", max_length=1024)] = ""
+    addr4: Annotated[str, Field(default="", max_length=1024)] = ""
+    phone: Annotated[str, Field(default="", max_length=1024)] = ""
+    fax: Annotated[str, Field(default="", max_length=1024)] = ""
+    email: Annotated[str, Field(default="", max_length=1024)] = ""
 
 
 # ── Split payload schema ──────────────────────────────────────────
@@ -154,7 +250,7 @@ def _splits_to_dicts(
     return result
 
 
-def _strip_noise(obj):
+def _strip_noise(obj: object) -> object:
     """Recursively remove keys with None or empty-string values from dicts.
 
     Empty strings are treated as absent — the convention across the
@@ -349,6 +445,18 @@ def safe_tool(func: Callable) -> Callable:
                     "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
                 }
             )
+        except StaleFXRateError as e:
+            # Subclass of ValueError — must be caught BEFORE the
+            # generic ValueError handler below, or the structured
+            # fx_detail + dedicated error_type collapse into a plain
+            # validation_error. The caller uses error_type to decide
+            # between create_price-then-retry and force=true.
+            logger.warning(f"Stale FX rate in {func.__name__}: {e}")
+            return _json({
+                "error": redact_paths(str(e)),
+                "error_type": "stale_fx_rate",
+                "fx_detail": e.fx_detail,
+            })
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
             return _json({

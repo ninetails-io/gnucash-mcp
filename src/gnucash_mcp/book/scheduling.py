@@ -295,7 +295,13 @@ class SchedulingMixin:
                 parent=book.root_template,
                 commodity=self._require_default_currency(book),
             )
-            book.session.add(template_acct)
+            # MP-11: ``book.session.add(template_acct)`` is
+            # redundant — piecash's Account auto-registers via
+            # the parent relationship. Documented in CLAUDE.md
+            # under "piecash gotchas." The flush is kept because
+            # the next block does a raw SQL INSERT against the
+            # scheduled-transaction table and needs the template
+            # account row to exist first.
             book.session.flush()
 
             try:

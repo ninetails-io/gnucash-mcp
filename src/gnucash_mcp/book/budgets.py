@@ -470,22 +470,37 @@ class BudgetsMixin:
         num_periods: int = 12,
         period_type: str = "monthly",
         description: str = "",
+        start_date: str | None = None,
     ) -> dict:
         """Create a new budget.
 
         Args:
             name: Budget name (e.g., "2026 Budget").
-            year: Budget year. Defaults to current year.
+            year: Budget year. Defaults to current year. Ignored
+                when ``start_date`` is provided (start_date is the
+                more specific signal).
             num_periods: Number of periods. Default 12.
             period_type: "monthly" (default), "quarterly", or "weekly".
             description: Optional description.
+            start_date: Optional ISO date (``YYYY-MM-DD``) when the
+                budget's first period begins. When omitted, falls
+                back to January 1 of ``year``. Use this to author
+                a budget covering a historical period (e.g.
+                ``start_date="2024-01-01"`` to compare 2024 actuals
+                against a freshly-authored target) or to start mid-
+                year (``start_date="2025-07-01"``).
+                Bookkeeper-flagged after PR #98: "no way to create
+                a budget that begins in the past blocks comparing
+                a freshly-authored budget against historical
+                actuals."
 
         Returns:
-            Dict with guid, name, and status.
+            Dict with guid, name, start_date, and status.
 
         Raises:
             ValueError: If budget with same name already exists,
-                       invalid period_type, or invalid num_periods.
+                       invalid period_type, invalid num_periods,
+                       or invalid ``start_date`` format.
         """
         import uuid
 
@@ -498,8 +513,20 @@ class BudgetsMixin:
         if num_periods < 1:
             raise ValueError("num_periods must be at least 1")
 
-        if year is None:
-            year = date.today().year
+        # Resolve the period anchor. ``start_date`` is the explicit
+        # signal when provided; ``year`` is the legacy convenience.
+        if start_date is not None:
+            try:
+                period_start = date.fromisoformat(start_date)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid start_date {start_date!r}: must be "
+                    f"YYYY-MM-DD ISO format. {e}"
+                )
+        else:
+            if year is None:
+                year = date.today().year
+            period_start = date(year, 1, 1)
 
         recurrence_map = {
             "monthly": ("month", 1),
@@ -534,7 +561,7 @@ class BudgetsMixin:
                     obj_guid=budget_guid,
                     recurrence_mult=rec_mult,
                     recurrence_period_type=rec_period_type,
-                    recurrence_period_start=date(year, 1, 1),
+                    recurrence_period_start=period_start,
                     recurrence_weekend_adjust="none",
                 )
             )
@@ -555,6 +582,7 @@ class BudgetsMixin:
             return {
                 "guid": short_guid,
                 "name": name,
+                "start_date": period_start.isoformat(),
                 "status": "created",
             }
 
@@ -681,10 +709,24 @@ class BudgetsMixin:
         Args:
             budget_name: Name of the budget.
             period: Which period to report:
-                - None: Current period based on today's date (default)
-                - Integer 0-N: Specific period
-                - "ytd": Year to date (all periods up to current)
-                - "all": All periods
+                - ``None``: Current period (based on today's date).
+                  Default.
+                - Integer ``0..num_periods-1``: A specific period
+                  by index (period 0 is the first; ``num_periods``
+                  out of range raises).
+                - ``"q1"`` / ``"q2"`` / ``"q3"`` / ``"q4"``:
+                  Quarter aliases. Maps each quarter to its three
+                  contributing periods on a monthly budget; raises
+                  on non-monthly budgets where the mapping isn't
+                  defined.
+                - ``"ytd"``: Year-to-date. Includes every period
+                  from the budget's start through the period
+                  covering today (or through the last period if
+                  today is past the budget's end). Raises if
+                  today's date is BEFORE the budget's start.
+                - ``"all"``: Every period in the budget — useful
+                  for comparing budget vs actual across the full
+                  authored range.
             account: Optional filter to specific account or parent.
             include_children: If True and account specified, include
                             child accounts. Default True.

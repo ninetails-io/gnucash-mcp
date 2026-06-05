@@ -98,6 +98,57 @@ class TestCreateBudget:
                 num_periods=0,
             )
 
+    def test_create_with_start_date(self, budget_book: Path):
+        """Explicit ``start_date`` anchors the first period exactly
+        — bookkeeper-flagged feature gap (PR #98 signoff). The
+        argument enables historical budget creation for
+        comparison against past actuals.
+        """
+        book = GnuCashBook(str(budget_book))
+        result = book.create_budget(
+            name="2024 Retroactive",
+            start_date="2024-01-01",
+            num_periods=12,
+            period_type="monthly",
+        )
+        assert result["start_date"] == "2024-01-01"
+
+        budget = book.get_budget(
+            compact=False, name="2024 Retroactive",
+        )
+        assert budget["start_date"] == "2024-01-01"
+
+    def test_start_date_wins_over_year(self, budget_book: Path):
+        """When both ``year`` and ``start_date`` are supplied, the
+        start_date is the more specific signal and takes precedence.
+        """
+        book = GnuCashBook(str(budget_book))
+        result = book.create_budget(
+            name="Mid-Year",
+            year=2026,  # ignored
+            start_date="2025-07-01",
+            num_periods=6,
+            period_type="monthly",
+        )
+        assert result["start_date"] == "2025-07-01"
+
+        budget = book.get_budget(compact=False, name="Mid-Year")
+        # start_date wins; year is ignored.
+        assert budget["start_date"] == "2025-07-01"
+
+    def test_create_invalid_start_date_raises(self, budget_book: Path):
+        """Malformed ``start_date`` raises with a clear message —
+        the ISO parse error is wrapped to surface the field name."""
+        book = GnuCashBook(str(budget_book))
+        with pytest.raises(
+            ValueError,
+            match=r"Invalid start_date '2025/01/01'",
+        ):
+            book.create_budget(
+                name="Bad Date Budget",
+                start_date="2025/01/01",
+            )
+
 
 # ============== TestSetBudgetAmount ==============
 

@@ -142,6 +142,32 @@ def _is_unreconciled(split) -> bool:
     return split.reconcile_state != "y" and not _is_voided(split)
 
 
+def _looks_like_guid_ref(value) -> bool:
+    """True iff ``value`` is a string worth resolving via
+    ``_resolve_account`` — short GUID (``%xxxxxxx``) or 32-char
+    hex full GUID.
+
+    Path strings are already canonical and skip the resolve;
+    non-strings and empty strings short-circuit to False.
+
+    Lives at module level so callers outside BaseGnuCashBook
+    (audit log, dashboard echoes, future display surfaces) can
+    cheaply check whether a value is worth a book lookup before
+    opening a session.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("%"):
+        return True
+    if len(value) == 32:
+        try:
+            int(value, 16)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
@@ -364,6 +390,24 @@ class GnuCashLockError(Exception):
     """Raised when the GnuCash book is locked by another process."""
 
     pass
+
+
+class StaleFXRateError(ValueError):
+    """Raised when posting/paying a foreign-currency document would
+    etch a stale exchange rate.
+
+    Carries a structured ``fx_detail`` so the tool layer
+    (``safe_tool``) can surface a machine-parseable ``error_type:
+    "stale_fx_rate"`` response with the currency, rate, rate date,
+    and age — the inputs the caller needs to either ``create_price``
+    or retry with ``force=True``. Subclasses ``ValueError`` so any
+    generic ``except ValueError`` path degrades it to a plain
+    validation error rather than dropping it.
+    """
+
+    def __init__(self, message: str, fx_detail: dict):
+        super().__init__(message)
+        self.fx_detail = fx_detail
 
 
 # ── Serializers ────────────────────────────────────────────────────
@@ -1272,6 +1316,129 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         if acct is not None and acct.guid in self._template_account_guids(book):
             return None
         return acct
+
+    def _normalize_account_refs(
+        self,
+        params: dict,
+        keys_to_normalize: set[str] | frozenset[str],
+    ) -> dict:
+        """Resolve any short / full-GUID account refs in ``params``
+        to canonical full paths.
+
+        Used by display surfaces (audit log, dashboard echoes) that
+        receive raw param dicts from the MCP tool layer and want to
+        render them human-readably. The audit log is the one human-
+        facing surface in the app — a reviewer shouldn't have to
+        look up ``%2e78c86`` to know what got reconciled.
+
+        R-3: chokepoint for the account-ref-to-fullname rewrite
+        pattern. Pre-fix this lived as
+        ``_normalize_account_refs_for_audit`` inside
+        ``logging_config.py`` and opened its own book session per
+        audit-log render via ``_get_book_func()``. Moving the book
+        mechanics into BaseGnuCashBook puts the work next to
+        ``_resolve_account`` — the other chokepoint it relies on —
+        and lets future display surfaces route through the same
+        primitive without re-deriving the session-open + walk-splits
+        + resolve loop.
+
+        ``keys_to_normalize`` is supplied by the caller because the
+        set of params that carry account refs is caller-specific
+        (audit logs care about ``account`` / ``post_account`` /
+        ``new_parent`` / conditional ``name``; a future dashboard
+        echo might care about different keys). The book layer
+        provides the *mechanics* of resolving refs; the caller
+        provides the *config* of which params to walk.
+
+        Args:
+            params: The raw param dict (typically from an audit-log
+                entry or tool-call record).
+            keys_to_normalize: Top-level keys whose string values
+                should be treated as account refs. ``splits`` is
+                ALWAYS walked when present (its dicts carry
+                ``account`` keys that universally hold refs).
+
+        Returns:
+            A new dict (non-destructive) with ref strings replaced
+            by canonical fullnames where resolution succeeded.
+            Unresolvable refs are left in place so downstream
+            rendering still has something to show.
+        """
+        if not params:
+            return params
+
+        # Pass 1: collect every unique ref worth a lookup.
+        refs: set[str] = set()
+        for key, value in params.items():
+            if key in keys_to_normalize and _looks_like_guid_ref(value):
+                refs.add(value)
+            elif key == "splits" and isinstance(value, list):
+                for split in value:
+                    if isinstance(split, dict):
+                        acct_ref = split.get("account")
+                        if _looks_like_guid_ref(acct_ref):
+                            refs.add(acct_ref)
+        if not refs:
+            return params
+
+        # Pass 2: one book open, resolve everything.
+        resolved: dict[str, str] = {}
+        # Defer the import to dodge the audit-log surfaces that
+        # don't always have ``logging_config`` already loaded
+        # (tests, scripts using GnuCashBook directly).
+        from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
+        debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
+        try:
+            with self.open(readonly=True) as book:
+                for ref in refs:
+                    try:
+                        account = self._resolve_account(book, ref)
+                        if account is not None:
+                            resolved[ref] = account.fullname
+                    except Exception as e:
+                        # Stale, ambiguous, malformed — leave the
+                        # raw ref in place; the log line is still
+                        # useful. Surface in debug log so a post-hoc
+                        # reader who notices a raw ``%xxxxxxx``
+                        # instead of a fullname can find the cause.
+                        debug_logger.warning(
+                            f"Account ref normalization: could not "
+                            f"resolve {ref!r} for canonical rendering "
+                            f"({type(e).__name__}: {e})"
+                        )
+                        continue
+        except Exception as e:
+            debug_logger.warning(
+                f"Account ref normalization: book unavailable "
+                f"({type(e).__name__}: {e})"
+            )
+
+        if not resolved:
+            return params
+
+        def _replace(s):
+            return resolved.get(s, s) if isinstance(s, str) else s
+
+        # Pass 3: rewrite. Non-destructive — return a new dict so
+        # any prior log line that already captured the original
+        # params is unaffected.
+        out: dict = {}
+        for key, value in params.items():
+            if key in keys_to_normalize:
+                out[key] = _replace(value)
+            elif key == "splits" and isinstance(value, list):
+                new_splits = []
+                for split in value:
+                    if isinstance(split, dict) and "account" in split:
+                        new_splits.append(
+                            {**split, "account": _replace(split["account"])}
+                        )
+                    else:
+                        new_splits.append(split)
+                out[key] = new_splits
+            else:
+                out[key] = value
+        return out
 
     def _find_transaction(
         self, book: piecash.Book, guid: str

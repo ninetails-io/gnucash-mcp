@@ -31,10 +31,91 @@ helpers above still walk ``book.prices`` directly today (the v1.3
 performance sweep replaces those walks).
 """
 
+import os
 from datetime import date, datetime
 from decimal import Decimal
 
 import piecash
+
+
+# ── FX staleness cap (Plumb Bob validation, 2026-06-04) ───────────
+#
+# Pre-fix ``_find_exchange_rate`` would happily use the temporally-
+# closest price regardless of distance from ``as_of`` — a 2027
+# invoice could silently use a 2026 rate, a 2020 invoice could
+# silently use a 2025 rate. The error message promised a price "on
+# or near DATE" but the function had no proximity bound, so the
+# error was effectively unreachable for any currency with at least
+# one price on file.
+#
+# The cap below filters candidates to ``|days_offset| <=
+# _FX_STALENESS_DAYS``. When no price within the window exists,
+# the function returns ``None`` and the caller's existing
+# "Add a price with create_price, then retry" error fires correctly
+# (now with a real chance to fire).
+#
+# Default 90 days matches a typical bookkeeping cadence (monthly
+# statement close + a grace period). The
+# ``GNUCASH_FX_STALENESS_DAYS`` env var overrides it; ``0`` or
+# negative disables the cap entirely (pre-fix behavior).
+
+
+def _fx_staleness_days() -> int:
+    """Read the FX staleness cap from the environment.
+
+    Resolved per-call rather than cached because the env var can
+    change between server starts (and tests need to monkey-patch
+    it). The lookup is O(1) so the cost is negligible.
+    """
+    raw = os.environ.get("GNUCASH_FX_STALENESS_DAYS")
+    if raw is None:
+        return 90
+    try:
+        return int(raw)
+    except ValueError:
+        # Malformed value falls back to the default. We don't
+        # want a startup typo to silently disable the cap (which
+        # would happen if we returned 0).
+        return 90
+
+
+# ── FX freshness guard (stale-rate guard on post/pay) ─────────────
+#
+# Distinct from the staleness *cap* above. The cap (90 days) is the
+# outer hard floor enforced inside ``_find_exchange_rate``: beyond
+# it, no rate is returned at all and posting hard-errors. The guard
+# below is the inner *freshness* check applied when a foreign-
+# currency document is posted or paid: when the chosen rate is more
+# than ``GNUCASH_FX_GUARD_DAYS`` (default 7) from the document's own
+# date, the operation refuses unless ``force=True`` — because the
+# rate gets etched in stone at post/pay time and ``create_price``
+# does not retroactively update an already-posted document.
+#
+# Both measure the SAME axis: ``|price_date - as_of|`` (the
+# document date), so they compose into three bands —
+#   <= 7 days   : proceed
+#   7..90 days  : refuse, forceable
+#   > 90 days   : cap hard-errors, not forceable
+#
+# Resolved per-call (not cached) so tests can monkey-patch the
+# threshold freely; the lookup is O(1).
+
+
+def _fx_guard_days() -> int:
+    """Read the FX freshness-guard threshold from the environment.
+
+    ``GNUCASH_FX_GUARD_DAYS`` overrides the 7-day default. A
+    malformed value falls back to 7 rather than silently disabling
+    the guard. Set to ``0`` or negative to disable the guard
+    entirely (the 90-day cap still applies).
+    """
+    raw = os.environ.get("GNUCASH_FX_GUARD_DAYS")
+    if raw is None:
+        return 7
+    try:
+        return int(raw)
+    except ValueError:
+        return 7
 
 
 def _to_date(dt: date | datetime) -> date:
@@ -160,6 +241,19 @@ class CurrencyMixin:
         anchors at or beyond today fold to ``date.max`` so future-
         dated forecast prices are included (convention).
 
+        **Intermediate-currency chaining (issue #94).** A commodity
+        with no price *directly* in the default currency, but
+        reachable through an intermediate, is resolved via
+        :meth:`_market_rate_to_default` (direct → inverse → single
+        pivot, then a security-priced-in-foreign-currency outer hop).
+        This covers a fund priced in USD inside an AED book
+        (fund→USD→AED), a foreign-cash balance whose pair is only
+        quoted through a vehicle currency (GBP→USD→AED), and the
+        3-hop composition. Every leg reuses the market-price filter,
+        so ``type='transaction'`` auto-placeholders never pollute a
+        chained rate. Commodities with no resolvable path stay absent
+        (caller falls back to cost basis).
+
         Args:
             book: Open piecash book.
             as_of: Upper bound on the price date. **Required** — pre-
@@ -195,7 +289,255 @@ class CurrencyMixin:
             existing = latest.get(key)
             if existing is None or p_date > existing[0]:
                 latest[key] = (p_date, Decimal(str(p.value)))
-        return {guid: rate for guid, (_d, rate) in latest.items()}
+        result = {guid: rate for guid, (_d, rate) in latest.items()}
+
+        # Issue #94: chain pass. For every commodity referenced by a
+        # market price that the direct pass above couldn't rate, try
+        # to reach the default currency through an intermediate. Only
+        # commodities with at least one market price are candidates —
+        # one with no price at all has no leg to chain and stays on
+        # cost basis. Each resolution memoizes nothing here; the
+        # per-commodity cost is a few indexed price walks, run only
+        # for the non-direct minority.
+        for commodity in self._commodities_with_market_prices(book):
+            if commodity.guid in result or commodity == default_currency:
+                continue
+            chained = self._market_rate_to_default(
+                book, commodity, default_currency, as_of,
+            )
+            if chained is not None:
+                result[commodity.guid] = chained
+        return result
+
+    @staticmethod
+    def _commodities_with_market_prices(
+        book: piecash.Book,
+    ) -> list[piecash.Commodity]:
+        """Distinct commodities that appear on either side of a market
+        price (``type='transaction'`` rows excluded).
+
+        Both sides matter: a held currency may appear only as the
+        *quote* side of a pair (``USD/GBP`` rather than ``GBP/USD``),
+        and still needs chaining. Returned in a stable order (by
+        namespace then mnemonic) so the chain pass is deterministic.
+        """
+        seen: dict[str, piecash.Commodity] = {}
+        for p in book.prices:
+            if not _is_market_price(p):
+                continue
+            for c in (p.commodity, p.currency):
+                seen.setdefault(c.guid, c)
+        return sorted(
+            seen.values(),
+            key=lambda c: (c.namespace or "", c.mnemonic or ""),
+        )
+
+    def _pivot_currencies(
+        self,
+        book: piecash.Book,
+    ) -> list[piecash.Commodity]:
+        """Currency commodities usable as a triangulation pivot —
+        every ``CURRENCY``-namespace commodity that appears in a market
+        price. Stable order (by mnemonic) for deterministic pivot
+        selection."""
+        currencies = {
+            c.guid: c
+            for c in self._commodities_with_market_prices(book)
+            if c.namespace == "CURRENCY"
+        }
+        return sorted(currencies.values(), key=lambda c: c.mnemonic or "")
+
+    def _cross_rate_with_path(
+        self,
+        book: piecash.Book,
+        from_commodity: piecash.Commodity,
+        to_commodity: piecash.Commodity,
+        as_of: date,
+    ) -> tuple[Decimal, list[str]] | None:
+        """Rate from ``from_commodity`` to ``to_commodity`` with the
+        intermediate path: direct, inverse, or single-pivot.
+
+        ``1 unit of from_commodity == rate units of to_commodity``.
+
+        Returns ``(rate, intermediates)`` where ``intermediates`` is
+        the list of pivot-currency mnemonics strictly between source
+        and target — ``[]`` for a direct/inverse hit, ``[P.mnemonic]``
+        for a single-pivot triangulation. The path feeds the ``(via
+        …)`` provenance annotation so a reader can tell a synthesized
+        cross from a directly-quoted rate.
+
+        Direct/inverse delegates to :meth:`_find_exchange_rate` (skips
+        ``type='transaction'``, enforces the staleness cap). Otherwise
+        each candidate pivot ``P`` with both ``from→P`` and ``P→to``
+        resolving is scored by its **freshest worst leg** (ties broken
+        by pivot mnemonic) so the choice is deterministic. Single pivot
+        only — no graph search, so no cycles and bounded cost.
+
+        ``from_commodity`` may be a security: ``from→P`` resolves to
+        the security's quote-currency price (the first leg of case A).
+
+        Valuation-only — invoice posting deliberately does **not** use
+        this; a posted rate must be a real quote, not a synthesized
+        cross.
+        """
+        if from_commodity == to_commodity:
+            return (Decimal("1"), [])
+        # Valuation chain: legs ignore the FX staleness cap so a
+        # holding values at its latest available rate (matching the
+        # cap-free direct path), regardless of age.
+        direct = self._find_exchange_rate_aged(
+            book,
+            from_commodity=from_commodity,
+            to_commodity=to_commodity,
+            as_of=as_of,
+            respect_staleness_cap=False,
+        )
+        if direct is not None:
+            return (direct[0], [])
+        best_key: tuple[int, str] | None = None
+        best: tuple[Decimal, list[str]] | None = None
+        for pivot in self._pivot_currencies(book):
+            if pivot == from_commodity or pivot == to_commodity:
+                continue
+            leg1 = self._find_exchange_rate_aged(
+                book, from_commodity=from_commodity,
+                to_commodity=pivot, as_of=as_of,
+                respect_staleness_cap=False,
+            )
+            if leg1 is None:
+                continue
+            leg2 = self._find_exchange_rate_aged(
+                book, from_commodity=pivot,
+                to_commodity=to_commodity, as_of=as_of,
+                respect_staleness_cap=False,
+            )
+            if leg2 is None:
+                continue
+            key = (max(leg1[1], leg2[1]), pivot.mnemonic or "")
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (leg1[0] * leg2[0], [pivot.mnemonic or ""])
+        return best
+
+    def _cross_rate(
+        self,
+        book: piecash.Book,
+        from_commodity: piecash.Commodity,
+        to_commodity: piecash.Commodity,
+        as_of: date,
+    ) -> Decimal | None:
+        """Rate-only wrapper over :meth:`_cross_rate_with_path`."""
+        res = self._cross_rate_with_path(
+            book, from_commodity, to_commodity, as_of,
+        )
+        return res[0] if res is not None else None
+
+    def _market_rate_to_default_with_path(
+        self,
+        book: piecash.Book,
+        commodity: piecash.Commodity,
+        default_currency: piecash.Commodity,
+        as_of: date,
+    ) -> tuple[Decimal, list[str]] | None:
+        """Market rate converting one unit of ``commodity`` to the
+        book default currency, with the intermediate path, chaining
+        when there is no direct price (issue #94).
+
+        Resolution order:
+
+        1. :meth:`_cross_rate_with_path` ``commodity → default`` —
+           handles a direct/inverse default-currency price, a currency
+           that triangulates through a pivot (case B), and a security
+           whose quote currency *is* a pivot leg (case A).
+        2. Security-outer fallback: for the newest market price of
+           ``commodity`` in some quote currency ``X`` that itself
+           reaches the default, return ``price(commodity in X) ×
+           rate(X → default)`` with path ``[X] + rest`` — the 3-hop
+           case C (fund priced in GBP, GBP only reachable via USD).
+
+        Returns ``(rate, intermediates)`` or ``None`` when no path
+        exists (caller keeps cost basis). ``intermediates`` is ``[]``
+        only for a direct default-currency price.
+        """
+        if commodity == default_currency:
+            return (Decimal("1"), [])
+        res = self._cross_rate_with_path(
+            book, commodity, default_currency, as_of,
+        )
+        if res is not None:
+            return res
+        for p in self._find_prices(
+            book, commodity_guid=commodity.guid, market_only=True,
+        ):
+            quote = p.currency
+            if quote == default_currency or quote == commodity:
+                continue
+            leg = self._cross_rate_with_path(
+                book, quote, default_currency, as_of,
+            )
+            if leg is not None:
+                return (
+                    Decimal(str(p.value)) * leg[0],
+                    [quote.mnemonic or ""] + leg[1],
+                )
+        return None
+
+    def _market_rate_to_default(
+        self,
+        book: piecash.Book,
+        commodity: piecash.Commodity,
+        default_currency: piecash.Commodity,
+        as_of: date,
+    ) -> Decimal | None:
+        """Rate-only wrapper over
+        :meth:`_market_rate_to_default_with_path`."""
+        res = self._market_rate_to_default_with_path(
+            book, commodity, default_currency, as_of,
+        )
+        return res[0] if res is not None else None
+
+    @staticmethod
+    def _format_via(intermediates: list[str]) -> str | None:
+        """Render a chain path as a ``(via …)`` provenance note.
+
+        ``[]`` → ``None`` (direct rate, no annotation). ``["USD"]`` →
+        ``"via USD"``. ``["GBP", "USD"]`` → ``"via GBP→USD"`` (the
+        full hop sequence, so the reader knows exactly which legs to
+        check if a synthesized rate looks off).
+        """
+        if not intermediates:
+            return None
+        return "via " + "→".join(intermediates)
+
+    def _rate_provenance(
+        self,
+        book: piecash.Book,
+        as_of: date,
+        default_currency: piecash.Commodity,
+    ) -> dict[str, str]:
+        """``{commodity_guid: "via …"}`` for every commodity whose
+        default-currency rate is *synthesized* through an intermediate.
+
+        Directly-priced commodities are absent (no provenance to
+        surface). Same family as ``fx_stale`` / ``discount_available``:
+        a confidence signal so the reader distinguishes a rate they
+        entered from one the system derived across two legs, each with
+        its own staleness and rounding. Computed only for the chained
+        minority, so it's cheap (and empty on single-currency books).
+        """
+        provenance: dict[str, str] = {}
+        for commodity in self._commodities_with_market_prices(book):
+            if commodity == default_currency:
+                continue
+            res = self._market_rate_to_default_with_path(
+                book, commodity, default_currency, as_of,
+            )
+            if res is None:
+                continue
+            via = self._format_via(res[1])
+            if via is not None:
+                provenance[commodity.guid] = via
+        return provenance
 
     def _account_conversion_factors(
         self,
@@ -267,6 +609,7 @@ class CurrencyMixin:
         default_currency: piecash.Commodity,
         today: date | None = None,
         with_cost_fallback: bool = True,
+        provenance: dict[str, str] | None = None,
     ) -> tuple[Decimal, str | None]:
         """Value an account-level quantity with a display annotation.
 
@@ -303,7 +646,11 @@ class CurrencyMixin:
         sym = account.commodity.mnemonic
         rate = rates.get(account.commodity.guid)
         if rate is not None:
-            return quantity * rate, f"{quantity} {sym} @ {rate}"
+            note = f"{quantity} {sym} @ {rate}"
+            via = (provenance or {}).get(account.commodity.guid)
+            if via:
+                note += f" ({via})"
+            return quantity * rate, note
         if not with_cost_fallback:
             return Decimal("0"), f"{quantity} {sym} — no price data"
         cost_basis = Decimal("0")
@@ -323,6 +670,33 @@ class CurrencyMixin:
 
         ``1 unit of from_commodity == rate units of to_commodity``.
 
+        Thin wrapper over :meth:`_find_exchange_rate_aged` that drops
+        the age/date metadata — the rate-only return that most callers
+        (FX gain/loss, price-delete safety, valuation) want. See the
+        aged variant for the selection rules and the staleness cap.
+
+        Returns:
+            Decimal rate, or ``None`` when no usable price exists in
+            either direction WITHIN the staleness window.
+        """
+        aged = CurrencyMixin._find_exchange_rate_aged(
+            book, from_commodity, to_commodity, as_of
+        )
+        return aged[0] if aged is not None else None
+
+    @staticmethod
+    def _find_exchange_rate_aged(
+        book: piecash.Book,
+        from_commodity: piecash.Commodity,
+        to_commodity: piecash.Commodity,
+        as_of: date,
+        respect_staleness_cap: bool = True,
+    ) -> tuple[Decimal, int, date] | None:
+        """Cross-currency rate near ``as_of``, with the chosen
+        price's age and date.
+
+        ``1 unit of from_commodity == rate units of to_commodity``.
+
         Preference order:
 
         1. Direct price (``commodity=from, currency=to``) dated on or
@@ -331,6 +705,21 @@ class CurrencyMixin:
            before, closest. Returned as ``1 / p.value``.
         3. Direct after ``as_of``, closest.
         4. Inverse after ``as_of``, closest.
+
+        **Staleness cap (Plumb Bob, 2026-06-04):** candidates more
+        than ``GNUCASH_FX_STALENESS_DAYS`` (default 90) from
+        ``as_of`` are excluded. Pre-fix the function would happily
+        return a 5-year-old rate on a 2027 invoice; the documented
+        "on or near DATE" promise was effectively unreachable.
+        Setting the env var to ``0`` or a negative value disables
+        the cap (restores pre-fix behavior). ``respect_staleness_cap=
+        False`` disables it per-call — used by the valuation chain
+        (issue #94), which must value a holding at its latest
+        available rate regardless of age (matching the cap-free
+        direct path in ``_rates_as_of``); the separate stale-price
+        warning, not a hard cap, is what flags age for reporting. The
+        cap stays on for invoice posting, where a stale rate is etched
+        and must be refused.
 
         Skips piecash's auto-created ``type='transaction'`` rows —
         those are 1.0 placeholders generated on cross-currency invoice
@@ -341,16 +730,26 @@ class CurrencyMixin:
         gets the same guard for consistent failure signaling).
 
         Returns:
-            Decimal rate, or ``None`` when no usable price exists in
-            either direction.
+            ``(rate, age_days, price_date)`` where ``age_days`` is the
+            absolute day distance ``|price_date - as_of|`` of the
+            chosen price and ``price_date`` is that price's date — the
+            inputs the freshness guard needs to judge staleness. Same-
+            commodity returns ``(Decimal("1"), 0, as_of)``. ``None``
+            when no usable price exists within the staleness window.
         """
         if from_commodity == to_commodity:
-            return Decimal("1")
+            return (Decimal("1"), 0, as_of)
 
-        best_before_direct: tuple[int, Decimal] | None = None
-        best_after_direct: tuple[int, Decimal] | None = None
-        best_before_inverse: tuple[int, Decimal] | None = None
-        best_after_inverse: tuple[int, Decimal] | None = None
+        cap = _fx_staleness_days()
+        # cap <= 0 (or respect_staleness_cap=False) disables the
+        # staleness window.
+        cap_enabled = respect_staleness_cap and cap > 0
+
+        # Each candidate: (abs_age_days, rate, price_date).
+        best_before_direct: tuple[int, Decimal, date] | None = None
+        best_after_direct: tuple[int, Decimal, date] | None = None
+        best_before_inverse: tuple[int, Decimal, date] | None = None
+        best_after_inverse: tuple[int, Decimal, date] | None = None
 
         for p in book.prices:
             if not _is_market_price(p):
@@ -358,26 +757,30 @@ class CurrencyMixin:
             p_date = _to_date(p.date)
             if p.commodity == from_commodity and p.currency == to_commodity:
                 days = (as_of - p_date).days
+                if cap_enabled and abs(days) > cap:
+                    continue
                 rate = Decimal(str(p.value))
                 if rate <= 0:
                     continue
                 if days >= 0:
                     if best_before_direct is None or days < best_before_direct[0]:
-                        best_before_direct = (days, rate)
+                        best_before_direct = (days, rate, p_date)
                 else:
                     if best_after_direct is None or -days < best_after_direct[0]:
-                        best_after_direct = (-days, rate)
+                        best_after_direct = (-days, rate, p_date)
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
+                if cap_enabled and abs(days) > cap:
+                    continue
                 if Decimal(str(p.value)) <= 0:
                     continue
                 rate = Decimal("1") / Decimal(str(p.value))
                 if days >= 0:
                     if best_before_inverse is None or days < best_before_inverse[0]:
-                        best_before_inverse = (days, rate)
+                        best_before_inverse = (days, rate, p_date)
                 else:
                     if best_after_inverse is None or -days < best_after_inverse[0]:
-                        best_after_inverse = (-days, rate)
+                        best_after_inverse = (-days, rate, p_date)
 
         for candidate in (
             best_before_direct,
@@ -386,5 +789,6 @@ class CurrencyMixin:
             best_after_inverse,
         ):
             if candidate is not None:
-                return candidate[1]
+                age_days, rate, p_date = candidate
+                return (rate, age_days, p_date)
         return None

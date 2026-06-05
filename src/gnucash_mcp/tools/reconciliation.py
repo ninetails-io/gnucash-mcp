@@ -10,6 +10,7 @@ from gnucash_mcp.tools._helpers import (
     SplitGuid,
     TransactionGuid,
     _json,
+    _parse_iso_date,
     safe_tool,
 )
 
@@ -33,7 +34,7 @@ def register(mcp, get_book) -> None:
             reconcile_date: Date in ISO format (YYYY-MM-DD). Required for 'y', defaults to today.
         """
         book = get_book()
-        rec_date = date.fromisoformat(reconcile_date) if reconcile_date else None
+        rec_date = _parse_iso_date(reconcile_date)
         result = book.set_reconcile_state(
             split_guid=split_guid,
             state=state,
@@ -67,7 +68,7 @@ def register(mcp, get_book) -> None:
             limit: Maximum splits to return. Defaults to 50, capped at 250.
         """
         book = get_book()
-        date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+        date_obj = _parse_iso_date(as_of_date)
         result = book.get_unreconciled_splits(
             account_name=account,
             as_of_date=date_obj,
@@ -166,7 +167,7 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         stmt_date = date.fromisoformat(statement_date)
-        through = date.fromisoformat(through_date) if through_date else None
+        through = _parse_iso_date(through_date)
         result = book.reconcile_account(
             account_name=account,
             statement_date=stmt_date,

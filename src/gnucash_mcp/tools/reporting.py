@@ -3,7 +3,7 @@
 from datetime import date
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import _json, _parse_iso_date, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -122,7 +122,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.net_worth(
             end_date=date.fromisoformat(end_date),
-            start_date=date.fromisoformat(start_date) if start_date else None,
+            start_date=_parse_iso_date(start_date),
             interval=interval,
         )
         return _json(result)

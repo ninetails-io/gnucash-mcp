@@ -1,5 +1,8 @@
 """Tests for tool module filtering and server configuration."""
 
+import re
+from pathlib import Path
+
 import pytest
 
 from gnucash_mcp.book import extracted_modules
@@ -12,6 +15,7 @@ from gnucash_mcp.server import (
     _loaded_tool_files,
     _reset_lazy_load_state,
     _server_state,
+    _validate_module_groups,
     _validate_tool_modules,
     mcp,
 )
@@ -796,3 +800,73 @@ class TestOwnerTypeGating:
         _LOADED_MODULES.update({"core", "freelancer"})
         with pytest.raises(ValueError, match="Invalid owner_type"):
             _gate_owner_type("venddor")
+
+
+class TestJsonDumpsForbiddenInTools:
+    """L-4: ``tools/*.py`` must serialize via the project's
+    ``_json()`` helper, never ``json.dumps``.
+
+    Why: ``_json`` enforces compact separators, strips noise
+    (None / empty-string fields), and disables ASCII escaping —
+    the wire format the bookkeeper review loop locked into
+    place during PR #92. Bare ``json.dumps`` would re-introduce
+    indented output (40-60% bloat), reintroduce noise fields,
+    or escape non-ASCII commodity names (CNY / Russian / etc.)
+    into ``\\uXXXX`` sequences.
+
+    Allowed exceptions:
+      - The ``_json`` definition itself in ``_helpers.py``.
+      - Comment text that mentions ``json.dumps`` for
+        explanatory purposes.
+    """
+
+    _CALL_RE = re.compile(r"\bjson\.dumps\s*\(")
+
+    def test_no_bare_json_dumps_calls_in_tools_files(self):
+        tools_dir = (
+            Path(__file__).parent.parent
+            / "src" / "gnucash_mcp" / "tools"
+        )
+        offending: list[str] = []
+        for py in sorted(tools_dir.glob("*.py")):
+            for i, raw in enumerate(py.read_text().splitlines(), 1):
+                line = raw.split("#", 1)[0]  # drop comments
+                if py.name == "_helpers.py" and "return json.dumps(" in line:
+                    # The _json() implementation is the canonical
+                    # call site; everything else in tools/* must
+                    # go through it.
+                    continue
+                if self._CALL_RE.search(line):
+                    offending.append(f"{py.name}:{i}: {raw.strip()}")
+        assert not offending, (
+            "tools/*.py must use _json(); found bare json.dumps():\n  "
+            + "\n  ".join(offending)
+        )
+
+
+class TestModuleGroupsValidation:
+    """MP-10: every member of MODULE_GROUPS must be a key in
+    TOOL_MODULES. A typo (``"reconcilation"``) would otherwise
+    produce a silently-empty expansion at runtime — the user
+    types ``--modules=core`` and the misspelled member just
+    doesn't load.
+    """
+
+    def test_current_mapping_passes(self):
+        # Should not raise.
+        _validate_module_groups()
+
+    def test_typo_in_member_raises(self):
+        bogus_groups = {"core": ["accounts", "reconcilation"]}
+        from gnucash_mcp import server as srv
+
+        original = srv.MODULE_GROUPS
+        srv.MODULE_GROUPS = bogus_groups
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="MODULE_GROUPS references unknown module",
+            ):
+                _validate_module_groups()
+        finally:
+            srv.MODULE_GROUPS = original

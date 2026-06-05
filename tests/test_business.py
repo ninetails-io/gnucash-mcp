@@ -3,7 +3,10 @@
 import json
 from datetime import date, timedelta
 from decimal import Decimal
+from pathlib import Path
+
 import pytest
+
 from gnucash_mcp.book import GnuCashBook
 
 
@@ -3564,6 +3567,10 @@ class TestTaxtableCrossCurrency:
         result = gb.post_invoice(
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
+            # Pin to the price date so the FX freshness guard
+            # doesn't fire — this test exercises tax conversion
+            # math, not rate staleness.
+            post_date="2026-05-24",
         )
         # Customer-facing total in EUR (invoice currency).
         assert Decimal(result["total"]) == Decimal("105.00")
@@ -5621,6 +5628,9 @@ class TestCreditNotePr87ReviewFollowups:
             invoice_id=src["id"],
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
+            # Pin to the price date; this test targets the apply-
+            # time cross-currency guard, not FX rate staleness.
+            post_date="2026-05-24",
         )
         cn = gb.create_credit_note(
             owner_id="000001", owner_type="customer",
@@ -5634,6 +5644,7 @@ class TestCreditNotePr87ReviewFollowups:
             invoice_id=cn["id"],
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
+            post_date="2026-05-24",
         )
         with pytest.raises(
             ValueError, match="Cross-currency apply not supported",
@@ -8156,6 +8167,89 @@ class TestPayInvoice:
             )
             assert rate is None
 
+    def test_find_exchange_rate_respects_staleness_cap(
+        self, business_book, monkeypatch,
+    ):
+        """Plumb Bob bookkeeper-flagged: pre-fix the function
+        would silently use a stale price regardless of distance
+        from ``as_of``. The 90-day default cap (overridable via
+        GNUCASH_FX_STALENESS_DAYS) now refuses prices outside
+        the window — surfacing the "Add a price with
+        create_price" error the docstring promised.
+        """
+        import piecash
+        from datetime import date as _date
+
+        gb = GnuCashBook(str(business_book))
+        # Insert a fresh EUR/USD price and a stale one.
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            try:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+                book.flush()
+            except Exception:
+                eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            # A "fresh" price 30 days before our as_of.
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 5, 1), value="1.10",
+                source="user:price", type="nav",
+            ))
+            # A "stale" price 5 years before our as_of (will be
+            # the only candidate when we drop the fresh one).
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2021, 1, 1), value="1.05",
+                source="user:price", type="nav",
+            ))
+            book.save()
+
+        # Default 90-day cap: fresh price (30 days back) is within
+        # window, stale price (years back) is outside. We get the
+        # fresh one.
+        monkeypatch.delenv("GNUCASH_FX_STALENESS_DAYS", raising=False)
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 5, 31),
+            )
+            assert rate == Decimal("1.10")
+
+        # Tighten the cap to 10 days: both prices fall outside.
+        # No usable rate → None → caller raises with the
+        # "Add a price" hint.
+        monkeypatch.setenv("GNUCASH_FX_STALENESS_DAYS", "10")
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                as_of=_date(2026, 5, 31),
+            )
+            assert rate is None, (
+                "Both prices are >10 days from as_of; cap should "
+                "refuse them"
+            )
+
+        # Cap=0 disables the window — original pre-fix behavior.
+        # The stale 2021 price is now usable on a 2026 query.
+        monkeypatch.setenv("GNUCASH_FX_STALENESS_DAYS", "0")
+        with gb.open(readonly=True) as book:
+            usd = book.default_currency
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            rate = gb._find_exchange_rate(
+                book, from_commodity=eur, to_commodity=usd,
+                # 6 years past the only "fresh" rate; default cap
+                # would refuse this, but the disable lets the
+                # nearest-available (the 2026-05-01 price) win.
+                as_of=_date(2032, 1, 1),
+            )
+            # 2026-05-01 is closer to 2032-01-01 than 2021-01-01.
+            assert rate == Decimal("1.10")
+
     def test_pay_invoice_converts_ar_quantity_when_ar_currency_differs(
         self, business_book,
     ):
@@ -9896,3 +9990,384 @@ class TestCnyBugReportFollowups:
                 gb._get_or_create_fx_account(
                     book, fx_account="Assets:Checking",
                 )
+
+
+class TestBusinessFreeTextCaps:
+    """MP-5: business entity free-text byte caps.
+
+    Two layers of defense, exercised separately:
+
+    1. **Tool layer** — Pydantic ``Field(max_length=N)`` on
+       ``notes`` and a ``BusinessAddressInput`` model with per-
+       field ``max_length`` on the address dict. FastMCP rejects
+       at the schema layer BEFORE ``@audit_log`` runs auto-backup,
+       so an oversize value rejects in milliseconds rather than
+       hanging on the backup (Plumb Bob's blocker on PR validation).
+
+    2. **Book layer** — ``_validate_business_freetext`` runs UTF-8
+       byte-length checks inside the create/update path. Belt-and-
+       suspenders for direct callers (scripts, tests) that bypass
+       the MCP boundary; also catches the pathological multi-byte
+       UTF-8 case where character length is under the schema cap
+       but byte length exceeds the storage cap.
+    """
+
+    def test_book_layer_rejects_oversize_notes(self, test_book: Path):
+        """Direct ``GnuCashBook.create_customer`` call with 5000-byte
+        notes should raise immediately — bypasses MCP boundary."""
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match=r"notes exceeds 4096-byte cap"):
+            gb.create_customer(name="Test", notes="X" * 5000)
+
+    def test_book_layer_rejects_oversize_address_field(
+        self, test_book: Path,
+    ):
+        gb = GnuCashBook(str(test_book))
+        with pytest.raises(
+            ValueError, match=r"address\.addr1 exceeds 1024-byte cap",
+        ):
+            gb.create_customer(
+                name="Test",
+                address={"addr1": "X" * 2000},
+            )
+
+    def test_book_layer_accepts_under_cap(self, test_book: Path):
+        gb = GnuCashBook(str(test_book))
+        result = gb.create_customer(
+            name="UnderCap", notes="X" * 4096,
+            address={"addr1": "Y" * 1024},
+        )
+        assert result["status"] == "created"
+
+    def test_pydantic_model_rejects_oversize_notes_before_book(
+        self, test_book: Path,
+    ):
+        """The tool-layer Pydantic constraint on ``notes`` should
+        reject oversize input WITHOUT triggering any book-layer
+        work. Verified by importing the annotation and asking
+        Pydantic to validate directly.
+        """
+        from pydantic import BaseModel, ValidationError
+        from gnucash_mcp.tools._helpers import BusinessNotes
+
+        class _Probe(BaseModel):
+            notes: BusinessNotes = ""
+
+        # 5000 chars — same as Plumb Bob's failing case.
+        with pytest.raises(ValidationError) as exc:
+            _Probe(notes="X" * 5000)
+        # Pydantic's message includes the max_length constraint.
+        msg = str(exc.value)
+        assert "4096" in msg, msg
+
+    def test_pydantic_model_rejects_oversize_address_field(
+        self, test_book: Path,
+    ):
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import BusinessAddressInput
+
+        with pytest.raises(ValidationError) as exc:
+            BusinessAddressInput(addr1="X" * 2000)
+        assert "1024" in str(exc.value)
+
+    def test_pydantic_address_model_forbids_unknown_keys(self):
+        """``BusinessAddressInput`` uses ``extra='forbid'`` so typo
+        keys (``adr1`` instead of ``addr1``) reject rather than
+        silently drop."""
+        from pydantic import ValidationError
+        from gnucash_mcp.tools._helpers import BusinessAddressInput
+
+        with pytest.raises(ValidationError) as exc:
+            BusinessAddressInput(adr1="oops")
+        assert "extra" in str(exc.value).lower() or "forbid" in str(exc.value).lower()
+
+
+class TestFXStaleRateGuard:
+    """FX freshness guard on post_invoice / pay_invoice.
+
+    A cross-currency document etches its exchange rate at post/pay
+    time and ``create_price`` cannot update it retroactively. The
+    guard refuses when the chosen rate is more than
+    ``GNUCASH_FX_GUARD_DAYS`` (default 7) from the document's own
+    date, unless ``force=True``. Three bands on one axis
+    (``|price_date - doc_date|``): ≤7 proceed, 7–90 refuse-but-
+    forceable, >90 the staleness cap hard-errors (not forceable).
+
+    The axis is the DOCUMENT date, not wall-clock today — a
+    correctly-dated backdated posting passes; a rate that drifts
+    forward of the document fails symmetrically.
+    """
+
+    def _eur_invoice_in_usd_book(
+        self, business_book, *, price_date, rate="1.10",
+    ):
+        """USD-default book + one EUR/USD market price at
+        ``price_date`` + an unposted 1-line EUR invoice (id 000001,
+        EUR 100). Returns the GnuCashBook."""
+        import piecash
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as bk:
+            eur = piecash.Commodity(
+                namespace="CURRENCY", mnemonic="EUR",
+                fullname="Euro", fraction=100,
+            )
+            bk.session.add(eur)
+            bk.flush()
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=bk.default_currency,
+                date=price_date, value=rate, type="last",
+            ))
+            bk.save()
+        gb.create_customer(name="Berlin GmbH", currency="EUR")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="work", quantity="1", price="100",
+        )
+        return gb
+
+    # ── fresh / under-threshold: guard silent ─────────────────────
+
+    def test_fresh_rate_posts_without_fx_stale(self, business_book):
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-03",  # 2 days
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    def test_six_days_under_threshold_posts(self, business_book):
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-07",  # 6 days
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    # ── stale band (7–90): refuse unless forced ───────────────────
+
+    def test_stale_rate_refused_without_force(self, business_book):
+        from gnucash_mcp.book import StaleFXRateError
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        with pytest.raises(StaleFXRateError) as exc:
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-06-20",  # 19 days
+            )
+        detail = exc.value.fx_detail
+        assert detail["currency"] == "EUR"
+        assert detail["rate_date"] == "2026-06-01"
+        assert detail["age_days"] == 19
+        assert Decimal(detail["rate"]) == Decimal("1.10")
+
+    def test_eight_days_just_over_threshold_refused(self, business_book):
+        from gnucash_mcp.book import StaleFXRateError
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        with pytest.raises(StaleFXRateError):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-06-09",  # 8 days
+            )
+
+    def test_stale_rate_forced_attaches_fx_stale(self, business_book):
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-20",  # 19 days
+            force=True,
+        )
+        assert result["status"] == "posted"
+        fx = result["fx_stale"]
+        assert fx["currency"] == "EUR"
+        assert fx["rate_date"] == "2026-06-01"
+        assert fx["age_days"] == 19
+        assert fx["forced"] is True
+        assert Decimal(fx["rate_used"]) == Decimal("1.10")
+
+    def test_force_with_fresh_rate_adds_no_block(self, business_book):
+        """force=True is silently ignored when nothing is stale —
+        no fx_stale block, because nothing was overridden."""
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-03",  # 2 days
+            force=True,
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    # ── document-date axis (the design decision) ──────────────────
+
+    def test_backdated_posting_judged_by_document_date(self, business_book):
+        """A January invoice posted with a January-dated rate passes
+        even though the document is months behind wall-clock today —
+        staleness is measured against the document date, not now."""
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 1, 2),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",  # 1 day from the rate
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    def test_forward_drifted_rate_refused_symmetrically(self, business_book):
+        """A rate dated AFTER the document by >7 days is just as
+        stale as one before it — |offset| is symmetric."""
+        from gnucash_mcp.book import StaleFXRateError
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 20),
+        )
+        with pytest.raises(StaleFXRateError) as exc:
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-06-01",  # rate is 19 days FORWARD
+            )
+        assert exc.value.fx_detail["age_days"] == 19
+
+    # ── interaction with the 90-day staleness cap ─────────────────
+
+    def test_beyond_cap_not_forceable(self, business_book):
+        """A rate past the 90-day staleness cap is excluded entirely
+        — the no-rate hard error fires and force cannot rescue it."""
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        with pytest.raises(ValueError, match="no matching price"):
+            gb.post_invoice(
+                invoice_id="000001",
+                post_account="Assets:Accounts Receivable",
+                post_date="2026-10-15",  # 136 days > 90
+                force=True,
+            )
+
+    # ── same-currency: guard never engages ────────────────────────
+
+    def test_same_currency_skips_guard(self, business_book):
+        """A USD invoice in a USD book never touches the rate path,
+        so an old post date is irrelevant — no guard, no price."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme USD")
+        inv = gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="work", quantity="1", price="100",
+        )
+        result = gb.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-01-01",  # far from "today", no price
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    # ── env override ──────────────────────────────────────────────
+
+    def test_env_var_disables_guard(self, business_book, monkeypatch):
+        monkeypatch.setenv("GNUCASH_FX_GUARD_DAYS", "0")
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        result = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-20",  # 19 days — would normally refuse
+        )
+        assert result["status"] == "posted"
+        assert "fx_stale" not in result
+
+    # ── pay path ──────────────────────────────────────────────────
+
+    def test_pay_stale_refused_then_forced(self, business_book):
+        """The guard covers pay as well as post: post fresh, then a
+        payment whose pay-date rate is stale refuses, and force lets
+        it through with an fx_stale block."""
+        from gnucash_mcp.book import StaleFXRateError
+        gb = self._eur_invoice_in_usd_book(
+            business_book, price_date=date(2026, 6, 1),
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-06-03",  # fresh post
+        )
+        # Pay 24 days after the only rate → stale at pay time.
+        with pytest.raises(StaleFXRateError):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="100",
+                payment_date="2026-06-25",
+            )
+        forced = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="100",
+            payment_date="2026-06-25",
+            force=True,
+        )
+        assert forced["status"] == "paid"
+        assert forced["fx_stale"]["age_days"] == 24
+        assert forced["fx_stale"]["forced"] is True
+
+    # ── audit-log "forced" annotation ─────────────────────────────
+
+    def test_audit_formatter_renders_forced_line(self):
+        from gnucash_mcp.logging_config import _fmt_invoice_post
+        entry = {
+            "params": {"id": "000001", "post_account": "Assets:A/R"},
+            "after_state": {
+                "total": "100.00",
+                "post_date": "2026-06-20",
+                "transaction_guid": "abcd1234",
+                "fx_stale": {
+                    "currency": "EUR",
+                    "rate_used": "1.1",
+                    "rate_date": "2026-06-01",
+                    "age_days": 19,
+                    "forced": True,
+                },
+            },
+        }
+        lines = _fmt_invoice_post(entry)
+        joined = "\n".join(lines)
+        assert "EUR" in joined
+        assert "19 days" in joined
+        assert "forced" in joined
+
+    def test_audit_formatter_no_fx_line_when_fresh(self):
+        from gnucash_mcp.logging_config import _fmt_invoice_post
+        entry = {
+            "params": {"id": "000001", "post_account": "Assets:A/R"},
+            "after_state": {
+                "total": "100.00",
+                "post_date": "2026-06-03",
+                "transaction_guid": "abcd1234",
+            },
+        }
+        joined = "\n".join(_fmt_invoice_post(entry))
+        assert "forced" not in joined
+        assert "stale" not in joined

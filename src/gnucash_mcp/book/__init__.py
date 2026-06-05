@@ -18,6 +18,7 @@ import importlib
 from gnucash_mcp.book._base import (
     BaseGnuCashBook,
     GnuCashLockError,
+    StaleFXRateError,
     _to_decimal,
     _verify_composite_write,
     _verify_delete,
@@ -109,6 +110,7 @@ __all__ = [
     "BaseGnuCashBook",
     "GnuCashBook",
     "GnuCashLockError",
+    "StaleFXRateError",
     "build_book_class",
     "extracted_modules",
     "_to_decimal",

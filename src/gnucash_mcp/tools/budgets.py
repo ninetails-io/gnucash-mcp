@@ -57,18 +57,26 @@ def register(mcp, get_book) -> None:
         num_periods: int = 12,
         period_type: str = "monthly",
         description: str = "",
+        start_date: str | None = None,
     ) -> str:
         """Create a new budget.
 
         Args:
             name: Budget name (e.g., "2026 Budget").
-            year: Budget year. Defaults to current year. Used to set start date.
+            year: Budget year. Defaults to current year. Ignored when
+                ``start_date`` is provided.
             num_periods: Number of periods. Default 12 (monthly for a year).
             period_type: Period length:
                 - "monthly" (default)
                 - "quarterly"
                 - "weekly"
             description: Optional description.
+            start_date: Optional ISO date (YYYY-MM-DD) when the
+                budget's first period begins. When omitted, falls
+                back to January 1 of ``year``. Use this to author
+                a historical budget for comparison against past
+                actuals (e.g. ``start_date="2024-01-01"``) or to
+                start mid-year.
         """
         book = get_book()
         result = book.create_budget(
@@ -77,6 +85,7 @@ def register(mcp, get_book) -> None:
             num_periods=num_periods,
             period_type=period_type,
             description=description,
+            start_date=start_date,
         )
         return _json(result)
 

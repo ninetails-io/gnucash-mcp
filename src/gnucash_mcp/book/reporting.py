@@ -246,10 +246,22 @@ class ReportingMixin:
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
+        Internal transfers are NOT filtered here (unlike
+        ``cash_flow``): every EXPENSE split is real spending by
+        definition. The cash-flow framing's transfer concept
+        doesn't apply.
+
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
+            depth: Hierarchy depth for grouping. ``1`` returns the
+                top-level expense buckets (``Expenses:Food``,
+                ``Expenses:Transport``); ``2`` adds one level of
+                children (``Expenses:Food:Groceries``,
+                ``Expenses:Food:Restaurants``). Deeper values
+                surface progressively finer leaves; values greater
+                than the account-tree depth are clamped to the leaf
+                level.
             compact: If True (default), return an aligned text table
                      suitable for direct LLM consumption (Phase 4C).
                      Verbose mode returns the structured dict.
@@ -390,11 +402,37 @@ class ReportingMixin:
     def balance_sheet(self, as_of_date: date) -> dict:
         """Generate a balance sheet as of a specific date.
 
+        Equity includes a computed **Unrealized gain/loss** line —
+        the residual that makes ``A = L + E`` hold by construction.
+        Assets render at market value (factor × quantity for
+        commodities and foreign-currency cash) while equity rolls
+        up from raw split values (historical cost). The residual
+        captures two effects under one heading:
+
+        - Investment market drift on STOCK/MUTUAL holdings
+          (shares × current_price vs. cost basis recorded as
+          split.value).
+        - FX translation adjustment on foreign-currency accounts
+          (current default-currency value vs. historical default-
+          currency equivalent at post time).
+
+        Both are accumulated-other-comprehensive-income items
+        under GAAP. Surfacing the decomposition is a future
+        feature; the single line preserves the balance-sheet
+        identity for any mix.
+
         Args:
-            as_of_date: Date to calculate balances as of.
+            as_of_date: Date to calculate balances as of. The
+                inclusive upper bound — transactions posted on
+                ``as_of_date`` are included. FX rates and
+                commodity prices are anchored to the same date for
+                a coherent historical view.
 
         Returns:
-            Dict with assets, liabilities, equity sections and totals.
+            Dict with ``assets``, ``liabilities``, ``equity``
+            sections (each a list of account rows) and ``totals``
+            (assets, liabilities, equity, with ``equity`` already
+            including the Unrealized line so totals balance).
         """
         # Sum splits across every relevant type in one SQL-filtered
         # pass. The old code opened Python loops per account; now we
@@ -466,6 +504,13 @@ class ReportingMixin:
             # have been valued at on the report date — not today's
             # rate (SB-2).
             latest_rates = self._rates_as_of(book, as_of_date)
+            # Provenance for any rate synthesized through an
+            # intermediate currency (issue #94), so a chained value
+            # renders "@ rate (… via USD)" — distinguishing a derived
+            # cross from a directly-quoted rate the reader entered.
+            rate_via = self._rate_provenance(
+                book, as_of_date, default_currency,
+            )
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
@@ -569,9 +614,12 @@ class ReportingMixin:
                         sym = commodity.mnemonic
                         qty = info["quantity"]
                         if rate is not None:
+                            via = rate_via.get(commodity.guid)
+                            via_note = f", {via}" if via else ""
                             balance_str = (
                                 f"{qty} {sym} @ {rate} "
-                                f"({ccy_mnemonic} {info['usd']:,.2f})"
+                                f"({ccy_mnemonic} {info['usd']:,.2f}"
+                                f"{via_note})"
                             )
                         else:
                             # No price on file — fall back to cost basis
@@ -759,7 +807,20 @@ class ReportingMixin:
             b_idx = 0
 
             for split, txn, account in rows:
-                # Snapshot every boundary strictly before this split.
+                # MP-8: snapshot every boundary STRICTLY BEFORE
+                # this split. The strict ``>`` is correct and
+                # deliberate: a boundary equal to a split's
+                # post_date includes that split in its snapshot
+                # (the boundary is "end of day", so a transaction
+                # posted that day has happened by then). The
+                # cumulative running totals above this loop
+                # advance after the snapshot is taken, so the
+                # snapshot reflects every prior split AND every
+                # split posted on the boundary date — matching
+                # the inclusive-end semantics ``_query_filtered_splits``
+                # enforces at the SQL boundary. A ``>=`` here
+                # would exclude same-day splits, silently breaking
+                # the trajectory's tie to ``balance_sheet(as_of)``.
                 while (
                     b_idx < len(boundaries)
                     and txn.post_date > boundaries[b_idx]
@@ -1097,6 +1158,12 @@ class ReportingMixin:
             )
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
+            # MP-9: track whether ANY debt-typed account exists, so
+            # the no-debts error can distinguish "no CREDIT/LIABILITY
+            # accounts at all" from "they exist but lack the apr
+            # slot" — the user's next action differs sharply
+            # between those cases.
+            debt_typed_account_count = 0
 
             # Template accounts (scheduled-transaction
             # scaffolding) inherit type=CREDIT/LIABILITY from
@@ -1112,6 +1179,7 @@ class ReportingMixin:
                     continue
                 if account.type not in debt_types:
                     continue
+                debt_typed_account_count += 1
 
                 # Materialize ``account.slots`` into a dict once. Pre-fix,
                 # each ``account[key]`` access (apr, minimum_payment,
@@ -1219,9 +1287,22 @@ class ReportingMixin:
                 })
 
         if not debts:
+            # MP-9: distinguish the two failure modes so the LLM's
+            # next action is right.
+            if debt_typed_account_count == 0:
+                raise ValueError(
+                    "No CREDIT or LIABILITY accounts found in the "
+                    "chart of accounts. Create the debt account(s) "
+                    "first via create_account, then set their APR "
+                    "via set_account_slot."
+                )
             raise ValueError(
-                "No debt accounts found with 'apr' slot set. "
-                "Use set_account_slot to set APR on your CREDIT/LIABILITY accounts."
+                f"Found {debt_typed_account_count} CREDIT/LIABILITY "
+                f"account(s) but none have an 'apr' slot set "
+                f"(or every APR is <= 0, or every balance is "
+                f"<= 0). Use set_account_slot to set 'apr' on the "
+                f"debt accounts you want included in the payoff "
+                f"plan."
             )
 
         total_minimums = sum(d["min_payment"] for d in debts)

@@ -417,6 +417,37 @@ TOOL_MODULES: dict[str, list[str]] = {
 }
 
 
+def _validate_module_groups() -> None:
+    """MP-10: every member of a MODULE_GROUPS expansion must exist
+    in TOOL_MODULES.
+
+    Pre-fix the group definitions referenced module names by
+    convention only — a typo (``"reconcilation"`` vs
+    ``"reconciliation"``) would silently produce an empty expansion
+    at runtime: ``--modules=core`` would just not load the
+    misspelled member, and the user would see "tool X not
+    available" with no indication that the alias was the cause.
+
+    This check fires at import time alongside ``_validate_tool_modules``
+    so the developer feedback is immediate and loud.
+    """
+    known = set(TOOL_MODULES.keys())
+    bad: dict[str, list[str]] = {}
+    for group, members in MODULE_GROUPS.items():
+        missing = [m for m in members if m not in known]
+        if missing:
+            bad[group] = missing
+    if bad:
+        report = "; ".join(
+            f"{g}={sorted(ms)}" for g, ms in sorted(bad.items())
+        )
+        raise RuntimeError(
+            f"MODULE_GROUPS references unknown module(s) in "
+            f"TOOL_MODULES: {report}. Add the modules to "
+            f"TOOL_MODULES or correct the group definition."
+        )
+
+
 def _validate_tool_modules() -> None:
     """Verify every registered tool belongs to a module in TOOL_MODULES.
 
@@ -783,6 +814,20 @@ def _get_server_config_impl() -> str:
 # survives _apply_module_filter's keep-set pass (Core's tool list
 # includes it). Previously gated behind --debug; now always
 # available as a diagnostic surface.
+#
+# MP-1: deliberately omits ``@audit_log``. Every other read tool
+# carries the decorator, but this one is a zero-side-effect config
+# inspection that the LLM calls reflexively as part of its
+# orientation pass (see the MCP server instructions and
+# ``get_book_summary``'s docstring referrals). Logging every
+# get_server_config call adds noise without signal — there's no
+# bookkeeping question the audit log answers about who looked at
+# the module list — and would clutter the human-readable trail the
+# bookkeeper depends on for forensic review of real activity.
+# The exception is documented here rather than enforced by a
+# contract test because the omission is the contract: a future
+# contributor adding @audit_log to this tool should read this
+# comment first and confirm they have a real reason to override.
 @mcp.tool()
 @safe_tool
 def get_server_config() -> str:
@@ -906,6 +951,7 @@ Logs are stored alongside the book file:
                 debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}")
 
     # Validate and apply module filter (also lazy-loads extracted modules)
+    _validate_module_groups()
     _validate_tool_modules()
     loaded_modules = _apply_module_filter(modules_value)
 
