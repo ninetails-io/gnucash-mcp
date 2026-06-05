@@ -1929,6 +1929,7 @@ class CoreMixin:
         latest_prices: dict,
         default_currency,
         today: date,
+        rate_via: dict[str, str] | None = None,
     ) -> _SummaryData:
         """Single-pass account walker for ``get_book_summary``.
 
@@ -1971,6 +1972,7 @@ class CoreMixin:
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
+                        provenance=rate_via,
                     )
                     data.asset_leaves.append((leaf, usd_value, note))
             elif account.type == "CREDIT":
@@ -2415,6 +2417,10 @@ class CoreMixin:
             # ``_anchor_for_as_of`` folds ``today`` to ``date.max``
             # so every forecast price is in scope.
             latest_prices = self._rates_as_of(book, today)
+            # Provenance for intermediate-chain-derived rates (issue
+            # #94) so a synthesized valuation renders "@ rate (via
+            # USD)" instead of an unfamiliar opaque number.
+            rate_via = self._rate_provenance(book, today, default_currency)
 
             # Single-pass account walker: categorized lists + totals.
             data = self._collect_summary_balance_sheet(
@@ -2424,6 +2430,7 @@ class CoreMixin:
                 latest_prices=latest_prices,
                 default_currency=default_currency,
                 today=today,
+                rate_via=rate_via,
             )
 
             # Transaction stats. Per-split unreconciled counting

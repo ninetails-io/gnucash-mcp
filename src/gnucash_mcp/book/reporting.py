@@ -504,6 +504,13 @@ class ReportingMixin:
             # have been valued at on the report date — not today's
             # rate (SB-2).
             latest_rates = self._rates_as_of(book, as_of_date)
+            # Provenance for any rate synthesized through an
+            # intermediate currency (issue #94), so a chained value
+            # renders "@ rate (… via USD)" — distinguishing a derived
+            # cross from a directly-quoted rate the reader entered.
+            rate_via = self._rate_provenance(
+                book, as_of_date, default_currency,
+            )
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
@@ -607,9 +614,12 @@ class ReportingMixin:
                         sym = commodity.mnemonic
                         qty = info["quantity"]
                         if rate is not None:
+                            via = rate_via.get(commodity.guid)
+                            via_note = f", {via}" if via else ""
                             balance_str = (
                                 f"{qty} {sym} @ {rate} "
-                                f"({ccy_mnemonic} {info['usd']:,.2f})"
+                                f"({ccy_mnemonic} {info['usd']:,.2f}"
+                                f"{via_note})"
                             )
                         else:
                             # No price on file — fall back to cost basis
