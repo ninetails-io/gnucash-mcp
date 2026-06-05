@@ -5225,7 +5225,8 @@ class BusinessMixin:
         target_commodity,
         as_of: date,
         context: str,
-    ) -> tuple[Decimal, Decimal | None]:
+        force: bool = False,
+    ) -> tuple[Decimal, Decimal | None, dict | None]:
         """Convert ``amount`` (in invoice currency) to the target
         commodity, quantized to that commodity's smallest fraction.
 
@@ -5236,9 +5237,19 @@ class BusinessMixin:
         — so a future fix to the rate-lookup or quantization
         cascade hits both paths without re-derivation.
 
+        **FX freshness guard.** Because GnuCash etches the exchange
+        rate at post/pay time and ``create_price`` does not update an
+        already-posted document, this chokepoint refuses to apply a
+        rate whose price is more than ``GNUCASH_FX_GUARD_DAYS``
+        (default 7) from ``as_of`` — the document's own date —
+        unless ``force=True``. The age axis is the same as the
+        90-day staleness cap inside ``_find_exchange_rate``, giving
+        three bands: ≤7 proceed, 7–90 refuse-but-forceable, >90 the
+        cap hard-errors (no rate returned at all).
+
         Args:
             book: Open piecash session (passed through to
-                ``_find_exchange_rate``).
+                ``_find_exchange_rate_aged``).
             amount: The value in invoice currency.
             invoice_currency: The invoice's currency commodity.
             target_commodity: The commodity to convert TO (e.g.
@@ -5246,32 +5257,44 @@ class BusinessMixin:
             as_of: Date for the rate lookup (post_date or
                 payment_date).
             context: ``"posting"`` or ``"payment"`` — embedded in
-                the no-rate-found error so the LLM sees which
-                operation needs the rate created.
+                the no-rate-found and stale-rate errors so the LLM
+                sees which operation needs the rate.
+            force: When True, apply a stale (7–90 day) rate anyway
+                and return its details in the third tuple slot for
+                the caller to surface as an ``fx_stale`` block.
 
         Returns:
-            ``(quantized_amount, rate)`` where ``rate`` is the
-            applied exchange rate, or ``None`` when the source
-            and target are the same currency (no conversion
-            needed). Same-currency returns the input ``amount``
-            untouched — no quantize, no rate.
+            ``(quantized_amount, rate, stale_meta)``. ``rate`` is the
+            applied exchange rate, or ``None`` for same-currency (the
+            input ``amount`` is returned untouched — no quantize, no
+            rate). ``stale_meta`` is ``None`` unless ``force=True``
+            overrode the freshness guard, in which case it is the
+            ``fx_stale`` dict (currency, rate_used, rate_date,
+            age_days, forced).
 
         Raises:
-            ValueError: When the currencies differ and no
-                exchange rate is on file for the given date.
-                Message names both currencies, the date, and the
-                operation context.
+            ValueError: When the currencies differ and no exchange
+                rate is on file within the staleness cap.
+            StaleFXRateError: When the rate is 7–90 days from
+                ``as_of`` and ``force`` is False. Carries a
+                structured ``fx_detail`` for the tool layer.
         """
         if target_commodity == invoice_currency:
-            return amount, None
-        rate = self._find_exchange_rate(
+            return amount, None, None
+
+        from gnucash_mcp.book._base import StaleFXRateError
+        from gnucash_mcp.book._currency import (
+            _fx_guard_days,
+            _fx_staleness_days,
+        )
+
+        aged = self._find_exchange_rate_aged(
             book,
             from_commodity=invoice_currency,
             to_commodity=target_commodity,
             as_of=as_of,
         )
-        if rate is None:
-            from gnucash_mcp.book._currency import _fx_staleness_days
+        if aged is None:
             cap = _fx_staleness_days()
             staleness_note = (
                 f" within ±{cap} days"
@@ -5289,11 +5312,47 @@ class BusinessMixin:
                 f"retry. (Override the staleness window via "
                 f"GNUCASH_FX_STALENESS_DAYS env var; 0 disables.)"
             )
+
+        rate, age_days, price_date = aged
+
+        # FX freshness guard. The 90-day cap already excluded
+        # anything further out, so age_days here is <= cap; this
+        # catches the 7..90 day "stale but usable" band.
+        guard = _fx_guard_days()
+        stale_meta = None
+        if guard > 0 and age_days > guard:
+            if not force:
+                raise StaleFXRateError(
+                    f"{invoice_currency.mnemonic}/"
+                    f"{target_commodity.mnemonic} rate is {age_days} "
+                    f"days from the {context} date ({as_of}); last "
+                    f"quoted {price_date.isoformat()} at {rate}. This "
+                    f"rate is locked at {context} time and cannot be "
+                    f"updated retroactively. Either run create_price("
+                    f"commodity='{invoice_currency.mnemonic}', "
+                    f"value='...') to add a rate near {as_of}, or pass "
+                    f"force=true to proceed with the stale rate.",
+                    {
+                        "currency": invoice_currency.mnemonic,
+                        "rate": str(rate),
+                        "rate_date": price_date.isoformat(),
+                        "age_days": age_days,
+                    },
+                )
+            stale_meta = {
+                "currency": invoice_currency.mnemonic,
+                "rate_used": str(rate),
+                "rate_date": price_date.isoformat(),
+                "age_days": age_days,
+                "forced": True,
+            }
+
         return (
             (amount * rate).quantize(
                 _commodity_quantum(target_commodity)
             ),
             rate,
+            stale_meta,
         )
 
     def post_invoice(
@@ -5304,6 +5363,7 @@ class BusinessMixin:
         due_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Post a customer invoice or vendor bill.
 
@@ -5442,16 +5502,23 @@ class BusinessMixin:
             # R-2: routes through ``_convert_invoice_amount`` so
             # post and pay share one rate-lookup + quantization
             # chokepoint. The rate is unused here (post doesn't
-            # need it for downstream FX-gain math).
+            # need it for downstream FX-gain math); ``stale_meta``
+            # is collected so the response can surface ``fx_stale``
+            # when ``force`` overrode the freshness guard.
+            fx_stale_overrides: list[dict] = []
+
             def _qty_for_split(acct, value_in_invoice_ccy):
-                qty, _rate = self._convert_invoice_amount(
+                qty, _rate, stale_meta = self._convert_invoice_amount(
                     book,
                     amount=value_in_invoice_ccy,
                     invoice_currency=inv.currency,
                     target_commodity=acct.commodity,
                     as_of=parsed_date,
                     context="posting",
+                    force=force,
                 )
+                if stale_meta is not None:
+                    fx_stale_overrides.append(stale_meta)
                 return qty
 
             # Build transaction splits
@@ -5577,6 +5644,13 @@ class BusinessMixin:
                 ),
                 "post_account": post_acct.fullname,
             }
+            # Surface the worst-aged forced override (if any) as a
+            # single fx_stale block — the common case is one foreign
+            # currency, so there is usually exactly one.
+            if fx_stale_overrides:
+                result["fx_stale"] = max(
+                    fx_stale_overrides, key=lambda m: m["age_days"]
+                )
 
         return result
 
@@ -5745,6 +5819,7 @@ class BusinessMixin:
         fx_account: str | None = None,
         apply_discount: bool = False,
         discount_account: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
@@ -5939,16 +6014,25 @@ class BusinessMixin:
             # chokepoint via ``_convert_invoice_amount``. Pay
             # consumes both the converted quantity AND the
             # rate (the rate feeds ``_compute_fx_gain_loss``
-            # below).
+            # below). ``stale_meta`` is collected so the response
+            # can surface ``fx_stale`` when ``force`` overrode the
+            # freshness guard; ``_convert`` keeps its 2-tuple shape
+            # so the unpack sites below are unchanged.
+            fx_stale_overrides: list[dict] = []
+
             def _convert(amount, target_commodity):
-                return self._convert_invoice_amount(
+                qty, rate, stale_meta = self._convert_invoice_amount(
                     book,
                     amount=amount,
                     invoice_currency=inv.currency,
                     target_commodity=target_commodity,
                     as_of=parsed_date,
                     context="payment",
+                    force=force,
                 )
+                if stale_meta is not None:
+                    fx_stale_overrides.append(stale_meta)
+                return qty, rate
 
             pay_quantity, exchange_rate = _convert(
                 payment_amount, pay_acct.commodity,
@@ -6286,6 +6370,11 @@ class BusinessMixin:
                 }
                 if discount_notice is not None:
                     result["discount_notice"] = discount_notice
+            # Surface the worst-aged forced FX override (if any).
+            if fx_stale_overrides:
+                result["fx_stale"] = max(
+                    fx_stale_overrides, key=lambda m: m["age_days"]
+                )
 
         return result
 

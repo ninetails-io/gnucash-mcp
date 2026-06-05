@@ -79,6 +79,45 @@ def _fx_staleness_days() -> int:
         return 90
 
 
+# ── FX freshness guard (stale-rate guard on post/pay) ─────────────
+#
+# Distinct from the staleness *cap* above. The cap (90 days) is the
+# outer hard floor enforced inside ``_find_exchange_rate``: beyond
+# it, no rate is returned at all and posting hard-errors. The guard
+# below is the inner *freshness* check applied when a foreign-
+# currency document is posted or paid: when the chosen rate is more
+# than ``GNUCASH_FX_GUARD_DAYS`` (default 7) from the document's own
+# date, the operation refuses unless ``force=True`` — because the
+# rate gets etched in stone at post/pay time and ``create_price``
+# does not retroactively update an already-posted document.
+#
+# Both measure the SAME axis: ``|price_date - as_of|`` (the
+# document date), so they compose into three bands —
+#   <= 7 days   : proceed
+#   7..90 days  : refuse, forceable
+#   > 90 days   : cap hard-errors, not forceable
+#
+# Resolved per-call (not cached) so tests can monkey-patch the
+# threshold freely; the lookup is O(1).
+
+
+def _fx_guard_days() -> int:
+    """Read the FX freshness-guard threshold from the environment.
+
+    ``GNUCASH_FX_GUARD_DAYS`` overrides the 7-day default. A
+    malformed value falls back to 7 rather than silently disabling
+    the guard. Set to ``0`` or negative to disable the guard
+    entirely (the 90-day cap still applies).
+    """
+    raw = os.environ.get("GNUCASH_FX_GUARD_DAYS")
+    if raw is None:
+        return 7
+    try:
+        return int(raw)
+    except ValueError:
+        return 7
+
+
 def _to_date(dt: date | datetime) -> date:
     """Convert a datetime or date to a date object.
 
@@ -365,6 +404,32 @@ class CurrencyMixin:
 
         ``1 unit of from_commodity == rate units of to_commodity``.
 
+        Thin wrapper over :meth:`_find_exchange_rate_aged` that drops
+        the age/date metadata — the rate-only return that most callers
+        (FX gain/loss, price-delete safety, valuation) want. See the
+        aged variant for the selection rules and the staleness cap.
+
+        Returns:
+            Decimal rate, or ``None`` when no usable price exists in
+            either direction WITHIN the staleness window.
+        """
+        aged = CurrencyMixin._find_exchange_rate_aged(
+            book, from_commodity, to_commodity, as_of
+        )
+        return aged[0] if aged is not None else None
+
+    @staticmethod
+    def _find_exchange_rate_aged(
+        book: piecash.Book,
+        from_commodity: piecash.Commodity,
+        to_commodity: piecash.Commodity,
+        as_of: date,
+    ) -> tuple[Decimal, int, date] | None:
+        """Cross-currency rate near ``as_of``, with the chosen
+        price's age and date.
+
+        ``1 unit of from_commodity == rate units of to_commodity``.
+
         Preference order:
 
         1. Direct price (``commodity=from, currency=to``) dated on or
@@ -391,20 +456,25 @@ class CurrencyMixin:
         gets the same guard for consistent failure signaling).
 
         Returns:
-            Decimal rate, or ``None`` when no usable price exists in
-            either direction WITHIN the staleness window.
+            ``(rate, age_days, price_date)`` where ``age_days`` is the
+            absolute day distance ``|price_date - as_of|`` of the
+            chosen price and ``price_date`` is that price's date — the
+            inputs the freshness guard needs to judge staleness. Same-
+            commodity returns ``(Decimal("1"), 0, as_of)``. ``None``
+            when no usable price exists within the staleness window.
         """
         if from_commodity == to_commodity:
-            return Decimal("1")
+            return (Decimal("1"), 0, as_of)
 
         cap = _fx_staleness_days()
         # cap <= 0 disables the staleness window (pre-fix behavior).
         cap_enabled = cap > 0
 
-        best_before_direct: tuple[int, Decimal] | None = None
-        best_after_direct: tuple[int, Decimal] | None = None
-        best_before_inverse: tuple[int, Decimal] | None = None
-        best_after_inverse: tuple[int, Decimal] | None = None
+        # Each candidate: (abs_age_days, rate, price_date).
+        best_before_direct: tuple[int, Decimal, date] | None = None
+        best_after_direct: tuple[int, Decimal, date] | None = None
+        best_before_inverse: tuple[int, Decimal, date] | None = None
+        best_after_inverse: tuple[int, Decimal, date] | None = None
 
         for p in book.prices:
             if not _is_market_price(p):
@@ -419,10 +489,10 @@ class CurrencyMixin:
                     continue
                 if days >= 0:
                     if best_before_direct is None or days < best_before_direct[0]:
-                        best_before_direct = (days, rate)
+                        best_before_direct = (days, rate, p_date)
                 else:
                     if best_after_direct is None or -days < best_after_direct[0]:
-                        best_after_direct = (-days, rate)
+                        best_after_direct = (-days, rate, p_date)
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
                 if cap_enabled and abs(days) > cap:
@@ -432,10 +502,10 @@ class CurrencyMixin:
                 rate = Decimal("1") / Decimal(str(p.value))
                 if days >= 0:
                     if best_before_inverse is None or days < best_before_inverse[0]:
-                        best_before_inverse = (days, rate)
+                        best_before_inverse = (days, rate, p_date)
                 else:
                     if best_after_inverse is None or -days < best_after_inverse[0]:
-                        best_after_inverse = (-days, rate)
+                        best_after_inverse = (-days, rate, p_date)
 
         for candidate in (
             best_before_direct,
@@ -444,5 +514,6 @@ class CurrencyMixin:
             best_after_inverse,
         ):
             if candidate is not None:
-                return candidate[1]
+                age_days, rate, p_date = candidate
+                return (rate, age_days, p_date)
         return None

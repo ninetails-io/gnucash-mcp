@@ -9341,7 +9341,9 @@ class TestMultiCurrencyDashboardHelpers:
             invoice_id="000001",
             post_account="Liabilities:Accounts Payable",
             owner_type="vendor",
-            post_date="2024-06-15",
+            # Pin to the rate date — this test checks report-time
+            # currency conversion, not FX freshness at posting.
+            post_date="2024-06-01",
         )
         # Run the report; verify totals come back as USD-converted.
         result = gc_book.vendor_spending_report(

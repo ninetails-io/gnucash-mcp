@@ -1214,6 +1214,30 @@ def _fmt_invoice_delete(entry: dict) -> list[str]:
     return lines
 
 
+def _fx_stale_lines(entry: dict) -> list[str]:
+    """Render the FX freshness-guard override line when present.
+
+    ``post_invoice`` / ``pay_invoice`` attach an ``fx_stale`` block
+    to the response only when ``force=True`` overrode the stale-rate
+    guard. Surfacing "forced" here gives the bookkeeper a traceable
+    record — a guard that was consciously overridden, unlike a
+    warning that leaves no trace. Empty list when no override.
+
+    Shared by the post and pay formatters; every bill/voucher/
+    credit-note variant delegates to those two, so this one helper
+    covers the whole business lifecycle.
+    """
+    after = entry.get("after_state") or {}
+    fx = after.get("fx_stale")
+    if not fx:
+        return []
+    return [
+        f"{_INDENT}FX: {fx.get('currency', '')} rate "
+        f"{fx.get('rate_used', '')} — {fx.get('age_days', '')} days "
+        f"stale, forced (quoted {fx.get('rate_date', '')})"
+    ]
+
+
 def _fmt_invoice_post(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -1228,6 +1252,7 @@ def _fmt_invoice_post(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
         )
+    lines += _fx_stale_lines(entry)
     return lines
 
 
@@ -1373,6 +1398,7 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+    lines += _fx_stale_lines(entry)
     return lines
 
 

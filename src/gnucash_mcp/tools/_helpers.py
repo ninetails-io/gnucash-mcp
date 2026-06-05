@@ -13,7 +13,7 @@ from typing import Annotated, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from gnucash_mcp.book import GnuCashLockError
+from gnucash_mcp.book import GnuCashLockError, StaleFXRateError
 
 
 def _parse_iso_date(s: str | None) -> date | None:
@@ -445,6 +445,18 @@ def safe_tool(func: Callable) -> Callable:
                     "suggestion": "Check that GNUCASH_BOOK_PATH is set correctly.",
                 }
             )
+        except StaleFXRateError as e:
+            # Subclass of ValueError — must be caught BEFORE the
+            # generic ValueError handler below, or the structured
+            # fx_detail + dedicated error_type collapse into a plain
+            # validation_error. The caller uses error_type to decide
+            # between create_price-then-retry and force=true.
+            logger.warning(f"Stale FX rate in {func.__name__}: {e}")
+            return _json({
+                "error": redact_paths(str(e)),
+                "error_type": "stale_fx_rate",
+                "fx_detail": e.fx_detail,
+            })
         except ValueError as e:
             logger.warning(f"Validation error in {func.__name__}: {e}")
             return _json({

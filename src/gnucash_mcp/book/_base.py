@@ -392,6 +392,24 @@ class GnuCashLockError(Exception):
     pass
 
 
+class StaleFXRateError(ValueError):
+    """Raised when posting/paying a foreign-currency document would
+    etch a stale exchange rate.
+
+    Carries a structured ``fx_detail`` so the tool layer
+    (``safe_tool``) can surface a machine-parseable ``error_type:
+    "stale_fx_rate"`` response with the currency, rate, rate date,
+    and age — the inputs the caller needs to either ``create_price``
+    or retry with ``force=True``. Subclasses ``ValueError`` so any
+    generic ``except ValueError`` path degrades it to a plain
+    validation error rather than dropping it.
+    """
+
+    def __init__(self, message: str, fx_detail: dict):
+        super().__init__(message)
+        self.fx_detail = fx_detail
+
+
 # ── Serializers ────────────────────────────────────────────────────
 
 

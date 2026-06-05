@@ -1019,11 +1019,22 @@ def register(mcp, get_book) -> None:
         due_date: str | None = None,
         description: str | None = None,
         owner_type: str | None = None,
+        force: bool = False,
     ) -> str:
         """Post a customer invoice or vendor bill.
 
         Posting creates a transaction in the A/R or A/P account and makes
         the invoice official. Once posted, entries cannot be added.
+
+        For a foreign-currency document, the exchange rate is etched
+        at posting and cannot be updated retroactively. If the latest
+        price for the invoice currency is more than 7 days from the
+        post date (the ``GNUCASH_FX_GUARD_DAYS`` window), posting is
+        refused with a ``stale_fx_rate`` error — run ``create_price``
+        for a rate near the post date, then retry, or pass
+        ``force=True`` to post with the stale rate (recorded in the
+        response and audit log as ``fx_stale``/"forced"). A rate
+        beyond the 90-day staleness cap cannot be forced.
 
         Args:
             id: Invoice or bill ID (e.g., "000001").
@@ -1032,6 +1043,8 @@ def register(mcp, get_book) -> None:
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
             owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+            force: Override the stale-FX-rate guard and post with a
+                7–90 day stale rate. Default False.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1042,6 +1055,7 @@ def register(mcp, get_book) -> None:
             due_date=due_date,
             description=description,
             owner_type=owner_type,
+            force=force,
         )
         return _json(result)
 
@@ -1086,6 +1100,7 @@ def register(mcp, get_book) -> None:
         fx_account: str | None = None,
         apply_discount: bool = False,
         discount_account: str | None = None,
+        force: bool = False,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
@@ -1136,6 +1151,12 @@ def register(mcp, get_book) -> None:
                 receive the discount split. Auto-resolves when
                 omitted. Accepts full path, %short GUID, or full
                 32-char GUID.
+            force: Override the stale-FX-rate guard. A cross-currency
+                payment etches the rate at pay time; if the latest
+                price is 7–90 days from the payment date the payment
+                is refused with ``stale_fx_rate`` unless ``force=True``
+                (the override is recorded as ``fx_stale``/"forced").
+                A rate beyond the 90-day cap cannot be forced.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1149,6 +1170,7 @@ def register(mcp, get_book) -> None:
             fx_account=fx_account,
             apply_discount=apply_discount,
             discount_account=discount_account,
+            force=force,
         )
         return _json(result)
 
