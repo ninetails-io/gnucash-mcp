@@ -7901,6 +7901,12 @@ class BusinessMixin:
             bills = filtered_bills
 
             vendor_data: dict[str, dict] = {}
+            # FX chokepoint: bills whose currency has no rate on file are
+            # NOT folded into the default-currency totals (that silently
+            # corrupts the sum). They're tracked here per currency and
+            # surfaced via a warning so the figure is honest about what
+            # it excludes.
+            unconverted: dict[str, dict] = {}
             for bill in bills:
                 v = self._find_vendor_by_guid(
                     book, bill.owner_guid
@@ -7955,23 +7961,38 @@ class BusinessMixin:
                 # Without conversion the grand totals mixed
                 # currencies — a EUR €2,500 bill and a USD $3,000
                 # bill summed to "5,500" of nothing in particular.
+                converted_ok = True
                 if bill.currency != default_currency:
                     rate = latest_rates.get(bill.currency.guid)
                     if rate is not None:
                         total = total * rate
                         paid = paid * rate
                         outstanding = outstanding * rate
-                    # If no rate is on file, fall back to the
-                    # un-converted figures rather than dropping the
-                    # bill silently. The bookkeeper sees a mixed-
-                    # currency total that's wrong by the FX delta,
-                    # which is the same fallback the rest of the
-                    # codebase uses for unpriced commodities.
+                    else:
+                        # No rate on file: exclude from the default-
+                        # currency totals rather than summing raw
+                        # foreign units. Accumulate per currency so the
+                        # excluded amount can be reported explicitly.
+                        converted_ok = False
+                        u = unconverted.setdefault(
+                            bill.currency.mnemonic,
+                            {
+                                "total_billed": Decimal(0),
+                                "total_paid": Decimal(0),
+                                "outstanding": Decimal(0),
+                                "bill_count": 0,
+                            },
+                        )
+                        u["total_billed"] += total
+                        u["total_paid"] += paid
+                        u["outstanding"] += outstanding
+                        u["bill_count"] += 1
 
-                vendor_data[v_name]["total_billed"] += total
-                vendor_data[v_name]["total_paid"] += paid
-                vendor_data[v_name]["outstanding"] += outstanding
-                vendor_data[v_name]["bill_count"] += 1
+                if converted_ok:
+                    vendor_data[v_name]["total_billed"] += total
+                    vendor_data[v_name]["total_paid"] += paid
+                    vendor_data[v_name]["outstanding"] += outstanding
+                    vendor_data[v_name]["bill_count"] += 1
 
             vendors_list = []
             grand_billed = Decimal(0)
@@ -7996,6 +8017,17 @@ class BusinessMixin:
                 reverse=True,
             )
 
+        # Warn (once per currency) about bills excluded from the
+        # default-currency totals for lack of a rate, naming the raw
+        # amount so the reader knows the magnitude of what's missing.
+        warnings = [
+            f"{d['bill_count']} bill(s) in {mn} excluded from "
+            f"{default_currency_mnemonic} totals — no exchange rate on "
+            f"file (raw {mn}: billed {d['total_billed']}, outstanding "
+            f"{d['outstanding']})"
+            for mn, d in unconverted.items()
+        ]
+
         full = {
             "vendors": vendors_list,
             "totals": {
@@ -8008,14 +8040,28 @@ class BusinessMixin:
                 ),
             },
         }
+        if unconverted:
+            full["unconverted"] = {
+                mn: {
+                    "total_billed": str(d["total_billed"]),
+                    "total_paid": str(d["total_paid"]),
+                    "outstanding": str(d["outstanding"]),
+                    "bill_count": d["bill_count"],
+                }
+                for mn, d in unconverted.items()
+            }
+            full["warnings"] = warnings
 
         if not compact:
             return full
 
-        return _format_vendor_spending_compact(
+        out = _format_vendor_spending_compact(
             vendors_list,
             grand_billed=grand_billed,
             grand_paid=grand_paid,
             grand_outstanding=grand_outstanding,
             currency=default_currency_mnemonic,
         )
+        if warnings:
+            out += "\n" + "\n".join(f"⚠ {w}" for w in warnings)
+        return out
