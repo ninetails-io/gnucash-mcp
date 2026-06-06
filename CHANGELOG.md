@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.3.0 — Business module complete, role-aligned modules
+## v1.3.1 — Business module, role-aligned modules, multi-currency correctness
 
 v1.2.1 fixed everything the business module *should* have been at first
 ship. v1.3 finishes the headline features the bookkeeper had been
@@ -335,15 +335,71 @@ transaction warnings are the next correctness items on the
 backlog. The bookkeeper's daily flow remains the production
 signal.
 
-**Tests:** 1,390 passing (was 1,114 at v1.2.1). New regression
+**Multi-currency correctness sweep.** An adversarial multi-agent
+review of the whole v1.3 surface, plus the valuation work it leaned
+on — validated against the synthetic Alex (USD) and Lin Wei (CNY)
+books and the bookkeeper's real-book pass.
+
+- **`get_book_summary` FX-converts foreign-currency liabilities.**
+  The dashboard balance-sheet and net-worth trajectory summed credit
+  cards and loans at raw account-commodity quantity, while
+  `balance_sheet` / `net_worth` converted them — so a foreign-
+  denominated card or loan disagreed across surfaces. All three now
+  agree to the cent.
+- **`debt_payoff_plan`** values foreign-currency debt in the book
+  default currency instead of summing raw foreign units.
+- **`vendor_spending_report`** excludes bills it can't convert (no
+  rate on file) from the default-currency totals and emits a
+  per-currency warning, rather than silently mixing currencies.
+- **Intermediate-currency valuation.** A holding priced only through
+  a pivot currency (e.g. a fund quoted in USD inside a CNY book) now
+  values via the chain, with provenance noting the derived path
+  (`via USD`).
+- **FX staleness cap.** Market-rate lookups exclude quotes more than
+  a configurable window (`GNUCASH_FX_STALENESS_DAYS`, default 90)
+  from the report date; invoice/bill post & pay raise a clear
+  `StaleFXRateError` rather than posting on a stale rate (override
+  with `force`).
+- **Consistent future-price convention.** The rate chain pass
+  applies the same "include future-dated forecasts at now-anchors"
+  rule as the direct pass.
+
+**Data safety.** Backup retention works again under
+`GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
+basename that resolved against the working directory — a silent
+no-op (unbounded backup growth) or a wrong-file delete. They now
+reconstruct the real path inside the backups directory.
+
+**Validation & hardening.**
+
+- `update_account`'s rename path enforces the same name validation as
+  `create_account` (rejects `:`, control characters, empty names) —
+  it was an unguarded parallel entry point.
+- Fuzzy FX / discount-account matching skips template accounts.
+- Business free-text input gates short-circuit at the MCP schema
+  boundary (reject before the audit log fires); transaction
+  write-verification handles two splits to the same account.
+
+**Retroactive budgets.** `create_budget` accepts a `start_date` so a
+budget can be anchored to a past period for back-comparison, not
+just the current year.
+
+Under the hood: cross-currency conversion consolidated into one path
+across invoice post/pay, and the deferred review items cleared.
+
+**Tests:** 1,537 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
 headline, and vendor spending), the role-aligned module groups,
 the balance-sheet equation closure across simple, multi-
-currency, and A/R-bearing books, and the synthetic Unrealized
-Gain/Loss line's presence/absence semantics. The two synthetic
-test personas (Alex, Lin Wei) and the bookkeeper's real-book
+currency, and A/R-bearing books, the synthetic Unrealized
+Gain/Loss line's presence/absence semantics, and the correctness
+sweep — cross-tool agreement on foreign-currency liabilities,
+vendor-report exclusion of unconvertible bills, backup pruning
+under path redaction, account-name rename validation, and
+same-account split write-verification. The two synthetic test
+personas (Alex, Lin Wei) and the bookkeeper's real-book
 validation remain the verification harness.
 
 ---
