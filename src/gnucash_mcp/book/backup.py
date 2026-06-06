@@ -343,6 +343,21 @@ class BackupMixin:
         from gnucash_mcp.logging_config import resolve_mcp_dir
         return resolve_mcp_dir(self.book_path) / "backups"
 
+    def _resolve_backup_path(self, entry: dict) -> Path:
+        """Absolute on-disk path for a backup listing entry.
+
+        Pruning must never trust ``entry["path"]`` directly: under
+        ``GNUCASH_REDACT_PATHS=1`` ``list_backups`` redacts that field
+        to the bare basename (MP-4), so ``Path(entry["path"]).unlink()``
+        would resolve against the process CWD — a silent no-op, or a
+        delete of an unrelated same-named file there. Reconstruct from
+        the backups dir + the filename so a prune only ever deletes a
+        file that actually lives in the backups directory, redaction on
+        or off. (``list_backups`` lists only direct children of the
+        backups dir, so the basename round-trips cleanly.)
+        """
+        return self._backups_dir() / Path(entry["path"]).name
+
     # ── Core primitive: create a backup ──────────────────────────
 
     def create_backup(
@@ -676,7 +691,7 @@ class BackupMixin:
         deleted: list[dict] = []
         kept: list[dict] = list(would_keep)
         for entry in would_delete:
-            p = Path(entry["path"])
+            p = self._resolve_backup_path(entry)
             try:
                 p.unlink()
                 deleted.append(entry)
@@ -828,7 +843,7 @@ class BackupMixin:
             entries = by_stage.get(stage.name, [])
             for old_entry in entries[stage.keep_last_n:]:
                 try:
-                    Path(old_entry["path"]).unlink()
+                    self._resolve_backup_path(old_entry).unlink()
                 except OSError as e:
                     debug_logger.warning(
                         f"Prune skipped {old_entry['path']}: {e}"

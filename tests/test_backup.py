@@ -383,6 +383,40 @@ class TestPruneBackups:
         kept_ts = sorted(e["timestamp"] for e in remaining)
         assert kept_ts[0] > "2026-04-19T08:06"  # minutes 7/8/9
 
+    def test_prune_under_path_redaction_deletes_real_files(
+        self, test_book: Path, monkeypatch,
+    ):
+        """H2 regression: with GNUCASH_REDACT_PATHS=1, ``list_backups``
+        redacts each entry's ``path`` to a bare basename. Pre-fix the
+        pruners called ``Path(entry["path"]).unlink()`` on that
+        basename, which resolved against the process CWD — a silent
+        no-op, so retention never actually trimmed. The prune must
+        still delete the real files in the backups dir.
+        """
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        book = GnuCashBook(str(test_book))
+        self._make_n_session_backups(book, 10)
+
+        backups_dir = book._backups_dir()
+        assert len(list(backups_dir.iterdir())) == 10
+
+        # Redaction is actually active: listed paths are basenames.
+        listed = book.list_backups()
+        assert listed and all("/" not in e["path"] for e in listed)
+
+        result = book.prune_backups(
+            keep_last_n=3, stage="session", dry_run=False
+        )
+        assert len(result["deleted"]) == 7
+
+        # The real files are gone (pre-fix: all 10 would remain because
+        # unlink targeted a CWD basename that doesn't exist there).
+        remaining = sorted(p.name for p in backups_dir.iterdir())
+        assert len(remaining) == 3, (
+            f"prune under path redaction did not delete real files; "
+            f"backups dir still holds: {remaining}"
+        )
+
     def test_prune_never_touches_manual_unless_asked(
         self, test_book: Path
     ):
