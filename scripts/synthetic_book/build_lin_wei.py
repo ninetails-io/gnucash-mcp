@@ -138,6 +138,8 @@ EXP_INCOME_TAX = "Expenses:Taxes:Income Tax"
 EXP_SOCIAL = "Expenses:Taxes:Social Insurance"
 EXP_BUSINESS_TAX = "Expenses:Taxes:Business Tax"
 EXP_STREAMING = "Expenses:Streaming"
+EXP_SUBSCRIPTIONS = "Expenses:Subscriptions"
+EXP_EDUCATION = "Expenses:Education"
 EXP_CLOTHING = "Expenses:Clothing"
 EXP_PET_FOOD = "Expenses:Pet:Food"
 EXP_PET_VET = "Expenses:Pet:Vet"
@@ -1023,9 +1025,10 @@ def gen_daily_weekly() -> list[dict]:
                     "date": dt,
                     "splits": [(src, -amt), (dst, amt)],
                 })
-        # 618 + Double 11 for the extra year.
-        for i, amt in enumerate(
-                [D("800"), D("700"), D("650"), D("550"), D("500")]):
+        # 618 + Double 11 for the extra year — trimmed to match the 2025
+        # hand-curated calendar below (¥1,150 / ¥1,700) now that the Phase 6b
+        # near-monthly Clothing baseline carries more of the annual total.
+        for i, amt in enumerate([D("450"), D("400"), D("300")]):
             dt = date(yy, 6, 10 + i)
             if _on_or_before_through(dt):
                 txns.append({
@@ -1033,9 +1036,7 @@ def gen_daily_weekly() -> list[dict]:
                     "date": dt,
                     "splits": [(ALIPAY, -amt), (EXP_CLOTHING, amt)],
                 })
-        for i, amt in enumerate(
-                [D("900"), D("800"), D("750"), D("700"),
-                 D("650"), D("600"), D("550"), D("550")]):
+        for i, amt in enumerate([D("500"), D("450"), D("400"), D("350")]):
             dt = date(yy, 11, 11 + (i // 2))
             if _on_or_before_through(dt):
                 txns.append({
@@ -1049,7 +1050,7 @@ def gen_daily_weekly() -> list[dict]:
         (date(YEAR, 1, 20), "年货采购", ALIPAY, EXP_GROCERIES, D("2500")),
         (date(YEAR, 2, 10), "春节旅行 回乡", CHECKING, EXP_TRAVEL, D("3500")),
         (date(YEAR, 3, 8), "字节年度疫苗体检", ALIPAY, EXP_PET_VET, D("800")),
-        (date(YEAR, 3, 20), "春装", CMB_CARD, EXP_CLOTHING, D("1200")),
+        (date(YEAR, 3, 20), "春装", CMB_CARD, EXP_CLOTHING, D("900")),
         (date(YEAR, 4, 5), "清明节 出行", CHECKING, EXP_TRAVEL, D("1500")),
         (date(YEAR, 5, 1), "劳动节 短途旅行", CHECKING, EXP_TRAVEL, D("2800")),
         (date(YEAR, 5, 28), "618预售", ALIPAY, EXP_CLOTHING, D("900")),
@@ -1068,8 +1069,11 @@ def gen_daily_weekly() -> list[dict]:
             "splits": [(src, -amt), (dst, amt)],
         })
 
-    # 618 (June) spread across 5 transactions (¥3,200).
-    june_amts = [D("800"), D("700"), D("650"), D("550"), D("500")]
+    # 618 (June) spread across 3 transactions (¥1,150). Trimmed from the
+    # original 5-order ¥3,200 haul so the higher near-monthly Clothing baseline
+    # (Phase 6b) doesn't push the annual Clothing average past the ~¥1,000/mo
+    # band — the seasonal texture stays, the spike just carries less of it.
+    june_amts = [D("450"), D("400"), D("300")]
     for i, amt in enumerate(june_amts):
         txns.append({
             "description": f"618购物节 第{i+1}单",
@@ -1077,9 +1081,9 @@ def gen_daily_weekly() -> list[dict]:
             "splits": [(ALIPAY, -amt), (EXP_CLOTHING, amt)],
         })
 
-    # Double 11 (November) spread across 8 transactions (¥5,500).
-    nov_amts = [D("900"), D("800"), D("750"), D("700"), D("650"),
-                D("600"), D("550"), D("550")]
+    # Double 11 (November) spread across 4 transactions (¥1,700). Trimmed from
+    # the original 8-order ¥5,500 haul for the same reason as 618 above.
+    nov_amts = [D("500"), D("450"), D("400"), D("350")]
     for i, amt in enumerate(nov_amts):
         txns.append({
             "description": f"双十一 第{i+1}单",
@@ -1119,6 +1123,28 @@ WEDDING_OCCASIONS = [
 ]
 ONLINE_RETAIL_VENDORS = ["淘宝", "京东商城", "拼多多", "天猫超市"]
 
+# Tech-consultant learning: course platforms + technical books + meetups.
+EDUCATION_COURSE_VENDORS = [
+    "极客时间 专栏", "极客时间 训练营", "Udemy 课程", "拉勾教育 课程",
+    "慕课网 实战课", "极客时间 大厂案例课",
+]
+EDUCATION_BOOK_VENDORS = [
+    "京东 技术书籍", "当当 计算机图书", "O'Reilly 技术书", "异步图书 技术书",
+]
+EDUCATION_MEETUP_VENDORS = [
+    "技术沙龙 报名", "QCon 大会 门票", "ArchSummit 架构师峰会",
+    "GDG 深圳 Meetup", "PyCon China 门票",
+]
+# Recurring digital subscriptions a Shenzhen tech worker actually pays for.
+# (mostly steady monthly autopay; VPN essential for cross-border work.)
+SUBSCRIPTION_VENDORS = [
+    ("VPN 服务 年付分摊", 28, 45),       # cross-border VPN (essential)
+    ("iCloud 储存 200GB", 21, 21),       # Apple iCloud monthly
+    ("知乎盐选 会员", 19, 25),            # Zhihu premium
+    ("得到 知识会员", 25, 38),            # DeDao premium
+    ("百度网盘 超级会员", 15, 30),        # cloud-drive membership
+]
+
 
 def gen_personal_life() -> list[dict]:
     """Personal-life spending streams, 2025-01 → THROUGH, localized to a
@@ -1139,6 +1165,8 @@ def gen_personal_life() -> list[dict]:
       Entertainment  ~¥400-800   KTV/电影/剧本杀/bars + occasional 演唱会 spike
       Personal Care  ~¥300-600   健身房 monthly + 理发 periodic + 美容/按摩
       Misc (online)  occasional 淘宝/京东/拼多多 orders most months
+      Education      ~¥200-400   极客时间/Udemy 课程 + 技术书籍 + 技术沙龙
+      Subscriptions  ~¥100-200   VPN/iCloud/知乎盐选/得到 monthly autopay
     """
     txns: list[dict] = []
     start = date(YEAR, 1, 1)
@@ -1334,6 +1362,106 @@ def gen_personal_life() -> list[dict]:
         nm = cur.month - 1 + 5  # +5 months
         cur = date(cur.year + nm // 12, nm % 12 + 1, 1)
         trip_idx += 1
+
+    # ── Clothing (baseline, part 1 — shared RNG): the original modest ──
+    #    near-monthly wardrobe habit. Kept on the shared ``rng`` in its original
+    #    position and with its original draw structure (so every category drawn
+    #    AFTER it — Education, Subscriptions — stays byte-stable). The recent-
+    #    window boost is layered separately at the end of this function on a
+    #    DEDICATED rng (part 2), so tuning the boost never perturbs this stream.
+    CLOTHING_ONLINE_VENDORS = ["优衣库 网店", "淘宝 服饰", "天猫 服装旗舰店",
+                               "网易严选 服饰"]
+    CLOTHING_MALL_VENDORS = ["万象城 优衣库", "海岸城 ZARA", "万象城 商场购物",
+                             "海岸城 H&M", "壹方城 服装"]
+    for yy, m in iter_months(start):
+        if rng.random() < 0.8:  # most months get a clothing purchase
+            day = _clamp_day(yy, m, rng.randint(4, 26))
+            if _on_or_before_through(day):
+                amt = _yuan(rng, 300, 650)
+                src = rng.choice([ALIPAY, ALIPAY, CMB_CARD])
+                vend = (rng.choice(CLOTHING_MALL_VENDORS) if src == CMB_CARD
+                        else rng.choice(CLOTHING_ONLINE_VENDORS))
+                txns.append({"description": vend, "date": day,
+                             "splits": [(src, -amt), (EXP_CLOTHING, amt)]})
+
+    # ── Education (NEW): a tech consultant who keeps learning. A recurring ──
+    #    small course/learning habit most months (~¥120-260 on 极客时间/慕课网,
+    #    Alipay/WeChat), an occasional bigger course or technical book on the
+    #    京东/当当/O'Reilly side (~¥200-400 on CMB card / Checking) a few times
+    #    a year, and a periodic 技术沙龙/meetup/conference fee. Aggregate lands
+    #    in the ~¥200-400/mo target. Near-monthly so the recent window is full.
+    for yy, m in iter_months(start):
+        # Small recurring online-course / column spend most months.
+        if rng.random() < 0.75:
+            day = _clamp_day(yy, m, rng.randint(5, 24))
+            if _on_or_before_through(day):
+                amt = _yuan(rng, 120, 260)
+                src = rng.choice([ALIPAY, WECHAT])
+                txns.append({
+                    "description": rng.choice(EDUCATION_COURSE_VENDORS),
+                    "date": day,
+                    "splits": [(src, -amt), (EXP_EDUCATION, amt)]})
+        # Quarterly-ish technical book order (Feb/May/Aug/Nov), larger ticket.
+        if m in (2, 5, 8, 11):
+            bday = _clamp_day(yy, m, rng.randint(8, 22))
+            if _on_or_before_through(bday):
+                amt = _yuan(rng, 200, 400)
+                txns.append({
+                    "description": rng.choice(EDUCATION_BOOK_VENDORS),
+                    "date": bday,
+                    "splits": [(CMB_CARD, -amt), (EXP_EDUCATION, amt)]})
+        # Twice-a-year 技术沙龙 / meetup / conference entry (Apr + Oct).
+        if m in (4, 10):
+            mday = _clamp_day(yy, m, rng.randint(10, 24))
+            if _on_or_before_through(mday):
+                amt = _yuan(rng, 200, 400)
+                txns.append({
+                    "description": rng.choice(EDUCATION_MEETUP_VENDORS),
+                    "date": mday,
+                    "splits": [(CHECKING, -amt), (EXP_EDUCATION, amt)]})
+
+    # ── Subscriptions (NEW): steady monthly digital autopay. Each vendor ──
+    #    debits on its own day-of-month from Checking (autopay), giving a
+    #    stable ~¥100-200/mo aggregate. VPN essential for cross-border tech
+    #    work; iCloud/知乎盐选/得到/百度网盘 round out the stack. Each runs
+    #    every month in range so any recent window is fully populated.
+    for i, (label, lo, hi) in enumerate(SUBSCRIPTION_VENDORS):
+        debit_day = 4 + i * 5  # spread across the month (4, 9, 14, 19, 24)
+        for yy, m in iter_months(start):
+            day = _clamp_day(yy, m, debit_day)
+            if not _on_or_before_through(day):
+                continue
+            amt = _yuan(rng, lo, hi)
+            txns.append({
+                "description": label,
+                "date": day,
+                "splits": [(CHECKING, -amt), (EXP_SUBSCRIPTIONS, amt)]})
+
+    # ── Clothing (baseline, part 2 — dedicated RNG top-up): the Phase 6 ──
+    #    618/双十一/春装 seasonal spikes cluster in Mar/Jun/Nov, so a recent
+    #    Feb→Jun evaluation window sees none of them, and part 1's modest
+    #    ~¥300-650/0.8 habit alone reads only ~¥300/mo there — well under the
+    #    bookkeeper's ~¥500-1,000/mo band. This near-certain monthly top-up
+    #    (~¥250-380: more 优衣库/淘宝/天猫 online + mall trips to 万象城/海岸城)
+    #    lifts part 1 + part 2 combined into band for the recent window while
+    #    keeping the annual average inside ~¥600-1,000/mo (helped by the trimmed
+    #    Phase 6 spikes). Uses its OWN dedicated RNG (``SEED + 210``) so its
+    #    draw count is decoupled from the shared stream — Education,
+    #    Subscriptions, and every category drawn earlier stay byte-stable no
+    #    matter how this block is tuned. Kept last in the function for that
+    #    reason. Small online buys ride Alipay; mall hauls ride the CMB card.
+    rng_cloth = random.Random(SEED + 210)
+    for yy, m in iter_months(start):
+        if rng_cloth.random() < 0.95:  # nearly every month gets a top-up
+            day = _clamp_day(yy, m, rng_cloth.randint(4, 26))
+            if _on_or_before_through(day):
+                amt = _yuan(rng_cloth, 250, 380)
+                src = rng_cloth.choice([ALIPAY, ALIPAY, CMB_CARD])
+                vend = (rng_cloth.choice(CLOTHING_MALL_VENDORS)
+                        if src == CMB_CARD
+                        else rng_cloth.choice(CLOTHING_ONLINE_VENDORS))
+                txns.append({"description": vend, "date": day,
+                             "splits": [(src, -amt), (EXP_CLOTHING, amt)]})
 
     return txns
 
@@ -2165,6 +2293,9 @@ def verify(out_path: Path, business: dict) -> None:
         ("Travel", EXP_TRAVEL, (0, None), False),
         ("Entertainment", EXP_ENTERTAINMENT, (400, 800), False),
         ("Personal Care", EXP_PERSONAL_CARE, (300, 600), False),
+        ("Clothing", EXP_CLOTHING, (500, 1000), True),
+        ("Education", EXP_EDUCATION, (200, 400), False),
+        ("Subscriptions", EXP_SUBSCRIPTIONS, (100, 200), False),
     ]
     print(f"  window: {window_start.isoformat()} → {THROUGH.isoformat()} "
           f"({n_months} months)")
