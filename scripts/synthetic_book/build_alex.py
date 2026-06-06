@@ -684,15 +684,30 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
 BASELINE_GROSS = D("3269.23")
 FIXED_HEALTH = D("145.00")
 FIXED_HSA = D("44.14")
-FED_PCT = D("380.00") / BASELINE_GROSS
-SS_PCT = D("202.69") / BASELINE_GROSS
-MED_PCT = D("47.40") / BASELINE_GROSS
+
+# US payroll withholding, rate-based so every deduction TRACKS gross — an
+# overtime paycheck withholds more than a base paycheck, and no two
+# different-gross paychecks are identical (the bookkeeper's "frozen
+# deductions" tell on Lin Wei, adapted to a US persona).
+#
+# FICA is exact statutory: Social Security 6.2%, Medicare 1.45% of gross.
+# Federal income-tax withholding is PROGRESSIVE: a base marginal rate on
+# the regular gross, plus a higher supplemental rate on any overtime portion
+# (the IRS 22% flat supplemental-wage rate), so federal is genuinely
+# non-proportional and clearly larger in overtime/bonus months — not a flat
+# percentage frozen across the year.
+SS_RATE = D("0.062")            # Social Security employee share
+MED_RATE = D("0.0145")          # Medicare employee share
+FED_BASE_RATE = D("0.1162")     # regular-wage federal withholding (≈ prior 380/3269)
+FED_SUPP_RATE = D("0.22")       # IRS supplemental rate on overtime/bonus
 
 
-def _paycheck_splits(gross: Decimal):
-    fed = (gross * FED_PCT).quantize(D("0.01"))
-    ss = (gross * SS_PCT).quantize(D("0.01"))
-    med = (gross * MED_PCT).quantize(D("0.01"))
+def _paycheck_splits(gross: Decimal, overtime: Decimal = D("0")):
+    ss = (gross * SS_RATE).quantize(D("0.01"))
+    med = (gross * MED_RATE).quantize(D("0.01"))
+    regular = gross - overtime
+    fed = (regular * FED_BASE_RATE
+           + overtime * FED_SUPP_RATE).quantize(D("0.01"))
     checking = gross - fed - ss - med - FIXED_HEALTH - FIXED_HSA
     return [
         (SALARY, -gross),
@@ -741,7 +756,7 @@ def gen_recurring(through: date) -> list[dict]:
         if overtime:
             desc += f" - ${overtime} overtime"
         txns.append({"description": desc, "date": d,
-                     "splits": _paycheck_splits(gross)})
+                     "splits": _paycheck_splits(gross, overtime)})
         d += timedelta(days=14)
         i += 1
 
@@ -773,20 +788,16 @@ def gen_recurring(through: date) -> list[dict]:
                            (EXP_AUTO_INT, a_int), (AUTO_LOAN, a_pri)],
             })
 
-    # Simple monthly bills.
-    simple = [
+    # Genuinely-fixed monthly bills (contractual / autopay flat rates) — these
+    # stay identical every month.
+    fixed_bills = [
         ("HOA Dues", CHECKING, EXP_HOA, D("425.00"), 1),
-        ("Internet - Comcast", CHECKING, EXP_INTERNET, D("79.99"), 3),
         ("Streaming Bundle", CHECKING, EXP_STREAMING, D("45.97"), 8),
-        ("Phone - T-Mobile", CHECKING, EXP_PHONE, D("140.00"), 12),
-        ("Electric - Seattle City Light", CHECKING, EXP_ELECTRIC, D("95.00"), 15),
-        ("Gas - Puget Sound Energy", CHECKING, EXP_GAS, D("65.00"), 15),
-        ("Water/Sewer - SPU", CHECKING, EXP_WATER, D("55.00"), 15),
         ("Pet Food - Chewy", CHECKING, EXP_PET_FOOD, D("48.00"), 20),
         ("AWS Cloud Hosting", AMEX, EXP_CLOUD, D("125.00"), 1),
         ("WeWork Coworking", AMEX, EXP_COWORKING, D("250.00"), 1),
     ]
-    for desc, src, dst, amt, day in simple:
+    for desc, src, dst, amt, day in fixed_bills:
         for yr, m in _month_iter(date(YEAR, 1, 1), through):
             when = _clamp_day(yr, m, day)
             if when <= through:
@@ -794,6 +805,62 @@ def gen_recurring(through: date) -> list[dict]:
                     "description": desc, "date": when,
                     "splits": [(src, -amt), (dst, amt)],
                 })
+
+    # Utilities + telecom DRIFT month to month (the bookkeeper's "too uniform"
+    # tell): seasonal variation on electric/gas/water plus small per-bill
+    # jitter on internet/phone. A dedicated RNG keeps these deterministic and
+    # decoupled from the other recurring streams. Seasonal multiplier indexed
+    # by month (Jan..Dec) for each utility — Seattle pattern: electric peaks
+    # in winter (heat/light) and mild summer (AC); gas peaks hard in winter
+    # (heating); water peaks in summer (gardens/irrigation).
+    rng_util = random.Random(SEED + 9)
+    ELEC_SEASON = {1: 1.30, 2: 1.25, 3: 1.10, 4: 0.95, 5: 0.90, 6: 0.95,
+                   7: 1.05, 8: 1.10, 9: 0.95, 10: 1.00, 11: 1.15, 12: 1.30}
+    GAS_SEASON = {1: 1.80, 2: 1.70, 3: 1.40, 4: 1.05, 5: 0.70, 6: 0.55,
+                  7: 0.50, 8: 0.50, 9: 0.65, 10: 1.00, 11: 1.45, 12: 1.75}
+    WATER_SEASON = {1: 0.85, 2: 0.85, 3: 0.90, 4: 1.00, 5: 1.15, 6: 1.30,
+                    7: 1.45, 8: 1.45, 9: 1.20, 10: 1.00, 11: 0.90, 12: 0.85}
+
+    def _seasonal(base: float, season: dict, m: int) -> Decimal:
+        # base × seasonal factor × ±6% random jitter, cents-bearing.
+        val = base * season[m] * (1 + rng_util.uniform(-0.06, 0.06))
+        return D(str(round(val, 2)))
+
+    seasonal_utils = [
+        ("Electric - Seattle City Light", EXP_ELECTRIC, 95.0, ELEC_SEASON),
+        ("Gas - Puget Sound Energy", EXP_GAS, 65.0, GAS_SEASON),
+        ("Water/Sewer - SPU", EXP_WATER, 55.0, WATER_SEASON),
+    ]
+    for desc, dst, base, season in seasonal_utils:
+        for yr, m in _month_iter(date(YEAR, 1, 1), through):
+            when = _clamp_day(yr, m, 15)
+            if when <= through:
+                amt = _seasonal(base, season, m)
+                txns.append({
+                    "description": desc, "date": when,
+                    "splits": [(CHECKING, -amt), (dst, amt)],
+                })
+
+    # Internet + phone: nominally flat, but real bills drift — promo
+    # roll-offs, overage, taxes/fees. Small per-bill jitter around the base,
+    # with a one-time mid-2026 price bump on internet (a believable rate
+    # increase) so the line isn't perfectly uniform across years.
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        when = _clamp_day(yr, m, 3)
+        if when <= through:
+            net_base = 79.99 if (yr, m) < (2026, 7) else 84.99  # mid-2026 bump
+            amt = D(str(round(net_base + rng_util.uniform(-1.5, 4.0), 2)))
+            txns.append({
+                "description": "Internet - Comcast", "date": when,
+                "splits": [(CHECKING, -amt), (EXP_INTERNET, amt)],
+            })
+        when = _clamp_day(yr, m, 12)
+        if when <= through:
+            amt = D(str(round(140.0 + rng_util.uniform(-3.0, 6.0), 2)))
+            txns.append({
+                "description": "Phone - T-Mobile", "date": when,
+                "splits": [(CHECKING, -amt), (EXP_PHONE, amt)],
+            })
 
     # Quarterly umbrella insurance (Jan/Apr/Jul/Oct, 15th).
     for yr, m in _month_iter(date(YEAR, 1, 1), through):
@@ -907,8 +974,92 @@ def _vary(rng, base, spread=0.2):
     return D(str(round(base * (1 + rng.uniform(-spread, spread)), 2)))
 
 
-def _uniform_cents(rng, low, high):
-    return D(str(round(rng.uniform(low, high), 2)))
+def _spend(rng, low, high) -> Decimal:
+    """A consumer dollar amount in ``[low, high]`` carrying realistic cents.
+
+    Real-world US retail/F&B receipts rarely land on a whole dollar: prices
+    like $4.85, $36.50, $12.99 are the norm. We draw a whole-dollar base in
+    range then add a cents component biased toward common price-point endings
+    (.99/.95/.50/.49/.00 and round-dime .x0) so the distribution looks like
+    menu/shelf pricing rather than uniform noise, while still spanning
+    arbitrary .xx values. Both splits of a transaction carry the same
+    magnitude, so cents balance automatically.
+
+    Use this for daily/weekly/discretionary/retail spend. Keep genuinely-round
+    items (paychecks, rent/mortgage, loan payments, fixed subscriptions,
+    transfers) on whole-dollar Decimals.
+    """
+    base = rng.randint(int(low), int(high))
+    r = rng.random()
+    if r < 0.14:
+        cents = 0           # genuinely round (some receipts are)
+    elif r < 0.34:
+        cents = 99          # .99 (the dominant US price ending)
+    elif r < 0.46:
+        cents = 95          # .95
+    elif r < 0.56:
+        cents = 50          # .50
+    elif r < 0.64:
+        cents = 49          # .49
+    elif r < 0.82:
+        cents = rng.randint(1, 9) * 10   # round dime: .10 .. .90
+    else:
+        cents = rng.randint(1, 99)       # arbitrary cents
+    amt = D(base) + (D(cents) / D(100))
+    return amt.quantize(D("0.01"))
+
+
+# ── Merchant → canonical expense category ───────────────────────
+#
+# Real people miscategorize SYSTEMATICALLY, not stochastically: a given
+# merchant lands in the SAME account every time (often via an autopay/auto-
+# import rule or a habit), right or wrong. This dict pins every recurring
+# consumer merchant to ONE canonical category so the daily/weekly/volume
+# generators look the merchant up here instead of scattering it across
+# buckets.
+#
+# The one deliberate, CONSISTENT miscategorization (the believable standing
+# mistake the household actually makes):
+#   • "Vending Machine" → Miscellaneous, ALWAYS. A careful bookkeeper would
+#     call a snack-machine charge Dining, but Alex set a stale auto-rule in
+#     the bank's import years ago that dumps every Vending Machine charge into
+#     Misc and never fixed it — so it's systematically (not randomly) wrong,
+#     the same way every time. That's the realistic texture: a consistent
+#     error, not stochastic scatter.
+# Everything else maps to the account a careful bookkeeper would expect. In
+# particular, "Transit Pass"/"Parking Meter" book to Auto:Fuel (transport's
+# nearest home in this chart) — NOT Dining.
+MERCHANT_CATEGORY: dict[str, str] = {
+    # Coffee / quick food → Dining (correct)
+    "Morning Coffee": EXP_DINING,
+    "Lunch Spot": EXP_DINING,
+    "Food Cart": EXP_DINING,
+    # Convenience / sundries → Groceries (correct)
+    "Corner Store": EXP_GROCERIES,
+    # Health / personal → the right home (correct)
+    "Drug Store": EXP_MEDICAL,
+    "Dry Cleaner": EXP_PERSONAL_CARE,
+    "News Stand": EXP_MISC,
+    # Transport — no Transport account in this chart, so the consistent home
+    # is Auto:Fuel (NOT Dining — that was the kind of wrong mapping the
+    # bookkeeper flagged).
+    "Parking Meter": EXP_FUEL,
+    "Transit Pass": EXP_FUEL,
+    # ── Deliberate sticky miscategorization (always wrong, always same) ──
+    "Vending Machine": EXP_MISC,   # stale bank-import auto-rule → Misc, every time
+}
+
+
+def merchant_category(name: str, default: str) -> str:
+    """Canonical category for ``name`` (consistent every time), else default.
+
+    Matches on a leading-substring key so descriptions with a suffix still
+    resolve. Encodes the sticky-error behavior in ``MERCHANT_CATEGORY``.
+    """
+    for key, cat in MERCHANT_CATEGORY.items():
+        if name.startswith(key):
+            return cat
+    return default
 
 
 def gen_daily_weekly(through: date) -> list[dict]:
@@ -931,9 +1082,11 @@ def gen_daily_weekly(through: date) -> list[dict]:
         vendor = GROCERY_VENDORS[i % len(GROCERY_VENDORS)]
         day = d + timedelta(days=rng.randint(0, 1))
         if day <= through:
-            amt = _vary(rng, 85.0)
+            amt = _spend(rng, 60, 110)
             txns.append({"description": vendor, "date": day,
-                         "splits": [(CHECKING, -amt), (EXP_GROCERIES, amt)]})
+                         "splits": [(CHECKING, -amt),
+                                    (merchant_category(vendor, EXP_GROCERIES),
+                                     amt)]})
         d += timedelta(days=7)
         i += 1
 
@@ -947,7 +1100,7 @@ def gen_daily_weekly(through: date) -> list[dict]:
         vendor = GAS_VENDORS[i % len(GAS_VENDORS)]
         day = d + timedelta(days=rng.randint(0, 6))
         if day <= through:
-            amt = _vary(rng, 52.0)
+            amt = _spend(rng, 38, 68)
             txns.append({"description": f"{vendor} Gas", "date": day,
                          "splits": [(CHECKING, -amt), (EXP_FUEL, amt)]})
         d += timedelta(days=7)
@@ -959,7 +1112,7 @@ def gen_daily_weekly(through: date) -> list[dict]:
     while d <= through:
         if d.weekday() < 5:
             vendor = rng.choice(COFFEE_VENDORS)
-            amt = _vary(rng, 5.50)
+            amt = _spend(rng, 4, 8)
             txns.append({"description": vendor, "date": d,
                          "splits": [(CHASE, -amt), (EXP_DINING, amt)]})
         d += timedelta(days=1)
@@ -972,7 +1125,7 @@ def gen_daily_weekly(through: date) -> list[dict]:
             if day > through:
                 continue
             vendor = rng.choice(RESTAURANTS)
-            amt = _uniform_cents(rng, 45.0, 95.0)
+            amt = _spend(rng, 45, 95)
             src = CHASE if rng.random() < 0.6 else CHECKING
             txns.append({"description": vendor, "date": day,
                          "splits": [(src, -amt), (EXP_DINING, amt)]})
@@ -985,7 +1138,7 @@ def gen_daily_weekly(through: date) -> list[dict]:
             if day > through:
                 continue
             descriptor, expense = rng.choice(AMAZON_CATEGORIES)
-            amt = _uniform_cents(rng, 15.0, 120.0)
+            amt = _spend(rng, 15, 120)
             txns.append({"description": f"Amazon.com - {descriptor}",
                          "date": day,
                          "splits": [(CHASE, -amt), (expense, amt)]})
@@ -999,11 +1152,16 @@ def gen_daily_weekly(through: date) -> list[dict]:
         if day > through:
             continue
         vendor = rng.choice(CLOTHING_VENDORS)
-        amt = _uniform_cents(rng, 35.0, 150.0)
+        amt = _spend(rng, 35, 150)
         txns.append({"description": vendor, "date": day,
                      "splits": [(CHASE, -amt), (EXP_CLOTHING, amt)]})
 
-    # Seasonal one-offs, replayed each calendar year in range.
+    # Seasonal one-offs, replayed each calendar year in range. The planned
+    # dollar figure is a budget target; the actual receipt carries realistic
+    # cents (real dinners/gifts/trips don't ring up on a whole dollar). A
+    # dedicated RNG keeps these deterministic and decoupled from the daily
+    # streams. Refunds (negative) stay exact — they reverse a known charge.
+    rng_event = random.Random(SEED + 11)
     for yr in range(YEAR, through.year + 1):
         for month, day, desc, amt_str, src, dst in MONTHLY_EVENTS:
             when = _clamp_day(yr, month, day)
@@ -1013,6 +1171,8 @@ def gen_daily_weekly(through: date) -> list[dict]:
             if amt < 0:
                 splits = [(src, abs(amt)), (dst, -abs(amt))]
             else:
+                cents = D(rng_event.randint(0, 99)) / D(100)
+                amt = (amt + cents).quantize(D("0.01"))
                 splits = [(src, -amt), (dst, amt)]
             txns.append({"description": desc, "date": when, "splits": splits})
 
@@ -1073,7 +1233,7 @@ def gen_personal_life(through: date) -> list[dict]:
         # Monthly pharmacy / small copay (~$30-60).
         day = _clamp_day(yr, m, rng.randint(6, 24))
         if day <= through:
-            amt = _uniform_cents(rng, 30.0, 60.0)
+            amt = _spend(rng, 30.0, 60.0)
             vendor = rng.choice(PHARMACY_VENDORS)
             txns.append({"description": vendor, "date": day,
                          "splits": [(CHECKING, -amt), (EXP_MEDICAL, amt)]})
@@ -1081,7 +1241,7 @@ def gen_personal_life(through: date) -> list[dict]:
         if m in (2, 5, 8, 11):
             dday = _clamp_day(yr, m, rng.randint(8, 22))
             if dday <= through:
-                amt = _uniform_cents(rng, 120.0, 180.0)
+                amt = _spend(rng, 120.0, 180.0)
                 vendor = rng.choice(DOCTOR_VENDORS)
                 txns.append({"description": vendor, "date": dday,
                              "splits": [(CHECKING, -amt),
@@ -1090,7 +1250,7 @@ def gen_personal_life(through: date) -> list[dict]:
         if m == 3:
             dday = _clamp_day(yr, m, rng.randint(10, 20))
             if dday <= through:
-                amt = _uniform_cents(rng, 180.0, 230.0)
+                amt = _spend(rng, 180.0, 230.0)
                 txns.append({"description": "Capitol Hill Dental - cleaning",
                              "date": dday,
                              "splits": [(CHECKING, -amt),
@@ -1111,7 +1271,7 @@ def gen_personal_life(through: date) -> list[dict]:
         if rng.random() < 0.85:  # ~5-6 of every 6 months get a small gift
             day = _clamp_day(yr, m, rng.randint(3, 26))
             if day <= through:
-                amt = _uniform_cents(rng, 30.0, 60.0)
+                amt = _spend(rng, 30.0, 60.0)
                 occ = rng.choice(GIFT_OCCASIONS)
                 txns.append({"description": occ, "date": day,
                              "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
@@ -1126,7 +1286,7 @@ def gen_personal_life(through: date) -> list[dict]:
             day = _clamp_day(yr, m, rng.randint(3, 26))
             if day > through:
                 continue
-            amt = _uniform_cents(rng, 60.0, 120.0)
+            amt = _spend(rng, 60.0, 120.0)
             occ = rng.choice(GIFT_OCCASIONS)
             txns.append({"description": occ, "date": day,
                          "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
@@ -1134,7 +1294,7 @@ def gen_personal_life(through: date) -> list[dict]:
         # of the named per-recipient gifts in MONTHLY_EVENTS).
         dday = _clamp_day(yr, 12, rng.randint(3, 8))
         if dday <= through:
-            amt = _uniform_cents(rng, 280.0, 320.0)
+            amt = _spend(rng, 280.0, 320.0)
             txns.append({"description": "Holiday gift haul",
                          "date": dday,
                          "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
@@ -1146,7 +1306,7 @@ def gen_personal_life(through: date) -> list[dict]:
     for yr, m in _month_iter(start, through):
         day = _clamp_day(yr, m, 5)
         if day <= through:
-            amt = _uniform_cents(rng, 50.0, 75.0)
+            amt = _spend(rng, 50.0, 75.0)
             txns.append({"description": "Monthly donation - Doctors Without "
                                         "Borders",
                          "date": day,
@@ -1154,7 +1314,7 @@ def gen_personal_life(through: date) -> list[dict]:
         if m == 12:
             dday = _clamp_day(yr, m, rng.randint(20, 28))
             if dday <= through:
-                amt = _uniform_cents(rng, 300.0, 500.0)
+                amt = _spend(rng, 300.0, 500.0)
                 txns.append({"description": "Year-end gift - Northwest Harvest",
                              "date": dday,
                              "splits": [(CHECKING, -amt),
@@ -1170,7 +1330,7 @@ def gen_personal_life(through: date) -> list[dict]:
         if rng.random() < 0.82:
             day = d + timedelta(days=rng.randint(3, 5))
             if day <= through:
-                amt = _uniform_cents(rng, 22.0, 50.0)
+                amt = _spend(rng, 22.0, 50.0)
                 vendor = rng.choice(ENTERTAINMENT_VENDORS)
                 txns.append({"description": vendor, "date": day,
                              "splits": [(CHASE, -amt),
@@ -1182,7 +1342,7 @@ def gen_personal_life(through: date) -> list[dict]:
             cday = _clamp_day(yr, m, rng.randint(8, 24))
             if cday > through:
                 continue
-            amt = _uniform_cents(rng, 150.0, 250.0)
+            amt = _spend(rng, 150.0, 250.0)
             vendor = rng.choice(CONCERT_VENDORS)
             txns.append({"description": vendor, "date": cday,
                          "splits": [(CHASE, -amt), (EXP_ENTERTAINMENT, amt)]})
@@ -1200,7 +1360,7 @@ def gen_personal_life(through: date) -> list[dict]:
     # Haircuts roughly every 6 weeks (42 days), jittered.
     d = start + timedelta(days=rng.randint(5, 20))
     while d <= through:
-        amt = _uniform_cents(rng, 35.0, 48.0)
+        amt = _spend(rng, 35.0, 48.0)
         txns.append({"description": "Rudy's Barbershop - haircut",
                      "date": d,
                      "splits": [(CHASE, -amt), (EXP_PERSONAL_CARE, amt)]})
@@ -1213,7 +1373,7 @@ def gen_personal_life(through: date) -> list[dict]:
             day = _clamp_day(yr, m, rng.randint(2, 27))
             if day > through:
                 continue
-            amt = _uniform_cents(rng, 40.0, 120.0)
+            amt = _spend(rng, 40.0, 120.0)
             txns.append({"description": "Amazon.com - online order",
                          "date": day,
                          "splits": [(CHASE, -amt), (EXP_MISC, amt)]})
@@ -1238,8 +1398,8 @@ def gen_personal_life(through: date) -> list[dict]:
     while cur <= through:
         flight_day = _clamp_day(cur.year, cur.month, rng.randint(18, 23))
         hotel_day = _clamp_day(cur.year, cur.month, rng.randint(24, 27))
-        flight = _uniform_cents(rng, 980.0, 1180.0)
-        hotel = _uniform_cents(rng, 620.0, 820.0)
+        flight = _spend(rng, 980.0, 1180.0)
+        hotel = _spend(rng, 620.0, 820.0)
         _, flight_desc, hotel_desc = trip_specs[trip_idx % len(trip_specs)]
         if flight_day <= through:
             txns.append({"description": flight_desc, "date": flight_day,
@@ -1488,27 +1648,28 @@ def run_business(book: GnuCashBook, through: date) -> dict:
                          description="2% discount if paid in 10 days, else net 30")
     counts["terms"] = 3
 
-    # Customers.
+    # Customers. Notes are natural client descriptors — nothing that names a
+    # test scenario (no "EUR-denominated", "FX case", currency tags, etc.).
     emerald = book.create_customer(
         name="Emerald Analytics", currency="USD",
-        notes="Monthly retainer, Net 30")
+        notes="Seattle analytics firm; monthly data-engineering retainer.")
     sound_transit = book.create_customer(
         name="Sound Transit Data Team", currency="USD",
-        notes="Project-based engagement, Net 15")
+        notes="Regional transit agency; project-based engagements.")
     berlin = book.create_customer(
         name="Berlin Digital GmbH", currency="EUR",
-        notes="EUR-denominated invoices, Net 30")
+        notes="Digital agency in Berlin; recurring engagements.")
     nord = book.create_customer(
         name="Nord Analytique", currency="CAD",
-        notes="Montréal client, CAD-denominated invoices, Net 30")
+        notes="Montréal data consultancy.")
     counts["customers"] = 4
 
     # Vendors.
     jetbrains = book.create_vendor(
-        name="JetBrains", currency="USD", notes="IDE/tooling subscriptions")
+        name="JetBrains", currency="USD", notes="Developer IDE and tooling.")
     bookkeeper = book.create_vendor(
         name="BookkeepingCo", currency="USD",
-        notes="Quarterly bookkeeping review")
+        notes="Outsourced bookkeeping firm.")
     counts["vendors"] = 2
 
     # Employee.
@@ -1609,7 +1770,7 @@ def run_business(book: GnuCashBook, through: date) -> dict:
             berlin["id"], berlin_open_date,
             berlin_open_date + timedelta(days=30), "5400.00",
             f"Berlin Digital engagement - "
-            f"{berlin_open_date.strftime('%B %Y')} (outstanding)",
+            f"{berlin_open_date.strftime('%B %Y')}",
             "EUR", AR_EUR, paid=False,
         )
 
@@ -1714,11 +1875,9 @@ def run_business(book: GnuCashBook, through: date) -> dict:
     run_bill(
         bookkeeper["id"], recent_open, recent_open + timedelta(days=30),
         "450.00",
-        "Quarterly bookkeeping review - current (outstanding)",
+        f"Quarterly bookkeeping review - {recent_open.strftime('%B %Y')}",
         EXP_ACCOUNTING, paid=False,
     )
-
-    return counts
 
     return counts
 
@@ -1898,12 +2057,21 @@ def run_investments(out_path: Path, through: date) -> dict:
                 cost_per = (Decimal(str(opening_split.value))
                             / Decimal(str(opening_split.quantity)))
                 cost_basis = (shares * cost_per).quantize(D("0.01"))
+                # Realized P/L = sale proceeds − cost basis, SIGNED:
+                #   above cost → gain > 0 ; below cost → gain < 0 (a LOSS).
+                # Capital Gains is a credit-normal INCOME account, so a gain is
+                # a credit (value = −gain < 0) and a loss is a debit
+                # (value = −gain > 0) that REDUCES capital-gains income. The
+                # three splits sum to zero either way:
+                #   (−cost_basis) + usd_amt + (−gain)
+                #   = −cost_basis + usd_amt − (usd_amt − cost_basis) = 0.
                 gain = usd_amt - cost_basis
                 inv_split = piecash.Split(
                     account=inv_acct, value=-cost_basis, quantity=-shares)
                 cash_split = piecash.Split(account=acct[CHECKING], value=usd_amt)
                 gain_split = piecash.Split(
                     account=acct[CAPITAL_GAINS], value=-gain)
+                assert (-cost_basis) + usd_amt + (-gain) == 0
                 piecash.Transaction(
                     currency=usd, description=f"Sell {shares} {sym} @ ${price}",
                     post_date=d, splits=[inv_split, cash_split, gain_split])
@@ -2187,8 +2355,6 @@ def run_edge_cases(book: GnuCashBook) -> dict:
 VOLUME_VENDORS = ["Morning Coffee", "Lunch Spot", "Parking Meter",
                   "Vending Machine", "Corner Store", "Food Cart",
                   "Transit Pass", "Drug Store", "Dry Cleaner", "News Stand"]
-DINING_VENDORS = {"Morning Coffee", "Lunch Spot", "Food Cart",
-                  "Vending Machine", "Corner Store"}
 
 
 def gen_volume(through: date) -> list[dict]:
@@ -2202,8 +2368,11 @@ def gen_volume(through: date) -> list[dict]:
     for _ in range(count):
         dt = date.fromordinal(start + rng.randint(0, span))
         vendor = rng.choice(VOLUME_VENDORS)
-        amt = D(str(round(rng.uniform(1.50, 15.00), 2)))
-        target = EXP_DINING if vendor in DINING_VENDORS else EXP_MISC
+        # Cents-bearing casual spend (was whole-dollar-prone uniform noise);
+        # each merchant resolves to ONE consistent category (incl. the sticky
+        # Vending Machine → Misc miscategorization).
+        amt = _spend(rng, 2, 15)
+        target = merchant_category(vendor, EXP_MISC)
         txns.append({"description": vendor, "date": dt,
                      "splits": [(CHECKING, -amt), (target, amt)]})
     return txns
@@ -2360,6 +2529,124 @@ def verify(out_path: Path, through: date) -> None:
     print(f"  net_worth tool:                 {nw_val:,.2f}")
     print(f"  agree (bs vs net_worth):        {abs(bs_nw - nw_val) < 1}")
 
+    # ── Realism: cents on consumer spend, consistent categorization, ──
+    #    variable payroll withholding, no meta-notes.
+    print("\n-- (R1) Realistic cents on consumer expense splits --")
+    consumer_accts = {
+        EXP_GROCERIES, EXP_DINING, EXP_FUEL, EXP_CLOTHING, EXP_MISC,
+        EXP_MEDICAL, EXP_GIFTS, EXP_CHARITY, EXP_TRAVEL, EXP_ENTERTAINMENT,
+        EXP_PERSONAL_CARE, EXP_EDUCATION, EXP_SUBSCRIPTIONS, EXP_PET_FOOD,
+        EXP_PET_VET, EXP_HOUSING_MAINT,
+    }
+    # Genuinely-round items only (flat dues / round tax payments). Federal
+    # withholding and amortized loan interest are COMPUTED values that
+    # legitimately carry cents, so they're intentionally not listed here.
+    structured_accts = {EXP_HOA, EXP_PROP_TAX, EXP_EST_TAX}
+    with book.open() as b:
+        cons_total = cons_cents = 0
+        struct_total = struct_round = 0
+        for t in b.transactions:
+            for s in t.splits:
+                fn = s.account.fullname
+                v = Decimal(str(s.value))
+                if v <= 0:
+                    continue
+                has_cents = (v % 1) != 0
+                if fn in consumer_accts:
+                    cons_total += 1
+                    if has_cents:
+                        cons_cents += 1
+                elif fn in structured_accts:
+                    struct_total += 1
+                    if not has_cents:
+                        struct_round += 1
+    if cons_total:
+        print(f"  consumer expense splits with cents: "
+              f"{cons_cents}/{cons_total} "
+              f"({100 * cons_cents / cons_total:.1f}%) — should be most")
+    if struct_total:
+        print(f"  structured splits that stay round (HOA/taxes/loan-int): "
+              f"{struct_round}/{struct_total} "
+              f"({100 * struct_round / struct_total:.1f}%)")
+
+    print("\n-- (R2) Consistent merchant → category mapping --")
+    with book.open() as b:
+        merch_cats: dict[str, set[str]] = {}
+        for t in b.transactions:
+            d = (t.description or "").split(" - ")[0].split(" Gas")[0]
+            for s in t.splits:
+                if Decimal(str(s.value)) > 0 and \
+                        s.account.type.upper() == "EXPENSE":
+                    merch_cats.setdefault(d, set()).add(s.account.fullname)
+        for sample in ("Morning Coffee", "Lunch Spot", "Corner Store",
+                       "Parking Meter", "Transit Pass", "Drug Store",
+                       "Vending Machine", "Starbucks", "QFC"):
+            cats = merch_cats.get(sample)
+            if cats:
+                tag = "consistent" if len(cats) == 1 else "SCATTERED"
+                print(f"    {sample:18s} -> {sorted(cats)} ({tag})")
+        print("  sticky miscategorization: Vending Machine -> "
+              f"{sorted(merch_cats.get('Vending Machine', set()))} "
+              "(always Miscellaneous — the standing auto-rule error)")
+
+    print("\n-- (R3) Variable payroll withholding (~4 paychecks) --")
+    with book.open() as b:
+        paychecks = []
+        for t in b.transactions:
+            if (t.description or "").startswith("Robin's Paycheck"):
+                gross = fed = ss = med = D("0")
+                for s in t.splits:
+                    fn = s.account.fullname
+                    v = Decimal(str(s.value))
+                    if fn == SALARY:
+                        gross = -v
+                    elif fn == "Expenses:Taxes:Federal":
+                        fed = v
+                    elif fn == EXP_SS:
+                        ss = v
+                    elif fn == EXP_MEDICARE:
+                        med = v
+                paychecks.append((t.post_date.date()
+                                  if hasattr(t.post_date, "date")
+                                  else t.post_date, gross, fed, ss, med))
+        paychecks.sort()
+        # Show two base + the first two overtime (higher-gross) paychecks.
+        base = [p for p in paychecks if p[1] == BASELINE_GROSS][:2]
+        ot = [p for p in paychecks if p[1] != BASELINE_GROSS][:2]
+        for when, gross, fed, ss, med in base + ot:
+            print(f"    {when} gross ${gross:>8,.2f} | fed ${fed:>7,.2f} "
+                  f"ss ${ss:>6,.2f} med ${med:>6,.2f}")
+        feds = {p[2] for p in paychecks}
+        print(f"  distinct federal-withholding amounts across "
+              f"{len(paychecks)} paychecks: {len(feds)} "
+              f"(>1 ⇒ not frozen)")
+
+    print("\n-- (R4) No generator/test meta-notes persisted --")
+    bad_tokens = ["FX payable", "EUR-denominated", "USD-denominated",
+                  "CAD-denominated", "(H1 case)", "denominated invoices",
+                  " case)", "(outstanding)"]
+    with book.open() as b:
+        hits = []
+        for c in b.customers:
+            note = c.notes or ""
+            for tok in bad_tokens:
+                if tok.lower() in note.lower():
+                    hits.append(("customer", c.name, tok))
+        for v in b.vendors:
+            note = v.notes or ""
+            for tok in bad_tokens:
+                if tok.lower() in note.lower():
+                    hits.append(("vendor", v.name, tok))
+        for t in b.transactions:
+            d = t.description or ""
+            for tok in bad_tokens:
+                if tok.lower() in d.lower():
+                    hits.append(("txn", d[:40], tok))
+    print(f"  meta-note hits in notes/descriptions: {len(hits)} "
+          f"(should be 0)")
+    for kind, name, tok in hits[:10]:
+        print(f"    {kind}: {name!r} contains {tok!r}")
+
     # ── (a) No data cliff: recent months have non-zero net + runway ──
     print("\n-- (a) Recent activity (no data cliff) --")
     lines = summary.splitlines()
@@ -2474,6 +2761,52 @@ def verify(out_path: Path, through: date) -> None:
         whole = Decimal(str(shares)) == Decimal(str(shares)).to_integral_value()
         tag = "WHOLE" if whole else "fractional"
         print(f"  {sym:6s} {shares} sh ({tag}) × ${latest} ≈ ${mkt:,.2f}")
+
+    # ── Capital-gains sign check: a below-cost sale books a LOSS that ──
+    #    reduces capital-gains income (positive/debit value on the Capital
+    #    Gains split), and every sell balances to zero.
+    print("\n-- (b2) Capital-gains sign (below-cost sale = loss) --")
+    with book.open() as b:
+        sells = []
+        for t in b.transactions:
+            d = t.description or ""
+            if not d.startswith("Sell "):
+                continue
+            gv = D("0")
+            for s in t.splits:
+                if s.account.fullname == CAPITAL_GAINS:
+                    gv += Decimal(str(s.value))
+            bal = sum(Decimal(str(s.value)) for s in t.splits)
+            # realized P/L = −(capital-gains split value)
+            realized = -gv
+            sells.append((d, realized, bal))
+        losses = [x for x in sells if x[1] < 0]
+        print(f"  sell transactions: {len(sells)}; "
+              f"all balance to zero: {all(b == 0 for _, _, b in sells)}")
+        for d, realized, _ in sells:
+            kind = "GAIN" if realized > 0 else ("LOSS" if realized < 0 else "flat")
+            print(f"    {d[:48]:48s} realized {realized:>10,.2f} ({kind})")
+        print(f"  below-cost sales booked as losses: {len(losses)} "
+              f"(loss ⇒ Capital Gains split value > 0, reduces income)")
+
+    # ── Recurring-expense drift: utilities must vary month to month now ──
+    print("\n-- (b3) Recurring utility drift (no longer uniform) --")
+    with book.open() as b:
+        util_by_desc: dict[str, list[Decimal]] = {}
+        for t in b.transactions:
+            d = t.description or ""
+            if d.startswith(("Electric -", "Gas -", "Water/Sewer")):
+                for s in t.splits:
+                    if s.account.fullname in (EXP_ELECTRIC, EXP_GAS, EXP_WATER) \
+                            and Decimal(str(s.value)) > 0:
+                        util_by_desc.setdefault(d, []).append(
+                            Decimal(str(s.value)))
+        for d, amts in util_by_desc.items():
+            uniq = len(set(amts))
+            lo, hi = min(amts), max(amts)
+            print(f"    {d[:34]:34s} n={len(amts):>3} distinct={uniq:>3} "
+                  f"range ${lo:,.2f}..${hi:,.2f} "
+                  f"(varies: {uniq > 1})")
 
     print("\n-- Checking operating buffer (target ~$40K-$60K) --")
     chk = _parse_money(book.get_balance(CHECKING, as_of_date=as_of))
