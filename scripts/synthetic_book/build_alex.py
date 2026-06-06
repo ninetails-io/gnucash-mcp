@@ -172,6 +172,8 @@ EXP_ACCOUNTING = "Expenses:Business:Accounting"
 EXP_BANK_CHARGES = "Expenses:Bank Charges"
 EXP_MISC = "Expenses:Miscellaneous"
 EXP_MEDICAL = "Expenses:Medical"
+EXP_ENTERTAINMENT = "Expenses:Entertainment"
+EXP_PERSONAL_CARE = "Expenses:Personal Care"
 
 
 # ── Phase 1: Commodities & prices ───────────────────────────────
@@ -407,6 +409,8 @@ ACCOUNTS = [
     ("Education", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
     ("Gifts", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
     ("Charity", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Entertainment", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Personal Care", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
     ("Business", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
     ("Cloud Hosting", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
     ("Software", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
@@ -1011,6 +1015,244 @@ def gen_daily_weekly(through: date) -> list[dict]:
             else:
                 splits = [(src, -amt), (dst, amt)]
             txns.append({"description": desc, "date": when, "splits": splits})
+
+    return txns
+
+
+# ── Phase 6b: Personal-life spending (medical, gifts, charity, ───
+#               travel, entertainment, personal care) ────────────
+
+# Vendors keep the spending legible in the register and the bookkeeper's
+# eyes — same texture as the daily/weekly vendor lists above.
+PHARMACY_VENDORS = ["Bartell Drugs", "Walgreens", "Rite Aid", "QFC Pharmacy"]
+DOCTOR_VENDORS = ["Polyclinic copay", "Swedish Medical copay",
+                  "Kaiser Permanente copay", "UW Medicine copay"]
+ENTERTAINMENT_VENDORS = [
+    "AMC Pacific Place", "SIFF Cinema", "Regal Thornton Place",
+    "The Crocodile (cover)", "Neumos (cover)", "Sunset Tavern",
+    "Stout Brewing", "Optimism Brewing", "Cinerama matinee",
+    "Bowling - Garage Billiards", "Trivia night - tab",
+    "Museum of Pop Culture", "Pacific Science Center",
+]
+CONCERT_VENDORS = [
+    "Climate Pledge Arena - concert", "Paramount Theatre - show",
+    "The Showbox - concert", "Moore Theatre - show",
+    "WaMu Theater - concert",
+]
+GIFT_OCCASIONS = [
+    "birthday gift - Robin's friend", "birthday gift - coworker",
+    "birthday gift - niece", "birthday gift - brother-in-law",
+    "housewarming gift", "wedding gift", "baby shower gift",
+]
+
+
+def gen_personal_life(through: date) -> list[dict]:
+    """Personal-life spending streams, 2025-01 → ``through``.
+
+    Each stream walks the months with realistic cadence and lumpiness,
+    amounts varied within target ranges via the seeded RNG (not
+    hardcoded). Paid from the same accounts the existing daily spend
+    uses: routine/household-style costs on Checking, discretionary
+    card-driver spend on Chase. Targets (monthly average):
+
+      Medical        ~$100-200   pharmacy monthly + quarterly copay + annual dental
+      Gifts          ~$50-100    lumpy: scattered birthdays + a December spike
+      Charity        ~$50-100    monthly donation + a December year-end gift
+      Travel         the one-time client trip lives in MONTHLY_EVENTS-style add below
+      Entertainment  ~$100-200   weekly-ish outings + occasional concert spikes
+      Personal Care  ~$50-80     monthly gym + a haircut every ~6 weeks
+    """
+    txns: list[dict] = []
+    start = date(YEAR, 1, 1)
+    rng = random.Random(SEED + 21)
+
+    # ── Medical: pharmacy/copay monthly, quarterly doctor visit, ──
+    #    annual dental cleaning. Routine health spend on Checking
+    #    (HSA card / debit-style); copays/uncovered costs still flow.
+    for yr, m in _month_iter(start, through):
+        # Monthly pharmacy / small copay (~$30-60).
+        day = _clamp_day(yr, m, rng.randint(6, 24))
+        if day <= through:
+            amt = _uniform_cents(rng, 30.0, 60.0)
+            vendor = rng.choice(PHARMACY_VENDORS)
+            txns.append({"description": vendor, "date": day,
+                         "splits": [(CHECKING, -amt), (EXP_MEDICAL, amt)]})
+        # Quarterly doctor-visit copay (~$120-180) in Feb/May/Aug/Nov.
+        if m in (2, 5, 8, 11):
+            dday = _clamp_day(yr, m, rng.randint(8, 22))
+            if dday <= through:
+                amt = _uniform_cents(rng, 120.0, 180.0)
+                vendor = rng.choice(DOCTOR_VENDORS)
+                txns.append({"description": vendor, "date": dday,
+                             "splits": [(CHECKING, -amt),
+                                        (EXP_MEDICAL, amt)]})
+        # Annual dental cleaning (~$200) each March.
+        if m == 3:
+            dday = _clamp_day(yr, m, rng.randint(10, 20))
+            if dday <= through:
+                amt = _uniform_cents(rng, 180.0, 230.0)
+                txns.append({"description": "Capitol Hill Dental - cleaning",
+                             "date": dday,
+                             "splits": [(CHECKING, -amt),
+                                        (EXP_MEDICAL, amt)]})
+
+    # ── Gifts: LUMPY but near-monthly baseline. Bookkeeper spec is ──
+    #    "$50-100/mo average, lumpy — $20 some months, $300 in December."
+    #    Most months get a small gift ($20-50); a handful of months
+    #    additionally carry a bigger occasion-gift ($60-120); plus a
+    #    ~$300 December holiday spike. (The seasonal MONTHLY_EVENTS
+    #    already carry the named December gift list; this layers the
+    #    small monthly habit + scattered occasions on top.)
+    #    Small near-monthly baseline: skip only ~1 in 6 months so any
+    #    recent-5-month window averages out near the target.
+    for yr, m in _month_iter(start, through):
+        if m == 12:
+            continue  # December carried by the named list + spike below
+        if rng.random() < 0.85:  # ~5-6 of every 6 months get a small gift
+            day = _clamp_day(yr, m, rng.randint(3, 26))
+            if day <= through:
+                amt = _uniform_cents(rng, 30.0, 60.0)
+                occ = rng.choice(GIFT_OCCASIONS)
+                txns.append({"description": occ, "date": day,
+                             "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
+    for yr in range(YEAR, through.year + 1):
+        # 5-6 bigger occasion gifts per year, spread across non-December
+        # months, for the realistic lumpiness on top of the baseline so
+        # any 5-month window catches a couple.
+        n_gifts = rng.randint(5, 6)
+        pool = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        chosen_months = rng.sample(pool, k=min(n_gifts, len(pool)))
+        for m in chosen_months:
+            day = _clamp_day(yr, m, rng.randint(3, 26))
+            if day > through:
+                continue
+            amt = _uniform_cents(rng, 60.0, 120.0)
+            occ = rng.choice(GIFT_OCCASIONS)
+            txns.append({"description": occ, "date": day,
+                         "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
+        # A consolidated ~$300 early-December holiday-gift haul (on top
+        # of the named per-recipient gifts in MONTHLY_EVENTS).
+        dday = _clamp_day(yr, 12, rng.randint(3, 8))
+        if dday <= through:
+            amt = _uniform_cents(rng, 280.0, 320.0)
+            txns.append({"description": "Holiday gift haul",
+                         "date": dday,
+                         "splits": [(CHASE, -amt), (EXP_GIFTS, amt)]})
+
+    # ── Charity: recurring monthly donation (~$50-75) + a December ──
+    #    year-end gift (~$300-500). The MONTHLY_EVENTS NAMI year-end
+    #    donation already exists; this adds the steady monthly habit
+    #    plus a second December gift so charity reads as ongoing.
+    for yr, m in _month_iter(start, through):
+        day = _clamp_day(yr, m, 5)
+        if day <= through:
+            amt = _uniform_cents(rng, 50.0, 75.0)
+            txns.append({"description": "Monthly donation - Doctors Without "
+                                        "Borders",
+                         "date": day,
+                         "splits": [(CHECKING, -amt), (EXP_CHARITY, amt)]})
+        if m == 12:
+            dday = _clamp_day(yr, m, rng.randint(20, 28))
+            if dday <= through:
+                amt = _uniform_cents(rng, 300.0, 500.0)
+                txns.append({"description": "Year-end gift - Northwest Harvest",
+                             "date": dday,
+                             "splits": [(CHECKING, -amt),
+                                        (EXP_CHARITY, amt)]})
+
+    # ── Entertainment: weekly-ish outings (~$25-60) on Chase, plus an ──
+    #    occasional concert/event spike (~$150-250) twice a year.
+    d = start
+    while d <= through:
+        # ~3 outings a month (skip ~1 week in 4), jittered onto a
+        # Thu-Sat evening, trimmed to land the recent-window average
+        # near the $100-200 target midpoint rather than over it.
+        if rng.random() < 0.82:
+            day = d + timedelta(days=rng.randint(3, 5))
+            if day <= through:
+                amt = _uniform_cents(rng, 22.0, 50.0)
+                vendor = rng.choice(ENTERTAINMENT_VENDORS)
+                txns.append({"description": vendor, "date": day,
+                             "splits": [(CHASE, -amt),
+                                        (EXP_ENTERTAINMENT, amt)]})
+        d += timedelta(days=7)
+    # Concert/event spikes: spring (May) + fall (Oct), each year.
+    for yr in range(YEAR, through.year + 1):
+        for m in (5, 10):
+            cday = _clamp_day(yr, m, rng.randint(8, 24))
+            if cday > through:
+                continue
+            amt = _uniform_cents(rng, 150.0, 250.0)
+            vendor = rng.choice(CONCERT_VENDORS)
+            txns.append({"description": vendor, "date": cday,
+                         "splits": [(CHASE, -amt), (EXP_ENTERTAINMENT, amt)]})
+
+    # ── Personal Care: monthly gym membership (~$50) + haircut every ──
+    #    ~6 weeks (~$40). Gym on Checking (autopay), haircuts on Chase.
+    for yr, m in _month_iter(start, through):
+        day = _clamp_day(yr, m, 2)
+        if day <= through:
+            amt = _vary(rng, 50.0, spread=0.06)  # ~$47-53 gym dues
+            txns.append({"description": "Gym membership - Seattle Athletic",
+                         "date": day,
+                         "splits": [(CHECKING, -amt),
+                                    (EXP_PERSONAL_CARE, amt)]})
+    # Haircuts roughly every 6 weeks (42 days), jittered.
+    d = start + timedelta(days=rng.randint(5, 20))
+    while d <= through:
+        amt = _uniform_cents(rng, 35.0, 48.0)
+        txns.append({"description": "Rudy's Barbershop - haircut",
+                     "date": d,
+                     "splits": [(CHASE, -amt), (EXP_PERSONAL_CARE, amt)]})
+        d += timedelta(days=42 + rng.randint(-4, 6))
+
+    # ── Light retail thickening: occasional Amazon-style purchases ──
+    #    (~$40-120) to Miscellaneous, ~1 per month some months.
+    for yr, m in _month_iter(start, through):
+        if rng.random() < 0.55:  # roughly half the months
+            day = _clamp_day(yr, m, rng.randint(2, 27))
+            if day > through:
+                continue
+            amt = _uniform_cents(rng, 40.0, 120.0)
+            txns.append({"description": "Amazon.com - online order",
+                         "date": day,
+                         "splits": [(CHASE, -amt), (EXP_MISC, amt)]})
+
+    # ── Periodic client-visit trips ($1,500-2,000 each): flight + hotel ──
+    #    in a single month, alternating Berlin (EUR client) / Toronto
+    #    (CAD client). Booked in USD on Chase (travel charged stateside).
+    #    One trip every ~5-6 months across the whole timeline, so any
+    #    recent-5-month window always catches at least one trip. Anchored
+    #    to month 3 then stepped +5/+6 months alternately. Keeps the
+    #    light travel above intact.
+    trip_anchor = date(YEAR, 3, 1)
+    # (city, flight-vendor, hotel-label) alternating across trips.
+    trip_specs = [
+        ("Berlin", "Lufthansa - SEA-BER (Berlin client visit)",
+         "Hotel - Berlin (client visit, 4 nights)"),
+        ("Toronto", "Air Canada - SEA-YYZ (Nord client visit)",
+         "Hotel - Toronto (client visit, 3 nights)"),
+    ]
+    trip_idx = 0
+    cur = trip_anchor
+    while cur <= through:
+        flight_day = _clamp_day(cur.year, cur.month, rng.randint(18, 23))
+        hotel_day = _clamp_day(cur.year, cur.month, rng.randint(24, 27))
+        flight = _uniform_cents(rng, 980.0, 1180.0)
+        hotel = _uniform_cents(rng, 620.0, 820.0)
+        _, flight_desc, hotel_desc = trip_specs[trip_idx % len(trip_specs)]
+        if flight_day <= through:
+            txns.append({"description": flight_desc, "date": flight_day,
+                         "splits": [(CHASE, -flight), (EXP_TRAVEL, flight)]})
+        if hotel_day <= through:
+            txns.append({"description": hotel_desc, "date": hotel_day,
+                         "splits": [(CHASE, -hotel), (EXP_TRAVEL, hotel)]})
+        # Step +5 or +6 months alternately so trips drift through the
+        # calendar and the cadence isn't mechanically regular.
+        step = 5 if trip_idx % 2 == 0 else 6
+        nm = cur.month - 1 + step
+        cur = date(cur.year + nm // 12, nm % 12 + 1, 1)
+        trip_idx += 1
 
     return txns
 
@@ -2146,6 +2388,83 @@ def verify(out_path: Path, through: date) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"    {ym_first.strftime('%Y-%m')}: (n/a: {exc})")
 
+    # ── (a2) Personal-life spending: avg monthly over last ~5 months ──
+    print("\n-- (a2) Personal-life spending (avg/mo over last ~5 months) --")
+    window_start = (through.replace(day=1) - relativedelta_safe(months=4))
+    n_months = 5
+    # Balance just before the window vs as-of THROUGH gives the period
+    # spend for each expense account (expenses only accrue debits).
+    day_before = window_start - timedelta(days=1)
+    # ``lumpy`` streams (Gifts) are SPECIFIED as zero-most-months with
+    # spikes, so a spike-free recent window legitimately averages low —
+    # the annual average is the target, not any 5-month slice. We assert
+    # only that they carry flow in the window, and report the figure.
+    personal = [
+        ("Medical", EXP_MEDICAL, (100, 200), False),
+        ("Gifts", EXP_GIFTS, (50, 100), True),
+        ("Charity", EXP_CHARITY, (50, 100), False),
+        ("Travel", EXP_TRAVEL, (0, None), False),
+        ("Entertainment", EXP_ENTERTAINMENT, (100, 200), False),
+        ("Personal Care", EXP_PERSONAL_CARE, (50, 80), False),
+    ]
+    print(f"  window: {window_start.isoformat()} → {through.isoformat()} "
+          f"({n_months} months)")
+    for label, path, (lo, hi), lumpy in personal:
+        bal_start = _parse_money(book.get_balance(path, as_of_date=day_before))
+        bal_end = _parse_money(book.get_balance(path, as_of_date=as_of))
+        period = bal_end - bal_start
+        avg = (period / n_months)
+        if hi is None:
+            band = f"(target >= ${lo}/mo cumulative trip-driven)"
+            ok = period > 0
+        elif lumpy:
+            band = f"(lumpy; target ~${lo}-{hi}/mo ANNUAL avg, low in a "
+            band += "spike-free window)"
+            ok = period > 0
+        else:
+            ok = lo * D("0.6") <= avg <= hi * D("1.6")
+            band = f"(target ~${lo}-{hi}/mo)"
+        print(f"    {label:14s} period ${period:>9,.2f} | "
+              f"avg ${avg:>7,.2f}/mo {band} "
+              f"{'OK' if ok else 'CHECK'}  non-zero={period != 0}")
+
+    # Gifts annual-average corroboration (its real target unit). Use the
+    # trailing 12 months ending at THROUGH so the December spike is in.
+    yr_start = (through.replace(day=1) - relativedelta_safe(months=11))
+    gifts_y0 = _parse_money(book.get_balance(
+        EXP_GIFTS, as_of_date=yr_start - timedelta(days=1)))
+    gifts_y1 = _parse_money(book.get_balance(EXP_GIFTS, as_of_date=as_of))
+    gifts_yr = gifts_y1 - gifts_y0
+    print(f"    Gifts trailing-12mo: ${gifts_yr:,.2f} => "
+          f"avg ${gifts_yr / 12:,.2f}/mo (annual target ~$50-100/mo)")
+
+    # The one-time client-visit trip must exist.
+    print("\n-- (a3) One-time client-visit trip ($1,500-$2,000) --")
+    with book.open() as b:
+        trip_total = D("0")
+        trip_descs = []
+        for t in b.transactions:
+            d = t.description or ""
+            if "Berlin client visit" in d or "client visit" in d:
+                for s in t.splits:
+                    if s.account.fullname == EXP_TRAVEL:
+                        trip_total += Decimal(str(s.value))
+                        trip_descs.append(d)
+        print(f"  trip travel total: ${trip_total:,.2f} across "
+              f"{len(trip_descs)} bookings "
+              f"(in $1,500-$2,000 band: "
+              f"{D('1500') <= trip_total <= D('2000')})")
+        for d in trip_descs:
+            print(f"    - {d}")
+
+    # New accounts must exist and carry flow.
+    print("\n-- (a4) New accounts present + with flow --")
+    for label, path in [("Entertainment", EXP_ENTERTAINMENT),
+                        ("Personal Care", EXP_PERSONAL_CARE)]:
+        bal = _parse_money(book.get_balance(path, as_of_date=as_of))
+        print(f"    {label:14s} {path}  lifetime ${bal:,.2f}  "
+              f"(exists+flow: {bal > 0})")
+
     print("\n-- (b) Investment holdings (whole vs fractional) --")
     for path, sym in [(AAPL, "AAPL"), (MSFT, "MSFT"), (VTSAX, "VTSAX"),
                       (VBTLX, "VBTLX"), (ETH, "ETH")]:
@@ -2304,6 +2623,11 @@ def build(out_path: Path, through: date) -> None:
     print("\nPhase 6: daily/weekly + seasonal")
     n = write_bulk(out_path, gen_daily_weekly(through))
     print(f"  {n} daily/weekly/seasonal transactions")
+
+    print("\nPhase 6b: personal-life spending "
+          "(medical/gifts/charity/travel/entertainment/personal care)")
+    n = write_bulk(out_path, gen_personal_life(through))
+    print(f"  {n} personal-life transactions")
 
     print("\nPhase 7a: direct 1099 contractor income")
     n = write_bulk(out_path, gen_contractor_income(through))
