@@ -675,9 +675,100 @@ def _on_or_before_through(d: date) -> bool:
 
 
 def _yuan(rng: random.Random, low: int, high: int) -> Decimal:
-    """A whole-yuan amount uniformly in ``[low, high]`` (Chinese spend is
-    almost always priced to the yuan, not the fen, for these categories)."""
+    """A whole-yuan amount uniformly in ``[low, high]``.
+
+    Reserved for genuinely-round amounts (fixed bills, dues priced to the
+    yuan). Consumer/discretionary spend uses ``_spend`` below, which carries
+    realistic jiao/fen — uniform integers are the single strongest
+    statistical fingerprint of generated data, so real receipts must show
+    cents.
+    """
     return D(str(rng.randint(low, high)))
+
+
+def _spend(rng: random.Random, low: int, high: int) -> Decimal:
+    """A consumer amount in ``[low, high]`` yuan carrying realistic jiao/fen.
+
+    Real-world retail/F&B receipts rarely land on a whole yuan: prices like
+    ¥18.80, ¥36.50, ¥27.30 are the norm. We draw a whole-yuan base in range
+    then add a fen component. The fen value is biased toward common
+    price-point endings (.00/.50/.80/.90/.99 and round-jiao .x0) so the
+    distribution looks like menu/shelf pricing rather than uniform noise,
+    while still spanning arbitrary .xx values. Both splits of a transaction
+    carry the same magnitude, so cents balance automatically.
+    """
+    base = rng.randint(low, high)
+    r = rng.random()
+    if r < 0.16:
+        fen = 0          # genuinely round (some receipts are)
+    elif r < 0.30:
+        fen = 50         # .50
+    elif r < 0.42:
+        fen = 80         # .80 (very common CN price ending)
+    elif r < 0.52:
+        fen = 90         # .90
+    elif r < 0.60:
+        fen = 99         # .99
+    elif r < 0.80:
+        fen = rng.randint(1, 9) * 10   # round jiao: .10 .. .90
+    else:
+        fen = rng.randint(1, 99)       # arbitrary fen
+    cents = D(base) + (D(fen) / D(100))
+    return cents.quantize(D("0.01"))
+
+
+# ── Merchant → canonical expense category ───────────────────────
+#
+# Real people miscategorize SYSTEMATICALLY, not stochastically: a given
+# merchant lands in the SAME account every time (often via an autopay rule
+# or a habit), right or wrong. This dict pins every recurring consumer
+# merchant to ONE canonical category. The daily/weekly/volume generators
+# look the merchant up here instead of scattering it across buckets.
+#
+# The one deliberate, CONSISTENT miscategorization (the believable standing
+# mistake the household actually makes):
+#   • 自动贩卖机 (vending machine) → Miscellaneous, ALWAYS. A careful
+#     bookkeeper would call a snack-machine charge Dining, but the user set a
+#     stale auto-rule years ago that dumps every 自动贩卖机 charge into Misc
+#     and never fixed it — so it's systematically (not randomly) wrong, the
+#     same way every time. That's the realistic texture: a consistent error,
+#     not stochastic scatter.
+# Everything else maps to the account a careful bookkeeper would expect.
+MERCHANT_CATEGORY: dict[str, str] = {
+    # Coffee / tea / delivery / dine-in → Dining (correct)
+    "瑞幸咖啡": EXP_DINING,
+    "瑞幸": EXP_DINING,
+    "美团外卖": EXP_DINING,
+    "饿了么外卖": EXP_DINING,
+    "饿了么": EXP_DINING,
+    # Groceries / convenience / warehouse → Groceries (correct)
+    "盒马鲜生": EXP_GROCERIES,
+    "盒马": EXP_GROCERIES,
+    "便利蜂": EXP_GROCERIES,
+    "7-11便利店": EXP_GROCERIES,
+    "全家便利店": EXP_GROCERIES,
+    "山姆会员店": EXP_GROCERIES,
+    # Transport — there is no Transport account, so the correct home is Auto.
+    # Ride-hail and bike-share both book to Auto:Parking consistently.
+    "滴滴出行": EXP_PARKING,
+    "共享单车": EXP_PARKING,
+    "EV充电": EXP_CHARGING,
+    # ── Deliberate sticky miscategorization (always wrong, always same) ──
+    "自动贩卖机": EXP_MISC,         # vending: stale auto-rule → Misc, every time
+}
+
+
+def merchant_category(name: str, default: str) -> str:
+    """Canonical category for ``name`` (consistent every time), else default.
+
+    Matches on a leading-substring key so descriptions with a suffix
+    (e.g. ``"瑞幸咖啡 (外送)"``) still resolve. Encodes the sticky-error
+    behavior in ``MERCHANT_CATEGORY``.
+    """
+    for key, cat in MERCHANT_CATEGORY.items():
+        if name.startswith(key):
+            return cat
+    return default
 
 
 # ── Phase 4: Scheduled-transaction templates ────────────────────
@@ -785,12 +876,53 @@ def _amort(base_int: Decimal, base_pri: Decimal, payment: Decimal,
     return m_int, m_pri
 
 
+# ── Payroll withholding (rate-based, cumulative IIT) ─────────────
+
+# Employee-side statutory rates as a fraction of gross. These track gross
+# month-to-month, so overtime/bonus months withhold more than base months —
+# unlike the old frozen 1650/1100 constants. Calibrated so a base ¥15,000
+# gross lands near the prior figures (social 1650, housing 1100).
+SOCIAL_INS_RATE = D("0.110")     # 五险 employee portion ≈ 11% of gross
+HOUSING_FUND_RATE = D("0.0733")  # 公积金 employee portion ≈ 7.33% of gross
+IIT_MONTHLY_DEDUCTION = D("5000")  # 起征点 ¥60,000/yr = ¥5,000/mo standard
+
+# China's cumulative-withholding (累计预扣法) annual brackets on cumulative
+# taxable income: (upper_bound, rate, quick_deduction). Approximate — the
+# point is that the income-tax line RISES through the year as cumulative
+# taxable income crosses brackets, and responds to gross. Not exact PRC law.
+IIT_BRACKETS = [
+    (D("36000"), D("0.03"), D("0")),
+    (D("144000"), D("0.10"), D("2520")),
+    (D("300000"), D("0.20"), D("16920")),
+    (D("420000"), D("0.25"), D("31920")),
+    (D("660000"), D("0.30"), D("52920")),
+    (D("960000"), D("0.35"), D("85920")),
+    (D("99999999"), D("0.45"), D("181920")),
+]
+
+
+def _iit_cumulative(cum_taxable: Decimal) -> Decimal:
+    """Total IIT owed YTD on ``cum_taxable`` (cumulative taxable income)."""
+    if cum_taxable <= 0:
+        return D("0")
+    for upper, rate, quick in IIT_BRACKETS:
+        if cum_taxable <= upper:
+            return (cum_taxable * rate - quick).quantize(D("0.01"))
+    return D("0")
+
+
 def gen_recurring() -> list[dict]:
     txns: list[dict] = []
     rng = random.Random(SEED + 5)
 
     months = list(iter_months())
     start_ym = (YEAR, 1)
+
+    # Cumulative-withholding state, reset each calendar year. Tracks YTD
+    # taxable income and YTD tax already withheld so each month's IIT is the
+    # incremental amount (累计预扣法) — it rises as the year progresses.
+    cum_taxable_by_year: dict[int, Decimal] = {}
+    cum_tax_by_year: dict[int, Decimal] = {}
 
     for elapsed, (yy, m) in enumerate(months):
         # Salary on the 15th, with overtime every 3rd month.
@@ -800,7 +932,25 @@ def gen_recurring() -> list[dict]:
             if m % 3 == 0:
                 overtime = D(str(rng.randint(500, 1500)))
             gross = D("15000") + overtime
-            net = D("11800") + overtime  # overtime flows to checking
+
+            # Statutory deductions track gross (so overtime months differ).
+            social = (gross * SOCIAL_INS_RATE).quantize(D("1"))
+            housing = (gross * HOUSING_FUND_RATE).quantize(D("1"))
+
+            # Cumulative-withholding IIT: this month's tax is the YTD tax owed
+            # on cumulative taxable income minus tax already withheld YTD.
+            month_taxable = gross - social - housing - IIT_MONTHLY_DEDUCTION
+            cum_taxable = cum_taxable_by_year.get(yy, D("0")) + month_taxable
+            cum_taxable_by_year[yy] = cum_taxable
+            tax_owed_ytd = _iit_cumulative(cum_taxable)
+            income_tax = (tax_owed_ytd - cum_tax_by_year.get(yy, D("0")))
+            if income_tax < 0:
+                income_tax = D("0")
+            income_tax = income_tax.quantize(D("0.01"))
+            cum_tax_by_year[yy] = cum_tax_by_year.get(yy, D("0")) + income_tax
+
+            # Net to checking = gross − all employee withholdings.
+            net = gross - income_tax - social - housing
             txns.append({
                 "description": "深圳市人民医院 工资" + (
                     f" (含加班 ¥{overtime})" if overtime else ""),
@@ -808,18 +958,19 @@ def gen_recurring() -> list[dict]:
                 "splits": [
                     (SALARY, -gross),
                     (CHECKING, net),
-                    (EXP_INCOME_TAX, D("450")),
-                    (EXP_SOCIAL, D("1650")),
-                    (HOUSING_FUND, D("1100")),
+                    (EXP_INCOME_TAX, income_tax),
+                    (EXP_SOCIAL, social),
+                    (HOUSING_FUND, housing),
                 ],
             })
-            # Housing fund employer match income (forced savings).
+            # Housing fund employer match income (forced savings) — matches
+            # the employee contribution, so it tracks gross too.
             txns.append({
                 "description": "住房公积金 单位缴存",
                 "date": d15,
                 "splits": [
-                    (HOUSING_FUND, D("1100")),
-                    (HOUSING_FUND_INCOME, D("-1100")),
+                    (HOUSING_FUND, housing),
+                    (HOUSING_FUND_INCOME, -housing),
                 ],
             })
 
@@ -952,40 +1103,50 @@ def gen_daily_weekly() -> list[dict]:
     while d <= end:
         wd = d.weekday()
         if wd < 5:  # weekday coffee
-            amt = D(str(rng.randint(15, 22)))
+            amt = _spend(rng, 15, 22)
+            vend = "瑞幸咖啡"
             txns.append({
-                "description": "瑞幸咖啡",
+                "description": vend,
                 "date": d,
-                "splits": [(WECHAT, -amt), (EXP_DINING, amt)],
+                "splits": [(WECHAT, -amt),
+                           (merchant_category(vend, EXP_DINING), amt)],
             })
         # convenience store most days
         if day_idx % 1 == 0 and rng.random() < 0.7:
-            amt = D(str(rng.randint(18, 35)))
+            amt = _spend(rng, 18, 35)
+            vend = rng.choice(["便利蜂", "7-11便利店", "全家便利店"])
             txns.append({
-                "description": rng.choice(["便利蜂", "7-11便利店", "全家便利店"]),
+                "description": vend,
                 "date": d,
-                "splits": [(WECHAT, -amt), (EXP_GROCERIES, amt)],
+                "splits": [(WECHAT, -amt),
+                           (merchant_category(vend, EXP_GROCERIES), amt)],
             })
         if wd in (1, 3, 5):  # Meituan delivery 3x/week
-            amt = D(str(rng.randint(28, 48)))
+            amt = _spend(rng, 28, 48)
+            vend = "美团外卖"
             txns.append({
-                "description": "美团外卖",
+                "description": vend,
                 "date": d,
-                "splits": [(ALIPAY, -amt), (EXP_DINING, amt)],
+                "splits": [(ALIPAY, -amt),
+                           (merchant_category(vend, EXP_DINING), amt)],
             })
         if wd == 6:  # weekly Hema groceries
-            amt = D(str(rng.randint(300, 420)))
+            amt = _spend(rng, 300, 420)
+            vend = "盒马鲜生"
             txns.append({
-                "description": "盒马鲜生",
+                "description": vend,
                 "date": d,
-                "splits": [(ALIPAY, -amt), (EXP_GROCERIES, amt)],
+                "splits": [(ALIPAY, -amt),
+                           (merchant_category(vend, EXP_GROCERIES), amt)],
             })
         if wd == 2:  # weekly EV charging
-            amt = D(str(rng.randint(60, 100)))
+            amt = _spend(rng, 60, 100)
+            vend = "EV充电"
             txns.append({
-                "description": "EV充电",
+                "description": vend,
                 "date": d,
-                "splits": [(WECHAT, -amt), (EXP_CHARGING, amt)],
+                "splits": [(WECHAT, -amt),
+                           (merchant_category(vend, EXP_CHARGING), amt)],
             })
         d = date.fromordinal(d.toordinal() + 1)
         day_idx += 1
@@ -995,11 +1156,13 @@ def gen_daily_weekly() -> list[dict]:
         sc = _clamp_day(yy, m, 12)
         if not _on_or_before_through(sc):
             continue
-        amt = D(str(rng.randint(420, 580)))
+        amt = _spend(rng, 420, 580)
+        vend = "山姆会员店"
         txns.append({
-            "description": "山姆会员店",
+            "description": vend,
             "date": sc,
-            "splits": [(ICBC_CARD, -amt), (EXP_GROCERIES, amt)],
+            "splits": [(ICBC_CARD, -amt),
+                       (merchant_category(vend, EXP_GROCERIES), amt)],
         })
 
     # Repeating seasonal anchors for every FULL year after 2025 that the
@@ -1179,7 +1342,7 @@ def gen_personal_life() -> list[dict]:
         # Monthly pharmacy / small out-of-pocket (~¥80-200).
         day = _clamp_day(yy, m, rng.randint(6, 24))
         if _on_or_before_through(day):
-            amt = _yuan(rng, 80, 200)
+            amt = _spend(rng,80, 200)
             txns.append({"description": rng.choice(PHARMACY_VENDORS),
                          "date": day,
                          "splits": [(WECHAT, -amt), (EXP_MEDICAL, amt)]})
@@ -1188,7 +1351,7 @@ def gen_personal_life() -> list[dict]:
         if m in (2, 5, 8, 11):
             dday = _clamp_day(yy, m, rng.randint(8, 22))
             if _on_or_before_through(dday):
-                amt = _yuan(rng, 250, 500)
+                amt = _spend(rng,250, 500)
                 txns.append({"description": rng.choice(CLINIC_VENDORS),
                              "date": dday,
                              "splits": [(CHECKING, -amt),
@@ -1198,7 +1361,7 @@ def gen_personal_life() -> list[dict]:
         if m in (3, 9):
             dday = _clamp_day(yy, m, rng.randint(10, 20))
             if _on_or_before_through(dday):
-                amt = _yuan(rng, 300, 700)
+                amt = _spend(rng,300, 700)
                 txns.append({"description": rng.choice(DENTAL_VENDORS),
                              "date": dday,
                              "splits": [(CHECKING, -amt),
@@ -1217,7 +1380,7 @@ def gen_personal_life() -> list[dict]:
         if rng.random() < 0.85:  # ~5 of every 6 months get a small gift
             day = _clamp_day(yy, m, rng.randint(3, 26))
             if _on_or_before_through(day):
-                amt = _yuan(rng, 120, 350)
+                amt = _spend(rng,120, 350)
                 txns.append({"description": rng.choice(GIFT_OCCASIONS),
                              "date": day,
                              "splits": [(WECHAT, -amt), (EXP_GIFTS, amt)]})
@@ -1232,7 +1395,7 @@ def gen_personal_life() -> list[dict]:
             day = _clamp_day(yy, m, rng.randint(3, 26))
             if not _on_or_before_through(day):
                 continue
-            amt = _yuan(rng, 800, 1600)
+            amt = _spend(rng,800, 1600)
             txns.append({"description": rng.choice(WEDDING_OCCASIONS),
                          "date": day,
                          "splits": [(CHECKING, -amt), (EXP_GIFTS, amt)]})
@@ -1244,14 +1407,14 @@ def gen_personal_life() -> list[dict]:
     for yy, m in iter_months(start):
         day = _clamp_day(yy, m, 8)
         if _on_or_before_through(day):
-            amt = _yuan(rng, 100, 200)
+            amt = _spend(rng,100, 200)
             txns.append({"description": "腾讯公益 月捐",
                          "date": day,
                          "splits": [(WECHAT, -amt), (EXP_CHARITY, amt)]})
         if m == 9:
             dday = _clamp_day(yy, m, 9)  # 99公益日
             if _on_or_before_through(dday):
-                amt = _yuan(rng, 500, 1000)
+                amt = _spend(rng,500, 1000)
                 txns.append({"description": "99公益日 配捐",
                              "date": dday,
                              "splits": [(WECHAT, -amt), (EXP_CHARITY, amt)]})
@@ -1265,7 +1428,7 @@ def gen_personal_life() -> list[dict]:
         if rng.random() < 0.80:
             day = date.fromordinal(d.toordinal() + rng.randint(4, 6))
             if _on_or_before_through(day):
-                amt = _yuan(rng, 80, 200)
+                amt = _spend(rng,80, 200)
                 src = rng.choice([WECHAT, ALIPAY])
                 txns.append({"description": rng.choice(ENTERTAINMENT_VENDORS),
                              "date": day,
@@ -1279,7 +1442,7 @@ def gen_personal_life() -> list[dict]:
             cday = _clamp_day(yy, m, rng.randint(8, 24))
             if not _on_or_before_through(cday):
                 continue
-            amt = _yuan(rng, 600, 1200)
+            amt = _spend(rng,600, 1200)
             txns.append({"description": rng.choice(CONCERT_VENDORS),
                          "date": cday,
                          "splits": [(CMB_CARD, -amt),
@@ -1290,7 +1453,7 @@ def gen_personal_life() -> list[dict]:
     for yy, m in iter_months(start):
         day = _clamp_day(yy, m, 3)
         if _on_or_before_through(day):
-            amt = _yuan(rng, 240, 280)  # 健身房 monthly dues
+            amt = _spend(rng,240, 280)  # 健身房 monthly dues
             txns.append({"description": "威尔士健身 月卡",
                          "date": day,
                          "splits": [(CHECKING, -amt),
@@ -1299,7 +1462,7 @@ def gen_personal_life() -> list[dict]:
         if rng.random() < 0.6:
             dday = _clamp_day(yy, m, rng.randint(12, 26))
             if _on_or_before_through(dday):
-                amt = _yuan(rng, 120, 300)
+                amt = _spend(rng,120, 300)
                 txns.append({"description": rng.choice(
                                  ["丝芙兰 护肤品", "屈臣氏 护肤", "美容院 面部护理"]),
                              "date": dday,
@@ -1309,7 +1472,7 @@ def gen_personal_life() -> list[dict]:
         if m % 2 == 0:
             mday = _clamp_day(yy, m, rng.randint(14, 28))
             if _on_or_before_through(mday):
-                amt = _yuan(rng, 150, 280)
+                amt = _spend(rng,150, 280)
                 txns.append({"description": "中医推拿按摩",
                              "date": mday,
                              "splits": [(WECHAT, -amt),
@@ -1317,7 +1480,7 @@ def gen_personal_life() -> list[dict]:
     # 理发 roughly every 5 weeks (35 days), jittered, on WeChat Pay.
     d = date.fromordinal(start.toordinal() + rng.randint(5, 18))
     while d <= THROUGH:
-        amt = _yuan(rng, 60, 120)
+        amt = _spend(rng,60, 120)
         txns.append({"description": "理发店 剪发",
                      "date": d,
                      "splits": [(WECHAT, -amt), (EXP_PERSONAL_CARE, amt)]})
@@ -1331,7 +1494,7 @@ def gen_personal_life() -> list[dict]:
             day = _clamp_day(yy, m, rng.randint(2, 27))
             if not _on_or_before_through(day):
                 continue
-            amt = _yuan(rng, 150, 500)
+            amt = _spend(rng,150, 500)
             src = rng.choice([ALIPAY, CMB_CARD])
             txns.append({"description": rng.choice(ONLINE_RETAIL_VENDORS) + " 网购",
                          "date": day,
@@ -1356,7 +1519,7 @@ def gen_personal_life() -> list[dict]:
         tday = _clamp_day(cur.year, cur.month, rng.randint(8, 22))
         desc, src, lo, hi = trip_specs[trip_idx % len(trip_specs)]
         if _on_or_before_through(tday):
-            amt = _yuan(rng, lo, hi)
+            amt = _spend(rng,lo, hi)
             txns.append({"description": desc, "date": tday,
                          "splits": [(src, -amt), (EXP_TRAVEL, amt)]})
         nm = cur.month - 1 + 5  # +5 months
@@ -1377,7 +1540,7 @@ def gen_personal_life() -> list[dict]:
         if rng.random() < 0.8:  # most months get a clothing purchase
             day = _clamp_day(yy, m, rng.randint(4, 26))
             if _on_or_before_through(day):
-                amt = _yuan(rng, 300, 650)
+                amt = _spend(rng,300, 650)
                 src = rng.choice([ALIPAY, ALIPAY, CMB_CARD])
                 vend = (rng.choice(CLOTHING_MALL_VENDORS) if src == CMB_CARD
                         else rng.choice(CLOTHING_ONLINE_VENDORS))
@@ -1395,7 +1558,7 @@ def gen_personal_life() -> list[dict]:
         if rng.random() < 0.75:
             day = _clamp_day(yy, m, rng.randint(5, 24))
             if _on_or_before_through(day):
-                amt = _yuan(rng, 120, 260)
+                amt = _spend(rng,120, 260)
                 src = rng.choice([ALIPAY, WECHAT])
                 txns.append({
                     "description": rng.choice(EDUCATION_COURSE_VENDORS),
@@ -1405,7 +1568,7 @@ def gen_personal_life() -> list[dict]:
         if m in (2, 5, 8, 11):
             bday = _clamp_day(yy, m, rng.randint(8, 22))
             if _on_or_before_through(bday):
-                amt = _yuan(rng, 200, 400)
+                amt = _spend(rng,200, 400)
                 txns.append({
                     "description": rng.choice(EDUCATION_BOOK_VENDORS),
                     "date": bday,
@@ -1414,7 +1577,7 @@ def gen_personal_life() -> list[dict]:
         if m in (4, 10):
             mday = _clamp_day(yy, m, rng.randint(10, 24))
             if _on_or_before_through(mday):
-                amt = _yuan(rng, 200, 400)
+                amt = _spend(rng,200, 400)
                 txns.append({
                     "description": rng.choice(EDUCATION_MEETUP_VENDORS),
                     "date": mday,
@@ -1431,7 +1594,7 @@ def gen_personal_life() -> list[dict]:
             day = _clamp_day(yy, m, debit_day)
             if not _on_or_before_through(day):
                 continue
-            amt = _yuan(rng, lo, hi)
+            amt = _spend(rng,lo, hi)
             txns.append({
                 "description": label,
                 "date": day,
@@ -1455,7 +1618,7 @@ def gen_personal_life() -> list[dict]:
         if rng_cloth.random() < 0.95:  # nearly every month gets a top-up
             day = _clamp_day(yy, m, rng_cloth.randint(4, 26))
             if _on_or_before_through(day):
-                amt = _yuan(rng_cloth, 250, 380)
+                amt = _spend(rng_cloth, 250, 380)
                 src = rng_cloth.choice([ALIPAY, ALIPAY, CMB_CARD])
                 vend = (rng_cloth.choice(CLOTHING_MALL_VENDORS)
                         if src == CMB_CARD
@@ -1517,10 +1680,10 @@ def run_business(book: GnuCashBook) -> dict:
         notes="本地跨境电商客户, Net 30")
     pacific = book.create_customer(
         name="Pacific Trade Solutions", currency="USD",
-        notes="美国客户, USD 计价, Net 30")
+        notes="美国客户, 移动应用外包, Net 30")
     munich = book.create_customer(
         name="Handelskontor München GmbH", currency="EUR",
-        notes="德国客户, EUR 计价, Net 30")
+        notes="德国客户, ERP 集成项目, Net 30")
     counts["customers"] = 3
 
     # Vendors.
@@ -1528,7 +1691,7 @@ def run_business(book: GnuCashBook) -> dict:
         name="阿里云", currency="CNY", notes="云服务")
     jetbrains = book.create_vendor(
         name="JetBrains", currency="USD",
-        notes="IDE 订阅 (USD-denominated, FX payable case)")
+        notes="IDE 年度订阅")
     urwork = book.create_vendor(
         name="优客工场", currency="CNY", notes="联合办公空间")
     counts["vendors"] = 3
@@ -1818,12 +1981,24 @@ def run_investments(out_path: Path) -> dict:
                 cost_per = (Decimal(str(opening_split.value))
                             / Decimal(str(opening_split.quantity)))
                 cost_basis = (shares * cost_per).quantize(D("0.01"))
-                gain = cny_amt - cost_basis
+                # Realized P/L = sale proceeds − cost basis, SIGNED.
+                #   above cost → realized_pl > 0  (a gain)
+                #   below cost → realized_pl < 0  (a LOSS — e.g. Moutai sold
+                #               at ¥1,437 vs ¥1,700 basis = −¥263)
+                # Capital Gains is a credit-normal INCOME account, so a gain
+                # is a credit (value = −realized_pl < 0) and a loss is a debit
+                # (value = −realized_pl > 0) that REDUCES capital-gains income.
+                # The three splits sum to zero either way:
+                #   (−cost_basis) + cny_amt + (−realized_pl)
+                #   = −cost_basis + cny_amt − (cny_amt − cost_basis) = 0.
+                realized_pl = cny_amt - cost_basis
                 inv_split = piecash.Split(
                     account=inv_acct, value=-cost_basis, quantity=-shares)
                 cash_split = piecash.Split(account=acct[CHECKING], value=cny_amt)
                 gain_split = piecash.Split(
-                    account=acct[CAPITAL_GAINS], value=-gain)
+                    account=acct[CAPITAL_GAINS], value=-realized_pl)
+                # Defensive: the synthetic data must balance to the fen.
+                assert (-cost_basis) + cny_amt + (-realized_pl) == 0
                 piecash.Transaction(
                     currency=cny, description=f"卖出 {shares} {sym} @ ¥{price}",
                     post_date=d, splits=[inv_split, cash_split, gain_split],
@@ -2078,8 +2253,11 @@ def gen_volume() -> list[dict]:
     for _ in range(count):
         dt = date.fromordinal(start + rng.randint(0, span))
         vendor = rng.choice(VOLUME_VENDORS)
-        amt = D(str(rng.randint(5, 80)))
-        category = rng.choice([EXP_DINING, EXP_MISC])
+        amt = _spend(rng, 5, 80)
+        # Category is the merchant's canonical bucket — consistent every time,
+        # including the sticky vending-machine→Misc miscategorization. No more
+        # per-transaction random scatter across Dining/Misc.
+        category = merchant_category(vendor, EXP_DINING)
         txns.append({
             "description": vendor,
             "date": dt,
@@ -2176,6 +2354,120 @@ def _parse_money(s) -> Decimal:
     return Decimal(str(s).replace(",", "").replace("¥", "").strip())
 
 
+def _verify_realism(out_path: Path) -> None:
+    """Deep-realism evidence: cents, merchant→category, payroll, cap-gains."""
+    book = piecash.open_book(str(out_path), readonly=True)
+    try:
+        txns = list(book.transactions)
+
+        # 1. Cents on consumer spend. Sample ~20 daily-spend transactions and
+        #    report the fraction carrying non-zero jiao/fen.
+        consumer_merchants = (
+            "瑞幸", "美团外卖", "饿了么", "盒马", "便利蜂", "7-11",
+            "全家便利店", "山姆", "滴滴出行", "共享单车", "自动贩卖机",
+            "EV充电",
+        )
+        consumer = [t for t in txns
+                    if any(t.description.startswith(k)
+                           for k in consumer_merchants)]
+        consumer.sort(key=lambda t: str(t.post_date))
+        sample = consumer[:20]
+        with_cents = 0
+        print("\n-- Realism #1: cents on consumer spend (sample of 20) --")
+        for t in sample:
+            amt = abs(t.splits[0].value)
+            has_cents = (amt % 1) != 0
+            with_cents += 1 if has_cents else 0
+            print(f"    {t.description:18s} ¥{amt}")
+        frac = with_cents / len(sample) if sample else 0
+        print(f"  fraction with non-zero jiao/fen: {with_cents}/{len(sample)} "
+              f"= {frac:.0%}")
+
+        # Structured items stay round.
+        print("  structured items (should be round):")
+        for key in ("深圳市人民医院 工资", "房贷还款", "车贷还款",
+                    "春节红包"):
+            hit = next((t for t in txns if t.description.startswith(key)),
+                       None)
+            if hit:
+                vals = [abs(s.value) for s in hit.splits]
+                allround = all((v % 1) == 0 for v in vals)
+                print(f"    {key:22s} splits {vals}  all_round={allround}")
+
+        # 3. Variable payroll withholding across months (incl. overtime).
+        print("\n-- Realism #3: payroll withholding varies by month --")
+        sal = sorted(
+            (t for t in txns if t.description.startswith("深圳市人民医院 工资")),
+            key=lambda t: str(t.post_date))
+        # First four 2025 salary runs (March is an overtime month).
+        for t in sal[:4]:
+            def _split(path_end):
+                for s in t.splits:
+                    if s.account.fullname.endswith(path_end):
+                        return s.value
+                return None
+            gross = -_split("Income:Salary")
+            it = _split("Taxes:Income Tax")
+            soc = _split("Taxes:Social Insurance")
+            hf = _split("Housing Fund")
+            ot = "OT" if "加班" in t.description else "  "
+            print(f"    {str(t.post_date)[:7]} {ot} gross ¥{gross:>8}  "
+                  f"income_tax ¥{it:>8}  social ¥{soc:>6}  housing ¥{hf:>6}")
+
+        # 2. Consistent merchant → category mapping.
+        print("\n-- Realism #2: merchant → category consistency --")
+        from collections import defaultdict
+        m2c: dict[str, set] = defaultdict(set)
+        for t in txns:
+            # The expense split is the one whose account is under Expenses.
+            exp = [s for s in t.splits
+                   if s.account.fullname.startswith("Expenses:")]
+            for s in exp:
+                for key in ("瑞幸", "美团外卖", "饿了么", "盒马", "便利蜂",
+                            "滴滴出行", "共享单车", "自动贩卖机", "山姆",
+                            "EV充电"):
+                    if t.description.startswith(key):
+                        m2c[key].add(s.account.fullname)
+        for key in sorted(m2c):
+            cats = sorted(m2c[key])
+            flag = "OK (single)" if len(cats) == 1 else "⚠ MULTIPLE"
+            short = [c.replace("Expenses:", "") for c in cats]
+            print(f"    {key:10s} → {short}  {flag}")
+        print("  deliberate sticky miscategorization: "
+              "自动贩卖机 → Miscellaneous (always)")
+
+        # 4. Meta-notes stripped from persisted customer/vendor data.
+        print("\n-- Realism #4: meta-notes in persisted data --")
+        bad = ("FX payable", "USD-denominated", "计价", "case", "H1 case",
+               "regression")
+        offenders = []
+        for ent in list(book.customers) + list(book.vendors):
+            note = ent.notes or ""
+            for b in bad:
+                if b in note:
+                    offenders.append((ent.name, b, note))
+        print(f"  customer/vendor notes scanned: "
+              f"{len(list(book.customers)) + len(list(book.vendors))}")
+        print(f"  offending notes: {offenders if offenders else 'NONE'}")
+
+        # 5. Capital-gains sign: below-cost sale must be a LOSS (negative).
+        print("\n-- Realism #5: realized capital gain/loss sign --")
+        for t in txns:
+            if t.description.startswith("卖出"):
+                cg = [s for s in t.splits if s.account.fullname.endswith(
+                    "Capital Gains")]
+                if not cg:
+                    continue
+                # Realized P/L = -(value on the income split).
+                realized = -cg[0].value
+                kind = "LOSS" if realized < 0 else "gain"
+                bal = sum(s.value for s in t.splits)
+                print(f"    {t.description:26s} realized P/L ¥{realized:>9} "
+                      f"({kind})  splits_balance={bal == 0}")
+    finally:
+        book.close()
+
+
 def verify(out_path: Path, business: dict) -> None:
     print("\n" + "=" * 64)
     print("VERIFICATION")
@@ -2191,6 +2483,9 @@ def verify(out_path: Path, business: dict) -> None:
     summary = book.get_book_summary()
     bs = book.balance_sheet(as_of_date=as_of)
     nw = book.net_worth(end_date=as_of)
+
+    # ── Realism checks (cents, categorization, withholding, cap-gains) ──
+    _verify_realism(out_path)
 
     # Net worth from the three tools.
     bs_assets = _parse_money(bs["assets"]["total"])
