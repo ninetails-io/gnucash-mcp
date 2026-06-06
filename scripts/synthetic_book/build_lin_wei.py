@@ -149,6 +149,8 @@ EXP_SOFTWARE = "Expenses:Business:Software"
 EXP_COWORKING = "Expenses:Business:Coworking"
 EXP_MISC = "Expenses:Miscellaneous"
 EXP_MEDICAL = "Expenses:Medical"
+EXP_ENTERTAINMENT = "Expenses:Entertainment"
+EXP_PERSONAL_CARE = "Expenses:Personal Care"
 
 
 # ── Phase 1: Commodities & prices ───────────────────────────────
@@ -453,6 +455,8 @@ ACCOUNTS = [
     ("Education", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
     ("Gifts", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
     ("Charity", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
+    ("Entertainment", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
+    ("Personal Care", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
     ("Business", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
     ("Cloud Hosting", "EXPENSE", "Expenses:Business", "CNY", "CURRENCY", False),
     ("Software", "EXPENSE", "Expenses:Business", "CNY", "CURRENCY", False),
@@ -666,6 +670,12 @@ def _clamp_day(year: int, month: int, day: int) -> date:
 def _on_or_before_through(d: date) -> bool:
     """True if ``d`` is on or before THROUGH (so we don't post the future)."""
     return d <= THROUGH
+
+
+def _yuan(rng: random.Random, low: int, high: int) -> Decimal:
+    """A whole-yuan amount uniformly in ``[low, high]`` (Chinese spend is
+    almost always priced to the yuan, not the fen, for these categories)."""
+    return D(str(rng.randint(low, high)))
 
 
 # ── Phase 4: Scheduled-transaction templates ────────────────────
@@ -1076,6 +1086,254 @@ def gen_daily_weekly() -> list[dict]:
             "date": date(YEAR, 11, 11 + (i // 2)),
             "splits": [(ICBC_CARD, -amt), (EXP_CLOTHING, amt)],
         })
+
+    return txns
+
+
+# ── Phase 6b: Personal-life spending (medical, gifts, charity, ───
+#               travel, entertainment, personal care) ────────────
+
+# Vendors keep the spending legible in the register and the bookkeeper's
+# eyes — same texture as the daily/weekly vendor lists above. All Chinese
+# (the book is a UTF-8 / character-encoding test corpus).
+PHARMACY_VENDORS = ["国大药房", "海王星辰药店", "老百姓大药房", "叮当快药"]
+CLINIC_VENDORS = ["社区健康服务中心 自费", "深圳市人民医院 门诊自费",
+                  "北大深圳医院 挂号", "丁香诊所 自费"]
+DENTAL_VENDORS = ["拜博口腔 洗牙", "美奥口腔 补牙", "深圳口腔医院"]
+ENTERTAINMENT_VENDORS = [
+    "万达影城 电影票", "保利院线 观影", "KTV 唱吧", "纯K量贩式KTV",
+    "剧本杀 谜案馆", "密室逃脱", "海岸城酒吧", "1979酒吧",
+    "深圳欢乐谷", "世界之窗", "Livehouse B10", "桌游吧",
+]
+CONCERT_VENDORS = [
+    "演唱会门票 (深圳湾体育中心)", "音乐节 (大运中心)",
+    "话剧 (保利剧院)", "脱口秀专场 (笑友剧场)",
+]
+GIFT_OCCASIONS = [
+    "同事生日礼物", "朋友生日红包", "侄女生日礼物", "乔迁之礼",
+    "满月红包", "探病果篮", "伴手礼",
+]
+WEDDING_OCCASIONS = [
+    "婚礼红包 (大学同学)", "婚礼红包 (前同事)", "婚礼随礼 (表妹)",
+    "婚礼红包 (老乡)",
+]
+ONLINE_RETAIL_VENDORS = ["淘宝", "京东商城", "拼多多", "天猫超市"]
+
+
+def gen_personal_life() -> list[dict]:
+    """Personal-life spending streams, 2025-01 → THROUGH, localized to a
+    Shenzhen (深圳) contractor household (林微 + 陈雨 + the cat 字节).
+
+    Each stream walks the months with realistic cadence and lumpiness,
+    amounts varied within CNY target ranges via the seeded RNG. Small
+    daily spend rides WeChat Pay / Alipay (matching the existing daily
+    conventions); larger items ride Checking or the credit cards. The
+    cadence is deliberately near-monthly + periodic so the bookkeeper's
+    recent-~5-month evaluation window is never empty for any category.
+
+    Targets (monthly average, CNY):
+      Medical        ~¥200-500   药店 monthly + periodic clinic/specialist + 牙科
+      Gifts          ~¥400-700   small near-monthly baseline + 婚礼红包 + occasions
+      Charity        ~¥100-300   腾讯公益 monthly + 99公益日 (Sep) spike
+      Travel         periodic trips (春节/国庆/international client) every ~5 mo
+      Entertainment  ~¥400-800   KTV/电影/剧本杀/bars + occasional 演唱会 spike
+      Personal Care  ~¥300-600   健身房 monthly + 理发 periodic + 美容/按摩
+      Misc (online)  occasional 淘宝/京东/拼多多 orders most months
+    """
+    txns: list[dict] = []
+    start = date(YEAR, 1, 1)
+    rng = random.Random(SEED + 21)
+
+    # ── Medical: 药店 monthly small spend, periodic clinic/specialist ──
+    #    visit, periodic 牙科 (dental). 医保 covers a lot, but out-of-pocket
+    #    (自费) happens. Small spend on WeChat Pay, bigger on Checking.
+    for yy, m in iter_months(start):
+        # Monthly pharmacy / small out-of-pocket (~¥80-200).
+        day = _clamp_day(yy, m, rng.randint(6, 24))
+        if _on_or_before_through(day):
+            amt = _yuan(rng, 80, 200)
+            txns.append({"description": rng.choice(PHARMACY_VENDORS),
+                         "date": day,
+                         "splits": [(WECHAT, -amt), (EXP_MEDICAL, amt)]})
+        # Periodic 自费 clinic / specialist visit (~¥250-500) in
+        # Feb/May/Aug/Nov.
+        if m in (2, 5, 8, 11):
+            dday = _clamp_day(yy, m, rng.randint(8, 22))
+            if _on_or_before_through(dday):
+                amt = _yuan(rng, 250, 500)
+                txns.append({"description": rng.choice(CLINIC_VENDORS),
+                             "date": dday,
+                             "splits": [(CHECKING, -amt),
+                                        (EXP_MEDICAL, amt)]})
+        # 牙科 (dental) twice a year — cleaning in March, a filling/checkup
+        # in September (~¥300-700).
+        if m in (3, 9):
+            dday = _clamp_day(yy, m, rng.randint(10, 20))
+            if _on_or_before_through(dday):
+                amt = _yuan(rng, 300, 700)
+                txns.append({"description": rng.choice(DENTAL_VENDORS),
+                             "date": dday,
+                             "splits": [(CHECKING, -amt),
+                                        (EXP_MEDICAL, amt)]})
+
+    # ── Gifts: LUMPY but with a small near-monthly baseline so no recent ──
+    #    window is empty. The existing seasonal calendar already carries
+    #    春节红包 (¥6,000 yearly, Phase 5), 中秋月饼礼盒 (¥1,800, Sep) and
+    #    节日礼物 (¥2,000, Dec) — do NOT duplicate those. This layers a
+    #    small monthly habit + scattered 婚礼红包 / occasion gifts on top.
+    for yy, m in iter_months(start):
+        # Skip Sep (中秋 carried) and Dec (节日礼物 carried) for the
+        # baseline so we don't pile on top of the big named events.
+        if m in (9, 12):
+            continue
+        if rng.random() < 0.85:  # ~5 of every 6 months get a small gift
+            day = _clamp_day(yy, m, rng.randint(3, 26))
+            if _on_or_before_through(day):
+                amt = _yuan(rng, 120, 350)
+                txns.append({"description": rng.choice(GIFT_OCCASIONS),
+                             "date": day,
+                             "splits": [(WECHAT, -amt), (EXP_GIFTS, amt)]})
+    # 婚礼红包: 3-4 weddings a year, spread across non-春节 months, each
+    # ¥800-1,600 — the lumpy occasions that make any 5-month window catch
+    # at least one.
+    for yy in sorted({y for y, _ in iter_months(start)}):
+        n_weddings = rng.randint(3, 4)
+        pool = [3, 4, 5, 6, 7, 8, 10, 11]
+        chosen = rng.sample(pool, k=min(n_weddings, len(pool)))
+        for m in chosen:
+            day = _clamp_day(yy, m, rng.randint(3, 26))
+            if not _on_or_before_through(day):
+                continue
+            amt = _yuan(rng, 800, 1600)
+            txns.append({"description": rng.choice(WEDDING_OCCASIONS),
+                         "date": day,
+                         "splits": [(CHECKING, -amt), (EXP_GIFTS, amt)]})
+
+    # ── Charity: recurring monthly 腾讯公益 donation (~¥100-200) + the ──
+    #    99公益日 spike each September (~¥500-1,000). The year-end
+    #    年末慈善捐款 (¥1,000, Dec 28) already exists in Phase 6 — don't
+    #    duplicate it; this adds the steady monthly habit + the Sep spike.
+    for yy, m in iter_months(start):
+        day = _clamp_day(yy, m, 8)
+        if _on_or_before_through(day):
+            amt = _yuan(rng, 100, 200)
+            txns.append({"description": "腾讯公益 月捐",
+                         "date": day,
+                         "splits": [(WECHAT, -amt), (EXP_CHARITY, amt)]})
+        if m == 9:
+            dday = _clamp_day(yy, m, 9)  # 99公益日
+            if _on_or_before_through(dday):
+                amt = _yuan(rng, 500, 1000)
+                txns.append({"description": "99公益日 配捐",
+                             "date": dday,
+                             "splits": [(WECHAT, -amt), (EXP_CHARITY, amt)]})
+
+    # ── Entertainment (NEW): weekly-ish outings (~¥80-200) on WeChat/Alipay ──
+    #    + occasional 演唱会 / festival spike (~¥600-1,200) twice a year.
+    d = start
+    while d <= THROUGH:
+        # ~3 outings a month (skip ~1 week in 5), jittered onto a
+        # Fri-Sun evening.
+        if rng.random() < 0.80:
+            day = date.fromordinal(d.toordinal() + rng.randint(4, 6))
+            if _on_or_before_through(day):
+                amt = _yuan(rng, 80, 200)
+                src = rng.choice([WECHAT, ALIPAY])
+                txns.append({"description": rng.choice(ENTERTAINMENT_VENDORS),
+                             "date": day,
+                             "splits": [(src, -amt),
+                                        (EXP_ENTERTAINMENT, amt)]})
+        d = date.fromordinal(d.toordinal() + 7)
+    # 演唱会 / 音乐节 spikes: spring (May) + fall (Oct), each year, on the
+    # CMB card (bigger discretionary charge).
+    for yy in sorted({y for y, _ in iter_months(start)}):
+        for m in (5, 10):
+            cday = _clamp_day(yy, m, rng.randint(8, 24))
+            if not _on_or_before_through(cday):
+                continue
+            amt = _yuan(rng, 600, 1200)
+            txns.append({"description": rng.choice(CONCERT_VENDORS),
+                         "date": cday,
+                         "splits": [(CMB_CARD, -amt),
+                                    (EXP_ENTERTAINMENT, amt)]})
+
+    # ── Personal Care (NEW): monthly 健身房 dues (~¥250) autopay + 理发 ──
+    #    every ~5 weeks (~¥60-120) + periodic 美容/护肤 and 按摩.
+    for yy, m in iter_months(start):
+        day = _clamp_day(yy, m, 3)
+        if _on_or_before_through(day):
+            amt = _yuan(rng, 240, 280)  # 健身房 monthly dues
+            txns.append({"description": "威尔士健身 月卡",
+                         "date": day,
+                         "splits": [(CHECKING, -amt),
+                                    (EXP_PERSONAL_CARE, amt)]})
+        # 美容 / 护肤 most months (~¥120-300) — skincare / facial.
+        if rng.random() < 0.6:
+            dday = _clamp_day(yy, m, rng.randint(12, 26))
+            if _on_or_before_through(dday):
+                amt = _yuan(rng, 120, 300)
+                txns.append({"description": rng.choice(
+                                 ["丝芙兰 护肤品", "屈臣氏 护肤", "美容院 面部护理"]),
+                             "date": dday,
+                             "splits": [(ALIPAY, -amt),
+                                        (EXP_PERSONAL_CARE, amt)]})
+        # 按摩 roughly every other month (~¥150-280).
+        if m % 2 == 0:
+            mday = _clamp_day(yy, m, rng.randint(14, 28))
+            if _on_or_before_through(mday):
+                amt = _yuan(rng, 150, 280)
+                txns.append({"description": "中医推拿按摩",
+                             "date": mday,
+                             "splits": [(WECHAT, -amt),
+                                        (EXP_PERSONAL_CARE, amt)]})
+    # 理发 roughly every 5 weeks (35 days), jittered, on WeChat Pay.
+    d = date.fromordinal(start.toordinal() + rng.randint(5, 18))
+    while d <= THROUGH:
+        amt = _yuan(rng, 60, 120)
+        txns.append({"description": "理发店 剪发",
+                     "date": d,
+                     "splits": [(WECHAT, -amt), (EXP_PERSONAL_CARE, amt)]})
+        d = date.fromordinal(d.toordinal() + 35 + rng.randint(-4, 6))
+
+    # ── Light online retail thickening: occasional 淘宝/京东/拼多多 orders ──
+    #    (~¥150-500) to Miscellaneous, most months (Chinese online shopping
+    #    is heavy; Misc is otherwise thin). Paid on Alipay or CMB card.
+    for yy, m in iter_months(start):
+        if rng.random() < 0.7:  # most months
+            day = _clamp_day(yy, m, rng.randint(2, 27))
+            if not _on_or_before_through(day):
+                continue
+            amt = _yuan(rng, 150, 500)
+            src = rng.choice([ALIPAY, CMB_CARD])
+            txns.append({"description": rng.choice(ONLINE_RETAIL_VENDORS) + " 网购",
+                         "date": day,
+                         "splits": [(src, -amt), (EXP_MISC, amt)]})
+
+    # ── Periodic trips (¥3,000-8,000 each): 高铁/flights + hotel folded ──
+    #    into the month. A trip every ~5 months across the timeline so any
+    #    recent-5-month window always catches at least one. Anchored to
+    #    month 2 (春节 home) then stepped +5 months, cycling through:
+    #    春节回乡 → 国庆出游 → international client visit (US Pacific Trade /
+    #    Europe Handelskontor München). The light seasonal travel in
+    #    Phase 6 stays intact; these are the bigger periodic anchors.
+    trip_specs = [
+        ("春节回乡 高铁+住宿 (深圳→老家)", CHECKING, 3000, 5000),
+        ("国庆出游 机票+酒店 (云南/三亚)", CHECKING, 4000, 7000),
+        ("出差 美国 Pacific Trade (机票+酒店)", CMB_CARD, 6000, 8000),
+        ("出差 德国 Handelskontor München (机票+酒店)", CMB_CARD, 6000, 8000),
+    ]
+    trip_idx = 0
+    cur = date(YEAR, 2, 1)
+    while cur <= THROUGH:
+        tday = _clamp_day(cur.year, cur.month, rng.randint(8, 22))
+        desc, src, lo, hi = trip_specs[trip_idx % len(trip_specs)]
+        if _on_or_before_through(tday):
+            amt = _yuan(rng, lo, hi)
+            txns.append({"description": desc, "date": tday,
+                         "splits": [(src, -amt), (EXP_TRAVEL, amt)]})
+        nm = cur.month - 1 + 5  # +5 months
+        cur = date(cur.year + nm // 12, nm % 12 + 1, 1)
+        trip_idx += 1
 
     return txns
 
@@ -1890,6 +2148,51 @@ def verify(out_path: Path, business: dict) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"  get_outstanding_invoices unavailable: {exc}")
 
+    # Personal-life spending: avg monthly over the last ~5 months. The
+    # bookkeeper evaluates the most recent window, so every category must
+    # carry flow there (not a single event elsewhere in the 17-month span).
+    print("\n-- Personal-life spending (avg/mo over last ~5 months) --")
+    nm = THROUGH.month - 4
+    ws_y = THROUGH.year + (nm - 1) // 12
+    ws_m = (nm - 1) % 12 + 1
+    window_start = date(ws_y, ws_m, 1)
+    n_months = 5
+    day_before = date.fromordinal(window_start.toordinal() - 1)
+    personal = [
+        ("Medical", EXP_MEDICAL, (200, 500), False),
+        ("Gifts", EXP_GIFTS, (200, 700), True),
+        ("Charity", EXP_CHARITY, (100, 300), False),
+        ("Travel", EXP_TRAVEL, (0, None), False),
+        ("Entertainment", EXP_ENTERTAINMENT, (400, 800), False),
+        ("Personal Care", EXP_PERSONAL_CARE, (300, 600), False),
+    ]
+    print(f"  window: {window_start.isoformat()} → {THROUGH.isoformat()} "
+          f"({n_months} months)")
+    for label, path, (lo, hi), lumpy in personal:
+        bal_start = _parse_money(book.get_balance(path, as_of_date=day_before))
+        bal_end = _parse_money(book.get_balance(path, as_of_date=as_of))
+        period = bal_end - bal_start
+        avg = period / n_months
+        if hi is None:
+            band = f"(target trip-driven; ≥1 trip in window)"
+            ok = period > 0
+        elif lumpy:
+            band = (f"(lumpy; target ~¥{lo}-{hi}/mo, recent window may "
+                    "run low/high)")
+            ok = period > 0
+        else:
+            ok = lo * D("0.5") <= avg <= hi * D("1.8")
+            band = f"(target ~¥{lo}-{hi}/mo)"
+        print(f"    {label:14s} period ¥{period:>10,.2f} | "
+              f"avg ¥{avg:>8,.2f}/mo {band} "
+              f"{'OK' if ok else 'CHECK'}  non-zero={period != 0}")
+
+    # New accounts exist with flow.
+    print("\n-- New accounts (Entertainment, Personal Care) --")
+    for path in (EXP_ENTERTAINMENT, EXP_PERSONAL_CARE):
+        bal = _parse_money(book.get_balance(path, as_of_date=as_of))
+        print(f"    {path}: lifetime flow ¥{bal:,.2f}  exists={bal != 0}")
+
     # Jobs present.
     print("\n-- Jobs --")
     try:
@@ -1990,6 +2293,11 @@ def build(out_path: Path) -> None:
     print("\nPhase 6: daily/weekly + seasonal")
     n = write_bulk(out_path, gen_daily_weekly())
     print(f"  {n} daily/weekly/seasonal transactions")
+
+    print("\nPhase 6b: personal-life spending "
+          "(medical/gifts/charity/travel/entertainment/personal care)")
+    n = write_bulk(out_path, gen_personal_life())
+    print(f"  {n} personal-life transactions")
 
     print("\nPhase 7a: direct contractor income")
     n = write_bulk(out_path, gen_contractor_income())
