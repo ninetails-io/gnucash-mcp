@@ -45,6 +45,15 @@ htmlcov/
 # ``samples/`` remain ignored.
 !samples/*.gnucash
 
+# ...but the *generated* books are regenerable from the build_*.py
+# scripts (+ market_data_cache.json), so they and their auto-backup /
+# .mcp sidecars are NOT committed. The scripts + cache are the source
+# of truth; run ``uv run python scripts/synthetic_book/build_*.py`` to
+# rebuild. (Later rules override the re-include above.)
+samples/*.generated.gnucash
+samples/*.generated.gnucash.*
+samples/*.gnucash.mcp/
+
 # OS
 .DS_Store
 Thumbs.db

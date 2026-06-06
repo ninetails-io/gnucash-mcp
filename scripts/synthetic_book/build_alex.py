@@ -1,0 +1,1659 @@
+"""Build the Alex Chen-Morales USD-default synthetic GnuCash book FROM ZERO.
+
+The USD analogue of ``build_lin_wei.py``: a single script that creates
+Alex's entire book from nothing — the SQLite file, the commodities,
+the full chart of accounts, opening balances and investment opening
+lots, scheduled-transaction templates, recurring instantiations,
+daily/weekly spending, contractor income + the LLC business module,
+investment activity, the credit-card lifecycle, a budget,
+reconciliation, edge cases, and a volume stress phase.
+
+It implements ``specs/SYNTHETIC_BOOK_SPEC.md`` — a USD-default book
+for a Seattle software contractor (Cascade Code LLC) with a European
+client paying in EUR. The mandatory FX regression case is the Berlin
+Digital GmbH EUR invoices, which post to a EUR A/R sub-account and
+settle cross-currency EUR->USD with realized FX gain/loss booked.
+
+All security prices and FX rates come from REAL historical market data
+via ``market_data.MarketData`` (offline, cache-backed): VTSAX, VBTLX,
+AAPL, MSFT, ETH (all USD-denominated; ETH is crypto) and EUR/GBP/CAD
+FX (all -> USD). Trade prices and conversion amounts use the actual
+quotes, not invented numbers.
+
+SAFETY: this script writes ONLY to ``samples/alex.generated.gnucash``
+(the ``--out`` path). It NEVER touches the bookkeeper-validated
+``samples/alex-chen-morales.gnucash``.
+
+Usage:
+    uv run python scripts/synthetic_book/build_alex.py
+    uv run python scripts/synthetic_book/build_alex.py --out /tmp/alex.gnucash
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+from datetime import date, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+import piecash
+
+from gnucash_mcp.book import GnuCashBook
+
+# market_data lives alongside this script; import works whether run as a
+# module or as a path because uv adds the script dir to sys.path.
+try:
+    from market_data import MarketData
+except ImportError:  # pragma: no cover - fallback for package-style import
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from market_data import MarketData
+
+
+# ── Configuration ───────────────────────────────────────────────
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUT = REPO_ROOT / "samples" / "alex.generated.gnucash"
+PROTECTED = REPO_ROOT / "samples" / "alex-chen-morales.gnucash"
+
+SEED = 20250101
+VOLUME_TXN_COUNT = 320  # Phase 13 small casual-spend transactions
+
+YEAR = 2025
+
+D = Decimal
+
+# Shared real-market-data accessor (offline; reads the committed cache).
+MD = MarketData.load()
+
+
+# ── Account path constants ──────────────────────────────────────
+
+CHECKING = "Assets:Current Assets:Checking Account"
+SAVINGS = "Assets:Current Assets:Savings Account"
+CASH = "Assets:Current Assets:Cash"
+AR_USD = "Assets:Accounts Receivable"
+AR_EUR = "Assets:Receivables:Accounts Receivable EUR"
+HSA = "Assets:Investments:HSA"
+CONDO = "Assets:Fixed Assets:Condo"
+VEHICLE = "Assets:Fixed Assets:Vehicle"
+
+VTSAX = "Assets:Investments:Brokerage:VTSAX"
+VBTLX = "Assets:Investments:Brokerage:VBTLX"
+AAPL = "Assets:Investments:Brokerage:AAPL"
+MSFT = "Assets:Investments:Brokerage:MSFT"
+ETH = "Assets:Investments:Brokerage:ETH"
+
+CHASE = "Liabilities:Credit Card:Chase Sapphire"
+AMEX = "Liabilities:Credit Card:Business Amex"
+MORTGAGE = "Liabilities:Loans:Mortgage"
+AUTO_LOAN = "Liabilities:Loans:Auto Loan"
+AP = "Liabilities:Accounts Payable"
+
+OPENING = "Equity:Opening Balances"
+
+SALARY = "Income:Salary"
+CONTRACTOR = "Income:Contractor Income"
+LLC_REVENUE = "Income:LLC Revenue"
+DIVIDENDS = "Income:Investment Income:Dividends"
+CAPITAL_GAINS = "Income:Investment Income:Capital Gains"
+INTEREST_INCOME = "Income:Investment Income:Interest"
+REIMBURSEMENTS = "Income:Reimbursements"
+FX_GAIN_LOSS = "Income:Foreign Exchange Gain/Loss"
+
+EXP_MORTGAGE_INT = "Expenses:Interest:Mortgage Interest"
+EXP_AUTO_INT = "Expenses:Interest:Auto Loan Interest"
+EXP_CC_INT = "Expenses:Interest:Credit Card Interest"
+EXP_HOA = "Expenses:Housing:HOA"
+EXP_HOUSING_MAINT = "Expenses:Housing:Maintenance"
+EXP_FUEL = "Expenses:Auto:Fuel"
+EXP_GROCERIES = "Expenses:Groceries"
+EXP_DINING = "Expenses:Dining"
+EXP_ELECTRIC = "Expenses:Utilities:Electric"
+EXP_GAS = "Expenses:Utilities:Gas"
+EXP_WATER = "Expenses:Utilities:Water"
+EXP_INTERNET = "Expenses:Utilities:Internet"
+EXP_PHONE = "Expenses:Utilities:Phone"
+EXP_HEALTH = "Expenses:Insurance:Health"
+EXP_UMBRELLA = "Expenses:Insurance:Umbrella"
+EXP_FED = "Expenses:Taxes:Federal"
+EXP_SS = "Expenses:Taxes:Social Security"
+EXP_MEDICARE = "Expenses:Taxes:Medicare"
+EXP_PROP_TAX = "Expenses:Taxes:Property Tax"
+EXP_EST_TAX = "Expenses:Taxes:Estimated Tax Payments"
+EXP_SUBSCRIPTIONS = "Expenses:Subscriptions"
+EXP_STREAMING = "Expenses:Streaming"
+EXP_CLOTHING = "Expenses:Clothing"
+EXP_PET_FOOD = "Expenses:Pet:Food"
+EXP_PET_VET = "Expenses:Pet:Vet"
+EXP_TRAVEL = "Expenses:Travel"
+EXP_EDUCATION = "Expenses:Education"
+EXP_GIFTS = "Expenses:Gifts"
+EXP_CHARITY = "Expenses:Charity"
+EXP_CLOUD = "Expenses:Business:Cloud Hosting"
+EXP_SOFTWARE = "Expenses:Business:Software"
+EXP_COWORKING = "Expenses:Business:Coworking"
+EXP_PROF_DEV = "Expenses:Business:Professional Development"
+EXP_ACCOUNTING = "Expenses:Business:Accounting"
+EXP_BANK_CHARGES = "Expenses:Bank Charges"
+EXP_MISC = "Expenses:Miscellaneous"
+EXP_MEDICAL = "Expenses:Medical"
+
+
+# ── Phase 1: Commodities & prices ───────────────────────────────
+
+# Securities: (mnemonic, fullname, namespace, fraction)
+SECURITIES = [
+    ("VTSAX", "Vanguard Total Stock Market Index Fund Admiral", "FUND", 10000),
+    ("VBTLX", "Vanguard Total Bond Market Index Fund Admiral", "FUND", 10000),
+    ("AAPL", "Apple Inc.", "NASDAQ", 10000),
+    ("MSFT", "Microsoft Corporation", "NASDAQ", 10000),
+    ("ETH", "Ethereum", "CRYPTO", 1000000),
+]
+
+FOREIGN_CURRENCIES = ["EUR", "GBP", "CAD"]
+
+# Monthly price points: 1st of every month, 2025-01 .. 2026-06.
+PRICE_MONTHS = [(2025, m) for m in range(1, 13)] + [(2026, m) for m in range(1, 7)]
+
+
+def _security_quant(symbol: str) -> Decimal:
+    """Quantization step for a security price (USD per share)."""
+    if symbol == "ETH":
+        return D("0.01")
+    return D("0.0001")
+
+
+def create_book_file(out_path: Path) -> None:
+    """Create the SQLite book with USD default + all commodities."""
+    if out_path.resolve() == PROTECTED.resolve():
+        raise SystemExit(
+            "REFUSING to write to the protected book: "
+            f"{PROTECTED}. Choose a different --out path."
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    book = piecash.create_book(
+        sqlite_file=str(out_path),
+        currency="USD",
+        overwrite=True,
+    )
+    try:
+        # Foreign currencies. ``book.currencies(mnemonic=...)`` has a
+        # built-in fallback that auto-creates the ISO 4217 currency.
+        for code in FOREIGN_CURRENCIES:
+            book.currencies(mnemonic=code)
+        # Securities.
+        for mnemonic, fullname, namespace, fraction in SECURITIES:
+            piecash.Commodity(
+                namespace=namespace,
+                mnemonic=mnemonic,
+                fullname=fullname,
+                fraction=fraction,
+                book=book,
+            )
+        book.save()
+    finally:
+        book.close()
+
+
+def add_prices(out_path: Path) -> int:
+    """Add monthly USD-base prices for securities + FX pairs (real data)."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    count = 0
+    try:
+        usd = book.default_currency
+        comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
+        for yr, mo in PRICE_MONTHS:
+            pdate = date(yr, mo, 1)
+            # Securities: USD close, real, forward-filled.
+            for sym, _full, _ns, _frac in SECURITIES:
+                comm = comm_by_mnemonic[sym]
+                value = MD.security(sym, pdate).quantize(_security_quant(sym))
+                piecash.Price(
+                    commodity=comm, currency=usd, date=pdate,
+                    value=value, type="last", source="user:market_data",
+                )
+                count += 1
+            # FX: USD per foreign unit, real, forward-filled.
+            for foreign in FOREIGN_CURRENCIES:
+                comm = comm_by_mnemonic[foreign]
+                value = MD.fx(foreign, "USD", pdate).quantize(D("0.0001"))
+                piecash.Price(
+                    commodity=comm, currency=usd, date=pdate,
+                    value=value, type="last", source="user:market_data",
+                )
+                count += 1
+        book.save()
+    finally:
+        book.close()
+    return count
+
+
+def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
+    """Add real prices on specific event dates (trades, invoice settle).
+
+    Each ``(symbol_or_currency, when)`` gets a real quote on that exact
+    date so cross-currency posts/pays find a fresh rate and lot-gain
+    calculations have an on-date market price.
+    """
+    book = piecash.open_book(str(out_path), readonly=False)
+    count = 0
+    try:
+        usd = book.default_currency
+        comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
+        sec_syms = {s[0] for s in SECURITIES}
+        # Skip (commodity, date) pairs that already have a price on file —
+        # e.g. monthly points laid down by add_prices, or DCA buys on the
+        # 1st. piecash rejects a duplicate commodity+date+currency price.
+        seen: set[tuple[str, str]] = set()
+        for p in book.prices:
+            seen.add((p.commodity.mnemonic, p.date.date().isoformat()
+                      if hasattr(p.date, "date") else p.date.isoformat()))
+        for sym, when in events:
+            key = (sym, when.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            comm = comm_by_mnemonic[sym]
+            if sym in sec_syms:
+                value = MD.security(sym, when).quantize(_security_quant(sym))
+            else:
+                value = MD.fx(sym, "USD", when).quantize(D("0.0001"))
+            piecash.Price(
+                commodity=comm, currency=usd, date=when,
+                value=value, type="last", source="user:market_data",
+            )
+            count += 1
+        book.save()
+    finally:
+        book.close()
+    return count
+
+
+# ── Phase 2: Chart of accounts ──────────────────────────────────
+
+# (name, type, parent, commodity, namespace, placeholder)
+ACCOUNTS = [
+    # Assets
+    ("Assets", "ASSET", None, "USD", "CURRENCY", True),
+    ("Current Assets", "ASSET", "Assets", "USD", "CURRENCY", True),
+    ("Checking Account", "BANK", "Assets:Current Assets", "USD", "CURRENCY", False),
+    ("Savings Account", "BANK", "Assets:Current Assets", "USD", "CURRENCY", False),
+    ("Cash", "CASH", "Assets:Current Assets", "USD", "CURRENCY", False),
+    ("Receivables", "ASSET", "Assets", "USD", "CURRENCY", True),
+    ("Accounts Receivable", "RECEIVABLE", "Assets", "USD", "CURRENCY", False),
+    ("Accounts Receivable EUR", "RECEIVABLE", "Assets:Receivables", "EUR", "CURRENCY", False),
+    ("Investments", "ASSET", "Assets", "USD", "CURRENCY", True),
+    ("Brokerage", "ASSET", "Assets:Investments", "USD", "CURRENCY", True),
+    ("VTSAX", "MUTUAL", "Assets:Investments:Brokerage", "VTSAX", "FUND", False),
+    ("VBTLX", "MUTUAL", "Assets:Investments:Brokerage", "VBTLX", "FUND", False),
+    ("AAPL", "STOCK", "Assets:Investments:Brokerage", "AAPL", "NASDAQ", False),
+    ("MSFT", "STOCK", "Assets:Investments:Brokerage", "MSFT", "NASDAQ", False),
+    ("ETH", "STOCK", "Assets:Investments:Brokerage", "ETH", "CRYPTO", False),
+    ("HSA", "BANK", "Assets:Investments", "USD", "CURRENCY", False),
+    ("Fixed Assets", "ASSET", "Assets", "USD", "CURRENCY", True),
+    ("Condo", "ASSET", "Assets:Fixed Assets", "USD", "CURRENCY", False),
+    ("Vehicle", "ASSET", "Assets:Fixed Assets", "USD", "CURRENCY", False),
+    # Liabilities
+    ("Liabilities", "LIABILITY", None, "USD", "CURRENCY", True),
+    ("Credit Card", "LIABILITY", "Liabilities", "USD", "CURRENCY", True),
+    ("Chase Sapphire", "CREDIT", "Liabilities:Credit Card", "USD", "CURRENCY", False),
+    ("Business Amex", "CREDIT", "Liabilities:Credit Card", "USD", "CURRENCY", False),
+    ("Loans", "LIABILITY", "Liabilities", "USD", "CURRENCY", True),
+    ("Mortgage", "LIABILITY", "Liabilities:Loans", "USD", "CURRENCY", False),
+    ("Auto Loan", "LIABILITY", "Liabilities:Loans", "USD", "CURRENCY", False),
+    ("Accounts Payable", "PAYABLE", "Liabilities", "USD", "CURRENCY", False),
+    # Income
+    ("Income", "INCOME", None, "USD", "CURRENCY", True),
+    ("Salary", "INCOME", "Income", "USD", "CURRENCY", False),
+    ("Contractor Income", "INCOME", "Income", "USD", "CURRENCY", False),
+    ("LLC Revenue", "INCOME", "Income", "USD", "CURRENCY", False),
+    ("Investment Income", "INCOME", "Income", "USD", "CURRENCY", True),
+    ("Dividends", "INCOME", "Income:Investment Income", "USD", "CURRENCY", False),
+    ("Capital Gains", "INCOME", "Income:Investment Income", "USD", "CURRENCY", False),
+    ("Interest", "INCOME", "Income:Investment Income", "USD", "CURRENCY", False),
+    ("Reimbursements", "INCOME", "Income", "USD", "CURRENCY", False),
+    # Income:Foreign Exchange Gain/Loss is auto-created by pay_invoice; create
+    # it up front so it always exists for direct FX transactions too.
+    ("Foreign Exchange Gain/Loss", "INCOME", "Income", "USD", "CURRENCY", False),
+    # Expenses
+    ("Expenses", "EXPENSE", None, "USD", "CURRENCY", True),
+    ("Housing", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Mortgage Interest", "EXPENSE", "Expenses:Housing", "USD", "CURRENCY", False),
+    ("HOA", "EXPENSE", "Expenses:Housing", "USD", "CURRENCY", False),
+    ("Insurance", "EXPENSE", "Expenses:Housing", "USD", "CURRENCY", False),
+    ("Maintenance", "EXPENSE", "Expenses:Housing", "USD", "CURRENCY", False),
+    ("Auto", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Fuel", "EXPENSE", "Expenses:Auto", "USD", "CURRENCY", False),
+    ("Insurance", "EXPENSE", "Expenses:Auto", "USD", "CURRENCY", False),
+    ("Maintenance", "EXPENSE", "Expenses:Auto", "USD", "CURRENCY", False),
+    ("Groceries", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Dining", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Utilities", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Electric", "EXPENSE", "Expenses:Utilities", "USD", "CURRENCY", False),
+    ("Gas", "EXPENSE", "Expenses:Utilities", "USD", "CURRENCY", False),
+    ("Water", "EXPENSE", "Expenses:Utilities", "USD", "CURRENCY", False),
+    ("Internet", "EXPENSE", "Expenses:Utilities", "USD", "CURRENCY", False),
+    ("Phone", "EXPENSE", "Expenses:Utilities", "USD", "CURRENCY", False),
+    ("Insurance", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Health", "EXPENSE", "Expenses:Insurance", "USD", "CURRENCY", False),
+    ("Life", "EXPENSE", "Expenses:Insurance", "USD", "CURRENCY", False),
+    ("Umbrella", "EXPENSE", "Expenses:Insurance", "USD", "CURRENCY", False),
+    ("Medical", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Taxes", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Federal", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Social Security", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Medicare", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Property Tax", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Self-Employment Tax", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Estimated Tax Payments", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Sales Tax", "EXPENSE", "Expenses:Taxes", "USD", "CURRENCY", False),
+    ("Subscriptions", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Streaming", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Clothing", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Pet", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Food", "EXPENSE", "Expenses:Pet", "USD", "CURRENCY", False),
+    ("Vet", "EXPENSE", "Expenses:Pet", "USD", "CURRENCY", False),
+    ("Travel", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Education", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Gifts", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Charity", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Business", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Cloud Hosting", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Software", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Coworking", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Professional Development", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Accounting", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Contractor Payments", "EXPENSE", "Expenses:Business", "USD", "CURRENCY", False),
+    ("Interest", "EXPENSE", "Expenses", "USD", "CURRENCY", True),
+    ("Credit Card Interest", "EXPENSE", "Expenses:Interest", "USD", "CURRENCY", False),
+    ("Mortgage Interest", "EXPENSE", "Expenses:Interest", "USD", "CURRENCY", False),
+    ("Auto Loan Interest", "EXPENSE", "Expenses:Interest", "USD", "CURRENCY", False),
+    ("Bank Charges", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    ("Miscellaneous", "EXPENSE", "Expenses", "USD", "CURRENCY", False),
+    # Equity
+    ("Equity", "EQUITY", None, "USD", "CURRENCY", True),
+    ("Opening Balances", "EQUITY", "Equity", "USD", "CURRENCY", False),
+]
+
+
+def create_accounts(out_path: Path) -> int:
+    """Create the full chart of accounts directly via piecash."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    count = 0
+    try:
+        comm_by_key = {}
+        for c in book.commodities:
+            comm_by_key[(c.namespace, c.mnemonic)] = c
+        usd = book.default_currency
+        comm_by_key[("CURRENCY", "USD")] = usd
+
+        acct_by_path: dict[str, piecash.Account] = {}
+        for name, atype, parent_path, comm_mn, ns, placeholder in ACCOUNTS:
+            parent = (
+                book.root_account if parent_path is None
+                else acct_by_path[parent_path]
+            )
+            commodity = comm_by_key[(ns, comm_mn)]
+            acct = piecash.Account(
+                name=name,
+                type=atype,
+                parent=parent,
+                commodity=commodity,
+                placeholder=placeholder,
+            )
+            full = name if parent_path is None else f"{parent_path}:{name}"
+            acct_by_path[full] = acct
+            count += 1
+        book.save()
+    finally:
+        book.close()
+    return count
+
+
+def set_account_slots(book: GnuCashBook) -> None:
+    """Set credit-card / loan metadata slots."""
+    book.set_account_slot(CHASE, "apr", "21.49")
+    book.set_account_slot(CHASE, "credit_limit", "12000")
+    book.set_account_slot(CHASE, "statement_close_day", "15")
+    book.set_account_slot(AMEX, "apr", "24.49")
+    book.set_account_slot(AMEX, "credit_limit", "20000")
+    book.set_account_slot(AMEX, "statement_close_day", "22")
+    book.set_account_slot(MORTGAGE, "apr", "6.25")
+    book.set_account_slot(AUTO_LOAN, "apr", "5.49")
+
+
+# ── Phase 3: Opening balances + investment lots ─────────────────
+
+# (account_path, balance_usd)  — opening balances via equity offset.
+OPENING_BALANCES = [
+    (CHECKING, D("14500")),
+    (SAVINGS, D("22000")),
+    (CASH, D("350")),
+    (HSA, D("4800")),
+    (MORTGAGE, D("-385000")),
+    (AUTO_LOAN, D("-18500")),
+    (CHASE, D("-2340")),
+    (AMEX, D("-1890")),
+    (CONDO, D("475000")),
+    (VEHICLE, D("28000")),
+]
+
+# (account, shares, cost_basis_usd, lot_title)
+OPENING_LOTS = [
+    (VTSAX, D("180.0000"), D("21600"), "VTSAX core position"),
+    (VBTLX, D("500.0000"), D("5250"), "VBTLX bond allocation"),
+    (AAPL, D("25.0000"), D("4750"), "AAPL 2023 purchase"),
+    (MSFT, D("15.0000"), D("5700"), "MSFT 2024 purchase"),
+    (ETH, D("2.500000"), D("6000"), "ETH 2024 purchase"),
+]
+
+
+def opening_balances(out_path: Path) -> None:
+    """Post opening balances (one balanced transaction) + investment lots."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    try:
+        usd = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        jan1 = date(YEAR, 1, 1)
+
+        # Cash/liability opening balances — single balanced transaction
+        # against Equity:Opening Balances.
+        splits = []
+        total = D("0")
+        for path, bal in OPENING_BALANCES:
+            splits.append(piecash.Split(account=acct[path], value=bal))
+            total += bal
+        splits.append(piecash.Split(account=acct[OPENING], value=-total))
+        piecash.Transaction(
+            currency=usd,
+            description="Opening Balances",
+            post_date=jan1,
+            splits=splits,
+        )
+
+        # Investment opening lots: buy each holding from equity at cost.
+        for path, units, cost, title in OPENING_LOTS:
+            inv_acct = acct[path]
+            lot = piecash.Lot(
+                title=title, account=inv_acct,
+                notes="opening position", is_closed=0,
+            )
+            inv_split = piecash.Split(
+                account=inv_acct, value=cost, quantity=units,
+            )
+            eq_split = piecash.Split(account=acct[OPENING], value=-cost)
+            piecash.Transaction(
+                currency=usd,
+                description=f"Opening position — {title}",
+                post_date=jan1,
+                splits=[inv_split, eq_split],
+            )
+            inv_split.lot = lot
+
+        book.save()
+    finally:
+        book.close()
+
+
+# ── Generic bulk transaction writer (piecash, fast, no audit) ───
+
+def write_bulk(out_path: Path, txns: list[dict]) -> int:
+    """Write a list of {description, date, currency, splits:[(path, value[, qty])]}.
+
+    Each split tuple is (account_path, value) for same-currency or
+    (account_path, value, quantity) when the account commodity differs
+    from the transaction currency. ``currency`` defaults to USD.
+    """
+    book = piecash.open_book(str(out_path), readonly=False)
+    count = 0
+    try:
+        usd = book.default_currency
+        comm_by = {c.mnemonic: c for c in book.commodities}
+        acct = {a.fullname: a for a in book.accounts}
+        for t in txns:
+            cur = comm_by[t.get("currency", "USD")]
+            splits = []
+            for sp in t["splits"]:
+                if len(sp) == 3:
+                    path, value, qty = sp
+                    splits.append(piecash.Split(
+                        account=acct[path], value=value, quantity=qty,
+                    ))
+                else:
+                    path, value = sp
+                    splits.append(piecash.Split(
+                        account=acct[path], value=value,
+                    ))
+            piecash.Transaction(
+                currency=cur,
+                description=t["description"],
+                post_date=t["date"],
+                splits=splits,
+            )
+            count += 1
+        book.save()
+    finally:
+        book.close()
+    return count
+
+
+def _days_in_month(year: int, month: int) -> int:
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return (nxt - date(year, month, 1)).days
+
+
+# ── Phase 4: Scheduled-transaction templates ────────────────────
+
+def create_scheduled_templates(book: GnuCashBook) -> int:
+    """Create the SX templates so scheduled-transaction tools have data.
+
+    Disabled at the end of the build to avoid the GnuCash GUI 'Since Last
+    Run' barrage. The actual recurring activity is generated directly in
+    Phase 5 for speed and amortization-split fidelity.
+    """
+    count = 0
+
+    def sx(name, description, splits, frequency, start_date="2025-01-15"):
+        nonlocal count
+        book.create_scheduled_transaction(
+            name=name, description=description, splits=splits,
+            start_date=start_date, frequency=frequency, enabled=True,
+        )
+        count += 1
+
+    # Robin's biweekly paycheck (baseline split per spec).
+    sx("Robin's Paycheck", "UW Medical biweekly paycheck", [
+        {"account": SALARY, "amount": "-3269.23"},
+        {"account": CHECKING, "amount": "2450.00"},
+        {"account": EXP_FED, "amount": "380.00"},
+        {"account": EXP_SS, "amount": "202.69"},
+        {"account": EXP_MEDICARE, "amount": "47.40"},
+        {"account": EXP_HEALTH, "amount": "145.00"},
+        {"account": HSA, "amount": "44.14"},
+    ], "biweekly", start_date="2025-01-10")
+
+    sx("Mortgage Payment", "Capitol Hill condo mortgage", [
+        {"account": CHECKING, "amount": "-2485.00"},
+        {"account": EXP_MORTGAGE_INT, "amount": "2006.25"},
+        {"account": MORTGAGE, "amount": "478.75"},
+    ], "monthly")
+
+    sx("Auto Loan Payment", "Subaru Outback auto loan", [
+        {"account": CHECKING, "amount": "-365.00"},
+        {"account": EXP_AUTO_INT, "amount": "84.63"},
+        {"account": AUTO_LOAN, "amount": "280.37"},
+    ], "monthly")
+
+    simple_monthly = [
+        ("HOA Dues", "Condo HOA dues", CHECKING, EXP_HOA, "425.00"),
+        ("Electric", "Seattle City Light", CHECKING, EXP_ELECTRIC, "95.00"),
+        ("Gas Utility", "Puget Sound Energy", CHECKING, EXP_GAS, "65.00"),
+        ("Water/Sewer", "Seattle Public Utilities", CHECKING, EXP_WATER, "55.00"),
+        ("Internet", "Comcast", CHECKING, EXP_INTERNET, "79.99"),
+        ("Phone", "T-Mobile", CHECKING, EXP_PHONE, "140.00"),
+        ("Streaming Bundle", "Streaming subscriptions", CHECKING, EXP_STREAMING, "45.97"),
+        ("Cloud Hosting (AWS)", "AWS", AMEX, EXP_CLOUD, "125.00"),
+        ("Coworking (WeWork)", "WeWork", AMEX, EXP_COWORKING, "250.00"),
+        ("Pet Food (Chewy)", "Chewy auto-ship", CHECKING, EXP_PET_FOOD, "48.00"),
+    ]
+    for name, desc, src, dst, amt in simple_monthly:
+        sx(name, desc, [
+            {"account": src, "amount": f"-{amt}"},
+            {"account": dst, "amount": amt},
+        ], "monthly")
+
+    # Quarterly.
+    sx("Estimated Tax Payment", "IRS estimated federal tax", [
+        {"account": CHECKING, "amount": "-4200.00"},
+        {"account": EXP_EST_TAX, "amount": "4200.00"},
+    ], "quarterly", start_date="2025-04-15")
+    sx("Umbrella Insurance", "Umbrella policy premium", [
+        {"account": CHECKING, "amount": "-125.00"},
+        {"account": EXP_UMBRELLA, "amount": "125.00"},
+    ], "quarterly")
+
+    # Yearly.
+    sx("Property Tax (1st Half)", "King County property tax", [
+        {"account": CHECKING, "amount": "-3200.00"},
+        {"account": EXP_PROP_TAX, "amount": "3200.00"},
+    ], "yearly", start_date="2025-04-30")
+    sx("Property Tax (2nd Half)", "King County property tax", [
+        {"account": CHECKING, "amount": "-3200.00"},
+        {"account": EXP_PROP_TAX, "amount": "3200.00"},
+    ], "yearly", start_date="2025-10-31")
+
+    return count
+
+
+# ── Phase 5: Recurring instantiations (direct, with amortization) ─
+
+BASELINE_GROSS = D("3269.23")
+FIXED_HEALTH = D("145.00")
+FIXED_HSA = D("44.14")
+FED_PCT = D("380.00") / BASELINE_GROSS
+SS_PCT = D("202.69") / BASELINE_GROSS
+MED_PCT = D("47.40") / BASELINE_GROSS
+
+
+def _paycheck_splits(gross: Decimal):
+    fed = (gross * FED_PCT).quantize(D("0.01"))
+    ss = (gross * SS_PCT).quantize(D("0.01"))
+    med = (gross * MED_PCT).quantize(D("0.01"))
+    checking = gross - fed - ss - med - FIXED_HEALTH - FIXED_HSA
+    return [
+        (SALARY, -gross),
+        (CHECKING, checking),
+        (EXP_FED, fed),
+        (EXP_SS, ss),
+        (EXP_MEDICARE, med),
+        (EXP_HEALTH, FIXED_HEALTH),
+        (HSA, FIXED_HSA),
+    ]
+
+
+def gen_recurring() -> list[dict]:
+    txns: list[dict] = []
+    rng = random.Random(SEED + 5)
+
+    # 26 biweekly paychecks from Jan 10, overtime on ~every 3rd-4th.
+    d = date(YEAR, 1, 10)
+    for i in range(26):
+        if d.year == YEAR:
+            overtime = D("0")
+            if i > 0 and i % rng.choice([3, 4]) == 0:
+                overtime = D(str(rng.randint(200, 400)))
+            gross = BASELINE_GROSS + overtime
+            desc = "Robin's Paycheck (UW Medical)"
+            if overtime:
+                desc += f" - ${overtime} overtime"
+            txns.append({"description": desc, "date": d,
+                         "splits": _paycheck_splits(gross)})
+        d += timedelta(days=14)
+
+    # Mortgage (1st) + auto loan (5th), H1 vs H2 amortization.
+    for i, m in enumerate(range(1, 13)):
+        h2 = i >= 6
+        m_int = D("1991.50") if h2 else D("2006.25")
+        m_pri = D("493.50") if h2 else D("478.75")
+        txns.append({
+            "description": "Mortgage Payment", "date": date(YEAR, m, 1),
+            "splits": [(CHECKING, -(m_int + m_pri)),
+                       (EXP_MORTGAGE_INT, m_int), (MORTGAGE, m_pri)],
+        })
+        a_int = D("76.20") if h2 else D("84.63")
+        a_pri = D("288.80") if h2 else D("280.37")
+        txns.append({
+            "description": "Auto Loan Payment", "date": date(YEAR, m, 5),
+            "splits": [(CHECKING, -(a_int + a_pri)),
+                       (EXP_AUTO_INT, a_int), (AUTO_LOAN, a_pri)],
+        })
+
+    # Simple monthly bills.
+    simple = [
+        ("HOA Dues", CHECKING, EXP_HOA, D("425.00"), 1),
+        ("Internet - Comcast", CHECKING, EXP_INTERNET, D("79.99"), 3),
+        ("Streaming Bundle", CHECKING, EXP_STREAMING, D("45.97"), 8),
+        ("Phone - T-Mobile", CHECKING, EXP_PHONE, D("140.00"), 12),
+        ("Electric - Seattle City Light", CHECKING, EXP_ELECTRIC, D("95.00"), 15),
+        ("Gas - Puget Sound Energy", CHECKING, EXP_GAS, D("65.00"), 15),
+        ("Water/Sewer - SPU", CHECKING, EXP_WATER, D("55.00"), 15),
+        ("Pet Food - Chewy", CHECKING, EXP_PET_FOOD, D("48.00"), 20),
+        ("AWS Cloud Hosting", AMEX, EXP_CLOUD, D("125.00"), 1),
+        ("WeWork Coworking", AMEX, EXP_COWORKING, D("250.00"), 1),
+    ]
+    for desc, src, dst, amt, day in simple:
+        for m in range(1, 13):
+            txns.append({
+                "description": desc, "date": date(YEAR, m, day),
+                "splits": [(src, -amt), (dst, amt)],
+            })
+
+    # Quarterly umbrella insurance (Jan/Apr/Jul/Oct).
+    for m in (1, 4, 7, 10):
+        txns.append({
+            "description": "Umbrella Insurance Premium",
+            "date": date(YEAR, m, 15),
+            "splits": [(CHECKING, D("-125.00")), (EXP_UMBRELLA, D("125.00"))],
+        })
+
+    # Property tax halves.
+    txns.append({
+        "description": "King County Property Tax (1st Half)",
+        "date": date(YEAR, 4, 30),
+        "splits": [(CHECKING, D("-3200.00")), (EXP_PROP_TAX, D("3200.00"))],
+    })
+    txns.append({
+        "description": "King County Property Tax (2nd Half)",
+        "date": date(YEAR, 10, 31),
+        "splits": [(CHECKING, D("-3200.00")), (EXP_PROP_TAX, D("3200.00"))],
+    })
+
+    # Estimated federal tax at real IRS deadlines (Q4 lands Jan 2026).
+    for d_dl, q in [(date(YEAR, 4, 15), "Q1"), (date(YEAR, 6, 15), "Q2"),
+                    (date(YEAR, 9, 15), "Q3"), (date(YEAR + 1, 1, 15), "Q4")]:
+        txns.append({
+            "description": f"Estimated Federal Tax - {q} {YEAR}",
+            "date": d_dl,
+            "splits": [(CHECKING, D("-4200.00")), (EXP_EST_TAX, D("4200.00"))],
+        })
+
+    return txns
+
+
+# ── Phase 6: Daily/weekly patterns + seasonal one-offs ──────────
+
+GROCERY_VENDORS = ["QFC", "Fred Meyer", "Safeway"]
+GAS_VENDORS = ["Shell", "76", "Safeway Fuel", "Chevron"]
+COFFEE_VENDORS = [
+    "Starbucks", "Victrola Coffee", "Caffé Ladro", "Stumptown Coffee",
+    "Cherry Street Coffee", "Lighthouse Roasters", "Slate Coffee",
+    "Tougo Coffee", "Analog Coffee", "Storyville Coffee",
+]
+RESTAURANTS = [
+    "Canlis", "Westward", "Shaker & Spear", "Purple Café",
+    "Tilikum Place Café", "Wild Ginger", "Kedai Makan", "Ba Bar",
+    "Terra Plata", "Il Corvo", "Marination Ma Kai", "Bateau",
+]
+AMAZON_CATEGORIES = [
+    ("household goods", EXP_MISC),
+    ("pet supplies", EXP_PET_FOOD),
+    ("books", EXP_EDUCATION),
+    ("office supplies", EXP_SOFTWARE),
+    ("kitchen goods", EXP_MISC),
+]
+CLOTHING_VENDORS = ["Target", "Nordstrom", "REI"]
+
+# (month, day, description, amount_str, source, target).
+# Negative amount = refund/reversal.
+MONTHLY_EVENTS = [
+    (1, 15, "Byte's vet visit", "180", CHECKING, EXP_PET_VET),
+    (1, 10, "New Year gift return", "-45", CHASE, EXP_GIFTS),
+    (2, 14, "Valentine's dinner - Canlis", "165", CHASE, EXP_DINING),
+    (2, 22, "Ski trip - Snoqualmie", "340", CHASE, EXP_TRAVEL),
+    (3, 5, "TurboTax Home & Business", "89", CHASE, EXP_SUBSCRIPTIONS),
+    (3, 18, "Spring clothing", "210", CHASE, EXP_CLOTHING),
+    (4, 12, "Byte's annual checkup", "320", CHECKING, EXP_PET_VET),
+    (5, 24, "Memorial Day BBQ supplies", "95", CHECKING, EXP_GROCERIES),
+    (5, 10, "Garden supplies", "67", CHASE, EXP_HOUSING_MAINT),
+    (6, 28, "Pride festival food", "120", CHASE, EXP_DINING),
+    (6, 28, "Pride festival merch", "85", CHASE, EXP_MISC),
+    (6, 15, "Anniversary dinner", "225", CHASE, EXP_DINING),
+    (7, 4, "4th of July party supplies", "145", CHECKING, EXP_DINING),
+    (7, 15, "Summer road trip - lodging", "890", CHASE, EXP_TRAVEL),
+    (7, 18, "Road trip fuel", "340", CHASE, EXP_FUEL),
+    (8, 8, "Dell U2725D monitor", "450", AMEX, EXP_SOFTWARE),
+    (9, 3, "PyCon US conference ticket", "799", AMEX, EXP_PROF_DEV),
+    (9, 1, "Labor Day camping", "280", CHASE, EXP_TRAVEL),
+    (10, 28, "Halloween supplies", "65", CHECKING, EXP_MISC),
+    (10, 20, "Byte vet visit", "150", CHECKING, EXP_PET_VET),
+    (11, 25, "Thanksgiving groceries", "185", CHECKING, EXP_GROCERIES),
+    (11, 28, "Black Friday - Target", "105", CHASE, EXP_CLOTHING),
+    (11, 28, "Black Friday - REI", "125", CHASE, EXP_CLOTHING),
+    (11, 29, "Black Friday - Nordstrom", "135", CHASE, EXP_CLOTHING),
+    (11, 29, "Cyber Monday - Amazon", "55", CHASE, EXP_MISC),
+    (12, 10, "Holiday gift - Robin", "120", CHASE, EXP_GIFTS),
+    (12, 12, "Holiday gift - Mom", "85", CHASE, EXP_GIFTS),
+    (12, 14, "Holiday gift - Dad", "95", CHASE, EXP_GIFTS),
+    (12, 15, "Holiday gift - sister", "65", CHASE, EXP_GIFTS),
+    (12, 18, "Holiday gift - coworkers", "75", CHASE, EXP_GIFTS),
+    (12, 20, "Holiday gift - friends group", "80", CHASE, EXP_GIFTS),
+    (12, 22, "Holiday gift - nieces", "90", CHASE, EXP_GIFTS),
+    (12, 23, "Holiday gift - last-minute", "40", CHASE, EXP_GIFTS),
+    (12, 26, "Holiday travel - flights", "580", CHASE, EXP_TRAVEL),
+    (12, 30, "Year-end donation - NAMI", "500", CHECKING, EXP_CHARITY),
+]
+
+
+def _vary(rng, base, spread=0.2):
+    return D(str(round(base * (1 + rng.uniform(-spread, spread)), 2)))
+
+
+def _uniform_cents(rng, low, high):
+    return D(str(round(rng.uniform(low, high), 2)))
+
+
+def gen_daily_weekly() -> list[dict]:
+    txns: list[dict] = []
+
+    # Weekend groceries (one Sat/Sun per weekend) on Checking.
+    rng = random.Random(SEED + 1)
+    d = date(YEAR, 1, 1)
+    while d.weekday() != 5:
+        d += timedelta(days=1)
+    i = 0
+    while d.year == YEAR:
+        vendor = GROCERY_VENDORS[i % len(GROCERY_VENDORS)]
+        day = d + timedelta(days=rng.randint(0, 1))
+        if day.year == YEAR:
+            amt = _vary(rng, 85.0)
+            txns.append({"description": vendor, "date": day,
+                         "splits": [(CHECKING, -amt), (EXP_GROCERIES, amt)]})
+        d += timedelta(days=7)
+        i += 1
+
+    # Weekly gas fills on Checking.
+    rng = random.Random(SEED + 2)
+    d = date(YEAR, 1, 1)
+    while d.weekday() != 0:
+        d += timedelta(days=1)
+    i = 0
+    while d.year == YEAR:
+        vendor = GAS_VENDORS[i % len(GAS_VENDORS)]
+        day = d + timedelta(days=rng.randint(0, 6))
+        if day.year == YEAR:
+            amt = _vary(rng, 52.0)
+            txns.append({"description": f"{vendor} Gas", "date": day,
+                         "splits": [(CHECKING, -amt), (EXP_FUEL, amt)]})
+        d += timedelta(days=7)
+        i += 1
+
+    # Weekday coffee on Chase.
+    rng = random.Random(SEED + 3)
+    d = date(YEAR, 1, 1)
+    while d.year == YEAR:
+        if d.weekday() < 5:
+            vendor = rng.choice(COFFEE_VENDORS)
+            amt = _vary(rng, 5.50)
+            txns.append({"description": vendor, "date": d,
+                         "splits": [(CHASE, -amt), (EXP_DINING, amt)]})
+        d += timedelta(days=1)
+
+    # Restaurants 2-3x/month.
+    rng = random.Random(SEED + 4)
+    for m in range(1, 13):
+        for _ in range(rng.randint(2, 3)):
+            day = date(YEAR, m, rng.randint(1, _days_in_month(YEAR, m)))
+            vendor = rng.choice(RESTAURANTS)
+            amt = _uniform_cents(rng, 45.0, 95.0)
+            src = CHASE if rng.random() < 0.6 else CHECKING
+            txns.append({"description": vendor, "date": day,
+                         "splits": [(src, -amt), (EXP_DINING, amt)]})
+
+    # Amazon 2-3x/month on Chase.
+    rng = random.Random(SEED + 5)
+    for m in range(1, 13):
+        for _ in range(rng.randint(2, 3)):
+            day = date(YEAR, m, rng.randint(1, _days_in_month(YEAR, m)))
+            descriptor, expense = rng.choice(AMAZON_CATEGORIES)
+            amt = _uniform_cents(rng, 15.0, 120.0)
+            txns.append({"description": f"Amazon.com - {descriptor}",
+                         "date": day,
+                         "splits": [(CHASE, -amt), (expense, amt)]})
+
+    # Quarterly clothing on Chase.
+    rng = random.Random(SEED + 6)
+    for m in (3, 6, 9, 12):
+        day = date(YEAR, m, rng.randint(10, 20))
+        vendor = rng.choice(CLOTHING_VENDORS)
+        amt = _uniform_cents(rng, 35.0, 150.0)
+        txns.append({"description": vendor, "date": day,
+                     "splits": [(CHASE, -amt), (EXP_CLOTHING, amt)]})
+
+    # Monthly seasonal one-offs.
+    for month, day, desc, amt_str, src, dst in MONTHLY_EVENTS:
+        amt = D(amt_str)
+        if amt < 0:
+            splits = [(src, abs(amt)), (dst, -abs(amt))]
+        else:
+            splits = [(src, -amt), (dst, amt)]
+        txns.append({"description": desc, "date": date(YEAR, month, day),
+                     "splits": splits})
+
+    return txns
+
+
+# ── Phase 7a: Direct 1099 contractor income ─────────────────────
+
+def gen_contractor_income() -> list[dict]:
+    direct = [
+        (1, "TechStartup Inc", D("4500")),
+        (2, "TechStartup Inc", D("4500")),
+        (3, "TechStartup Inc", D("4500")),
+        (5, "DataFlow Systems", D("6000")),
+        (6, "DataFlow Systems", D("6000")),
+        (8, "CloudNine Consulting", D("3800")),
+        (9, "CloudNine Consulting", D("3800")),
+        (11, "WinterTech Solutions", D("5200")),
+        (12, "WinterTech Solutions", D("5200")),
+    ]
+    return [{
+        "description": f"{client} - monthly invoice payment",
+        "date": date(YEAR, m, 15),
+        "splits": [(CHECKING, amt), (CONTRACTOR, -amt)],
+    } for m, client, amt in direct]
+
+
+# ── Phase 7b: Business module (customers, vendors, invoices, bills)
+
+# Berlin Digital EUR invoices: (month_open, day_open, month_pay, day_pay, eur)
+BERLIN_INVOICES = [
+    (3, 10, 4, 9, "4500.00"),
+    (6, 5, 7, 5, "6200.00"),
+    (9, 8, 10, 8, "4500.00"),
+    (12, 3, 1, 2, "5800.00"),   # paid Jan 2 2026
+]
+
+
+def business_event_price_dates() -> list[tuple[str, date]]:
+    """EUR price dates needed for Berlin invoice post + pay (real rates)."""
+    out: list[tuple[str, date]] = []
+    for mo, do, mp, dp, _eur in BERLIN_INVOICES:
+        out.append(("EUR", date(YEAR, mo, do)))
+        pay_year = YEAR if mp >= mo else YEAR + 1
+        out.append(("EUR", date(pay_year, mp, dp)))
+    return out
+
+
+def run_business(book: GnuCashBook) -> dict:
+    """Create billterms, customers, vendors, invoices, and bills."""
+    counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
+              "terms": 0, "employees": 0}
+
+    book.create_billterm(name="Net 15", due_days=15,
+                         description="Payment due within 15 days")
+    book.create_billterm(name="Net 30", due_days=30,
+                         description="Payment due within 30 days")
+    book.create_billterm(name="2/10 Net 30", due_days=30, discount_days=10,
+                         discount_percent="2",
+                         description="2% discount if paid in 10 days, else net 30")
+    counts["terms"] = 3
+
+    # Customers.
+    emerald = book.create_customer(
+        name="Emerald Analytics", currency="USD",
+        notes="Monthly retainer, Net 30")
+    sound_transit = book.create_customer(
+        name="Sound Transit Data Team", currency="USD",
+        notes="Project-based engagement, Net 15")
+    berlin = book.create_customer(
+        name="Berlin Digital GmbH", currency="EUR",
+        notes="EUR-denominated invoices, Net 30")
+    counts["customers"] = 3
+
+    # Vendors.
+    jetbrains = book.create_vendor(
+        name="JetBrains", currency="USD", notes="IDE/tooling subscriptions")
+    bookkeeper = book.create_vendor(
+        name="BookkeepingCo", currency="USD",
+        notes="Quarterly bookkeeping review")
+    counts["vendors"] = 2
+
+    # Employee.
+    book.create_employee(name="Sam Rivera", currency="USD")
+    counts["employees"] = 1
+
+    def run_invoice(customer_id, month_open, day_open, month_pay, day_pay,
+                    amount, description, currency, post_account,
+                    pay_year=YEAR):
+        date_open = date(YEAR, month_open, day_open).isoformat()
+        date_pay = date(pay_year, month_pay, day_pay).isoformat()
+        cross = currency != "USD"
+        inv = book.create_invoice(
+            customer_id=customer_id, date_opened=date_open,
+            currency=currency, term="Net 30",
+        )
+        book.add_invoice_entry(
+            invoice_id=inv["id"], account=LLC_REVENUE,
+            description=description, quantity="1", price=amount,
+        )
+        book.post_invoice(
+            invoice_id=inv["id"], post_account=post_account,
+            post_date=date_open, owner_type="customer", force=cross,
+        )
+        book.pay_invoice(
+            invoice_id=inv["id"], payment_account=CHECKING,
+            amount=amount, payment_date=date_pay, owner_type="customer",
+            force=cross,
+        )
+        counts["invoices"] += 1
+        return inv["id"]
+
+    # Emerald: $3,500/month, all 12 months (USD -> USD checking).
+    for m in range(1, 13):
+        run_invoice(
+            emerald["id"], m, 1, m, 28, "3500.00",
+            f"{date(YEAR, m, 1).strftime('%B %Y')} consulting retainer",
+            "USD", AR_USD,
+        )
+
+    # Sound Transit: USD, Net 15.
+    for m, do, dp, amt in [(2, 5, 20, "8500.00"), (3, 5, 20, "8500.00"),
+                           (6, 1, 16, "12000.00"), (10, 3, 18, "8500.00")]:
+        run_invoice(
+            sound_transit["id"], m, do, m, dp, amt,
+            f"Data engineering services - {date(YEAR, m, 1).strftime('%B %Y')}",
+            "USD", AR_USD,
+        )
+
+    # Berlin Digital: EUR invoices -> EUR A/R, paid cross-currency to USD.
+    for mo, do, mp, dp, eur in BERLIN_INVOICES:
+        pay_year = YEAR if mp >= mo else YEAR + 1
+        run_invoice(
+            berlin["id"], mo, do, mp, dp, eur,
+            f"Berlin Digital engagement - {date(YEAR, mo, 1).strftime('%B %Y')}",
+            "EUR", AR_EUR, pay_year=pay_year,
+        )
+
+    # Vendor bills.
+    def run_bill(vendor_id, month_open, day_open, month_pay, day_pay, amount,
+                 description, expense_account, payment_account=CHECKING):
+        date_open = date(YEAR, month_open, day_open).isoformat()
+        date_pay = date(YEAR, month_pay, day_pay).isoformat()
+        bill = book.create_bill(
+            vendor_id=vendor_id, date_opened=date_open, term="Net 30",
+        )
+        book.add_bill_entry(
+            bill_id=bill["id"], account=expense_account,
+            description=description, quantity="1", price=amount,
+        )
+        book.post_invoice(
+            invoice_id=bill["id"], post_account=AP,
+            post_date=date_open, owner_type="vendor",
+        )
+        book.pay_invoice(
+            invoice_id=bill["id"], payment_account=payment_account,
+            amount=amount, payment_date=date_pay, owner_type="vendor",
+        )
+        counts["bills"] += 1
+        return bill["id"]
+
+    # JetBrains annual ($289), paid from Business Amex.
+    run_bill(
+        jetbrains["id"], 1, 12, 1, 25, "289.00",
+        "JetBrains IntelliJ IDEA Ultimate subscription (annual)",
+        EXP_SOFTWARE, payment_account=AMEX,
+    )
+
+    # BookkeepingCo quarterly ($450).
+    for mo in (3, 6, 9, 12):
+        run_bill(
+            bookkeeper["id"], mo, 5, mo, 20, "450.00",
+            f"Quarterly bookkeeping review - Q{(mo - 1) // 3 + 1}",
+            EXP_ACCOUNTING,
+        )
+
+    return counts
+
+
+# ── Phase 8: Investment activity ────────────────────────────────
+
+ACCT_BY_SYMBOL = {"VTSAX": VTSAX, "VBTLX": VBTLX, "AAPL": AAPL,
+                  "MSFT": MSFT, "ETH": ETH}
+OPENING_LOT_TITLE = {
+    "VTSAX": "VTSAX core position", "VBTLX": "VBTLX bond allocation",
+    "AAPL": "AAPL 2023 purchase", "MSFT": "MSFT 2024 purchase",
+    "ETH": "ETH 2024 purchase",
+}
+
+# (month, day, action, symbol, shares) — price comes from real market data.
+QUARTERLY_TRADES = [
+    (3, 10, "buy", "AAPL", D("5.0000")),
+    (5, 15, "sell", "AAPL", D("3.0000")),
+    (7, 20, "buy", "ETH", D("0.500000")),
+    (8, 15, "buy", "MSFT", D("10.0000")),
+    (10, 8, "sell", "ETH", D("1.000000")),
+    (11, 18, "sell", "MSFT", D("5.0000")),
+    (12, 15, "sell", "VBTLX", D("100.0000")),
+    (12, 16, "buy", "VBTLX", D("100.0000")),
+]
+
+# Reinvested dividends (per-share rates from the spec).
+DIVIDENDS_PLAN = [
+    (3, 15, "VTSAX", D("68.00")), (6, 15, "VTSAX", D("73.00")),
+    (9, 15, "VTSAX", D("79.00")), (12, 15, "VTSAX", D("84.00")),
+    (2, 15, "AAPL", D("6.25")), (5, 15, "AAPL", D("7.50")),
+    (8, 15, "AAPL", D("6.75")), (11, 15, "AAPL", D("6.75")),
+    (3, 15, "MSFT", D("11.25")), (6, 15, "MSFT", D("11.25")),
+    (9, 15, "MSFT", D("18.75")), (12, 15, "MSFT", D("15.00")),
+]
+
+
+def investment_event_price_dates() -> list[tuple[str, date]]:
+    """All security price dates needed for trades + dividends (real data)."""
+    out: list[tuple[str, date]] = []
+    # DCA on the 1st (already covered by monthly price points, but be safe).
+    for m in range(1, 13):
+        out.append(("VTSAX", date(YEAR, m, 1)))
+        out.append(("VBTLX", date(YEAR, m, 1)))
+    for m, day, _a, sym, _sh in QUARTERLY_TRADES:
+        out.append((sym, date(YEAR, m, day)))
+    for m, day, sym, _amt in DIVIDENDS_PLAN:
+        out.append((sym, date(YEAR, m, day)))
+    return out
+
+
+def _shares_from_usd(usd: Decimal, price: Decimal, fraction: int) -> Decimal:
+    places = D(1) / D(fraction)
+    return (usd / price).quantize(places)
+
+
+def run_investments(out_path: Path) -> dict:
+    """Monthly DCA, quarterly trades, reinvested dividends. Direct piecash."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    counts = {"txns": 0, "lots": 0}
+    try:
+        usd = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        frac = {s[0]: s[3] for s in SECURITIES}
+
+        def find_lot(title):
+            for a in book.accounts:
+                for lot in a.lots:
+                    if lot.title == title:
+                        return lot
+            return None
+
+        # Monthly DCA: $500 VTSAX + $200 VBTLX on the 1st (real prices).
+        dca = [("VTSAX", D("500.00")), ("VBTLX", D("200.00"))]
+        for m in range(1, 13):
+            d = date(YEAR, m, 1)
+            for sym, amt in dca:
+                price = MD.security(sym, d).quantize(_security_quant(sym))
+                shares = _shares_from_usd(amt, price, frac[sym])
+                inv_acct = acct[ACCT_BY_SYMBOL[sym]]
+                lot = piecash.Lot(
+                    title=f"{sym} DCA {YEAR}-{m:02d}", account=inv_acct,
+                    notes=f"Monthly DCA — ${amt} @ ${price}", is_closed=0,
+                )
+                inv_split = piecash.Split(
+                    account=inv_acct, value=amt, quantity=shares)
+                cash_split = piecash.Split(account=acct[CHECKING], value=-amt)
+                piecash.Transaction(
+                    currency=usd, description=f"DCA {sym}",
+                    post_date=d, splits=[inv_split, cash_split])
+                inv_split.lot = lot
+                counts["txns"] += 1
+                counts["lots"] += 1
+
+        # Quarterly trades at real prices.
+        for m, day, action, sym, shares in QUARTERLY_TRADES:
+            d = date(YEAR, m, day)
+            price = MD.security(sym, d).quantize(_security_quant(sym))
+            inv_acct = acct[ACCT_BY_SYMBOL[sym]]
+            usd_amt = (shares * price).quantize(D("0.01"))
+            if action == "buy":
+                lot = piecash.Lot(
+                    title=f"{sym} {d.isoformat()} purchase", account=inv_acct,
+                    notes=f"{shares} shares @ ${price}", is_closed=0,
+                )
+                inv_split = piecash.Split(
+                    account=inv_acct, value=usd_amt, quantity=shares)
+                cash_split = piecash.Split(account=acct[CHECKING], value=-usd_amt)
+                piecash.Transaction(
+                    currency=usd, description=f"Buy {shares} {sym} @ ${price}",
+                    post_date=d, splits=[inv_split, cash_split])
+                inv_split.lot = lot
+                counts["lots"] += 1
+            else:
+                lot = find_lot(OPENING_LOT_TITLE[sym])
+                opening_split = lot.splits[0]
+                cost_per = (Decimal(str(opening_split.value))
+                            / Decimal(str(opening_split.quantity)))
+                cost_basis = (shares * cost_per).quantize(D("0.01"))
+                gain = usd_amt - cost_basis
+                inv_split = piecash.Split(
+                    account=inv_acct, value=-cost_basis, quantity=-shares)
+                cash_split = piecash.Split(account=acct[CHECKING], value=usd_amt)
+                gain_split = piecash.Split(
+                    account=acct[CAPITAL_GAINS], value=-gain)
+                piecash.Transaction(
+                    currency=usd, description=f"Sell {shares} {sym} @ ${price}",
+                    post_date=d, splits=[inv_split, cash_split, gain_split])
+                inv_split.lot = lot
+            counts["txns"] += 1
+
+        # Reinvested dividends at real prices.
+        for m, day, sym, amt in DIVIDENDS_PLAN:
+            d = date(YEAR, m, day)
+            price = MD.security(sym, d).quantize(_security_quant(sym))
+            shares = _shares_from_usd(amt, price, frac[sym])
+            inv_acct = acct[ACCT_BY_SYMBOL[sym]]
+            lot = piecash.Lot(
+                title=f"{sym} dividend {d.isoformat()}", account=inv_acct,
+                notes=f"Reinvested dividend — ${amt} @ ${price}", is_closed=0,
+            )
+            inv_split = piecash.Split(
+                account=inv_acct, value=amt, quantity=shares)
+            income_split = piecash.Split(account=acct[DIVIDENDS], value=-amt)
+            piecash.Transaction(
+                currency=usd, description=f"{sym} dividend (reinvested)",
+                post_date=d, splits=[inv_split, income_split])
+            inv_split.lot = lot
+            counts["txns"] += 1
+            counts["lots"] += 1
+
+        book.save()
+    finally:
+        book.close()
+    return counts
+
+
+# ── Phase 9: Credit card lifecycle ──────────────────────────────
+
+def gen_credit_cards() -> list[dict]:
+    """Chase payoff arc (Jan-Jun) + Amex monthly with Aug late fee.
+
+    The pay-in-full balance queries in the original phase script depended
+    on the live running balance; here we build the book in deterministic
+    passes, so we approximate the lifecycle with fixed, sensible amounts
+    that keep both cards roughly in the spec's narrative shape.
+    """
+    txns: list[dict] = []
+
+    # Chase interest Jan-May (declining), then paid off in June.
+    chase_interest = [(1, D("42.00")), (2, D("35.00")), (3, D("28.00")),
+                      (4, D("20.00")), (5, D("12.00"))]
+    for m, amt in chase_interest:
+        txns.append({
+            "description": f"Chase Sapphire interest — "
+                           f"{date(YEAR, m, 1).strftime('%B %Y')}",
+            "date": date(YEAR, m, 15),
+            "splits": [(CHASE, -amt), (EXP_CC_INT, amt)],
+        })
+    # Chase minimum payments Jan-May, larger payoff June.
+    chase_payments = [(1, 20, D("500.00")), (2, 20, D("500.00")),
+                      (3, 20, D("500.00")), (4, 20, D("500.00")),
+                      (5, 20, D("500.00")), (6, 25, D("1200.00"))]
+    for m, day, amt in chase_payments:
+        label = "June payoff" if m == 6 else "payment"
+        txns.append({
+            "description": f"Chase Sapphire {label} — "
+                           f"{date(YEAR, m, 1).strftime('%B %Y')}",
+            "date": date(YEAR, m, day),
+            "splits": [(CHECKING, -amt), (CHASE, amt)],
+        })
+    # Jul-Dec pay-in-full (daily-driver charges land on Chase).
+    for m in range(7, 13):
+        txns.append({
+            "description": f"Chase Sapphire — "
+                           f"{date(YEAR, m, 1).strftime('%b')} pay-in-full",
+            "date": date(YEAR, m, 28),
+            "splits": [(CHECKING, -D("650.00")), (CHASE, D("650.00"))],
+        })
+
+    # Business Amex monthly pay-in-full (covers AWS+WeWork ~$375/mo).
+    for m in range(1, 13):
+        if m == 8:
+            continue
+        txns.append({
+            "description": f"Business Amex — "
+                           f"{date(YEAR, m, 1).strftime('%b')} pay-in-full",
+            "date": date(YEAR, m, 25),
+            "splits": [(CHECKING, -D("375.00")), (AMEX, D("375.00"))],
+        })
+    # August late: partial payment + $29 late fee + ~$38 interest.
+    txns.append({
+        "description": "Business Amex — August partial payment (late)",
+        "date": date(YEAR, 8, 25),
+        "splits": [(CHECKING, -D("200.00")), (AMEX, D("200.00"))],
+    })
+    txns.append({
+        "description": "Business Amex — late payment fee",
+        "date": date(YEAR, 8, 28),
+        "splits": [(AMEX, -D("29.00")), (EXP_BANK_CHARGES, D("29.00"))],
+    })
+    txns.append({
+        "description": "Business Amex — August interest (missed cycle)",
+        "date": date(YEAR, 8, 28),
+        "splits": [(AMEX, -D("38.00")), (EXP_CC_INT, D("38.00"))],
+    })
+
+    return txns
+
+
+# ── Phase 10: Budget ────────────────────────────────────────────
+
+def run_budget(book: GnuCashBook) -> None:
+    name = "2025 Annual Budget"
+    book.create_budget(name=name, year=YEAR, num_periods=12,
+                       period_type="monthly",
+                       description="Alex & Robin 2025 household budget")
+    monthly = [
+        (EXP_GROCERIES, "400"), (EXP_DINING, "350"), (EXP_HOA, "425"),
+        (EXP_FUEL, "220"), (EXP_STREAMING, "46"), (EXP_CLOTHING, "150"),
+        (EXP_TRAVEL, "300"), (EXP_CLOUD, "150"), (EXP_GIFTS, "100"),
+        (EXP_CHARITY, "50"), (EXP_MISC, "200"),
+    ]
+    for acct, amt in monthly:
+        book.set_budget_amount(budget_name=name, account=acct, amount=amt,
+                               period="all")
+    # Parent rollups (placeholders).
+    book.set_budget_amount(budget_name=name, account="Expenses:Utilities",
+                           amount="450", period="all")
+    book.set_budget_amount(budget_name=name, account="Expenses:Pet",
+                           amount="70", period="all")
+
+    # Seasonal overrides (period 0-indexed: Jun=5, Jul=6, Aug=7, Nov=10).
+    for p in (5, 6, 7):
+        book.set_budget_amount(budget_name=name, account=EXP_TRAVEL,
+                               amount="600", period=p)
+    book.set_budget_amount(budget_name=name, account=EXP_GIFTS,
+                           amount="800", period=10)
+    book.set_budget_amount(budget_name=name, account=EXP_CHARITY,
+                           amount="500", period=10)
+
+
+# ── Phase 12: Edge cases ────────────────────────────────────────
+
+def run_edge_cases(book: GnuCashBook) -> dict:
+    """Voided, recategorized, returned/refunded, split-corrected, deleted."""
+    info = {}
+
+    # 1. Voided: $500 to Wrong Vendor on 03/15.
+    r = book.create_transaction(
+        description="Payment to Wrong Vendor (mis-routed)",
+        trans_date=date(YEAR, 3, 15),
+        splits=[{"account": CHECKING, "amount": "-500.00"},
+                {"account": EXP_MISC, "amount": "500.00"}],
+        check_duplicates=False,
+    )
+    book.void_transaction(guid=r["guid"], reason="Paid wrong vendor")
+    info["voided_guid"] = r["guid"]
+
+    # 2. Recategorized: $89 Office Supplies (Misc) -> Business:Software.
+    r = book.create_transaction(
+        description="Office Supplies (Amazon)",
+        trans_date=date(YEAR, 4, 20),
+        splits=[{"account": CHASE, "amount": "-89.00"},
+                {"account": EXP_MISC, "amount": "89.00"}],
+        check_duplicates=False,
+    )
+    book.replace_splits(
+        guid=r["guid"],
+        splits=[{"account": CHASE, "amount": "-89.00"},
+                {"account": EXP_SOFTWARE, "amount": "89.00"}],
+    )
+    info["recategorized_guid"] = r["guid"]
+
+    # 3. Returned purchase: $249 Electronics on 08/10, credit -$249 08/22.
+    book.create_transaction(
+        description="Electronics Store", trans_date=date(YEAR, 8, 10),
+        splits=[{"account": CHASE, "amount": "-249.00"},
+                {"account": EXP_MISC, "amount": "249.00"}],
+        check_duplicates=False,
+    )
+    book.create_transaction(
+        description="Electronics Store — return", trans_date=date(YEAR, 8, 22),
+        splits=[{"account": CHASE, "amount": "249.00"},
+                {"account": EXP_MISC, "amount": "-249.00"}],
+        check_duplicates=False,
+    )
+
+    # 4. Partial refund: $120 Department Store 09/05, $45 refund 09/15.
+    book.create_transaction(
+        description="Department Store", trans_date=date(YEAR, 9, 5),
+        splits=[{"account": CHASE, "amount": "-120.00"},
+                {"account": EXP_CLOTHING, "amount": "120.00"}],
+        check_duplicates=False,
+    )
+    book.create_transaction(
+        description="Department Store — partial refund",
+        trans_date=date(YEAR, 9, 15),
+        splits=[{"account": CHASE, "amount": "45.00"},
+                {"account": EXP_CLOTHING, "amount": "-45.00"}],
+        check_duplicates=False,
+    )
+
+    # 5. Split correction: $150 Dining -> $120 Dining + $30 Gifts.
+    r = book.create_transaction(
+        description="Dinner + gift card combo purchase",
+        trans_date=date(YEAR, 10, 1),
+        splits=[{"account": CHASE, "amount": "-150.00"},
+                {"account": EXP_DINING, "amount": "150.00"}],
+        check_duplicates=False,
+    )
+    book.replace_splits(
+        guid=r["guid"],
+        splits=[{"account": CHASE, "amount": "-150.00"},
+                {"account": EXP_DINING, "amount": "120.00"},
+                {"account": EXP_GIFTS, "amount": "30.00"}],
+    )
+    info["split_correction_guid"] = r["guid"]
+
+    # 6. Deleted duplicate grocery on 11/15.
+    r = book.create_transaction(
+        description="QFC (duplicate of 11/15)",
+        trans_date=date(YEAR, 11, 15),
+        splits=[{"account": CHECKING, "amount": "-92.50"},
+                {"account": EXP_GROCERIES, "amount": "92.50"}],
+        check_duplicates=False,
+    )
+    book.delete_transaction(guid=r["guid"])
+    info["deleted_guid"] = r["guid"]
+
+    return info
+
+
+# ── Phase 13: Volume stress ─────────────────────────────────────
+
+VOLUME_VENDORS = ["Morning Coffee", "Lunch Spot", "Parking Meter",
+                  "Vending Machine", "Corner Store", "Food Cart",
+                  "Transit Pass", "Drug Store", "Dry Cleaner", "News Stand"]
+DINING_VENDORS = {"Morning Coffee", "Lunch Spot", "Food Cart",
+                  "Vending Machine", "Corner Store"}
+
+
+def gen_volume() -> list[dict]:
+    rng = random.Random(SEED + 13)
+    txns = []
+    start = date(YEAR, 1, 1).toordinal()
+    span = date(YEAR, 12, 31).toordinal() - start
+    for _ in range(VOLUME_TXN_COUNT):
+        dt = date.fromordinal(start + rng.randint(0, span))
+        vendor = rng.choice(VOLUME_VENDORS)
+        amt = D(str(round(rng.uniform(1.50, 15.00), 2)))
+        target = EXP_DINING if vendor in DINING_VENDORS else EXP_MISC
+        txns.append({"description": vendor, "date": dt,
+                     "splits": [(CHECKING, -amt), (target, amt)]})
+    return txns
+
+
+# ── Phase 11: Reconciliation ────────────────────────────────────
+
+def run_reconciliation(book: GnuCashBook) -> None:
+    """Reconcile checking for Jan, Jun, Dec 2025 (bulk through-date)."""
+    for label, through, stmt_date in [
+        ("January", date(YEAR, 1, 31), date(YEAR, 1, 31)),
+        ("June", date(YEAR, 6, 30), date(YEAR, 6, 30)),
+        ("December", date(YEAR, 12, 31), date(YEAR, 12, 31)),
+    ]:
+        bal = book.get_balance(CHECKING, as_of_date=through)
+        try:
+            book.reconcile_account(
+                account_name=CHECKING, statement_date=stmt_date,
+                statement_balance=str(bal), reconcile_all=True,
+                through_date=through,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Reconciliation {label} skipped: {exc}")
+
+
+# ── Disable scheduled transactions ──────────────────────────────
+
+def disable_scheduled(book: GnuCashBook) -> None:
+    import re
+    sxs = book.list_scheduled_transactions(enabled_only=False)
+    guids = re.findall(r"\b([0-9a-f]{8,})\b", str(sxs))
+    for g in set(guids):
+        try:
+            book.update_scheduled_transaction(guid=g, enabled=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ── Verification ────────────────────────────────────────────────
+
+def _parse_money(s) -> Decimal:
+    return Decimal(str(s).replace(",", "").replace("$", "").strip())
+
+
+def verify(out_path: Path) -> None:
+    print("\n" + "=" * 64)
+    print("VERIFICATION")
+    print("=" * 64)
+    book = GnuCashBook(str(out_path))
+
+    # Covers all activity (Berlin Q4 payment crosses into Jan 2026) and
+    # reaches the latest price snapshot.
+    as_of = date(2026, 6, 30)
+
+    summary = book.get_book_summary()
+    bs = book.balance_sheet(as_of_date=as_of)
+    nw = book.net_worth(end_date=as_of)
+
+    bs_assets = _parse_money(bs["assets"]["total"])
+    bs_liab = _parse_money(bs["liabilities"]["total"])
+    bs_nw = bs_assets - bs_liab
+    nw_val = _parse_money(nw["net_worth"])
+
+    print("\n-- Cross-tool net worth agreement --")
+    print(f"  balance_sheet: assets {bs_assets:,.2f} - liabilities "
+          f"{bs_liab:,.2f} = net worth {bs_nw:,.2f}")
+    print(f"  net_worth tool:                 {nw_val:,.2f}")
+    print(f"  agree (bs vs net_worth):        {abs(bs_nw - nw_val) < 1}")
+    # get_book_summary renders net worth as a trajectory block; surface the
+    # "now" line, which is the current-net-worth figure.
+    lines = summary.splitlines()
+    for i, line in enumerate(lines):
+        if "net worth trajectory" in line.lower():
+            for j in range(i + 1, min(i + 7, len(lines))):
+                if "now:" in lines[j].lower():
+                    print(f"  get_book_summary (now): {lines[j].strip()}")
+            break
+
+    print("\n-- Investment holdings (real latest prices) --")
+    for path, sym in [(AAPL, "AAPL"), (VTSAX, "VTSAX"), (MSFT, "MSFT"),
+                      (ETH, "ETH"), (VBTLX, "VBTLX")]:
+        shares = book.get_balance(path)
+        latest = MD.security(sym, as_of).quantize(_security_quant(sym))
+        mkt = (Decimal(str(shares)) * latest).quantize(D("0.01"))
+        print(f"  {sym:6s} {shares} sh × ${latest} ≈ ${mkt:,.2f}")
+
+    print("\n-- Berlin Digital EUR A/R (FX invoices) --")
+    eur_ar = book.get_balance(AR_EUR)
+    latest_eur = MD.fx("EUR", "USD", as_of).quantize(D("0.0001"))
+    print(f"  A/R EUR balance (EUR commodity): €{eur_ar}")
+    print(f"  latest EUR/USD on file: {latest_eur}  "
+          f"(0 EUR expected — all 4 invoices settled)")
+    fx_bal = book.get_balance(FX_GAIN_LOSS)
+    print(f"  Income:Foreign Exchange Gain/Loss balance: {fx_bal}")
+
+    print("\n-- Counts --")
+    with book.open() as b:
+        n_acct = len(list(b.accounts))
+        n_txn = len(list(b.transactions))
+        n_inv = len(list(b.invoices))
+        n_price = len(list(b.prices))
+        n_cust = len(list(b.customers))
+        n_vend = len(list(b.vendors))
+        lots = sum(len(a.lots) for a in b.accounts)
+    print(f"  accounts:        {n_acct}")
+    print(f"  transactions:    {n_txn}")
+    print(f"  invoices+bills:  {n_inv}")
+    print(f"  customers:       {n_cust}")
+    print(f"  vendors:         {n_vend}")
+    print(f"  prices:          {n_price}")
+    print(f"  lots:            {lots}")
+
+    print("\n-- balance_sheet liabilities (full) --")
+    for r in bs["liabilities"]["accounts"]:
+        print(f"    {r}")
+    print(f"  TOTAL liabilities: {bs['liabilities']['total']}")
+
+
+# ── Driver ──────────────────────────────────────────────────────
+
+def build(out_path: Path) -> None:
+    print(f"Building Alex Chen-Morales book at: {out_path}")
+
+    print("\nPhase 1: book file + commodities + monthly prices")
+    create_book_file(out_path)
+    n_prices = add_prices(out_path)
+    # Real prices on every trade / invoice settle date.
+    event_dates = (investment_event_price_dates()
+                   + business_event_price_dates())
+    n_event = add_event_prices(out_path, event_dates)
+    print(f"  commodities + {n_prices} monthly prices + "
+          f"{n_event} event prices")
+
+    print("\nPhase 2: chart of accounts")
+    n_acct = create_accounts(out_path)
+    print(f"  {n_acct} accounts created")
+
+    book = GnuCashBook(str(out_path))
+    set_account_slots(book)
+    print("  account slots set")
+
+    print("\nPhase 3: opening balances + investment lots")
+    opening_balances(out_path)
+    print("  opening balances posted")
+
+    print("\nPhase 4: scheduled-transaction templates")
+    n_sx = create_scheduled_templates(book)
+    print(f"  {n_sx} SX templates created")
+
+    print("\nPhase 5: recurring instantiations")
+    n = write_bulk(out_path, gen_recurring())
+    print(f"  {n} recurring transactions")
+
+    print("\nPhase 6: daily/weekly + seasonal")
+    n = write_bulk(out_path, gen_daily_weekly())
+    print(f"  {n} daily/weekly/seasonal transactions")
+
+    print("\nPhase 7a: direct 1099 contractor income")
+    n = write_bulk(out_path, gen_contractor_income())
+    print(f"  {n} contractor deposits")
+
+    print("\nPhase 7b: business module")
+    business = run_business(book)
+    print(f"  {business}")
+
+    print("\nPhase 8: investments")
+    inv_counts = run_investments(out_path)
+    print(f"  {inv_counts}")
+
+    print("\nPhase 9: credit card lifecycle")
+    n = write_bulk(out_path, gen_credit_cards())
+    print(f"  {n} credit-card transactions")
+
+    print("\nPhase 10: budget")
+    run_budget(book)
+    print("  budget created")
+
+    print("\nPhase 12: edge cases")
+    edge = run_edge_cases(book)
+    print(f"  {edge}")
+
+    print("\nPhase 13: volume stress")
+    n = write_bulk(out_path, gen_volume())
+    print(f"  {n} volume transactions")
+
+    print("\nPhase 11: reconciliation")
+    run_reconciliation(book)
+    print("  reconciliation done")
+
+    print("\nDisabling scheduled transactions")
+    disable_scheduled(book)
+    print("  scheduled transactions disabled")
+
+    verify(out_path)
+    print("\nDone.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out", default=str(DEFAULT_OUT),
+        help="Output path (default: samples/alex.generated.gnucash)")
+    args = parser.parse_args()
+    out_path = Path(args.out).resolve()
+    if out_path == PROTECTED.resolve():
+        raise SystemExit(f"REFUSING to write to protected book: {PROTECTED}")
+    build(out_path)
+
+
+if __name__ == "__main__":
+    main()
