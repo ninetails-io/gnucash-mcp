@@ -60,12 +60,42 @@ PROTECTED = REPO_ROOT / "samples" / "alex-chen-morales.gnucash"
 SEED = 20250101
 VOLUME_TXN_COUNT = 320  # Phase 13 small casual-spend transactions
 
-YEAR = 2025
+YEAR = 2025  # the book opens 2025-01-01
+
+# How far forward the "living tissue" runs. The skeleton (opening
+# balances, lots, business module) is anchored in 2025; recurring
+# activity, daily/weekly spend, and seasonal one-offs now run
+# continuously from 2025-01-01 through THROUGH so the book reaches the
+# present with a realistic burn-rate, runway, and monthly-net (no months
+# of zero activity — the "data cliff" the bookkeeper flagged). Override
+# with ``--through YYYY-MM-DD`` (the verify step pins 2026-06-04).
+THROUGH = date.today()
+
+# The committed market-data cache ends here; quotes past this date
+# forward-fill the last real close (MarketData already does this, but we
+# keep the constant so price-snapshot generation knows the horizon).
+CACHE_END = date(2026, 6, 30)
 
 D = Decimal
 
 # Shared real-market-data accessor (offline; reads the committed cache).
 MD = MarketData.load()
+
+
+def _month_iter(start: date, end: date):
+    """Yield (year, month) for every month touched by [start, end]."""
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+
+
+def _clamp_day(year: int, month: int, day: int) -> date:
+    """A date on ``day`` of the month, clamped to the real month-end."""
+    last = _days_in_month(year, month)
+    return date(year, month, min(day, last))
 
 
 # ── Account path constants ──────────────────────────────────────
@@ -154,8 +184,17 @@ SECURITIES = [
 
 FOREIGN_CURRENCIES = ["EUR", "GBP", "CAD"]
 
-# Monthly price points: 1st of every month, 2025-01 .. 2026-06.
-PRICE_MONTHS = [(2025, m) for m in range(1, 13)] + [(2026, m) for m in range(1, 7)]
+# Monthly price points: 1st of every month from 2025-01 through the
+# month of THROUGH (computed at import time). Quotes past CACHE_END
+# forward-fill the last real close so valuations stay populated to the
+# present. Computed via a function so a ``--through`` override that lands
+# past today still gets price coverage.
+def _price_months(through: date) -> list[tuple[int, int]]:
+    end = max(through, CACHE_END)
+    return list(_month_iter(date(YEAR, 1, 1), end))
+
+
+PRICE_MONTHS = _price_months(THROUGH)
 
 
 def _security_quant(symbol: str) -> Decimal:
@@ -654,42 +693,73 @@ def _paycheck_splits(gross: Decimal):
     ]
 
 
-def gen_recurring() -> list[dict]:
+def _amortized_split(rate_annual: Decimal, payment: Decimal,
+                     balance: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    """One amortization period: returns (interest, principal, new_balance).
+
+    ``balance`` is the outstanding principal as a positive Decimal.
+    """
+    interest = (balance * rate_annual / D("12")).quantize(D("0.01"))
+    principal = (payment - interest).quantize(D("0.01"))
+    if principal > balance:  # final stub payment
+        principal = balance
+    return interest, principal, balance - principal
+
+
+def gen_recurring(through: date) -> list[dict]:
+    """Recurring activity from 2025-01-01 through ``through``.
+
+    Paychecks, loan amortization, monthly bills, quarterly/annual
+    premiums, property tax, and estimated federal tax all run
+    continuously to the present so the book has no "data cliff" — the
+    most recent months show realistic income and burn.
+    """
     txns: list[dict] = []
     rng = random.Random(SEED + 5)
 
-    # 26 biweekly paychecks from Jan 10, overtime on ~every 3rd-4th.
+    # Biweekly paychecks from Jan 10 2025, overtime ~every 3rd-4th.
     d = date(YEAR, 1, 10)
-    for i in range(26):
-        if d.year == YEAR:
-            overtime = D("0")
-            if i > 0 and i % rng.choice([3, 4]) == 0:
-                overtime = D(str(rng.randint(200, 400)))
-            gross = BASELINE_GROSS + overtime
-            desc = "Robin's Paycheck (UW Medical)"
-            if overtime:
-                desc += f" - ${overtime} overtime"
-            txns.append({"description": desc, "date": d,
-                         "splits": _paycheck_splits(gross)})
+    i = 0
+    while d <= through:
+        overtime = D("0")
+        if i > 0 and i % rng.choice([3, 4]) == 0:
+            overtime = D(str(rng.randint(200, 400)))
+        gross = BASELINE_GROSS + overtime
+        desc = "Robin's Paycheck (UW Medical)"
+        if overtime:
+            desc += f" - ${overtime} overtime"
+        txns.append({"description": desc, "date": d,
+                     "splits": _paycheck_splits(gross)})
         d += timedelta(days=14)
+        i += 1
 
-    # Mortgage (1st) + auto loan (5th), H1 vs H2 amortization.
-    for i, m in enumerate(range(1, 13)):
-        h2 = i >= 6
-        m_int = D("1991.50") if h2 else D("2006.25")
-        m_pri = D("493.50") if h2 else D("478.75")
-        txns.append({
-            "description": "Mortgage Payment", "date": date(YEAR, m, 1),
-            "splits": [(CHECKING, -(m_int + m_pri)),
-                       (EXP_MORTGAGE_INT, m_int), (MORTGAGE, m_pri)],
-        })
-        a_int = D("76.20") if h2 else D("84.63")
-        a_pri = D("288.80") if h2 else D("280.37")
-        txns.append({
-            "description": "Auto Loan Payment", "date": date(YEAR, m, 5),
-            "splits": [(CHECKING, -(a_int + a_pri)),
-                       (EXP_AUTO_INT, a_int), (AUTO_LOAN, a_pri)],
-        })
+    # Mortgage (1st) + auto loan (5th), true declining-balance
+    # amortization carried forward month over month.
+    mort_bal = D("385000.00")
+    mort_pmt = D("2485.00")
+    mort_rate = D("0.0625")
+    auto_bal = D("18500.00")
+    auto_pmt = D("365.00")
+    auto_rate = D("0.0549")
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        first = date(yr, m, 1)
+        if first <= through and mort_bal > 0:
+            m_int, m_pri, mort_bal = _amortized_split(
+                mort_rate, mort_pmt, mort_bal)
+            txns.append({
+                "description": "Mortgage Payment", "date": first,
+                "splits": [(CHECKING, -(m_int + m_pri)),
+                           (EXP_MORTGAGE_INT, m_int), (MORTGAGE, m_pri)],
+            })
+        fifth = _clamp_day(yr, m, 5)
+        if fifth <= through and auto_bal > 0:
+            a_int, a_pri, auto_bal = _amortized_split(
+                auto_rate, auto_pmt, auto_bal)
+            txns.append({
+                "description": "Auto Loan Payment", "date": fifth,
+                "splits": [(CHECKING, -(a_int + a_pri)),
+                           (EXP_AUTO_INT, a_int), (AUTO_LOAN, a_pri)],
+            })
 
     # Simple monthly bills.
     simple = [
@@ -705,40 +775,54 @@ def gen_recurring() -> list[dict]:
         ("WeWork Coworking", AMEX, EXP_COWORKING, D("250.00"), 1),
     ]
     for desc, src, dst, amt, day in simple:
-        for m in range(1, 13):
-            txns.append({
-                "description": desc, "date": date(YEAR, m, day),
-                "splits": [(src, -amt), (dst, amt)],
-            })
+        for yr, m in _month_iter(date(YEAR, 1, 1), through):
+            when = _clamp_day(yr, m, day)
+            if when <= through:
+                txns.append({
+                    "description": desc, "date": when,
+                    "splits": [(src, -amt), (dst, amt)],
+                })
 
-    # Quarterly umbrella insurance (Jan/Apr/Jul/Oct).
-    for m in (1, 4, 7, 10):
-        txns.append({
-            "description": "Umbrella Insurance Premium",
-            "date": date(YEAR, m, 15),
-            "splits": [(CHECKING, D("-125.00")), (EXP_UMBRELLA, D("125.00"))],
-        })
+    # Quarterly umbrella insurance (Jan/Apr/Jul/Oct, 15th).
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        if m in (1, 4, 7, 10):
+            when = date(yr, m, 15)
+            if when <= through:
+                txns.append({
+                    "description": "Umbrella Insurance Premium",
+                    "date": when,
+                    "splits": [(CHECKING, D("-125.00")),
+                               (EXP_UMBRELLA, D("125.00"))],
+                })
 
-    # Property tax halves.
-    txns.append({
-        "description": "King County Property Tax (1st Half)",
-        "date": date(YEAR, 4, 30),
-        "splits": [(CHECKING, D("-3200.00")), (EXP_PROP_TAX, D("3200.00"))],
-    })
-    txns.append({
-        "description": "King County Property Tax (2nd Half)",
-        "date": date(YEAR, 10, 31),
-        "splits": [(CHECKING, D("-3200.00")), (EXP_PROP_TAX, D("3200.00"))],
-    })
+    # Property tax halves, every year (Apr 30 / Oct 31).
+    for yr in range(YEAR, through.year + 1):
+        for mo, day, half in [(4, 30, "1st"), (10, 31, "2nd")]:
+            when = date(yr, mo, day)
+            if when <= through:
+                txns.append({
+                    "description": f"King County Property Tax ({half} Half)",
+                    "date": when,
+                    "splits": [(CHECKING, D("-3200.00")),
+                               (EXP_PROP_TAX, D("3200.00"))],
+                })
 
-    # Estimated federal tax at real IRS deadlines (Q4 lands Jan 2026).
-    for d_dl, q in [(date(YEAR, 4, 15), "Q1"), (date(YEAR, 6, 15), "Q2"),
-                    (date(YEAR, 9, 15), "Q3"), (date(YEAR + 1, 1, 15), "Q4")]:
-        txns.append({
-            "description": f"Estimated Federal Tax - {q} {YEAR}",
-            "date": d_dl,
-            "splits": [(CHECKING, D("-4200.00")), (EXP_EST_TAX, D("4200.00"))],
-        })
+    # Estimated federal tax at real IRS quarterly deadlines.
+    for yr in range(YEAR, through.year + 2):
+        for mo, day, q in [(4, 15, "Q1"), (6, 15, "Q2"),
+                           (9, 15, "Q3"), (1, 15, "Q4")]:
+            # Q4 of tax-year Y is paid the following January.
+            tax_year = yr - 1 if q == "Q4" else yr
+            if tax_year < YEAR:
+                continue
+            when = date(yr, mo, day)
+            if when <= through:
+                txns.append({
+                    "description": f"Estimated Federal Tax - {q} {tax_year}",
+                    "date": when,
+                    "splits": [(CHECKING, D("-4200.00")),
+                               (EXP_EST_TAX, D("4200.00"))],
+                })
 
     return txns
 
@@ -815,19 +899,26 @@ def _uniform_cents(rng, low, high):
     return D(str(round(rng.uniform(low, high), 2)))
 
 
-def gen_daily_weekly() -> list[dict]:
+def gen_daily_weekly(through: date) -> list[dict]:
+    """Daily/weekly/seasonal spend from 2025-01-01 through ``through``.
+
+    Runs continuously so the most recent weeks have groceries, gas,
+    coffee, dining, and Amazon activity — the burn-rate the dashboard
+    reads. Seasonal one-offs replay each calendar year.
+    """
     txns: list[dict] = []
+    start = date(YEAR, 1, 1)
 
     # Weekend groceries (one Sat/Sun per weekend) on Checking.
     rng = random.Random(SEED + 1)
-    d = date(YEAR, 1, 1)
+    d = start
     while d.weekday() != 5:
         d += timedelta(days=1)
     i = 0
-    while d.year == YEAR:
+    while d <= through:
         vendor = GROCERY_VENDORS[i % len(GROCERY_VENDORS)]
         day = d + timedelta(days=rng.randint(0, 1))
-        if day.year == YEAR:
+        if day <= through:
             amt = _vary(rng, 85.0)
             txns.append({"description": vendor, "date": day,
                          "splits": [(CHECKING, -amt), (EXP_GROCERIES, amt)]})
@@ -836,14 +927,14 @@ def gen_daily_weekly() -> list[dict]:
 
     # Weekly gas fills on Checking.
     rng = random.Random(SEED + 2)
-    d = date(YEAR, 1, 1)
+    d = start
     while d.weekday() != 0:
         d += timedelta(days=1)
     i = 0
-    while d.year == YEAR:
+    while d <= through:
         vendor = GAS_VENDORS[i % len(GAS_VENDORS)]
         day = d + timedelta(days=rng.randint(0, 6))
-        if day.year == YEAR:
+        if day <= through:
             amt = _vary(rng, 52.0)
             txns.append({"description": f"{vendor} Gas", "date": day,
                          "splits": [(CHECKING, -amt), (EXP_FUEL, amt)]})
@@ -852,8 +943,8 @@ def gen_daily_weekly() -> list[dict]:
 
     # Weekday coffee on Chase.
     rng = random.Random(SEED + 3)
-    d = date(YEAR, 1, 1)
-    while d.year == YEAR:
+    d = start
+    while d <= through:
         if d.weekday() < 5:
             vendor = rng.choice(COFFEE_VENDORS)
             amt = _vary(rng, 5.50)
@@ -863,9 +954,11 @@ def gen_daily_weekly() -> list[dict]:
 
     # Restaurants 2-3x/month.
     rng = random.Random(SEED + 4)
-    for m in range(1, 13):
+    for yr, m in _month_iter(start, through):
         for _ in range(rng.randint(2, 3)):
-            day = date(YEAR, m, rng.randint(1, _days_in_month(YEAR, m)))
+            day = _clamp_day(yr, m, rng.randint(1, 28))
+            if day > through:
+                continue
             vendor = rng.choice(RESTAURANTS)
             amt = _uniform_cents(rng, 45.0, 95.0)
             src = CHASE if rng.random() < 0.6 else CHECKING
@@ -874,9 +967,11 @@ def gen_daily_weekly() -> list[dict]:
 
     # Amazon 2-3x/month on Chase.
     rng = random.Random(SEED + 5)
-    for m in range(1, 13):
+    for yr, m in _month_iter(start, through):
         for _ in range(rng.randint(2, 3)):
-            day = date(YEAR, m, rng.randint(1, _days_in_month(YEAR, m)))
+            day = _clamp_day(yr, m, rng.randint(1, 28))
+            if day > through:
+                continue
             descriptor, expense = rng.choice(AMAZON_CATEGORIES)
             amt = _uniform_cents(rng, 15.0, 120.0)
             txns.append({"description": f"Amazon.com - {descriptor}",
@@ -885,72 +980,131 @@ def gen_daily_weekly() -> list[dict]:
 
     # Quarterly clothing on Chase.
     rng = random.Random(SEED + 6)
-    for m in (3, 6, 9, 12):
-        day = date(YEAR, m, rng.randint(10, 20))
+    for yr, m in _month_iter(start, through):
+        if m not in (3, 6, 9, 12):
+            continue
+        day = date(yr, m, rng.randint(10, 20))
+        if day > through:
+            continue
         vendor = rng.choice(CLOTHING_VENDORS)
         amt = _uniform_cents(rng, 35.0, 150.0)
         txns.append({"description": vendor, "date": day,
                      "splits": [(CHASE, -amt), (EXP_CLOTHING, amt)]})
 
-    # Monthly seasonal one-offs.
-    for month, day, desc, amt_str, src, dst in MONTHLY_EVENTS:
-        amt = D(amt_str)
-        if amt < 0:
-            splits = [(src, abs(amt)), (dst, -abs(amt))]
-        else:
-            splits = [(src, -amt), (dst, amt)]
-        txns.append({"description": desc, "date": date(YEAR, month, day),
-                     "splits": splits})
+    # Seasonal one-offs, replayed each calendar year in range.
+    for yr in range(YEAR, through.year + 1):
+        for month, day, desc, amt_str, src, dst in MONTHLY_EVENTS:
+            when = _clamp_day(yr, month, day)
+            if when > through:
+                continue
+            amt = D(amt_str)
+            if amt < 0:
+                splits = [(src, abs(amt)), (dst, -abs(amt))]
+            else:
+                splits = [(src, -amt), (dst, amt)]
+            txns.append({"description": desc, "date": when, "splits": splits})
 
     return txns
 
 
 # ── Phase 7a: Direct 1099 contractor income ─────────────────────
 
-def gen_contractor_income() -> list[dict]:
-    direct = [
-        (1, "TechStartup Inc", D("4500")),
-        (2, "TechStartup Inc", D("4500")),
-        (3, "TechStartup Inc", D("4500")),
-        (5, "DataFlow Systems", D("6000")),
-        (6, "DataFlow Systems", D("6000")),
-        (8, "CloudNine Consulting", D("3800")),
-        (9, "CloudNine Consulting", D("3800")),
-        (11, "WinterTech Solutions", D("5200")),
-        (12, "WinterTech Solutions", D("5200")),
-    ]
-    return [{
-        "description": f"{client} - monthly invoice payment",
-        "date": date(YEAR, m, 15),
-        "splits": [(CHECKING, amt), (CONTRACTOR, -amt)],
-    } for m, client, amt in direct]
+CONTRACTOR_CLIENTS = [
+    ("TechStartup Inc", D("4500")),
+    ("DataFlow Systems", D("6000")),
+    ("CloudNine Consulting", D("3800")),
+    ("WinterTech Solutions", D("5200")),
+]
+
+
+def gen_contractor_income(through: date) -> list[dict]:
+    """1099 deposits on the 15th, ~8 months a year (gaps are realistic
+    for a contractor), continuing through ``through``."""
+    rng = random.Random(SEED + 7)
+    txns: list[dict] = []
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        # ~2/3 of months have a 1099 deposit.
+        if rng.random() > 0.66:
+            continue
+        when = date(yr, m, 15)
+        if when > through:
+            continue
+        client, amt = rng.choice(CONTRACTOR_CLIENTS)
+        txns.append({
+            "description": f"{client} - monthly invoice payment",
+            "date": when,
+            "splits": [(CHECKING, amt), (CONTRACTOR, -amt)],
+        })
+    return txns
 
 
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
 
-# Berlin Digital EUR invoices: (month_open, day_open, month_pay, day_pay, eur)
-BERLIN_INVOICES = [
-    (3, 10, 4, 9, "4500.00"),
-    (6, 5, 7, 5, "6200.00"),
-    (9, 8, 10, 8, "4500.00"),
-    (12, 3, 1, 2, "5800.00"),   # paid Jan 2 2026
-]
+# Berlin Digital invoices a quarter apart; the EUR amount cycles through
+# this list. Generated dynamically through THROUGH so EUR A/R has both
+# settled invoices (realized FX gain/loss) AND recent open ones.
+BERLIN_AMOUNTS = ["4500.00", "6200.00", "4500.00", "5800.00", "5100.00"]
 
 
-def business_event_price_dates() -> list[tuple[str, date]]:
-    """EUR price dates needed for Berlin invoice post + pay (real rates)."""
+def _berlin_invoice_plan(through: date) -> list[dict]:
+    """Quarterly Berlin EUR invoices, opened on the 8th, paid ~30 days
+    later. Invoices whose payment date is past ``through`` are left
+    POSTED-BUT-UNPAID. Returns dicts with open/pay dates + paid flag.
+    """
+    plan: list[dict] = []
+    i = 0
+    for yr, m in _month_iter(date(YEAR, 3, 1), through):
+        if m not in (3, 6, 9, 12):
+            continue
+        date_open = date(yr, m, 8)
+        if date_open > through:
+            continue
+        date_pay = date_open + timedelta(days=30)
+        amount = BERLIN_AMOUNTS[i % len(BERLIN_AMOUNTS)]
+        i += 1
+        plan.append({
+            "date_open": date_open,
+            "date_pay": date_pay,
+            "amount": amount,
+            "paid": date_pay <= through,
+        })
+    return plan
+
+
+def _berlin_recent_open_date(through: date) -> date | None:
+    """Open date for the deliberately-outstanding recent Berlin EUR
+    invoice (~20 days before ``through``), or None if too early."""
+    when = through - timedelta(days=20)
+    return when if when >= date(YEAR, 1, 1) else None
+
+
+def business_event_price_dates(through: date) -> list[tuple[str, date]]:
+    """EUR price dates needed for Berlin invoice post + pay (real rates).
+
+    Every open date needs a rate (post); every settled invoice also needs
+    a rate on its pay date for the cross-currency realized FX gain/loss.
+    """
     out: list[tuple[str, date]] = []
-    for mo, do, mp, dp, _eur in BERLIN_INVOICES:
-        out.append(("EUR", date(YEAR, mo, do)))
-        pay_year = YEAR if mp >= mo else YEAR + 1
-        out.append(("EUR", date(pay_year, mp, dp)))
+    for inv in _berlin_invoice_plan(through):
+        out.append(("EUR", inv["date_open"]))
+        if inv["paid"]:
+            out.append(("EUR", inv["date_pay"]))
+    recent = _berlin_recent_open_date(through)
+    if recent is not None:
+        out.append(("EUR", recent))
     return out
 
 
-def run_business(book: GnuCashBook) -> dict:
-    """Create billterms, customers, vendors, invoices, and bills."""
+def run_business(book: GnuCashBook, through: date) -> dict:
+    """Create billterms, customers, vendors, invoices, bills, and jobs.
+
+    A realistic slice of invoices is left POSTED-BUT-UNPAID so the book
+    shows outstanding receivables in both USD and EUR A/R; the rest are
+    paid (Berlin's settled EUR invoices still book realized FX gain/loss).
+    Three jobs group project invoices across customers.
+    """
     counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
-              "terms": 0, "employees": 0}
+              "terms": 0, "employees": 0, "jobs": 0, "open_invoices": 0}
 
     book.create_billterm(name="Net 15", due_days=15,
                          description="Payment due within 15 days")
@@ -985,15 +1139,16 @@ def run_business(book: GnuCashBook) -> dict:
     book.create_employee(name="Sam Rivera", currency="USD")
     counts["employees"] = 1
 
-    def run_invoice(customer_id, month_open, day_open, month_pay, day_pay,
-                    amount, description, currency, post_account,
-                    pay_year=YEAR):
-        date_open = date(YEAR, month_open, day_open).isoformat()
-        date_pay = date(pay_year, month_pay, day_pay).isoformat()
+    def run_invoice(customer_id, date_open, date_pay, amount, description,
+                    currency, post_account, paid=True, job_id=None):
+        """Create + post an invoice; pay it only when ``paid`` is True.
+
+        Returns the invoice id. ``date_open`` / ``date_pay`` are dates.
+        """
         cross = currency != "USD"
         inv = book.create_invoice(
-            customer_id=customer_id, date_opened=date_open,
-            currency=currency, term="Net 30",
+            customer_id=customer_id, date_opened=date_open.isoformat(),
+            currency=currency, term="Net 30", job_id=job_id,
         )
         book.add_invoice_entry(
             invoice_id=inv["id"], account=LLC_REVENUE,
@@ -1001,49 +1156,123 @@ def run_business(book: GnuCashBook) -> dict:
         )
         book.post_invoice(
             invoice_id=inv["id"], post_account=post_account,
-            post_date=date_open, owner_type="customer", force=cross,
-        )
-        book.pay_invoice(
-            invoice_id=inv["id"], payment_account=CHECKING,
-            amount=amount, payment_date=date_pay, owner_type="customer",
+            post_date=date_open.isoformat(), owner_type="customer",
             force=cross,
         )
+        if paid:
+            book.pay_invoice(
+                invoice_id=inv["id"], payment_account=CHECKING,
+                amount=amount, payment_date=date_pay.isoformat(),
+                owner_type="customer", force=cross,
+            )
+        else:
+            counts["open_invoices"] += 1
         counts["invoices"] += 1
         return inv["id"]
 
-    # Emerald: $3,500/month, all 12 months (USD -> USD checking).
-    for m in range(1, 13):
+    # Emerald: $3,500/month retainer, every month through ``through``.
+    # The two most-recent retainers are left open (outstanding A/R);
+    # everything older is paid ~27 days after opening.
+    emerald_months = [
+        (yr, m) for yr, m in _month_iter(date(YEAR, 1, 1), through)
+        if date(yr, m, 1) <= through
+    ]
+    for idx, (yr, m) in enumerate(emerald_months):
+        date_open = date(yr, m, 1)
+        date_pay = date_open + timedelta(days=27)
+        # Open if it's one of the last two months, or its pay date is
+        # still in the future.
+        is_recent = idx >= len(emerald_months) - 2
+        paid = (not is_recent) and date_pay <= through
         run_invoice(
-            emerald["id"], m, 1, m, 28, "3500.00",
-            f"{date(YEAR, m, 1).strftime('%B %Y')} consulting retainer",
-            "USD", AR_USD,
+            emerald["id"], date_open, date_pay, "3500.00",
+            f"{date_open.strftime('%B %Y')} consulting retainer",
+            "USD", AR_USD, paid=paid,
         )
 
-    # Sound Transit: USD, Net 15.
-    for m, do, dp, amt in [(2, 5, 20, "8500.00"), (3, 5, 20, "8500.00"),
-                           (6, 1, 16, "12000.00"), (10, 3, 18, "8500.00")]:
+    # Sound Transit: larger project invoices, Net 15. Most paid; the
+    # last one left open as a recent outstanding receivable.
+    st_plan = []
+    qn = 0
+    for yr, m in _month_iter(date(YEAR, 2, 1), through):
+        if m not in (2, 6, 10):
+            continue
+        date_open = date(yr, m, 3)
+        if date_open > through:
+            continue
+        amount = ["8500.00", "12000.00", "8500.00"][qn % 3]
+        qn += 1
+        st_plan.append((date_open, amount))
+    for idx, (date_open, amount) in enumerate(st_plan):
+        date_pay = date_open + timedelta(days=15)
+        paid = (idx < len(st_plan) - 1) and date_pay <= through
         run_invoice(
-            sound_transit["id"], m, do, m, dp, amt,
-            f"Data engineering services - {date(YEAR, m, 1).strftime('%B %Y')}",
-            "USD", AR_USD,
+            sound_transit["id"], date_open, date_pay, amount,
+            f"Data engineering services - {date_open.strftime('%B %Y')}",
+            "USD", AR_USD, paid=paid,
         )
 
-    # Berlin Digital: EUR invoices -> EUR A/R, paid cross-currency to USD.
-    for mo, do, mp, dp, eur in BERLIN_INVOICES:
-        pay_year = YEAR if mp >= mo else YEAR + 1
+    # Berlin Digital: EUR invoices -> EUR A/R. Settled ones cross to USD
+    # with realized FX gain/loss; recent ones left open (EUR A/R balance).
+    for inv in _berlin_invoice_plan(through):
         run_invoice(
-            berlin["id"], mo, do, mp, dp, eur,
-            f"Berlin Digital engagement - {date(YEAR, mo, 1).strftime('%B %Y')}",
-            "EUR", AR_EUR, pay_year=pay_year,
+            berlin["id"], inv["date_open"], inv["date_pay"], inv["amount"],
+            f"Berlin Digital engagement - "
+            f"{inv['date_open'].strftime('%B %Y')}",
+            "EUR", AR_EUR, paid=inv["paid"],
         )
+
+    # One recent Berlin EUR invoice opened ~20 days before ``through`` and
+    # left OUTSTANDING, so EUR A/R carries a live foreign-currency balance
+    # (the quarterly cadence alone can leave EUR A/R empty near the
+    # horizon). Its post date is added to the event-price dates so the
+    # cross-currency post finds a real EUR/USD rate.
+    berlin_open_date = _berlin_recent_open_date(through)
+    if berlin_open_date is not None:
+        run_invoice(
+            berlin["id"], berlin_open_date,
+            berlin_open_date + timedelta(days=30), "5400.00",
+            f"Berlin Digital engagement - "
+            f"{berlin_open_date.strftime('%B %Y')} (outstanding)",
+            "EUR", AR_EUR, paid=False,
+        )
+
+    # ── Jobs: multi-invoice projects over customers ──
+    jobs_specs = [
+        (sound_transit["id"], "Sound Transit Q1 Migration", "ST-MIG-Q1",
+         [("4500.00", True), ("4500.00", True)]),
+        (emerald["id"], "Emerald Dashboard Revamp", "EM-DASH",
+         [("6000.00", True), ("5500.00", False)]),
+        (sound_transit["id"], "Sound Transit Realtime Feed", "ST-RT",
+         [("7200.00", False)]),
+    ]
+    job_open = date(YEAR, 4, 5)
+    for owner_id, jname, jref, milestones in jobs_specs:
+        if job_open > through:
+            break
+        job = book.create_job(
+            owner_id=owner_id, owner_type="customer",
+            name=jname, reference=jref,
+        )
+        counts["jobs"] += 1
+        for i, (amount, paid) in enumerate(milestones):
+            mo = job_open + timedelta(days=30 * i)
+            if mo > through:
+                break
+            run_invoice(
+                owner_id, mo, mo + timedelta(days=20), amount,
+                f"{jname} — milestone {i + 1}", "USD", AR_USD,
+                paid=(paid and mo + timedelta(days=20) <= through),
+                job_id=job["id"],
+            )
+        job_open += timedelta(days=45)
 
     # Vendor bills.
-    def run_bill(vendor_id, month_open, day_open, month_pay, day_pay, amount,
-                 description, expense_account, payment_account=CHECKING):
-        date_open = date(YEAR, month_open, day_open).isoformat()
-        date_pay = date(YEAR, month_pay, day_pay).isoformat()
+    def run_bill(vendor_id, date_open, date_pay, amount, description,
+                 expense_account, payment_account=CHECKING, paid=True):
         bill = book.create_bill(
-            vendor_id=vendor_id, date_opened=date_open, term="Net 30",
+            vendor_id=vendor_id, date_opened=date_open.isoformat(),
+            term="Net 30",
         )
         book.add_bill_entry(
             bill_id=bill["id"], account=expense_account,
@@ -1051,29 +1280,50 @@ def run_business(book: GnuCashBook) -> dict:
         )
         book.post_invoice(
             invoice_id=bill["id"], post_account=AP,
-            post_date=date_open, owner_type="vendor",
+            post_date=date_open.isoformat(), owner_type="vendor",
         )
-        book.pay_invoice(
-            invoice_id=bill["id"], payment_account=payment_account,
-            amount=amount, payment_date=date_pay, owner_type="vendor",
-        )
+        if paid:
+            book.pay_invoice(
+                invoice_id=bill["id"], payment_account=payment_account,
+                amount=amount, payment_date=date_pay.isoformat(),
+                owner_type="vendor",
+            )
         counts["bills"] += 1
         return bill["id"]
 
     # JetBrains annual ($289), paid from Business Amex.
     run_bill(
-        jetbrains["id"], 1, 12, 1, 25, "289.00",
+        jetbrains["id"], date(YEAR, 1, 12), date(YEAR, 1, 25), "289.00",
         "JetBrains IntelliJ IDEA Ultimate subscription (annual)",
         EXP_SOFTWARE, payment_account=AMEX,
     )
 
-    # BookkeepingCo quarterly ($450).
-    for mo in (3, 6, 9, 12):
+    # BookkeepingCo quarterly ($450), every quarter through ``through``.
+    for yr, m in _month_iter(date(YEAR, 3, 1), through):
+        if m not in (3, 6, 9, 12):
+            continue
+        date_open = date(yr, m, 5)
+        if date_open > through:
+            continue
         run_bill(
-            bookkeeper["id"], mo, 5, mo, 20, "450.00",
-            f"Quarterly bookkeeping review - Q{(mo - 1) // 3 + 1}",
+            bookkeeper["id"], date_open, date_open + timedelta(days=15),
+            "450.00",
+            f"Quarterly bookkeeping review - Q{(m - 1) // 3 + 1} {yr}",
             EXP_ACCOUNTING,
         )
+
+    # Re-dated outstanding bill: a recent BookkeepingCo bill left UNPAID
+    # so Accounts Payable shows a current outstanding balance (rather than
+    # a stale/corrupt-looking one). Opened ~10 days before ``through``.
+    recent_open = through - timedelta(days=10)
+    run_bill(
+        bookkeeper["id"], recent_open, recent_open + timedelta(days=30),
+        "450.00",
+        "Quarterly bookkeeping review - current (outstanding)",
+        EXP_ACCOUNTING, paid=False,
+    )
+
+    return counts
 
     return counts
 
@@ -1111,17 +1361,32 @@ DIVIDENDS_PLAN = [
 ]
 
 
-def investment_event_price_dates() -> list[tuple[str, date]]:
-    """All security price dates needed for trades + dividends (real data)."""
+def investment_event_price_dates(through: date) -> list[tuple[str, date]]:
+    """All security price dates needed for trades + dividends (real data),
+    spanning the full activity window through ``through``."""
     out: list[tuple[str, date]] = []
     # DCA on the 1st (already covered by monthly price points, but be safe).
-    for m in range(1, 13):
-        out.append(("VTSAX", date(YEAR, m, 1)))
-        out.append(("VBTLX", date(YEAR, m, 1)))
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        d = date(yr, m, 1)
+        if d <= through:
+            out.append(("VTSAX", d))
+            out.append(("VBTLX", d))
+    # 2025 fixed quarterly trades.
     for m, day, _a, sym, _sh in QUARTERLY_TRADES:
         out.append((sym, date(YEAR, m, day)))
-    for m, day, sym, _amt in DIVIDENDS_PLAN:
-        out.append((sym, date(YEAR, m, day)))
+    # 2026+ whole-share stock buys (Feb/May/Aug/Nov, 10th).
+    for yr, m in _month_iter(date(YEAR + 1, 1, 1), through):
+        if m in (2, 5, 8, 11):
+            d = date(yr, m, 10)
+            if d <= through:
+                out.append(("AAPL", d))
+                out.append(("MSFT", d))
+    # Dividends, replayed each year.
+    for yr in range(YEAR, through.year + 1):
+        for m, day, sym, _amt in DIVIDENDS_PLAN:
+            d = date(yr, m, day)
+            if d <= through:
+                out.append((sym, d))
     return out
 
 
@@ -1130,8 +1395,10 @@ def _shares_from_usd(usd: Decimal, price: Decimal, fraction: int) -> Decimal:
     return (usd / price).quantize(places)
 
 
-def run_investments(out_path: Path) -> dict:
-    """Monthly DCA, quarterly trades, reinvested dividends. Direct piecash."""
+def run_investments(out_path: Path, through: date) -> dict:
+    """Monthly DCA, quarterly trades, reinvested dividends, plus recent
+    whole-share stock buys — continuing through ``through``. Direct
+    piecash."""
     book = piecash.open_book(str(out_path), readonly=False)
     counts = {"txns": 0, "lots": 0}
     try:
@@ -1147,15 +1414,19 @@ def run_investments(out_path: Path) -> dict:
             return None
 
         # Monthly DCA: $500 VTSAX + $200 VBTLX on the 1st (real prices).
+        # Funds → fractional shares (realistic for Vanguard mutual funds).
+        # Runs continuously through ``through``.
         dca = [("VTSAX", D("500.00")), ("VBTLX", D("200.00"))]
-        for m in range(1, 13):
-            d = date(YEAR, m, 1)
+        for yr, m in _month_iter(date(YEAR, 1, 1), through):
+            d = date(yr, m, 1)
+            if d > through:
+                continue
             for sym, amt in dca:
                 price = MD.security(sym, d).quantize(_security_quant(sym))
                 shares = _shares_from_usd(amt, price, frac[sym])
                 inv_acct = acct[ACCT_BY_SYMBOL[sym]]
                 lot = piecash.Lot(
-                    title=f"{sym} DCA {YEAR}-{m:02d}", account=inv_acct,
+                    title=f"{sym} DCA {yr}-{m:02d}", account=inv_acct,
                     notes=f"Monthly DCA — ${amt} @ ${price}", is_closed=0,
                 )
                 inv_split = piecash.Split(
@@ -1163,6 +1434,38 @@ def run_investments(out_path: Path) -> dict:
                 cash_split = piecash.Split(account=acct[CHECKING], value=-amt)
                 piecash.Transaction(
                     currency=usd, description=f"DCA {sym}",
+                    post_date=d, splits=[inv_split, cash_split])
+                inv_split.lot = lot
+                counts["txns"] += 1
+                counts["lots"] += 1
+
+        # Quarterly WHOLE-SHARE stock buys (AAPL/MSFT are individual
+        # stocks — you buy whole shares). Cost = shares × real price.
+        # Starts after the 2025 fixed trade calendar so it doesn't
+        # collide; runs through ``through``.
+        stock_dca = [("AAPL", 2), ("MSFT", 1)]  # whole shares per quarter
+        for yr, m in _month_iter(date(YEAR + 1, 1, 1), through):
+            if m not in (2, 5, 8, 11):
+                continue
+            d = date(yr, m, 10)
+            if d > through:
+                continue
+            for sym, n_shares in stock_dca:
+                price = MD.security(sym, d).quantize(_security_quant(sym))
+                shares = D(n_shares)  # WHOLE shares
+                usd_amt = (shares * price).quantize(D("0.01"))
+                inv_acct = acct[ACCT_BY_SYMBOL[sym]]
+                lot = piecash.Lot(
+                    title=f"{sym} buy {d.isoformat()}", account=inv_acct,
+                    notes=f"{shares} whole shares @ ${price}", is_closed=0,
+                )
+                inv_split = piecash.Split(
+                    account=inv_acct, value=usd_amt, quantity=shares)
+                cash_split = piecash.Split(
+                    account=acct[CHECKING], value=-usd_amt)
+                piecash.Transaction(
+                    currency=usd,
+                    description=f"Buy {shares} {sym} @ ${price}",
                     post_date=d, splits=[inv_split, cash_split])
                 inv_split.lot = lot
                 counts["txns"] += 1
@@ -1205,25 +1508,49 @@ def run_investments(out_path: Path) -> dict:
                 inv_split.lot = lot
             counts["txns"] += 1
 
-        # Reinvested dividends at real prices.
-        for m, day, sym, amt in DIVIDENDS_PLAN:
-            d = date(YEAR, m, day)
-            price = MD.security(sym, d).quantize(_security_quant(sym))
-            shares = _shares_from_usd(amt, price, frac[sym])
-            inv_acct = acct[ACCT_BY_SYMBOL[sym]]
-            lot = piecash.Lot(
-                title=f"{sym} dividend {d.isoformat()}", account=inv_acct,
-                notes=f"Reinvested dividend — ${amt} @ ${price}", is_closed=0,
-            )
-            inv_split = piecash.Split(
-                account=inv_acct, value=amt, quantity=shares)
-            income_split = piecash.Split(account=acct[DIVIDENDS], value=-amt)
-            piecash.Transaction(
-                currency=usd, description=f"{sym} dividend (reinvested)",
-                post_date=d, splits=[inv_split, income_split])
-            inv_split.lot = lot
-            counts["txns"] += 1
-            counts["lots"] += 1
+        # Reinvested dividends at real prices, replayed each year
+        # through ``through``.
+        # VTSAX (a fund) reinvests its dividends — fractional DRIP shares
+        # are realistic. AAPL/MSFT (individual stocks) pay dividends in
+        # CASH to Checking, so their share counts stay WHOLE.
+        for yr in range(YEAR, through.year + 1):
+            for m, day, sym, amt in DIVIDENDS_PLAN:
+                d = date(yr, m, day)
+                if d > through:
+                    continue
+                inv_acct = acct[ACCT_BY_SYMBOL[sym]]
+                if sym in ("AAPL", "MSFT"):
+                    # Cash dividend → Checking (no new shares).
+                    cash_split = piecash.Split(
+                        account=acct[CHECKING], value=amt)
+                    income_split = piecash.Split(
+                        account=acct[DIVIDENDS], value=-amt)
+                    piecash.Transaction(
+                        currency=usd,
+                        description=f"{sym} dividend (cash)",
+                        post_date=d, splits=[cash_split, income_split])
+                    counts["txns"] += 1
+                else:
+                    price = MD.security(sym, d).quantize(
+                        _security_quant(sym))
+                    shares = _shares_from_usd(amt, price, frac[sym])
+                    lot = piecash.Lot(
+                        title=f"{sym} dividend {d.isoformat()}",
+                        account=inv_acct,
+                        notes=f"Reinvested dividend — ${amt} @ ${price}",
+                        is_closed=0,
+                    )
+                    inv_split = piecash.Split(
+                        account=inv_acct, value=amt, quantity=shares)
+                    income_split = piecash.Split(
+                        account=acct[DIVIDENDS], value=-amt)
+                    piecash.Transaction(
+                        currency=usd,
+                        description=f"{sym} dividend (reinvested)",
+                        post_date=d, splits=[inv_split, income_split])
+                    inv_split.lot = lot
+                    counts["txns"] += 1
+                    counts["lots"] += 1
 
         book.save()
     finally:
@@ -1233,13 +1560,16 @@ def run_investments(out_path: Path) -> dict:
 
 # ── Phase 9: Credit card lifecycle ──────────────────────────────
 
-def gen_credit_cards() -> list[dict]:
+def gen_credit_cards(through: date) -> list[dict]:
     """Chase payoff arc (Jan-Jun) + Amex monthly with Aug late fee.
 
     The pay-in-full balance queries in the original phase script depended
     on the live running balance; here we build the book in deterministic
     passes, so we approximate the lifecycle with fixed, sensible amounts
-    that keep both cards roughly in the spec's narrative shape.
+    that keep both cards roughly in the spec's narrative shape. From 2026
+    onward both cards run a steady monthly pay-in-full so the balances
+    stay realistic as daily-driver charges keep landing on them through
+    ``through`` (rather than ballooning past the 2025 cliff).
     """
     txns: list[dict] = []
 
@@ -1300,6 +1630,29 @@ def gen_credit_cards() -> list[dict]:
         "date": date(YEAR, 8, 28),
         "splits": [(AMEX, -D("38.00")), (EXP_CC_INT, D("38.00"))],
     })
+
+    # 2026+ steady-state pay-in-full for both cards so they don't balloon
+    # as the daily-driver charges keep landing through ``through``. We
+    # stop one month short of ``through`` so the most recent cycle's
+    # charges remain as an outstanding (unpaid) balance — realistic.
+    cutoff = (through.replace(day=1) - timedelta(days=1))
+    for yr, m in _month_iter(date(YEAR + 1, 1, 1), cutoff):
+        chase_when = _clamp_day(yr, m, 28)
+        if date(YEAR, 1, 1) <= chase_when <= cutoff:
+            txns.append({
+                "description": f"Chase Sapphire — "
+                               f"{chase_when.strftime('%b %Y')} pay-in-full",
+                "date": chase_when,
+                "splits": [(CHECKING, -D("700.00")), (CHASE, D("700.00"))],
+            })
+        amex_when = _clamp_day(yr, m, 25)
+        if date(YEAR, 1, 1) <= amex_when <= cutoff:
+            txns.append({
+                "description": f"Business Amex — "
+                               f"{amex_when.strftime('%b %Y')} pay-in-full",
+                "date": amex_when,
+                "splits": [(CHECKING, -D("375.00")), (AMEX, D("375.00"))],
+            })
 
     return txns
 
@@ -1436,12 +1789,15 @@ DINING_VENDORS = {"Morning Coffee", "Lunch Spot", "Food Cart",
                   "Vending Machine", "Corner Store"}
 
 
-def gen_volume() -> list[dict]:
+def gen_volume(through: date) -> list[dict]:
     rng = random.Random(SEED + 13)
     txns = []
     start = date(YEAR, 1, 1).toordinal()
-    span = date(YEAR, 12, 31).toordinal() - start
-    for _ in range(VOLUME_TXN_COUNT):
+    span = through.toordinal() - start
+    # Scale the casual-spend volume with the elapsed span so a longer
+    # book gets proportionally more incidental transactions.
+    count = max(VOLUME_TXN_COUNT, int(VOLUME_TXN_COUNT * span / 365))
+    for _ in range(count):
         dt = date.fromordinal(start + rng.randint(0, span))
         vendor = rng.choice(VOLUME_VENDORS)
         amt = D(str(round(rng.uniform(1.50, 15.00), 2)))
@@ -1454,34 +1810,113 @@ def gen_volume() -> list[dict]:
 # ── Phase 11: Reconciliation ────────────────────────────────────
 
 def run_reconciliation(book: GnuCashBook) -> None:
-    """Reconcile checking for Jan, Jun, Dec 2025 (bulk through-date)."""
-    for label, through, stmt_date in [
+    """Reconcile only the FIRST few statement cycles of checking.
+
+    A realistic book is reconciled through the last bank statement and
+    has many hundreds of more-recent unreconciled splits. We reconcile
+    checking through the first three months of 2025 and leave everything
+    after that unreconciled, matching how an active book actually looks
+    (the bookkeeper flagged a fully-reconciled book as unrealistic).
+    """
+    for label, through_date, stmt_date in [
         ("January", date(YEAR, 1, 31), date(YEAR, 1, 31)),
-        ("June", date(YEAR, 6, 30), date(YEAR, 6, 30)),
-        ("December", date(YEAR, 12, 31), date(YEAR, 12, 31)),
+        ("February", date(YEAR, 2, 28), date(YEAR, 2, 28)),
+        ("March", date(YEAR, 3, 31), date(YEAR, 3, 31)),
     ]:
-        bal = book.get_balance(CHECKING, as_of_date=through)
+        bal = book.get_balance(CHECKING, as_of_date=through_date)
         try:
             book.reconcile_account(
                 account_name=CHECKING, statement_date=stmt_date,
                 statement_balance=str(bal), reconcile_all=True,
-                through_date=through,
+                through_date=through_date,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  Reconciliation {label} skipped: {exc}")
 
 
-# ── Disable scheduled transactions ──────────────────────────────
+# ── Scheduled-transaction state (stay ENABLED, realistic timing) ─
 
-def disable_scheduled(book: GnuCashBook) -> None:
-    import re
-    sxs = book.list_scheduled_transactions(enabled_only=False)
-    guids = re.findall(r"\b([0-9a-f]{8,})\b", str(sxs))
-    for g in set(guids):
-        try:
-            book.update_scheduled_transaction(guid=g, enabled=False)
-        except Exception:  # noqa: BLE001
-            pass
+# Schedules we deliberately leave OVERDUE (last_occur pushed two periods
+# back so the dashboard surfaces an overdue-scheduled warning) — by name.
+OVERDUE_SX = {"Auto Loan Payment", "Estimated Tax Payment"}
+
+
+def set_schedule_state(out_path: Path, through: date) -> dict:
+    """Leave SX templates ENABLED with realistic ``last_occur`` timing.
+
+    Most schedules get ``last_occur`` set to their most recent occurrence
+    on/before ``through`` so their next occurrence is upcoming (the
+    dashboard's "due soon" line, and a working
+    ``create_transaction_from_scheduled`` target). A couple in
+    ``OVERDUE_SX`` are pushed two periods back so they read as overdue —
+    driving the overdue-schedule warning.
+
+    We set ``last_occur`` directly via piecash because the public
+    ``update_scheduled_transaction`` tool intentionally doesn't expose it
+    (it's GnuCash desktop's "Since Last Run" cursor, not user-editable).
+    """
+    from dateutil.relativedelta import relativedelta
+
+    period = {
+        "weekly": timedelta(days=7),
+        "biweekly": timedelta(days=14),
+        "monthly": relativedelta(months=1),
+        "quarterly": relativedelta(months=3),
+        "yearly": relativedelta(years=1),
+    }
+    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
+
+    book = piecash.open_book(str(out_path), readonly=False)
+    try:
+        for sx in book.session.query(piecash.ScheduledTransaction).all():
+            rec = sx.recurrence
+            if rec is None:
+                continue
+            mult = rec.recurrence_mult
+            ptype = rec.recurrence_period_type
+            # Map piecash recurrence to a frequency label.
+            if ptype == "week" and mult == 2:
+                freq = "biweekly"
+            elif ptype == "week":
+                freq = "weekly"
+            elif ptype == "month" and mult == 3:
+                freq = "quarterly"
+            elif ptype == "year":
+                freq = "yearly"
+            else:
+                freq = "monthly"
+
+            start = sx.start_date
+            if hasattr(start, "date"):
+                start = start.date()
+
+            # Walk occurrences forward from start, collecting those on or
+            # before ``through``.
+            step = period[freq]
+            occs = []
+            cur = start
+            while cur <= through and len(occs) < 5000:
+                occs.append(cur)
+                cur = cur + step
+
+            if not occs:
+                last_occ = None
+            elif sx.name in OVERDUE_SX and len(occs) >= 2:
+                # Push last_occur back so the next occurrence falls before
+                # today → the dashboard reads it as overdue.
+                last_occ = occs[-2]
+                info["overdue"] += 1
+            else:
+                last_occ = occs[-1]
+                info["upcoming"] += 1
+
+            sx.enabled = 1
+            sx.last_occur = last_occ
+            info["enabled"] += 1
+        book.save()
+    finally:
+        book.close()
+    return info
 
 
 # ── Verification ────────────────────────────────────────────────
@@ -1490,15 +1925,14 @@ def _parse_money(s) -> Decimal:
     return Decimal(str(s).replace(",", "").replace("$", "").strip())
 
 
-def verify(out_path: Path) -> None:
+def verify(out_path: Path, through: date) -> None:
     print("\n" + "=" * 64)
     print("VERIFICATION")
     print("=" * 64)
     book = GnuCashBook(str(out_path))
 
-    # Covers all activity (Berlin Q4 payment crosses into Jan 2026) and
-    # reaches the latest price snapshot.
-    as_of = date(2026, 6, 30)
+    # Value the book as of THROUGH (the present horizon).
+    as_of = through
 
     summary = book.get_book_summary()
     bs = book.balance_sheet(as_of_date=as_of)
@@ -1509,37 +1943,104 @@ def verify(out_path: Path) -> None:
     bs_nw = bs_assets - bs_liab
     nw_val = _parse_money(nw["net_worth"])
 
-    print("\n-- Cross-tool net worth agreement --")
+    print("\n-- (g) Cross-tool net worth agreement --")
     print(f"  balance_sheet: assets {bs_assets:,.2f} - liabilities "
           f"{bs_liab:,.2f} = net worth {bs_nw:,.2f}")
     print(f"  net_worth tool:                 {nw_val:,.2f}")
     print(f"  agree (bs vs net_worth):        {abs(bs_nw - nw_val) < 1}")
-    # get_book_summary renders net worth as a trajectory block; surface the
-    # "now" line, which is the current-net-worth figure.
+
+    # ── (a) No data cliff: recent months have non-zero net + runway ──
+    print("\n-- (a) Recent activity (no data cliff) --")
     lines = summary.splitlines()
     for i, line in enumerate(lines):
-        if "net worth trajectory" in line.lower():
-            for j in range(i + 1, min(i + 7, len(lines))):
-                if "now:" in lines[j].lower():
-                    print(f"  get_book_summary (now): {lines[j].strip()}")
-            break
+        low = line.lower()
+        if any(k in low for k in (
+                "net worth trajectory", "now:", "monthly net",
+                "runway", "burn")):
+            print(f"  summary: {line.strip()}")
+    # Per-month net income over the last 3 calendar months before THROUGH.
+    print("  monthly net (income - expenses), last 3 months:")
+    for back in (2, 1, 0):
+        ym_first = (through.replace(day=1)
+                    - relativedelta_safe(months=back))
+        nxt = ym_first + relativedelta_safe(months=1)
+        m_end = min(nxt - timedelta(days=1), through)
+        try:
+            inc = book.income_by_source(
+                start_date=ym_first, end_date=m_end, compact=False)
+            exp = book.spending_by_category(
+                start_date=ym_first, end_date=m_end, compact=False)
+            ti = _parse_money(inc.get("total", "0"))
+            te = _parse_money(exp.get("total", "0"))
+            print(f"    {ym_first.strftime('%Y-%m')}: income "
+                  f"{ti:,.2f} - expenses {te:,.2f} = net {ti - te:,.2f}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"    {ym_first.strftime('%Y-%m')}: (n/a: {exc})")
 
-    print("\n-- Investment holdings (real latest prices) --")
-    for path, sym in [(AAPL, "AAPL"), (VTSAX, "VTSAX"), (MSFT, "MSFT"),
-                      (ETH, "ETH"), (VBTLX, "VBTLX")]:
+    print("\n-- (b) Investment holdings (whole vs fractional) --")
+    for path, sym in [(AAPL, "AAPL"), (MSFT, "MSFT"), (VTSAX, "VTSAX"),
+                      (VBTLX, "VBTLX"), (ETH, "ETH")]:
         shares = book.get_balance(path)
         latest = MD.security(sym, as_of).quantize(_security_quant(sym))
         mkt = (Decimal(str(shares)) * latest).quantize(D("0.01"))
-        print(f"  {sym:6s} {shares} sh × ${latest} ≈ ${mkt:,.2f}")
+        whole = Decimal(str(shares)) == Decimal(str(shares)).to_integral_value()
+        tag = "WHOLE" if whole else "fractional"
+        print(f"  {sym:6s} {shares} sh ({tag}) × ${latest} ≈ ${mkt:,.2f}")
 
-    print("\n-- Berlin Digital EUR A/R (FX invoices) --")
-    eur_ar = book.get_balance(AR_EUR)
-    latest_eur = MD.fx("EUR", "USD", as_of).quantize(D("0.0001"))
-    print(f"  A/R EUR balance (EUR commodity): €{eur_ar}")
-    print(f"  latest EUR/USD on file: {latest_eur}  "
-          f"(0 EUR expected — all 4 invoices settled)")
+    print("\n-- (c) Outstanding receivables (USD + EUR) --")
+    usd_ar = book.get_balance(AR_USD, as_of_date=as_of)
+    eur_ar = book.get_balance(AR_EUR, as_of_date=as_of)
+    print(f"  Assets:Accounts Receivable (USD): ${usd_ar}")
+    print(f"  Assets:Receivables:A/R EUR (EUR): €{eur_ar}")
+    try:
+        out_inv = book.get_outstanding_invoices(compact=False)
+        n_out = len(out_inv) if isinstance(out_inv, list) else "see above"
+        print(f"  get_outstanding_invoices count: {n_out}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  get_outstanding_invoices: {exc}")
+
+    print("\n-- (h) Berlin FX gain/loss (paid EUR invoices) --")
     fx_bal = book.get_balance(FX_GAIN_LOSS)
-    print(f"  Income:Foreign Exchange Gain/Loss balance: {fx_bal}")
+    print(f"  Income:Foreign Exchange Gain/Loss balance: {fx_bal} "
+          f"(non-zero ⇒ realized FX booked on settled EUR invoices)")
+
+    print("\n-- (d) Scheduled transactions (must stay ENABLED) --")
+    enabled = book.list_scheduled_transactions(
+        enabled_only=True, compact=False)
+    n_en = len(enabled) if isinstance(enabled, list) else 0
+    print(f"  enabled scheduled transactions: {n_en}")
+    if isinstance(enabled, list):
+        for sx in enabled[:6]:
+            print(f"    {sx['name']}: next {sx.get('next_occurrence')} "
+                  f"(last {sx.get('last_occurrence')})")
+    # Overdue line from the dashboard.
+    for line in lines:
+        if "overdue scheduled" in line.lower():
+            print(f"  summary: {line.strip()}")
+
+    print("\n-- (e) Jobs --")
+    try:
+        jobs = book.list_jobs(compact=False)
+        n_jobs = len(jobs) if isinstance(jobs, list) else 0
+        print(f"  jobs: {n_jobs}")
+        if isinstance(jobs, list):
+            for j in jobs:
+                print(f"    {j.get('name')} ({j.get('reference')})")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  list_jobs: {exc}")
+
+    print("\n-- (f) Reconciliation (most splits unreconciled) --")
+    with book.open() as b:
+        from sqlalchemy import text as _text
+        rows = b.session.execute(_text(
+            "SELECT reconcile_state, COUNT(*) FROM splits "
+            "GROUP BY reconcile_state")).fetchall()
+        state_counts = {r[0]: r[1] for r in rows}
+    n_unrec = state_counts.get("n", 0)
+    n_rec = state_counts.get("y", 0)
+    n_clr = state_counts.get("c", 0)
+    print(f"  splits by reconcile_state: unreconciled(n)={n_unrec}, "
+          f"reconciled(y)={n_rec}, cleared(c)={n_clr}")
 
     print("\n-- Counts --")
     with book.open() as b:
@@ -1564,17 +2065,23 @@ def verify(out_path: Path) -> None:
     print(f"  TOTAL liabilities: {bs['liabilities']['total']}")
 
 
+def relativedelta_safe(months: int = 0):
+    from dateutil.relativedelta import relativedelta
+    return relativedelta(months=months)
+
+
 # ── Driver ──────────────────────────────────────────────────────
 
-def build(out_path: Path) -> None:
+def build(out_path: Path, through: date) -> None:
     print(f"Building Alex Chen-Morales book at: {out_path}")
+    print(f"Activity runs 2025-01-01 → {through.isoformat()} (THROUGH)")
 
     print("\nPhase 1: book file + commodities + monthly prices")
     create_book_file(out_path)
     n_prices = add_prices(out_path)
     # Real prices on every trade / invoice settle date.
-    event_dates = (investment_event_price_dates()
-                   + business_event_price_dates())
+    event_dates = (investment_event_price_dates(through)
+                   + business_event_price_dates(through))
     n_event = add_event_prices(out_path, event_dates)
     print(f"  commodities + {n_prices} monthly prices + "
           f"{n_event} event prices")
@@ -1596,27 +2103,27 @@ def build(out_path: Path) -> None:
     print(f"  {n_sx} SX templates created")
 
     print("\nPhase 5: recurring instantiations")
-    n = write_bulk(out_path, gen_recurring())
+    n = write_bulk(out_path, gen_recurring(through))
     print(f"  {n} recurring transactions")
 
     print("\nPhase 6: daily/weekly + seasonal")
-    n = write_bulk(out_path, gen_daily_weekly())
+    n = write_bulk(out_path, gen_daily_weekly(through))
     print(f"  {n} daily/weekly/seasonal transactions")
 
     print("\nPhase 7a: direct 1099 contractor income")
-    n = write_bulk(out_path, gen_contractor_income())
+    n = write_bulk(out_path, gen_contractor_income(through))
     print(f"  {n} contractor deposits")
 
     print("\nPhase 7b: business module")
-    business = run_business(book)
+    business = run_business(book, through)
     print(f"  {business}")
 
     print("\nPhase 8: investments")
-    inv_counts = run_investments(out_path)
+    inv_counts = run_investments(out_path, through)
     print(f"  {inv_counts}")
 
     print("\nPhase 9: credit card lifecycle")
-    n = write_bulk(out_path, gen_credit_cards())
+    n = write_bulk(out_path, gen_credit_cards(through))
     print(f"  {n} credit-card transactions")
 
     print("\nPhase 10: budget")
@@ -1628,31 +2135,39 @@ def build(out_path: Path) -> None:
     print(f"  {edge}")
 
     print("\nPhase 13: volume stress")
-    n = write_bulk(out_path, gen_volume())
+    n = write_bulk(out_path, gen_volume(through))
     print(f"  {n} volume transactions")
 
     print("\nPhase 11: reconciliation")
     run_reconciliation(book)
-    print("  reconciliation done")
+    print("  reconciliation done (only first 3 months of 2025)")
 
-    print("\nDisabling scheduled transactions")
-    disable_scheduled(book)
-    print("  scheduled transactions disabled")
+    print("\nScheduled-transaction state (stay ENABLED, realistic timing)")
+    sx_state = set_schedule_state(out_path, through)
+    print(f"  {sx_state}")
 
-    verify(out_path)
+    verify(out_path, through)
     print("\nDone.")
 
 
 def main() -> None:
+    global THROUGH, PRICE_MONTHS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--out", default=str(DEFAULT_OUT),
         help="Output path (default: samples/alex.generated.gnucash)")
+    parser.add_argument(
+        "--through", default=None,
+        help="Run activity through this date (YYYY-MM-DD). "
+             "Default: today.")
     args = parser.parse_args()
+    if args.through:
+        THROUGH = date.fromisoformat(args.through)
+        PRICE_MONTHS = _price_months(THROUGH)
     out_path = Path(args.out).resolve()
     if out_path == PROTECTED.resolve():
         raise SystemExit(f"REFUSING to write to protected book: {PROTECTED}")
-    build(out_path)
+    build(out_path, THROUGH)
 
 
 if __name__ == "__main__":
