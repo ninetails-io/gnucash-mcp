@@ -439,8 +439,11 @@ class BusinessMixin:
             return acct, None
 
         # Layer 2: fuzzy match by leaf-name substring.
+        template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
+            if account.guid in template_guids:
+                continue
             if account.type not in {"INCOME", "EXPENSE"}:
                 continue
             name_lower = account.name.lower()
@@ -554,8 +557,11 @@ class BusinessMixin:
             return acct, None
 
         # Layer 2: fuzzy match by leaf-name substring.
+        template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
+            if account.guid in template_guids:
+                continue
             if account.type not in {"INCOME", "EXPENSE"}:
                 continue
             name_lower = account.name.lower()
@@ -6849,6 +6855,19 @@ class BusinessMixin:
                     {"guid": inv_guid},
                 ).fetchall()
                 for ref in tax_refs:
+                    # Intentionally NOT paired with a _verify_*: the
+                    # stored ``refcount`` column has no in-process
+                    # consumer (every refcount decision goes through
+                    # ``_compute_taxtable_refcount``'s live COUNT(*)),
+                    # ``MAX(0, …)`` makes any miss a harmless no-op, and
+                    # ``taxtable_guid`` is read from the same entry rows
+                    # being deleted in this transaction. This is a
+                    # best-effort cache decrement, not a source of truth.
+                    # (Review L3: corruption harm refuted; the contract
+                    # scanner covers ``Table.__table__`` DML, not raw
+                    # text() — broadening it to every text() statement
+                    # would flag the many legitimately-unverified slot
+                    # operations, so that is deliberately out of scope.)
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
@@ -7965,9 +7984,15 @@ class BusinessMixin:
                 if bill.currency != default_currency:
                     rate = latest_rates.get(bill.currency.guid)
                     if rate is not None:
-                        total = total * rate
-                        paid = paid * rate
-                        outstanding = outstanding * rate
+                        # Quantize the FX products to the default
+                        # currency's precision: the verbose path emits
+                        # these via str(), so an unquantized product
+                        # would expose a long fractional tail (the
+                        # compact path masks it via _money's 2dp). L4.
+                        q = _commodity_quantum(default_currency)
+                        total = (total * rate).quantize(q)
+                        paid = (paid * rate).quantize(q)
+                        outstanding = (outstanding * rate).quantize(q)
                     else:
                         # No rate on file: exclude from the default-
                         # currency totals rather than summing raw
