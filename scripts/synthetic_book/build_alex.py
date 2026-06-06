@@ -16,9 +16,11 @@ settle cross-currency EUR->USD with realized FX gain/loss booked.
 
 All security prices and FX rates come from REAL historical market data
 via ``market_data.MarketData`` (offline, cache-backed): VTSAX, VBTLX,
-AAPL, MSFT, ETH (all USD-denominated; ETH is crypto) and EUR/GBP/CAD
-FX (all -> USD). Trade prices and conversion amounts use the actual
-quotes, not invented numbers.
+AAPL, MSFT, ETH (all USD-denominated; ETH is crypto) and EUR/CAD
+FX (both -> USD). Trade prices and conversion amounts use the actual
+quotes, not invented numbers. EUR backs Berlin Digital GmbH and CAD
+backs Nord Analytique; both have real A/R accounts, invoices, and
+on-date prices (no orphan commodities).
 
 SAFETY: this script writes ONLY to ``samples/alex.generated.gnucash``
 (the ``--out`` path). It NEVER touches the bookkeeper-validated
@@ -105,6 +107,7 @@ SAVINGS = "Assets:Current Assets:Savings Account"
 CASH = "Assets:Current Assets:Cash"
 AR_USD = "Assets:Accounts Receivable"
 AR_EUR = "Assets:Receivables:Accounts Receivable EUR"
+AR_CAD = "Assets:Receivables:Accounts Receivable CAD"
 HSA = "Assets:Investments:HSA"
 CONDO = "Assets:Fixed Assets:Condo"
 VEHICLE = "Assets:Fixed Assets:Vehicle"
@@ -182,7 +185,11 @@ SECURITIES = [
     ("ETH", "Ethereum", "CRYPTO", 1000000),
 ]
 
-FOREIGN_CURRENCIES = ["EUR", "GBP", "CAD"]
+# EUR (Berlin Digital) + CAD (Nord Analytique) are both live FX surfaces
+# with real accounts, invoices, and prices. GBP was historically listed
+# here but had zero GBP accounts/transactions — an orphan commodity — so
+# it is deliberately omitted.
+FOREIGN_CURRENCIES = ["EUR", "CAD"]
 
 # Monthly price points: 1st of every month from 2025-01 through the
 # month of THROUGH (computed at import time). Quotes past CACHE_END
@@ -324,6 +331,7 @@ ACCOUNTS = [
     ("Receivables", "ASSET", "Assets", "USD", "CURRENCY", True),
     ("Accounts Receivable", "RECEIVABLE", "Assets", "USD", "CURRENCY", False),
     ("Accounts Receivable EUR", "RECEIVABLE", "Assets:Receivables", "EUR", "CURRENCY", False),
+    ("Accounts Receivable CAD", "RECEIVABLE", "Assets:Receivables", "CAD", "CURRENCY", False),
     ("Investments", "ASSET", "Assets", "USD", "CURRENCY", True),
     ("Brokerage", "ASSET", "Assets:Investments", "USD", "CURRENCY", True),
     ("VTSAX", "MUTUAL", "Assets:Investments:Brokerage", "VTSAX", "FUND", False),
@@ -1038,6 +1046,88 @@ def gen_contractor_income(through: date) -> list[dict]:
     return txns
 
 
+# ── Phase 7c: Cash management — surplus sweeps out of checking ──
+
+# A savvy tech freelancer wouldn't park six figures in a non-interest
+# checking account. Without active cash management, Alex's checking
+# balloons to ~$155K (income outpaces spend). These sweeps move the
+# surplus into savings and the brokerage on an ongoing cadence so
+# checking settles into a realistic ~$40K-$60K operating buffer. Net
+# worth is unchanged — cash is reclassified into other assets, and
+# A = L + E still balances. VTSAX sweeps buy fractional fund shares at
+# real prices (realistic for a Vanguard mutual fund) and open their own
+# lots, exactly like the DCA path.
+
+MONTHLY_SAVINGS_SWEEP = D("4000.00")     # checking -> savings, monthly
+QUARTERLY_VTSAX_SWEEP = D("14000.00")    # checking -> VTSAX, quarterly
+
+
+def gen_savings_sweep(through: date) -> list[dict]:
+    """Monthly surplus transfer from Checking into Savings (on the 27th).
+
+    Skips the opening month so the sweep reads as a habit that starts
+    once the first months of income have landed.
+    """
+    txns: list[dict] = []
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        when = _clamp_day(yr, m, 27)
+        # Start sweeping from February 2025 onward.
+        if when < date(YEAR, 2, 1) or when > through:
+            continue
+        txns.append({
+            "description": "Transfer to savings (monthly surplus sweep)",
+            "date": when,
+            "splits": [(CHECKING, -MONTHLY_SAVINGS_SWEEP),
+                       (SAVINGS, MONTHLY_SAVINGS_SWEEP)],
+        })
+    return txns
+
+
+def run_vtsax_sweep(out_path: Path, through: date) -> dict:
+    """Quarterly surplus sweep from Checking into VTSAX (fractional shares).
+
+    A separate lot per sweep, cost = USD swept, shares at the real VTSAX
+    close on the sweep date. Mirrors the DCA path so lot/gain tooling
+    sees consistent data.
+    """
+    book = piecash.open_book(str(out_path), readonly=False)
+    counts = {"txns": 0, "lots": 0}
+    try:
+        usd = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        frac = {s[0]: s[3] for s in SECURITIES}["VTSAX"]
+        inv_acct = acct[VTSAX]
+        # Quarterly: Mar/Jun/Sep/Dec on the 20th.
+        for yr, m in _month_iter(date(YEAR, 1, 1), through):
+            if m not in (3, 6, 9, 12):
+                continue
+            when = _clamp_day(yr, m, 20)
+            if when < date(YEAR, 2, 1) or when > through:
+                continue
+            price = MD.security("VTSAX", when).quantize(_security_quant("VTSAX"))
+            shares = _shares_from_usd(QUARTERLY_VTSAX_SWEEP, price, frac)
+            lot = piecash.Lot(
+                title=f"VTSAX sweep {when.isoformat()}", account=inv_acct,
+                notes=f"Surplus sweep — ${QUARTERLY_VTSAX_SWEEP} @ ${price}",
+                is_closed=0,
+            )
+            inv_split = piecash.Split(
+                account=inv_acct, value=QUARTERLY_VTSAX_SWEEP, quantity=shares)
+            cash_split = piecash.Split(
+                account=acct[CHECKING], value=-QUARTERLY_VTSAX_SWEEP)
+            piecash.Transaction(
+                currency=usd,
+                description="Surplus sweep to VTSAX",
+                post_date=when, splits=[inv_split, cash_split])
+            inv_split.lot = lot
+            counts["txns"] += 1
+            counts["lots"] += 1
+        book.save()
+    finally:
+        book.close()
+    return counts
+
+
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
 
 # Berlin Digital invoices a quarter apart; the EUR amount cycles through
@@ -1078,8 +1168,45 @@ def _berlin_recent_open_date(through: date) -> date | None:
     return when if when >= date(YEAR, 1, 1) else None
 
 
+# Nord Analytique (Montréal) invoices in CAD ~every 2 months. The CAD
+# amount cycles through this list. Settled ones cross CAD->USD with
+# realized FX gain/loss; the most recent one is left OUTSTANDING so CAD
+# A/R carries a live foreign-currency balance alongside EUR.
+NORD_AMOUNTS = ["6800.00", "5200.00", "7400.00", "6100.00", "5900.00"]
+
+
+def _nord_invoice_plan(through: date) -> list[dict]:
+    """Bi-monthly Nord CAD invoices, opened on the 12th of odd months,
+    paid ~30 days later. The single most-recent invoice is left
+    POSTED-BUT-UNPAID (outstanding CAD A/R); all earlier ones are paid
+    (cross-currency realized FX gain/loss). Returns dicts with
+    open/pay dates + paid flag.
+    """
+    raw: list[dict] = []
+    i = 0
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        if m % 2 == 0:  # invoice in odd months (Jan, Mar, May, ...)
+            continue
+        date_open = date(yr, m, 12)
+        if date_open > through:
+            continue
+        amount = NORD_AMOUNTS[i % len(NORD_AMOUNTS)]
+        i += 1
+        raw.append({
+            "date_open": date_open,
+            "date_pay": date_open + timedelta(days=30),
+            "amount": amount,
+        })
+    # Leave the single most-recent invoice outstanding so CAD A/R always
+    # carries a live balance near the horizon; pay everything older.
+    for idx, inv in enumerate(raw):
+        is_last = idx == len(raw) - 1
+        inv["paid"] = (not is_last) and inv["date_pay"] <= through
+    return raw
+
+
 def business_event_price_dates(through: date) -> list[tuple[str, date]]:
-    """EUR price dates needed for Berlin invoice post + pay (real rates).
+    """EUR + CAD price dates needed for invoice post + pay (real rates).
 
     Every open date needs a rate (post); every settled invoice also needs
     a rate on its pay date for the cross-currency realized FX gain/loss.
@@ -1092,6 +1219,10 @@ def business_event_price_dates(through: date) -> list[tuple[str, date]]:
     recent = _berlin_recent_open_date(through)
     if recent is not None:
         out.append(("EUR", recent))
+    for inv in _nord_invoice_plan(through):
+        out.append(("CAD", inv["date_open"]))
+        if inv["paid"]:
+            out.append(("CAD", inv["date_pay"]))
     return out
 
 
@@ -1125,7 +1256,10 @@ def run_business(book: GnuCashBook, through: date) -> dict:
     berlin = book.create_customer(
         name="Berlin Digital GmbH", currency="EUR",
         notes="EUR-denominated invoices, Net 30")
-    counts["customers"] = 3
+    nord = book.create_customer(
+        name="Nord Analytique", currency="CAD",
+        notes="Montréal client, CAD-denominated invoices, Net 30")
+    counts["customers"] = 4
 
     # Vendors.
     jetbrains = book.create_vendor(
@@ -1237,26 +1371,46 @@ def run_business(book: GnuCashBook, through: date) -> dict:
             "EUR", AR_EUR, paid=False,
         )
 
+    # Nord Analytique: CAD invoices -> CAD A/R. Settled ones cross CAD to
+    # USD with realized FX gain/loss; the most recent one is left open so
+    # CAD A/R carries a live foreign-currency balance (a genuine CAD
+    # multi-currency surface alongside Berlin's EUR).
+    for inv in _nord_invoice_plan(through):
+        run_invoice(
+            nord["id"], inv["date_open"], inv["date_pay"], inv["amount"],
+            f"Nord Analytique data services - "
+            f"{inv['date_open'].strftime('%B %Y')}",
+            "CAD", AR_CAD, paid=inv["paid"],
+        )
+
     # ── Jobs: multi-invoice projects over customers ──
+    # Milestones are dated BACKWARD from ``through`` so each job's
+    # OUTSTANDING milestone lands in a realistic recent aging window
+    # (anchor offset below). Year-old open invoices would look like
+    # corruption (no write-off), so the unpaid milestones are kept
+    # current-to-recently-past-due; paid milestones step back in time
+    # from the anchor. ``anchor_days`` = days before ``through`` that the
+    # job's LAST milestone opens.
     jobs_specs = [
         (sound_transit["id"], "Sound Transit Q1 Migration", "ST-MIG-Q1",
-         [("4500.00", True), ("4500.00", True)]),
+         [("4500.00", True), ("4500.00", True)], 95),
         (emerald["id"], "Emerald Dashboard Revamp", "EM-DASH",
-         [("6000.00", True), ("5500.00", False)]),
+         [("6000.00", True), ("5500.00", False)], 28),
         (sound_transit["id"], "Sound Transit Realtime Feed", "ST-RT",
-         [("7200.00", False)]),
+         [("7200.00", False)], 12),
     ]
-    job_open = date(YEAR, 4, 5)
-    for owner_id, jname, jref, milestones in jobs_specs:
-        if job_open > through:
-            break
+    for owner_id, jname, jref, milestones, anchor_days in jobs_specs:
+        last_open = through - timedelta(days=anchor_days)
+        first_open = last_open - timedelta(days=30 * (len(milestones) - 1))
+        if first_open < date(YEAR, 1, 1):
+            continue
         job = book.create_job(
             owner_id=owner_id, owner_type="customer",
             name=jname, reference=jref,
         )
         counts["jobs"] += 1
         for i, (amount, paid) in enumerate(milestones):
-            mo = job_open + timedelta(days=30 * i)
+            mo = first_open + timedelta(days=30 * i)
             if mo > through:
                 break
             run_invoice(
@@ -1265,7 +1419,6 @@ def run_business(book: GnuCashBook, through: date) -> dict:
                 paid=(paid and mo + timedelta(days=20) <= through),
                 job_id=job["id"],
             )
-        job_open += timedelta(days=45)
 
     # Vendor bills.
     def run_bill(vendor_id, date_open, date_pay, amount, description,
@@ -1387,6 +1540,13 @@ def investment_event_price_dates(through: date) -> list[tuple[str, date]]:
             d = date(yr, m, day)
             if d <= through:
                 out.append((sym, d))
+    # Quarterly VTSAX surplus sweeps (Mar/Jun/Sep/Dec, 20th) need a real
+    # VTSAX price on the sweep date for the fractional-share math.
+    for yr, m in _month_iter(date(YEAR, 1, 1), through):
+        if m in (3, 6, 9, 12):
+            d = _clamp_day(yr, m, 20)
+            if date(YEAR, 2, 1) <= d <= through:
+                out.append(("VTSAX", d))
     return out
 
 
@@ -1838,7 +1998,16 @@ def run_reconciliation(book: GnuCashBook) -> None:
 
 # Schedules we deliberately leave OVERDUE (last_occur pushed two periods
 # back so the dashboard surfaces an overdue-scheduled warning) — by name.
-OVERDUE_SX = {"Auto Loan Payment", "Estimated Tax Payment"}
+#
+# Only the Estimated Tax Payment stays overdue: it's a believable
+# real-world lapse (a freelancer can genuinely miss a quarterly IRS
+# deadline) and the bookkeeper keeps it as a demo of the overdue-warning
+# surface. The Auto Loan Payment is NOT overdue — missing a car payment
+# hits credit after 30 days, which would be unrealistic; its recurring
+# instantiation is posted current (the monthly amortization in
+# ``gen_recurring`` runs through ``through``) and its SX cursor advances
+# to the latest occurrence below.
+OVERDUE_SX = {"Estimated Tax Payment"}
 
 
 def set_schedule_state(out_path: Path, through: date) -> dict:
@@ -1987,22 +2156,48 @@ def verify(out_path: Path, through: date) -> None:
         tag = "WHOLE" if whole else "fractional"
         print(f"  {sym:6s} {shares} sh ({tag}) × ${latest} ≈ ${mkt:,.2f}")
 
-    print("\n-- (c) Outstanding receivables (USD + EUR) --")
+    print("\n-- Checking operating buffer (target ~$40K-$60K) --")
+    chk = _parse_money(book.get_balance(CHECKING, as_of_date=as_of))
+    sav = _parse_money(book.get_balance(SAVINGS, as_of_date=as_of))
+    in_band = D("40000") <= chk <= D("60000")
+    print(f"  Checking: ${chk:,.2f}  (in $40K-$60K band: {in_band})")
+    print(f"  Savings:  ${sav:,.2f}")
+
+    print("\n-- (c) Outstanding receivables (USD + EUR + CAD) --")
     usd_ar = book.get_balance(AR_USD, as_of_date=as_of)
     eur_ar = book.get_balance(AR_EUR, as_of_date=as_of)
+    cad_ar = book.get_balance(AR_CAD, as_of_date=as_of)
     print(f"  Assets:Accounts Receivable (USD): ${usd_ar}")
     print(f"  Assets:Receivables:A/R EUR (EUR): €{eur_ar}")
+    print(f"  Assets:Receivables:A/R CAD (CAD): C${cad_ar}")
     try:
         out_inv = book.get_outstanding_invoices(compact=False)
         n_out = len(out_inv) if isinstance(out_inv, list) else "see above"
         print(f"  get_outstanding_invoices count: {n_out}")
+        if isinstance(out_inv, list):
+            worst = 0
+            for r in out_inv:
+                due = r.get("due_date")
+                if due:
+                    days = (through - date.fromisoformat(due)).days
+                    worst = max(worst, days)
+            print(f"  most-overdue outstanding invoice: {worst} days "
+                  f"past due (target: <= ~90)")
     except Exception as exc:  # noqa: BLE001
         print(f"  get_outstanding_invoices: {exc}")
 
-    print("\n-- (h) Berlin FX gain/loss (paid EUR invoices) --")
+    print("\n-- (h) FX gain/loss (paid EUR + CAD invoices) --")
     fx_bal = book.get_balance(FX_GAIN_LOSS)
     print(f"  Income:Foreign Exchange Gain/Loss balance: {fx_bal} "
-          f"(non-zero ⇒ realized FX booked on settled EUR invoices)")
+          f"(non-zero ⇒ realized FX booked on settled EUR/CAD invoices)")
+
+    print("\n-- GBP must be absent; CAD prices must exist --")
+    with book.open() as b:
+        comm_mn = sorted({c.mnemonic for c in b.commodities})
+        cad_prices = sum(1 for p in b.prices if p.commodity.mnemonic == "CAD")
+    print(f"  commodities: {comm_mn}")
+    print(f"  GBP present: {'GBP' in comm_mn}  (should be False)")
+    print(f"  CAD prices on file: {cad_prices}")
 
     print("\n-- (d) Scheduled transactions (must stay ENABLED) --")
     enabled = book.list_scheduled_transactions(
@@ -2113,6 +2308,12 @@ def build(out_path: Path, through: date) -> None:
     print("\nPhase 7a: direct 1099 contractor income")
     n = write_bulk(out_path, gen_contractor_income(through))
     print(f"  {n} contractor deposits")
+
+    print("\nPhase 7c: cash management (surplus sweeps out of checking)")
+    n = write_bulk(out_path, gen_savings_sweep(through))
+    sweep = run_vtsax_sweep(out_path, through)
+    print(f"  {n} savings sweeps + {sweep['txns']} VTSAX sweeps "
+          f"({sweep['lots']} lots)")
 
     print("\nPhase 7b: business module")
     business = run_business(book, through)
