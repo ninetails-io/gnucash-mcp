@@ -302,8 +302,14 @@ class CurrencyMixin:
         for commodity in self._commodities_with_market_prices(book):
             if commodity.guid in result or commodity == default_currency:
                 continue
+            # Use the future-folded ``anchor`` (not raw ``as_of``) so a
+            # chained commodity applies the same "now/future anchors
+            # include forecast prices" convention as the direct pass
+            # above. The chain legs run with the staleness cap disabled,
+            # so an anchor of ``date.max`` selects the latest available
+            # rate rather than excluding everything as stale.
             chained = self._market_rate_to_default(
-                book, commodity, default_currency, as_of,
+                book, commodity, default_currency, anchor,
             )
             if chained is not None:
                 result[commodity.guid] = chained

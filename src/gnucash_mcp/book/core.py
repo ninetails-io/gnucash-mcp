@@ -548,30 +548,28 @@ class CoreMixin:
                 if split.transaction.post_date <= as_of:
                     balance += split.quantity
 
+            if balance == 0:
+                continue
+
+            # FX chokepoint: value the signed balance in the default
+            # currency via the same rate map the report tools use, then
+            # sort into assets / liabilities. _market_value handles the
+            # rate-or-cost-basis fallback (cost basis filtered to
+            # post_date <= as_of via ``today=as_of``). Liabilities are
+            # credit-natural (negative balance); negating the converted
+            # value yields the positive magnitude — mirroring
+            # balance_sheet's per-bucket negate so this trajectory and
+            # the net_worth report agree on foreign-currency debt.
+            converted, _ = self._market_value(
+                account, balance,
+                rates=rates,
+                default_currency=default_currency,
+                today=as_of,
+            )
             if account.type in self._NW_ASSET_TYPES:
-                if balance == 0:
-                    continue
-                if account.commodity == default_currency:
-                    assets_total += balance
-                else:
-                    rate = rates.get(account.commodity.guid)
-                    if rate is not None:
-                        assets_total += balance * rate
-                    else:
-                        # Cost-basis fallback: split values are in
-                        # transaction currency (= book default for
-                        # typical purchases of foreign-commodity
-                        # assets). Approximation but the same one
-                        # the existing summary uses.
-                        cost_basis = Decimal("0")
-                        for split in account.splits:
-                            if split.transaction.post_date <= as_of:
-                                cost_basis += Decimal(str(split.value))
-                        assets_total += cost_basis
+                assets_total += converted
             else:
-                # Liability bucket. Negate to get positive magnitude;
-                # subtract from net worth via liabilities_total.
-                liabilities_total += -balance
+                liabilities_total += -converted
 
         return assets_total - liabilities_total
 
@@ -1976,16 +1974,33 @@ class CoreMixin:
                     )
                     data.asset_leaves.append((leaf, usd_value, note))
             elif account.type == "CREDIT":
-                if is_leaf:
-                    data.credit_cards.append((leaf, -balance))
+                if is_leaf and balance != 0:
+                    # FX chokepoint: convert via the same rate map as
+                    # assets/AR/AP, then negate the credit-natural
+                    # balance to a positive magnitude. Pre-fix this
+                    # appended raw account-commodity quantity, diverging
+                    # from balance_sheet/net_worth on foreign debt.
+                    usd_value, _ = self._market_value(
+                        account, balance,
+                        rates=latest_prices,
+                        default_currency=default_currency,
+                        today=today,
+                    )
+                    data.credit_cards.append((leaf, -usd_value))
             elif account.type == "LIABILITY":
-                if is_leaf:
-                    neg_balance = -balance
+                if is_leaf and balance != 0:
+                    usd_value, _ = self._market_value(
+                        account, balance,
+                        rates=latest_prices,
+                        default_currency=default_currency,
+                        today=today,
+                    )
+                    pos_value = -usd_value
                     if "loan" in account.fullname.lower():
-                        data.loan_accts.append((leaf, neg_balance))
+                        data.loan_accts.append((leaf, pos_value))
                     else:
                         data.other_liab_accts.append(
-                            (leaf, neg_balance)
+                            (leaf, pos_value)
                         )
             elif account.type == "RECEIVABLE":
                 if is_leaf and balance != 0:

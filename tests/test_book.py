@@ -8193,6 +8193,134 @@ class TestCrossToolPriceAgreement:
         # 6700 USD Checking + 1500 USD Euro Savings = 8200.
         assert "now: USD 8,200" in summary
 
+    @staticmethod
+    def _foreign_liability_book(tmp_path: Path) -> Path:
+        """USD-default book with a EUR-denominated credit card.
+
+        Checking holds 1000 USD; the EUR Visa carries a -500 EUR
+        balance; EUR/USD is 1.20. So the card is worth 600 USD and
+        net worth is 1000 - 600 = 400 USD. The raw foreign quantity
+        (500) is the canary: it only surfaces if a tool skips FX
+        conversion on the liability.
+        """
+        import piecash
+        from piecash import factories
+
+        book_path = tmp_path / "foreign_liability.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        root = book.root_account
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        visa_eur = piecash.Account(
+            name="Visa EUR", type="CREDIT", parent=liabilities,
+            commodity=eur,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity, commodity=usd,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel_eur = piecash.Account(
+            name="Travel", type="EXPENSE", parent=expenses, commodity=eur,
+        )
+        book.save()
+
+        # Checking opening balance: +1000 USD.
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=opening, value=Decimal("-1000")),
+            ],
+        ))
+        # Charge 500 EUR on the card (EUR transaction; value==quantity).
+        book.session.add(piecash.Transaction(
+            currency=eur, description="Hotel in Berlin",
+            post_date=date(2024, 1, 10),
+            splits=[
+                piecash.Split(
+                    account=visa_eur,
+                    value=Decimal("-500"), quantity=Decimal("-500"),
+                ),
+                piecash.Split(
+                    account=travel_eur,
+                    value=Decimal("500"), quantity=Decimal("500"),
+                ),
+            ],
+        ))
+        # EUR/USD = 1.20 (past-dated so every "now" tool picks it).
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2024, 2, 1),
+            value="1.20", source="user:test", type="nav",
+        ))
+        book.save()
+        return book_path
+
+    def test_summary_and_reports_agree_on_foreign_liability(
+        self, tmp_path: Path,
+    ):
+        """H1 regression: ``get_book_summary`` must FX-convert
+        foreign-currency liabilities, matching ``balance_sheet`` and
+        ``net_worth``. Pre-fix the dashboard summed raw account-
+        commodity quantity for CREDIT/LIABILITY while the report tools
+        converted — so a EUR credit card diverged by the FX delta on
+        the surface the LLM calls first.
+        """
+        from datetime import date as date_cls
+
+        gc_book = GnuCashBook(str(self._foreign_liability_book(tmp_path)))
+        today = date_cls.today()
+
+        # balance_sheet converts the card: 500 EUR × 1.20 = 600 USD.
+        bs = gc_book.balance_sheet(as_of_date=today)
+        card_row = next(
+            a for a in bs["liabilities"]["accounts"]
+            if a["account"] == "Liabilities:Visa EUR"
+        )
+        assert Decimal(card_row["default_currency_value"]) == Decimal("600.00")
+
+        # net_worth point-in-time: 1000 - 600 = 400 USD. (Book-layer
+        # methods take date objects; the MCP wrapper parses ISO strings.)
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("400.00")
+
+        # The dashboard must agree on BOTH arms:
+        summary = gc_book.get_book_summary()
+        # (a) _collect_summary_balance_sheet: the rendered card value is
+        #     the converted 600.00, NOT the raw 500.
+        assert "Credit cards (1): USD 600.00" in summary, (
+            f"dashboard did not FX-convert the EUR credit card; "
+            f"saw:\n{summary}"
+        )
+        assert "USD 500.00" not in summary  # canary: raw EUR quantity
+        # (b) _compute_net_worth_at trajectory "now" anchor: 400.
+        assert "now: USD 400" in summary, (
+            f"trajectory 'now' net worth did not convert the EUR "
+            f"liability; saw:\n{summary}"
+        )
+
 
 class TestNonUsdDefaultCurrency:
     """Bookkeeper-flagged: every compact-mode formatter that emits
