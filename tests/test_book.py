@@ -5858,6 +5858,32 @@ class TestUpdateAccount:
         # Verify new name exists
         assert gc_book.get_account("Expenses:Food & Groceries") is not None
 
+    def test_update_account_rename_rejects_invalid_names(
+        self, test_book: Path
+    ):
+        """M5 regression: the rename branch must reject ':' (path
+        separator), control chars, and whitespace-only names — the same
+        MP-14 validation create_account enforces. Pre-fix the rename
+        path was an unguarded parallel entry point that would corrupt
+        the account's fullname for downstream path parsing.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="cannot contain ':'"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Foo:Bar",
+            )
+        with pytest.raises(ValueError, match="cannot be empty"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="   ",
+            )
+        with pytest.raises(ValueError, match="control characters"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Bad\x01Name",
+            )
+        # Account unchanged after the rejected renames.
+        assert gc_book.get_account("Expenses:Groceries") is not None
+
     def test_update_account_description(self, test_book: Path):
         """Should update account description."""
         gc_book = GnuCashBook(str(test_book))

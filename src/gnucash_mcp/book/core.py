@@ -3779,6 +3779,35 @@ class CoreMixin:
         "STOCK",
     }
 
+    @staticmethod
+    def _validate_account_name(name: str) -> None:
+        """Validate a user-supplied account name (MP-14).
+
+        ``:`` is the path separator (``Expenses:Groceries``); a name
+        containing it corrupts every downstream ``fullname.split(":")``
+        traversal. Control characters (\\x00-\\x1f, \\x7f) round-trip
+        badly through SQLite text storage and the audit log's text
+        rendering. Empty / whitespace-only names aren't user-meaningful
+        even if piecash would accept them. Shared chokepoint for
+        create_account and update_account's rename branch so both entry
+        points enforce the same rule. Raises ``ValueError`` on any
+        violation.
+        """
+        if not name or not name.strip():
+            raise ValueError("Account name cannot be empty")
+        if ":" in name:
+            raise ValueError(
+                f"Account name cannot contain ':' (path separator). "
+                f"Got: {name!r}. To create a nested account, pass the "
+                f"leaf name as ``name`` and the full parent path as "
+                f"``parent``."
+            )
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
+            raise ValueError(
+                f"Account name contains control characters. "
+                f"Got: {name!r}."
+            )
+
     def create_account(
         self,
         name: str,
@@ -3818,28 +3847,9 @@ class CoreMixin:
                 f"Valid types: {', '.join(sorted(self.VALID_ACCOUNT_TYPES))}"
             )
 
-        # MP-14: validate account name up front. ``:`` is the path
-        # separator (``Expenses:Groceries``); a name containing it
-        # corrupts every downstream lookup that does a
-        # ``fullname.split(":")`` traversal. Control characters
-        # (\x00-\x1f, \x7f) round-trip badly through SQLite text
-        # storage and the audit log's text rendering. Empty /
-        # whitespace-only names are not user-meaningful even if
-        # piecash would accept them.
-        if not name or not name.strip():
-            raise ValueError("Account name cannot be empty")
-        if ":" in name:
-            raise ValueError(
-                f"Account name cannot contain ':' (path separator). "
-                f"Got: {name!r}. To create a nested account, pass the "
-                f"leaf name as ``name`` and the full parent path as "
-                f"``parent``."
-            )
-        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in name):
-            raise ValueError(
-                f"Account name contains control characters. "
-                f"Got: {name!r}."
-            )
+        # MP-14: validate the account name (shared chokepoint with
+        # update_account's rename branch).
+        self._validate_account_name(name)
 
         with self.open(readonly=False) as book:
             # Determine parent account
@@ -3963,6 +3973,11 @@ class CoreMixin:
 
             # Check for name conflict if renaming
             if new_name and new_name != account.name:
+                # MP-14: same name validation as create_account — the
+                # rename path was an unguarded parallel entry point
+                # (':' / control chars / empty would corrupt fullname
+                # parsing downstream).
+                self._validate_account_name(new_name)
                 if account.parent:
                     for sibling in account.parent.children:
                         if sibling.name == new_name and sibling.guid != account.guid:
@@ -4252,29 +4267,31 @@ class CoreMixin:
 
         if expected_splits is not None:
             actual_splits = list(transaction.splits)
-            actual_by_acct = {}
-            for s in actual_splits:
-                actual_by_acct[s.account.fullname] = (
-                    Decimal(str(s.value)),
-                    Decimal(str(s.quantity)),
-                    s.memo or "",
-                )
             if len(actual_splits) != len(expected_splits):
                 raise RuntimeError(
                     f"Transaction write verification failed: "
                     f"{len(actual_splits)} splits on disk, "
                     f"expected {len(expected_splits)}"
                 )
+            # Multiset of actual splits per account. Keying by fullname
+            # alone collapsed two splits to the SAME account (legal via
+            # replace_splits) — the second overwrote the first, leaving
+            # its value unverified. A per-account list, consuming one
+            # entry per matched expected split, verifies every split.
+            actual_by_acct: dict[str, list] = {}
+            for s in actual_splits:
+                actual_by_acct.setdefault(
+                    s.account.fullname, []
+                ).append(
+                    (Decimal(str(s.value)), Decimal(str(s.quantity)))
+                )
             for expected in expected_splits:
                 # Normalize the input account ref to canonical
                 # fullname before lookup. The book methods accept
                 # full path, ``%short`` GUID, or full 32-char GUID;
                 # post-save splits are keyed by ``Account.fullname``.
-                # Pre-fix this comparison was string-vs-string against
-                # the raw input, so a shortcut input like ``%77b59dd``
-                # raised a false "split not found post-save" RuntimeError
-                # even though the write had landed correctly.
-                # (Bookkeeper finding from PR #75 review.)
+                # (Bookkeeper finding from PR #75 review: a shortcut
+                # ref like ``%77b59dd`` must resolve before comparison.)
                 ref = expected["account"]
                 resolved = self._resolve_account(book, ref)
                 if resolved is None:
@@ -4286,30 +4303,44 @@ class CoreMixin:
                         f"save and verify)"
                     )
                 acct_fullname = resolved.fullname
-                if acct_fullname not in actual_by_acct:
+                bucket = actual_by_acct.get(acct_fullname)
+                if not bucket:
                     raise RuntimeError(
                         f"Transaction write verification failed: "
                         f"split for {acct_fullname!r} (input "
                         f"ref {ref!r}) not found post-save"
                     )
-                actual_value, actual_qty, actual_memo = (
-                    actual_by_acct[acct_fullname]
-                )
                 ev = _to_decimal(expected["amount"])
-                if actual_value != ev:
-                    raise RuntimeError(
-                        f"Transaction write verification failed: "
-                        f"split {acct_fullname!r} value on disk is "
-                        f"{actual_value}, expected {ev}"
-                    )
-                if "quantity" in expected:
-                    eq = _to_decimal(expected["quantity"])
-                    if actual_qty != eq:
+                eq = (
+                    _to_decimal(expected["quantity"])
+                    if "quantity" in expected else None
+                )
+                # Consume the first split matching value (and quantity,
+                # when the caller specified it).
+                match_idx = next(
+                    (
+                        i for i, (av, aq) in enumerate(bucket)
+                        if av == ev and (eq is None or aq == eq)
+                    ),
+                    None,
+                )
+                if match_idx is None:
+                    # No match — surface a precise diff against the
+                    # first remaining entry (the only one in the common
+                    # single-split-per-account case).
+                    av, aq = bucket[0]
+                    if av != ev:
                         raise RuntimeError(
                             f"Transaction write verification failed: "
-                            f"split {acct_fullname!r} quantity on "
-                            f"disk is {actual_qty}, expected {eq}"
+                            f"split {acct_fullname!r} value on disk is "
+                            f"{av}, expected {ev}"
                         )
+                    raise RuntimeError(
+                        f"Transaction write verification failed: "
+                        f"split {acct_fullname!r} quantity on "
+                        f"disk is {aq}, expected {eq}"
+                    )
+                bucket.pop(match_idx)
 
     def update_transaction(
         self,
