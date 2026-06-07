@@ -363,6 +363,13 @@ books and the bookkeeper's real-book pass.
 - **Consistent future-price convention.** The rate chain pass
   applies the same "include future-dated forecasts at now-anchors"
   rule as the direct pass.
+- **`income_by_source` / `spending_by_category` net contra splits.**
+  Both reports dropped within-account negative splits per split (a
+  realized capital loss, an expense refund), reporting *gross*
+  instead of *net* — a Capital Gains source showed gains-only, a
+  refunded category overstated spend. They now net signed amounts per
+  account before presenting. (Account balances were always correct;
+  only these two reports misstated.)
 
 **Data safety.** Backup retention works again under
 `GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
@@ -387,7 +394,7 @@ just the current year.
 Under the hood: cross-currency conversion consolidated into one path
 across invoice post/pay, and the deferred review items cleared.
 
-**Tests:** 1,537 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,539 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
@@ -397,10 +404,11 @@ currency, and A/R-bearing books, the synthetic Unrealized
 Gain/Loss line's presence/absence semantics, and the correctness
 sweep — cross-tool agreement on foreign-currency liabilities,
 vendor-report exclusion of unconvertible bills, backup pruning
-under path redaction, account-name rename validation, and
-same-account split write-verification. The two synthetic test
-personas (Alex, Lin Wei) and the bookkeeper's real-book
-validation remain the verification harness.
+under path redaction, account-name rename validation,
+same-account split write-verification, and report contra-split
+netting (capital-loss in income, refund in expenses). The two
+synthetic test personas (Alex, Lin Wei) and the bookkeeper's
+real-book validation remain the verification harness.
 
 ---
 
