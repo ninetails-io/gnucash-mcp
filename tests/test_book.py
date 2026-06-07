@@ -7917,6 +7917,51 @@ class TestSpendingByCategory:
         assert result["total"] == "0"
         assert result["categories"] == []
 
+    def test_spending_by_category_nets_refunds(self, tmp_path: Path):
+        """Regression: a refund (negative split) nets against spending
+        within its category instead of being dropped. Pre-fix the
+        per-split ``amount <= 0: continue`` discarded the refund, so the
+        category reported GROSS spend (overstated)."""
+        import piecash
+        bp = tmp_path / "refund.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        shopping = piecash.Account(name="Shopping", type="EXPENSE",
+                                   parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=opening, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Buy", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=shopping, value=Decimal("500")),
+                    piecash.Split(account=checking, value=Decimal("-500"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Return", post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=shopping, value=Decimal("-200")),
+                    piecash.Split(account=checking, value=Decimal("200"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("300")  # 500 - 200, net
+        assert len(result["categories"]) == 1
+        assert Decimal(result["categories"][0]["amount"]) == Decimal("300")
+
 
 class TestIncomeBySource:
     """Tests for income_by_source method."""
@@ -7934,6 +7979,43 @@ class TestIncomeBySource:
         assert "total" in result
         assert "sources" in result
         assert Decimal(result["total"]) > 0
+
+    def test_income_by_source_nets_losses(self, tmp_path: Path):
+        """Regression: a realized loss (negative contribution) in an
+        income account nets against gains in that source instead of
+        being dropped. Pre-fix the per-split ``amount <= 0: continue``
+        discarded the loss, so the source reported GROSS gains."""
+        import piecash
+        bp = tmp_path / "loss.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        inc = piecash.Account(name="Income", type="INCOME", parent=root,
+                              commodity=usd, placeholder=True)
+        capgains = piecash.Account(name="Capital Gains", type="INCOME",
+                                   parent=inc, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Gain", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=capgains, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Loss", post_date=date(2025, 4, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("-300")),
+                    piecash.Split(account=capgains, value=Decimal("300"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).income_by_source(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("700")  # 1000 - 300, net
+        assert len(result["sources"]) == 1
+        assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
 
 
 class TestBalanceSheet:

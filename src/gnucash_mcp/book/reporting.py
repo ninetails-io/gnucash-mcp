@@ -288,12 +288,16 @@ class ReportingMixin:
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Expense splits are positive when money is spent.
+                # Expense splits are positive when money is spent; a
+                # refund / return / intra-type reclassification posts a
+                # NEGATIVE amount to the expense account. Accumulate the
+                # signed amount so contra entries net against spending
+                # within a category. Dropping non-positive splits here
+                # would report GROSS spend, overstating any category that
+                # had a refund.
                 amount = self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
-                if amount <= 0:
-                    continue
                 group_account = self._get_account_at_depth(
                     account, depth - 1
                 )
@@ -302,6 +306,10 @@ class ReportingMixin:
                     account_name, Decimal("0")
                 ) + amount
 
+            # Drop decision is made AFTER aggregation, not per split: a
+            # category whose net spend is <= 0 (net-refunded for the
+            # period) isn't a spend line.
+            totals = {n: a for n, a in totals.items() if a > 0}
             total = sum(totals.values()) if totals else Decimal("0")
             categories = []
             for account_name, amount in sorted(
@@ -361,12 +369,17 @@ class ReportingMixin:
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
                 # Income splits are stored negative (money coming in);
-                # flip to positive for the "how much did I earn" view.
+                # flip to positive for the "how much did I earn" view. A
+                # NEGATIVE contribution inside an income account — a
+                # realized capital loss in Capital Gains, an income
+                # reversal/clawback — flips to a negative amount.
+                # Accumulate the signed amount so losses net against
+                # gains within a source. Dropping them per split would
+                # report GROSS income, overstating the source (a
+                # gains-minus-loss account would show only the gains).
                 amount = -self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
-                if amount <= 0:
-                    continue
                 group_account = self._get_account_at_depth(
                     account, depth - 1
                 )
@@ -375,6 +388,10 @@ class ReportingMixin:
                     account_name, Decimal("0")
                 ) + amount
 
+            # Drop decision is made AFTER aggregation, not per split: a
+            # source whose net is <= 0 (net loss for the period) isn't an
+            # income line.
+            totals = {n: a for n, a in totals.items() if a > 0}
             total = sum(totals.values()) if totals else Decimal("0")
             sources = []
             for account_name, amount in sorted(
