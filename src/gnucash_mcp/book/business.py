@@ -232,6 +232,15 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
                 f"posted:{posted}{action_str}"
             )
             continue
+        # Overpaid doc: the counterparty holds a credit, so the
+        # aging-clock columns would invite double-collection.
+        # Surface the direction explicitly instead (C2).
+        if r.get("overpaid"):
+            lines.append(
+                f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
+                f"posted:{posted}  OVERPAID — credit balance"
+            )
+            continue
         due = r.get("due_date") or "?"
         days = r.get("days_past_due")
         if days is None:
@@ -6075,6 +6084,34 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
 
+            # ── Overpayment guard (adversarial pass 2, C2) ────────
+            # The lot balance is signed: positive for A/R invoices,
+            # negative for A/P bills, flipped for credit notes.
+            # Normalize to "amount still owed" via effective_is_bill
+            # and reject any payment beyond it. Pre-fix nothing
+            # compared amount to remaining: an overpayment drove the
+            # lot negative, lot-close (== 0 exactly) never fired, and
+            # downstream abs() calls inverted the sign — a customer
+            # who overpaid by $1,000 rendered as still OWING $1,000
+            # in the collections list.
+            remaining_before_pay = self._calculate_lot_balance(lot_obj)
+            if effective_is_bill:
+                remaining_before_pay = -remaining_before_pay
+            if payment_amount > remaining_before_pay:
+                doc_label = self._doc_label_for(inv.owner_type)
+                raise ValueError(
+                    f"Payment of {payment_amount} "
+                    f"{inv.currency.mnemonic} exceeds the "
+                    f"outstanding balance of {remaining_before_pay} "
+                    f"{inv.currency.mnemonic} on {doc_label} "
+                    f"{invoice_id}. Pay at most the outstanding "
+                    f"balance. To record a genuine overpayment, pay "
+                    f"the outstanding balance and book the excess as "
+                    f"a credit note (create_credit_note) so it shows "
+                    f"as credit owed to the counterparty rather than "
+                    f"a phantom receivable."
+                )
+
             # ── Early-payment discount validation ────────────────
             # Five rejection cases, each with a distinct error so
             # the caller can see exactly which precondition failed.
@@ -6314,6 +6351,15 @@ class BusinessMixin:
 
             book.save()
 
+            # Direction-normalized remaining: positive = still owed.
+            # Never abs() a lot balance — with the overpayment guard
+            # above this is always >= 0 via pay_invoice, but if some
+            # other path left the lot negative, a credit must surface
+            # as negative rather than masquerade as money owed (C2).
+            remaining_directional = (
+                -remaining if effective_is_bill else remaining
+            )
+
             result = {
                 "id": inv.id,
                 "type": (
@@ -6325,7 +6371,7 @@ class BusinessMixin:
                 ),
                 "status": "paid",
                 "amount_paid": str(payment_amount),
-                "remaining_balance": str(abs(remaining)),
+                "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
                 # consumers (e.g. get_transaction lookup) accept
                 # 8+ char prefixes via _resolve_guid.
@@ -6343,9 +6389,16 @@ class BusinessMixin:
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
                 if fx_result is not None:
                     fx_diff_default = fx_result["fx_diff_default"]
+                    # effective_is_bill, not is_bill: a cross-currency
+                    # credit-note refund pays out like a bill, so the
+                    # label must follow the same direction the ledger
+                    # split was booked with (_compute_fx_gain_loss is
+                    # called with effective_is_bill above). Pre-fix a
+                    # booked FX loss on a customer credit-note refund
+                    # was labeled "gain" (adversarial pass 2, A4).
                     direction = (
-                        "loss" if (is_bill and fx_diff_default > 0)
-                        or (not is_bill and fx_diff_default < 0)
+                        "loss" if (effective_is_bill and fx_diff_default > 0)
+                        or (not effective_is_bill and fx_diff_default < 0)
                         else "gain"
                     )
                     result["fx_realized"] = {
@@ -7572,7 +7625,20 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
+                # Single Job query via _resolve_owner_type_and_job
+                # — Copilot PR #88 review caught the original
+                # ``_effective_owner_type`` + ``_find_job_by_guid``
+                # side-by-side as redundant. Resolved up front
+                # because the lot-balance direction below needs the
+                # effective side too.
+                is_credit_note = self._get_is_credit_note(inv)
+                effective_ot, job_for_inv = (
+                    self._resolve_owner_type_and_job(book, inv)
+                )
+                job_id_field = (
+                    job_for_inv.id if job_for_inv else None
+                )
+                is_bill = self._is_bill_side(effective_ot)
 
                 post_acc_guid = inv.post_acc_guid
                 post_acct = book.session.query(
@@ -7593,14 +7659,29 @@ class BusinessMixin:
                 if balance == Decimal(0):
                     continue
 
+                # Direction-normalize the signed lot balance to
+                # "amount still owed" (or, for a credit note, credit
+                # still available): A/R invoice lots run positive,
+                # A/P bill lots negative, credit notes flipped.
+                # NEGATIVE here means overpaid — the counterparty
+                # holds a credit. Pre-fix this was abs()'d, so an
+                # overpaid invoice rendered as money still OWED in a
+                # collections list, inviting double-collection
+                # (adversarial pass 2, C2).
+                amount_due = -balance if (is_bill ^ is_credit_note) else balance
+                overpaid = amount_due < 0 and not is_credit_note
+
                 try:
                     grand_total = self._get_invoice_entries_and_total(
                         book, inv,
                     )["grand_total"]
                 except ValueError:
-                    grand_total = abs(balance)
+                    grand_total = max(amount_due, Decimal("0"))
 
-                amount_paid = grand_total - abs(balance)
+                # Signed arithmetic keeps amount_paid honest in the
+                # overpaid case: grand 3500, due −1000 → paid 4500
+                # (the pre-fix abs() derivation showed paid 2500).
+                amount_paid = grand_total - amount_due
 
                 # Owner lookup via the polymorphic dispatcher —
                 # routes customer/vendor/employee/job (chasing
@@ -7609,10 +7690,7 @@ class BusinessMixin:
                 # customer/vendor finders keyed off ``is_bill``,
                 # which returned None for job-attached invoices
                 # because inv.owner_guid points at a Job, not a
-                # customer/vendor row. Bookkeeper didn't probe
-                # this path; Copilot caught the related redundant-
-                # query pattern below and the bug surfaced
-                # during the refactor.
+                # customer/vendor row.
                 owner = self._find_invoice_owner_by_guid(
                     book, inv.owner_type, inv.owner_guid,
                 )
@@ -7621,42 +7699,31 @@ class BusinessMixin:
                 posted_dt = _safe_invoice_date(inv, "date_posted")
                 # Resolve the due date through the same three-step
                 # chain the warnings collector uses, so the bookkeeper
-                # sees identical numbers in both places.
+                # sees identical numbers in both places. No aging
+                # clock on credit notes (money the business OWES has
+                # no past-due concept) or overpaid docs (nothing left
+                # to collect) — pre-fix an unapplied credit note
+                # carried ``days_past_due: 238`` in a collections
+                # list (C2).
                 due_date, no_terms = self._resolve_invoice_due_date(
                     book, inv,
                 )
                 days_past_due = (
                     (today - due_date).days
                     if due_date is not None
+                    and not is_credit_note
+                    and not overpaid
                     else None
                 )
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
                 # Credit-note row: type stays as the owner-type
-                # tag ('invoice' / 'bill'), but we add a flag so
-                # the compact formatter can distinguish. The
+                # tag ('invoice' / 'bill'), but the is_credit_note
+                # flag lets the compact formatter distinguish. The
                 # amount-due is the unsettled credit balance —
                 # what's still available to apply or refund.
-                # For job-attached docs (owner_type=3), the
-                # semantic type comes from the effective
-                # owner_type (chases through the Job to the
-                # underlying customer/vendor); we also surface
-                # a job_id so the formatter can annotate the
-                # row.
-                #
-                # Single Job query via _resolve_owner_type_and_job
-                # — Copilot PR #88 review caught the original
-                # ``_effective_owner_type`` + ``_find_job_by_guid``
-                # side-by-side as redundant.
-                is_credit_note = self._get_is_credit_note(inv)
-                effective_ot, job_for_inv = (
-                    self._resolve_owner_type_and_job(book, inv)
-                )
-                job_id_field = (
-                    job_for_inv.id if job_for_inv else None
-                )
-                results.append({
+                row = {
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
                         effective_ot, "invoice"
@@ -7674,9 +7741,12 @@ class BusinessMixin:
                     "no_terms": no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
-                    "amount_due": str(abs(balance)),
+                    "amount_due": str(amount_due),
                     "job_id": job_id_field,
-                })
+                }
+                if overpaid:
+                    row["overpaid"] = True
+                results.append(row)
 
             # Sort: most overdue first (largest days_past_due), so the
             # bookkeeper sees the urgent receivables / bills at the top.
@@ -7743,6 +7813,10 @@ class BusinessMixin:
             owner_type = (
                 "customer" if job.owner_type == 2 else "vendor"
             )
+            # Lot-balance direction for every invoice linked to this
+            # job follows the job's side: A/R lots run positive, A/P
+            # lots negative (credit notes flip per-invoice below).
+            job_is_bill = self._is_bill_side(job.owner_type)
 
             # Linked invoices: polymorphic owner pointer where
             # owner_type=3 and owner_guid=job.guid. Indexed query.
@@ -7771,10 +7845,13 @@ class BusinessMixin:
 
                 if _is_invoice_posted(inv):
                     posted_count += 1
-                    # Posted: paid = billed - outstanding (from
-                    # the lot balance). The lot balance is the
-                    # unsettled amount, so abs(balance) =
-                    # outstanding.
+                    # Posted: paid = billed - outstanding (from the
+                    # lot balance). Direction-normalized, NOT abs()'d:
+                    # an overpaid invoice carries a NEGATIVE
+                    # outstanding (credit held by the counterparty),
+                    # which keeps ``paid`` honest instead of
+                    # understating it by twice the credit
+                    # (adversarial pass 2, C2).
                     post_acct_guid = inv.post_acc_guid
                     post_acct = book.session.query(
                         piecash.Account
@@ -7786,8 +7863,14 @@ class BusinessMixin:
                                 lot_obj = lot
                                 break
                     if lot_obj:
-                        outstanding = abs(
-                            self._calculate_lot_balance(lot_obj)
+                        lot_balance = self._calculate_lot_balance(
+                            lot_obj
+                        )
+                        flip = job_is_bill ^ self._get_is_credit_note(
+                            inv
+                        )
+                        outstanding = (
+                            -lot_balance if flip else lot_balance
                         )
                         paid = billed - outstanding
                     else:
