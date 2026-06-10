@@ -476,14 +476,18 @@ class CoreMixin:
         the trajectory's "now", but this helper preserves the
         semantics so the user's reference number stays the same.
 
-        Algorithm mirrors the per-leaf breakdown elsewhere in
+        Algorithm mirrors the per-account breakdown elsewhere in
         ``get_book_summary``:
 
-        - **Leaf-only iteration.** Parents with children are skipped
-          (their balances are already represented by their children).
-          Matches the per-leaf display structure of the assets and
-          liabilities sections.
-        - **Skips:** ROOT, template-subtree accounts, placeholders.
+        - **Own-splits-per-account.** Every account contributes the
+          sum of its *own* splits. There is no roll-up in this code,
+          so a parent's (or placeholder's) direct splits are real
+          money not represented by any other row — skipping them
+          drops it. Parents and placeholders without direct splits
+          contribute zero and fall out via the ``balance == 0``
+          check. Shared rule with ``balance_sheet`` and ``net_worth``
+          in ``book/reporting.py`` (adversarial pass 2, C1).
+        - **Skips:** ROOT and template-subtree accounts only.
         - **Asset accounts** (ASSET / BANK / CASH / STOCK / MUTUAL):
           balance × most-recent-rate-on-or-before-``as_of``. If the
           commodity has no price by ``as_of``, fall back to cost
@@ -519,13 +523,6 @@ class CoreMixin:
         # for historical reconstruction.
         rates = self._rates_as_of(book, as_of, default_currency)
 
-        # is_leaf: an account with no children. Compute the parent
-        # set once and check membership per account.
-        parent_guids: set[str] = set()
-        for a in accounts:
-            if a.parent and a.parent.type != "ROOT":
-                parent_guids.add(a.parent.guid)
-
         assets_total = Decimal("0")
         liabilities_total = Decimal("0")
 
@@ -533,10 +530,6 @@ class CoreMixin:
             if account.type == "ROOT":
                 continue
             if account.guid in template_guids:
-                continue
-            if account.placeholder:
-                continue
-            if account.guid in parent_guids:
                 continue
 
             if account.type not in self._NW_ASSET_TYPES \
@@ -1923,7 +1916,6 @@ class CoreMixin:
         self,
         accounts: list,
         template_guids: set[str],
-        parent_guids: set[str],
         latest_prices: dict,
         default_currency,
         today: date,
@@ -1951,11 +1943,14 @@ class CoreMixin:
             data.total_accounts += 1
 
             has_activity = len(account.splits) > 0
-            is_leaf = account.guid not in parent_guids
 
-            # Balance in the account's own commodity, today-filtered
-            # (future-dated transactions excluded so the snapshot
-            # agrees with trajectory's "now" anchor).
+            # Balance of the account's OWN splits in its own
+            # commodity, today-filtered (future-dated transactions
+            # excluded so the snapshot agrees with trajectory's "now"
+            # anchor). Parents and placeholders are included: there is
+            # no roll-up here, so direct splits on them are real money
+            # no other row represents (C1). Accounts with no direct
+            # splits fall out via the ``balance != 0`` checks below.
             balance = Decimal("0")
             for split in account.splits:
                 if split.transaction.post_date <= today:
@@ -1964,7 +1959,7 @@ class CoreMixin:
             leaf = account.fullname.split(":")[-1]
 
             if account.type in asset_types:
-                if is_leaf and balance != 0:
+                if balance != 0:
                     usd_value, note = self._market_value(
                         account, balance,
                         rates=latest_prices,
@@ -1974,7 +1969,7 @@ class CoreMixin:
                     )
                     data.asset_leaves.append((leaf, usd_value, note))
             elif account.type == "CREDIT":
-                if is_leaf and balance != 0:
+                if balance != 0:
                     # FX chokepoint: convert via the same rate map as
                     # assets/AR/AP, then negate the credit-natural
                     # balance to a positive magnitude. Pre-fix this
@@ -1988,7 +1983,7 @@ class CoreMixin:
                     )
                     data.credit_cards.append((leaf, -usd_value))
             elif account.type == "LIABILITY":
-                if is_leaf and balance != 0:
+                if balance != 0:
                     usd_value, _ = self._market_value(
                         account, balance,
                         rates=latest_prices,
@@ -2003,7 +1998,7 @@ class CoreMixin:
                             (leaf, pos_value)
                         )
             elif account.type == "RECEIVABLE":
-                if is_leaf and balance != 0:
+                if balance != 0:
                     # A/R is debit-natural: positive balance = owed to us.
                     usd_value, _ = self._market_value(
                         account, balance,
@@ -2013,7 +2008,7 @@ class CoreMixin:
                     )
                     data.receivable_accts.append((leaf, usd_value))
             elif account.type == "PAYABLE":
-                if is_leaf and balance != 0:
+                if balance != 0:
                     # A/P is credit-natural: negate for "what we owe".
                     usd_value, _ = self._market_value(
                         account, -balance,
@@ -2420,13 +2415,6 @@ class CoreMixin:
             # list collapses each pass.
             accounts = list(book.accounts)
 
-            # Parent GUIDs (placeholder containers) — the collector
-            # needs this to identify leaf accounts.
-            parent_guids: set[str] = set()
-            for account in accounts:
-                if account.parent and account.parent.type != "ROOT":
-                    parent_guids.add(account.parent.guid)
-
             # ``_rates_as_of(book, today)`` — future TRANSACTIONS
             # are excluded but future PRICES are included.
             # ``_anchor_for_as_of`` folds ``today`` to ``date.max``
@@ -2441,7 +2429,6 @@ class CoreMixin:
             data = self._collect_summary_balance_sheet(
                 accounts=accounts,
                 template_guids=template_guids,
-                parent_guids=parent_guids,
                 latest_prices=latest_prices,
                 default_currency=default_currency,
                 today=today,

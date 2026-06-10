@@ -529,22 +529,27 @@ class TestDailyExpenseBurnBookAgeClamp:
 
 
 class TestBalanceSheetSkipsPlaceholders:
-    """SB-8: ``balance_sheet`` must skip placeholder accounts so it
-    agrees with ``_compute_net_worth_at`` (which already filters
-    them at ``core.py:443``).
+    """SB-8, SUPERSEDED by adversarial pass 2's C1: the original
+    SB-8 skip guarded a double-count ``balance_sheet`` never
+    actually produces — there is no roll-up in that report, so a
+    placeholder's direct splits appear on no other row and
+    skipping them deleted real money (the balancing-residual
+    equity line silently re-balanced the sheet around the hole).
 
-    Pre-fix a placeholder with direct splits — rare but legal —
-    would be double-counted: once on the placeholder row, once
-    implicitly through its children's rows.
+    The corrected invariant — shared with ``net_worth`` and
+    ``_compute_net_worth_at`` — is own-splits-per-account: every
+    account contributes exactly its own splits, placeholders
+    included. No row is double-counted because children's rows
+    never include the parent's direct splits in the first place.
     """
 
-    def test_placeholder_with_direct_splits_not_double_counted(
+    def test_placeholder_with_direct_splits_counted_once(
         self, tmp_path,
     ):
-        """Construct a book where a placeholder ``Assets:Cash`` has
-        a direct split AND a child ``Assets:Cash:Wallet`` with its
-        own split. ``balance_sheet`` should only count the
-        non-placeholder leaf — pre-fix it counted both."""
+        """Placeholder ``Assets:Cash`` has a $100 direct split AND a
+        child ``Assets:Cash:Wallet`` with its own $50 split. Both
+        rows appear, each with exactly its own money: total $150.
+        (The retired SB-8 behavior dropped Cash entirely → $50.)"""
         book_path = tmp_path / "placeholder_book.gnucash"
         book = piecash.create_book(
             str(book_path), currency="USD", overwrite=True,
@@ -609,20 +614,25 @@ class TestBalanceSheetSkipsPlaceholders:
 
         gb = GnuCashBook(str(book_path))
         bs = gb.balance_sheet(date(2026, 12, 31))
-        # Only Wallet (the leaf) should appear in assets, not Cash
-        # (placeholder). Pre-fix Cash would have shown $100.
-        leaf_names = {a["account"] for a in bs["assets"]["accounts"]}
-        assert "Assets:Cash:Wallet" in leaf_names, (
-            f"leaf account missing: {leaf_names}"
+        # Both rows appear — each account contributes exactly its
+        # own splits. (Pre-C1 the placeholder skip dropped Cash's
+        # $100 and the unrealized residual hid the hole.)
+        rows = {
+            a["account"]: Decimal(a["balance"])
+            for a in bs["assets"]["accounts"]
+        }
+        assert rows.get("Assets:Cash:Wallet") == Decimal("50.00"), (
+            f"leaf account wrong/missing: {rows}"
         )
-        assert "Assets:Cash" not in leaf_names, (
-            f"placeholder included in balance sheet: {leaf_names}"
+        assert rows.get("Assets:Cash") == Decimal("100.00"), (
+            f"placeholder's own splits dropped: {rows}"
         )
-        # Assets total = $50 (leaf only).
-        assert Decimal(bs["assets"]["total"]) == Decimal("50.00"), (
-            f"placeholder double-counted in totals: "
-            f"{bs['assets']['total']}"
+        assert Decimal(bs["assets"]["total"]) == Decimal("150.00"), (
+            f"assets total wrong: {bs['assets']['total']}"
         )
+        # And the sheet still balances without a phantom residual:
+        # equity total equals assets (no liabilities in this book).
+        assert Decimal(bs["equity"]["total"]) == Decimal("150.00")
 
 
 # ── HP-6: _collect_warnings placeholder price filter ───────────────

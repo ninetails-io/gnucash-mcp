@@ -479,15 +479,15 @@ class ReportingMixin:
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
-                # Skip placeholder accounts so the balance sheet
-                # matches ``_compute_net_worth_at``'s convention
-                # (which already filters ``account.placeholder``
-                # before its balance loop). Pre-fix a placeholder
-                # with direct splits — rare but legal — was double-
-                # counted: once on the placeholder line, once on the
-                # implicit roll-up through its children. SB-8.
-                if account.placeholder:
-                    continue
+                # Placeholder accounts are NOT skipped: there is no
+                # roll-up in this report, so direct splits on a
+                # placeholder — rare but legal — are real money no
+                # other row represents. The SB-8 skip guarded a
+                # double-count this code never produces; with the
+                # balancing-residual equity line it silently deleted
+                # the dropped asset instead (adversarial pass 2, C1).
+                # Same own-splits-per-account rule as ``net_worth``
+                # and ``_compute_net_worth_at``.
                 # Value the split in the book's default currency so
                 # investment shares (VTSAX @ $128, etc.) and foreign-
                 # currency holdings contribute their market/USD value

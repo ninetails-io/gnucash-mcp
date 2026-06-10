@@ -8429,6 +8429,112 @@ class TestCrossToolPriceAgreement:
             f"liability; saw:\n{summary}"
         )
 
+    @staticmethod
+    def _checking_1000_book(tmp_path: Path) -> Path:
+        """USD book with a single 1000 USD Checking balance."""
+        import piecash
+
+        book_path = tmp_path / "own_splits.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=usd,
+        )
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=equity, value=Decimal("-1000")),
+            ],
+        ))
+        book.save()
+        return book_path
+
+    def _assert_all_surfaces_report_1000(self, gc_book) -> None:
+        """All three net-worth surfaces must count Checking's own
+        splits: balance_sheet, net_worth, and the dashboard's
+        trajectory "now" anchor (``_compute_net_worth_at``) plus its
+        per-account display (``_collect_summary_balance_sheet``)."""
+        from datetime import date as date_cls
+
+        today = date_cls.today()
+        bs = gc_book.balance_sheet(as_of_date=today)
+        assert Decimal(bs["assets"]["total"]) == Decimal("1000.00")
+        assert any(
+            a["account"] == "Assets:Checking"
+            for a in bs["assets"]["accounts"]
+        ), "Checking's own splits dropped from balance_sheet"
+
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("1000.00")
+
+        summary = gc_book.get_book_summary()
+        assert "now: USD 1,000" in summary, (
+            f"trajectory 'now' dropped Checking's own splits; "
+            f"saw:\n{summary}"
+        )
+        assert "Checking: USD 1000.00" in summary, (
+            f"dashboard assets section dropped Checking; saw:\n{summary}"
+        )
+
+    def test_parent_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): an account's own splits
+        must count even after it gains a child. Pre-fix, creating one
+        EMPTY sub-account under Checking silently dropped Checking's
+        entire balance from the dashboard's net-worth anchor (leaf-only
+        iteration) while balance_sheet / net_worth kept it — three
+        surfaces, three scopes.
+        """
+        import piecash
+
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            piecash.Account(
+                name="Sub", type="BANK", parent=checking,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
+
+    def test_placeholder_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): a placeholder's direct
+        splits are real money — rare but legal. Pre-fix, marking
+        Checking a placeholder deleted its balance from balance_sheet
+        (where the unrealized residual silently re-balanced the sheet)
+        and from the dashboard anchor, while net_worth kept it.
+        """
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            checking.placeholder = 1
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
+
 
 class TestNonUsdDefaultCurrency:
     """Bookkeeper-flagged: every compact-mode formatter that emits
