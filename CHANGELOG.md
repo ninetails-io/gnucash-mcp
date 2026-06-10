@@ -371,6 +371,40 @@ books and the bookkeeper's real-book pass.
   account before presenting. (Account balances were always correct;
   only these two reports misstated.)
 
+**Final adversarial pass (pre-release).** A second adversarial
+review of the release candidate probed the shapes the synthetic
+books can't produce — parents and placeholders with direct splits,
+overpayments, contra splits against budgets — and held the release
+for four fixes:
+
+- **Net-worth surfaces agree on which splits count.** The dashboard
+  skipped parent and placeholder accounts' own splits;
+  `balance_sheet` skipped placeholders'; `net_worth` skipped
+  neither. None of the three rolls children up, so a parent's or
+  placeholder's *direct* splits are real money no other row
+  represents — and the balancing-residual equity line hid the
+  deletion from the sheet's own A = L + E check. All three now share
+  one rule: every account contributes exactly its own splits.
+- **`pay_invoice` rejects overpayments.** Nothing compared the
+  payment to the remaining balance: an overpayment drove the lot
+  negative and downstream `abs()` calls inverted the sign — a
+  customer who overpaid by $1,000 showed as still *owing* $1,000 in
+  the collections list. Overpaying now rejects with guidance to book
+  the excess as a credit note; `remaining_balance`, `amount_due`,
+  and job-report `outstanding` are direction-normalized (a negative
+  reads as credit held by the counterparty, rendered `OVERPAID` in
+  compact rows); credit notes no longer carry an aging clock in the
+  verbose outstanding list.
+- **Budget actuals net contra splits.** `get_budget_report` and the
+  dashboard budget headline still used the per-split gross filter
+  the contra-netting fix above retired for the income/spending
+  reports — the budget surfaces contradicted those reports on the
+  same data. Both now accumulate signed amounts.
+- **FX direction label on credit-note refunds.** A cross-currency
+  credit-note refund's booked FX loss was labeled `"gain"` in the
+  pay response (the ledger split was always correct); the label now
+  follows the same effective direction the split was booked with.
+
 **Data safety.** Backup retention works again under
 `GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
 basename that resolved against the working directory — a silent
@@ -394,7 +428,7 @@ just the current year.
 Under the hood: cross-currency conversion consolidated into one path
 across invoice post/pay, and the deferred review items cleared.
 
-**Tests:** 1,539 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,550 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
