@@ -1346,11 +1346,15 @@ class CoreMixin:
                 amt = self._split_in_default_currency(
                     s, s.account, factors.get(s.account.guid),
                 )
-                # EXPENSE: positive value = spend (count). INCOME:
-                # negative value = revenue (count as positive).
-                if atype == "EXPENSE" and amt > 0:
+                # Accumulate SIGNED amounts so contra splits (expense
+                # refunds, income clawbacks) net into the headline —
+                # the a34867c pattern, mirrored from get_budget_report
+                # (adversarial pass 2, C3). EXPENSE: positive = spend.
+                # INCOME: stored negative; flip so revenue counts
+                # positive toward the target.
+                if atype == "EXPENSE":
                     actuals += amt
-                elif atype == "INCOME" and amt < 0:
+                elif atype == "INCOME":
                     actuals += -amt
 
         # Period progression.

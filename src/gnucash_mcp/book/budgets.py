@@ -878,11 +878,20 @@ class BudgetsMixin:
                     split, account,
                     factors.get(account.guid),
                 )
-                if account.type == "EXPENSE" and amount > 0:
+                # Accumulate SIGNED amounts so contra splits (refunds
+                # on expense accounts, losses/clawbacks on income
+                # accounts) net against the rollup target — the same
+                # netting fix income_by_source / spending_by_category
+                # received in a34867c. The pre-fix per-split gross
+                # filter (`amount > 0` / `amount < 0`) made the budget
+                # report contradict those reports on identical data
+                # (adversarial pass 2, C3): spend 200 + refund 120
+                # showed actual 200 instead of net 80.
+                if account.type == "EXPENSE":
                     actuals[rollup_target] = actuals.get(
                         rollup_target, Decimal("0")
                     ) + amount
-                elif account.type == "INCOME" and amount < 0:
+                elif account.type == "INCOME":
                     actuals[rollup_target] = actuals.get(
                         rollup_target, Decimal("0")
                     ) + (-amount)
