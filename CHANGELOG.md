@@ -467,6 +467,23 @@ combination:
   ignores them; stale docstrings corrected and a dead helper
   removed.
 
+**Live-test signoff fixes.** The bookkeeper's post-pass validation
+run surfaced two more, both fixed before the release PR:
+
+- **Auto-fill no-match guard actually fires.** The description match
+  was bidirectional substring, so an empty-description transaction
+  matched *every* proposed description — a no-match auto-fill cloned
+  that unrelated transaction under the caller's description (a
+  phantom write) instead of raising "no match found". Blank
+  descriptions now carry no match signal on either side, which also
+  cleans the same false D-signal out of the stability, recent-match,
+  and duplicate buckets.
+- **Dashboard never ages credit notes.** The summary's warnings
+  listed an unapplied credit note as past due and counted it in the
+  overdue tally while `get_outstanding_invoices` correctly exempted
+  it. Credit notes stay in the open counts but carry no aging clock
+  anywhere.
+
 **Data safety.** Backup retention works again under
 `GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
 basename that resolved against the working directory — a silent
@@ -490,7 +507,7 @@ just the current year.
 Under the hood: cross-currency conversion consolidated into one path
 across invoice post/pay, and the deferred review items cleared.
 
-**Tests:** 1,580 passing (was 1,114 at v1.2.1). New regression
+**Tests:** 1,584 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
