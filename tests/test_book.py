@@ -5181,6 +5181,68 @@ class TestAutoFillTransaction:
                 description="Never Seen Before XYZ123",
             )
 
+    def _add_empty_description_txn(self, gc_book) -> None:
+        """Post a (legal) empty-description transaction dated most
+        recent, mimicking the A/P transaction that triggered the
+        live-test blocker."""
+        gc_book.create_transaction(
+            description="",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "1242.50"},
+                {"account": "Assets:Checking", "amount": "-1242.50"},
+            ],
+            trans_date=date(2024, 2, 20),
+            check_duplicates=False,
+        )
+
+    def test_no_match_guard_fires_despite_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Live-test blocker regression: an empty-description
+        transaction in the book desc-matched EVERY proposal ("" is a
+        substring of everything), so a no-match auto-fill cloned that
+        unrelated transaction under the caller's description instead
+        of raising. The guard must fire and nothing must be written."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(
+                description="Never Seen Before XYZ123",
+            )
+        # No phantom landed in the book.
+        phantom = gc_book.search_transactions(
+            query="Never Seen Before XYZ123", field="description",
+            compact=False,
+        )
+        assert phantom == []
+
+    def test_real_match_beats_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Positive control: matching still works with the empty-
+        description transaction present (and more recent) — the real
+        description match is the source, not the empty one."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
+
+    def test_empty_proposal_does_not_match_everything(
+        self, test_book: Path,
+    ):
+        """An empty PROPOSED description carries no match signal
+        either — pre-fix it substring-matched every transaction in
+        the book and auto-filled from the most recent one."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(description="")
+
     def test_auto_fill_with_dry_run(self, test_book: Path):
         """Should auto-fill and report the source in dry run mode.
 

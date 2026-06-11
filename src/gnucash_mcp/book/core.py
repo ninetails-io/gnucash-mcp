@@ -3083,10 +3083,21 @@ class CoreMixin:
             if txn.post_date is None:
                 continue
 
+            # Empty/whitespace descriptions carry no match signal:
+            # "" is a substring of everything, so an empty-description
+            # transaction would otherwise desc-match EVERY proposed
+            # description — and when nothing real matched, auto-fill
+            # would clone that unrelated transaction under the caller's
+            # description instead of raising "no match found"
+            # (bookkeeper live-test blocker, pass-2 signoff).
             txn_desc_lower = txn.description.lower()
             desc_match = (
-                desc_lower in txn_desc_lower
-                or txn_desc_lower in desc_lower
+                bool(desc_lower.strip())
+                and bool(txn_desc_lower.strip())
+                and (
+                    desc_lower in txn_desc_lower
+                    or txn_desc_lower in desc_lower
+                )
             )
 
             # --- Auto-fill: first description match wins ---
