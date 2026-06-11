@@ -536,10 +536,7 @@ class CoreMixin:
                     and account.type not in self._NW_LIABILITY_TYPES:
                 continue
 
-            balance = Decimal("0")
-            for split in account.splits:
-                if split.transaction.post_date <= as_of:
-                    balance += split.quantity
+            balance = self._own_splits_balance(account, as_of=as_of)
 
             if balance == 0:
                 continue
@@ -806,9 +803,7 @@ class CoreMixin:
             name = account.name
             if not (name.startswith("Imbalance-") or name.startswith("Orphan-")):
                 continue
-            balance = Decimal("0")
-            for split in account.splits:
-                balance += split.quantity
+            balance = self._own_splits_balance(account)
             if balance != 0:
                 acct_commodity = (
                     account.commodity if account.commodity
@@ -860,9 +855,7 @@ class CoreMixin:
                     if self._is_in_retirement_subtree(account):
                         continue
 
-                    balance_qty = Decimal("0")
-                    for split in account.splits:
-                        balance_qty += split.quantity
+                    balance_qty = self._own_splits_balance(account)
                     if balance_qty <= 0:
                         # Zero = unused, not low. Negative = overdraft,
                         # captured separately by runway's
@@ -1522,9 +1515,7 @@ class CoreMixin:
                 # clean enough for the standard naming convention.
                 continue
 
-            balance = Decimal("0")
-            for split in account.splits:
-                balance += split.quantity
+            balance = self._own_splits_balance(account)
             if balance == 0:
                 continue
 
@@ -1959,10 +1950,7 @@ class CoreMixin:
             # no roll-up here, so direct splits on them are real money
             # no other row represents (C1). Accounts with no direct
             # splits fall out via the ``balance != 0`` checks below.
-            balance = Decimal("0")
-            for split in account.splits:
-                if split.transaction.post_date <= today:
-                    balance += split.quantity
+            balance = self._own_splits_balance(account, as_of=today)
 
             leaf = account.fullname.split(":")[-1]
 
@@ -2692,12 +2680,7 @@ class CoreMixin:
             if not account:
                 raise ValueError(f"Account not found: {account_name}")
 
-            balance = Decimal("0")
-            for split in account.splits:
-                if split.transaction.post_date <= as_of_date:
-                    balance += split.quantity
-
-            return balance
+            return self._own_splits_balance(account, as_of=as_of_date)
 
     # Server-side ceiling for list_transactions / search_transactions
     # limits. Caller-supplied limits above this are clamped with a note.
@@ -3084,6 +3067,16 @@ class CoreMixin:
             # loans, etc.), training the user to ignore the
             # duplicate warning.
             if self._is_template_transaction(txn, template_guids):
+                continue
+
+            # Voided transactions are not signal sources (C8): the
+            # void-and-re-enter workflow this server recommends makes
+            # the voided txn the most recent description match, and
+            # auto-fill would clone its zeroed splits into a silent
+            # $0 transaction that passes validation. Duplicates /
+            # stability buckets skip them for the same reason — a
+            # voided entry is not evidence the event happened.
+            if any(_is_voided(s) for s in txn.splits):
                 continue
 
             txn_desc_lower = txn.description.lower()
@@ -4407,6 +4400,19 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
+            # Voided transactions are immutable (C8). Writing values
+            # into state='v' splits is the partial-void corruption
+            # generator: the amounts move balance sums while staying
+            # invisible to cash_flow / lots / reconciliation, and a
+            # later re-void overwrites the void-former-* slots with
+            # the new values, destroying the originals. No force
+            # override — the legitimate path is unvoid first.
+            if any(_is_voided(s) for s in transaction.splits):
+                raise ValueError(
+                    f"Transaction {guid} is voided. Use "
+                    f"unvoid_transaction first, then update."
+                )
+
             # Check for reconciled splits when modifying splits
             if splits is not None:
                 reconciled = [
@@ -4590,6 +4596,14 @@ class CoreMixin:
                         f"Cannot use placeholder account: {account_name}"
                     )
                 resolved_accounts.append((account, split_data))
+
+            # 4a. Voided transactions are immutable (C8) — same
+            # rationale as update_transaction; no force override.
+            if any(_is_voided(s) for s in transaction.splits):
+                raise ValueError(
+                    f"Transaction {guid} is voided. Use "
+                    f"unvoid_transaction first, then replace splits."
+                )
 
             # 4. Check reconciled splits
             reconciled = [

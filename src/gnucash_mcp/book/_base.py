@@ -1576,3 +1576,31 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return any(
             s.account.guid in template_guids for s in txn.splits
         )
+
+    @staticmethod
+    def _own_splits_balance(account, as_of: "date | None" = None):
+        """Balance of the account's OWN splits in its own commodity.
+
+        The one rule every own-splits sum shares (C8 read-side):
+
+        - voided splits are excluded by **state**, not value. A
+          well-formed void contributes 0 either way; the corrupted
+          partial-void shape (``state='v'`` with non-zero values,
+          producible by legacy data or desktop edits) must not move
+          balances when the same split is invisible to cash_flow /
+          lots / reconciliation counts.
+        - ``as_of`` (inclusive) caps to posted-by-then transactions;
+          ``None`` means no date bound — callers that intentionally
+          include future-dated transactions pass nothing.
+        """
+        balance = Decimal("0")
+        for split in account.splits:
+            if _is_voided(split):
+                continue
+            if (
+                as_of is not None
+                and split.transaction.post_date > as_of
+            ):
+                continue
+            balance += split.quantity
+        return balance

@@ -479,6 +479,12 @@ class ReportingMixin:
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
+                # Voided by state, not value: a well-formed void
+                # contributes 0 anyway; the corrupted partial-void
+                # shape (state='v', non-zero values) must not move
+                # the sheet when cash_flow / lots can't see it (C8).
+                if _is_voided(split):
+                    continue
                 # Placeholder accounts are NOT skipped: there is no
                 # roll-up in this report, so direct splits on a
                 # placeholder — rare but legal — are real money no
@@ -730,6 +736,10 @@ class ReportingMixin:
                 )
                 total = Decimal("0")
                 for split, _txn, account in rows:
+                    # Voided-by-state filter — same rule as
+                    # balance_sheet (C8 read-side).
+                    if _is_voided(split):
+                        continue
                     # Liabilities are stored negative, so adding the
                     # converted amount directly gives assets minus
                     # liabilities. Investments and foreign-currency
@@ -847,6 +857,11 @@ class ReportingMixin:
                         "net_worth": str(_snapshot_at(boundaries[b_idx])),
                     })
                     b_idx += 1
+                # Voided-by-state filter (C8 read-side) — placed
+                # after the boundary advance so a voided split still
+                # flushes due snapshots, just never accumulates.
+                if _is_voided(split):
+                    continue
                 # Accumulate per-account quantity AND value. Both are
                 # kept so ``_snapshot_at`` can pick the right view
                 # (rate-based vs cost-basis) at each boundary.

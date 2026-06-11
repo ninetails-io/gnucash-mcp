@@ -281,11 +281,13 @@ class TestNativeSxTemplateLeak:
 
 
 class TestVoidedThenTouched:
-    """C8 (adversarial pass 2), unfixed: the ``_is_voided``
-    chokepoint protects read paths, but several write paths never
-    consult it — they can push non-zero values into ``state='v'``
-    splits, producing the "partial-void corruption" state the
-    predicate's own docstring names.
+    """C8 (adversarial pass 2): voided splits are protected at every
+    boundary. Write paths (``update_transaction``, ``replace_splits``,
+    ``reconcile_account``, auto-fill) refuse or skip them; balance
+    surfaces exclude them by **state** so the partial-void corruption
+    shape (``state='v'`` with non-zero values — legacy data or
+    desktop edits) cannot move money that cash_flow / lots /
+    reconciliation counts can't see.
 
     Builds the corruption in an isolated book (NOT the shared
     pathological book — a corrupted split would poison every
@@ -323,11 +325,6 @@ class TestVoidedThenTouched:
                     split.quantity = Decimal("100.00")
             book.save()
 
-    @pytest.mark.xfail(
-        reason="C8 unfixed: balance surfaces sum voided splits by "
-               "value instead of routing through _is_voided",
-        strict=True,
-    )
     def test_corrupted_void_invisible_to_balance_surfaces(
         self, test_book: Path,
     ):
@@ -358,11 +355,6 @@ class TestVoidedThenTouched:
             gc.net_worth(end_date=date.today())["net_worth"]
         ) == before_nw
 
-    @pytest.mark.xfail(
-        reason="C8 unfixed: update_transaction guards only "
-               "reconciled splits, not voided ones",
-        strict=True,
-    )
     def test_update_transaction_refuses_voided_target(
         self, test_book: Path,
     ):
@@ -380,11 +372,6 @@ class TestVoidedThenTouched:
                 ],
             )
 
-    @pytest.mark.xfail(
-        reason="C8 unfixed: reconcile_account bulk path flips "
-               "voided splits to 'y'",
-        strict=True,
-    )
     def test_reconcile_account_must_not_flip_voided(
         self, test_book: Path,
     ):
@@ -429,11 +416,6 @@ class TestVoidedThenTouched:
             f"{state!r}, defeating unvoid_transaction"
         )
 
-    @pytest.mark.xfail(
-        reason="C8 unfixed: auto-fill sources splits from voided "
-               "transactions, building a silent $0 transaction",
-        strict=True,
-    )
     def test_autofill_never_sources_from_voided(self, test_book: Path):
         """The void-and-re-enter workflow this server recommends
         makes the voided transaction the most recent description
