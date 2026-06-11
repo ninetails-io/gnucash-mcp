@@ -582,3 +582,74 @@ class TestSplitToDictLotGuid:
                 # short collision-safe prefix. The full guid must start
                 # with that prefix.
                 assert s["lot_guid"].startswith(lot["guid"])
+
+
+class TestLotGainForeignDenominatedPurchase:
+    """A1 (adversarial pass 2): a lot bought via a foreign-currency
+    transaction must convert its cost basis to the book default
+    currency (at the historical purchase rate) before subtracting
+    it from default-currency proceeds — pre-fix the gain was wrong
+    by the full FX factor."""
+
+    def test_gain_converts_foreign_cost_basis(self, tmp_path):
+        import piecash
+        from piecash import factories
+        from datetime import date
+        from decimal import Decimal
+
+        bp = tmp_path / "fx_lot.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        stock = piecash.Commodity(
+            namespace="NASDAQ", mnemonic="STK",
+            fullname="Stock Co", fraction=10000,
+        )
+        book.session.add(stock)
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        eur_bank = piecash.Account(name="EUR Bank", type="BANK",
+                                   parent=assets, commodity=eur)
+        holding = piecash.Account(name="STK", type="STOCK",
+                                  parent=assets, commodity=stock)
+        book.save()
+        # Buy 10 STK for EUR 1,000 — purchase TRANSACTION is EUR.
+        buy_split = piecash.Split(
+            account=holding, value=Decimal("1000"),
+            quantity=Decimal("10"),
+        )
+        book.session.add(piecash.Transaction(
+            currency=eur, description="Buy STK",
+            post_date=date(2026, 1, 15),
+            splits=[
+                buy_split,
+                piecash.Split(account=eur_bank, value=Decimal("-1000"),
+                              quantity=Decimal("-1000")),
+            ],
+        ))
+        lot = piecash.Lot(title="STK lot", account=holding, is_closed=0)
+        buy_split.lot = lot
+        # Historical EUR→USD at purchase; current STK quote in USD.
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2026, 1, 15),
+            value="1.10", source="user:test", type="nav",
+        ))
+        book.session.add(piecash.Price(
+            commodity=stock, currency=usd, date=date(2026, 6, 1),
+            value="150.00", source="user:test", type="nav",
+        ))
+        book.save()
+        lot_guid = lot.guid
+        book.close()
+
+        gb = GnuCashBook(str(bp))
+        result = gb.calculate_lot_gain(lot_guid=lot_guid)
+
+        # Cost basis EUR 1,000 × 1.10 = USD 1,100; proceeds
+        # 10 × 150 = 1,500 → gain 400. Pre-fix: 1,500 − 1,000 = 500
+        # (EUR units subtracted from USD units).
+        assert Decimal(result["cost_basis"]) == Decimal("1100.00")
+        assert Decimal(result["sale_proceeds"]) == Decimal("1500.00")
+        assert Decimal(result["capital_gain"]) == Decimal("400.00")
