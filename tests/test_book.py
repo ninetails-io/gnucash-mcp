@@ -7962,6 +7962,121 @@ class TestSpendingByCategory:
         assert len(result["categories"]) == 1
         assert Decimal(result["categories"][0]["amount"]) == Decimal("300")
 
+    @staticmethod
+    def _travel_refund_book(tmp_path: Path) -> Path:
+        """Travel 2,000 spend + Travel:Refunds −900 + Food 1,000 —
+        the C6 live shape: a net-negative LEAF under a positive
+        parent, plus an unrelated category."""
+        import piecash
+        bp = tmp_path / "depth_invariant.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        travel = piecash.Account(name="Travel", type="EXPENSE",
+                                 parent=exp, commodity=usd)
+        refunds = piecash.Account(name="Refunds", type="EXPENSE",
+                                  parent=travel, commodity=usd)
+        food = piecash.Account(name="Food", type="EXPENSE",
+                               parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("10000")),
+                    piecash.Split(account=opening, value=Decimal("-10000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Flights", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=travel, value=Decimal("2000")),
+                    piecash.Split(account=checking, value=Decimal("-2000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Airline refund",
+            post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=refunds, value=Decimal("-900")),
+                    piecash.Split(account=checking, value=Decimal("900"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Groceries", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=food, value=Decimal("1000")),
+                    piecash.Split(account=checking, value=Decimal("-1000"))]))
+        book.save()
+        return bp
+
+    def test_total_is_depth_invariant(self, tmp_path: Path):
+        """C6 regression (adversarial pass 2): the TOTAL must not
+        change with the ``depth`` grouping knob. Pre-fix the −900
+        refund leaf netted against Travel at depth 1 but was DROPPED
+        at leaf depth, so the same period reported two different
+        totals."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        totals = set()
+        for depth in (1, 2, 3, 5):
+            result = gc.spending_by_category(
+                compact=False,
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 12, 31),
+                depth=depth,
+            )
+            totals.add(Decimal(result["total"]))
+        assert totals == {Decimal("2100")}, (
+            f"TOTAL varies with depth: {sorted(totals)}"
+        )
+
+    def test_net_negative_group_surfaced_not_dropped(
+        self, tmp_path: Path,
+    ):
+        """C6: at leaf depth the net-refunded category is excluded
+        from the spend lines but surfaced explicitly — an erased
+        real signal pre-fix."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        netted = result["net_negative_netted"]
+        assert len(netted) == 1
+        assert netted[0]["account"] == "Expenses:Travel:Refunds"
+        assert Decimal(netted[0]["amount"]) == Decimal("-900")
+        # Compact mode carries the same signal.
+        compact = gc.spending_by_category(
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        assert "netted into TOTAL" in compact
+        assert "Refunds" in compact
+
+    def test_depth_one_groups_to_top_level_buckets(
+        self, tmp_path: Path,
+    ):
+        """A7 regression (adversarial pass 2): the documented
+        contract is depth 1 = top-level buckets (Expenses:Travel),
+        depth 2 = their children. Pre-fix the off-by-one collapsed
+        the whole default report to a single 'Expenses 100%' row."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=1,
+        )
+        names = {c["account"] for c in result["categories"]}
+        assert names == {"Expenses:Travel", "Expenses:Food"}, names
+        by_name = {c["account"]: c for c in result["categories"]}
+        # Refund leaf nets against its Travel parent at this depth.
+        assert Decimal(
+            by_name["Expenses:Travel"]["amount"]
+        ) == Decimal("1100")
+
 
 class TestIncomeBySource:
     """Tests for income_by_source method."""

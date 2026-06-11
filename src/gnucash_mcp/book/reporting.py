@@ -298,22 +298,35 @@ class ReportingMixin:
                 amount = self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
+                # ``depth`` (not ``depth - 1``): path[0] is the type
+                # root ("Expenses"), so the documented "depth 1 =
+                # top-level buckets (Expenses:Food)" needs path[1].
+                # Pre-fix the off-by-one collapsed the entire default
+                # report to a single "Expenses 100%" row (A7).
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            # Drop decision is made AFTER aggregation, not per split: a
-            # category whose net spend is <= 0 (net-refunded for the
-            # period) isn't a spend line.
-            totals = {n: a for n, a in totals.items() if a > 0}
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision is made AFTER aggregation, not per split. A
+            # category whose net spend is < 0 (net-refunded for the
+            # period) isn't a spend LINE, but its net still belongs in
+            # the TOTAL — dropping it made the total change with the
+            # ``depth`` parameter (a net-negative leaf nets against
+            # siblings at low depth, vanishes at high depth) and untied
+            # income − spending from net income (C6). Net-negative
+            # groups surface explicitly instead of vanishing.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             categories = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -323,14 +336,31 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(categories, total, "account")
+                out = _format_breakdown_tsv(categories, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-refunded "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "categories": categories,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     def income_by_source(
         self,
@@ -380,22 +410,30 @@ class ReportingMixin:
                 amount = -self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
+                # ``depth`` (not ``depth - 1``) — same A7 off-by-one
+                # fix as spending_by_category.
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            # Drop decision is made AFTER aggregation, not per split: a
-            # source whose net is <= 0 (net loss for the period) isn't an
-            # income line.
-            totals = {n: a for n, a in totals.items() if a > 0}
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision is made AFTER aggregation, not per split. A
+            # source whose net is < 0 (net loss for the period) isn't
+            # an income LINE, but its net still belongs in the TOTAL
+            # so the total stays depth-invariant and income − spending
+            # ties to net income (C6). Net-loss sources surface
+            # explicitly instead of vanishing.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             sources = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -405,14 +443,31 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(sources, total, "account")
+                out = _format_breakdown_tsv(sources, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-loss "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "sources": sources,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     # ── Balance sheet and net worth ──────────────────────────────────
 
