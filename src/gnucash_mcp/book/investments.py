@@ -73,6 +73,11 @@ class InvestmentsMixin:
 
             for commodity in book.commodities:
                 ns = commodity.namespace
+                # GnuCash's ``template`` pseudo-commodity backs SX
+                # template accounts in desktop-created books —
+                # scaffolding, not a tracked holding.
+                if ns.lower() == "template":
+                    continue
                 if ns not in by_namespace:
                     by_namespace[ns] = []
 

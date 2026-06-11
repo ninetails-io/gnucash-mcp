@@ -1013,9 +1013,13 @@ class CoreMixin:
         # ── 4. Stale prices ──
         stale_prices: list[str] = []
         try:
+            # Template accounts would mark GnuCash's ``template``
+            # pseudo-commodity in-use and misfire a permanent
+            # "no price on file" warning on desktop-created books.
+            template_guids = self._template_account_guids(book)
             in_use: set = set()
             for a in accounts:
-                if a.type != "ROOT":
+                if a.type != "ROOT" and a.guid not in template_guids:
                     in_use.add(a.commodity.guid)
 
             # Single pass over book.prices builds both signals we
@@ -2442,8 +2446,15 @@ class CoreMixin:
             # Transaction stats. Per-split unreconciled counting
             # was dropped from this surface — the Reconciliation
             # section below (per-account) is the actionable
-            # replacement.
-            transactions = list(book.transactions)
+            # replacement. SX template recipes are filtered: a
+            # desktop-created template dated years before the first
+            # real entry would otherwise stretch the activity range
+            # and inflate the count (this list also feeds
+            # _collect_warnings and the daily-burn clamp).
+            transactions = [
+                t for t in book.transactions
+                if not self._is_template_transaction(t, template_guids)
+            ]
             total_txns = len(transactions)
             first_date: date | None = None
             last_date: date | None = None
@@ -2461,8 +2472,12 @@ class CoreMixin:
             n_vendors = len(list(book.vendors))
             n_employees = len(list(book.employees))
             n_budgets = book.session.query(Budget).count()
+            # The ``template`` namespace holds GnuCash's pseudo-
+            # commodity for SX template accounts — scaffolding, not
+            # a holding the user tracks.
             commodity_mnemonics = sorted(set(
                 c.mnemonic for c in book.commodities
+                if c.namespace.lower() != "template"
             ))
             biz_counts = self._business_summary_counts(book)
 
@@ -2739,7 +2754,21 @@ class CoreMixin:
                 focus_fullname = acct.fullname
                 transactions = {split.transaction for split in acct.splits}
             else:
-                transactions = set(book.transactions)
+                # Hide scheduled-transaction template recipes — real
+                # Transaction rows in desktop-created books whose
+                # splits post under root_template. The account-
+                # filtered branch above is safe without the check
+                # (``_resolve_account`` never resolves a template
+                # account), but this unfiltered path would render a
+                # stale "Mortgage Payment" recipe identically to a
+                # real event.
+                template_guids = self._template_account_guids(book)
+                transactions = {
+                    t for t in book.transactions
+                    if not self._is_template_transaction(
+                        t, template_guids
+                    )
+                }
 
             # Apply date filters
             filtered = []
@@ -3054,9 +3083,7 @@ class CoreMixin:
             # every near-cadence description (mortgage, HOA, auto
             # loans, etc.), training the user to ignore the
             # duplicate warning.
-            if template_guids and any(
-                s.account.guid in template_guids for s in txn.splits
-            ):
+            if self._is_template_transaction(txn, template_guids):
                 continue
 
             txn_desc_lower = txn.description.lower()
@@ -3663,7 +3690,15 @@ class CoreMixin:
         with self.open(readonly=True) as book:
             matched = []
 
+            # Same template-recipe filter as list_transactions: all
+            # four field modes would otherwise match SX templates in
+            # desktop-created books.
+            template_guids = self._template_account_guids(book)
             for transaction in book.transactions:
+                if self._is_template_transaction(
+                    transaction, template_guids
+                ):
+                    continue
                 if field == "description":
                     if query.lower() in transaction.description.lower():
                         matched.append(transaction)

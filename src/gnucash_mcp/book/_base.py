@@ -1557,3 +1557,22 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         self._collect_descendants(rt, descendants)
         guids.update(a.guid for a in descendants)
         return guids
+
+    @staticmethod
+    def _is_template_transaction(txn, template_guids: set) -> bool:
+        """True iff ``txn`` is a scheduled-transaction template recipe.
+
+        GnuCash desktop persists each SX's split recipe as a real
+        Transaction row whose splits post to accounts under
+        ``root_template``. Our own ``create_scheduled_transaction``
+        uses a splits-json slot instead, so server-built books never
+        produce these rows — but books touched by the desktop UI are
+        full of them, and they render indistinguishably from real
+        events unless filtered. Single predicate so every
+        transaction-iteration surface applies the same rule
+        (companion to ``_template_account_guids`` for account
+        iterations).
+        """
+        return any(
+            s.account.guid in template_guids for s in txn.splits
+        )

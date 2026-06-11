@@ -26,6 +26,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
+import piecash
 import pytest
 
 from gnucash_mcp.book import GnuCashBook
@@ -166,25 +167,16 @@ class TestCrossSurfaceAgreement:
 
 
 class TestNativeSxTemplateLeak:
-    """C9 (adversarial pass 2), unfixed: desktop GnuCash persists
+    """C9 (adversarial pass 2): desktop GnuCash persists
     scheduled-transaction recipes as real Transaction rows against
-    ``root_template`` accounts. ``list_transactions`` (unfiltered
-    path), ``search_transactions``, and the dashboard transaction
-    stats iterate ``book.transactions`` with no template filter, so
-    a stale recipe renders identically to a real event.
-
-    These are strict xfails: they describe the post-fix contract
-    (the same ``_template_account_guids`` filter the sibling
-    ``_collect_create_signals`` already applies at core.py:3027).
-    When the C9 fix lands they XPASS — remove the markers and they
-    become the locks that let C9 be marked fixed.
+    ``root_template`` accounts, and a ``template`` pseudo-commodity
+    behind them. Every transaction- and commodity-iteration surface
+    must filter both — a stale recipe would otherwise render
+    identically to a real event. Locked via the
+    ``_is_template_transaction`` chokepoint (the same rule
+    ``_collect_create_signals`` already applied).
     """
 
-    @pytest.mark.xfail(
-        reason="C9 unfixed: list_transactions does not filter "
-               "template transactions",
-        strict=True,
-    )
     def test_template_absent_from_list_transactions(
         self, pathological_book,
     ):
@@ -195,11 +187,6 @@ class TestNativeSxTemplateLeak:
             "SX template recipe rendered as a real transaction"
         )
 
-    @pytest.mark.xfail(
-        reason="C9 unfixed: search_transactions does not filter "
-               "template transactions",
-        strict=True,
-    )
     def test_template_absent_from_search_transactions(
         self, pathological_book,
     ):
@@ -210,11 +197,6 @@ class TestNativeSxTemplateLeak:
             "2485", field="amount", compact=False,
         ) == []
 
-    @pytest.mark.xfail(
-        reason="C9 unfixed: dashboard transaction stats count "
-               "template rows and stretch first-activity date",
-        strict=True,
-    )
     def test_template_does_not_stretch_dashboard_dates(
         self, pathological_book,
     ):
@@ -227,6 +209,75 @@ class TestNativeSxTemplateLeak:
             "dashboard first-activity date stretched by an SX "
             "template row"
         )
+
+    def test_template_pseudo_commodity_hidden(self, pathological_book):
+        """The ``template`` pseudo-commodity must not surface in
+        list_commodities, the dashboard Commodities line, or the
+        stale-price warnings (it can never have a price)."""
+        gb = GnuCashBook(str(pathological_book.path))
+
+        verbose = gb.list_commodities(compact=False)
+        assert "template" not in verbose
+        assert "template" not in gb.list_commodities(compact=True)
+
+        summary = gb.get_book_summary()
+        commodities_line = next(
+            ln for ln in summary.splitlines()
+            if ln.startswith("Commodities:")
+        )
+        assert "template" not in commodities_line
+        assert "Stale price: template" not in summary
+
+    def test_delete_scheduled_transaction_with_recipe_rows(
+        self, scheduled_book,
+    ):
+        """Desktop-created SXs leave real Transaction rows on the
+        template account; delete must remove the recipe rows along
+        with the account instead of orphaning their splits."""
+        gc = GnuCashBook(str(scheduled_book))
+        created = gc.create_scheduled_transaction(
+            name="Rent",
+            description="Monthly Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        # Plant a desktop-style recipe transaction on the SX's
+        # template account (our splits-json design leaves it empty).
+        with gc.open(readonly=False) as book:
+            template_acct = next(
+                a for a in book.root_template.children
+            )
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Monthly Rent",
+                post_date=date(2026, 1, 1),
+                splits=[
+                    piecash.Split(
+                        account=template_acct,
+                        value=Decimal("1850.00"),
+                    ),
+                    piecash.Split(
+                        account=template_acct,
+                        value=Decimal("-1850.00"),
+                    ),
+                ],
+            ))
+            book.save()
+
+        gc.delete_scheduled_transaction(guid=created["guid"])
+
+        with gc.open(readonly=True) as book:
+            assert list(book.root_template.children) == [], (
+                "template account survived the SX delete"
+            )
+            assert not any(
+                t.description == "Monthly Rent"
+                for t in book.transactions
+            ), "recipe transaction orphaned by the SX delete"
 
 
 class TestVoidedThenTouched:

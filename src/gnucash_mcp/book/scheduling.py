@@ -934,6 +934,17 @@ class SchedulingMixin:
             template_acct = sx.template_account
             book.session.delete(sx)
             if template_acct:
+                # Desktop-created SXs store the split recipe as real
+                # Transaction rows posted to the template account;
+                # our splits-json design leaves it empty. Delete the
+                # recipe transactions first — deleting the account
+                # alone would orphan their splits (or fail the FK
+                # check at save).
+                recipe_txns = {
+                    s.transaction for s in list(template_acct.splits)
+                }
+                for txn in recipe_txns:
+                    book.session.delete(txn)
                 book.session.delete(template_acct)
 
             book.save()

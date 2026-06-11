@@ -1162,6 +1162,20 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
         parent=book.root_template, commodity=usd,
     )
     book.session.add(template_acct)
+    # Desktop GnuCash also creates a ``template`` pseudo-commodity
+    # and denominates template accounts in it. A second template
+    # account holds it here so the commodity surfaces
+    # (list_commodities, the dashboard Commodities line, stale-price
+    # warnings) can be probed for the leak.
+    template_commodity = piecash.Commodity(
+        namespace="template", mnemonic="template",
+        fullname="template", fraction=1,
+    )
+    book.session.add(template_commodity)
+    piecash.Account(
+        name="Recipe Holder", type="BANK",
+        parent=book.root_template, commodity=template_commodity,
+    )
     book.flush()
     template_txn = piecash.Transaction(
         currency=usd, description="Mortgage Payment",
