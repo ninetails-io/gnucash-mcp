@@ -766,6 +766,9 @@ class BusinessMixin:
         exchange_rate: Decimal,
         fx_account: str | None,
         default_currency,
+        discount_amount: Decimal = Decimal("0"),
+        discount_quantity: Decimal | None = None,
+        discount_commodity=None,
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
 
@@ -798,6 +801,18 @@ class BusinessMixin:
                 gain/loss split. Resolved via
                 :meth:`_get_or_create_fx_account`.
             default_currency: The book's default currency commodity.
+            discount_amount: Early-payment discount in invoice
+                currency (``0`` when no discount applied).
+            discount_quantity: The discount split's unsigned quantity
+                in ``discount_commodity`` (booked at the pay-date
+                rate). ``None`` when no discount.
+            discount_commodity: The discount account's commodity.
+                The discount leg's drift — ``discount ×
+                (pay_rate − post_rate)`` — is realized FX exactly
+                like the payment leg's; pre-fix it was booked
+                nowhere, leaving assets ≠ equity by that amount on
+                any cross-currency discount settlement (C10
+                companion).
 
         Returns:
             ``None`` when no FX split should be booked:
@@ -893,6 +908,55 @@ class BusinessMixin:
             ).quantize(_commodity_quantum(default_currency))
         else:
             fx_diff_default = fx_diff_pay
+
+        # Discount leg (C10 companion). Same shape as the payment
+        # leg: the discount expense/income was booked at the
+        # pay-date rate while the A/R it helped relieve was carried
+        # at the post-date rate; the difference is realized FX.
+        # Skipped when the discount is denominated in the invoice
+        # currency itself (no conversion → no drift) or when a
+        # needed rate is missing (mirror the graceful-skip
+        # convention above — the payment still records, only the
+        # delta isn't surfaced).
+        if (
+            discount_amount > 0
+            and discount_quantity is not None
+            and discount_commodity is not None
+            and discount_commodity != inv.currency
+        ):
+            rate_at_post_disc = self._rate_from_post_transaction(
+                inv.post_txn, discount_commodity,
+            )
+            if rate_at_post_disc is None:
+                post_date_obj = inv.post_txn.post_date
+                if hasattr(post_date_obj, "date") and callable(
+                    post_date_obj.date
+                ):
+                    post_date_obj = post_date_obj.date()
+                rate_at_post_disc = self._find_exchange_rate(
+                    book,
+                    from_commodity=inv.currency,
+                    to_commodity=discount_commodity,
+                    as_of=post_date_obj,
+                )
+            if rate_at_post_disc is not None:
+                expected_disc_at_post = (
+                    discount_amount * rate_at_post_disc
+                ).quantize(_commodity_quantum(discount_commodity))
+                diff_disc = discount_quantity - expected_disc_at_post
+                if discount_commodity != default_currency:
+                    disc_to_default = self._find_exchange_rate(
+                        book,
+                        from_commodity=discount_commodity,
+                        to_commodity=default_currency,
+                        as_of=parsed_date,
+                    )
+                    if disc_to_default is not None:
+                        fx_diff_default += (
+                            diff_disc * disc_to_default
+                        ).quantize(_commodity_quantum(default_currency))
+                else:
+                    fx_diff_default += diff_disc
 
         # Skip booking the FX split when the realized delta is below
         # the smallest representable unit in the FX account's
@@ -1776,6 +1840,24 @@ class BusinessMixin:
             if split.reconcile_state == "v":
                 continue
             total += Decimal(str(split.value))
+        return total
+
+    @staticmethod
+    def _calculate_lot_quantity(lot) -> Decimal:
+        """Sum of split QUANTITIES in a lot, skipping voided splits.
+
+        Companion to :meth:`_calculate_lot_balance` (which sums
+        ``value``, i.e. invoice-currency units). Quantities are in
+        the post account's commodity — when that commodity differs
+        from the invoice currency, this is what the receivable /
+        payable account actually carries, and it's the number a
+        settlement must relieve exactly (C10).
+        """
+        total = Decimal(0)
+        for split in lot.splits:
+            if split.reconcile_state == "v":
+                continue
+            total += Decimal(str(split.quantity))
         return total
 
     @staticmethod
@@ -6215,6 +6297,18 @@ class BusinessMixin:
                         f"apply_discount for a partial payment."
                     )
 
+                # Book the discount at the ACTUAL shortfall, not the
+                # computed expectation. The tolerance above admits a
+                # 1-quantum mismatch (rounding of the user's payment);
+                # booking ``expected`` then left the splits off by
+                # that quantum and the transaction died later with an
+                # opaque GncImbalanceError after the validator had
+                # blessed the input (A5). A/R clears
+                # ``remaining_before`` and the bank brings
+                # ``payment_amount``, so the discount leg must be
+                # exactly their difference.
+                expected = shortfall.quantize(quantum)
+
                 # All validation passed — resolve the discount account
                 # and build the split. Quantize to the discount
                 # account's commodity quantum after cross-currency
@@ -6253,6 +6347,35 @@ class BusinessMixin:
             else:
                 full_settle_amount = payment_amount
                 full_settle_post_qty = post_quantity
+
+            # C10: when the A/R-A/P account's commodity differs from
+            # the invoice currency, relieve the lot at the rate it is
+            # CARRIED at — proportional to the lot's remaining
+            # quantity — never at the pay-date rate. Pay-date relief
+            # left the post→pay drift in the account's quantity
+            # balance forever (a permanent phantom A/R on a fully
+            # settled invoice) while the same drift was also booked
+            # as the explicit FX split. A full settlement relieves
+            # the remaining quantity exactly; a partial one relieves
+            # pro-rata in invoice-currency terms.
+            if (
+                post_acct.commodity != inv.currency
+                and remaining_before_pay > 0
+            ):
+                lot_qty_remaining = self._calculate_lot_quantity(
+                    lot_obj
+                )
+                qty_owed = (
+                    -lot_qty_remaining if effective_is_bill
+                    else lot_qty_remaining
+                )
+                if full_settle_amount == remaining_before_pay:
+                    full_settle_post_qty = qty_owed
+                else:
+                    full_settle_post_qty = (
+                        qty_owed * full_settle_amount
+                        / remaining_before_pay
+                    ).quantize(_commodity_quantum(post_acct.commodity))
 
             if effective_is_bill:
                 # Pay vendor bill (or refund customer credit note):
@@ -6327,6 +6450,17 @@ class BusinessMixin:
                     exchange_rate=exchange_rate,
                     fx_account=fx_account,
                     default_currency=default_currency,
+                    discount_amount=discount_amount_invoice_ccy,
+                    discount_quantity=(
+                        discount_split.quantity * (
+                            -1 if effective_is_bill else 1
+                        )
+                        if discount_split is not None else None
+                    ),
+                    discount_commodity=(
+                        discount_acct.commodity
+                        if discount_acct is not None else None
+                    ),
                 )
                 if fx_result is not None:
                     splits.append(fx_result["split"])
