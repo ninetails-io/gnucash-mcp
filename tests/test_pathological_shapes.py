@@ -1,0 +1,398 @@
+"""Cross-surface regression tests against the pathological-shapes book.
+
+The final adversarial review of v1.3.1 (specs/Code Reviews/
+CODE_REVIEW_v1_3_1_ADVERSARIAL_PASS_2.md) observed that every
+confirmed defect lived in a shape the synthetic sample books
+structurally cannot produce. The ``pathological_book`` fixture
+(conftest.py) packs those shapes into one small book; this module
+runs every report surface against the combination and asserts they
+agree with each other and with hand-computed totals.
+
+Two kinds of tests live here:
+
+- **Locks** — passing tests that hold the C1 (own-splits counting)
+  and C2 (overpaid-lot direction) fixes in place against the
+  combined book, not just the isolated single-shape books their
+  targeted regressions use.
+- **``xfail(strict=True)`` markers** — review findings C9 (native
+  SX templates surfacing as real transactions) and C8 (voided
+  splits touched by write paths) are documented but not yet fixed.
+  Each xfail describes the expected post-fix behavior; when the fix
+  lands the marker trips XPASS and must be removed, flipping the
+  test into a permanent lock.
+"""
+
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+from gnucash_mcp.book import GnuCashBook
+
+# Hand-computed totals for the pathological book (see the fixture
+# docstring in conftest.py for the per-account arithmetic).
+EXPECTED_ASSETS = Decimal("11600.00")
+EXPECTED_LIABILITIES = Decimal("0.00")
+EXPECTED_NET_WORTH = Decimal("11600.00")
+
+
+class TestCrossSurfaceAgreement:
+    """All report surfaces must agree on the same numbers even with
+    every pathological shape present at once."""
+
+    def test_balance_sheet_balances_and_includes_every_shape(
+        self, pathological_book,
+    ):
+        gb = GnuCashBook(str(pathological_book.path))
+        bs = gb.balance_sheet(as_of_date=date.today())
+
+        assert Decimal(bs["assets"]["total"]) == EXPECTED_ASSETS
+        assert Decimal(bs["liabilities"]["total"]) == EXPECTED_LIABILITIES
+        # A = L + E must hold exactly — and not via a fat unrealized
+        # residual silently absorbing a dropped account (the C1
+        # failure mode the equity residual used to hide).
+        assert (
+            Decimal(bs["assets"]["total"])
+            - Decimal(bs["liabilities"]["total"])
+            == Decimal(bs["equity"]["total"])
+        )
+
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        # Parent with direct splits and a child: own splits counted.
+        assert Decimal(
+            rows["Assets:Checking"]["balance"]
+        ) == Decimal("10200.00")
+        # Placeholder with direct splits: real money, not skipped.
+        assert Decimal(
+            rows["Assets:Savings"]["balance"]
+        ) == Decimal("500.00")
+        # Overpaid receivable: negative, direction preserved.
+        assert Decimal(
+            rows["Assets:Accounts Receivable"]["balance"]
+        ) == Decimal("-200.00")
+        # Foreign-denominated A/R: triplet rendering with the
+        # parseable converted amount alongside (EUR 1,000 at 1.10).
+        eur_row = rows["Assets:Accounts Receivable EUR"]
+        assert "EUR" in eur_row["balance"]
+        assert (
+            Decimal(eur_row["default_currency_value"])
+            == Decimal("1100.00")
+        )
+
+    def test_net_worth_agrees_with_balance_sheet(
+        self, pathological_book,
+    ):
+        gb = GnuCashBook(str(pathological_book.path))
+        nw = gb.net_worth(end_date=date.today())
+        assert Decimal(nw["net_worth"]) == EXPECTED_NET_WORTH
+
+    def test_dashboard_now_anchor_agrees(self, pathological_book):
+        """The dashboard's trajectory "now" anchor and its assets
+        section must match balance_sheet / net_worth — three
+        surfaces, ONE scope (C1)."""
+        gb = GnuCashBook(str(pathological_book.path))
+        summary = gb.get_book_summary()
+        assert "now: USD 11,600" in summary, (
+            f"trajectory 'now' disagrees with balance_sheet; "
+            f"saw:\n{summary}"
+        )
+        # Parent-with-children and placeholder accounts both render
+        # their own balances in the assets section.
+        assert "Checking: USD 10200.00" in summary
+        assert "Savings: USD 500.00" in summary
+
+    def test_cash_flow_excludes_voided_expense(self, pathological_book):
+        """The only expense transaction in the book is voided; no
+        flow surface may count its zombie splits."""
+        gb = GnuCashBook(str(pathological_book.path))
+        flow = gb.cash_flow(
+            start_date=date(2026, 1, 1), end_date=date(2026, 6, 1),
+        )
+        assert Decimal(flow["outflows"]) == Decimal("0")
+        # Transfer-inclusive mode must also run clean over the
+        # placeholder transfer and lot-assigned manual payment.
+        gb.cash_flow(
+            start_date=date(2026, 1, 1), end_date=date(2026, 6, 1),
+            include_transfers=True,
+        )
+
+    def test_outstanding_invoices_mixed_shapes(self, pathological_book):
+        """Overpaid USD invoice and open EUR invoice side by side:
+        direction surfaced on one, foreign currency on the other,
+        aging clock only where it belongs (C2)."""
+        gb = GnuCashBook(str(pathological_book.path))
+        rows = {
+            r["id"]: r
+            for r in gb.get_outstanding_invoices(compact=False)
+        }
+
+        overpaid = rows[pathological_book.usd_invoice_id]
+        assert overpaid["overpaid"] is True
+        assert Decimal(overpaid["amount_due"]) == Decimal("-200.00")
+        assert Decimal(overpaid["amount_paid"]) == Decimal("700.00")
+        assert overpaid["days_past_due"] is None, (
+            "aging clock must not tick on an overpaid document"
+        )
+
+        eur_row = rows[pathological_book.eur_invoice_id]
+        assert eur_row["currency"] == "EUR"
+        assert Decimal(eur_row["amount_due"]) == Decimal("1000.00")
+        assert Decimal(eur_row["amount_paid"]) == Decimal("0.00")
+
+        assert "OVERPAID" in gb.get_outstanding_invoices(compact=True)
+
+    def test_list_and_search_render_clean(self, pathological_book):
+        """Both transaction surfaces handle the full shape mix
+        without raising, in compact and verbose modes."""
+        gb = GnuCashBook(str(pathological_book.path))
+
+        verbose = gb.list_transactions(compact=False, limit=250)
+        descriptions = {t["description"] for t in verbose}
+        assert "Opening balance" in descriptions
+        assert "Transfer to savings" in descriptions
+        assert "Manual overpayment" in descriptions
+        assert isinstance(
+            gb.list_transactions(compact=True, limit=250), str
+        )
+
+        hits = gb.search_transactions(
+            "Manual overpayment", compact=False,
+        )
+        assert len(hits) == 1
+        assert isinstance(
+            gb.search_transactions("150", field="amount"), str
+        )
+
+
+class TestNativeSxTemplateLeak:
+    """C9 (adversarial pass 2), unfixed: desktop GnuCash persists
+    scheduled-transaction recipes as real Transaction rows against
+    ``root_template`` accounts. ``list_transactions`` (unfiltered
+    path), ``search_transactions``, and the dashboard transaction
+    stats iterate ``book.transactions`` with no template filter, so
+    a stale recipe renders identically to a real event.
+
+    These are strict xfails: they describe the post-fix contract
+    (the same ``_template_account_guids`` filter the sibling
+    ``_collect_create_signals`` already applies at core.py:3027).
+    When the C9 fix lands they XPASS — remove the markers and they
+    become the locks that let C9 be marked fixed.
+    """
+
+    @pytest.mark.xfail(
+        reason="C9 unfixed: list_transactions does not filter "
+               "template transactions",
+        strict=True,
+    )
+    def test_template_absent_from_list_transactions(
+        self, pathological_book,
+    ):
+        gb = GnuCashBook(str(pathological_book.path))
+        verbose = gb.list_transactions(compact=False, limit=250)
+        descriptions = {t["description"] for t in verbose}
+        assert "Mortgage Payment" not in descriptions, (
+            "SX template recipe rendered as a real transaction"
+        )
+
+    @pytest.mark.xfail(
+        reason="C9 unfixed: search_transactions does not filter "
+               "template transactions",
+        strict=True,
+    )
+    def test_template_absent_from_search_transactions(
+        self, pathological_book,
+    ):
+        gb = GnuCashBook(str(pathological_book.path))
+        assert gb.search_transactions("Mortgage", compact=False) == []
+        # Amount search must not surface the template's 2,485 either.
+        assert gb.search_transactions(
+            "2485", field="amount", compact=False,
+        ) == []
+
+    @pytest.mark.xfail(
+        reason="C9 unfixed: dashboard transaction stats count "
+               "template rows and stretch first-activity date",
+        strict=True,
+    )
+    def test_template_does_not_stretch_dashboard_dates(
+        self, pathological_book,
+    ):
+        """The template is dated 2020-01-01; every real transaction
+        is from 2026. An unfiltered dashboard reports the book's
+        first activity six years early."""
+        gb = GnuCashBook(str(pathological_book.path))
+        summary = gb.get_book_summary()
+        assert "2020-01-01" not in summary, (
+            "dashboard first-activity date stretched by an SX "
+            "template row"
+        )
+
+
+class TestVoidedThenTouched:
+    """C8 (adversarial pass 2), unfixed: the ``_is_voided``
+    chokepoint protects read paths, but several write paths never
+    consult it — they can push non-zero values into ``state='v'``
+    splits, producing the "partial-void corruption" state the
+    predicate's own docstring names.
+
+    Builds the corruption in an isolated book (NOT the shared
+    pathological book — a corrupted split would poison every
+    cross-surface total above).
+    """
+
+    def _voided_txn(self, gc: GnuCashBook) -> str:
+        created = gc.create_transaction(
+            description="Voided pattern",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "75.00"},
+                {"account": "Assets:Checking", "amount": "-75.00"},
+            ],
+            trans_date=date(2026, 2, 1),
+            check_duplicates=False,
+        )
+        gc.void_transaction(guid=created["guid"], reason="test void")
+        return created["guid"]
+
+    def _corrupt_voided_split(self, gc: GnuCashBook, guid: str) -> None:
+        """Simulate the partial-void corruption: both splits keep
+        ``state='v'`` but carry non-zero (balanced) values again —
+        exactly what the unguarded ``update_transaction`` path
+        writes when handed a voided target. The values must balance
+        or piecash refuses the save, which is also why the C8 shape
+        survives in real books: it passes every structural check."""
+        with gc.open(readonly=False) as book:
+            txn = gc._find_transaction(book, guid)
+            for split in txn.splits:
+                if split.account.fullname == "Assets:Checking":
+                    split.value = Decimal("-100.00")
+                    split.quantity = Decimal("-100.00")
+                else:
+                    split.value = Decimal("100.00")
+                    split.quantity = Decimal("100.00")
+            book.save()
+
+    @pytest.mark.xfail(
+        reason="C8 unfixed: balance surfaces sum voided splits by "
+               "value instead of routing through _is_voided",
+        strict=True,
+    )
+    def test_corrupted_void_invisible_to_balance_surfaces(
+        self, test_book: Path,
+    ):
+        """``_is_voided`` is documented state-only precisely so that
+        a corrupted ``state='v', value != 0`` split still reads as
+        voided. Balance surfaces must honor that: the corruption
+        must not move get_balance / balance_sheet / net_worth."""
+        gc = GnuCashBook(str(test_book))
+        guid = self._voided_txn(gc)
+
+        before_balance = gc.get_balance(account_name="Assets:Checking")
+        before_assets = Decimal(
+            gc.balance_sheet(as_of_date=date.today())["assets"]["total"]
+        )
+        before_nw = Decimal(
+            gc.net_worth(end_date=date.today())["net_worth"]
+        )
+
+        self._corrupt_voided_split(gc, guid)
+
+        assert gc.get_balance(
+            account_name="Assets:Checking"
+        ) == before_balance
+        assert Decimal(
+            gc.balance_sheet(as_of_date=date.today())["assets"]["total"]
+        ) == before_assets
+        assert Decimal(
+            gc.net_worth(end_date=date.today())["net_worth"]
+        ) == before_nw
+
+    @pytest.mark.xfail(
+        reason="C8 unfixed: update_transaction guards only "
+               "reconciled splits, not voided ones",
+        strict=True,
+    )
+    def test_update_transaction_refuses_voided_target(
+        self, test_book: Path,
+    ):
+        """Writing new split values into a voided transaction is the
+        partial-void corruption generator — it must refuse the way
+        ``set_reconcile_state`` already does."""
+        gc = GnuCashBook(str(test_book))
+        guid = self._voided_txn(gc)
+        with pytest.raises(ValueError, match="void"):
+            gc.update_transaction(
+                guid=guid,
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "80.00"},
+                    {"account": "Assets:Checking", "amount": "-80.00"},
+                ],
+            )
+
+    @pytest.mark.xfail(
+        reason="C8 unfixed: reconcile_account bulk path flips "
+               "voided splits to 'y'",
+        strict=True,
+    )
+    def test_reconcile_account_must_not_flip_voided(
+        self, test_book: Path,
+    ):
+        """Bulk reconcile must not move a voided split to 'y' — the
+        exact mutation ``set_reconcile_state`` rejects with a
+        written rationale. (Worst chain: void → bulk-reconcile →
+        unvoid reports 'not voided' → re-void overwrites the
+        void-former-* slots with zeros.)"""
+        gc = GnuCashBook(str(test_book))
+        guid = self._voided_txn(gc)
+        with gc.open(readonly=True) as book:
+            txn = gc._find_transaction(book, guid)
+            split_guid = next(
+                s.guid for s in txn.splits
+                if s.account.fullname == "Assets:Checking"
+            )
+
+        # A voided split contributes 0, so the statement balance is
+        # whatever the account's reconciled balance already is (0.00
+        # in this fixture) — validation passes and the bulk path
+        # reaches the flip.
+        try:
+            gc.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2026, 3, 1),
+                statement_balance="0.00",
+                split_guids=[split_guid],
+            )
+        except ValueError:
+            # Post-fix behavior may also be an explicit refusal —
+            # either way the split must still be voided below.
+            pass
+
+        with gc.open(readonly=True) as book:
+            txn = gc._find_transaction(book, guid)
+            state = next(
+                s.reconcile_state for s in txn.splits
+                if s.guid == split_guid
+            )
+        assert state == "v", (
+            "bulk reconcile flipped a voided split to "
+            f"{state!r}, defeating unvoid_transaction"
+        )
+
+    @pytest.mark.xfail(
+        reason="C8 unfixed: auto-fill sources splits from voided "
+               "transactions, building a silent $0 transaction",
+        strict=True,
+    )
+    def test_autofill_never_sources_from_voided(self, test_book: Path):
+        """The void-and-re-enter workflow this server recommends
+        makes the voided transaction the most recent description
+        match; auto-fill must skip it (and with no other match,
+        report no-match) instead of cloning zeroed splits."""
+        gc = GnuCashBook(str(test_book))
+        self._voided_txn(gc)
+        with pytest.raises(ValueError, match="[Nn]o match"):
+            gc.create_transaction(
+                description="Voided pattern",
+                trans_date=date(2026, 3, 1),
+                check_duplicates=False,
+            )
