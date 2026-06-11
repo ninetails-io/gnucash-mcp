@@ -2643,6 +2643,42 @@ class TestGetBookSummaryWarnings:
         assert "20 days overdue" not in warnings_block
         assert "(posted without terms)" not in warnings_block
 
+    def test_credit_note_never_ages_into_dashboard_warnings(
+        self, business_book: Path,
+    ):
+        """Live-test minor finding: the dashboard listed an unapplied
+        credit note as 'N days past 30-day default' and counted it in
+        the overdue tally, while get_outstanding_invoices correctly
+        exempted it. A credit note is money the business OWES — it
+        stays in the open counts but never ages."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Emerald Analytics", currency="USD")
+        cn = gc.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            date_opened=(date.today() - timedelta(days=238)).isoformat(),
+        )
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Service credit",
+            quantity="1", price="500",
+        )
+        gc.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=(date.today() - timedelta(days=238)).isoformat(),
+        )
+
+        result = gc.get_book_summary()
+        # No past-due warning line for the credit note (it's the only
+        # posted document in this book).
+        assert "Past due" not in result, result
+        assert "past 30-day default" not in result
+        # Counted as open, never as overdue.
+        assert "1 overdue" not in result
+
+
     def test_past_due_invoice_uses_term_duedays_no_terms_annotation(
         self, business_book: Path,
     ):

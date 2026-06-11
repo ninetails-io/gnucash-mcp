@@ -248,8 +248,25 @@ class CoreMixin:
                 )
                 continue
 
+            # Credit notes stay in the OPEN counts (they're open
+            # documents awaiting application/refund) but never age
+            # into the overdue counts — they're money the business
+            # OWES, with no past-due concept. Matches
+            # get_outstanding_invoices, which the live-test signoff
+            # flagged this surface as contradicting.
+            is_credit_note = False
+            get_is_cn = getattr(self, "_get_is_credit_note", None)
+            if get_is_cn is not None:
+                try:
+                    is_credit_note = bool(get_is_cn(inv))
+                except Exception:
+                    _debug_logger.debug(
+                        "summary signals: credit-note check failed",
+                        exc_info=True,
+                    )
+
             is_overdue = False
-            if resolve_due is not None:
+            if resolve_due is not None and not is_credit_note:
                 try:
                     due_date, _ = resolve_due(book, inv)
                     if due_date is not None and due_date < today:
@@ -932,10 +949,24 @@ class CoreMixin:
                     self, "_find_vendor_by_guid", None,
                 )
                 overdue_inv_entries: list[tuple[int, str]] = []
+                get_is_cn = getattr(
+                    self, "_get_is_credit_note", None,
+                )
                 for inv in book.session.query(Invoice).filter(
                     Invoice.date_posted.isnot(None)
                 ).all():
                     try:
+                        # Credit notes never belong in a past-due
+                        # warning: their balance is money the
+                        # business OWES (available to apply or
+                        # refund), and an aging clock on it reads
+                        # as a collections item.
+                        # get_outstanding_invoices already exempts
+                        # them; this surface said "238 days past
+                        # 30-day default" about the same document.
+                        if get_is_cn is not None and get_is_cn(inv):
+                            continue
+
                         # Three-step due-date resolution lives on
                         # ``BusinessMixin`` (``_resolve_invoice_due_date``)
                         # so the warnings collector and
