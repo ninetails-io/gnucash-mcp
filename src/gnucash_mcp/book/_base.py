@@ -584,7 +584,12 @@ def _transaction_to_dict(
     )
     result = {
         "guid": txn_guid,
-        "date": transaction.post_date.isoformat(),
+        # Null post_date is a legal old-book artifact (A9); render
+        # as None rather than crashing the whole listing.
+        "date": (
+            transaction.post_date.isoformat()
+            if transaction.post_date else None
+        ),
         "description": transaction.description,
         "currency": transaction.currency.mnemonic,
         "splits": [
@@ -744,7 +749,11 @@ def _transaction_to_compact_line(
             collision-safe prefix (built via ``_guid_prefix_map``).
             Defaults to raw 8-char truncation when absent.
     """
-    date_str = transaction.post_date.isoformat()
+    # Null post_date is a legal old-book artifact (A9).
+    date_str = (
+        transaction.post_date.isoformat()
+        if transaction.post_date else "(no date)"
+    )
     short = _short_guid(transaction.guid, prefixes)
     desc = transaction.description
     splits = list(transaction.splits)
@@ -1557,3 +1566,53 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         self._collect_descendants(rt, descendants)
         guids.update(a.guid for a in descendants)
         return guids
+
+    @staticmethod
+    def _is_template_transaction(txn, template_guids: set) -> bool:
+        """True iff ``txn`` is a scheduled-transaction template recipe.
+
+        GnuCash desktop persists each SX's split recipe as a real
+        Transaction row whose splits post to accounts under
+        ``root_template``. Our own ``create_scheduled_transaction``
+        uses a splits-json slot instead, so server-built books never
+        produce these rows — but books touched by the desktop UI are
+        full of them, and they render indistinguishably from real
+        events unless filtered. Single predicate so every
+        transaction-iteration surface applies the same rule
+        (companion to ``_template_account_guids`` for account
+        iterations).
+        """
+        return any(
+            s.account.guid in template_guids for s in txn.splits
+        )
+
+    @staticmethod
+    def _own_splits_balance(account, as_of: "date | None" = None):
+        """Balance of the account's OWN splits in its own commodity.
+
+        The one rule every own-splits sum shares (C8 read-side):
+
+        - voided splits are excluded by **state**, not value. A
+          well-formed void contributes 0 either way; the corrupted
+          partial-void shape (``state='v'`` with non-zero values,
+          producible by legacy data or desktop edits) must not move
+          balances when the same split is invisible to cash_flow /
+          lots / reconciliation counts.
+        - ``as_of`` (inclusive) caps to posted-by-then transactions;
+          ``None`` means no date bound — callers that intentionally
+          include future-dated transactions pass nothing.
+        - null ``post_date`` rows (old-book artifact, A9) are
+          excluded — same rule ``_query_filtered_splits`` applies,
+          so this sum agrees with the SQL-backed reports.
+        """
+        balance = Decimal("0")
+        for split in account.splits:
+            if _is_voided(split):
+                continue
+            post_date = split.transaction.post_date
+            if post_date is None:
+                continue
+            if as_of is not None and post_date > as_of:
+                continue
+            balance += split.quantity
+        return balance

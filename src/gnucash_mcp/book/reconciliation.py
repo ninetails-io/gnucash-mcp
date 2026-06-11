@@ -387,6 +387,13 @@ class ReconciliationMixin:
                 for split in account.splits:
                     if split.reconcile_state == "y":
                         continue
+                    # Voided splits are zombies, not pending work —
+                    # flipping one to 'y' is the exact mutation
+                    # set_reconcile_state rejects, and it defeats
+                    # unvoid_transaction (C8). The sweep skips them
+                    # silently; they were never reconcilable.
+                    if _is_voided(split):
+                        continue
                     if split.guid in exempt_guids:
                         continue
                     if (
@@ -414,6 +421,15 @@ class ReconciliationMixin:
                         )
                     if split.reconcile_state == "y":
                         raise ValueError(f"Split {guid} is already reconciled")
+                    # Explicitly-targeted voided split: refuse loudly
+                    # (same contract as set_reconcile_state) rather
+                    # than silently skipping a split the caller named.
+                    if _is_voided(split):
+                        raise ValueError(
+                            f"Split {guid} is voided. Voided splits "
+                            f"cannot be reconciled; use "
+                            f"unvoid_transaction first."
+                        )
 
                     splits_to_reconcile.append(split)
                     reconciling_total += split.quantity

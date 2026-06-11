@@ -288,24 +288,45 @@ class ReportingMixin:
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Expense splits are positive when money is spent.
+                # Expense splits are positive when money is spent; a
+                # refund / return / intra-type reclassification posts a
+                # NEGATIVE amount to the expense account. Accumulate the
+                # signed amount so contra entries net against spending
+                # within a category. Dropping non-positive splits here
+                # would report GROSS spend, overstating any category that
+                # had a refund.
                 amount = self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
-                if amount <= 0:
-                    continue
+                # ``depth`` (not ``depth - 1``): path[0] is the type
+                # root ("Expenses"), so the documented "depth 1 =
+                # top-level buckets (Expenses:Food)" needs path[1].
+                # Pre-fix the off-by-one collapsed the entire default
+                # report to a single "Expenses 100%" row (A7).
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision is made AFTER aggregation, not per split. A
+            # category whose net spend is < 0 (net-refunded for the
+            # period) isn't a spend LINE, but its net still belongs in
+            # the TOTAL — dropping it made the total change with the
+            # ``depth`` parameter (a net-negative leaf nets against
+            # siblings at low depth, vanishes at high depth) and untied
+            # income − spending from net income (C6). Net-negative
+            # groups surface explicitly instead of vanishing.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             categories = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -315,14 +336,31 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(categories, total, "account")
+                out = _format_breakdown_tsv(categories, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-refunded "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "categories": categories,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     def income_by_source(
         self,
@@ -361,24 +399,41 @@ class ReportingMixin:
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
                 # Income splits are stored negative (money coming in);
-                # flip to positive for the "how much did I earn" view.
+                # flip to positive for the "how much did I earn" view. A
+                # NEGATIVE contribution inside an income account — a
+                # realized capital loss in Capital Gains, an income
+                # reversal/clawback — flips to a negative amount.
+                # Accumulate the signed amount so losses net against
+                # gains within a source. Dropping them per split would
+                # report GROSS income, overstating the source (a
+                # gains-minus-loss account would show only the gains).
                 amount = -self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
-                if amount <= 0:
-                    continue
+                # ``depth`` (not ``depth - 1``) — same A7 off-by-one
+                # fix as spending_by_category.
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision is made AFTER aggregation, not per split. A
+            # source whose net is < 0 (net loss for the period) isn't
+            # an income LINE, but its net still belongs in the TOTAL
+            # so the total stays depth-invariant and income − spending
+            # ties to net income (C6). Net-loss sources surface
+            # explicitly instead of vanishing.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             sources = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -388,14 +443,31 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(sources, total, "account")
+                out = _format_breakdown_tsv(sources, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-loss "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "sources": sources,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     # ── Balance sheet and net worth ──────────────────────────────────
 
@@ -462,15 +534,21 @@ class ReportingMixin:
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
-                # Skip placeholder accounts so the balance sheet
-                # matches ``_compute_net_worth_at``'s convention
-                # (which already filters ``account.placeholder``
-                # before its balance loop). Pre-fix a placeholder
-                # with direct splits — rare but legal — was double-
-                # counted: once on the placeholder line, once on the
-                # implicit roll-up through its children. SB-8.
-                if account.placeholder:
+                # Voided by state, not value: a well-formed void
+                # contributes 0 anyway; the corrupted partial-void
+                # shape (state='v', non-zero values) must not move
+                # the sheet when cash_flow / lots can't see it (C8).
+                if _is_voided(split):
                     continue
+                # Placeholder accounts are NOT skipped: there is no
+                # roll-up in this report, so direct splits on a
+                # placeholder — rare but legal — are real money no
+                # other row represents. The SB-8 skip guarded a
+                # double-count this code never produces; with the
+                # balancing-residual equity line it silently deleted
+                # the dropped asset instead (adversarial pass 2, C1).
+                # Same own-splits-per-account rule as ``net_worth``
+                # and ``_compute_net_worth_at``.
                 # Value the split in the book's default currency so
                 # investment shares (VTSAX @ $128, etc.) and foreign-
                 # currency holdings contribute their market/USD value
@@ -713,6 +791,10 @@ class ReportingMixin:
                 )
                 total = Decimal("0")
                 for split, _txn, account in rows:
+                    # Voided-by-state filter — same rule as
+                    # balance_sheet (C8 read-side).
+                    if _is_voided(split):
+                        continue
                     # Liabilities are stored negative, so adding the
                     # converted amount directly gives assets minus
                     # liabilities. Investments and foreign-currency
@@ -830,6 +912,11 @@ class ReportingMixin:
                         "net_worth": str(_snapshot_at(boundaries[b_idx])),
                     })
                     b_idx += 1
+                # Voided-by-state filter (C8 read-side) — placed
+                # after the boundary advance so a voided split still
+                # flushes due snapshots, just never accumulates.
+                if _is_voided(split):
+                    continue
                 # Accumulate per-account quantity AND value. Both are
                 # kept so ``_snapshot_at`` can pick the right view
                 # (rate-based vs cost-basis) at each boundary.
@@ -886,6 +973,11 @@ class ReportingMixin:
         come from and where did it go?" rather than "every debit
         and credit that touched a cash account, including same-
         pocket reshuffling." SB-5.
+
+        Invoice/bill settlements (lot-linked A/R / A/P legs) count
+        as real flow despite having no income/expense split — the
+        income was recognized at post time, and the payment is when
+        the cash actually moved (C4). See ``_cashflow_txn_guids``.
 
         Args:
             start_date: Start of period (inclusive).
@@ -998,12 +1090,27 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
     ) -> set[str]:
-        """Set of transaction GUIDs in the period that have at
-        least one non-voided INCOME or EXPENSE split.
+        """Set of transaction GUIDs in the period that count as real
+        cash-flow events rather than internal transfers.
 
         Used by ``cash_flow`` to filter "internal transfer" noise
         from the default report — see that method's docstring
         for the rationale (SB-5).
+
+        Two qualifying shapes (C4):
+
+        1. A non-voided INCOME or EXPENSE split — the ordinary
+           earn/spend event.
+        2. A non-voided **lot-linked** RECEIVABLE / PAYABLE split —
+           an invoice/bill settlement. Income was recognized at post
+           time (A/R ↔ Income never touches cash), so the payment is
+           A/R ↔ bank: structurally a transfer, but it IS the
+           revenue receipt. Pre-fix these were filtered out — unless
+           FX drift happened to add a realized-FX income split,
+           which rescued that one payment and made classification
+           depend on rate movement. Keying on the lot link is
+           deterministic and pulls every settlement into the flow;
+           manual A/R adjustments without a lot stay transfers.
 
         Routes through ``_query_filtered_splits`` to inherit the
         date-bound fix, template-account exclusion, and null-
@@ -1018,10 +1125,21 @@ class ReportingMixin:
             end_date=end_date,
             account_types=_NET_INCOME_TYPES,
         )
-        return {
+        guids = {
             txn.guid for split, txn, _acct in rows
             if not _is_voided(split)
         }
+        settlement_rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=frozenset({"RECEIVABLE", "PAYABLE"}),
+        )
+        guids.update(
+            txn.guid for split, txn, _acct in settlement_rows
+            if not _is_voided(split) and split.lot is not None
+        )
+        return guids
 
     # ── Debt Payoff ───────────────────────────────────────────────
 
@@ -1174,6 +1292,17 @@ class ReportingMixin:
             # template balances. Defense-in-depth, not a bug fix.
             template_guids = self._template_account_guids(book)
 
+            # FX chokepoint: per-account conversion factors so a
+            # foreign-currency debt is valued in the book default
+            # currency (rate × quantity, cost-basis fallback) instead
+            # of summing raw foreign units. "Now" report → today's
+            # rates. Pre-fix this summed raw split.quantity, the lone
+            # reporting-layer method that bypassed the FX helper used by
+            # balance_sheet / net_worth / cash_flow.
+            debt_factors = self._account_conversion_factors(
+                book, date.today()
+            )
+
             for account in book.accounts:
                 if account.guid in template_guids:
                     continue
@@ -1201,10 +1330,24 @@ class ReportingMixin:
                 if apr <= 0:
                     continue
 
-                # Calculate current balance (negate because liabilities are stored negative)
+                # Calculate current balance in the book default currency
+                # (negate because liabilities are stored negative).
+                # "Now" report: future-dated transactions are excluded
+                # (C5) — a payment scheduled for next week hasn't
+                # reduced today's payoff balance — and voided splits
+                # are excluded by state. Null post_date rows (old-book
+                # artifact) can't be dated, so they're skipped too.
+                today = date.today()
                 balance = Decimal("0")
                 for split in account.splits:
-                    balance += split.quantity
+                    if _is_voided(split):
+                        continue
+                    post_date = split.transaction.post_date
+                    if post_date is None or post_date > today:
+                        continue
+                    balance += self._split_in_default_currency(
+                        split, account, debt_factors.get(account.guid)
+                    )
                 balance = -balance  # Convert to positive amount owed
 
                 if balance <= 0:
@@ -1222,6 +1365,20 @@ class ReportingMixin:
                         min_payment = Decimal(mp_str)
                     except InvalidOperation:
                         pass
+                # Slots store untagged scalars; the convention is
+                # the ACCOUNT's commodity (matching the dashboard's
+                # utilization math, which compares credit_limit to
+                # the account-commodity balance). The plan's math
+                # runs in book default currency, so convert with the
+                # same factor the balance used (A3) — pre-fix a
+                # ¥2,000 minimum was treated as $2,000 and skewed
+                # the feasibility gate and the avalanche schedule.
+                if min_payment is not None:
+                    slot_factor = debt_factors.get(account.guid)
+                    if slot_factor is not None and slot_factor != 1:
+                        min_payment = (
+                            min_payment * slot_factor
+                        ).quantize(Decimal("0.01"))
 
                 # 2. Type-aware fallback. Credit cards and amortizing
                 #    loans have very different minimum-payment shapes:
@@ -1264,12 +1421,17 @@ class ReportingMixin:
                         if min_payment > balance:
                             min_payment = balance
 
-                credit_limit = None
+                credit_limit = None  # account-ccy slot; converted below (A3)
                 cl_val = slot_by_name.get("credit_limit")
                 if cl_val is not None:
                     try:
                         cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
                         credit_limit = Decimal(cl_str)
+                        slot_factor = debt_factors.get(account.guid)
+                        if slot_factor is not None and slot_factor != 1:
+                            credit_limit = (
+                                credit_limit * slot_factor
+                            ).quantize(Decimal("0.01"))
                     except InvalidOperation:
                         pass
 

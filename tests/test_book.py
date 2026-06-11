@@ -2643,6 +2643,42 @@ class TestGetBookSummaryWarnings:
         assert "20 days overdue" not in warnings_block
         assert "(posted without terms)" not in warnings_block
 
+    def test_credit_note_never_ages_into_dashboard_warnings(
+        self, business_book: Path,
+    ):
+        """Live-test minor finding: the dashboard listed an unapplied
+        credit note as 'N days past 30-day default' and counted it in
+        the overdue tally, while get_outstanding_invoices correctly
+        exempted it. A credit note is money the business OWES — it
+        stays in the open counts but never ages."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Emerald Analytics", currency="USD")
+        cn = gc.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            date_opened=(date.today() - timedelta(days=238)).isoformat(),
+        )
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Service credit",
+            quantity="1", price="500",
+        )
+        gc.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=(date.today() - timedelta(days=238)).isoformat(),
+        )
+
+        result = gc.get_book_summary()
+        # No past-due warning line for the credit note (it's the only
+        # posted document in this book).
+        assert "Past due" not in result, result
+        assert "past 30-day default" not in result
+        # Counted as open, never as overdue.
+        assert "1 overdue" not in result
+
+
     def test_past_due_invoice_uses_term_duedays_no_terms_annotation(
         self, business_book: Path,
     ):
@@ -5181,6 +5217,68 @@ class TestAutoFillTransaction:
                 description="Never Seen Before XYZ123",
             )
 
+    def _add_empty_description_txn(self, gc_book) -> None:
+        """Post a (legal) empty-description transaction dated most
+        recent, mimicking the A/P transaction that triggered the
+        live-test blocker."""
+        gc_book.create_transaction(
+            description="",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "1242.50"},
+                {"account": "Assets:Checking", "amount": "-1242.50"},
+            ],
+            trans_date=date(2024, 2, 20),
+            check_duplicates=False,
+        )
+
+    def test_no_match_guard_fires_despite_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Live-test blocker regression: an empty-description
+        transaction in the book desc-matched EVERY proposal ("" is a
+        substring of everything), so a no-match auto-fill cloned that
+        unrelated transaction under the caller's description instead
+        of raising. The guard must fire and nothing must be written."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(
+                description="Never Seen Before XYZ123",
+            )
+        # No phantom landed in the book.
+        phantom = gc_book.search_transactions(
+            query="Never Seen Before XYZ123", field="description",
+            compact=False,
+        )
+        assert phantom == []
+
+    def test_real_match_beats_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Positive control: matching still works with the empty-
+        description transaction present (and more recent) — the real
+        description match is the source, not the empty one."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
+
+    def test_empty_proposal_does_not_match_everything(
+        self, test_book: Path,
+    ):
+        """An empty PROPOSED description carries no match signal
+        either — pre-fix it substring-matched every transaction in
+        the book and auto-filled from the most recent one."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(description="")
+
     def test_auto_fill_with_dry_run(self, test_book: Path):
         """Should auto-fill and report the source in dry run mode.
 
@@ -5857,6 +5955,32 @@ class TestUpdateAccount:
         assert gc_book.get_account("Expenses:Groceries") is None
         # Verify new name exists
         assert gc_book.get_account("Expenses:Food & Groceries") is not None
+
+    def test_update_account_rename_rejects_invalid_names(
+        self, test_book: Path
+    ):
+        """M5 regression: the rename branch must reject ':' (path
+        separator), control chars, and whitespace-only names — the same
+        MP-14 validation create_account enforces. Pre-fix the rename
+        path was an unguarded parallel entry point that would corrupt
+        the account's fullname for downstream path parsing.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="cannot contain ':'"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Foo:Bar",
+            )
+        with pytest.raises(ValueError, match="cannot be empty"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="   ",
+            )
+        with pytest.raises(ValueError, match="control characters"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Bad\x01Name",
+            )
+        # Account unchanged after the rejected renames.
+        assert gc_book.get_account("Expenses:Groceries") is not None
 
     def test_update_account_description(self, test_book: Path):
         """Should update account description."""
@@ -7891,6 +8015,166 @@ class TestSpendingByCategory:
         assert result["total"] == "0"
         assert result["categories"] == []
 
+    def test_spending_by_category_nets_refunds(self, tmp_path: Path):
+        """Regression: a refund (negative split) nets against spending
+        within its category instead of being dropped. Pre-fix the
+        per-split ``amount <= 0: continue`` discarded the refund, so the
+        category reported GROSS spend (overstated)."""
+        import piecash
+        bp = tmp_path / "refund.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        shopping = piecash.Account(name="Shopping", type="EXPENSE",
+                                   parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=opening, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Buy", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=shopping, value=Decimal("500")),
+                    piecash.Split(account=checking, value=Decimal("-500"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Return", post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=shopping, value=Decimal("-200")),
+                    piecash.Split(account=checking, value=Decimal("200"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("300")  # 500 - 200, net
+        assert len(result["categories"]) == 1
+        assert Decimal(result["categories"][0]["amount"]) == Decimal("300")
+
+    @staticmethod
+    def _travel_refund_book(tmp_path: Path) -> Path:
+        """Travel 2,000 spend + Travel:Refunds −900 + Food 1,000 —
+        the C6 live shape: a net-negative LEAF under a positive
+        parent, plus an unrelated category."""
+        import piecash
+        bp = tmp_path / "depth_invariant.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        travel = piecash.Account(name="Travel", type="EXPENSE",
+                                 parent=exp, commodity=usd)
+        refunds = piecash.Account(name="Refunds", type="EXPENSE",
+                                  parent=travel, commodity=usd)
+        food = piecash.Account(name="Food", type="EXPENSE",
+                               parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("10000")),
+                    piecash.Split(account=opening, value=Decimal("-10000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Flights", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=travel, value=Decimal("2000")),
+                    piecash.Split(account=checking, value=Decimal("-2000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Airline refund",
+            post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=refunds, value=Decimal("-900")),
+                    piecash.Split(account=checking, value=Decimal("900"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Groceries", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=food, value=Decimal("1000")),
+                    piecash.Split(account=checking, value=Decimal("-1000"))]))
+        book.save()
+        return bp
+
+    def test_total_is_depth_invariant(self, tmp_path: Path):
+        """C6 regression (adversarial pass 2): the TOTAL must not
+        change with the ``depth`` grouping knob. Pre-fix the −900
+        refund leaf netted against Travel at depth 1 but was DROPPED
+        at leaf depth, so the same period reported two different
+        totals."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        totals = set()
+        for depth in (1, 2, 3, 5):
+            result = gc.spending_by_category(
+                compact=False,
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 12, 31),
+                depth=depth,
+            )
+            totals.add(Decimal(result["total"]))
+        assert totals == {Decimal("2100")}, (
+            f"TOTAL varies with depth: {sorted(totals)}"
+        )
+
+    def test_net_negative_group_surfaced_not_dropped(
+        self, tmp_path: Path,
+    ):
+        """C6: at leaf depth the net-refunded category is excluded
+        from the spend lines but surfaced explicitly — an erased
+        real signal pre-fix."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        netted = result["net_negative_netted"]
+        assert len(netted) == 1
+        assert netted[0]["account"] == "Expenses:Travel:Refunds"
+        assert Decimal(netted[0]["amount"]) == Decimal("-900")
+        # Compact mode carries the same signal.
+        compact = gc.spending_by_category(
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        assert "netted into TOTAL" in compact
+        assert "Refunds" in compact
+
+    def test_depth_one_groups_to_top_level_buckets(
+        self, tmp_path: Path,
+    ):
+        """A7 regression (adversarial pass 2): the documented
+        contract is depth 1 = top-level buckets (Expenses:Travel),
+        depth 2 = their children. Pre-fix the off-by-one collapsed
+        the whole default report to a single 'Expenses 100%' row."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=1,
+        )
+        names = {c["account"] for c in result["categories"]}
+        assert names == {"Expenses:Travel", "Expenses:Food"}, names
+        by_name = {c["account"]: c for c in result["categories"]}
+        # Refund leaf nets against its Travel parent at this depth.
+        assert Decimal(
+            by_name["Expenses:Travel"]["amount"]
+        ) == Decimal("1100")
+
 
 class TestIncomeBySource:
     """Tests for income_by_source method."""
@@ -7908,6 +8192,43 @@ class TestIncomeBySource:
         assert "total" in result
         assert "sources" in result
         assert Decimal(result["total"]) > 0
+
+    def test_income_by_source_nets_losses(self, tmp_path: Path):
+        """Regression: a realized loss (negative contribution) in an
+        income account nets against gains in that source instead of
+        being dropped. Pre-fix the per-split ``amount <= 0: continue``
+        discarded the loss, so the source reported GROSS gains."""
+        import piecash
+        bp = tmp_path / "loss.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        inc = piecash.Account(name="Income", type="INCOME", parent=root,
+                              commodity=usd, placeholder=True)
+        capgains = piecash.Account(name="Capital Gains", type="INCOME",
+                                   parent=inc, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Gain", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=capgains, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Loss", post_date=date(2025, 4, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("-300")),
+                    piecash.Split(account=capgains, value=Decimal("300"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).income_by_source(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("700")  # 1000 - 300, net
+        assert len(result["sources"]) == 1
+        assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
 
 
 class TestBalanceSheet:
@@ -8192,6 +8513,240 @@ class TestCrossToolPriceAgreement:
         # Trajectory's "now" anchor should reflect the same rate too:
         # 6700 USD Checking + 1500 USD Euro Savings = 8200.
         assert "now: USD 8,200" in summary
+
+    @staticmethod
+    def _foreign_liability_book(tmp_path: Path) -> Path:
+        """USD-default book with a EUR-denominated credit card.
+
+        Checking holds 1000 USD; the EUR Visa carries a -500 EUR
+        balance; EUR/USD is 1.20. So the card is worth 600 USD and
+        net worth is 1000 - 600 = 400 USD. The raw foreign quantity
+        (500) is the canary: it only surfaces if a tool skips FX
+        conversion on the liability.
+        """
+        import piecash
+        from piecash import factories
+
+        book_path = tmp_path / "foreign_liability.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        root = book.root_account
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        visa_eur = piecash.Account(
+            name="Visa EUR", type="CREDIT", parent=liabilities,
+            commodity=eur,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity, commodity=usd,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel_eur = piecash.Account(
+            name="Travel", type="EXPENSE", parent=expenses, commodity=eur,
+        )
+        book.save()
+
+        # Checking opening balance: +1000 USD.
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=opening, value=Decimal("-1000")),
+            ],
+        ))
+        # Charge 500 EUR on the card (EUR transaction; value==quantity).
+        book.session.add(piecash.Transaction(
+            currency=eur, description="Hotel in Berlin",
+            post_date=date(2024, 1, 10),
+            splits=[
+                piecash.Split(
+                    account=visa_eur,
+                    value=Decimal("-500"), quantity=Decimal("-500"),
+                ),
+                piecash.Split(
+                    account=travel_eur,
+                    value=Decimal("500"), quantity=Decimal("500"),
+                ),
+            ],
+        ))
+        # EUR/USD = 1.20 (past-dated so every "now" tool picks it).
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2024, 2, 1),
+            value="1.20", source="user:test", type="nav",
+        ))
+        book.save()
+        return book_path
+
+    def test_summary_and_reports_agree_on_foreign_liability(
+        self, tmp_path: Path,
+    ):
+        """H1 regression: ``get_book_summary`` must FX-convert
+        foreign-currency liabilities, matching ``balance_sheet`` and
+        ``net_worth``. Pre-fix the dashboard summed raw account-
+        commodity quantity for CREDIT/LIABILITY while the report tools
+        converted — so a EUR credit card diverged by the FX delta on
+        the surface the LLM calls first.
+        """
+        from datetime import date as date_cls
+
+        gc_book = GnuCashBook(str(self._foreign_liability_book(tmp_path)))
+        today = date_cls.today()
+
+        # balance_sheet converts the card: 500 EUR × 1.20 = 600 USD.
+        bs = gc_book.balance_sheet(as_of_date=today)
+        card_row = next(
+            a for a in bs["liabilities"]["accounts"]
+            if a["account"] == "Liabilities:Visa EUR"
+        )
+        assert Decimal(card_row["default_currency_value"]) == Decimal("600.00")
+
+        # net_worth point-in-time: 1000 - 600 = 400 USD. (Book-layer
+        # methods take date objects; the MCP wrapper parses ISO strings.)
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("400.00")
+
+        # The dashboard must agree on BOTH arms:
+        summary = gc_book.get_book_summary()
+        # (a) _collect_summary_balance_sheet: the rendered card value is
+        #     the converted 600.00, NOT the raw 500.
+        assert "Credit cards (1): USD 600.00" in summary, (
+            f"dashboard did not FX-convert the EUR credit card; "
+            f"saw:\n{summary}"
+        )
+        assert "USD 500.00" not in summary  # canary: raw EUR quantity
+        # (b) _compute_net_worth_at trajectory "now" anchor: 400.
+        assert "now: USD 400" in summary, (
+            f"trajectory 'now' net worth did not convert the EUR "
+            f"liability; saw:\n{summary}"
+        )
+
+    @staticmethod
+    def _checking_1000_book(tmp_path: Path) -> Path:
+        """USD book with a single 1000 USD Checking balance."""
+        import piecash
+
+        book_path = tmp_path / "own_splits.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=usd,
+        )
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=equity, value=Decimal("-1000")),
+            ],
+        ))
+        book.save()
+        return book_path
+
+    def _assert_all_surfaces_report_1000(self, gc_book) -> None:
+        """All three net-worth surfaces must count Checking's own
+        splits: balance_sheet, net_worth, and the dashboard's
+        trajectory "now" anchor (``_compute_net_worth_at``) plus its
+        per-account display (``_collect_summary_balance_sheet``)."""
+        from datetime import date as date_cls
+
+        today = date_cls.today()
+        bs = gc_book.balance_sheet(as_of_date=today)
+        assert Decimal(bs["assets"]["total"]) == Decimal("1000.00")
+        assert any(
+            a["account"] == "Assets:Checking"
+            for a in bs["assets"]["accounts"]
+        ), "Checking's own splits dropped from balance_sheet"
+
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("1000.00")
+
+        summary = gc_book.get_book_summary()
+        assert "now: USD 1,000" in summary, (
+            f"trajectory 'now' dropped Checking's own splits; "
+            f"saw:\n{summary}"
+        )
+        assert "Checking: USD 1000.00" in summary, (
+            f"dashboard assets section dropped Checking; saw:\n{summary}"
+        )
+
+    def test_parent_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): an account's own splits
+        must count even after it gains a child. Pre-fix, creating one
+        EMPTY sub-account under Checking silently dropped Checking's
+        entire balance from the dashboard's net-worth anchor (leaf-only
+        iteration) while balance_sheet / net_worth kept it — three
+        surfaces, three scopes.
+        """
+        import piecash
+
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            piecash.Account(
+                name="Sub", type="BANK", parent=checking,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
+
+    def test_placeholder_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): a placeholder's direct
+        splits are real money — rare but legal. Pre-fix, marking
+        Checking a placeholder deleted its balance from balance_sheet
+        (where the unrealized residual silently re-balanced the sheet)
+        and from the dashboard anchor, while net_worth kept it.
+        """
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            checking.placeholder = 1
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
 
 
 class TestNonUsdDefaultCurrency:

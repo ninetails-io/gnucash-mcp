@@ -8559,6 +8559,283 @@ class TestPayInvoice:
             )
 
 
+# ============== Overpayment guard + direction (C2/A4) ==============
+
+
+class TestOverpaymentGuard:
+    """C2 regression (adversarial pass 2): ``pay_invoice`` must
+    reject payments beyond the outstanding balance, and the
+    surfaces that render lot balances must surface DIRECTION
+    instead of abs()-laundering a negative (overpaid) balance
+    into phantom money-owed.
+    """
+
+    def _post_invoice(self, gb, amount="3500.00"):
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        return "000001"
+
+    def test_overpayment_rejected(self, business_book):
+        """Paying $4,500 on a $3,500 invoice rejects — pre-fix it
+        'succeeded' and the customer showed as still owing $1,000."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "3500.00")
+        with pytest.raises(ValueError, match="exceeds the outstanding"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="4500.00",
+            )
+        # Lot untouched by the rejected payment.
+        rows = gb.get_outstanding_invoices(compact=False)
+        assert Decimal(rows[0]["amount_due"]) == Decimal("3500.00")
+
+    def test_overpay_after_partial_rejected_exact_ok(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        with pytest.raises(ValueError, match="exceeds the outstanding"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="400",
+            )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+
+    def test_pay_settled_invoice_rejected(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        with pytest.raises(ValueError, match="exceeds the outstanding"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="0.01",
+            )
+
+    def test_overpay_vendor_bill_rejected(self, business_book):
+        """Direction check on the A/P side (negative-natural lot)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        with pytest.raises(ValueError, match="exceeds the outstanding"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="60",
+                owner_type="vendor",
+            )
+
+    def test_overpaid_lot_surfaces_direction(self, business_book):
+        """A lot driven negative outside pay_invoice (e.g. a manual
+        payment transaction) must surface as OVERPAID with a negative
+        amount_due and no aging clock — not as phantom money owed.
+        Pre-fix: amount_due abs()'d to +200, amount_paid derived as
+        300 (grand − abs) instead of 700, days_past_due ticking."""
+        import piecash
+
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="400",
+        )
+        # Push the lot negative with a manual payment split: 500
+        # posted − 400 paid − 300 manual = −200 (customer credit).
+        with gb.open(readonly=False) as book:
+            ar = next(
+                a for a in book.accounts
+                if a.fullname == "Assets:Accounts Receivable"
+            )
+            checking = next(
+                a for a in book.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            lot_obj = ar.lots[0]
+            ar_split = piecash.Split(
+                account=ar, value=Decimal("-300"),
+            )
+            piecash.Transaction(
+                currency=book.default_currency,
+                description="Manual overpayment",
+                post_date=date(2026, 5, 1),
+                splits=[
+                    ar_split,
+                    piecash.Split(
+                        account=checking, value=Decimal("300"),
+                    ),
+                ],
+            )
+            ar_split.lot = lot_obj
+            book.save()
+
+        rows = gb.get_outstanding_invoices(compact=False)
+        assert len(rows) == 1
+        row = rows[0]
+        assert Decimal(row["amount_due"]) == Decimal("-200.00")
+        assert row["overpaid"] is True
+        assert row["days_past_due"] is None, (
+            "aging clock must not tick on an overpaid document"
+        )
+        assert Decimal(row["amount_paid"]) == Decimal("700.00")
+
+        compact = gb.get_outstanding_invoices(compact=True)
+        assert "OVERPAID" in compact
+
+    def test_credit_note_rows_carry_no_aging_clock(self, business_book):
+        """An unapplied credit note is money the business OWES — it
+        must not carry days_past_due in a collections list."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Out-of-scope work credit",
+            quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date="2025-10-01",  # long past — clock would tick
+        )
+
+        rows = gb.get_outstanding_invoices(compact=False)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["is_credit_note"] is True
+        assert Decimal(row["amount_due"]) == Decimal("100.00")
+        assert row["days_past_due"] is None, (
+            "credit notes have no past-due concept"
+        )
+
+
+class TestCreditNoteRefundFxDirection:
+    """A4 regression (adversarial pass 2): ``fx_realized.direction``
+    must follow ``effective_is_bill`` — the direction the ledger
+    split was booked with. A cross-currency customer credit-note
+    refund pays out like a bill; pre-fix the label keyed off raw
+    ``is_bill`` and called a booked FX LOSS a "gain".
+    """
+
+    def _add_eur_ar_and_price(self, gb, rate_date, rate_value):
+        import piecash
+        from datetime import date as _date
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = None
+            for c in book.commodities:
+                if c.mnemonic == "EUR":
+                    eur = c
+                    break
+            if eur is None:
+                eur = piecash.factories.create_currency_from_ISO("EUR")
+                book.session.add(eur)
+            if not any(a.fullname == "Assets:Accounts Receivable EUR"
+                       for a in book.accounts):
+                assets = next(
+                    a for a in book.accounts if a.fullname == "Assets"
+                )
+                book.session.add(piecash.Account(
+                    name="Accounts Receivable EUR", type="RECEIVABLE",
+                    parent=assets, commodity=eur,
+                ))
+            parsed = (
+                rate_date if isinstance(rate_date, _date)
+                else _date.fromisoformat(rate_date)
+            )
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=parsed,
+                value=str(rate_value), source="user:test", type="nav",
+            ))
+            book.save()
+
+    def test_refund_fx_loss_labeled_loss(self, business_book):
+        """CN posted at 1.10 (A/R relieved 4,950 USD); refunded at
+        1.12 (5,040 USD sent) → 90 USD more left the company than
+        was booked = realized LOSS. The ledger books the +90 debit
+        either way; the label must agree with it."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="EUR credit",
+            quantity="1", price="4500.00",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable EUR",
+            owner_type="customer",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id=cn["id"],
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+            owner_type="customer",
+        )
+
+        assert "fx_realized" in result
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("90.00")
+        # Ledger: debit (loss) on the FX account.
+        fx_balance = gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        )
+        assert fx_balance == Decimal("90")
+        # Label must agree with the ledger. Pre-fix: "gain".
+        assert result["fx_realized"]["direction"] == "loss"
+
+
 # ============== Early-payment discount ==============
 
 
@@ -10371,3 +10648,290 @@ class TestFXStaleRateGuard:
         joined = "\n".join(_fmt_invoice_post(entry))
         assert "forced" not in joined
         assert "stale" not in joined
+
+
+# ============== Cross-commodity A/R relief + discount FX (C10/A5) ==============
+
+
+class TestCrossCommodityArRelief:
+    """C10 (adversarial pass 2): when the A/R account's commodity
+    differs from the invoice currency, the settlement must relieve
+    the lot at the rate the receivable was CARRIED at (post-date),
+    not the pay-date rate. Pre-fix the post→pay drift landed twice —
+    a permanent residual A/R quantity AND the explicit FX split.
+    """
+
+    def _add_eur_and_rates(self, gb: GnuCashBook) -> None:
+        import piecash
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=date(2026, 3, 10),
+                value="1.10", source="user:test", type="nav",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=date(2026, 3, 20),
+                value="1.20", source="user:test", type="nav",
+            ))
+            book.save()
+
+    def test_settled_foreign_invoice_leaves_zero_ar(
+        self, business_book,
+    ):
+        """EUR 1,000 invoice posted to USD A/R at 1.10 (carried
+        1,100), fully paid at 1.20 (1,200 received). Pre-fix the
+        relief quantity used the pay-date rate (1,200), leaving a
+        permanent −100 USD A/R balance; the 100 USD drift belongs
+        ONLY in the FX gain split."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_and_rates(gb)
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR consulting",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",  # USD A/R
+            post_date="2026-03-10",
+        )
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("1100")
+
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="1000.00",
+            payment_date="2026-03-20",
+        )
+
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(
+            result["fx_realized"]["amount"]
+        ) == Decimal("100.00")
+        # The drift lands ONCE: A/R fully relieved, no phantom.
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("0"), "phantom A/R residue after full settlement"
+        assert gb.get_outstanding_invoices(compact=False) == []
+
+    def test_partial_payment_relieves_pro_rata(self, business_book):
+        """A 40% payment relieves 40% of the carried quantity, so
+        two partials + the closer still zero the account."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_and_rates(gb)
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR consulting",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="400.00", payment_date="2026-03-20",
+        )
+        # 40% of the carried 1,100 relieved → 660 remains.
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("660")
+        gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="600.00", payment_date="2026-03-20",
+        )
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("0")
+
+
+class TestDiscountFxAndQuantumTolerance:
+    """C10 companion + A5: the early-payment discount leg of a
+    cross-currency settlement carries the same post→pay drift as
+    the payment leg, and the validator's 1-quantum tolerance must
+    produce a bookable transaction."""
+
+    def _setup_eur_invoice_with_terms(self, gb: GnuCashBook) -> None:
+        import piecash
+
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+            assets = next(
+                a for a in book.accounts if a.fullname == "Assets"
+            )
+            book.session.add(piecash.Account(
+                name="Accounts Receivable EUR", type="RECEIVABLE",
+                parent=assets, commodity=eur,
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=date(2026, 3, 10),
+                value="1.10", source="user:test", type="nav",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=date(2026, 3, 15),
+                value="1.20", source="user:test", type="nav",
+            ))
+            book.save()
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_billterm(
+            name="2/10 Net 30", due_days=30,
+            discount_days=10, discount_percent="2",
+        )
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            term="2/10 Net 30", date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="EUR consulting",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+
+    def test_discount_leg_drift_is_booked(self, business_book):
+        """EUR 1,000 @ 1.10 post, settled at 1.20 with a 2% (EUR 20)
+        discount: payment-leg drift 980 × 0.10 = 98, discount-leg
+        drift 20 × 0.10 = 2. Pre-fix only the 98 was booked and the
+        balance sheet was off by the 2."""
+        gb = GnuCashBook(str(business_book))
+        self._setup_eur_invoice_with_terms(gb)
+
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980.00",
+            payment_date="2026-03-15",
+            apply_discount=True,
+        )
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(
+            result["fx_realized"]["amount"]
+        ) == Decimal("100.00")
+        # Ledger agrees: gain is a credit on the FX income account.
+        assert gb.get_balance(
+            account_name="Income:Foreign Exchange Gain/Loss"
+        ) == Decimal("-100")
+        # And the books tie: A = L + E exactly.
+        bs = gb.balance_sheet(as_of_date=date(2026, 3, 31))
+        assert (
+            Decimal(bs["assets"]["total"])
+            - Decimal(bs["liabilities"]["total"])
+            == Decimal(bs["equity"]["total"])
+        )
+
+    def test_one_quantum_shortfall_mismatch_books_cleanly(
+        self, business_book,
+    ):
+        """A5: the validator admits a 1-cent shortfall-vs-expected
+        mismatch; the discount books at the ACTUAL shortfall so the
+        splits balance. Pre-fix the blessed input died with an
+        opaque GncImbalanceError."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(
+            name="2/10 Net 30", due_days=30,
+            discount_days=10, discount_percent="2",
+        )
+        gb.create_invoice(
+            customer_id="000001", term="2/10 Net 30",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        # Expected discount 20.00; pay 980.01 → shortfall 19.99,
+        # within the 1-quantum tolerance.
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980.01",
+            payment_date="2026-03-15",
+            apply_discount=True,
+        )
+        assert result["status"] == "paid"
+        assert Decimal(result["remaining_balance"]) == Decimal("0")
+        # Discount booked at the actual shortfall.
+        assert gb.get_balance(
+            account_name="Expenses:Sales Discounts"
+        ) == Decimal("19.99")
+
+
+class TestDeleteCreditNoteSlotCleanup:
+    """A6 (adversarial pass 2): deleting an unposted credit note
+    must remove its slot rows (the ``credit-note`` flag and the
+    ``gnc-mcp/applies-to-invoice`` linkage) — the raw-SQL row
+    delete has no ON DELETE CASCADE and orphaned them pre-fix."""
+
+    def test_slots_removed_with_credit_note(self, business_book):
+        from sqlalchemy import text
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )
+        with gb.open(readonly=True) as book:
+            inv = gb._resolve_credit_note(book, cn["id"])
+            cn_guid = inv.guid
+            n_before = book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE obj_guid = :g"),
+                {"g": cn_guid},
+            ).scalar()
+        assert n_before > 0, "fixture should have credit-note slots"
+
+        gb.delete_credit_note(credit_note_id=cn["id"])
+
+        with gb.open(readonly=True) as book:
+            n_after = book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE obj_guid = :g"),
+                {"g": cn_guid},
+            ).scalar()
+        assert n_after == 0, "credit-note slot rows orphaned"

@@ -299,11 +299,26 @@ class CurrencyMixin:
         # cost basis. Each resolution memoizes nothing here; the
         # per-commodity cost is a few indexed price walks, run only
         # for the non-direct minority.
+        # Past anchors forbid after-anchor fallbacks in the chain
+        # legs (C7): the direct pass above hard-filters future
+        # prices for historical reports, and a chained commodity
+        # must honor the same convention — not value a 2025-06-30
+        # sheet at a rate first quoted in September. Now/future
+        # anchors fold to date.max, where every price is "before"
+        # and the flag is moot (forecasts included by convention).
+        allow_after = anchor >= date.today()
         for commodity in self._commodities_with_market_prices(book):
             if commodity.guid in result or commodity == default_currency:
                 continue
+            # Use the future-folded ``anchor`` (not raw ``as_of``) so a
+            # chained commodity applies the same "now/future anchors
+            # include forecast prices" convention as the direct pass
+            # above. The chain legs run with the staleness cap disabled,
+            # so an anchor of ``date.max`` selects the latest available
+            # rate rather than excluding everything as stale.
             chained = self._market_rate_to_default(
-                book, commodity, default_currency, as_of,
+                book, commodity, default_currency, anchor,
+                allow_after=allow_after,
             )
             if chained is not None:
                 result[commodity.guid] = chained
@@ -353,6 +368,7 @@ class CurrencyMixin:
         from_commodity: piecash.Commodity,
         to_commodity: piecash.Commodity,
         as_of: date,
+        allow_after: bool = True,
     ) -> tuple[Decimal, list[str]] | None:
         """Rate from ``from_commodity`` to ``to_commodity`` with the
         intermediate path: direct, inverse, or single-pivot.
@@ -391,6 +407,7 @@ class CurrencyMixin:
             to_commodity=to_commodity,
             as_of=as_of,
             respect_staleness_cap=False,
+            allow_after=allow_after,
         )
         if direct is not None:
             return (direct[0], [])
@@ -403,6 +420,7 @@ class CurrencyMixin:
                 book, from_commodity=from_commodity,
                 to_commodity=pivot, as_of=as_of,
                 respect_staleness_cap=False,
+                allow_after=allow_after,
             )
             if leg1 is None:
                 continue
@@ -410,6 +428,7 @@ class CurrencyMixin:
                 book, from_commodity=pivot,
                 to_commodity=to_commodity, as_of=as_of,
                 respect_staleness_cap=False,
+                allow_after=allow_after,
             )
             if leg2 is None:
                 continue
@@ -425,10 +444,12 @@ class CurrencyMixin:
         from_commodity: piecash.Commodity,
         to_commodity: piecash.Commodity,
         as_of: date,
+        allow_after: bool = True,
     ) -> Decimal | None:
         """Rate-only wrapper over :meth:`_cross_rate_with_path`."""
         res = self._cross_rate_with_path(
             book, from_commodity, to_commodity, as_of,
+            allow_after=allow_after,
         )
         return res[0] if res is not None else None
 
@@ -438,6 +459,7 @@ class CurrencyMixin:
         commodity: piecash.Commodity,
         default_currency: piecash.Commodity,
         as_of: date,
+        allow_after: bool = True,
     ) -> tuple[Decimal, list[str]] | None:
         """Market rate converting one unit of ``commodity`` to the
         book default currency, with the intermediate path, chaining
@@ -463,17 +485,24 @@ class CurrencyMixin:
             return (Decimal("1"), [])
         res = self._cross_rate_with_path(
             book, commodity, default_currency, as_of,
+            allow_after=allow_after,
         )
         if res is not None:
             return res
         for p in self._find_prices(
             book, commodity_guid=commodity.guid, market_only=True,
         ):
+            # Newest-first list with no date bound; the outer hop
+            # honors the same anchor convention as the legs (C7) —
+            # past anchors never price off a future quote.
+            if not allow_after and _to_date(p.date) > as_of:
+                continue
             quote = p.currency
             if quote == default_currency or quote == commodity:
                 continue
             leg = self._cross_rate_with_path(
                 book, quote, default_currency, as_of,
+                allow_after=allow_after,
             )
             if leg is not None:
                 return (
@@ -488,11 +517,13 @@ class CurrencyMixin:
         commodity: piecash.Commodity,
         default_currency: piecash.Commodity,
         as_of: date,
+        allow_after: bool = True,
     ) -> Decimal | None:
         """Rate-only wrapper over
         :meth:`_market_rate_to_default_with_path`."""
         res = self._market_rate_to_default_with_path(
             book, commodity, default_currency, as_of,
+            allow_after=allow_after,
         )
         return res[0] if res is not None else None
 
@@ -525,12 +556,20 @@ class CurrencyMixin:
         its own staleness and rounding. Computed only for the chained
         minority, so it's cheap (and empty on single-currency books).
         """
+        # Fold the anchor exactly as ``_rates_as_of`` does, and apply
+        # the same past-anchor allow_after rule — otherwise the
+        # provenance pass can resolve a DIFFERENT path than the one
+        # that produced the rate and the "(via …)" note lies (C7
+        # cosmetic relative).
+        anchor = self._anchor_for_as_of(as_of)
+        allow_after = anchor >= date.today()
         provenance: dict[str, str] = {}
         for commodity in self._commodities_with_market_prices(book):
             if commodity == default_currency:
                 continue
             res = self._market_rate_to_default_with_path(
-                book, commodity, default_currency, as_of,
+                book, commodity, default_currency, anchor,
+                allow_after=allow_after,
             )
             if res is None:
                 continue
@@ -691,6 +730,7 @@ class CurrencyMixin:
         to_commodity: piecash.Commodity,
         as_of: date,
         respect_staleness_cap: bool = True,
+        allow_after: bool = True,
     ) -> tuple[Decimal, int, date] | None:
         """Cross-currency rate near ``as_of``, with the chosen
         price's age and date.
@@ -720,6 +760,15 @@ class CurrencyMixin:
         warning, not a hard cap, is what flags age for reporting. The
         cap stays on for invoice posting, where a stale rate is etched
         and must be refused.
+
+        ``allow_after=False`` drops preference 3 and 4 entirely —
+        no price dated after ``as_of`` is ever considered. Used by
+        the valuation chain for PAST anchors (C7): the direct pass in
+        ``_rates_as_of`` hard-filters future prices for historical
+        reports, and the chain legs must honor the same convention or
+        a commodity first priced after the report date silently
+        values at that future rate while its directly-priced sibling
+        falls back to cost basis.
 
         Skips piecash's auto-created ``type='transaction'`` rows —
         those are 1.0 placeholders generated on cross-currency invoice
@@ -757,6 +806,8 @@ class CurrencyMixin:
             p_date = _to_date(p.date)
             if p.commodity == from_commodity and p.currency == to_commodity:
                 days = (as_of - p_date).days
+                if days < 0 and not allow_after:
+                    continue
                 if cap_enabled and abs(days) > cap:
                     continue
                 rate = Decimal(str(p.value))
@@ -770,6 +821,8 @@ class CurrencyMixin:
                         best_after_direct = (-days, rate, p_date)
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
+                if days < 0 and not allow_after:
+                    continue
                 if cap_enabled and abs(days) > cap:
                     continue
                 if Decimal(str(p.value)) <= 0:

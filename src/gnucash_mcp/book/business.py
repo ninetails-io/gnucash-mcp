@@ -232,6 +232,15 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
                 f"posted:{posted}{action_str}"
             )
             continue
+        # Overpaid doc: the counterparty holds a credit, so the
+        # aging-clock columns would invite double-collection.
+        # Surface the direction explicitly instead (C2).
+        if r.get("overpaid"):
+            lines.append(
+                f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
+                f"posted:{posted}  OVERPAID — credit balance"
+            )
+            continue
         due = r.get("due_date") or "?"
         days = r.get("days_past_due")
         if days is None:
@@ -439,8 +448,11 @@ class BusinessMixin:
             return acct, None
 
         # Layer 2: fuzzy match by leaf-name substring.
+        template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
+            if account.guid in template_guids:
+                continue
             if account.type not in {"INCOME", "EXPENSE"}:
                 continue
             name_lower = account.name.lower()
@@ -554,8 +566,11 @@ class BusinessMixin:
             return acct, None
 
         # Layer 2: fuzzy match by leaf-name substring.
+        template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
+            if account.guid in template_guids:
+                continue
             if account.type not in {"INCOME", "EXPENSE"}:
                 continue
             name_lower = account.name.lower()
@@ -751,6 +766,9 @@ class BusinessMixin:
         exchange_rate: Decimal,
         fx_account: str | None,
         default_currency,
+        discount_amount: Decimal = Decimal("0"),
+        discount_quantity: Decimal | None = None,
+        discount_commodity=None,
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
 
@@ -783,6 +801,18 @@ class BusinessMixin:
                 gain/loss split. Resolved via
                 :meth:`_get_or_create_fx_account`.
             default_currency: The book's default currency commodity.
+            discount_amount: Early-payment discount in invoice
+                currency (``0`` when no discount applied).
+            discount_quantity: The discount split's unsigned quantity
+                in ``discount_commodity`` (booked at the pay-date
+                rate). ``None`` when no discount.
+            discount_commodity: The discount account's commodity.
+                The discount leg's drift — ``discount ×
+                (pay_rate − post_rate)`` — is realized FX exactly
+                like the payment leg's; pre-fix it was booked
+                nowhere, leaving assets ≠ equity by that amount on
+                any cross-currency discount settlement (C10
+                companion).
 
         Returns:
             ``None`` when no FX split should be booked:
@@ -878,6 +908,55 @@ class BusinessMixin:
             ).quantize(_commodity_quantum(default_currency))
         else:
             fx_diff_default = fx_diff_pay
+
+        # Discount leg (C10 companion). Same shape as the payment
+        # leg: the discount expense/income was booked at the
+        # pay-date rate while the A/R it helped relieve was carried
+        # at the post-date rate; the difference is realized FX.
+        # Skipped when the discount is denominated in the invoice
+        # currency itself (no conversion → no drift) or when a
+        # needed rate is missing (mirror the graceful-skip
+        # convention above — the payment still records, only the
+        # delta isn't surfaced).
+        if (
+            discount_amount > 0
+            and discount_quantity is not None
+            and discount_commodity is not None
+            and discount_commodity != inv.currency
+        ):
+            rate_at_post_disc = self._rate_from_post_transaction(
+                inv.post_txn, discount_commodity,
+            )
+            if rate_at_post_disc is None:
+                post_date_obj = inv.post_txn.post_date
+                if hasattr(post_date_obj, "date") and callable(
+                    post_date_obj.date
+                ):
+                    post_date_obj = post_date_obj.date()
+                rate_at_post_disc = self._find_exchange_rate(
+                    book,
+                    from_commodity=inv.currency,
+                    to_commodity=discount_commodity,
+                    as_of=post_date_obj,
+                )
+            if rate_at_post_disc is not None:
+                expected_disc_at_post = (
+                    discount_amount * rate_at_post_disc
+                ).quantize(_commodity_quantum(discount_commodity))
+                diff_disc = discount_quantity - expected_disc_at_post
+                if discount_commodity != default_currency:
+                    disc_to_default = self._find_exchange_rate(
+                        book,
+                        from_commodity=discount_commodity,
+                        to_commodity=default_currency,
+                        as_of=parsed_date,
+                    )
+                    if disc_to_default is not None:
+                        fx_diff_default += (
+                            diff_disc * disc_to_default
+                        ).quantize(_commodity_quantum(default_currency))
+                else:
+                    fx_diff_default += diff_disc
 
         # Skip booking the FX split when the realized delta is below
         # the smallest representable unit in the FX account's
@@ -1761,6 +1840,24 @@ class BusinessMixin:
             if split.reconcile_state == "v":
                 continue
             total += Decimal(str(split.value))
+        return total
+
+    @staticmethod
+    def _calculate_lot_quantity(lot) -> Decimal:
+        """Sum of split QUANTITIES in a lot, skipping voided splits.
+
+        Companion to :meth:`_calculate_lot_balance` (which sums
+        ``value``, i.e. invoice-currency units). Quantities are in
+        the post account's commodity — when that commodity differs
+        from the invoice currency, this is what the receivable /
+        payable account actually carries, and it's the number a
+        settlement must relieve exactly (C10).
+        """
+        total = Decimal(0)
+        for split in lot.splits:
+            if split.reconcile_state == "v":
+                continue
+            total += Decimal(str(split.quantity))
         return total
 
     @staticmethod
@@ -3360,11 +3457,17 @@ class BusinessMixin:
                     raise ValueError(
                         f"Taxtable {name!r} is referenced by "
                         f"{refcount} entries. Replacing its "
-                        f"entries changes the tax math for "
-                        f"FUTURE entries on those documents — "
-                        f"existing posted invoices retain their "
-                        f"original splits. Pass ``force=True`` "
-                        f"to proceed."
+                        f"entries rewrites the tax math everywhere "
+                        f"the table is read LIVE: already-posted "
+                        f"documents keep their original splits, "
+                        f"but their DISPLAYED totals recompute "
+                        f"from the new entries — outstanding lists "
+                        f"would show phantom amount_paid/amount_due "
+                        f"(recomputed total vs the lot's real "
+                        f"balance). Prefer creating a NEW taxtable "
+                        f"for future documents; pass ``force=True`` "
+                        f"only if you accept that historical-"
+                        f"display skew."
                     )
                 resolved = self._validate_taxtable_entries(
                     book, entries,
@@ -6069,6 +6172,34 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
 
+            # ── Overpayment guard (adversarial pass 2, C2) ────────
+            # The lot balance is signed: positive for A/R invoices,
+            # negative for A/P bills, flipped for credit notes.
+            # Normalize to "amount still owed" via effective_is_bill
+            # and reject any payment beyond it. Pre-fix nothing
+            # compared amount to remaining: an overpayment drove the
+            # lot negative, lot-close (== 0 exactly) never fired, and
+            # downstream abs() calls inverted the sign — a customer
+            # who overpaid by $1,000 rendered as still OWING $1,000
+            # in the collections list.
+            remaining_before_pay = self._calculate_lot_balance(lot_obj)
+            if effective_is_bill:
+                remaining_before_pay = -remaining_before_pay
+            if payment_amount > remaining_before_pay:
+                doc_label = self._doc_label_for(inv.owner_type)
+                raise ValueError(
+                    f"Payment of {payment_amount} "
+                    f"{inv.currency.mnemonic} exceeds the "
+                    f"outstanding balance of {remaining_before_pay} "
+                    f"{inv.currency.mnemonic} on {doc_label} "
+                    f"{invoice_id}. Pay at most the outstanding "
+                    f"balance. To record a genuine overpayment, pay "
+                    f"the outstanding balance and book the excess as "
+                    f"a credit note (create_credit_note) so it shows "
+                    f"as credit owed to the counterparty rather than "
+                    f"a phantom receivable."
+                )
+
             # ── Early-payment discount validation ────────────────
             # Five rejection cases, each with a distinct error so
             # the caller can see exactly which precondition failed.
@@ -6172,6 +6303,18 @@ class BusinessMixin:
                         f"apply_discount for a partial payment."
                     )
 
+                # Book the discount at the ACTUAL shortfall, not the
+                # computed expectation. The tolerance above admits a
+                # 1-quantum mismatch (rounding of the user's payment);
+                # booking ``expected`` then left the splits off by
+                # that quantum and the transaction died later with an
+                # opaque GncImbalanceError after the validator had
+                # blessed the input (A5). A/R clears
+                # ``remaining_before`` and the bank brings
+                # ``payment_amount``, so the discount leg must be
+                # exactly their difference.
+                expected = shortfall.quantize(quantum)
+
                 # All validation passed — resolve the discount account
                 # and build the split. Quantize to the discount
                 # account's commodity quantum after cross-currency
@@ -6210,6 +6353,35 @@ class BusinessMixin:
             else:
                 full_settle_amount = payment_amount
                 full_settle_post_qty = post_quantity
+
+            # C10: when the A/R-A/P account's commodity differs from
+            # the invoice currency, relieve the lot at the rate it is
+            # CARRIED at — proportional to the lot's remaining
+            # quantity — never at the pay-date rate. Pay-date relief
+            # left the post→pay drift in the account's quantity
+            # balance forever (a permanent phantom A/R on a fully
+            # settled invoice) while the same drift was also booked
+            # as the explicit FX split. A full settlement relieves
+            # the remaining quantity exactly; a partial one relieves
+            # pro-rata in invoice-currency terms.
+            if (
+                post_acct.commodity != inv.currency
+                and remaining_before_pay > 0
+            ):
+                lot_qty_remaining = self._calculate_lot_quantity(
+                    lot_obj
+                )
+                qty_owed = (
+                    -lot_qty_remaining if effective_is_bill
+                    else lot_qty_remaining
+                )
+                if full_settle_amount == remaining_before_pay:
+                    full_settle_post_qty = qty_owed
+                else:
+                    full_settle_post_qty = (
+                        qty_owed * full_settle_amount
+                        / remaining_before_pay
+                    ).quantize(_commodity_quantum(post_acct.commodity))
 
             if effective_is_bill:
                 # Pay vendor bill (or refund customer credit note):
@@ -6284,6 +6456,17 @@ class BusinessMixin:
                     exchange_rate=exchange_rate,
                     fx_account=fx_account,
                     default_currency=default_currency,
+                    discount_amount=discount_amount_invoice_ccy,
+                    discount_quantity=(
+                        discount_split.quantity * (
+                            -1 if effective_is_bill else 1
+                        )
+                        if discount_split is not None else None
+                    ),
+                    discount_commodity=(
+                        discount_acct.commodity
+                        if discount_acct is not None else None
+                    ),
                 )
                 if fx_result is not None:
                     splits.append(fx_result["split"])
@@ -6308,6 +6491,15 @@ class BusinessMixin:
 
             book.save()
 
+            # Direction-normalized remaining: positive = still owed.
+            # Never abs() a lot balance — with the overpayment guard
+            # above this is always >= 0 via pay_invoice, but if some
+            # other path left the lot negative, a credit must surface
+            # as negative rather than masquerade as money owed (C2).
+            remaining_directional = (
+                -remaining if effective_is_bill else remaining
+            )
+
             result = {
                 "id": inv.id,
                 "type": (
@@ -6319,7 +6511,7 @@ class BusinessMixin:
                 ),
                 "status": "paid",
                 "amount_paid": str(payment_amount),
-                "remaining_balance": str(abs(remaining)),
+                "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
                 # consumers (e.g. get_transaction lookup) accept
                 # 8+ char prefixes via _resolve_guid.
@@ -6337,9 +6529,16 @@ class BusinessMixin:
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
                 if fx_result is not None:
                     fx_diff_default = fx_result["fx_diff_default"]
+                    # effective_is_bill, not is_bill: a cross-currency
+                    # credit-note refund pays out like a bill, so the
+                    # label must follow the same direction the ledger
+                    # split was booked with (_compute_fx_gain_loss is
+                    # called with effective_is_bill above). Pre-fix a
+                    # booked FX loss on a customer credit-note refund
+                    # was labeled "gain" (adversarial pass 2, A4).
                     direction = (
-                        "loss" if (is_bill and fx_diff_default > 0)
-                        or (not is_bill and fx_diff_default < 0)
+                        "loss" if (effective_is_bill and fx_diff_default > 0)
+                        or (not effective_is_bill and fx_diff_default < 0)
                         else "gain"
                     )
                     result["fx_realized"] = {
@@ -6849,6 +7048,19 @@ class BusinessMixin:
                     {"guid": inv_guid},
                 ).fetchall()
                 for ref in tax_refs:
+                    # Intentionally NOT paired with a _verify_*: the
+                    # stored ``refcount`` column has no in-process
+                    # consumer (every refcount decision goes through
+                    # ``_compute_taxtable_refcount``'s live COUNT(*)),
+                    # ``MAX(0, …)`` makes any miss a harmless no-op, and
+                    # ``taxtable_guid`` is read from the same entry rows
+                    # being deleted in this transaction. This is a
+                    # best-effort cache decrement, not a source of truth.
+                    # (Review L3: corruption harm refuted; the contract
+                    # scanner covers ``Table.__table__`` DML, not raw
+                    # text() — broadening it to every text() statement
+                    # would flag the many legitimately-unverified slot
+                    # operations, so that is deliberately out of scope.)
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
@@ -6878,6 +7090,26 @@ class BusinessMixin:
                 Invoice.__table__,
                 {"guid": inv_guid},
                 f"{type_label} '{doc_id}'",
+            )
+
+            # Slot cleanup (A6): credit-note flag, the
+            # gnc-mcp/applies-to-invoice linkage, and any date
+            # slots live in the slots table keyed by this guid with
+            # no ON DELETE CASCADE — the raw-SQL row delete above
+            # would orphan them. Same explicit-cleanup pattern as
+            # ``_delete_business_person``.
+            from piecash.kvp import Slot
+
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == inv_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Slot.__table__,
+                {"obj_guid": inv_guid},
+                f"Slots for {type_label.lower()} '{doc_id}'",
             )
 
             book.save()
@@ -7553,7 +7785,20 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
+                # Single Job query via _resolve_owner_type_and_job
+                # — Copilot PR #88 review caught the original
+                # ``_effective_owner_type`` + ``_find_job_by_guid``
+                # side-by-side as redundant. Resolved up front
+                # because the lot-balance direction below needs the
+                # effective side too.
+                is_credit_note = self._get_is_credit_note(inv)
+                effective_ot, job_for_inv = (
+                    self._resolve_owner_type_and_job(book, inv)
+                )
+                job_id_field = (
+                    job_for_inv.id if job_for_inv else None
+                )
+                is_bill = self._is_bill_side(effective_ot)
 
                 post_acc_guid = inv.post_acc_guid
                 post_acct = book.session.query(
@@ -7574,14 +7819,29 @@ class BusinessMixin:
                 if balance == Decimal(0):
                     continue
 
+                # Direction-normalize the signed lot balance to
+                # "amount still owed" (or, for a credit note, credit
+                # still available): A/R invoice lots run positive,
+                # A/P bill lots negative, credit notes flipped.
+                # NEGATIVE here means overpaid — the counterparty
+                # holds a credit. Pre-fix this was abs()'d, so an
+                # overpaid invoice rendered as money still OWED in a
+                # collections list, inviting double-collection
+                # (adversarial pass 2, C2).
+                amount_due = -balance if (is_bill ^ is_credit_note) else balance
+                overpaid = amount_due < 0 and not is_credit_note
+
                 try:
                     grand_total = self._get_invoice_entries_and_total(
                         book, inv,
                     )["grand_total"]
                 except ValueError:
-                    grand_total = abs(balance)
+                    grand_total = max(amount_due, Decimal("0"))
 
-                amount_paid = grand_total - abs(balance)
+                # Signed arithmetic keeps amount_paid honest in the
+                # overpaid case: grand 3500, due −1000 → paid 4500
+                # (the pre-fix abs() derivation showed paid 2500).
+                amount_paid = grand_total - amount_due
 
                 # Owner lookup via the polymorphic dispatcher —
                 # routes customer/vendor/employee/job (chasing
@@ -7590,10 +7850,7 @@ class BusinessMixin:
                 # customer/vendor finders keyed off ``is_bill``,
                 # which returned None for job-attached invoices
                 # because inv.owner_guid points at a Job, not a
-                # customer/vendor row. Bookkeeper didn't probe
-                # this path; Copilot caught the related redundant-
-                # query pattern below and the bug surfaced
-                # during the refactor.
+                # customer/vendor row.
                 owner = self._find_invoice_owner_by_guid(
                     book, inv.owner_type, inv.owner_guid,
                 )
@@ -7602,42 +7859,31 @@ class BusinessMixin:
                 posted_dt = _safe_invoice_date(inv, "date_posted")
                 # Resolve the due date through the same three-step
                 # chain the warnings collector uses, so the bookkeeper
-                # sees identical numbers in both places.
+                # sees identical numbers in both places. No aging
+                # clock on credit notes (money the business OWES has
+                # no past-due concept) or overpaid docs (nothing left
+                # to collect) — pre-fix an unapplied credit note
+                # carried ``days_past_due: 238`` in a collections
+                # list (C2).
                 due_date, no_terms = self._resolve_invoice_due_date(
                     book, inv,
                 )
                 days_past_due = (
                     (today - due_date).days
                     if due_date is not None
+                    and not is_credit_note
+                    and not overpaid
                     else None
                 )
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
                 # Credit-note row: type stays as the owner-type
-                # tag ('invoice' / 'bill'), but we add a flag so
-                # the compact formatter can distinguish. The
+                # tag ('invoice' / 'bill'), but the is_credit_note
+                # flag lets the compact formatter distinguish. The
                 # amount-due is the unsettled credit balance —
                 # what's still available to apply or refund.
-                # For job-attached docs (owner_type=3), the
-                # semantic type comes from the effective
-                # owner_type (chases through the Job to the
-                # underlying customer/vendor); we also surface
-                # a job_id so the formatter can annotate the
-                # row.
-                #
-                # Single Job query via _resolve_owner_type_and_job
-                # — Copilot PR #88 review caught the original
-                # ``_effective_owner_type`` + ``_find_job_by_guid``
-                # side-by-side as redundant.
-                is_credit_note = self._get_is_credit_note(inv)
-                effective_ot, job_for_inv = (
-                    self._resolve_owner_type_and_job(book, inv)
-                )
-                job_id_field = (
-                    job_for_inv.id if job_for_inv else None
-                )
-                results.append({
+                row = {
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
                         effective_ot, "invoice"
@@ -7655,9 +7901,12 @@ class BusinessMixin:
                     "no_terms": no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
-                    "amount_due": str(abs(balance)),
+                    "amount_due": str(amount_due),
                     "job_id": job_id_field,
-                })
+                }
+                if overpaid:
+                    row["overpaid"] = True
+                results.append(row)
 
             # Sort: most overdue first (largest days_past_due), so the
             # bookkeeper sees the urgent receivables / bills at the top.
@@ -7724,6 +7973,10 @@ class BusinessMixin:
             owner_type = (
                 "customer" if job.owner_type == 2 else "vendor"
             )
+            # Lot-balance direction for every invoice linked to this
+            # job follows the job's side: A/R lots run positive, A/P
+            # lots negative (credit notes flip per-invoice below).
+            job_is_bill = self._is_bill_side(job.owner_type)
 
             # Linked invoices: polymorphic owner pointer where
             # owner_type=3 and owner_guid=job.guid. Indexed query.
@@ -7752,10 +8005,13 @@ class BusinessMixin:
 
                 if _is_invoice_posted(inv):
                     posted_count += 1
-                    # Posted: paid = billed - outstanding (from
-                    # the lot balance). The lot balance is the
-                    # unsettled amount, so abs(balance) =
-                    # outstanding.
+                    # Posted: paid = billed - outstanding (from the
+                    # lot balance). Direction-normalized, NOT abs()'d:
+                    # an overpaid invoice carries a NEGATIVE
+                    # outstanding (credit held by the counterparty),
+                    # which keeps ``paid`` honest instead of
+                    # understating it by twice the credit
+                    # (adversarial pass 2, C2).
                     post_acct_guid = inv.post_acc_guid
                     post_acct = book.session.query(
                         piecash.Account
@@ -7767,8 +8023,14 @@ class BusinessMixin:
                                 lot_obj = lot
                                 break
                     if lot_obj:
-                        outstanding = abs(
-                            self._calculate_lot_balance(lot_obj)
+                        lot_balance = self._calculate_lot_balance(
+                            lot_obj
+                        )
+                        flip = job_is_bill ^ self._get_is_credit_note(
+                            inv
+                        )
+                        outstanding = (
+                            -lot_balance if flip else lot_balance
                         )
                         paid = billed - outstanding
                     else:
@@ -7901,6 +8163,12 @@ class BusinessMixin:
             bills = filtered_bills
 
             vendor_data: dict[str, dict] = {}
+            # FX chokepoint: bills whose currency has no rate on file are
+            # NOT folded into the default-currency totals (that silently
+            # corrupts the sum). They're tracked here per currency and
+            # surfaced via a warning so the figure is honest about what
+            # it excludes.
+            unconverted: dict[str, dict] = {}
             for bill in bills:
                 v = self._find_vendor_by_guid(
                     book, bill.owner_guid
@@ -7955,23 +8223,44 @@ class BusinessMixin:
                 # Without conversion the grand totals mixed
                 # currencies — a EUR €2,500 bill and a USD $3,000
                 # bill summed to "5,500" of nothing in particular.
+                converted_ok = True
                 if bill.currency != default_currency:
                     rate = latest_rates.get(bill.currency.guid)
                     if rate is not None:
-                        total = total * rate
-                        paid = paid * rate
-                        outstanding = outstanding * rate
-                    # If no rate is on file, fall back to the
-                    # un-converted figures rather than dropping the
-                    # bill silently. The bookkeeper sees a mixed-
-                    # currency total that's wrong by the FX delta,
-                    # which is the same fallback the rest of the
-                    # codebase uses for unpriced commodities.
+                        # Quantize the FX products to the default
+                        # currency's precision: the verbose path emits
+                        # these via str(), so an unquantized product
+                        # would expose a long fractional tail (the
+                        # compact path masks it via _money's 2dp). L4.
+                        q = _commodity_quantum(default_currency)
+                        total = (total * rate).quantize(q)
+                        paid = (paid * rate).quantize(q)
+                        outstanding = (outstanding * rate).quantize(q)
+                    else:
+                        # No rate on file: exclude from the default-
+                        # currency totals rather than summing raw
+                        # foreign units. Accumulate per currency so the
+                        # excluded amount can be reported explicitly.
+                        converted_ok = False
+                        u = unconverted.setdefault(
+                            bill.currency.mnemonic,
+                            {
+                                "total_billed": Decimal(0),
+                                "total_paid": Decimal(0),
+                                "outstanding": Decimal(0),
+                                "bill_count": 0,
+                            },
+                        )
+                        u["total_billed"] += total
+                        u["total_paid"] += paid
+                        u["outstanding"] += outstanding
+                        u["bill_count"] += 1
 
-                vendor_data[v_name]["total_billed"] += total
-                vendor_data[v_name]["total_paid"] += paid
-                vendor_data[v_name]["outstanding"] += outstanding
-                vendor_data[v_name]["bill_count"] += 1
+                if converted_ok:
+                    vendor_data[v_name]["total_billed"] += total
+                    vendor_data[v_name]["total_paid"] += paid
+                    vendor_data[v_name]["outstanding"] += outstanding
+                    vendor_data[v_name]["bill_count"] += 1
 
             vendors_list = []
             grand_billed = Decimal(0)
@@ -7996,6 +8285,17 @@ class BusinessMixin:
                 reverse=True,
             )
 
+        # Warn (once per currency) about bills excluded from the
+        # default-currency totals for lack of a rate, naming the raw
+        # amount so the reader knows the magnitude of what's missing.
+        warnings = [
+            f"{d['bill_count']} bill(s) in {mn} excluded from "
+            f"{default_currency_mnemonic} totals — no exchange rate on "
+            f"file (raw {mn}: billed {d['total_billed']}, outstanding "
+            f"{d['outstanding']})"
+            for mn, d in unconverted.items()
+        ]
+
         full = {
             "vendors": vendors_list,
             "totals": {
@@ -8008,14 +8308,28 @@ class BusinessMixin:
                 ),
             },
         }
+        if unconverted:
+            full["unconverted"] = {
+                mn: {
+                    "total_billed": str(d["total_billed"]),
+                    "total_paid": str(d["total_paid"]),
+                    "outstanding": str(d["outstanding"]),
+                    "bill_count": d["bill_count"],
+                }
+                for mn, d in unconverted.items()
+            }
+            full["warnings"] = warnings
 
         if not compact:
             return full
 
-        return _format_vendor_spending_compact(
+        out = _format_vendor_spending_compact(
             vendors_list,
             grand_billed=grand_billed,
             grand_paid=grand_paid,
             grand_outstanding=grand_outstanding,
             currency=default_currency_mnemonic,
         )
+        if warnings:
+            out += "\n" + "\n".join(f"⚠ {w}" for w in warnings)
+        return out

@@ -1219,3 +1219,96 @@ class TestQueryEndDateInclusive:
             f"max={bs_max['assets']['total']}, "
             f"post-data={bs_post_data['assets']['total']}"
         )
+
+
+class TestHistoricalAnchorChainRates:
+    """C7 (adversarial pass 2): the issue-#94 chain pass must honor
+    the historical-anchor convention the direct pass enforces. A
+    commodity with no on-or-before price falls into the chain legs,
+    which run cap-free — pre-fix they fell back to *after-anchor*
+    prices with no upper bound, so ``balance_sheet(2025-06-30)`` for
+    a fund first priced in September used the September rate while a
+    directly-priced sibling correctly fell back to cost basis.
+    """
+
+    @staticmethod
+    def _fund_via_eur_book(tmp_path: Path) -> Path:
+        """USD book holding a fund priced only in EUR (forces the
+        chain pass), with both legs' first quotes dated 2025-09-01
+        — months after the 2025-01-15 buy."""
+        bp = tmp_path / "chain_anchor.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        from piecash import factories
+
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        fund = piecash.Commodity(
+            namespace="FUND", mnemonic="GFUND",
+            fullname="Global Fund", fraction=10000,
+        )
+        book.session.add(fund)
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        gfund = piecash.Account(name="GFUND", type="MUTUAL",
+                                parent=assets, commodity=fund)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("10000")),
+                    piecash.Split(account=opening, value=Decimal("-10000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Buy fund",
+            post_date=date(2025, 1, 15),
+            splits=[
+                piecash.Split(account=gfund, value=Decimal("1000"),
+                              quantity=Decimal("10")),
+                piecash.Split(account=checking, value=Decimal("-1000")),
+            ]))
+        # First quotes: 2025-09-01 on BOTH legs (fund→EUR, EUR→USD).
+        book.session.add(piecash.Price(
+            commodity=fund, currency=eur, date=date(2025, 9, 1),
+            value="95.00", source="user:test", type="nav"))
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2025, 9, 1),
+            value="1.10", source="user:test", type="nav"))
+        book.save()
+        return bp
+
+    def test_past_anchor_never_uses_future_chain_rate(
+        self, tmp_path: Path,
+    ):
+        gb = GnuCashBook(str(self._fund_via_eur_book(tmp_path)))
+
+        # June 30: no quote exists on or before the anchor on either
+        # leg → cost basis (1,000), NOT 10 × 95 × 1.10 = 1,045.
+        bs_past = gb.balance_sheet(as_of_date=date(2025, 6, 30))
+        rows = {a["account"]: a for a in bs_past["assets"]["accounts"]}
+        fund_row = rows["Assets:GFUND"]
+        assert "no price data" in fund_row["balance"], fund_row
+        assert Decimal(
+            fund_row["default_currency_value"]
+        ) == Decimal("1000.00")
+        assert Decimal(bs_past["assets"]["total"]) == Decimal("10000.00")
+
+    def test_past_anchor_still_chains_when_quotes_precede_it(
+        self, tmp_path: Path,
+    ):
+        """The fix must not break legitimate historical chaining —
+        an anchor after the quotes still resolves fund→EUR→USD."""
+        gb = GnuCashBook(str(self._fund_via_eur_book(tmp_path)))
+        bs = gb.balance_sheet(as_of_date=date(2025, 9, 30))
+        rows = {a["account"]: a for a in bs["assets"]["accounts"]}
+        fund_row = rows["Assets:GFUND"]
+        assert Decimal(
+            fund_row["default_currency_value"]
+        ) == Decimal("1045.00")
+        assert Decimal(bs["assets"]["total"]) == Decimal("10045.00")

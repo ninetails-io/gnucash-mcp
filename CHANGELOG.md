@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.3.0 — Business module complete, role-aligned modules
+## v1.3.1 — Business module, role-aligned modules, multi-currency correctness
 
 v1.2.1 fixed everything the business module *should* have been at first
 ship. v1.3 finishes the headline features the bookkeeper had been
@@ -335,16 +335,193 @@ transaction warnings are the next correctness items on the
 backlog. The bookkeeper's daily flow remains the production
 signal.
 
-**Tests:** 1,390 passing (was 1,114 at v1.2.1). New regression
+**Multi-currency correctness sweep.** An adversarial multi-agent
+review of the whole v1.3 surface, plus the valuation work it leaned
+on — validated against the synthetic Alex (USD) and Lin Wei (CNY)
+books and the bookkeeper's real-book pass.
+
+- **`get_book_summary` FX-converts foreign-currency liabilities.**
+  The dashboard balance-sheet and net-worth trajectory summed credit
+  cards and loans at raw account-commodity quantity, while
+  `balance_sheet` / `net_worth` converted them — so a foreign-
+  denominated card or loan disagreed across surfaces. All three now
+  agree to the cent.
+- **`debt_payoff_plan`** values foreign-currency debt in the book
+  default currency instead of summing raw foreign units.
+- **`vendor_spending_report`** excludes bills it can't convert (no
+  rate on file) from the default-currency totals and emits a
+  per-currency warning, rather than silently mixing currencies.
+- **Intermediate-currency valuation.** A holding priced only through
+  a pivot currency (e.g. a fund quoted in USD inside a CNY book) now
+  values via the chain, with provenance noting the derived path
+  (`via USD`).
+- **FX staleness cap.** Market-rate lookups exclude quotes more than
+  a configurable window (`GNUCASH_FX_STALENESS_DAYS`, default 90)
+  from the report date; invoice/bill post & pay raise a clear
+  `StaleFXRateError` rather than posting on a stale rate (override
+  with `force`).
+- **Consistent future-price convention.** The rate chain pass
+  applies the same "include future-dated forecasts at now-anchors"
+  rule as the direct pass.
+- **`income_by_source` / `spending_by_category` net contra splits.**
+  Both reports dropped within-account negative splits per split (a
+  realized capital loss, an expense refund), reporting *gross*
+  instead of *net* — a Capital Gains source showed gains-only, a
+  refunded category overstated spend. They now net signed amounts per
+  account before presenting. (Account balances were always correct;
+  only these two reports misstated.)
+
+**Final adversarial pass (pre-release).** A second adversarial
+review of the release candidate probed the shapes the synthetic
+books can't produce — parents and placeholders with direct splits,
+overpayments, contra splits against budgets — and held the release
+for four fixes:
+
+- **Net-worth surfaces agree on which splits count.** The dashboard
+  skipped parent and placeholder accounts' own splits;
+  `balance_sheet` skipped placeholders'; `net_worth` skipped
+  neither. None of the three rolls children up, so a parent's or
+  placeholder's *direct* splits are real money no other row
+  represents — and the balancing-residual equity line hid the
+  deletion from the sheet's own A = L + E check. All three now share
+  one rule: every account contributes exactly its own splits.
+- **`pay_invoice` rejects overpayments.** Nothing compared the
+  payment to the remaining balance: an overpayment drove the lot
+  negative and downstream `abs()` calls inverted the sign — a
+  customer who overpaid by $1,000 showed as still *owing* $1,000 in
+  the collections list. Overpaying now rejects with guidance to book
+  the excess as a credit note; `remaining_balance`, `amount_due`,
+  and job-report `outstanding` are direction-normalized (a negative
+  reads as credit held by the counterparty, rendered `OVERPAID` in
+  compact rows); credit notes no longer carry an aging clock in the
+  verbose outstanding list.
+- **Budget actuals net contra splits.** `get_budget_report` and the
+  dashboard budget headline still used the per-split gross filter
+  the contra-netting fix above retired for the income/spending
+  reports — the budget surfaces contradicted those reports on the
+  same data. Both now accumulate signed amounts.
+- **FX direction label on credit-note refunds.** A cross-currency
+  credit-note refund's booked FX loss was labeled `"gain"` in the
+  pay response (the ledger split was always correct); the label now
+  follows the same effective direction the split was booked with.
+
+The remaining findings from the same review closed before release,
+locked by a new "pathological shapes" fixture book (parents and
+placeholders with direct splits, an overpaid invoice lot, a voided
+transaction, a desktop-created SX template, foreign-denominated A/R,
+a future-dated entry) that runs every report surface against the
+combination:
+
+- **Native SX templates filtered everywhere.** GnuCash desktop
+  persists scheduled-transaction recipes as real Transaction rows
+  under `root_template` plus a `template` pseudo-commodity.
+  `list_transactions`, `search_transactions`, the dashboard stats /
+  warnings, `list_commodities`, and the Commodities line now filter
+  both via a shared `_is_template_transaction` chokepoint, and
+  `delete_scheduled_transaction` removes desktop recipe rows instead
+  of orphaning their splits.
+- **Voided splits protected at every boundary.** `update_transaction`
+  and `replace_splits` refuse voided targets (unvoid first),
+  `reconcile_account` skips voided splits in bulk sweeps and refuses
+  explicitly-targeted ones, and auto-fill / duplicate detection no
+  longer source signals from voided history (the silent-$0-
+  transaction generator). Balance surfaces exclude voided splits by
+  state through a new `_own_splits_balance` chokepoint, so the
+  partial-void corruption shape can't move money invisibly.
+- **Future-dated transactions excluded from "now" surfaces.**
+  Runway, the low-cash warning, and `debt_payoff_plan` now cap at
+  today like every other "now" surface; null `post_date` rows (an
+  old-book artifact) render as `(no date)` instead of raising.
+- **Report totals are depth-invariant.** `spending_by_category` /
+  `income_by_source` totals are the signed sum over every group;
+  net-refunded categories and net-loss sources surface explicitly
+  (`net_negative_netted`) instead of silently vanishing at deeper
+  `depth` values. The `depth` parameter now matches its documented
+  contract (1 = top-level buckets like `Expenses:Food`); the old
+  off-by-one collapsed the default report to a single `Expenses
+  100%` row.
+- **Historical anchors never value via future rates.** The
+  intermediate-currency chain pass honors the same on-or-before
+  convention as the direct pass for past anchors; rate provenance
+  notes now name the path that actually produced the rate.
+- **Invoice settlements count as cash flow.** Lot-linked A/R / A/P
+  payments are real flow (the freelancer's revenue receipt), not
+  internal transfers — and the classification no longer depends on
+  whether FX drift happened to add a rescue split.
+- **Cross-commodity A/R relieved at the carried rate.** When the
+  receivable account's commodity differs from the invoice currency,
+  settlements relieve the lot at the post-date rate it was carried
+  at (pro-rata for partials), so a fully settled invoice leaves no
+  phantom A/R; the early-payment-discount leg's FX drift is booked
+  with the payment leg's, and the discount books at the actual
+  shortfall so the validator's 1-quantum tolerance can't produce an
+  unbalanceable transaction.
+- **Lot gains convert foreign cost basis.** `calculate_lot_gain`
+  converts foreign-denominated purchase legs at their historical
+  purchase rates before comparing against default-currency proceeds.
+- **Smaller corrections.** `update_taxtable`'s force gate spells out
+  the live-recompute blast radius; debt-plan `minimum_payment` /
+  `credit_limit` slots convert from the account's commodity;
+  invoice-family deletes clean their slot rows; `get_lot` marks
+  voided zombie rows and the dashboard reconciliation section
+  ignores them; stale docstrings corrected and a dead helper
+  removed.
+
+**Live-test signoff fixes.** The bookkeeper's post-pass validation
+run surfaced two more, both fixed before the release PR:
+
+- **Auto-fill no-match guard actually fires.** The description match
+  was bidirectional substring, so an empty-description transaction
+  matched *every* proposed description — a no-match auto-fill cloned
+  that unrelated transaction under the caller's description (a
+  phantom write) instead of raising "no match found". Blank
+  descriptions now carry no match signal on either side, which also
+  cleans the same false D-signal out of the stability, recent-match,
+  and duplicate buckets.
+- **Dashboard never ages credit notes.** The summary's warnings
+  listed an unapplied credit note as past due and counted it in the
+  overdue tally while `get_outstanding_invoices` correctly exempted
+  it. Credit notes stay in the open counts but carry no aging clock
+  anywhere.
+
+**Data safety.** Backup retention works again under
+`GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
+basename that resolved against the working directory — a silent
+no-op (unbounded backup growth) or a wrong-file delete. They now
+reconstruct the real path inside the backups directory.
+
+**Validation & hardening.**
+
+- `update_account`'s rename path enforces the same name validation as
+  `create_account` (rejects `:`, control characters, empty names) —
+  it was an unguarded parallel entry point.
+- Fuzzy FX / discount-account matching skips template accounts.
+- Business free-text input gates short-circuit at the MCP schema
+  boundary (reject before the audit log fires); transaction
+  write-verification handles two splits to the same account.
+
+**Retroactive budgets.** `create_budget` accepts a `start_date` so a
+budget can be anchored to a past period for back-comparison, not
+just the current year.
+
+Under the hood: cross-currency conversion consolidated into one path
+across invoice post/pay, and the deferred review items cleared.
+
+**Tests:** 1,584 passing (was 1,114 at v1.2.1). New regression
 classes cover the four Stage 3 features end-to-end, the strict-
 kwargs contract, the `id` alias mutex, the FX-correct
 breakdowns (now extended to monthly net, runway, budget
 headline, and vendor spending), the role-aligned module groups,
 the balance-sheet equation closure across simple, multi-
-currency, and A/R-bearing books, and the synthetic Unrealized
-Gain/Loss line's presence/absence semantics. The two synthetic
-test personas (Alex, Lin Wei) and the bookkeeper's real-book
-validation remain the verification harness.
+currency, and A/R-bearing books, the synthetic Unrealized
+Gain/Loss line's presence/absence semantics, and the correctness
+sweep — cross-tool agreement on foreign-currency liabilities,
+vendor-report exclusion of unconvertible bills, backup pruning
+under path redaction, account-name rename validation,
+same-account split write-verification, and report contra-split
+netting (capital-loss in income, refund in expenses). The two
+synthetic test personas (Alex, Lin Wei) and the bookkeeper's
+real-book validation remain the verification harness.
 
 ---
 

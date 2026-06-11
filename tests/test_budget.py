@@ -910,6 +910,104 @@ class TestGetBudgetReport:
             book.get_budget_report(compact=False,budget_name="Nonexistent", period=0)
 
 
+# ============== TestBudgetContraNetting ==============
+
+
+class TestBudgetContraNetting:
+    """C3 regression (adversarial pass 2): budget actuals must
+    accumulate SIGNED amounts so contra splits (expense refunds,
+    income clawbacks) net — the same a34867c fix that
+    income_by_source / spending_by_category received. Pre-fix the
+    per-split gross filter (``amount > 0`` / ``amount < 0``) made
+    the budget surfaces contradict those reports on the same data:
+    spend 200 + refund 120 showed actual 200 instead of net 80.
+    """
+
+    def test_report_nets_expense_refunds(self, budget_book: Path):
+        """get_budget_report: Jan Groceries spend is $500; a $120
+        refund must net the actual to $380, not stay at gross $500."""
+        from datetime import date as date_cls
+
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="600.00",
+        )
+        book.create_transaction(
+            description="Grocery return",
+            trans_date=date_cls(2026, 1, 20),
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-120.00"},
+                {"account": "Assets:Checking", "amount": "120.00"},
+            ],
+        )
+
+        report = book.get_budget_report(
+            compact=False, budget_name="2026 Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        groceries = by_acct["Expenses:Groceries"]
+        assert Decimal(groceries["actual"]) == Decimal("380"), (
+            f"budget report kept gross actuals (refund dropped): "
+            f"{groceries}"
+        )
+        assert Decimal(groceries["remaining"]) == Decimal("220")
+
+    def test_dashboard_headline_nets_expense_refunds(
+        self, budget_book: Path,
+    ):
+        """_budget_headline (dashboard): spend 200 + refund 120 against
+        a 160 budget = 50% used (net 80), not 125% (gross 200).
+
+        Uses Entertainment — the fixture account with no other
+        transactions — because the headline accumulates actuals over
+        the budget's full period range, and Groceries carries Jan/Feb
+        fixture spend that would muddy the assertion.
+        """
+        from datetime import date as date_cls
+
+        today = date_cls.today()
+        month_start = date_cls(today.year, today.month, 1)
+
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(
+            name="Headline", year=today.year, num_periods=12,
+        )
+        book.set_budget_amount(
+            budget_name="Headline",
+            account="Expenses:Entertainment",
+            amount="160.00", period=today.month - 1,
+        )
+        book.create_transaction(
+            description="Concert tickets",
+            trans_date=month_start,
+            splits=[
+                {"account": "Expenses:Entertainment", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+        )
+        book.create_transaction(
+            description="Concert refund",
+            trans_date=month_start,
+            splits=[
+                {"account": "Expenses:Entertainment", "amount": "-120.00"},
+                {"account": "Assets:Checking", "amount": "120.00"},
+            ],
+        )
+
+        with book.open(readonly=True) as b:
+            transactions = list(b.transactions)
+            headline = book._budget_headline(b, transactions)
+
+        assert headline is not None, "budget headline returned None"
+        assert headline["used_pct"] == Decimal("50"), (
+            f"dashboard headline kept gross actuals (refund dropped): "
+            f"{headline}"
+        )
+
+
 # ============== TestListAndGetBudget ==============
 
 

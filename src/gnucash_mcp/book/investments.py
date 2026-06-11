@@ -73,6 +73,11 @@ class InvestmentsMixin:
 
             for commodity in book.commodities:
                 ns = commodity.namespace
+                # GnuCash's ``template`` pseudo-commodity backs SX
+                # template accounts in desktop-created books —
+                # scaffolding, not a tracked holding.
+                if ns.lower() == "template":
+                    continue
                 if ns not in by_namespace:
                     by_namespace[ns] = []
 
@@ -841,13 +846,22 @@ class InvestmentsMixin:
 
             splits = []
             for split in lot.splits:
-                splits.append({
+                row = {
                     "guid": prefixes.get(split.guid, split.guid),
-                    "date": split.transaction.post_date.isoformat(),
+                    "date": (
+                        split.transaction.post_date.isoformat()
+                        if split.transaction.post_date else None
+                    ),
                     "description": split.transaction.description,
                     "quantity": str(split.quantity),
                     "value": str(split.value),
-                })
+                }
+                # The summary already excludes voided zombies; an
+                # unmarked 0-row here read as a real event the
+                # summary then contradicted (A8).
+                if _is_voided(split):
+                    row["voided"] = True
+                splits.append(row)
 
             summary = self._lot_summary(lot)
             # Phase 6A: ``is_closed`` already lives at the top level
@@ -1004,6 +1018,8 @@ class InvestmentsMixin:
             else:
                 shares_to_sell = remaining
 
+            default_ccy = self._require_default_currency(book)
+
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
@@ -1018,7 +1034,6 @@ class InvestmentsMixin:
                 # through ``_find_prices`` with both filters fixes
                 # both at one chokepoint.
                 commodity = lot.account.commodity
-                default_ccy = self._require_default_currency(book)
                 recent = self._find_prices(
                     book,
                     commodity_guid=commodity.guid,
@@ -1031,13 +1046,38 @@ class InvestmentsMixin:
                     )
                 price = Decimal(str(recent[0].value))
 
+            # Cost basis must be in the same currency as the
+            # proceeds (A1). ``purchase_value`` sums raw
+            # ``split.value`` — TRANSACTION-currency units. A
+            # foreign-denominated buy (EUR-currency purchase
+            # transaction in a USD book) must convert at its
+            # historical purchase date or the tax-relevant gain is
+            # wrong by the full FX factor. Same-currency buys (the
+            # common case) pass through unchanged; a missing
+            # historical rate degrades to the raw value (house
+            # fallback convention).
+            purchase_value_default = Decimal("0")
+            for split in lot.splits:
+                if _is_voided(split) or split.quantity <= 0:
+                    continue
+                value = Decimal(str(split.value))
+                txn_ccy = split.transaction.currency
+                if txn_ccy != default_ccy:
+                    rate = self._cross_rate(
+                        book, txn_ccy, default_ccy,
+                        as_of=split.transaction.post_date,
+                    )
+                    if rate is not None:
+                        value = value * rate
+                purchase_value_default += value
+
             # Prorate cost basis on shares-to-sell. Avoids the precision
             # loss of ``cost_per_share * shares`` for non-round
             # per-share costs (e.g., $100 / 3 shares: prorate gives
             # exactly $100 for selling all 3, while the divide-then-
             # multiply path gives $99.99...). Tax-relevant.
             cost_basis = (
-                raw["purchase_value"] * shares_to_sell
+                purchase_value_default * shares_to_sell
                 / raw["purchase_quantity"]
             )
             proceeds = price * shares_to_sell

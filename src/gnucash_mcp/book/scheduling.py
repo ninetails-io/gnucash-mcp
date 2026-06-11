@@ -506,6 +506,16 @@ class SchedulingMixin:
                 continue
 
             count += 1
+            # splits-json amounts are in the book default currency by
+            # construction: create_scheduled_transaction pins the
+            # template transaction to the default currency, and
+            # create_transaction_from_scheduled instantiates with no
+            # currency override — so every stored amount is a default-
+            # currency value. Summing them needs no FX conversion, and
+            # get_book_summary's single "{default_currency} N" label is
+            # correct. (A foreign-currency SX would require a native-
+            # GnuCash template, which carries no splits-json slot and so
+            # contributes nothing here.)
             for s in self._get_sx_splits(book, sx):
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
@@ -924,6 +934,17 @@ class SchedulingMixin:
             template_acct = sx.template_account
             book.session.delete(sx)
             if template_acct:
+                # Desktop-created SXs store the split recipe as real
+                # Transaction rows posted to the template account;
+                # our splits-json design leaves it empty. Delete the
+                # recipe transactions first — deleting the account
+                # alone would orphan their splits (or fail the FK
+                # check at save).
+                recipe_txns = {
+                    s.transaction for s in list(template_acct.splits)
+                }
+                for txn in recipe_txns:
+                    book.session.delete(txn)
                 book.session.delete(template_acct)
 
             book.save()
