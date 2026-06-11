@@ -974,6 +974,11 @@ class ReportingMixin:
         and credit that touched a cash account, including same-
         pocket reshuffling." SB-5.
 
+        Invoice/bill settlements (lot-linked A/R / A/P legs) count
+        as real flow despite having no income/expense split — the
+        income was recognized at post time, and the payment is when
+        the cash actually moved (C4). See ``_cashflow_txn_guids``.
+
         Args:
             start_date: Start of period (inclusive).
             end_date: End of period (inclusive).
@@ -1085,12 +1090,27 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
     ) -> set[str]:
-        """Set of transaction GUIDs in the period that have at
-        least one non-voided INCOME or EXPENSE split.
+        """Set of transaction GUIDs in the period that count as real
+        cash-flow events rather than internal transfers.
 
         Used by ``cash_flow`` to filter "internal transfer" noise
         from the default report — see that method's docstring
         for the rationale (SB-5).
+
+        Two qualifying shapes (C4):
+
+        1. A non-voided INCOME or EXPENSE split — the ordinary
+           earn/spend event.
+        2. A non-voided **lot-linked** RECEIVABLE / PAYABLE split —
+           an invoice/bill settlement. Income was recognized at post
+           time (A/R ↔ Income never touches cash), so the payment is
+           A/R ↔ bank: structurally a transfer, but it IS the
+           revenue receipt. Pre-fix these were filtered out — unless
+           FX drift happened to add a realized-FX income split,
+           which rescued that one payment and made classification
+           depend on rate movement. Keying on the lot link is
+           deterministic and pulls every settlement into the flow;
+           manual A/R adjustments without a lot stay transfers.
 
         Routes through ``_query_filtered_splits`` to inherit the
         date-bound fix, template-account exclusion, and null-
@@ -1105,10 +1125,21 @@ class ReportingMixin:
             end_date=end_date,
             account_types=_NET_INCOME_TYPES,
         )
-        return {
+        guids = {
             txn.guid for split, txn, _acct in rows
             if not _is_voided(split)
         }
+        settlement_rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=frozenset({"RECEIVABLE", "PAYABLE"}),
+        )
+        guids.update(
+            txn.guid for split, txn, _acct in settlement_rows
+            if not _is_voided(split) and split.lot is not None
+        )
+        return guids
 
     # ── Debt Payoff ───────────────────────────────────────────────
 

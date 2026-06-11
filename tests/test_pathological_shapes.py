@@ -103,14 +103,22 @@ class TestCrossSurfaceAgreement:
         assert "Checking: USD 10200.00" in summary
         assert "Savings: USD 500.00" in summary
 
-    def test_cash_flow_excludes_voided_expense(self, pathological_book):
-        """The only expense transaction in the book is voided; no
-        flow surface may count its zombie splits."""
+    def test_cash_flow_voided_settlements_and_transfers(
+        self, pathological_book,
+    ):
+        """Three classification rules at once: the voided expense
+        contributes nothing; lot-linked A/R settlements ARE inflows
+        (C4 — pre-fix the 400 + 300 invoice payments were filtered
+        as 'internal transfers' and default inflows read 0); the
+        opening-balance and savings transfers stay excluded with a
+        visible count."""
         gb = GnuCashBook(str(pathological_book.path))
         flow = gb.cash_flow(
             start_date=date(2026, 1, 1), end_date=date(2026, 6, 1),
         )
         assert Decimal(flow["outflows"]) == Decimal("0")
+        assert Decimal(flow["inflows"]) == Decimal("700")
+        assert flow["transfers_excluded"] == 2
         # Transfer-inclusive mode must also run clean over the
         # placeholder transfer and lot-assigned manual payment.
         gb.cash_flow(
