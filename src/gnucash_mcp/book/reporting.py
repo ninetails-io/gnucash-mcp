@@ -1365,6 +1365,20 @@ class ReportingMixin:
                         min_payment = Decimal(mp_str)
                     except InvalidOperation:
                         pass
+                # Slots store untagged scalars; the convention is
+                # the ACCOUNT's commodity (matching the dashboard's
+                # utilization math, which compares credit_limit to
+                # the account-commodity balance). The plan's math
+                # runs in book default currency, so convert with the
+                # same factor the balance used (A3) — pre-fix a
+                # ¥2,000 minimum was treated as $2,000 and skewed
+                # the feasibility gate and the avalanche schedule.
+                if min_payment is not None:
+                    slot_factor = debt_factors.get(account.guid)
+                    if slot_factor is not None and slot_factor != 1:
+                        min_payment = (
+                            min_payment * slot_factor
+                        ).quantize(Decimal("0.01"))
 
                 # 2. Type-aware fallback. Credit cards and amortizing
                 #    loans have very different minimum-payment shapes:
@@ -1407,12 +1421,17 @@ class ReportingMixin:
                         if min_payment > balance:
                             min_payment = balance
 
-                credit_limit = None
+                credit_limit = None  # account-ccy slot; converted below (A3)
                 cl_val = slot_by_name.get("credit_limit")
                 if cl_val is not None:
                     try:
                         cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
                         credit_limit = Decimal(cl_str)
+                        slot_factor = debt_factors.get(account.guid)
+                        if slot_factor is not None and slot_factor != 1:
+                            credit_limit = (
+                                credit_limit * slot_factor
+                            ).quantize(Decimal("0.01"))
                     except InvalidOperation:
                         pass
 

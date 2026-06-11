@@ -3457,11 +3457,17 @@ class BusinessMixin:
                     raise ValueError(
                         f"Taxtable {name!r} is referenced by "
                         f"{refcount} entries. Replacing its "
-                        f"entries changes the tax math for "
-                        f"FUTURE entries on those documents — "
-                        f"existing posted invoices retain their "
-                        f"original splits. Pass ``force=True`` "
-                        f"to proceed."
+                        f"entries rewrites the tax math everywhere "
+                        f"the table is read LIVE: already-posted "
+                        f"documents keep their original splits, "
+                        f"but their DISPLAYED totals recompute "
+                        f"from the new entries — outstanding lists "
+                        f"would show phantom amount_paid/amount_due "
+                        f"(recomputed total vs the lot's real "
+                        f"balance). Prefer creating a NEW taxtable "
+                        f"for future documents; pass ``force=True`` "
+                        f"only if you accept that historical-"
+                        f"display skew."
                     )
                 resolved = self._validate_taxtable_entries(
                     book, entries,
@@ -7084,6 +7090,26 @@ class BusinessMixin:
                 Invoice.__table__,
                 {"guid": inv_guid},
                 f"{type_label} '{doc_id}'",
+            )
+
+            # Slot cleanup (A6): credit-note flag, the
+            # gnc-mcp/applies-to-invoice linkage, and any date
+            # slots live in the slots table keyed by this guid with
+            # no ON DELETE CASCADE — the raw-SQL row delete above
+            # would orphan them. Same explicit-cleanup pattern as
+            # ``_delete_business_person``.
+            from piecash.kvp import Slot
+
+            book.session.execute(
+                Slot.__table__.delete().where(
+                    Slot.__table__.c.obj_guid == inv_guid
+                )
+            )
+            _verify_delete(
+                book.session,
+                Slot.__table__,
+                {"obj_guid": inv_guid},
+                f"Slots for {type_label.lower()} '{doc_id}'",
             )
 
             book.save()

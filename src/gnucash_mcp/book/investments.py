@@ -846,13 +846,22 @@ class InvestmentsMixin:
 
             splits = []
             for split in lot.splits:
-                splits.append({
+                row = {
                     "guid": prefixes.get(split.guid, split.guid),
-                    "date": split.transaction.post_date.isoformat(),
+                    "date": (
+                        split.transaction.post_date.isoformat()
+                        if split.transaction.post_date else None
+                    ),
                     "description": split.transaction.description,
                     "quantity": str(split.quantity),
                     "value": str(split.value),
-                })
+                }
+                # The summary already excludes voided zombies; an
+                # unmarked 0-row here read as a real event the
+                # summary then contradicted (A8).
+                if _is_voided(split):
+                    row["voided"] = True
+                splits.append(row)
 
             summary = self._lot_summary(lot)
             # Phase 6A: ``is_closed`` already lives at the top level

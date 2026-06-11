@@ -179,6 +179,12 @@ class TestDebtPayoffPlan:
         # Converted (1000 × 1.25), not the raw foreign 1000.
         assert Decimal(loan["balance"]) == Decimal("1250.00")
         assert Decimal(result["total_balance"]) == Decimal("1250.00")
+        # A3 (adversarial pass 2): the minimum_payment slot is an
+        # account-currency scalar — 100 EUR must enter the plan as
+        # 125.00 USD, not be treated as $100. Pre-fix the M1 balance
+        # conversion de-synced balance and minimum, skewing the
+        # feasibility gate.
+        assert Decimal(loan["minimum_payment"]) == Decimal("125.00")
 
     def test_no_debt_accounts_at_all(self, tmp_path: Path):
         """Should raise the MP-9 "no debt accounts" branch on a

@@ -10892,3 +10892,46 @@ class TestDiscountFxAndQuantumTolerance:
         assert gb.get_balance(
             account_name="Expenses:Sales Discounts"
         ) == Decimal("19.99")
+
+
+class TestDeleteCreditNoteSlotCleanup:
+    """A6 (adversarial pass 2): deleting an unposted credit note
+    must remove its slot rows (the ``credit-note`` flag and the
+    ``gnc-mcp/applies-to-invoice`` linkage) — the raw-SQL row
+    delete has no ON DELETE CASCADE and orphaned them pre-fix."""
+
+    def test_slots_removed_with_credit_note(self, business_book):
+        from sqlalchemy import text
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Sales",
+            description="Work", quantity="1", price="100.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )
+        with gb.open(readonly=True) as book:
+            inv = gb._resolve_credit_note(book, cn["id"])
+            cn_guid = inv.guid
+            n_before = book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE obj_guid = :g"),
+                {"g": cn_guid},
+            ).scalar()
+        assert n_before > 0, "fixture should have credit-note slots"
+
+        gb.delete_credit_note(credit_note_id=cn["id"])
+
+        with gb.open(readonly=True) as book:
+            n_after = book.session.execute(
+                text("SELECT COUNT(*) FROM slots WHERE obj_guid = :g"),
+                {"g": cn_guid},
+            ).scalar()
+        assert n_after == 0, "credit-note slot rows orphaned"

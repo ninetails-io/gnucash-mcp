@@ -378,6 +378,11 @@ class CoreMixin:
             unreconciled_count = 0
             oldest_unreconciled_date = None
             for s in account.splits:
+                # Voided splits are zombies, not reconcilable
+                # activity (A8) — they must not make an account
+                # surface in the reconciliation section.
+                if _is_voided(s):
+                    continue
                 any_splits = True
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
@@ -495,25 +500,27 @@ class CoreMixin:
           check. Shared rule with ``balance_sheet`` and ``net_worth``
           in ``book/reporting.py`` (adversarial pass 2, C1).
         - **Skips:** ROOT and template-subtree accounts only.
-        - **Asset accounts** (ASSET / BANK / CASH / STOCK / MUTUAL):
-          balance × most-recent-rate-on-or-before-``as_of``. If the
-          commodity has no price by ``as_of``, fall back to cost
-          basis (sum of split.value, which is in transaction
-          currency = book default for typical USD-denominated buys).
-          That fallback is the same one the assets-section
-          ``_market_value`` helper uses; preserves user-expected
-          numbers for unpriced foreign holdings.
-        - **Liability accounts** (LIABILITY / CREDIT): subtract the
-          raw balance from net worth. Liabilities are stored as
-          negative balances; ``-balance`` gives the positive
-          liability magnitude that's then subtracted. No conversion —
-          matches the existing bottom-line behavior, which assumes
-          liabilities denominated in default currency (the common
-          case for personal books).
+        - **Asset accounts** (ASSET / BANK / CASH / STOCK /
+          MUTUAL / RECEIVABLE): balance × most-recent-rate-on-or-
+          before-``as_of``. If the commodity has no price by
+          ``as_of``, fall back to cost basis (sum of split.value,
+          which is in transaction currency = book default for
+          typical USD-denominated buys). That fallback is the same
+          one the assets-section ``_market_value`` helper uses;
+          preserves user-expected numbers for unpriced foreign
+          holdings.
+        - **Liability accounts** (LIABILITY / CREDIT / PAYABLE):
+          converted exactly the same way; negating the converted
+          credit-natural balance yields the positive liability
+          magnitude that's then subtracted — mirroring
+          balance_sheet's per-bucket negate so foreign-currency
+          debt agrees across surfaces.
 
-        Receivables and payables: excluded from the result because
-        they have their own sections in the summary and aren't part
-        of the canonical assets_total − liabilities_total formula.
+        Receivables and payables are INCLUDED in the formula —
+        they're real balance-sheet items and ``balance_sheet`` /
+        ``net_worth`` count them, so this anchor must too or the
+        three surfaces disagree. (They still get their own display
+        sections in the summary; that's presentation, not scope.)
         """
         template_guids = self._template_account_guids(book)
         # "Now" anchors (as_of >= today) use the absolute latest price
@@ -1486,12 +1493,11 @@ class CoreMixin:
         accounts likewise convert at latest rate, with cost-basis
         fallback for the unpriced case.
 
-        **Daily burn** = sum of expense splits over the last
-        ``_RUNWAY_BURN_DAYS`` days, divided by that window size.
-        Uses ``split.value`` (transaction currency) — for typical
-        books where expense accounts share the book default
-        currency, accurate; multi-currency expenses sum raw without
-        per-day FX conversion (rare in personal bookkeeping).
+        **Daily burn** = expense outflow over the last
+        ``_RUNWAY_BURN_DAYS`` days (book-age clamped), divided by
+        the window size — each expense split converted to the book
+        default currency via ``_daily_expense_burn``, so
+        multi-currency books burn correctly.
 
         Special cases:
         - ``daily_burn <= 0`` (no expense data): return None →
@@ -1719,7 +1725,6 @@ class CoreMixin:
             })
         return result
 
-    @staticmethod
     @staticmethod
     def _format_reconciliation_lag(
         days_behind: int, with_parens: bool = True,
@@ -2931,45 +2936,6 @@ class CoreMixin:
         )
         return categorization if categorization else all_names
 
-    def _find_recent_description_matches(
-        self,
-        book,
-        description: str,
-        limit: int = 5,
-        days: int = 90,
-    ) -> list:
-        """Find recent transactions with matching descriptions.
-
-        Uses bidirectional case-insensitive substring matching
-        (same logic as _auto_fill_splits and _find_duplicates).
-
-        Args:
-            book: Open piecash book (readonly).
-            description: Description to match.
-            limit: Maximum matches to return.
-            days: How far back to search.
-
-        Returns:
-            List of piecash Transaction objects, most recent first.
-        """
-        desc_lower = description.lower()
-        cutoff = date.today() - timedelta(days=days)
-        matches = []
-
-        sorted_txns = sorted(
-            book.transactions, key=lambda t: t.post_date, reverse=True
-        )
-        for txn in sorted_txns:
-            if txn.post_date < cutoff:
-                break
-            txn_desc_lower = txn.description.lower()
-            if desc_lower in txn_desc_lower or txn_desc_lower in desc_lower:
-                matches.append(txn)
-                if len(matches) >= limit:
-                    break
-
-        return matches
-
     def _collect_create_signals(
         self,
         book: piecash.Book,
@@ -2991,9 +2957,9 @@ class CoreMixin:
         single pass over ``book.transactions``.
 
         The four original helpers (``_auto_fill_splits``,
-        ``_check_auto_fill_stability``, ``_find_duplicates``, and the
-        post-write ``_find_recent_description_matches``) each opened the
-        book and did its own full-table scan. This collector folds all
+        ``_check_auto_fill_stability``, ``_find_duplicates``, and a
+        post-write recent-description matcher, since deleted) each
+        opened the book and did its own full-table scan. This collector folds all
         of them into one sort + one traversal, classifying each
         transaction into whichever signal bucket(s) it matches.
 

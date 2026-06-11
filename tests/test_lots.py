@@ -653,3 +653,29 @@ class TestLotGainForeignDenominatedPurchase:
         assert Decimal(result["cost_basis"]) == Decimal("1100.00")
         assert Decimal(result["sale_proceeds"]) == Decimal("1500.00")
         assert Decimal(result["capital_gain"]) == Decimal("400.00")
+
+
+class TestGetLotVoidedSplitMarking:
+    """A8 (adversarial pass 2): get_lot's split rows must mark
+    voided zombies — pre-fix they rendered as unmarked 0-rows the
+    lot's own summary excluded, a quiet contradiction."""
+
+    def test_voided_split_is_marked(self, investment_book):
+        gb = GnuCashBook(str(investment_book))
+        split_guid = _buy_shares(
+            gb, 10, Decimal("100"), date(2026, 1, 10),
+        )
+        lot = gb.create_lot(
+            account="Assets:Investments:VTSAX", title="Lot A",
+        )
+        gb.assign_split_to_lot(split_guid=split_guid, lot_guid=lot["guid"])
+        # Void the underlying buy — the split stays in the lot as a
+        # zombie.
+        with gb.open(readonly=True) as book:
+            sp = gb._find_split(book, split_guid)
+            txn_guid = sp.transaction.guid
+        gb.void_transaction(guid=txn_guid, reason="bad import")
+
+        detail = gb.get_lot(guid=lot["guid"])
+        assert len(detail["splits"]) == 1
+        assert detail["splits"][0].get("voided") is True
