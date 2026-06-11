@@ -423,7 +423,7 @@ args.
 
 ---
 
-## What's in v1.3.0
+## What's in v1.3.1
 
 This release fills in the business-feature complement promised
 since v1.2 and lands a deep correctness pass on the surfaces
@@ -557,7 +557,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,355 tests as of v1.3.0
+uv run pytest                       # 1,584 tests as of v1.3.1
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
