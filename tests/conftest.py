@@ -6,7 +6,7 @@ import pytest
 import piecash
 from piecash import factories
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 
@@ -1273,6 +1273,21 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
         invoice_id=eur_invoice_id,
         post_account="Assets:Accounts Receivable EUR",
         post_date="2026-03-10",
+    )
+
+    # Shape 7 (C5): a future-dated transaction — entered ahead of
+    # time, a workflow the server supports. Every "now" surface
+    # (balance_sheet/net_worth/dashboard/get_balance/runway/low-cash/
+    # debt payoff) must exclude it, so the cross-surface totals above
+    # hold with this row present; the register surfaces still show it.
+    gb.create_transaction(
+        description="Scheduled rent (future)",
+        splits=[
+            {"account": "Expenses:Groceries", "amount": "1000.00"},
+            {"account": "Assets:Checking", "amount": "-1000.00"},
+        ],
+        trans_date=date.today() + timedelta(days=10),
+        check_duplicates=False,
     )
 
     return PathologicalBook(

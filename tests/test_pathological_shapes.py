@@ -429,3 +429,89 @@ class TestVoidedThenTouched:
                 trans_date=date(2026, 3, 1),
                 check_duplicates=False,
             )
+
+
+class TestFutureDatedNowSurfaces:
+    """C5 (adversarial pass 2): future-dated TRANSACTIONS are
+    excluded from every "now" surface (the events haven't happened
+    yet); future-dated PRICES stay included (intentional forecasts).
+    The fixture carries a rent payment dated today+10 — the
+    cross-surface totals in TestCrossSurfaceAgreement already prove
+    balance_sheet / net_worth / dashboard ignore it; this class
+    locks the point-read and register behavior explicitly."""
+
+    def test_future_txn_excluded_from_balances_but_listed(
+        self, pathological_book,
+    ):
+        gb = GnuCashBook(str(pathological_book.path))
+        # Point reads exclude the future expense...
+        assert gb.get_balance(
+            account_name="Assets:Checking"
+        ) == Decimal("10200")
+        nw = gb.net_worth(end_date=date.today())
+        assert Decimal(nw["net_worth"]) == EXPECTED_NET_WORTH
+        # ...but the register still shows it — it's a real entry,
+        # just not a "now" event.
+        verbose = gb.list_transactions(compact=False, limit=250)
+        assert "Scheduled rent (future)" in {
+            t["description"] for t in verbose
+        }
+
+
+class TestNullPostDateRows:
+    """A9 (adversarial pass 2): null ``post_date`` rows are a
+    documented old-book artifact. Listing, search, dashboard, and
+    duplicate-detection must tolerate them instead of raising
+    TypeError on date compares."""
+
+    def _null_grocery_date(self, gc: GnuCashBook) -> None:
+        from sqlalchemy import text
+
+        with gc.open(readonly=False) as book:
+            book.session.execute(text(
+                "UPDATE transactions SET post_date = NULL "
+                "WHERE description = 'Weekly Groceries'"
+            ))
+            book.save()
+
+    def test_surfaces_tolerate_null_post_date(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._null_grocery_date(gc)
+
+        # Unbounded listing renders it (sorted oldest, date=None).
+        listed = gc.list_transactions(compact=False, limit=50)
+        by_desc = {t["description"]: t for t in listed}
+        assert "Weekly Groceries" in by_desc
+        assert by_desc["Weekly Groceries"]["date"] is None
+        # A start_date bound excludes what can't be dated.
+        bounded = gc.list_transactions(
+            start_date=date(2024, 1, 1), compact=False,
+        )
+        assert "Weekly Groceries" not in {
+            t["description"] for t in bounded
+        }
+        # Compact line, search, and the dashboard all render.
+        assert "(no date)" in gc.list_transactions(compact=True)
+        assert len(gc.search_transactions(
+            "Weekly Groceries", compact=False,
+        )) == 1
+        gc.get_book_summary()
+
+    def test_duplicate_detection_skips_undated_rows(
+        self, test_book: Path,
+    ):
+        """The create-signals collector does date-window arithmetic;
+        an undated row can't anchor it and must be skipped, not
+        crash the create."""
+        gc = GnuCashBook(str(test_book))
+        self._null_grocery_date(gc)
+        result = gc.create_transaction(
+            description="Weekly Groceries",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "99.00"},
+                {"account": "Assets:Checking", "amount": "-99.00"},
+            ],
+            trans_date=date(2026, 6, 1),
+            check_duplicates=True,
+        )
+        assert result["status"] == "created"

@@ -1246,8 +1246,19 @@ class ReportingMixin:
 
                 # Calculate current balance in the book default currency
                 # (negate because liabilities are stored negative).
+                # "Now" report: future-dated transactions are excluded
+                # (C5) — a payment scheduled for next week hasn't
+                # reduced today's payoff balance — and voided splits
+                # are excluded by state. Null post_date rows (old-book
+                # artifact) can't be dated, so they're skipped too.
+                today = date.today()
                 balance = Decimal("0")
                 for split in account.splits:
+                    if _is_voided(split):
+                        continue
+                    post_date = split.transaction.post_date
+                    if post_date is None or post_date > today:
+                        continue
                     balance += self._split_in_default_currency(
                         split, account, debt_factors.get(account.guid)
                     )

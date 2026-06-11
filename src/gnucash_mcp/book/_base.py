@@ -584,7 +584,12 @@ def _transaction_to_dict(
     )
     result = {
         "guid": txn_guid,
-        "date": transaction.post_date.isoformat(),
+        # Null post_date is a legal old-book artifact (A9); render
+        # as None rather than crashing the whole listing.
+        "date": (
+            transaction.post_date.isoformat()
+            if transaction.post_date else None
+        ),
         "description": transaction.description,
         "currency": transaction.currency.mnemonic,
         "splits": [
@@ -744,7 +749,11 @@ def _transaction_to_compact_line(
             collision-safe prefix (built via ``_guid_prefix_map``).
             Defaults to raw 8-char truncation when absent.
     """
-    date_str = transaction.post_date.isoformat()
+    # Null post_date is a legal old-book artifact (A9).
+    date_str = (
+        transaction.post_date.isoformat()
+        if transaction.post_date else "(no date)"
+    )
     short = _short_guid(transaction.guid, prefixes)
     desc = transaction.description
     splits = list(transaction.splits)
@@ -1592,15 +1601,18 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         - ``as_of`` (inclusive) caps to posted-by-then transactions;
           ``None`` means no date bound — callers that intentionally
           include future-dated transactions pass nothing.
+        - null ``post_date`` rows (old-book artifact, A9) are
+          excluded — same rule ``_query_filtered_splits`` applies,
+          so this sum agrees with the SQL-backed reports.
         """
         balance = Decimal("0")
         for split in account.splits:
             if _is_voided(split):
                 continue
-            if (
-                as_of is not None
-                and split.transaction.post_date > as_of
-            ):
+            post_date = split.transaction.post_date
+            if post_date is None:
+                continue
+            if as_of is not None and post_date > as_of:
                 continue
             balance += split.quantity
         return balance

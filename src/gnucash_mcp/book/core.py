@@ -384,13 +384,20 @@ class CoreMixin:
                     has_yc = True
                 if rstate == "y":
                     pd = s.transaction.post_date
-                    if latest_y_date is None or pd > latest_y_date:
+                    if pd is not None and (
+                        latest_y_date is None or pd > latest_y_date
+                    ):
                         latest_y_date = pd
                 if _is_unreconciled(s):
                     unreconciled_count += 1
                     pd = s.transaction.post_date
-                    if (oldest_unreconciled_date is None
-                            or pd < oldest_unreconciled_date):
+                    # Null post_date (old-book artifact, A9) still
+                    # counts as backlog; it just can't anchor the
+                    # oldest-date lag display.
+                    if pd is not None and (
+                        oldest_unreconciled_date is None
+                        or pd < oldest_unreconciled_date
+                    ):
                         oldest_unreconciled_date = pd
 
             # ASSET passes only when it has reconcilable history.
@@ -855,7 +862,12 @@ class CoreMixin:
                     if self._is_in_retirement_subtree(account):
                         continue
 
-                    balance_qty = self._own_splits_balance(account)
+                    # "Now" warning: cap at today (C5) so a future-
+                    # dated deposit can't suppress a real low-cash
+                    # alarm (or a future payment fire a premature one).
+                    balance_qty = self._own_splits_balance(
+                        account, as_of=today,
+                    )
                     if balance_qty <= 0:
                         # Zero = unused, not low. Negative = overdraft,
                         # captured separately by runway's
@@ -1412,10 +1424,12 @@ class CoreMixin:
         # pre-materialized list ``get_book_summary`` builds; if
         # it's empty the function returns 0 below regardless, so
         # the fallback of 1 day avoids divide-by-zero.
-        if transactions:
-            first_txn_date = min(
-                t.post_date for t in transactions
-            )
+        dated = [
+            t.post_date for t in transactions
+            if t.post_date is not None  # old-book artifact (A9)
+        ]
+        if dated:
+            first_txn_date = min(dated)
             book_age_days = max(1, (today - first_txn_date).days)
             days = min(days, book_age_days)
         window_start = today - timedelta(days=days)
@@ -1423,6 +1437,8 @@ class CoreMixin:
         factors = self._account_conversion_factors(book, today)
         expenses = Decimal("0")
         for txn in transactions:
+            if txn.post_date is None:  # old-book artifact (A9)
+                continue
             if txn.post_date < window_start or txn.post_date > today:
                 continue
             for s in txn.splits:
@@ -1515,7 +1531,11 @@ class CoreMixin:
                 # clean enough for the standard naming convention.
                 continue
 
-            balance = self._own_splits_balance(account)
+            # "Now" surface: cap at today (C5). Pre-fix the liquid
+            # pass summed unbounded while its own cost-basis fallback
+            # below filtered future splits — a rent payment dated
+            # +10 days moved runway while net_worth correctly didn't.
+            balance = self._own_splits_balance(account, as_of=today)
             if balance == 0:
                 continue
 
@@ -1660,6 +1680,8 @@ class CoreMixin:
         # transactions outside the window.
         for txn in transactions:
             d = txn.post_date
+            if d is None:  # old-book artifact (A9)
+                continue
             if d < window_start or d > window_end:
                 continue
             idx = (
@@ -2448,6 +2470,8 @@ class CoreMixin:
             last_date: date | None = None
             for txn in transactions:
                 d = txn.post_date
+                if d is None:  # old-book artifact (A9)
+                    continue
                 if first_date is None or d < first_date:
                     first_date = d
                 if last_date is None or d > last_date:
@@ -2753,17 +2777,22 @@ class CoreMixin:
                     )
                 }
 
-            # Apply date filters
+            # Apply date filters. Null post_date rows (an old-book
+            # artifact — see _query.py) sort as date.min: visible in
+            # unbounded listings, excluded by any start_date bound.
             filtered = []
             for trans in transactions:
-                if start_date and trans.post_date < start_date:
+                post_date = trans.post_date or date.min
+                if start_date and post_date < start_date:
                     continue
-                if end_date and trans.post_date > end_date:
+                if end_date and post_date > end_date:
                     continue
                 filtered.append(trans)
 
             # Sort by date descending
-            filtered.sort(key=lambda t: t.post_date, reverse=True)
+            filtered.sort(
+                key=lambda t: t.post_date or date.min, reverse=True
+            )
 
             total_matched = len(filtered)
             # Apply limit
@@ -3054,9 +3083,13 @@ class CoreMixin:
 
         # One sort, one iteration. Descending by post_date so auto-fill
         # and the "recent" / "stability" buckets fill from most-recent
-        # outward — their caps short-circuit the rest.
+        # outward — their caps short-circuit the rest. Null post_date
+        # rows (old-book artifact) sort oldest and are skipped in the
+        # loop — every bucket does date arithmetic on them.
         sorted_txns = sorted(
-            book.transactions, key=lambda t: t.post_date, reverse=True
+            book.transactions,
+            key=lambda t: t.post_date or date.min,
+            reverse=True,
         )
 
         for txn in sorted_txns:
@@ -3077,6 +3110,11 @@ class CoreMixin:
             # stability buckets skip them for the same reason — a
             # voided entry is not evidence the event happened.
             if any(_is_voided(s) for s in txn.splits):
+                continue
+
+            # Undated rows can't anchor cadence or duplicate-window
+            # math (A9).
+            if txn.post_date is None:
                 continue
 
             txn_desc_lower = txn.description.lower()
@@ -3710,8 +3748,11 @@ class CoreMixin:
                     if self._match_amount(transaction, query):
                         matched.append(transaction)
 
-            # Sort by date descending
-            matched.sort(key=lambda t: t.post_date, reverse=True)
+            # Sort by date descending; null post_date (old-book
+            # artifact) sorts oldest.
+            matched.sort(
+                key=lambda t: t.post_date or date.min, reverse=True
+            )
 
             total_matched = len(matched)
             matched = matched[:effective_limit]
