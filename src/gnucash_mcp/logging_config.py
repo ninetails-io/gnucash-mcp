@@ -1912,19 +1912,13 @@ _ACCOUNT_REF_KEYS_CONDITIONAL: dict[tuple[str, str], frozenset[str]] = {
 }
 
 
-# R-3: ``_looks_like_guid_ref`` moved to ``book/_base.py`` so it
-# sits next to ``_resolve_account`` (the chokepoint it gates) and
-# can be shared by any future display surface that wants to skip
-# already-canonical path strings before opening a session.
-
-
 def _normalize_account_refs_for_audit(
     params: dict, entity_type: str, operation: str
 ) -> dict:
     """Audit-log-specific wrapper around
     :meth:`BaseGnuCashBook._normalize_account_refs`.
 
-    R-3 split the responsibilities:
+    The responsibilities are split:
 
     - This function knows the audit-log-specific config — which
       param keys carry account refs always, which carry them only
@@ -2094,7 +2088,7 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
-            # Write rate limit (Stage 6 #3). Default disabled —
+            # Write rate limit. Default disabled —
             # enabled when the user sets GNUCASH_WRITE_RATE_LIMIT.
             # Checked BEFORE the auto-backup trigger and BEFORE
             # the pre-clear of staged audit state: a rate-limited

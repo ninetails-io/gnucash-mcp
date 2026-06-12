@@ -86,7 +86,7 @@ class QueryMixin:
             .join(Account, Split.account_guid == Account.guid)
             .filter(Transaction.post_date.isnot(None))
         )
-        # HP-12 defense-in-depth: exclude template-subtree accounts.
+        # Defense-in-depth: exclude template-subtree accounts.
         # Currently dormant — ``Transaction.post_date.isnot(None)``
         # above already filters SX templates (their splits live on
         # transactions with null post_date). But making the account-

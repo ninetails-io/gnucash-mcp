@@ -87,7 +87,7 @@ def _collapse_period_runs(
 def _format_budget_report_compact(report: dict) -> str:
     """Render a budget-report dict as a compact text table.
 
-    Layout per Phase 5B::
+    Layout::
 
         2026 Annual Budget — Period 3 (Apr 2026)
         Account                          Budget   Actual  Remaining  %Used
@@ -795,12 +795,11 @@ class BudgetsMixin:
 
             # Pre-compute conversion factors so both targets (this
             # loop) and actuals (the loop further down) value at the
-            # same period-end anchor. Pre-fix factors were built
-            # only for actuals — budget *targets* were summed raw
-            # in their stored account commodity, so ``used_pct`` was
-            # meaningless on multi-currency budgets where the actuals
-            # were in the book's default currency but the targets
-            # weren't (SB-6).
+            # same period-end anchor. Converting only the actuals
+            # would leave budget *targets* summed raw in their stored
+            # account commodity, making ``used_pct`` meaningless on
+            # multi-currency budgets (actuals in the book's default
+            # currency, targets not).
             factors = self._account_conversion_factors(book, last_end)
 
             # Gather budgeted amounts (FX-converted to default
@@ -847,11 +846,10 @@ class BudgetsMixin:
                         continue  # separately budgeted — don't roll up
                     # If multiple budgeted ancestors cover this descendant
                     # (nested parents), keep the nearest one (the deepest
-                    # budgeted ancestor). Pre-fix used ``len(name)`` as a
-                    # depth proxy — broke under pathological naming where
-                    # a shallower path with longer leaf names would
-                    # incorrectly win over a deeper path. ``count(":")``
-                    # is the real depth (HP-7).
+                    # budgeted ancestor). ``len(name)`` as a depth proxy
+                    # breaks under pathological naming — a shallower path
+                    # with longer leaf names would incorrectly win over a
+                    # deeper path. ``count(":")`` is the real depth.
                     existing = rollup_map.get(desc.fullname)
                     if (
                         existing is None
@@ -881,12 +879,12 @@ class BudgetsMixin:
                 # Accumulate SIGNED amounts so contra splits (refunds
                 # on expense accounts, losses/clawbacks on income
                 # accounts) net against the rollup target — the same
-                # netting fix income_by_source / spending_by_category
-                # received in a34867c. The pre-fix per-split gross
-                # filter (`amount > 0` / `amount < 0`) made the budget
-                # report contradict those reports on identical data
-                # (adversarial pass 2, C3): spend 200 + refund 120
-                # showed actual 200 instead of net 80.
+                # netting convention income_by_source /
+                # spending_by_category use. A per-split gross
+                # filter (`amount > 0` / `amount < 0`) makes the budget
+                # report contradict those reports on identical data:
+                # spend 200 + refund 120 shows actual 200 instead of
+                # net 80.
                 if account.type == "EXPENSE":
                     actuals[rollup_target] = actuals.get(
                         rollup_target, Decimal("0")

@@ -24,8 +24,8 @@ def _parse_iso_date(s: str | None) -> date | None:
     to surface at the MCP boundary unchanged
     (``ValueError: Invalid isoformat string: '2025-01-XX'``).
 
-    R-4: chokepoints the ``date.fromisoformat(x) if x else None``
-    pattern that recurred at ~21 tool-wrapper sites. Required
+    Chokepoints the ``date.fromisoformat(x) if x else None``
+    pattern that recurs across the tool wrappers. Required
     dates (where the caller has already guaranteed non-None) keep
     calling ``date.fromisoformat`` directly — the distinction is
     explicit at the call site.
@@ -67,7 +67,7 @@ ScheduledTransactionGuid = Annotated[
 ]
 
 
-# ── Business-entity free-text caps (MP-5) ─────────────────────────
+# ── Business-entity free-text caps ────────────────────────────────
 #
 # The book-layer ``_validate_business_freetext`` chokepoint rejects
 # oversize input correctly — but it runs INSIDE the tool body,
@@ -76,9 +76,8 @@ ScheduledTransactionGuid = Annotated[
 # seconds-to-minutes; from the caller's seat, a 5000-byte ``notes``
 # value looks like a hang before the validation rejects.
 #
-# Plumb Bob (bookkeeper validation, 2026-06-04) flagged this:
-# "for a defense-in-depth input gate, a hang is worse than the
-# unbounded write it was meant to prevent." Pydantic Field
+# For a defense-in-depth input gate, a hang is worse than the
+# unbounded write it was meant to prevent. Pydantic Field
 # constraints validate at the FastMCP schema layer — BEFORE any
 # decorator runs, including auto-backup — so an oversize value
 # rejects in milliseconds with the correct error shape.
@@ -121,7 +120,7 @@ class BusinessAddressInput(BaseModel):
     employee). All sub-fields are optional strings capped at 1024
     characters at the MCP boundary.
 
-    Same MP-5 rationale as ``BusinessNotes``: the cap fires at the
+    Same rationale as ``BusinessNotes``: the cap fires at the
     schema layer so an oversize value rejects fast without auto-
     backup running first.
     """
@@ -177,13 +176,12 @@ class SplitInput(BaseModel):
     """
 
     # ``extra="forbid"`` matches the server-global setting on
-    # ``ArgModelBase`` (set in server.py at import time). Pre-fix
-    # this used ``extra="ignore"``, which silently dropped typo'd
+    # ``ArgModelBase`` (set in server.py at import time).
+    # ``extra="ignore"`` silently drops typo'd
     # keys: ``{"quantitiy": "10"}`` instead of ``{"quantity": "10"}``
     # would discard the quantity entirely and the transaction would
     # post with cross-currency value/quantity mismatch (or with the
-    # default-zero behavior, depending on the path). HP-10 from
-    # specs/CODE_REVIEW_v1_3.md.
+    # default-zero behavior, depending on the path).
     model_config = ConfigDict(
         coerce_numbers_to_str=True,
         extra="forbid",

@@ -234,7 +234,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
             continue
         # Overpaid doc: the counterparty holds a credit, so the
         # aging-clock columns would invite double-collection.
-        # Surface the direction explicitly instead (C2).
+        # Surface the direction explicitly instead.
         if r.get("overpaid"):
             lines.append(
                 f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
@@ -809,10 +809,9 @@ class BusinessMixin:
             discount_commodity: The discount account's commodity.
                 The discount leg's drift — ``discount ×
                 (pay_rate − post_rate)`` — is realized FX exactly
-                like the payment leg's; pre-fix it was booked
-                nowhere, leaving assets ≠ equity by that amount on
-                any cross-currency discount settlement (C10
-                companion).
+                like the payment leg's; leaving it unbooked puts
+                assets ≠ equity by that amount on any
+                cross-currency discount settlement.
 
         Returns:
             ``None`` when no FX split should be booked:
@@ -891,7 +890,7 @@ class BusinessMixin:
                 as_of=parsed_date,
             )
             if pay_to_default_rate is None:
-                # HP-5: missing third-currency rate. Mirror the
+                # Missing third-currency rate. Mirror the
                 # ``rate_at_post`` branch above (which returns
                 # None when no rate is available) — skip the FX
                 # booking gracefully instead of raising. The
@@ -909,7 +908,7 @@ class BusinessMixin:
         else:
             fx_diff_default = fx_diff_pay
 
-        # Discount leg (C10 companion). Same shape as the payment
+        # Discount leg. Same shape as the payment
         # leg: the discount expense/income was booked at the
         # pay-date rate while the A/R it helped relieve was carried
         # at the post-date rate; the difference is realized FX.
@@ -1475,7 +1474,7 @@ class BusinessMixin:
         ``owner_type`` (numeric 2/4/5) was redundant with the
         human-readable ``type`` field and is dropped. ``is_posted``
         is derivable from ``date_posted`` (non-null = posted) and
-        is dropped too. Phase 3C: ``owner_guid`` (raw 32-char hex)
+        is dropped too. ``owner_guid`` (raw 32-char hex)
         is dropped in favor of ``owner_name`` resolved by the caller
         — the same readability swap we did for entry account refs.
 
@@ -1726,7 +1725,7 @@ class BusinessMixin:
             "total": str(total),
         }
         if account_paths is not None and acct_guid:
-            # Phase 3C: surface the readable path. Falls back to the
+            # Surface the readable path. Falls back to the
             # raw GUID when a stale entry references a deleted account.
             result["account"] = account_paths.get(
                 acct_guid, acct_guid,
@@ -1851,7 +1850,7 @@ class BusinessMixin:
         the post account's commodity — when that commodity differs
         from the invoice currency, this is what the receivable /
         payable account actually carries, and it's the number a
-        settlement must relieve exactly (C10).
+        settlement must relieve exactly.
         """
         total = Decimal(0)
         for split in lot.splits:
@@ -2167,7 +2166,7 @@ class BusinessMixin:
         """
         from piecash.business.person import Address
 
-        # MP-5: cap free-text byte lengths up front.
+        # Cap free-text byte lengths up front.
         notes_kwarg = extra_kwargs.get("notes")
         self._validate_business_freetext(
             notes=notes_kwarg, address=address,
@@ -2224,8 +2223,8 @@ class BusinessMixin:
         "phone", "fax", "email",
     )
 
-    # MP-5: free-text caps on business-entity fields. Same shape as
-    # HP-9's caps on ``void_transaction(reason)`` and
+    # Free-text caps on business-entity fields. Same shape as
+    # the caps on ``void_transaction(reason)`` and
     # ``set_account_slot(value)`` — prevents a misbehaving LLM (or
     # a user copy-pasting a multi-MB blob) from bloating the
     # business-entity rows. Notes can be paragraphs; address sub-
@@ -2240,7 +2239,7 @@ class BusinessMixin:
         notes: str | None = None,
         address: dict | None = None,
     ) -> None:
-        """MP-5: validate notes / address sub-field byte lengths
+        """Validate notes / address sub-field byte lengths
         before they reach the ORM. UTF-8 byte length, not character
         length — the storage backing is SQLite TEXT and the byte
         cap is what matters for serialization.
@@ -2388,7 +2387,7 @@ class BusinessMixin:
                     f"{entity_label} has no notes field — drop "
                     f"``notes=`` from the update call."
                 )
-            # MP-5: cap notes byte length up front.
+            # Cap notes byte length up front.
             self._validate_business_freetext(notes=notes)
             current_notes = entity.notes or ""
             if current_notes != notes:
@@ -2400,7 +2399,7 @@ class BusinessMixin:
             changed["active"] = bool(active)
 
         if address is not None:
-            # MP-5: cap address-field byte lengths up front.
+            # Cap address-field byte lengths up front.
             self._validate_business_freetext(address=address)
             # piecash's ``Address`` is a composite view over raw
             # ``addr_*`` columns on the Customer / Vendor / Employee
@@ -3721,9 +3720,9 @@ class BusinessMixin:
 
     # Human-readable document label for use in error messages,
     # status returns, and audit log entries. Title-case canonical
-    # form. Three-way (Invoice / Bill / Voucher) replaces the
-    # legacy binary ``"Bill" if is_bill else "Invoice"`` which
-    # mislabeled vouchers as bills. (Copilot PR #86 review.)
+    # form. Three-way (Invoice / Bill / Voucher) — a binary
+    # ``"Bill" if is_bill else "Invoice"`` mislabels vouchers
+    # as bills.
     _OWNER_TYPE_TO_DOC_LABEL = {2: "Invoice", 4: "Bill", 5: "Voucher"}
 
     @staticmethod
@@ -5072,11 +5071,11 @@ class BusinessMixin:
                 return "\n".join(lines)
             else:
                 # Verbose path: resolve owner per invoice so each dict
-                # carries the readable name. ``owner_guid`` was dropped
-                # from the dict shape in Phase 3C.
+                # carries the readable name (``owner_guid`` is not
+                # part of the dict shape).
                 #
-                # Job preload — avoids the N+1 query pattern Copilot
-                # flagged on PR #88. Single query for every Job
+                # Job preload — avoids an N+1 query
+                # pattern. Single query for every Job
                 # referenced by job-attached invoices in the result
                 # set, indexed by GUID, then in-memory lookup per
                 # row. With 100 job-attached invoices spanning 5
@@ -5164,7 +5163,7 @@ class BusinessMixin:
                     {"guid": inv.guid},
                 ).fetchall()
 
-            # Phase 3C: build a guid → fullname map once (covers every
+            # Build a guid → fullname map once (covers every
             # account referenced by entries on this invoice), then
             # thread it through ``_entry_to_dict`` so each entry shows
             # ``account: "Income:LLC Revenue"`` instead of an opaque
@@ -5334,10 +5333,10 @@ class BusinessMixin:
         """Convert ``amount`` (in invoice currency) to the target
         commodity, quantized to that commodity's smallest fraction.
 
-        R-2: shared chokepoint for the cross-currency math that
-        ``post_invoice`` and ``pay_invoice`` previously did with
-        nearly-identical inline closures (``_qty_for_split`` and
-        ``_convert``). One helper, two callers, same error shape
+        Shared chokepoint for the cross-currency math behind
+        ``post_invoice`` and ``pay_invoice`` (their inline
+        ``_qty_for_split`` and ``_convert`` closures both route
+        here). One helper, two callers, same error shape
         — so a future fix to the rate-lookup or quantization
         cascade hits both paths without re-derivation.
 
@@ -5576,9 +5575,9 @@ class BusinessMixin:
                 account=post_acct,
                 is_closed=0,
             )
-            # MP-11: see investments.py — Lot auto-registers via
-            # the account back-pop; the explicit session.add was
-            # redundant.
+            # Lot auto-registers via the account back-pop —
+            # an explicit session.add would be redundant (see
+            # the matching note in investments.py).
 
             # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
             if is_bill:
@@ -5603,7 +5602,7 @@ class BusinessMixin:
 
             # Helper: convert a value in invoice currency to the
             # equivalent quantity in the given account's commodity.
-            # R-2: routes through ``_convert_invoice_amount`` so
+            # Routes through ``_convert_invoice_amount`` so
             # post and pay share one rate-lookup + quantization
             # chokepoint. The rate is unused here (post doesn't
             # need it for downstream FX-gain math); ``stale_meta``
@@ -6113,15 +6112,14 @@ class BusinessMixin:
             # side via ``_qty_for_split(post_acct, ...)``; the pay
             # path didn't, so a USD A/R holding a EUR invoice was
             # liquidated in EUR-as-USD on payment.
-            # R-2: ``post_invoice`` and ``pay_invoice`` share
+            # ``post_invoice`` and ``pay_invoice`` share
             # the cross-currency rate-lookup + quantization
             # chokepoint via ``_convert_invoice_amount``. Pay
             # consumes both the converted quantity AND the
             # rate (the rate feeds ``_compute_fx_gain_loss``
             # below). ``stale_meta`` is collected so the response
             # can surface ``fx_stale`` when ``force`` overrode the
-            # freshness guard; ``_convert`` keeps its 2-tuple shape
-            # so the unpack sites below are unchanged.
+            # freshness guard.
             fx_stale_overrides: list[dict] = []
 
             def _convert(amount, target_commodity):
@@ -6173,7 +6171,7 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
 
-            # ── Overpayment guard (adversarial pass 2, C2) ────────
+            # ── Overpayment guard ─────────────────────────────────
             # The lot balance is signed: positive for A/R invoices,
             # negative for A/P bills, flipped for credit notes.
             # Normalize to "amount still owed" via effective_is_bill
@@ -6204,7 +6202,7 @@ class BusinessMixin:
             # ── Early-payment discount validation ────────────────
             # Five rejection cases, each with a distinct error so
             # the caller can see exactly which precondition failed.
-            # Per the spec: discount is an explicit opt-in (no
+            # Discount is an explicit opt-in (no
             # auto-detect from coincidental shortfall) — when
             # apply_discount=True, the call either honors all
             # invariants and books the discount split, or rejects.
@@ -6307,10 +6305,10 @@ class BusinessMixin:
                 # Book the discount at the ACTUAL shortfall, not the
                 # computed expectation. The tolerance above admits a
                 # 1-quantum mismatch (rounding of the user's payment);
-                # booking ``expected`` then left the splits off by
-                # that quantum and the transaction died later with an
-                # opaque GncImbalanceError after the validator had
-                # blessed the input (A5). A/R clears
+                # booking ``expected`` would leave the splits off by
+                # that quantum and the transaction dies later with an
+                # opaque GncImbalanceError after the validator has
+                # blessed the input. A/R clears
                 # ``remaining_before`` and the bank brings
                 # ``payment_amount``, so the discount leg must be
                 # exactly their difference.
@@ -6355,13 +6353,13 @@ class BusinessMixin:
                 full_settle_amount = payment_amount
                 full_settle_post_qty = post_quantity
 
-            # C10: when the A/R-A/P account's commodity differs from
+            # When the A/R-A/P account's commodity differs from
             # the invoice currency, relieve the lot at the rate it is
             # CARRIED at — proportional to the lot's remaining
             # quantity — never at the pay-date rate. Pay-date relief
-            # left the post→pay drift in the account's quantity
+            # leaves the post→pay drift in the account's quantity
             # balance forever (a permanent phantom A/R on a fully
-            # settled invoice) while the same drift was also booked
+            # settled invoice) while the same drift is also booked
             # as the explicit FX split. A full settlement relieves
             # the remaining quantity exactly; a partial one relieves
             # pro-rata in invoice-currency terms.
@@ -6496,7 +6494,7 @@ class BusinessMixin:
             # Never abs() a lot balance — with the overpayment guard
             # above this is always >= 0 via pay_invoice, but if some
             # other path left the lot negative, a credit must surface
-            # as negative rather than masquerade as money owed (C2).
+            # as negative rather than masquerade as money owed.
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
             )
@@ -6534,9 +6532,9 @@ class BusinessMixin:
                     # credit-note refund pays out like a bill, so the
                     # label must follow the same direction the ledger
                     # split was booked with (_compute_fx_gain_loss is
-                    # called with effective_is_bill above). Pre-fix a
-                    # booked FX loss on a customer credit-note refund
-                    # was labeled "gain" (adversarial pass 2, A4).
+                    # called with effective_is_bill above) — keyed on
+                    # is_bill, a booked FX loss on a customer
+                    # credit-note refund would be labeled "gain".
                     direction = (
                         "loss" if (effective_is_bill and fx_diff_default > 0)
                         or (not effective_is_bill and fx_diff_default < 0)
@@ -7057,11 +7055,14 @@ class BusinessMixin:
                     # ``taxtable_guid`` is read from the same entry rows
                     # being deleted in this transaction. This is a
                     # best-effort cache decrement, not a source of truth.
-                    # (Review L3: corruption harm refuted; the contract
-                    # scanner covers ``Table.__table__`` DML, not raw
-                    # text() — broadening it to every text() statement
-                    # would flag the many legitimately-unverified slot
-                    # operations, so that is deliberately out of scope.)
+                    # (The write-verification contract test —
+                    # tests/test_contract_integrity.py::
+                    # TestWriteVerificationCoverage — scans
+                    # ``Table.__table__`` DML, not raw text();
+                    # broadening it to every text() statement would
+                    # flag the many legitimately-unverified slot
+                    # operations, so this site is deliberately
+                    # outside its scope.)
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
@@ -7093,7 +7094,7 @@ class BusinessMixin:
                 f"{type_label} '{doc_id}'",
             )
 
-            # Slot cleanup (A6): credit-note flag, the
+            # Slot cleanup: credit-note flag, the
             # gnc-mcp/applies-to-invoice linkage, and any date
             # slots live in the slots table keyed by this guid with
             # no ON DELETE CASCADE — the raw-SQL row delete above
@@ -7825,10 +7826,9 @@ class BusinessMixin:
                 # still available): A/R invoice lots run positive,
                 # A/P bill lots negative, credit notes flipped.
                 # NEGATIVE here means overpaid — the counterparty
-                # holds a credit. Pre-fix this was abs()'d, so an
-                # overpaid invoice rendered as money still OWED in a
-                # collections list, inviting double-collection
-                # (adversarial pass 2, C2).
+                # holds a credit. Never abs() this: an overpaid
+                # invoice would render as money still OWED in a
+                # collections list, inviting double-collection.
                 amount_due = -balance if (is_bill ^ is_credit_note) else balance
                 overpaid = amount_due < 0 and not is_credit_note
 
@@ -7863,9 +7863,9 @@ class BusinessMixin:
                 # sees identical numbers in both places. No aging
                 # clock on credit notes (money the business OWES has
                 # no past-due concept) or overpaid docs (nothing left
-                # to collect) — pre-fix an unapplied credit note
-                # carried ``days_past_due: 238`` in a collections
-                # list (C2).
+                # to collect) — otherwise an unapplied credit note
+                # carries an ever-growing ``days_past_due`` in a
+                # collections list.
                 due_date, no_terms = self._resolve_invoice_due_date(
                     book, inv,
                 )
@@ -8011,8 +8011,7 @@ class BusinessMixin:
                     # an overpaid invoice carries a NEGATIVE
                     # outstanding (credit held by the counterparty),
                     # which keeps ``paid`` honest instead of
-                    # understating it by twice the credit
-                    # (adversarial pass 2, C2).
+                    # understating it by twice the credit.
                     post_acct_guid = inv.post_acc_guid
                     post_acct = book.session.query(
                         piecash.Account
@@ -8106,15 +8105,14 @@ class BusinessMixin:
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to specific vendor.
             compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4D).
+                     suitable for direct LLM consumption.
                      Verbose mode returns the structured dict.
 
         Returns:
             If compact: text table (one line per vendor + TOTAL).
             If not compact: dict with vendor breakdown and grand totals.
-            The Phase 4D spec dropped the ``period`` echo (it duplicated
-            input the caller already has); verbose mode no longer
-            includes it either.
+            Neither shape echoes the ``period`` (it duplicates
+            input the caller already has).
         """
         from piecash.business.invoice import Invoice
 
@@ -8129,9 +8127,8 @@ class BusinessMixin:
             default_currency_mnemonic = default_currency.mnemonic
 
             # Latest market rates for FX conversion as of the
-            # report period's end. Pre-v1.3 release this omitted
-            # ``as_of`` and used today's rates against historical
-            # vendor periods — SB-3.
+            # report period's end — historical vendor periods
+            # must not be valued at today's rates.
             latest_rates = self._rates_as_of(book, parsed_end)
 
             query = book.session.query(Invoice).filter(
@@ -8232,7 +8229,7 @@ class BusinessMixin:
                         # currency's precision: the verbose path emits
                         # these via str(), so an unquantized product
                         # would expose a long fractional tail (the
-                        # compact path masks it via _money's 2dp). L4.
+                        # compact path masks it via _money's 2dp).
                         q = _commodity_quantum(default_currency)
                         total = (total * rate).quantize(q)
                         paid = (paid * rate).quantize(q)

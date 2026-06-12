@@ -1344,11 +1344,11 @@ def register(mcp, get_book) -> None:
             active_only=active_only,
             compact=not verbose,
         )
-        # Match the other list_* tools' verbose pattern. HP-4
-        # sweep (v1.3) routed all list_* verbose returns through
-        # _json so the response shape is uniform; the previous
-        # ``json.dumps(indent=2)`` form added 40-60% bloat from
-        # indentation and skipped the ``_strip_noise`` pass.
+        # Match the other list_* tools' verbose pattern: all
+        # list_* verbose returns route through
+        # _json so the response shape is uniform; a
+        # ``json.dumps(indent=2)`` form adds 40-60% bloat from
+        # indentation and skips the ``_strip_noise`` pass.
         if verbose:
             return _json(result)
         return result

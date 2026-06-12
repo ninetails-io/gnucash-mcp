@@ -196,7 +196,7 @@ class ReconciliationMixin:
                 # ``n`` (new) and ``c`` (cleared) count as pending
                 # bookkeeping work. ``_is_unreconciled`` is the
                 # chokepoint shared with the dashboard count
-                # (``_account_reconciliation_status``) so HP-8
+                # (``_account_reconciliation_status``) so the
                 # convergence is structural rather than
                 # docstring-promised.
                 if not _is_unreconciled(split):
@@ -390,7 +390,7 @@ class ReconciliationMixin:
                     # Voided splits are zombies, not pending work —
                     # flipping one to 'y' is the exact mutation
                     # set_reconcile_state rejects, and it defeats
-                    # unvoid_transaction (C8). The sweep skips them
+                    # unvoid_transaction. The sweep skips them
                     # silently; they were never reconcilable.
                     if _is_voided(split):
                         continue
@@ -515,7 +515,7 @@ class ReconciliationMixin:
         """
         if not reason or not reason.strip():
             raise ValueError("Void reason is required")
-        # HP-9 length cap. 4 KiB covers any realistic void
+        # Length cap. 4 KiB covers any realistic void
         # explanation — multi-paragraph context, audit trail
         # notes, references to ticket numbers — while keeping a
         # malicious or runaway caller from exhausting the book

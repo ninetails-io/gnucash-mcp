@@ -105,16 +105,15 @@ class _SummaryData:
     ``get_book_summary``.
 
     Populated in one walk over ``book.accounts`` by
-    ``_collect_summary_balance_sheet`` so the multi-pass shape that
-    ``get_book_summary`` previously used inline collapses into a
-    single collector → many renderers pipeline.
+    ``_collect_summary_balance_sheet`` — a single collector feeding
+    many renderers, rather than per-section passes.
 
     All ``Decimal`` totals are pre-rounded to 2 dp (consistent with
     every place ``get_book_summary`` displays them); per-leaf
     balances are stored at native precision so renderers can
     re-round if they want.
 
-    R-1: the dataclass is internal — no caller outside
+    The dataclass is internal — no caller outside
     ``get_book_summary`` and its renderers should depend on the
     field shape, since the renderers will continue evolving as
     the bookkeeper review surfaces new section requirements.
@@ -238,7 +237,7 @@ class CoreMixin:
                 if balance == 0:
                     continue
             except Exception:
-                # MP-12: swallow ORM hiccups (detached instance,
+                # Swallow ORM hiccups (detached instance,
                 # missing account/lot) so summary signals survive
                 # partial corruption; log so the underlying cause
                 # can be investigated when --debug is on.
@@ -272,7 +271,7 @@ class CoreMixin:
                     if due_date is not None and due_date < today:
                         is_overdue = True
                 except Exception:
-                    # MP-12: due-date resolution can fail on
+                    # Due-date resolution can fail on
                     # corrupt term records; surface in debug log.
                     _debug_logger.debug(
                         "summary signals: due date resolve failed",
@@ -304,7 +303,7 @@ class CoreMixin:
                 Job.active == 1,
             ).count()
         except Exception:
-            # MP-12: jobs table may not exist on very old books;
+            # The jobs table may not exist on very old books;
             # log and continue.
             _debug_logger.debug(
                 "summary signals: active jobs query failed",
@@ -376,7 +375,7 @@ class CoreMixin:
             #   - any_splits (used vs. unused account)
             #   - unreconciled_count (total non-y, non-voided)
             #   - oldest_unreconciled_date (oldest pending work)
-            # Post-HP-8 the count is state-only (doesn't depend on
+            # The count is state-only (doesn't depend on
             # ``latest_y_date``), so it folds into the existing
             # sweep — half the splits work per dashboard call.
             # ``_is_unreconciled`` is the chokepoint shared with
@@ -396,7 +395,7 @@ class CoreMixin:
             oldest_unreconciled_date = None
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
-                # activity (A8) — they must not make an account
+                # activity — they must not make an account
                 # surface in the reconciliation section.
                 if _is_voided(s):
                     continue
@@ -413,7 +412,7 @@ class CoreMixin:
                 if _is_unreconciled(s):
                     unreconciled_count += 1
                     pd = s.transaction.post_date
-                    # Null post_date (old-book artifact, A9) still
+                    # Null post_date (an old-book artifact) still
                     # counts as backlog; it just can't anchor the
                     # oldest-date lag display.
                     if pd is not None and (
@@ -499,11 +498,7 @@ class CoreMixin:
         """Net worth in book-default currency as of ``as_of``.
 
         Single source of truth for the net-worth number the summary
-        displays. Trajectory's "now" anchor and the (former) bottom-
-        line "Net worth:" line both agreed-by-construction when both
-        existed; the bottom-line has since been retired in favor of
-        the trajectory's "now", but this helper preserves the
-        semantics so the user's reference number stays the same.
+        displays (the trajectory's "now" anchor).
 
         Algorithm mirrors the per-account breakdown elsewhere in
         ``get_book_summary``:
@@ -515,7 +510,7 @@ class CoreMixin:
           drops it. Parents and placeholders without direct splits
           contribute zero and fall out via the ``balance == 0``
           check. Shared rule with ``balance_sheet`` and ``net_worth``
-          in ``book/reporting.py`` (adversarial pass 2, C1).
+          in ``book/reporting.py``.
         - **Skips:** ROOT and template-subtree accounts only.
         - **Asset accounts** (ASSET / BANK / CASH / STOCK /
           MUTUAL / RECEIVABLE): balance × most-recent-rate-on-or-
@@ -813,7 +808,7 @@ class CoreMixin:
         default_currency = self._require_default_currency(book)
 
         # ── 1. Data integrity: Imbalance / Orphan accounts ──
-        # MP-2: each Imbalance-{ccy}/Orphan-{ccy} account is its
+        # Each Imbalance-{ccy}/Orphan-{ccy} account is its
         # own commodity, so the per-account balance is correct in
         # its own currency — that's the right display unit
         # ("Imbalance-EUR: 234.56" tells the user the defect is
@@ -886,7 +881,7 @@ class CoreMixin:
                     if self._is_in_retirement_subtree(account):
                         continue
 
-                    # "Now" warning: cap at today (C5) so a future-
+                    # "Now" warning: cap at today so a future-
                     # dated deposit can't suppress a real low-cash
                     # alarm (or a future payment fire a premature one).
                     balance_qty = self._own_splits_balance(
@@ -1068,16 +1063,14 @@ class CoreMixin:
             # Single pass over book.prices builds both signals we
             # need: in-use commodities (every priced commodity is
             # in-use even if no account holds it) and the latest
-            # market-price date per commodity. Pre-fix the method
-            # iterated ``book.prices`` twice — once for ``in_use``,
-            # once for ``by_commodity_latest`` — paying the ORM
-            # hydration cost twice on a book with hundreds of prices.
+            # market-price date per commodity.
             #
-            # HP-6: ``in_use.add`` runs AFTER the
-            # ``_is_market_price`` filter. Pre-fix a commodity that
-            # only had piecash auto-placeholder prices (created on
-            # cross-currency transactions) was marked in_use, and
-            # the downstream "no price on file" warning misfired:
+            # ``in_use.add`` runs AFTER the
+            # ``_is_market_price`` filter. Marking before filtering
+            # would tag a commodity that
+            # only has piecash auto-placeholder prices (created on
+            # cross-currency transactions) as in_use, and
+            # the downstream "no price on file" warning misfires:
             # the placeholder isn't a real quote, the commodity
             # has no market price, but in_use says it's tracked.
             # Filter first, then mark.
@@ -1269,8 +1262,8 @@ class CoreMixin:
         budgeted parent roll up to that parent for actuals
         accumulation. A descendant that's separately budgeted on
         its own line stays out of the rollup so its actuals aren't
-        double-counted (matches ``get_budget_report`` behavior;
-        SB-9). The full budget report is a separate tool the LLM
+        double-counted (matches ``get_budget_report`` behavior).
+        The full budget report is a separate tool the LLM
         can call for category-level detail; the headline trades
         that detail for a single-line summary the LLM can reference
         proactively ("you're 11% over pace; want me to identify
@@ -1328,10 +1321,9 @@ class CoreMixin:
 
         # Sum budget targets across all (account, period) pairs and
         # also FX-convert each target to default currency at the
-        # period-end rate. Pre-fix targets were summed raw — apples-
+        # period-end rate. Raw target sums would be apples-
         # to-oranges against default-currency actuals on multi-
-        # currency budgets (SB-6, mirroring the get_budget_report
-        # fix in budgets.py).
+        # currency budgets (mirrors get_budget_report).
         factors = self._account_conversion_factors(book, period_end)
         total_budgeted = Decimal("0")
         budgeted_accounts: list = []
@@ -1348,10 +1340,10 @@ class CoreMixin:
         if total_budgeted <= 0:
             return None
 
-        # SB-9: roll descendants of placeholder-budgeted parents
-        # into the rollup set so their splits contribute to actuals.
-        # PR #46 fixed this in ``get_budget_report``; the dashboard
-        # headline was left behind. A descendant that's separately
+        # Roll descendants of placeholder-budgeted parents
+        # into the rollup set so their splits contribute to actuals
+        # (the same rollup ``get_budget_report`` performs).
+        # A descendant that's separately
         # budgeted on its own line stays out of the rollup so its
         # actuals aren't double-counted toward both its own line
         # and its ancestor's line.
@@ -1395,8 +1387,8 @@ class CoreMixin:
                 )
                 # Accumulate SIGNED amounts so contra splits (expense
                 # refunds, income clawbacks) net into the headline —
-                # the a34867c pattern, mirrored from get_budget_report
-                # (adversarial pass 2, C3). EXPENSE: positive = spend.
+                # the same netting convention as get_budget_report.
+                # EXPENSE: positive = spend.
                 # INCOME: stored negative; flip so revenue counts
                 # positive toward the target.
                 if atype == "EXPENSE":
@@ -1455,16 +1447,16 @@ class CoreMixin:
         if days is None:
             days = self._RUNWAY_BURN_DAYS
         today = date.today()
-        # SB-7 book-age clamp. The 180-day window is a MAX, not a
+        # Book-age clamp. The 180-day window is a MAX, not a
         # fixed denominator: dividing recent spend by 180 days on
-        # a 19-day-old book over-stated runway by ~10×. Use the
+        # a 19-day-old book over-states runway by ~10×. Use the
         # actual book age when smaller. ``transactions`` is the
         # pre-materialized list ``get_book_summary`` builds; if
         # it's empty the function returns 0 below regardless, so
         # the fallback of 1 day avoids divide-by-zero.
         dated = [
             t.post_date for t in transactions
-            if t.post_date is not None  # old-book artifact (A9)
+            if t.post_date is not None  # old-book artifact
         ]
         if dated:
             first_txn_date = min(dated)
@@ -1475,7 +1467,7 @@ class CoreMixin:
         factors = self._account_conversion_factors(book, today)
         expenses = Decimal("0")
         for txn in transactions:
-            if txn.post_date is None:  # old-book artifact (A9)
+            if txn.post_date is None:  # old-book artifact
                 continue
             if txn.post_date < window_start or txn.post_date > today:
                 continue
@@ -1568,10 +1560,10 @@ class CoreMixin:
                 # clean enough for the standard naming convention.
                 continue
 
-            # "Now" surface: cap at today (C5). Pre-fix the liquid
-            # pass summed unbounded while its own cost-basis fallback
-            # below filtered future splits — a rent payment dated
-            # +10 days moved runway while net_worth correctly didn't.
+            # "Now" surface: cap at today. An unbounded sum here
+            # (while the cost-basis fallback below filters future
+            # splits) would let a rent payment dated +10 days move
+            # runway while net_worth correctly doesn't.
             balance = self._own_splits_balance(account, as_of=today)
             if balance == 0:
                 continue
@@ -1716,7 +1708,7 @@ class CoreMixin:
         # transactions outside the window.
         for txn in transactions:
             d = txn.post_date
-            if d is None:  # old-book artifact (A9)
+            if d is None:  # old-book artifact
                 continue
             if d < window_start or d > window_end:
                 continue
@@ -1924,7 +1916,6 @@ class CoreMixin:
             label = entry["label"]
             if entry["is_mtd"]:
                 label += " (MTD)"
-            # L-1: inlined ``_format_monthly_net`` — single caller.
             # Always shows explicit sign + thousands separator;
             # whole dollars (cents would noise up the summary).
             out.append(f"  {label}: {int(entry['net']):+,}")
@@ -1957,10 +1948,9 @@ class CoreMixin:
 
     # ── Summary collector / section renderers ────────────────────
     #
-    # R-1: ``get_book_summary`` used to inline every section's data
-    # collection and rendering — ~480 lines, mostly a long sequence
-    # of ``lines.append(...)`` calls with intermixed totals work.
-    # Decomposed so each section has a single owner.
+    # ``get_book_summary`` is decomposed so each section has a
+    # single owner, rather than one long inline sequence of
+    # ``lines.append(...)`` calls with intermixed totals work.
     #
     # The pattern matches the already-extracted helpers
     # (``_render_reconciliation`` / ``_render_runway`` / etc.):
@@ -2005,7 +1995,7 @@ class CoreMixin:
             # excluded so the snapshot agrees with trajectory's "now"
             # anchor). Parents and placeholders are included: there is
             # no roll-up here, so direct splits on them are real money
-            # no other row represents (C1). Accounts with no direct
+            # no other row represents. Accounts with no direct
             # splits fall out via the ``balance != 0`` checks below.
             balance = self._own_splits_balance(account, as_of=today)
 
@@ -2422,7 +2412,7 @@ class CoreMixin:
         file, cost basis (sum of split values in the transaction currency)
         is used as a fallback and the line is tagged accordingly.
 
-        R-1: orchestrator only. Data collection and per-section
+        Orchestrator only. Data collection and per-section
         rendering live in dedicated helpers (``_collect_*`` /
         ``_render_*``); see the section-renderers block above.
         Adding a new section is a single method addition plus one
@@ -2473,8 +2463,8 @@ class CoreMixin:
             # ``_anchor_for_as_of`` folds ``today`` to ``date.max``
             # so every forecast price is in scope.
             latest_prices = self._rates_as_of(book, today)
-            # Provenance for intermediate-chain-derived rates (issue
-            # #94) so a synthesized valuation renders "@ rate (via
+            # Provenance for intermediate-chain-derived rates,
+            # so a synthesized valuation renders "@ rate (via
             # USD)" instead of an unfamiliar opaque number.
             rate_via = self._rate_provenance(book, today, default_currency)
 
@@ -2505,7 +2495,7 @@ class CoreMixin:
             last_date: date | None = None
             for txn in transactions:
                 d = txn.post_date
-                if d is None:  # old-book artifact (A9)
+                if d is None:  # old-book artifact
                     continue
                 if first_date is None or d < first_date:
                     first_date = d
@@ -3098,7 +3088,7 @@ class CoreMixin:
             if self._is_template_transaction(txn, template_guids):
                 continue
 
-            # Voided transactions are not signal sources (C8): the
+            # Voided transactions are not signal sources: the
             # void-and-re-enter workflow this server recommends makes
             # the voided txn the most recent description match, and
             # auto-fill would clone its zeroed splits into a silent
@@ -3109,7 +3099,7 @@ class CoreMixin:
                 continue
 
             # Undated rows can't anchor cadence or duplicate-window
-            # math (A9).
+            # math.
             if txn.post_date is None:
                 continue
 
@@ -3848,7 +3838,7 @@ class CoreMixin:
 
     @staticmethod
     def _validate_account_name(name: str) -> None:
-        """Validate a user-supplied account name (MP-14).
+        """Validate a user-supplied account name.
 
         ``:`` is the path separator (``Expenses:Groceries``); a name
         containing it corrupts every downstream ``fullname.split(":")``
@@ -3914,7 +3904,7 @@ class CoreMixin:
                 f"Valid types: {', '.join(sorted(self.VALID_ACCOUNT_TYPES))}"
             )
 
-        # MP-14: validate the account name (shared chokepoint with
+        # Validate the account name (shared chokepoint with
         # update_account's rename branch).
         self._validate_account_name(name)
 
@@ -4040,7 +4030,7 @@ class CoreMixin:
 
             # Check for name conflict if renaming
             if new_name and new_name != account.name:
-                # MP-14: same name validation as create_account — the
+                # Same name validation as create_account — the
                 # rename path was an unguarded parallel entry point
                 # (':' / control chars / empty would corrupt fullname
                 # parsing downstream).
@@ -4448,7 +4438,7 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # Voided transactions are immutable (C8). Writing values
+            # Voided transactions are immutable. Writing values
             # into state='v' splits is the partial-void corruption
             # generator: the amounts move balance sums while staying
             # invisible to cash_flow / lots / reconciliation, and a
@@ -4645,7 +4635,7 @@ class CoreMixin:
                     )
                 resolved_accounts.append((account, split_data))
 
-            # 4a. Voided transactions are immutable (C8) — same
+            # 4a. Voided transactions are immutable — same
             # rationale as update_transaction; no force override.
             if any(_is_voided(s) for s in transaction.splits):
                 raise ValueError(

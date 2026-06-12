@@ -348,7 +348,7 @@ class BackupMixin:
 
         Pruning must never trust ``entry["path"]`` directly: under
         ``GNUCASH_REDACT_PATHS=1`` ``list_backups`` redacts that field
-        to the bare basename (MP-4), so ``Path(entry["path"]).unlink()``
+        to the bare basename, so ``Path(entry["path"]).unlink()``
         would resolve against the process CWD — a silent no-op, or a
         delete of an unrelated same-named file there. Reconstruct from
         the backups dir + the filename so a prune only ever deletes a
@@ -475,13 +475,13 @@ class BackupMixin:
 
         size_bytes = backup_path.stat().st_size
 
-        # MP-4: route path-bearing fields through ``redact_paths``
+        # Route path-bearing fields through ``redact_paths``
         # (imported at module top). Pass-through unless
         # ``GNUCASH_REDACT_PATHS=1``; when set, paths collapse to
         # basename so responses are safe to share externally
         # without leaking filesystem layout.
 
-        # L-5: shell-quote interpolated paths. Paths with spaces
+        # Shell-quote interpolated paths. Paths with spaces
         # or shell metachars would otherwise break the command —
         # and if a future code path ever passes a user-influenced
         # path component, an unquoted f-string is a latent
@@ -540,7 +540,7 @@ class BackupMixin:
                 "age": _describe_age(ts, now),
                 "size_bytes": size,
                 "label": label,
-                # MP-4: opt-in path redaction.
+                # Opt-in path redaction.
                 "path": redact_paths(str(path)),
             })
 
@@ -611,7 +611,7 @@ class BackupMixin:
                 "the 5 most recent manual backups)."
             )
 
-        # MP-3: symmetric footgun guard for the auto stages.
+        # Symmetric footgun guard for the auto stages.
         # ``prune_backups(keep_last_n=0)`` without an explicit
         # ``stage`` deletes every session / weekly / monthly
         # backup in one call. The user typed it intending "free up

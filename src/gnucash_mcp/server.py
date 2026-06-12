@@ -417,11 +417,11 @@ TOOL_MODULES: dict[str, list[str]] = {
 
 
 def _validate_module_groups() -> None:
-    """MP-10: every member of a MODULE_GROUPS expansion must exist
-    in TOOL_MODULES.
+    """Every member of a MODULE_GROUPS expansion must exist in
+    TOOL_MODULES.
 
-    Pre-fix the group definitions referenced module names by
-    convention only — a typo (``"reconcilation"`` vs
+    Without this check the group definitions reference module names
+    by convention only — a typo (``"reconcilation"`` vs
     ``"reconciliation"``) would silently produce an empty expansion
     at runtime: ``--modules=core`` would just not load the
     misspelled member, and the user would see "tool X not
@@ -811,10 +811,9 @@ def _get_server_config_impl() -> str:
 
 # Register get_server_config unconditionally at import time so it
 # survives _apply_module_filter's keep-set pass (Core's tool list
-# includes it). Previously gated behind --debug; now always
-# available as a diagnostic surface.
+# includes it).
 #
-# MP-1: deliberately omits ``@audit_log``. Every other read tool
+# Deliberately omits ``@audit_log``. Every other read tool
 # carries the decorator, but this one is a zero-side-effect config
 # inspection that the LLM calls reflexively as part of its
 # orientation pass (see the MCP server instructions and

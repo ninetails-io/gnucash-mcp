@@ -241,7 +241,7 @@ class CurrencyMixin:
         anchors at or beyond today fold to ``date.max`` so future-
         dated forecast prices are included (convention).
 
-        **Intermediate-currency chaining (issue #94).** A commodity
+        **Intermediate-currency chaining.** A commodity
         with no price *directly* in the default currency, but
         reachable through an intermediate, is resolved via
         :meth:`_market_rate_to_default` (direct → inverse → single
@@ -256,12 +256,11 @@ class CurrencyMixin:
 
         Args:
             book: Open piecash book.
-            as_of: Upper bound on the price date. **Required** — pre-
-                v1.3 release this defaulted to ``None`` (no upper
-                bound, i.e. always-latest rates). Five historical-
-                report sites passed nothing and silently used today's
-                rates regardless of report date; the default has been
-                dropped so every caller must declare its intent. Pass
+            as_of: Upper bound on the price date. **Required**
+                deliberately — a default (always-latest rates) would
+                let historical-report callers silently use today's
+                rates regardless of report date; every caller must
+                declare its intent. Pass
                 the report's as_of / end_date; the
                 ``_anchor_for_as_of`` helper handles the "include
                 future forecasts at now-or-future anchors" convention.
@@ -291,7 +290,7 @@ class CurrencyMixin:
                 latest[key] = (p_date, Decimal(str(p.value)))
         result = {guid: rate for guid, (_d, rate) in latest.items()}
 
-        # Issue #94: chain pass. For every commodity referenced by a
+        # Chain pass. For every commodity referenced by a
         # market price that the direct pass above couldn't rate, try
         # to reach the default currency through an intermediate. Only
         # commodities with at least one market price are candidates —
@@ -300,7 +299,7 @@ class CurrencyMixin:
         # per-commodity cost is a few indexed price walks, run only
         # for the non-direct minority.
         # Past anchors forbid after-anchor fallbacks in the chain
-        # legs (C7): the direct pass above hard-filters future
+        # legs: the direct pass above hard-filters future
         # prices for historical reports, and a chained commodity
         # must honor the same convention — not value a 2025-06-30
         # sheet at a rate first quoted in September. Now/future
@@ -463,7 +462,7 @@ class CurrencyMixin:
     ) -> tuple[Decimal, list[str]] | None:
         """Market rate converting one unit of ``commodity`` to the
         book default currency, with the intermediate path, chaining
-        when there is no direct price (issue #94).
+        when there is no direct price.
 
         Resolution order:
 
@@ -493,7 +492,7 @@ class CurrencyMixin:
             book, commodity_guid=commodity.guid, market_only=True,
         ):
             # Newest-first list with no date bound; the outer hop
-            # honors the same anchor convention as the legs (C7) —
+            # honors the same anchor convention as the legs —
             # past anchors never price off a future quote.
             if not allow_after and _to_date(p.date) > as_of:
                 continue
@@ -559,8 +558,7 @@ class CurrencyMixin:
         # Fold the anchor exactly as ``_rates_as_of`` does, and apply
         # the same past-anchor allow_after rule — otherwise the
         # provenance pass can resolve a DIFFERENT path than the one
-        # that produced the rate and the "(via …)" note lies (C7
-        # cosmetic relative).
+        # that produced the rate and the "(via …)" note lies.
         anchor = self._anchor_for_as_of(as_of)
         allow_after = anchor >= date.today()
         provenance: dict[str, str] = {}
@@ -746,15 +744,15 @@ class CurrencyMixin:
         3. Direct after ``as_of``, closest.
         4. Inverse after ``as_of``, closest.
 
-        **Staleness cap (Plumb Bob, 2026-06-04):** candidates more
+        **Staleness cap:** candidates more
         than ``GNUCASH_FX_STALENESS_DAYS`` (default 90) from
-        ``as_of`` are excluded. Pre-fix the function would happily
-        return a 5-year-old rate on a 2027 invoice; the documented
-        "on or near DATE" promise was effectively unreachable.
+        ``as_of`` are excluded. Without the cap the function would
+        happily return a 5-year-old rate on a current invoice,
+        making the documented "on or near DATE" promise unreachable.
         Setting the env var to ``0`` or a negative value disables
-        the cap (restores pre-fix behavior). ``respect_staleness_cap=
-        False`` disables it per-call — used by the valuation chain
-        (issue #94), which must value a holding at its latest
+        the cap entirely. ``respect_staleness_cap=
+        False`` disables it per-call — used by the valuation
+        chain, which must value a holding at its latest
         available rate regardless of age (matching the cap-free
         direct path in ``_rates_as_of``); the separate stale-price
         warning, not a hard cap, is what flags age for reporting. The
@@ -763,7 +761,7 @@ class CurrencyMixin:
 
         ``allow_after=False`` drops preference 3 and 4 entirely —
         no price dated after ``as_of`` is ever considered. Used by
-        the valuation chain for PAST anchors (C7): the direct pass in
+        the valuation chain for PAST anchors: the direct pass in
         ``_rates_as_of`` hard-filters future prices for historical
         reports, and the chain legs must honor the same convention or
         a commodity first priced after the report date silently

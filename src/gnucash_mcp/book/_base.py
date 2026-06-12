@@ -112,19 +112,17 @@ def _is_unreconciled(split) -> bool:
     same predicate ``get_unreconciled_splits`` (the detail tool)
     and ``_account_reconciliation_status`` (the dashboard count)
     both consult. Routing both sites through this helper enforces
-    HP-8's convergence structurally instead of by docstring promise.
+    the convergence structurally instead of by docstring promise.
 
     ``state == "n"`` (new) and ``state == "c"`` (cleared) both
     count — cleared splits are not finalized; they're the
     bookkeeper's tentative state before a final ``"y"`` mark.
     ``state == "y"`` (reconciled) and voided zombies are excluded.
 
-    Pre-HP-8 the dashboard count and the detail tool disagreed on
-    pre-``latest_y_date`` unreconciled splits (the dashboard scoped
-    its count to splits AFTER the most recent ``y``; the detail
-    tool returned all non-y). The fix landed at both sites by
-    hand-aligning the predicate; this helper chokepoints it so a
-    future change can't recreate HP-8 in a new shape.
+    Without the shared predicate the two surfaces drift (e.g. a
+    dashboard count scoped to splits after the most recent ``y``
+    while the detail tool returns all non-y); chokepointing it here
+    keeps them agreeing by construction.
 
     Scope: this is the **as-of-today** predicate. The dashboard
     surface (``_account_reconciliation_status`` →
@@ -582,7 +580,7 @@ def _transaction_to_dict(
     )
     result = {
         "guid": txn_guid,
-        # Null post_date is a legal old-book artifact (A9); render
+        # Null post_date is a legal old-book artifact; render
         # as None rather than crashing the whole listing.
         "date": (
             transaction.post_date.isoformat()
@@ -747,7 +745,7 @@ def _transaction_to_compact_line(
             collision-safe prefix (built via ``_guid_prefix_map``).
             Defaults to raw 8-char truncation when absent.
     """
-    # Null post_date is a legal old-book artifact (A9).
+    # Null post_date is a legal old-book artifact.
     date_str = (
         transaction.post_date.isoformat()
         if transaction.post_date else "(no date)"
@@ -1338,14 +1336,10 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         facing surface in the app — a reviewer shouldn't have to
         look up ``%2e78c86`` to know what got reconciled.
 
-        R-3: chokepoint for the account-ref-to-fullname rewrite
-        pattern. Pre-fix this lived as
-        ``_normalize_account_refs_for_audit`` inside
-        ``logging_config.py`` and opened its own book session per
-        audit-log render via ``_get_book_func()``. Moving the book
-        mechanics into BaseGnuCashBook puts the work next to
+        Chokepoint for the account-ref-to-fullname rewrite
+        pattern. Living in BaseGnuCashBook puts the work next to
         ``_resolve_account`` — the other chokepoint it relies on —
-        and lets future display surfaces route through the same
+        and lets display surfaces route through the same
         primitive without re-deriving the session-open + walk-splits
         + resolve loop.
 
@@ -1588,7 +1582,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _own_splits_balance(account, as_of: "date | None" = None):
         """Balance of the account's OWN splits in its own commodity.
 
-        The one rule every own-splits sum shares (C8 read-side):
+        The one rule every own-splits sum shares:
 
         - voided splits are excluded by **state**, not value. A
           well-formed void contributes 0 either way; the corrupted
@@ -1599,7 +1593,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         - ``as_of`` (inclusive) caps to posted-by-then transactions;
           ``None`` means no date bound — callers that intentionally
           include future-dated transactions pass nothing.
-        - null ``post_date`` rows (old-book artifact, A9) are
+        - null ``post_date`` rows (an old-book artifact) are
           excluded — same rule ``_query_filtered_splits`` applies,
           so this sum agrees with the SQL-backed reports.
         """

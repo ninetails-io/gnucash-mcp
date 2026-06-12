@@ -95,13 +95,13 @@ def register(mcp, get_book) -> None:
         # rather see back) gives a uniform contract: every tool that
         # echoes an account responds with the canonical full path.
         #
-        # MP-6: this double-fetch (get_account here + get_balance
+        # This double-fetch (get_account here + get_balance
         # below) is a deliberate trade-off. Dropping the get_account
         # call would shave one indexed query per ``get_balance`` —
         # cheap on its own — but it would also break the "every
         # tool echoes canonical paths" contract that
-        # ``TestCanonicalAccountEcho`` locks in PR #56's bookkeeper
-        # work. The contract wins: a caller who passed ``%2e78c86``
+        # ``TestCanonicalAccountEcho`` (tests/test_book.py) locks
+        # in. The contract wins: a caller who passed ``%2e78c86``
         # gets back ``Assets:Current Assets:Savings`` and instantly
         # confirms which account they were asking about, with zero
         # ambiguity if they fat-fingered the prefix. The extra

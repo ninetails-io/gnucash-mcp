@@ -52,13 +52,13 @@ class InvestmentsMixin:
             by_namespace: dict[str, list[dict]] = {}
 
             # Single pass over ``book.prices`` to build a latest-
-            # market-quote map keyed by commodity GUID. Pre-fix this
-            # method iterated ``book.prices`` without the
-            # ``_is_market_price`` filter, so a ``type='transaction'``
+            # market-quote map keyed by commodity GUID. The
+            # ``_is_market_price`` filter is required — without it a
+            # ``type='transaction'``
             # placeholder newer than the user's last ``nav`` quote
-            # would shadow it (SB-11). The fix applies the predicate
+            # would shadow it. The predicate applies
             # in this same single pass — same chokepoint, no N+1
-            # per-commodity query (Copilot-flagged on PR #95: a
+            # per-commodity query (a
             # per-commodity ``_find_prices`` call would issue one DB
             # query per commodity).
             latest_market: dict[str, tuple[date, "Price"]] = {}
@@ -140,8 +140,7 @@ class InvestmentsMixin:
         Raises:
             ValueError: If commodity already exists in that namespace.
         """
-        # MP-13: validate inputs up front. Mirrors HP-11's
-        # symmetric-gate principle — bad inputs reject before
+        # Validate inputs up front — bad inputs reject before
         # the ORM round-trip, with a useful error rather than
         # IntegrityError / silent corruption downstream.
         if not mnemonic or not mnemonic.strip():
@@ -730,7 +729,7 @@ class InvestmentsMixin:
                 notes=notes,
                 is_closed=0,
             )
-            # MP-11: ``book.session.add(lot)`` is redundant —
+            # ``book.session.add(lot)`` is redundant —
             # piecash's Lot.__init__ assigns ``self.account``,
             # which back-populates through Account.lots and
             # auto-registers the Lot with the session. Verified
@@ -857,14 +856,14 @@ class InvestmentsMixin:
                     "value": str(split.value),
                 }
                 # The summary already excludes voided zombies; an
-                # unmarked 0-row here read as a real event the
-                # summary then contradicted (A8).
+                # unmarked 0-row here would read as a real event the
+                # summary then contradicts.
                 if _is_voided(split):
                     row["voided"] = True
                 splits.append(row)
 
             summary = self._lot_summary(lot)
-            # Phase 6A: ``is_closed`` already lives at the top level
+            # ``is_closed`` already lives at the top level
             # of this response. Drop it from the nested ``summary``
             # so callers see the field once, not twice.
             summary_compact = {k: v for k, v in summary.items() if k != "is_closed"}
@@ -948,8 +947,8 @@ class InvestmentsMixin:
                 auto_closed = True
 
             # split_guid and lot_guid are echoed inputs — dropped.
-            # ``is_closed`` is included on this response (Phase 6A
-            # removed it from ``_lot_summary``, but the auto-close
+            # ``is_closed`` is included on this response
+            # (``_lot_summary`` omits it, but the auto-close
             # behavior of this tool is exactly what the caller wants
             # to know about — keep it surfaced here).
             return {
@@ -1024,14 +1023,14 @@ class InvestmentsMixin:
                 price = _to_decimal(sale_price)
             else:
                 # Look up latest market price for this commodity in
-                # the book's default currency. Pre-fix this walk had
-                # two bugs: no ``_is_market_price`` filter (a
+                # the book's default currency. Two filters are both
+                # required: the ``_is_market_price`` filter (a
                 # ``type='transaction'`` placeholder could shadow
-                # real quotes — SB-11 placeholder portion) and no
+                # real quotes) and the
                 # currency filter (a foreign-currency quote could
                 # mis-denominate proceeds against a default-currency
-                # cost basis — SB-11 currency portion). Routing
-                # through ``_find_prices`` with both filters fixes
+                # cost basis). Routing
+                # through ``_find_prices`` applies
                 # both at one chokepoint.
                 commodity = lot.account.commodity
                 recent = self._find_prices(
@@ -1047,7 +1046,7 @@ class InvestmentsMixin:
                 price = Decimal(str(recent[0].value))
 
             # Cost basis must be in the same currency as the
-            # proceeds (A1). ``purchase_value`` sums raw
+            # proceeds. ``purchase_value`` sums raw
             # ``split.value`` — TRANSACTION-currency units. A
             # foreign-denominated buy (EUR-currency purchase
             # transaction in a USD book) must convert at its

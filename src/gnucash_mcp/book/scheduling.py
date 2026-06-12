@@ -295,7 +295,7 @@ class SchedulingMixin:
                 parent=book.root_template,
                 commodity=self._require_default_currency(book),
             )
-            # MP-11: ``book.session.add(template_acct)`` is
+            # ``book.session.add(template_acct)`` would be
             # redundant — piecash's Account auto-registers via
             # the parent relationship. Documented in CLAUDE.md
             # under "piecash gotchas." The flush is kept because
@@ -620,7 +620,7 @@ class SchedulingMixin:
         """Create an actual transaction from a scheduled template.
 
         Three-phase write to keep the schedule advance and the
-        transaction in lockstep (SB-10):
+        transaction in lockstep:
 
         1. **Read-only** session: resolve the scheduled-transaction
            row, compute the target ``txn_date``, validate
@@ -641,9 +641,9 @@ class SchedulingMixin:
            existence invariant holds in both the success and
            duplicate-detected branches.
 
-        Pre-fix the schedule advanced BEFORE the transaction call;
-        any raise in phase 2 left the schedule moved with no
-        transaction posted, and a re-run would skip the period
+        Advancing the schedule BEFORE the transaction call is the
+        trap: any raise in phase 2 leaves the schedule moved with
+        no transaction posted, and a re-run skips the period
         entirely.
 
         Args:
@@ -741,7 +741,8 @@ class SchedulingMixin:
         # ── Phase 2: create the transaction. ────────────────────
         # On raise: schedule is unchanged (phase 3 not reached).
         # On status="rejected": duplicate detector caught an
-        # equivalent prior transaction — for SB-10 purposes that
+        # equivalent prior transaction — for schedule-advance
+        # purposes that
         # transaction IS the one for this period, so we proceed
         # to advance the schedule and forward the rejection signal
         # to the caller in the response.
