@@ -54,6 +54,36 @@ Classification is the work; editing is its output. A sweep is not measured
 by diff size. A large share of this codebase's comments are excellent and
 must survive untouched.
 
+### 8. A comment earns its length
+
+About 40% of this codebase is commentary. Length is a cost the reader
+pays on every visit, so a block over ~6 lines must earn each paragraph —
+each one stating a distinct constraint, trap, or contract fact. Concretely:
+
+- **Chokepoint rationale lives once, on the chokepoint.** A call site
+  gets at most a one-line pointer ("converted via
+  ``_convert_invoice_amount``; see its docstring"), never a
+  re-explanation. If two blocks explain the same rule, one of them is
+  a pointer.
+- **Trap stories are one to two sentences:** name the wrong move, name
+  the consequence. The regression suite carries the reproduction; the
+  comment only has to make the trap visible (rule 3 still governs the
+  floor — never compress past the point where the trap disappears).
+- **Args entries exist only when they add semantics** — units, valid
+  ranges, sentinel values, cross-field constraints, failure modes. An
+  entry that restates the parameter name, the type hint, or the
+  default verbatim is cut.
+- **One example per format docstring.** Pick the most representative;
+  delete the variations.
+- **Don't narrate control flow or structure** the code or its section
+  headers already show ("then we loop over…", "skeleton: 1. open the
+  book…").
+- **Don't re-document the callee.** A docstring that summarizes what a
+  helper it calls already documents gets a cross-reference instead.
+
+Rules 1–3 dominate rule 8: an invariant, a piecash quirk, or a live trap
+is never deleted to hit a length budget.
+
 ---
 
 ## Type specimens
