@@ -4,6 +4,25 @@ Rule 8 execution plan. Companion to [COMMENT_DOCTRINE.md](COMMENT_DOCTRINE.md)
 (rule 8) and successor to [COMMENT_SWEEP_MANIFEST.md](COMMENT_SWEEP_MANIFEST.md).
 Drafted 2026-06-12 on `chore/comment-sweep` at the post-sweep state.
 
+> **AS-BUILT (2026-06-12).** Executed in five gated commits
+> (`ef67c8d` business · `60b269a` core · `aa4891d`
+> base/query/currency · `505c2c2`
+> reporting/recon/sched/budgets/invest/backup · `dd67ded`
+> logging/format/server/tools), all appended to
+> `.git-blame-ignore-revs`. Net result: **−3,461 lines** across 17
+> files (estimate was 2,100–2,500 — docstring rewrites tightened
+> more surrounding prose than the per-block budgets predicted);
+> src/ commentary went **39% → 31.7%**. Every commit passed all
+> three gates (pytest 1,584 / AST-identical after docstring strip /
+> wire-surface byte-identical). The DO-NOT-TOUCH list below was
+> honored in full; trap stories survive in 1–2-sentence form per
+> rule 3's floor. The doctest caution resolved benign: pytest does
+> not collect doctests, so `_format_number`'s Examples were trimmed
+> to one. A handful of `Returns:` lines that still claimed a `guid`
+> key on guid-omitted responses were corrected in passing (rule 6).
+> The tables below are retained as drafted, as the record of the
+> budgets the edits were made against.
+
 **Anchors are symbol names, not line numbers** — line numbers drift; locate
 every block by its enclosing function/class/header text. If executing after
 a compaction, re-read the doctrine and the target file's section for the
