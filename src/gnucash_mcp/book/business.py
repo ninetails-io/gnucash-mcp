@@ -4657,16 +4657,17 @@ class BusinessMixin:
         taxtable: str | None = None,
         tax_included: bool = False,
     ) -> dict:
-        """Shared implementation behind ``add_invoice_entry`` and
-        ``add_bill_entry``. The two methods were 90% duplicated
-        (the only differences: which side of the entries-table
-        column pair gets the price/account, the owner_type code,
-        the allowed account types, and the response id key). This
-        helper takes ``owner_type`` (2=customer invoice, 4=vendor
-        bill), looks up the per-doc config in ``_ENTRY_CONFIG``,
-        and writes the entry.
+        """Write a line-item entry on an invoice, bill, or voucher.
 
-        **Taxtable wire-up (commit 4 of the v1.3 taxtable arc):**
+        Shared implementation behind ``add_invoice_entry``,
+        ``add_bill_entry``, ``add_voucher_entry``, and
+        ``add_credit_note_entry``. ``owner_type`` (2=customer
+        invoice, 4=vendor bill, 5=employee voucher) selects the
+        per-doc config in ``_ENTRY_CONFIG``: which side of the
+        entries-table column pair gets the price/account, the
+        allowed account types, and the response id key.
+
+        **Taxtable wire-up:**
 
         When ``taxtable`` is given, the entry is marked taxable and
         the resolved taxtable's GUID is written to ``i_taxtable``

@@ -56,10 +56,10 @@ class _CreateSignals:
     """Signals gathered in a single pass over ``book.transactions`` for
     the ``create_transaction`` preflight and post-write checks.
 
-    Before this was consolidated, ``create_transaction`` made four
-    separate helper calls — each opening the book, scanning the full
-    transaction list, and producing one signal. That's ``~4 × (open +
-    O(N))`` per create. On a 10k-txn book the four opens alone cost
+    One pass matters: gathering each signal with its own helper
+    call — each opening the book, scanning the full transaction
+    list, and producing one signal — costs ``~4 × (open +
+    O(N))`` per create. On a 10k-txn book the opens alone are
     80–150 ms, plus ~40k iterations for the scans.
 
     Collecting everything in one pass turns the hot path into a single
@@ -2966,10 +2966,9 @@ class CoreMixin:
         """Gather every signal ``create_transaction`` might need in a
         single pass over ``book.transactions``.
 
-        The four original helpers (``_auto_fill_splits``,
-        ``_check_auto_fill_stability``, ``_find_duplicates``, and a
-        post-write recent-description matcher, since deleted) each
-        opened the book and did its own full-table scan. This collector folds all
+        The four signals (auto-fill source, auto-fill stability,
+        duplicate candidates, recent matches) each need their own
+        full-table view; this collector folds all
         of them into one sort + one traversal, classifying each
         transaction into whichever signal bucket(s) it matches.
 

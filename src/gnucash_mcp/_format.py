@@ -8,11 +8,11 @@ import from here; ``book/`` and ``tools/`` stay decoupled.
 Two pieces:
 
 - :func:`_format_number` — single chokepoint for currency / percentage
-  / share-quantity rounding. Replaces ad-hoc ``str(decimal)`` calls
-  that leaked 26-digit Decimal arithmetic into responses.
+  / share-quantity rounding. Ad-hoc ``str(decimal)`` calls leak
+  26-digit Decimal arithmetic into responses.
 - :func:`_apply_limit` — generalized truncation + notice helper.
-  Mirrors the contract previously baked into
-  ``CoreMixin._truncation_notice`` but parameterized so any tool can
+  Same contract as ``CoreMixin._truncation_notice`` but
+  parameterized so any tool can
   plug in its own entity name.
 """
 
