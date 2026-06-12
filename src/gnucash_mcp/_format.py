@@ -29,35 +29,21 @@ def _format_number(
     decimals: int = 2,
     strip_trailing: bool = False,
 ) -> str:
-    """Format a numeric value with consistent precision.
+    """Format a numeric value with consistent precision, e.g.
+    ``_format_number(Decimal("1234.567"))`` → ``'1234.57'``.
 
     Args:
         value: Decimal, str, int, float, or None. None and empty
-            strings render as ``"0"`` (or ``"0.00"`` etc., per
-            ``decimals``) so omission and zero are visually identical
-            in the response.
-        decimals: Number of decimal places. Common settings:
-            - 2 for currency amounts and percentages
-            - 4 for share quantities (mutual funds, stocks)
-            - 6 for crypto (sub-satoshi precision matters)
-        strip_trailing: When True, drop trailing zeros after the
-            decimal point. ``"1.50"`` → ``"1.5"``, ``"1.00"`` → ``"1"``.
+            strings render as zero so omission and zero look
+            identical in the response.
+        decimals: 2 for currency/percentages, 4 for share
+            quantities, 6 for crypto.
+        strip_trailing: Drop trailing zeros (``"1.50"`` → ``"1.5"``).
             Default False — currency-style fixed precision.
 
     Returns:
-        Decimal string suitable for direct inclusion in a JSON or TSV
-        response. Inputs that don't parse as numbers are returned
-        ``str(value)`` unchanged so callers don't have to pre-validate.
-
-    Examples:
-        >>> _format_number(Decimal("1234.567"))
-        '1234.57'
-        >>> _format_number(Decimal("0.123456789"), decimals=2)
-        '0.12'
-        >>> _format_number(Decimal("230.762"), decimals=4)
-        '230.7620'
-        >>> _format_number(Decimal("1.50"), decimals=2, strip_trailing=True)
-        '1.5'
+        Decimal string ready for JSON/TSV. Non-numeric input passes
+        through as ``str(value)`` so callers needn't pre-validate.
     """
     if value is None or value == "":
         if strip_trailing:
@@ -67,9 +53,7 @@ def _format_number(
     try:
         d = Decimal(str(value))
     except (InvalidOperation, ValueError):
-        # Not a number — pass through unchanged. Defensive: callers
-        # can hand us free-form strings (e.g. "N/A") for fields that
-        # are usually numeric and we shouldn't crash the tool.
+        # Free-form strings ("N/A") pass through unchanged.
         return str(value)
 
     quantum = Decimal(1).scaleb(-decimals)  # 0.01 for decimals=2
@@ -90,27 +74,12 @@ def _format_number(
 def _book_display_name(book_path) -> str:
     """Render a book path as filename only — no directory leakage.
 
-    Routine LLM-visible responses (``get_server_config``,
-    ``get_book_summary``'s orientation line) must not include the full
-    absolute path to the GnuCash book. That would leak the user's
-    username, home directory layout, and any custom organization
-    (``~/Finances/``, ``~/Documents/Books/``) into every transcript
-    — a privacy concern for a tool that gets used on real personal
-    financial data and a security concern for screenshots / shared
-    sessions.
-
-    The filename alone is sufficient to verify *which* book is
-    loaded ("yes, this is Alex's book, not Lin Wei's"); the path
-    components leading to it are the sensitive bit.
-
-    This is an always-on redaction for the book path specifically,
-    distinct from :func:`gnucash_mcp.logging_config.redact_paths`
-    which is opt-in via ``GNUCASH_REDACT_PATHS=1`` and aimed at
-    error-message paths (where the directory may be load-bearing
-    debugging signal).
-
-    Returns ``"not set"`` for falsy input so the orientation reads
-    sensibly when ``GNUCASH_BOOK_PATH`` was never set.
+    Routine LLM-visible responses must not carry the full book path:
+    it leaks username and home-directory layout into every
+    transcript, and the filename alone verifies *which* book is
+    loaded. Always-on, unlike the opt-in ``redact_paths`` (which
+    targets error-message paths where the directory can be
+    load-bearing debugging signal). Falsy input → ``"not set"``.
     """
     if not book_path:
         return "not set"
@@ -135,34 +104,24 @@ def _apply_limit(
 
     Three notice cases:
 
-    1. **Truncated.** ``total > effective`` → return the slice with a
+    1. **Truncated** — return the slice with a
        ``[Showing N of M ...]`` message.
-    2. **Capped only.** Caller passed ``limit > max_cap`` but the full
-       result still fits — return everything with a ``[Limit capped at
-       N]`` message so the caller knows their over-limit had no effect.
-    3. **Fits naturally.** ``total <= effective`` and ``limit <= max_cap``
-       → return everything, no notice.
+    2. **Capped only** — ``limit > max_cap`` but everything fits;
+       the ``[Limit capped at N]`` notice says the over-limit had
+       no effect.
+    3. **Fits naturally** — everything, no notice.
 
     Args:
-        items: Full list, already filtered/sorted by the caller.
-        limit: Caller-supplied limit. Falsy values fall back to
-            ``default`` so omitting the parameter still gives a
-            reasonable response size.
-        default: Fallback limit (50 matches the ``list_transactions``
-            convention).
-        max_cap: Server-side ceiling. Larger limits are silently
-            clamped and signaled via the cap-notice.
-        entity_name: Plural noun in notice strings — e.g. ``"splits"``,
-            ``"invoices"``, ``"prices"``. Renders as
-            ``"Showing 5 of 35 invoices"``.
-        suggest_narrow: When True, the over-limit hint mentions
-            ``"narrow filters"`` first. Useful for tools that take
-            date-range / account-filter parameters where narrowing is
-            the better path than raising the limit.
+        limit: Falsy values fall back to ``default`` (50, the
+            list_transactions convention); values above ``max_cap``
+            (250) clamp with the cap notice.
+        entity_name: Plural noun for the notice ("splits",
+            "invoices").
+        suggest_narrow: Mention "narrow filters" first in the hint —
+            for tools where narrowing beats raising the limit.
 
     Returns:
-        Tuple ``(truncated, notice)``. ``notice`` is ``None`` only when
-        nothing was truncated and no cap was applied.
+        ``(truncated, notice)``; ``notice`` is None only in case 3.
     """
     if not limit or limit < 1:
         limit = default

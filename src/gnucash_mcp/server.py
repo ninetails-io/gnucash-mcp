@@ -15,21 +15,14 @@ from mcp.server.fastmcp import FastMCP
 # Strict tool-argument validation: reject unknown kwargs at the MCP
 # boundary instead of silently ignoring them.
 #
-# FastMCP generates a Pydantic model per tool from the function
-# signature, all inheriting from ``ArgModelBase``. The base class's
-# default config doesn't set ``extra``, so Pydantic falls back to
-# ``"ignore"`` — typo'd or stale-spec parameter names silently
-# no-op. Example: calling
-# ``reconcile_account`` with ``except=[...]`` (the spec's name)
-# instead of ``except_guids=[...]`` (the actual Python-safe param)
-# ran the tool with no exclusion at all, surfacing only as a
-# balance mismatch downstream.
-#
-# Patching ``ArgModelBase.model_config`` to include
-# ``extra="forbid"`` makes the dynamically-created arg models
-# reject unknown fields with a clear ``"Extra inputs are not
-# permitted"`` error. Applied at import time, before any tool
-# module loads.
+# FastMCP's per-tool Pydantic models inherit ``ArgModelBase``, whose
+# config doesn't set ``extra`` — Pydantic falls back to "ignore", so
+# typo'd or stale-spec parameter names silently no-op. Example:
+# calling ``reconcile_account`` with ``except=[...]`` (the spec's
+# name) instead of ``except_guids=[...]`` ran the tool with no
+# exclusion at all, surfacing only as a balance mismatch downstream.
+# Patching ``extra="forbid"`` in makes the arg models reject unknown
+# fields loudly. Applied at import, before any tool module loads.
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 
 ArgModelBase.model_config = {
@@ -69,70 +62,35 @@ SAFETY: Reconciled splits are protected (use force=true to override). Prefer voi
 )
 
 # ---------------------------------------------------------------------------
-# Tool module definitions — controls which tools are advertised via --modules
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# MODULE_GROUPS — composition aliases that expand to one or more modules.
-#
-# Lets ``--modules=core`` (or any group name) expand to a set of underlying
-# module keys. The groups define the role-aligned partition: ``core``
-# (always-on ledger primitives), ``bookkeeper``, ``investor``, and
-# ``business``.
-#
-# Expansion is single-pass (groups don't reference other groups). The
-# partition is deliberately flat; if nesting becomes useful later we'll
-# add cycle detection then.
+# MODULE_GROUPS — composition aliases expanding to underlying module
+# keys; the role-aligned partition (core / bookkeeper / investor /
+# business). Expansion is single-pass — groups don't reference other
+# groups; add cycle detection if nesting ever lands.
 # ---------------------------------------------------------------------------
 MODULE_GROUPS: dict[str, list[str]] = {
-    # ``core`` expands to its nine ledger sub-modules. Always-on
-    # (force-added in _apply_module_filter), so a user with no
-    # --modules flag gets all nine. Users can ALSO pick individual
-    # sub-modules — e.g. ``--modules=accounts`` is valid but doesn't
-    # change the fact that core is loaded too.
-    #
-    # ``reconciliation`` is part of core: reconciliation touches
-    # money and every configuration touches money, so excluding it
-    # from any persona-aligned cut produces a server that can't
-    # reconcile statements (a hole
-    # in the "any configuration that handles ledgers" promise).
+    # ``core`` is always-on (force-added in _apply_module_filter).
+    # ``reconciliation`` belongs here: reconciliation touches money
+    # and every configuration touches money — excluding it from any
+    # persona cut produces a server that can't reconcile statements.
     "core": [
         "summary", "accounts", "transactions", "slots",
         "audit", "backup", "balance_sheet", "diagnostic",
         "reconciliation",
     ],
-    # ``bookkeeper`` bundles the personal-finance management
-    # cluster: run reports, manage budgets, schedule recurring
-    # transactions. The three underlying modules stay separately
-    # selectable for users who want a finer cut.
+    # Personal-finance cluster; members stay separately selectable.
     "bookkeeper": [
         "reporting", "budgets", "scheduling",
     ],
-    # ``investor`` bundles the two halves of the legacy
-    # ``investments`` module: ``tax_lots`` (cost-basis tracking)
-    # and ``portfolio`` (commodities + prices, the multi-currency
-    # primitive). A user typing ``--modules=investor`` wants both
-    # because tax-lot accounting is meaningless without prices.
-    # The split is preserved at the leaf-module level so a
-    # multi-currency household without a brokerage can still
-    # pick ``portfolio`` alone.
+    # Both halves of the legacy ``investments`` module — tax-lot
+    # accounting is meaningless without prices, but a multi-currency
+    # household without a brokerage can still pick portfolio alone.
     "investor": [
         "tax_lots", "portfolio",
     ],
-    # ``business`` is the small-business persona alias. It expands
-    # to ``freelancer`` (the customer-facing invoice tools) plus
-    # ``business_complete`` (the vendor/employee/jobs/credit-
-    # notes/billing-terms tools). The group must stay the
-    # superset: a ``business`` selection that loaded only the
-    # vendor half would give "small business workflow" users
-    # vendor management without the ability to create or post a
-    # customer invoice.
-    #
-    # The two leaves stay independently selectable for users who
-    # want a finer cut (a solo freelancer with no vendor activity
-    # uses ``--modules=freelancer``; a back-office bookkeeper
-    # managing only vendor side could pick
-    # ``--modules=business_complete`` though that's a less common
-    # carve-out).
+    # Small-business persona. The group must stay the SUPERSET of
+    # both halves — loading only the vendor half would give
+    # "small business workflow" users vendor management without the
+    # ability to create or post a customer invoice.
     "business": [
         "freelancer", "business_complete",
     ],
@@ -140,31 +98,16 @@ MODULE_GROUPS: dict[str, list[str]] = {
 
 
 # ---------------------------------------------------------------------------
-# MODULE_BACKED_BY — per public-module, the set of legacy tool-file /
-# mixin names needed to back its tools.
-#
-# Pre-restructure the mapping was 1:1 (module ``X`` → tool file
-# ``tools/X.py`` → mixin ``XMixin``). The restructure breaks that:
-# Core's 29 tools include void/unvoid AND the reconciliation
-# surface (both from ``reconciliation.py``), the slot tools +
-# audit log (from ``admin.py``), and the backup tools (from
-# ``backup.py``). The mixin classes still live in their original
-# files; this dict tells ``_apply_module_filter`` which tool files to
-# lazy-load AND ``main()`` which mixins to compose for the requested
-# module set.
-#
-# An entry missing from this dict means "1:1 — uses the legacy name
-# of the same module."
+# MODULE_BACKED_BY — per public module, the legacy tool-file / mixin
+# names backing its tools. The public partition no longer maps 1:1
+# onto files (e.g. ``transactions`` spans core.py + reconciliation.py);
+# this dict tells ``_apply_module_filter`` which tool files to
+# lazy-load and ``main()`` which mixins to compose. A missing entry
+# means 1:1 with the module's own name.
 # ---------------------------------------------------------------------------
 MODULE_BACKED_BY: dict[str, set[str]] = {
-    # Core sub-modules — each maps to the legacy tool-file / mixin
-    # name(s) that host its tools. summary/accounts/transactions/
-    # balance_sheet are largely served by ``core.py`` and
-    # ``reporting.py`` (balance_sheet specifically); slots/audit by
-    # ``admin.py``; backup by ``backup.py``; the void/unvoid pair in
-    # transactions by ``reconciliation.py``. The diagnostic
-    # sub-module's one tool registers inline in server.py, so it
-    # needs no backing file.
+    # diagnostic's one tool registers inline in server.py — no
+    # backing file.
     "summary": {"core"},
     "accounts": {"core"},
     "transactions": {"core", "reconciliation"},
@@ -173,24 +116,11 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
     "backup": {"backup"},
     "balance_sheet": {"reporting"},
     "diagnostic": set(),
-    # ``portfolio`` (prices / commodities) and ``tax_lots`` (cost-
-    # basis tracking) are the two halves of what used to be the
-    # ``investments`` module. The ``investor`` group alias in
-    # MODULE_GROUPS pulls them both in for users who want the full
-    # surface.
     "portfolio": {"investments"},
     "tax_lots": {"investments"},
-    # ``freelancer`` (customer-facing invoicing) and
-    # ``business_complete`` (vendor + employee management, vendor
-    # bills, jobs, credit notes, billing terms) split the legacy
-    # ``business`` module along persona lines. Both back onto the
-    # same ``tools/business.py`` file — the public modules are
-    # subsets of one underlying registration.
-    #
-    # The ``business`` PUBLIC name is a MODULE_GROUPS alias that
-    # expands to both halves (see MODULE_GROUPS above); it doesn't
-    # appear here because groups never need their own backing
-    # entry — they resolve via their members' backings.
+    # freelancer / business_complete are subsets of one underlying
+    # tools/business.py registration. The ``business`` group alias
+    # doesn't appear here — groups resolve via their members.
     "freelancer": {"business"},
     "business_complete": {"business"},
 }
@@ -198,9 +128,6 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
 
 TOOL_MODULES: dict[str, list[str]] = {
     # ── Core ledger sub-modules (composed via MODULE_GROUPS["core"]) ──
-    # Each is independently selectable via --modules but normally all
-    # nine are loaded together because the ``core`` group alias is
-    # always force-added.
     "summary": [
         "get_book_summary",
     ],
@@ -221,15 +148,13 @@ TOOL_MODULES: dict[str, list[str]] = {
         "delete_transaction",
         "replace_splits",
         "search_transactions",
-        # Void / unvoid live here — they're the audit-preserving
-        # erasure path for transactions, paired with delete_transaction
-        # (which refuses posted documents and points at void).
+        # Void / unvoid: the audit-preserving erasure path, paired
+        # with delete_transaction.
         "void_transaction",
         "unvoid_transaction",
     ],
     "slots": [
-        # Per-account metadata used by multiple modules — APR,
-        # credit_limit, statement-close-day, minimum_payment.
+        # Per-account metadata (APR, credit_limit, statement day).
         "get_account_slots",
         "set_account_slot",
         "delete_account_slot",
@@ -238,23 +163,18 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_audit_log",
     ],
     "backup": [
-        # Auto-snapshot hook is always-on regardless; these expose
-        # the manual control surface for inspecting / pruning the
-        # snapshot history.
+        # Manual control surface; the auto-snapshot hook is
+        # always-on regardless.
         "create_backup",
         "list_backups",
         "prune_backups",
     ],
     "balance_sheet": [
-        # THE canonical accounting report — Assets, Liabilities,
-        # Equity reconciling to zero. Analytical reports (cash flow,
-        # spending breakdowns, net worth time series) stay in the
-        # ``reporting`` module.
+        # THE canonical report; analytical reports stay in
+        # ``reporting``.
         "balance_sheet",
     ],
     "diagnostic": [
-        # Server config introspection — loaded modules, tool count,
-        # version. Always available regardless of --debug.
         "get_server_config",
     ],
     "reconciliation": [
@@ -285,11 +205,8 @@ TOOL_MODULES: dict[str, list[str]] = {
         "update_scheduled_transaction",
         "delete_scheduled_transaction",
     ],
-    # ``investments`` split into ``portfolio`` (the multi-currency
-    # primitive: commodities + prices) and ``investor`` (tax-lot
-    # management). A multi-currency household without a brokerage
-    # picks portfolio without investor; a single-currency investor
-    # picks the inverse.
+    # ``investments`` split: portfolio = the multi-currency
+    # primitive (commodities + prices); tax_lots = cost basis.
     "portfolio": [
         "list_commodities",
         "create_commodity",
@@ -306,24 +223,15 @@ TOOL_MODULES: dict[str, list[str]] = {
         "calculate_lot_gain",
         "close_lot",
     ],
-    # ``business`` split into ``freelancer`` (customer-facing
-    # invoicing — the natural surface for a solo consultant) and
-    # ``business`` (vendor + employee management, vendor bills —
-    # additive to freelancer for full small-business workflow). The
-    # shared-lifecycle tools (post/unpost/pay_invoice, list/get_invoice,
-    # get_outstanding_invoices) live in freelancer because customer
-    # invoicing is the dominant use case; runtime owner_type gating
-    # (see _gate_owner_type in tools/_helpers.py) rejects vendor-side
-    # use when business isn't loaded.
-    #
-    # Taxtables live in freelancer because customer-facing sales
-    # tax (Canadian GST, UK VAT, US state sales tax on services)
-    # is a primary freelancer concern — a solo consultant
-    # collecting tax on invoices needs the CRUD surface without
-    # also pulling in vendor management. The polymorphic
-    # add_*_entry tools share the taxtable parameter; runtime
-    # use on a vendor bill or voucher reads the same taxtable
-    # registry whether ``business`` is loaded or not.
+    # Placement rule for the freelancer/business_complete split:
+    # polymorphic and shared-registry tools (invoice lifecycle,
+    # taxtables, billterms, jobs, credit notes) live in freelancer
+    # because the customer side is the dominant solo-consultant use
+    # case; vendor-side use of the same tools is rejected at runtime
+    # by _gate_owner_type (tools/_helpers.py) when
+    # business_complete isn't loaded. business_complete owns the
+    # vendor/employee ENTITIES and the workflows that don't make
+    # sense without them.
     "freelancer": [
         "create_customer",
         "list_customers",
@@ -344,49 +252,21 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_taxtable",
         "update_taxtable",
         "delete_taxtable",
-        # Billterms — payment-terms registry shared by customer
-        # invoices and vendor bills. Lives here because every
-        # invoice carries terms; a solo freelancer setting
-        # "Net 30" or "2/10 Net 30" on customer invoices needs
-        # the CRUD surface without pulling in vendor management.
+        # Billterms, jobs, credit notes — placement rule above.
         "create_billterm",
         "list_billterms",
-        # Jobs — project-level grouping over invoices/bills for
-        # a single customer or vendor. Polymorphic on owner_type
-        # via the same _gate_owner_type pattern as the invoice
-        # tools: a freelancer-only user can create customer jobs
-        # but vendor jobs require business_complete to be loaded.
-        # Lives here because per-client P&L is a freelancer's
-        # natural year-end view.
         "create_job",
         "list_jobs",
         "get_job",
         "update_job",
         "delete_job",
         "get_job_report",
-        # Credit notes — refund/return documents. Polymorphic on
-        # owner_type. A freelancer issuing a customer refund
-        # works in this surface; vendor-side credit notes
-        # require business_complete via the gate.
         "create_credit_note",
         "add_credit_note_entry",
         "delete_credit_note",
         "apply_credit_note",
     ],
-    # ``business_complete`` — vendor + employee surface only.
-    # Together with ``freelancer`` (which owns billterms,
-    # jobs, and credit notes),
-    # forms the full small-business toolkit. Both leaves expand
-    # together under the ``business`` group alias in
-    # MODULE_GROUPS.
-    #
-    # Polymorphic tools (jobs, credit notes) live in freelancer
-    # — a freelancer-only user uses them for customer-side
-    # operations; vendor-side use requires ``business_complete``
-    # via the _gate_owner_type check. This module owns the
-    # *entities* (vendors, employees) and the *vendor-side
-    # workflows* (bills, vouchers, vendor_spending_report) that
-    # don't make sense without those entities.
+    # Vendor + employee surface — see the placement rule above.
     "business_complete": [
         "create_vendor",
         "list_vendors",
@@ -401,9 +281,8 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_employee",
         "update_employee",
         "delete_employee",
-        # Employee expense vouchers (v1.3). Lifecycle (post /
-        # unpost / pay) flows through the polymorphic invoice
-        # tools in freelancer with owner_type='employee'.
+        # Voucher lifecycle (post/unpost/pay) flows through the
+        # polymorphic invoice tools with owner_type='employee'.
         "create_voucher",
         "add_voucher_entry",
         "delete_voucher",
@@ -414,17 +293,10 @@ TOOL_MODULES: dict[str, list[str]] = {
 
 def _validate_module_groups() -> None:
     """Every member of a MODULE_GROUPS expansion must exist in
-    TOOL_MODULES.
-
-    Without this check the group definitions reference module names
-    by convention only — a typo (``"reconcilation"`` vs
-    ``"reconciliation"``) would silently produce an empty expansion
-    at runtime: ``--modules=core`` would just not load the
-    misspelled member, and the user would see "tool X not
-    available" with no indication that the alias was the cause.
-
-    This check fires at import time alongside ``_validate_tool_modules``
-    so the developer feedback is immediate and loud.
+    TOOL_MODULES — a typo'd member would otherwise silently drop
+    out of the expansion, surfacing only as "tool X not available"
+    with no hint that the alias was the cause. Fires at startup
+    alongside ``_validate_tool_modules``.
     """
     known = set(TOOL_MODULES.keys())
     bad: dict[str, list[str]] = {}
@@ -467,13 +339,8 @@ def _validate_tool_modules() -> None:
             f"Add them to the appropriate module."
         )
 
-    # Phantom check is scoped to modules whose backing tool files
-    # aren't extracted (i.e., tools ship at server.py import time
-    # rather than lazy-load). A module's backing files come from
-    # MODULE_BACKED_BY when set, otherwise default 1:1 to the module
-    # name itself. ``portfolio`` and ``investor`` back onto the
-    # extracted ``investments`` file, so their tools are lazy-loaded
-    # despite the module names being new.
+    # Phantom check scoped to modules whose backing files aren't
+    # extracted (tools shipping at import time, not lazy-load).
     extracted = extracted_modules()
     expected_now = set()
     for mod_name, tools in TOOL_MODULES.items():
@@ -490,16 +357,11 @@ def _validate_tool_modules() -> None:
         )
 
 
-# Track which ``gnucash_mcp.tools.<file>`` modules have already had
-# their ``register()`` called. A "skip if any tool
-# from this module is already registered" heuristic
-# breaks here: ``void_transaction`` is in Core's tool
-# list but lives in ``tools/reconciliation.py``. With reconciliation
-# loaded first, ``any(t in registered for t in TOOL_MODULES['core'])``
-# returns True (because void_transaction is registered) — so
-# ``tools/core.py`` would never load, and create_transaction et al.
-# would never register. Tracking files explicitly avoids the false
-# positive.
+# Tool files whose register() has run. Tracked explicitly — an
+# "any tool from this module already registered" heuristic breaks
+# because modules span files (void_transaction is in Core's list
+# but lives in tools/reconciliation.py; with reconciliation loaded
+# first, the heuristic would skip tools/core.py entirely).
 _loaded_tool_files: set[str] = set()
 
 
@@ -568,30 +430,16 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     else:
         requested = {m.strip() for m in modules_str.split(",")}
 
-    # Fail-fast on names that don't resolve to a known sub-module
-    # or group. A stderr warning followed by partial
-    # load would be silent in practice because Claude Desktop captures
-    # MCP server stderr into a log file the user never sees: a
-    # typo'd ``--modules=bookeeper`` (missing the 'k') would
-    # silently load only ``core``, leaving the user unable to
-    # tell whether the tools they wanted are missing because
-    # they typed it wrong or because the server is broken.
-    # Same
-    # principle as ``extra="forbid"`` on tool kwargs — financial
-    # software shouldn't silently swallow typos in configuration
-    # either.
-    #
-    # **Validation runs BEFORE the ``all`` check** so a typo'd
-    # name alongside ``all`` (e.g. ``--modules=bookeeper,all``)
-    # still rejects. ``all``
-    # is a loading instruction, not a validation
-    # bypass: every supplied name must be a real module or group.
+    # Fail fast on unknown names — a stderr warning + partial load
+    # is silent in practice (Claude Desktop buries MCP stderr), so
+    # a typo'd ``--modules=bookeeper`` would just look like missing
+    # tools. Same principle as ``extra="forbid"`` on tool kwargs.
+    # Validation runs BEFORE the ``all`` check: ``all`` is a
+    # loading instruction, not a validation bypass.
     known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
     unknown = requested - known - {"all"}
     if unknown:
-        # Per-typo, suggest the closest known name (did-you-mean).
-        # Use simple shared-character ratio; close enough for the
-        # typo-class we're trying to catch without pulling in a
+        # did-you-mean via difflib — close enough without a
         # Levenshtein dependency.
         import difflib
         lines = ["Unknown module name(s) on --modules / GNUCASH_MCP_MODULES:"]
@@ -622,14 +470,10 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         enabled_modules = set(TOOL_MODULES.keys())
         groups_used: list[str] = ["all"]
     else:
-        # ``core`` is always-on. Force-add before group expansion so
-        # the eight core sub-modules come along even when the user
-        # passes only e.g. ``--modules=reporting``.
+        # core is always-on — force-add before group expansion.
         requested.add("core")
 
-        # Expand groups single-pass. Groups don't reference other
-        # groups (deliberate flat partition); if that changes,
-        # cycle-detection lands here.
+        # Single-pass group expansion (flat partition).
         enabled_modules: set[str] = set()
         groups_used = []
         for name in requested:
@@ -639,15 +483,11 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
             else:
                 enabled_modules.add(name)
 
-    # Keep only known sub-module names. Group expansion above may
-    # have introduced names that aren't TOOL_MODULES keys if the
-    # group def is stale; filter them out before lookup.
+    # Drop names a stale group def may have introduced.
     enabled_modules &= set(TOOL_MODULES.keys())
 
-    # Build a group-aware display string for get_server_config.
-    # Groups render as ``group[member1, member2, ...]``; standalone
-    # sub-modules (not covered by any group the user requested)
-    # render bare.
+    # Group-aware display string for get_server_config:
+    # ``group[member1, ...]``, standalone sub-modules bare.
     accounted_for: set[str] = set()
     display_parts: list[str] = []
     for group_name in sorted(groups_used):
@@ -662,9 +502,7 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     display_parts.extend(standalone)
     _server_state["modules_display"] = ", ".join(display_parts)
 
-    # Expand each enabled module to its backing tool-files (per
-    # MODULE_BACKED_BY; default 1:1). Lazy-load any backing files
-    # that are extracted.
+    # Lazy-load each enabled module's extracted backing files.
     backing_files: set[str] = set()
     for mod_name in enabled_modules:
         backing_files.update(
@@ -686,12 +524,8 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         if tool_name not in keep:
             mcp.remove_tool(tool_name)
 
-    # Snapshot the enabled set for tool wrappers that gate behavior
-    # on module availability (e.g., owner_type='vendor' on Freelancer
-    # tools when Business isn't loaded). Also register any group
-    # whose members are fully loaded — that way
-    # ``is_module_enabled("core")`` works alongside the
-    # individual sub-module checks.
+    # Snapshot for is_module_enabled; fully-loaded groups register
+    # too so group and sub-module checks both work.
     _LOADED_MODULES.clear()
     _LOADED_MODULES.update(enabled_modules)
     for group_name, members in MODULE_GROUPS.items():
@@ -783,23 +617,15 @@ def _get_server_config_impl() -> str:
     return "\n".join(lines)
 
 
-# Register get_server_config unconditionally at import time so it
-# survives _apply_module_filter's keep-set pass (Core's tool list
-# includes it).
+# Registered unconditionally at import so it survives
+# _apply_module_filter's keep-set pass.
 #
-# Deliberately omits ``@audit_log``. Every other read tool
-# carries the decorator, but this one is a zero-side-effect config
-# inspection that the LLM calls reflexively as part of its
-# orientation pass (see the MCP server instructions and
-# ``get_book_summary``'s docstring referrals). Logging every
-# get_server_config call adds noise without signal — there's no
-# bookkeeping question the audit log answers about who looked at
-# the module list — and would clutter the human-readable trail the
-# bookkeeper depends on for forensic review of real activity.
-# The exception is documented here rather than enforced by a
-# contract test because the omission is the contract: a future
-# contributor adding @audit_log to this tool should read this
-# comment first and confirm they have a real reason to override.
+# Deliberately omits ``@audit_log`` — the omission IS the contract.
+# This zero-side-effect config inspection is called reflexively
+# during orientation; logging it adds noise without answering any
+# bookkeeping question, cluttering the trail the bookkeeper reviews.
+# A contributor adding @audit_log here should confirm a real reason
+# to override.
 @mcp.tool()
 @safe_tool
 def get_server_config() -> str:
@@ -932,11 +758,8 @@ Logs are stored alongside the book file:
     # import), leave the existing instance alone; otherwise subsequent
     # get_book() calls will use this class.
     global _book_class
-    # Expand each loaded module to its backing mixin set. The mixin
-    # layer owns Core's methods in their original files — Core needs
-    # CoreMixin + ReconciliationMixin + AdminMixin + BackupMixin
-    # composed together to back its tools. ``MODULE_BACKED_BY``
-    # provides the mapping; modules not listed there default to 1:1.
+    # Expand each loaded module to its backing mixin set via
+    # MODULE_BACKED_BY (default 1:1).
     backing_mixins: set[str] = set()
     for mod_name in loaded_modules:
         backing_mixins.update(
@@ -965,11 +788,8 @@ Logs are stored alongside the book file:
         except Exception:
             pass  # Book may be locked — don't block startup
 
-    # Populate runtime state and conditionally register debug tool.
-    # ``modules_display`` was set by ``_apply_module_filter`` with
-    # group-aware rendering (``core[summary, accounts, ...], reporting``
-    # rather than the flat list of 8+ sub-modules). Fall back to a
-    # bare join if the display key wasn't set for some reason.
+    # ``modules_display`` carries _apply_module_filter's group-aware
+    # rendering; fall back to a bare join if unset.
     tool_count = len(mcp._tool_manager._tools)
     modules_display = _server_state.get(
         "modules_display", ", ".join(loaded_modules)
