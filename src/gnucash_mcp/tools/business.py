@@ -1278,7 +1278,7 @@ def register(mcp, get_book) -> None:
     # single customer or vendor. The financial lifecycle stays
     # on the linked invoices; the job itself only has
     # ``active``/``inactive`` state. See create_invoice and
-    # create_bill (v1.3) for how to link a new invoice to a job.
+    # create_bill for how to link a new invoice to a job.
 
     @mcp.tool()
     @safe_tool

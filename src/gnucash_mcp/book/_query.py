@@ -9,8 +9,8 @@ Single source of truth for: "give me all splits matching
 ``(start_date, end_date, account_types, account_guids)`` as ORM
 rows, ordered however the caller wants."
 
-The function lives here rather than on ``ReportingMixin`` (where it
-originated) because budgets needs it too — and any future module
+The function lives here rather than on ``ReportingMixin``
+because budgets needs it too — and any future module
 that wants date-range-filtered splits should reach for the same
 primitive rather than rolling its own Python-side
 ``for txn in book.transactions: if date_match`` loop.
@@ -111,17 +111,15 @@ class QueryMixin:
             # ``balance_sheet(2025-12-31)`` returning a balance that
             # excluded December 31 activity, while ``get_balance``
             # (which compares Python-side, post-``process_result_value``,
-            # where the time has already been stripped) showed the
-            # correct number. Bookkeeper-flagged on Lin Wei's book
-            # during Branch 1 validation. Using the day after as a
+            # where the time has already been stripped) showing the
+            # correct number. Using the day after as a
             # strict upper bound includes the full as_of date
             # regardless of stored time component.
             #
             # ``end_date == date.max`` is treated as "no upper bound"
             # — ``date.max + timedelta(days=1)`` overflows. A caller
             # passing ``date.max`` semantically wants every row,
-            # which is what dropping the filter does. Copilot-flagged
-            # on PR #95.
+            # which is what dropping the filter does.
             q = q.filter(
                 Transaction.post_date < end_date + timedelta(days=1)
             )

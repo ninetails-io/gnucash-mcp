@@ -116,7 +116,7 @@ class _SummaryData:
     The dataclass is internal — no caller outside
     ``get_book_summary`` and its renderers should depend on the
     field shape, since the renderers will continue evolving as
-    the bookkeeper review surfaces new section requirements.
+    review feedback surfaces new section requirements.
     """
 
     # Account categorization (per-leaf rows the section renderers iterate).
@@ -177,8 +177,8 @@ class CoreMixin:
         ``None``) — the rendering layer omits the lines anyway
         when there's no Receivables/Payables activity.
 
-        The bookkeeper's principle for the summary: "tell the LLM
-        what needs attention, not what exists." Invoice counts
+        The summary's principle: tell the LLM
+        what needs attention, not what exists. Invoice counts
         and overdue counts are actionable; account counts are
         structural and already shown via the nested per-account
         breakdown below each line.
@@ -208,13 +208,13 @@ class CoreMixin:
         #
         # Pre-index accounts and lots once, not per-invoice — this
         # method runs inside get_book_summary on every dashboard
-        # call. The pre-fix loop did one SQL query per invoice to
-        # resolve the post account, then a linear scan of
-        # post_acct.lots to find the matching lot. On a book with
-        # 100 posted invoices that's 100 round-trips plus 100
+        # call. A per-invoice SQL query to
+        # resolve the post account, plus a linear scan of
+        # post_acct.lots to find the matching lot, is on a book with
+        # 100 posted invoices 100 round-trips plus 100
         # linear scans against potentially hundreds of lots each —
-        # noticeable latency on every summary call. Copilot
-        # flagged it; pre-indexing is the standard N+1 fix.
+        # noticeable latency on every summary call. Pre-indexing
+        # is the standard N+1 fix.
         accounts_by_guid = {
             acct.guid: acct for acct in book.accounts
         }
@@ -251,8 +251,7 @@ class CoreMixin:
             # documents awaiting application/refund) but never age
             # into the overdue counts — they're money the business
             # OWES, with no past-due concept. Matches
-            # get_outstanding_invoices, which the live-test signoff
-            # flagged this surface as contradicting.
+            # get_outstanding_invoices so the two surfaces agree.
             is_credit_note = False
             get_is_cn = getattr(self, "_get_is_credit_note", None)
             if get_is_cn is not None:
@@ -536,7 +535,7 @@ class CoreMixin:
         """
         template_guids = self._template_account_guids(book)
         # "Now" anchors (as_of >= today) use the absolute latest price
-        # on file — including any future-dated forecasts the bookkeeper
+        # on file — including any future-dated forecasts the user
         # has deliberately written. Past anchors filter to prices
         # observed by the anchor date (historical reconstruction).
         # See the comment in get_book_summary's inline price loop for
@@ -679,18 +678,15 @@ class CoreMixin:
     # only — real estate, vehicles, and other fixed assets aren't
     # runway even if they're wealth.
     #
-    # The spec originally proposed including ASSET-typed accounts
+    # A tempting heuristic is to also include ASSET-typed accounts
     # whose commodity is the book default ("cash-equivalent ASSET")
-    # as a heuristic for catching brokerage cash and escrow. In
+    # to catch brokerage cash and escrow. In
     # practice GnuCash's ASSET type is structurally for fixed assets
     # — users code real estate, vehicles, and similar wealth as
-    # ASSET in default currency, and that heuristic over-counts.
-    # The bookkeeper hit this on Alex's book: a USD-default condo
-    # ($473K) and vehicle ($28K) added $501K of "liquid" that Alex
-    # cannot use to make payroll next week. 768 days of runway
-    # ("Alex is fine for two years") vs. 116 days ("Alex has four
-    # months to collect receivables or restructure") is a very
-    # different conversation.
+    # ASSET in default currency, and that heuristic over-counts:
+    # a condo and a vehicle add hundreds of thousands of "liquid"
+    # that cannot make payroll next week, turning a four-month
+    # runway into a fictional two-year one.
     #
     # Cleaner rule, observed across actual user books: BANK, CASH,
     # STOCK, MUTUAL. Brokerage positions (STOCK/MUTUAL) ARE liquid
@@ -752,7 +748,7 @@ class CoreMixin:
         The category ordering puts operational urgency (cash
         flow signals) above data-quality concerns: a near-empty
         bank account or unpaid receivable is the conversation
-        Robin needs to have today; stale prices are next-week
+        the user needs to have today; stale prices are next-week
         cleanup.
 
         Coverage:
@@ -1438,11 +1434,11 @@ class CoreMixin:
         — caller treats that as "no daily-burn signal."
 
         Each EXPENSE split is converted to the book's default
-        currency at the most recent market rate. Pre-v1.3.0 this
-        summed ``split.value`` raw, mixing currencies on books with
-        foreign-currency expenses; on Lin Wei (CNY-default with
-        USD subscriptions) the burn was understated by the USD
-        component's spot-rate factor.
+        currency at the most recent market rate. Summing
+        ``split.value`` raw would mix currencies on books with
+        foreign-currency expenses (a CNY-default book with
+        USD subscriptions understates the burn by the USD
+        component's spot-rate factor).
         """
         if days is None:
             days = self._RUNWAY_BURN_DAYS
@@ -1550,11 +1546,10 @@ class CoreMixin:
                 # Retirement accounts (IRA, 401k, 403b, pension, etc.)
                 # share BANK / STOCK / MUTUAL types with truly liquid
                 # accounts but carry early-withdrawal penalties that
-                # disqualify them from "if income stops today" runway.
-                # The bookkeeper hit this on Alex's book: a $13,716
-                # 401k under Assets:Investments:Retirement was being
-                # counted as liquid, inflating runway from ~95 days
-                # to 124. Filtering by ancestor-named-Retirement is
+                # disqualify them from "if income stops today" runway
+                # — counting a 401k as liquid silently inflates the
+                # runway number. Filtering by ancestor-named-Retirement
+                # is
                 # the structural-intent heuristic — fragile if a user
                 # names the subtree "Tax-advantaged" instead, but
                 # clean enough for the standard naming convention.
@@ -2109,8 +2104,8 @@ class CoreMixin:
     ) -> list[str]:
         """Render Book / Currency / Data range / Last entry header.
 
-        ``Last entry`` carries a staleness signal — bookkeeper-asked-for
-        because the answer to "let's reconcile" vs "let's enter 200
+        ``Last entry`` carries a staleness signal —
+        the answer to "let's reconcile" vs "let's enter 200
         transactions first" pivots on it. Four cases keyed on
         ``(today - last_date).days``:
 
@@ -2433,14 +2428,13 @@ class CoreMixin:
             # Liabilities totals agree with trajectory's "now" by
             # construction. Without this filter, future-dated
             # transactions in the book would skew the current
-            # snapshot — bookkeeper hit this on Alex's book where
-            # 34 days of data past today produced a $2,906 gap
+            # snapshot and open a gap
             # between Assets-Liabilities and trajectory.
             #
-            # Prices are NOT today-filtered. The bookkeeper writes
-            # future-dated yfinance close prices intentionally as
+            # Prices are NOT today-filtered. Users write
+            # future-dated prices intentionally as
             # forecasts the displays should track; balance_sheet
-            # uses the absolute latest, and this summary now
+            # uses the absolute latest, and this summary
             # matches by construction. ``_compute_net_worth_at``
             # (above) special-cases ``as_of >= today`` to use the
             # same all-prices lookup so the trajectory "now"
@@ -2452,9 +2446,9 @@ class CoreMixin:
             # the whole subtree.
             template_guids = self._template_account_guids(book)
 
-            # Materialize the account list once. CODE_REVIEW noted
-            # 7-10 passes over ``book.accounts`` between this method
-            # and the sub-helpers it calls; threading the in-memory
+            # Materialize the account list once. This method and
+            # the sub-helpers it calls make many passes over
+            # ``book.accounts``; threading the in-memory
             # list collapses each pass.
             accounts = list(book.accounts)
 
@@ -2555,9 +2549,9 @@ class CoreMixin:
             )
 
             # Jobs: single conditional line. Absence-as-signal —
-            # the bookkeeper said "jobs existing doesn't need
-            # attention but knowing they're in play points to the
-            # right drill-down tool."
+            # jobs existing doesn't need
+            # attention, but knowing they're in play points to the
+            # right drill-down tool.
             if biz_counts["active_jobs"] > 0:
                 lines.append(
                     f"Jobs: {biz_counts['active_jobs']} active"
@@ -2848,11 +2842,10 @@ class CoreMixin:
                 return "\n".join(lines)
             else:
                 # Verbose mode: emit short prefixes for transaction
-                # GUIDs, split GUIDs, and lot GUIDs so the bookkeeper
-                # workflow doesn't pay 24 wasted chars per GUID per
-                # row. Compact mode already does this; pre-v1.3.1
-                # verbose left them at full 32-char width even
-                # though every consuming tool accepts 8+ char
+                # GUIDs, split GUIDs, and lot GUIDs so callers
+                # don't pay 24 wasted chars per GUID per
+                # row. Compact mode does the same;
+                # every consuming tool accepts 8+ char
                 # prefixes via ``_resolve_guid``.
                 txn_prefixes = self._transaction_prefix_map(book)
                 split_prefixes = self._split_prefix_map(book)
@@ -3108,8 +3101,7 @@ class CoreMixin:
             # transaction would otherwise desc-match EVERY proposed
             # description — and when nothing real matched, auto-fill
             # would clone that unrelated transaction under the caller's
-            # description instead of raising "no match found"
-            # (bookkeeper live-test blocker, pass-2 signoff).
+            # description instead of raising "no match found".
             txn_desc_lower = txn.description.lower()
             desc_match = (
                 bool(desc_lower.strip())
@@ -3255,7 +3247,7 @@ class CoreMixin:
 
             confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
 
-        A list-of-dicts JSON response to the bookkeeper was
+        A list-of-dicts JSON response costs
         ~120 chars per candidate; the TSV form is closer to 40. The
         rejection path emits two or three candidates typically, and
         the savings compound when the LLM retries a mis-hit.
@@ -4346,9 +4338,9 @@ class CoreMixin:
                 # Normalize the input account ref to canonical
                 # fullname before lookup. The book methods accept
                 # full path, ``%short`` GUID, or full 32-char GUID;
-                # post-save splits are keyed by ``Account.fullname``.
-                # (Bookkeeper finding from PR #75 review: a shortcut
-                # ref like ``%77b59dd`` must resolve before comparison.)
+                # post-save splits are keyed by ``Account.fullname``,
+                # so a shortcut
+                # ref like ``%77b59dd`` must resolve before comparison.
                 ref = expected["account"]
                 resolved = self._resolve_account(book, ref)
                 if resolved is None:
@@ -4739,5 +4731,3 @@ class CoreMixin:
                 result["warnings"] = warnings
 
             return result
-
-    # Reconciliation / reporting / budgets / scheduling / lots methods moved to their mixins.

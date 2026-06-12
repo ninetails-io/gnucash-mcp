@@ -106,9 +106,8 @@ def _money_compact(value: Decimal, currency: str = "USD") -> str:
     The ``currency`` argument carries the book's default currency
     mnemonic (``"USD"``, ``"CNY"``, ``"EUR"``, etc.) — matches
     ``get_book_summary``'s ``"USD 6700.00"`` rendering style and
-    works for non-USD books out of the box. Pre-fix this helper
-    hardcoded ``$`` and broke as soon as the bookkeeper pointed it
-    at a CNY-default book.
+    works for non-USD books out of the box (a hardcoded ``$``
+    breaks on any non-USD-default book).
     """
     quantized = value.quantize(Decimal("0.01"))
     if quantized == quantized.to_integral_value():
@@ -143,9 +142,8 @@ def _format_debt_payoff_compact(
         Total interest: USD 59,022
         Debt-free: April 2030
 
-    Replaces the verbose dict (with multi-line YETI ``explanation`` per
-    account) that was the heaviest single response in Abe's audit.
-    Verbose mode preserves the dict for programmatic consumers.
+    Verbose mode preserves the structured dict for programmatic
+    consumers.
     """
     # Account names: leaf-name only when path is unambiguous (saves
     # context vs. echoing "Liabilities:Credit Card:Business Amex" on

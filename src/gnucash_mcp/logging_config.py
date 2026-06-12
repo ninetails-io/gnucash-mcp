@@ -100,7 +100,7 @@ def _get_write_rate_limiter() -> _WriteRateLimiter | None:
         steady-state rate.
 
     Default (no env vars): no limiting — writes proceed at full
-    speed, matching pre-Stage-6 behavior.
+    speed.
     """
     global _write_limiter, _write_limiter_initialized
     if _write_limiter_initialized:
@@ -1201,7 +1201,7 @@ def _fmt_invoice_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
-    # Plumb Bob bookkeeper-flagged: delete_invoice accepts ``id`` as
+    # ``delete_invoice`` accepts ``id`` as
     # the preferred alias OR ``invoice_id`` for back-compat. Prefer
     # whichever the caller supplied; fall back to empty string so
     # the formatter never renders ``id:None``.
@@ -1587,7 +1587,6 @@ def _fmt_credit_note_apply(entry: dict) -> list[str]:
     # would print "remaining: 0.00" lines on fully-settled
     # documents. Decimal comparison handles every quantize
     # shape ("0", "0.00", "0.0000") uniformly.
-    # (Copilot PR #87 review.)
     from decimal import Decimal as _D, InvalidOperation as _IO
     def _is_zero(s: str) -> bool:
         if not s:

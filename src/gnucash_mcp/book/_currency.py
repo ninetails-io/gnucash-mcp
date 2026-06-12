@@ -38,26 +38,25 @@ from decimal import Decimal
 import piecash
 
 
-# ── FX staleness cap (Plumb Bob validation, 2026-06-04) ───────────
+# ── FX staleness cap ───────────────────────────────────────────────
 #
-# Pre-fix ``_find_exchange_rate`` would happily use the temporally-
+# Without the cap, ``_find_exchange_rate`` would use the temporally-
 # closest price regardless of distance from ``as_of`` — a 2027
 # invoice could silently use a 2026 rate, a 2020 invoice could
-# silently use a 2025 rate. The error message promised a price "on
-# or near DATE" but the function had no proximity bound, so the
-# error was effectively unreachable for any currency with at least
+# silently use a 2025 rate — and the "on or near DATE" promise in
+# the no-rate error would be
+# effectively unreachable for any currency with at least
 # one price on file.
 #
 # The cap below filters candidates to ``|days_offset| <=
 # _FX_STALENESS_DAYS``. When no price within the window exists,
-# the function returns ``None`` and the caller's existing
-# "Add a price with create_price, then retry" error fires correctly
-# (now with a real chance to fire).
+# the function returns ``None`` and the caller's
+# "Add a price with create_price, then retry" error fires.
 #
 # Default 90 days matches a typical bookkeeping cadence (monthly
 # statement close + a grace period). The
 # ``GNUCASH_FX_STALENESS_DAYS`` env var overrides it; ``0`` or
-# negative disables the cap entirely (pre-fix behavior).
+# negative disables the cap entirely.
 
 
 def _fx_staleness_days() -> int:
@@ -217,10 +216,8 @@ class CurrencyMixin:
 
         Every report-level caller of ``_account_conversion_factors``
         and ``_rates_as_of`` runs its ``as_of`` through this helper
-        first so the convention is enforced exactly once. Pre-v1.3
-        release the convention was implicit in the ``as_of=None``
-        default; now that the default is gone, the helper is the
-        explicit home for it.
+        first so the convention is enforced exactly once; this
+        helper is the convention's explicit home.
         """
         return date.max if as_of >= date.today() else as_of
 

@@ -1088,7 +1088,7 @@ class InvestmentsMixin:
                 "cost_basis": _format_number(cost_basis, decimals=2),
                 "sale_proceeds": _format_number(proceeds, decimals=2),
                 "capital_gain": _format_number(gain, decimals=2),
-                # The 26-digit case the spec called out — ``(gain /
+                # ``(gain /
                 # cost_basis) * 100`` produces an unbounded repeating
                 # decimal in the general case. 2 decimal places is
                 # what humans and reports actually use.

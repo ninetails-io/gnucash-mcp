@@ -56,8 +56,8 @@ def _slot_value_str(value) -> str:
     value depending on slot type. Centralizing the access keeps
     every caller agreeing on the same extraction.
 
-    Hoisted to ``_base`` from ``admin`` in v1.3 — the credit-note
-    slot helpers in ``BusinessMixin`` need the same access pattern,
+    Lives in ``_base`` because the credit-note slot helpers in
+    ``BusinessMixin`` need the same access pattern as ``AdminMixin``,
     and a sideways import from ``business`` into ``admin`` would
     add a coupling that doesn't reflect the dependency direction
     (admin is the slot-tool mixin; business is also a slot
@@ -249,11 +249,9 @@ def _verify_delete(
     Raises RuntimeError if matching rows still exist.
 
     Shape-matches ``_verify_composite_write``: the ``table`` argument
-    is a SQLAlchemy Core Table (``Entity.__table__``). The previous
-    signature hardcoded ``FROM slots`` via raw SQL, which kept this
-    helper scoped to slot deletes; generalizing to any table lets us
-    pair deletes-with-verification for Entry / Invoice / Customer /
-    Vendor cleanup too.
+    is a SQLAlchemy Core Table (``Entity.__table__``), so the helper
+    pairs deletes-with-verification for any table — slots, Entry,
+    Invoice, Customer, and Vendor cleanup alike.
     """
     from sqlalchemy import select, func, and_
 
@@ -486,10 +484,9 @@ def _split_to_dict(
     collision-safe short forms (typically 8 chars) via lookup in
     the prefix maps. When omitted, falls back to full 32-char
     GUIDs — preserved for any caller that hasn't migrated to the
-    prefix-aware path. v1.3.1 bookkeeper feedback drove the
-    prefix path on read tools (get_transaction, verbose
-    list_transactions) where the full GUIDs were dead-weight
-    tokens the LLM never used.
+    prefix-aware path. Read tools (get_transaction, verbose
+    list_transactions) use the prefix path: full GUIDs there are
+    dead-weight tokens the LLM never uses.
     """
     rec_date = split.reconcile_date
     if rec_date and rec_date.year <= 1970:
@@ -1215,10 +1212,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         Same mtime-keyed pattern as ``_transaction_prefix_map``.
         Used by ``get_transaction`` and verbose ``list_transactions``
-        to emit collision-safe short split GUIDs in responses. Pre-
-        v1.3.1 these surfaces emitted full 32-char split GUIDs —
-        24 wasted chars per split per call, identified by the
-        bookkeeper as token bloat in real LLM workflows.
+        to emit collision-safe short split GUIDs in responses
+        (full 32-char split GUIDs are 24 wasted chars per split
+        per call).
         """
         mtime_ns = self.book_path.stat().st_mtime_ns
         if (

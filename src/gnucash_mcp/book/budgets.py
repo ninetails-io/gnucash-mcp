@@ -489,10 +489,6 @@ class BudgetsMixin:
                 ``start_date="2024-01-01"`` to compare 2024 actuals
                 against a freshly-authored target) or to start mid-
                 year (``start_date="2025-07-01"``).
-                Bookkeeper-flagged after PR #98: "no way to create
-                a budget that begins in the past blocks comparing
-                a freshly-authored budget against historical
-                actuals."
 
         Returns:
             Dict with guid, name, start_date, and status.

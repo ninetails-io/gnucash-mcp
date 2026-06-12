@@ -19,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 # signature, all inheriting from ``ArgModelBase``. The base class's
 # default config doesn't set ``extra``, so Pydantic falls back to
 # ``"ignore"`` — typo'd or stale-spec parameter names silently
-# no-op. Bookkeeper-found bug on PR #92 review: calling
+# no-op. Example: calling
 # ``reconcile_account`` with ``except=[...]`` (the spec's name)
 # instead of ``except_guids=[...]`` (the actual Python-safe param)
 # ran the tool with no exclusion at all, surfacing only as a
@@ -90,12 +90,11 @@ MODULE_GROUPS: dict[str, list[str]] = {
     # sub-modules — e.g. ``--modules=accounts`` is valid but doesn't
     # change the fact that core is loaded too.
     #
-    # ``reconciliation`` joined core in v1.3.1 — bookkeeper-flagged
-    # that reconciliation touches money and every configuration
-    # touches money, so excluding it from any persona-aligned cut
-    # produced a server that couldn't reconcile statements (a hole
+    # ``reconciliation`` is part of core: reconciliation touches
+    # money and every configuration touches money, so excluding it
+    # from any persona-aligned cut produces a server that can't
+    # reconcile statements (a hole
     # in the "any configuration that handles ledgers" promise).
-    # Moved from the bookkeeper group to core; now always loaded.
     "core": [
         "summary", "accounts", "transactions", "slots",
         "audit", "backup", "balance_sheet", "diagnostic",
@@ -105,8 +104,6 @@ MODULE_GROUPS: dict[str, list[str]] = {
     # cluster: run reports, manage budgets, schedule recurring
     # transactions. The three underlying modules stay separately
     # selectable for users who want a finer cut.
-    # (Reconciliation used to live here too — moved to core in
-    # v1.3.1, see the comment above.)
     "bookkeeper": [
         "reporting", "budgets", "scheduling",
     ],
@@ -122,14 +119,13 @@ MODULE_GROUPS: dict[str, list[str]] = {
         "tax_lots", "portfolio",
     ],
     # ``business`` is the small-business persona alias. It expands
-    # to ``freelancer`` (the 19 customer-facing invoice tools) plus
-    # ``business_complete`` (the 29 vendor/employee/jobs/credit-
-    # notes/billing-terms tools). Pre-v1.3 ``business`` was a
-    # standalone leaf containing only the second half — a user
-    # picking ``--modules=business`` for "small business workflow"
-    # got vendor management but couldn't create or post a customer
-    # invoice. Bookkeeper-found on PR #92 review; the fix
-    # restructures business into the natural superset.
+    # to ``freelancer`` (the customer-facing invoice tools) plus
+    # ``business_complete`` (the vendor/employee/jobs/credit-
+    # notes/billing-terms tools). The group must stay the
+    # superset: a ``business`` selection that loaded only the
+    # vendor half would give "small business workflow" users
+    # vendor management without the ability to create or post a
+    # customer invoice.
     #
     # The two leaves stay independently selectable for users who
     # want a finer cut (a solo freelancer with no vendor activity
@@ -378,8 +374,8 @@ TOOL_MODULES: dict[str, list[str]] = {
         "apply_credit_note",
     ],
     # ``business_complete`` — vendor + employee surface only.
-    # Together with ``freelancer`` (which now owns billterms,
-    # jobs, and credit notes via the v1.3.1 redistribution),
+    # Together with ``freelancer`` (which owns billterms,
+    # jobs, and credit notes),
     # forms the full small-business toolkit. Both leaves expand
     # together under the ``business`` group alias in
     # MODULE_GROUPS.
@@ -573,25 +569,22 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         requested = {m.strip() for m in modules_str.split(",")}
 
     # Fail-fast on names that don't resolve to a known sub-module
-    # or group. Pre-v1.3.0 this was a stderr warning, then partial
-    # load — silent in practice because Claude Desktop captures
-    # MCP server stderr into a log file the user never sees. A
+    # or group. A stderr warning followed by partial
+    # load would be silent in practice because Claude Desktop captures
+    # MCP server stderr into a log file the user never sees: a
     # typo'd ``--modules=bookeeper`` (missing the 'k') would
     # silently load only ``core``, leaving the user unable to
     # tell whether the tools they wanted are missing because
     # they typed it wrong or because the server is broken.
-    # Bookkeeper-found bug on the PR #92 review pass; same
+    # Same
     # principle as ``extra="forbid"`` on tool kwargs — financial
     # software shouldn't silently swallow typos in configuration
     # either.
     #
     # **Validation runs BEFORE the ``all`` check** so a typo'd
     # name alongside ``all`` (e.g. ``--modules=bookeeper,all``)
-    # still rejects. Pre-v1.3.1 ``all`` shortcut past validation
-    # to "load everything" and any typos in the list were
-    # silently ignored — the typo would only surface later if the
-    # user removed ``all`` and got a different failure mode. v1.3
-    # treats ``all`` as a loading instruction, not a validation
+    # still rejects. ``all``
+    # is a loading instruction, not a validation
     # bypass: every supplied name must be a real module or group.
     known = set(TOOL_MODULES.keys()) | set(MODULE_GROUPS.keys())
     unknown = requested - known - {"all"}
@@ -748,25 +741,9 @@ if _book_path and (_audit_mode or _debug_mode):
         debug_log(f"Server module loaded. Book path: {_book_path}")
 
 
-# safe_tool, _json, _strip_noise moved to gnucash_mcp/tools/_helpers.py
-
-
-# ============== Tools ==============
-# Core tools moved to gnucash_mcp/tools/core.py — every module now
-# lives in its own file and registers lazily via _apply_module_filter.
-
-
-# Reconciliation/reporting/budgets/scheduling/lots tools moved to gnucash_mcp/tools/<module>.py.
-
-
-# Admin tools (get_account_slots, set_account_slot, delete_account_slot,
-# get_audit_log) moved to gnucash_mcp/tools/admin.py — registered on
-# demand via register() when the 'admin' module is enabled.
-
-
-# ============== Business Tools ==============
-# Business tools (22) moved to gnucash_mcp/tools/business.py — registered
-# on demand when the 'business' module is enabled.
+# Tool registration lives in gnucash_mcp/tools/<module>.py — every
+# module has its own file and registers lazily via
+# _apply_module_filter.
 
 
 # ============== Resources ==============
@@ -778,9 +755,6 @@ def accounts_resource() -> str:
     book = get_book()
     accounts = book.list_accounts(compact=False)
     return _json(accounts)
-
-
-# get_audit_log moved to gnucash_mcp/tools/admin.py.
 
 
 # ============== Server Diagnostic Tool ==============
@@ -1008,9 +982,6 @@ Logs are stored alongside the book file:
         "default_currency_ok": currency_ok,
     })
 
-    # get_server_config is now registered unconditionally at module
-    # import time (see above), so no per-run conditional registration
-    # is needed here.
     if debug_flag or _debug_mode:
         debug_log(f"Modules: {modules_display}")
         debug_log(f"Tools loaded: {tool_count}")

@@ -580,8 +580,8 @@ class SchedulingMixin:
                     splits = self._get_sx_splits(book, sx)
 
                     # Calculate total amount (sum of positive splits).
-                    # _to_decimal is defensive for any legacy slots whose
-                    # pre-fix JSON may still carry a numeric literal.
+                    # _to_decimal is defensive for any older slots whose
+                    # JSON may still carry a numeric literal.
                     total = Decimal("0")
                     for s in splits:
                         amt = _to_decimal(s["amount"])
@@ -780,7 +780,7 @@ class SchedulingMixin:
                 # another tool invocation), the schedule already
                 # registered the period — incrementing
                 # ``instance_count`` again would double-count.
-                # Copilot-flagged on PR #97. The MCP server runs
+                # The MCP server runs
                 # single-threaded so this is practically
                 # unreachable today, but the gate is cheap and the
                 # invariant ("instance_count equals the number of

@@ -283,10 +283,8 @@ class ReconciliationMixin:
           OFX-import workflows — one tool call, no GUID round-trip.
           Pass ``through_date`` to restrict to splits on or before
           a specific date; by default no date filter is applied
-          (the bookkeeper-validated semantics — pre-fix this
-          defaulted to ``statement_date`` and silently excluded
-          payment splits dated after the statement, which the
-          tester hit on a CareCredit payoff). Reject if
+          (defaulting to ``statement_date`` would silently exclude
+          payment splits dated after the statement). Reject if
           ``split_guids`` is also given to avoid ambiguity.
 
         Both modes verify the resulting reconciled balance ties to

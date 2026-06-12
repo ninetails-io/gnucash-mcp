@@ -1,7 +1,7 @@
 """Shared helpers for MCP tool wrappers.
 
-These used to live in server.py; they are now shared across every
-tool-registration module under gnucash_mcp/tools/.
+Shared across every tool-registration module under
+gnucash_mcp/tools/.
 """
 
 import json
@@ -280,8 +280,6 @@ def _json(obj) -> str:
     ``\\uXXXX`` form. The escape behavior is technically valid JSON
     but makes the wire format unreadable for human reviewers and
     breaks any downstream substring match on the original text.
-    Bookkeeper-flagged on a CNY-default test book where every
-    SSE/SZSE commodity name came back as escape sequences.
     """
     return json.dumps(
         _strip_noise(obj), separators=(",", ":"), ensure_ascii=False,
@@ -354,10 +352,8 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     # Anything else (typos like 'venddor', unknown future types) is
     # rejected here so the LLM gets a clear validation error instead
     # of a silent coercion that masks the typo as "search customer
-    # invoices, find nothing, return not-found." Pre-fix: 'venddor'
-    # → coerced to 'customer' → book-layer lookup against customer
-    # invoices → "invoice not found", with no indication the input
-    # was misspelled. (Copilot review on PR #86.)
+    # invoices, find nothing, return not-found" with no indication
+    # the input was misspelled.
     if owner_type is not None and owner_type != "customer":
         raise ValueError(
             f"Invalid owner_type {owner_type!r}. Must be 'customer' "
