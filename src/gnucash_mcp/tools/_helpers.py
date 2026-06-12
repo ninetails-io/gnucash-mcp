@@ -120,7 +120,7 @@ class BusinessAddressInput(BaseModel):
     employee). All sub-fields are optional strings capped at 1024
     characters at the MCP boundary.
 
-    Same rationale as ``BusinessNotes``: the cap fires at the
+    Same MP-5 rationale as ``BusinessNotes``: the cap fires at the
     schema layer so an oversize value rejects fast without auto-
     backup running first.
     """
