@@ -8,6 +8,18 @@ working tree at the sweep snapshot (2026-06-11).
 stated reason) / FIX-FALSE (rule 6 — false about the present code; lands in
 the `fix(comments):` commit).
 
+**As-built (2026-06-11):** every entry was applied as classified, with one
+deviation — `_helpers.py` `BusinessAddressInput` docstring (the entry below
+marked REWRITE) was applied, then REVERTED to byte-identical after the
+full-schema wire baseline showed the docstring surfaces in six tool input
+schemas; its as-built disposition is KEEP (wire surface), and its "MP-5"
+token joins the whitelist. Sweep commits: 5dca761 (rule 6), 94cb36f
+(rule 4), bab8f4e (rule 2), adc0d97 (rule 3), f12ca90 (rule 5), f399761
+(wire revert); see `.git-blame-ignore-revs`. Acceptance: banned-pattern
+greps clean outside the whitelist, 1,584/1,584 tests pass, tool surface
+(descriptions + schemas) byte-identical, all 21 changed src files
+AST-identical to develop after docstring stripping.
+
 Coverage: every run of 3+ consecutive `#` comment lines in `src/` appears
 below (classified entries first, then auto-KEEP runs per file); every
 banned-pattern hit is either inside a classified entry or in the whitelist
@@ -5355,6 +5367,10 @@ untracked location. Policy: no comment may cite an untracked file.
 - Additional whitelist: `server.py:886` ("Bookkeeper members (3): reporting,
   budgets, scheduling.") — module-group name inside the executable `--help`
   string; out of edit scope (executable line), exempt from grep gate #1.
+- Additional whitelist (as-built): `tools/_helpers.py` `BusinessAddressInput`
+  class docstring ("Same MP-5 rationale…") — wire surface (appears in six
+  tool input schemas); exempt from grep gate #1. Logged in
+  COMMENT_SWEEP_FINDINGS.md §3.
 
 ## Stats
 
