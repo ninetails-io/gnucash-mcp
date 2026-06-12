@@ -854,8 +854,8 @@ class BudgetsMixin:
                         rollup_map[desc.fullname] = acct_name
 
             # Calculate actuals from transactions. Date filter pushed
-            # to SQL via _query_filtered_splits — pre-fix the inner
-            # Python loop touched every transaction in the book before
+            # to SQL via _query_filtered_splits rather than an inner
+            # Python loop touching every transaction in the book before
             # gating on the date range. The rollup-membership check
             # and the EXPENSE/INCOME sign discipline stay in Python
             # (the rollup map is per-budget, not expressible as a

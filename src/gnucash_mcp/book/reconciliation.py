@@ -85,10 +85,10 @@ class ReconciliationMixin:
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
 
-            # Reject state changes on voided splits. Pre-fix the input
-            # gate accepted any of {n, c, y} regardless of current
-            # state, so a voided split could be moved to ``y`` — which
-            # zeroed the void marker and defeated
+            # Reject state changes on voided splits. Accepting any of
+            # {n, c, y} regardless of current
+            # state would let a voided split be moved to ``y`` —
+            # zeroing the void marker and defeating
             # ``unvoid_transaction``'s recovery path. To re-reconcile
             # a previously-voided split the user must unvoid first.
             if _is_voided(split):
@@ -408,9 +408,9 @@ class ReconciliationMixin:
                         raise ValueError(f"Split not found: {guid}")
                     # Compare by GUID against the resolved account so
                     # ``account_name`` accepts ``%short`` and full-GUID
-                    # input. Pre-fix the check compared against the raw
-                    # input string, rejecting any shortcut form even
-                    # when it resolved to the right account.
+                    # input. Comparing against the raw
+                    # input string would reject any shortcut form even
+                    # when it resolves to the right account.
                     if split.account.guid != account.guid:
                         raise ValueError(
                             f"Split {guid} belongs to account "
@@ -433,11 +433,11 @@ class ReconciliationMixin:
                     reconciling_total += split.quantity
 
             # Quantize both sides to the account commodity's
-            # smallest fraction before comparing. Pre-fix a user
+            # smallest fraction before comparing. Otherwise a user
             # typing ``"1234.567"`` against a 2-decimal book
-            # produced a perpetual 0.007 mismatch with no clear
-            # error — every reconciliation attempt failed even
-            # when the books agreed at the cent. Now the
+            # produces a perpetual 0.007 mismatch with no clear
+            # error — every reconciliation attempt fails even
+            # when the books agree at the cent. The
             # statement balance and computed balance are both
             # normalized to the commodity's smallest unit (USD ->
             # 2 decimals, JPY -> 0, BHD -> 3) before equality.
@@ -555,9 +555,9 @@ class ReconciliationMixin:
             # local time (mirroring the audit-log convention) so a
             # later reader can reconstruct "when was this voided"
             # unambiguously across DST transitions and timezone
-            # changes. Pre-fix this stored a naive ``datetime.now()``
-            # whose interpretation depended on the host's current
-            # zone — same string would mean different absolute times
+            # changes. A naive ``datetime.now()`` is the trap:
+            # its interpretation depends on the host's current
+            # zone — the same string means different absolute times
             # before/after a DST shift.
             transaction["void-reason"] = reason
             transaction["void-time"] = (
@@ -617,10 +617,10 @@ class ReconciliationMixin:
                 raise ValueError(f"Transaction {guid} is not voided")
 
             # Validate up-front that EVERY voided split has its
-            # void-former slots present. Pre-fix partial corruption
+            # void-former slots present. Otherwise partial corruption
             # (e.g., a split missing its void-former-value but with
-            # void-former-quantity present) silently produced a
-            # partial unvoid — the value-missing split would stay
+            # void-former-quantity present) silently produces a
+            # partial unvoid — the value-missing split stays
             # at zero while its sibling was restored. Better to
             # refuse and surface the corruption explicitly.
             missing_slots = []

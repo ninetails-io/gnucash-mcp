@@ -146,12 +146,12 @@ class BusinessAddressInput(BaseModel):
 #
 # Transaction-creating tools (create_transaction, update_transaction,
 # replace_splits, create_scheduled_transaction) all take a list of
-# split dicts. Before this model existed, the tool signature was
-# ``splits: list[dict]`` — pydantic doesn't descend into bare ``dict``,
-# so the inner ``amount`` / ``quantity`` values round-tripped through
-# whatever type the JSON parser produced. When a client sent a bare
-# JSON number (``"amount": 94.87``), the parser emitted a float, and
-# ``Decimal(split["amount"])`` inside the book method inherited the
+# split dicts. A bare ``splits: list[dict]`` signature is the trap
+# — pydantic doesn't descend into bare ``dict``,
+# so the inner ``amount`` / ``quantity`` values round-trip through
+# whatever type the JSON parser produces. When a client sends a bare
+# JSON number (``"amount": 94.87``), the parser emits a float, and
+# ``Decimal(split["amount"])`` inside the book method inherits the
 # IEEE-754 epsilon ( ``0.8699999999999999955591...`` ) — causing
 # spurious "splits do not balance" errors on non-dyadic decimals.
 #
@@ -463,8 +463,8 @@ def safe_tool(func: Callable) -> Callable:
             # ``_verify_transaction_state`` raise ``RuntimeError``
             # specifically for "the write didn't land" — a critical
             # correctness signal that should NOT collapse into the
-            # generic "unexpected_error" bucket. Pre-fix this
-            # masked write-verification failures behind the same
+            # generic "unexpected_error" bucket — that would
+            # mask write-verification failures behind the same
             # error_type as e.g. ``KeyError`` lookup failures, so
             # callers couldn't tell "the write failed" from "we
             # tried to read a missing key."

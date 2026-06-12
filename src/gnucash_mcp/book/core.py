@@ -325,11 +325,11 @@ class CoreMixin:
               "days_behind": int | None,   # None iff "never reconciled"
             }
 
-        The single-int "N unreconciled" count this replaces was
-        operationally useless: it included income/expense/equity
-        splits that conceptually can't be reconciled, so the number
-        was misleadingly large and gave the LLM no actionable signal
-        about which accounts had drifted from reality.
+        A single-int "N unreconciled" count would be
+        operationally useless: it would include income/expense/equity
+        splits that conceptually can't be reconciled — misleadingly
+        large, with no actionable signal
+        about which accounts have drifted from reality.
 
         Filtering rules:
 
@@ -478,10 +478,8 @@ class CoreMixin:
     # the summary — accounting-wise, A/R is an asset and A/P a
     # liability, so the trajectory's "now" anchor (and every past-
     # anchor reconstruction) must include them to agree with
-    # balance_sheet and net_worth. Pre-v1.3.0 these were excluded
-    # here while balance_sheet excluded them too; both were wrong in
-    # the same direction, so the cross-tool numbers happened to
-    # agree. Fixing balance_sheet (v1.3) forces this set to follow
+    # balance_sheet and net_worth. This set must track
+    # balance_sheet's buckets
     # so the dashboard's headline net worth doesn't drift from the
     # canonical balance-sheet identity.
     _NW_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
@@ -952,9 +950,9 @@ class CoreMixin:
                         # business OWES (available to apply or
                         # refund), and an aging clock on it reads
                         # as a collections item.
-                        # get_outstanding_invoices already exempts
-                        # them; this surface said "238 days past
-                        # 30-day default" about the same document.
+                        # get_outstanding_invoices exempts
+                        # them too — the two surfaces must not
+                        # disagree about the same document.
                         if get_is_cn is not None and get_is_cn(inv):
                             continue
 
@@ -1172,9 +1170,9 @@ class CoreMixin:
         # Surface auto-backup chain breaks. The single failure mode
         # this server most fears is data loss; an auto-backup that has
         # been silently failing for weeks turns into "you have no
-        # recovery option" the day the book corrupts. Pre-fix, the
-        # debug log was the only place this surfaced — and the
-        # bookkeeper doesn't read debug logs. We render the warning
+        # recovery option" the day the book corrupts — and the
+        # debug log is not a surface anyone reviews routinely.
+        # We render the warning
         # right next to integrity issues because backup health is
         # itself a data-safety concern.
         backup_health: list[str] = []
@@ -1788,11 +1786,10 @@ class CoreMixin:
     # to append to the summary (or ``[]`` to omit the section
     # entirely — absence-as-signal, per the spec).
     #
-    # Pre-extraction the render block was one long sequence inside
-    # ``get_book_summary``. Pulling each section into its own helper
-    # mirrors the data layer's decomposition and makes adding or
-    # modifying a section a one-method change instead of surgery
-    # through the render block. Each helper is self-contained — no
+    # Each section renders in its own helper,
+    # mirroring the data layer's decomposition: adding or
+    # modifying a section is a one-method change instead of surgery
+    # through a monolithic render block. Each helper is self-contained — no
     # cross-section state — so the rendering order in
     # ``get_book_summary`` becomes a one-glance read.
 
@@ -1965,8 +1962,8 @@ class CoreMixin:
         """Single-pass account walker for ``get_book_summary``.
 
         Walks ``accounts`` once, building the categorized lists and
-        running counters the renderers need. Pre-fix the same walk
-        was inline in ``get_book_summary``; extracting it keeps the
+        running counters the renderers need. Keeping the walk here
+        (not inline in ``get_book_summary``) keeps the
         renderer signatures focused on what they consume rather
         than threading 15 collection variables through.
 
@@ -2010,8 +2007,8 @@ class CoreMixin:
                 if balance != 0:
                     # FX chokepoint: convert via the same rate map as
                     # assets/AR/AP, then negate the credit-natural
-                    # balance to a positive magnitude. Pre-fix this
-                    # appended raw account-commodity quantity, diverging
+                    # balance to a positive magnitude. Appending raw
+                    # account-commodity quantity would diverge
                     # from balance_sheet/net_worth on foreign debt.
                     usd_value, _ = self._market_value(
                         account, balance,
@@ -2472,10 +2469,10 @@ class CoreMixin:
                 rate_via=rate_via,
             )
 
-            # Transaction stats. Per-split unreconciled counting
-            # was dropped from this surface — the Reconciliation
+            # Transaction stats. There is no per-split unreconciled
+            # count on this surface — the Reconciliation
             # section below (per-account) is the actionable
-            # replacement. SX template recipes are filtered: a
+            # signal. SX template recipes are filtered: a
             # desktop-created template dated years before the first
             # real entry would otherwise stretch the activity range
             # and inflate the count (this list also feeds
@@ -3142,9 +3139,9 @@ class CoreMixin:
                 # Signal 2: proposed PRIMARY amount (max abs split
                 # value) within ±$1.00 of candidate's primary amount.
                 #
-                # Earlier iterations compared any-to-any across every
-                # split pair. On multi-split transactions (paychecks
-                # with 10+ deduction splits) that produced
+                # Comparing any-to-any across every
+                # split pair is the trap: on multi-split transactions
+                # (paychecks with 10+ deduction splits) it produces
                 # false-positive MEDIUM matches whenever a tiny
                 # deduction happened to land within ±$1 of a
                 # candidate's amount — e.g. a paycheck-vs-coffee-shop
@@ -3343,12 +3340,12 @@ class CoreMixin:
           ``quantity == value``) or explicit (cross-currency, caller
           must supply ``quantity`` with the same sign as ``value``).
 
-        Pre-extraction, ``update_transaction`` interleaved these
-        checks with the mutation loop — the first split would have
-        ``split.value`` reassigned BEFORE the sibling split's
-        cross-currency quantity was validated, so a bad-input
-        update could leave the transaction in a partial state if
-        the session didn't rollback cleanly. Validating everything
+        Interleaving these
+        checks with the mutation loop is the trap — the first split
+        gets ``split.value`` reassigned BEFORE the sibling split's
+        cross-currency quantity is validated, so a bad-input
+        update can leave the transaction in a partial state if
+        the session doesn't rollback cleanly. Validating everything
         up-front makes the subsequent mutation pass effectively
         infallible.
 
@@ -4167,11 +4164,10 @@ class CoreMixin:
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_account_to_dict(account))
 
-            # Capture info before deletion. Pre-fix the response
-            # included a short-prefix GUID computed against
-            # ``book.accounts`` BEFORE the delete — but the LLM
+            # Capture info before deletion. Don't return a
+            # short-prefix GUID here — the LLM
             # would receive a handle pointing at a row that no
-            # longer exists. ``_resolve_guid`` would then raise
+            # longer exists, and ``_resolve_guid`` would raise
             # "No account" on any subsequent attempt to use it.
             # Returning ``fullname`` and ``status="deleted"`` is
             # enough for the audit-log human reader and the LLM to
@@ -4273,8 +4269,7 @@ class CoreMixin:
         verified" invariant calls out for ``update_transaction`` and
         ``replace_splits``.
 
-        Pre-fix, both methods called ``book.save()`` and trusted the
-        result. piecash has historically silently no-op'd setattrs
+        piecash has historically silently no-op'd setattrs
         on some slot-backed fields; without this round-trip the
         thin response could lie about what's stored. Bypasses the
         ORM identity map via ``session.expire`` so we read what's
@@ -4323,8 +4318,8 @@ class CoreMixin:
                     f"expected {len(expected_splits)}"
                 )
             # Multiset of actual splits per account. Keying by fullname
-            # alone collapsed two splits to the SAME account (legal via
-            # replace_splits) — the second overwrote the first, leaving
+            # alone would collapse two splits to the SAME account (legal
+            # via replace_splits) — the second overwriting the first, leaving
             # its value unverified. A per-account list, consuming one
             # entry per matched expected split, verifies every split.
             actual_by_acct: dict[str, list] = {}
@@ -4479,12 +4474,9 @@ class CoreMixin:
 
                 # Validate everything up-front via the shared validator:
                 # sum-to-zero, account resolution (path / %short / full
-                # GUID), cross-currency quantity/sign. Pre-extraction
-                # the validation interleaved with mutation — the first
-                # split's ``value`` was reassigned before the sibling's
-                # cross-currency quantity was checked, so a bad-input
-                # update could leave the transaction in a partial state
-                # if the session didn't rollback cleanly. Now the
+                # GUID), cross-currency quantity/sign — see
+                # ``_validate_transaction_splits`` for why validation
+                # must not interleave with mutation. The
                 # mutation pass below is effectively infallible.
                 validated = self._validate_transaction_splits(
                     book, splits, trans_currency,
@@ -4524,9 +4516,9 @@ class CoreMixin:
             # Verify the write landed — re-read the transaction from
             # disk and compare each field we tried to set. Honors the
             # ``Every write is verified`` invariant CLAUDE.md spells
-            # out; pre-fix, ``update_transaction`` skipped this and a
-            # piecash silent setattr no-op would have shipped a thin
-            # response that lied about what was stored.
+            # out; without it, a
+            # piecash silent setattr no-op would ship a thin
+            # response that lies about what was stored.
             self._verify_transaction_state(
                 book, transaction,
                 expected_description=description,

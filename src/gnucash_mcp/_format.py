@@ -91,8 +91,8 @@ def _book_display_name(book_path) -> str:
     """Render a book path as filename only — no directory leakage.
 
     Routine LLM-visible responses (``get_server_config``,
-    ``get_book_summary``'s orientation line) used to include the full
-    absolute path to the GnuCash book. That leaks the user's
+    ``get_book_summary``'s orientation line) must not include the full
+    absolute path to the GnuCash book. That would leak the user's
     username, home directory layout, and any custom organization
     (``~/Finances/``, ``~/Documents/Books/``) into every transcript
     — a privacy concern for a tool that gets used on real personal

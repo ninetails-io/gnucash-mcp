@@ -111,11 +111,11 @@ def _now_utc() -> datetime:
 def _format_ts(ts: datetime) -> str:
     """Format a UTC timestamp for filenames (colons stripped).
 
-    Includes microseconds. Pre-fix, second-resolution timestamps meant
-    two ``create_backup`` calls within the same second produced the
+    Includes microseconds. At second resolution,
+    two ``create_backup`` calls within the same second produce the
     same filename — and SQLite's ``connection.backup(dest_conn)``
     truncates an existing dest, so the second snapshot silently
-    overwrote the first. Microsecond resolution makes collisions
+    overwrites the first. Microsecond resolution makes collisions
     practically impossible; the explicit ``Path.exists()`` check in
     ``create_backup`` is the second line of defense.
     """
@@ -134,8 +134,9 @@ def _parse_ts(ts_str: str) -> datetime:
 def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
     """Human-readable age string for listings — 'just now', '3 days ago', etc.
 
-    Rounds to nearest unit rather than floor — pre-fix a 59.9-minute
-    age displayed as "59 minutes ago" (one unit short of the next
+    Rounds to nearest unit rather than floor — flooring displays
+    a 59.9-minute
+    age as "59 minutes ago" (one unit short of the next
     boundary). Round-half-up makes the boundary cases honest:
     59m30s reads as "60 minutes ago" → which then promotes to "1
     hour ago" via the next-bucket check.
@@ -433,9 +434,9 @@ class BackupMixin:
                 source_conn.backup(dest_conn)
             except Exception:
                 # Disk-full (or any other) failure mid-copy leaves
-                # a partial/empty file at backup_path. Pre-fix the
-                # try/finally only closed the connection — the
-                # truncated file stayed on disk and would surface
+                # a partial/empty file at backup_path. Closing the
+                # connection alone would leave the
+                # truncated file on disk, surfacing
                 # in ``list_backups`` as a "valid backup" until the
                 # next ``PRAGMA integrity_check`` (which only runs
                 # in the success path). Best to fail loud: close
@@ -525,8 +526,8 @@ class BackupMixin:
                 size = path.stat().st_size
             except OSError as e:
                 # Most common case: a broken symlink (target moved
-                # or deleted). Pre-fix this was silently dropped —
-                # ``list_backups`` showed N-1 entries and
+                # or deleted). Dropping it silently would show
+                # N-1 entries in ``list_backups`` and
                 # ``prune_backups`` would never clean the broken
                 # link. Logging surfaces the issue at the next
                 # debug-log inspection without breaking the listing.
@@ -669,8 +670,8 @@ class BackupMixin:
 
         # Sort would_keep by stage-then-timestamp-desc so a multi-
         # stage prune groups sessions/weeklies/monthlies together
-        # (newest-first within each stage). Pre-fix it was just
-        # timestamp-desc, which interleaved stages — readable for
+        # (newest-first within each stage). Plain
+        # timestamp-desc interleaves stages — readable for
         # single-stage prunes, awkward for the ``stage=None`` (all
         # auto stages) case. Two-pass stable sort: timestamp-desc
         # first so the within-stage order is newest-first, then
@@ -778,8 +779,9 @@ class BackupMixin:
                 )
         except Exception as e:
             # Failure path: the user's write is still allowed to
-            # proceed, but the bookkeeper needs to find out — pre-fix,
-            # OSError-on-disk-full was silently swallowed for weeks.
+            # proceed, but the user needs to find out — a silently
+            # swallowed OSError-on-disk-full leaves no recovery
+            # option the day it matters.
             # We persist the failure so get_book_summary's Warnings
             # section can surface it on the next read.
             debug_logger.warning(f"Auto-backup skipped: {e}")

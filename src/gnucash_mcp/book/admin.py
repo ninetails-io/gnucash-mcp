@@ -13,8 +13,8 @@ from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported f
 # GnuCash's KVP store rather than flat keys. The MCP-facing
 # account-slot tools only manage flat keys (``apr``,
 # ``credit_limit``, ``minimum_payment``, etc.), so we restrict
-# user input to a safe alphabet up-front. Pre-fix a key like
-# ``credit/limit`` silently created a sub-slot under ``credit`` —
+# user input to a safe alphabet up-front. A key like
+# ``credit/limit`` would silently create a sub-slot under ``credit`` —
 # invisible to ``get_account_slots`` keyed lookups.
 #
 # Note: internal slot keys (set by our own book methods, not

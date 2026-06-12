@@ -248,9 +248,9 @@ class InvestmentsMixin:
                 )
 
             # Resolve currency: explicit input wins; otherwise default
-            # to the book's currency. Pre-fix, an unspecified currency
-            # silently became "USD" — which on a non-USD-default book
-            # stored prices like ``commodity=USD currency=USD`` (1 USD
+            # to the book's currency. Defaulting to a hardcoded "USD"
+            # is the trap — on a non-USD-default book it
+            # stores prices like ``commodity=USD currency=USD`` (1 USD
             # = X USD, nonsense), invisible to ``_find_exchange_rate``
             # and silently shadowed by older valid prices on lookup.
             if currency is None:
@@ -261,9 +261,9 @@ class InvestmentsMixin:
                 )
 
             # Check for existing price (same commodity/currency/date/source).
-            # Indexed query — pre-fix this walked every price in the book
-            # for every create_price call. On a book with thousands of
-            # historical prices that's a measurable hot path.
+            # Indexed query — walking every price in the book
+            # per create_price call is a measurable hot path on a book
+            # with thousands of historical prices.
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
                 currency_guid=resolved_currency.guid,
@@ -425,8 +425,7 @@ class InvestmentsMixin:
             end_date: Optional end date filter.
             currency: Optional currency filter (e.g., "USD").
             limit: Maximum prices to return. Defaults to 50, capped at
-                   250 server-side. Pre-fix this method dumped every
-                   matching price regardless of caller intent.
+                   250 server-side.
 
         Returns:
             Dict with ``prices`` (list, possibly truncated), ``count``
@@ -522,12 +521,10 @@ class InvestmentsMixin:
             commodity: Symbol of the commodity (e.g., "VTSAX").
             namespace: Namespace of the commodity (e.g., "FUND").
             currency: Currency for the price. Defaults to the book's
-                default currency. Pre-fix the default was hardcoded
-                ``"USD"``, which silently returned None for every
-                price on a non-USD-default book (CNY, EUR, etc.) —
-                same USD-default-everywhere assumption the v1.2.1
-                multi-currency hardening pass fixed for
-                ``create_price`` but missed here. Pass explicitly
+                default currency — a hardcoded ``"USD"`` default
+                would silently return None for every
+                price on a non-USD-default book (CNY, EUR,
+                etc.). Pass explicitly
                 to get a non-default-currency price (e.g., the USD
                 price of a stock on a CNY-default book).
 
@@ -620,9 +617,10 @@ class InvestmentsMixin:
             # Voided splits are zombies — preserved for audit trail
             # with quantity/value zeroed. Skip explicitly so the
             # intent is documented and partial-corruption cases
-            # (state=v but quantity != 0) are also excluded. Pre-fix
-            # this worked by coincidence because zeroed quantity
-            # contributes 0 to either branch below.
+            # (state=v but quantity != 0) are also excluded
+            # (without the filter, well-formed voids work only by
+            # coincidence: zeroed quantity contributes 0 to either
+            # branch below).
             if _is_voided(split):
                 continue
             if split.quantity > 0:
@@ -665,12 +663,11 @@ class InvestmentsMixin:
             remaining_cost_basis, original_cost_basis,
             cost_per_share, and is_closed.
 
-        Pre-fix the field name was just ``cost_basis`` (the
-        post-sale residual). After a partial sale the reading
-        ``cost_basis: $50`` on a lot bought for $100 was
-        ambiguous — was the lot bought for $50, or is $50 what's
-        left of the original cost? Now both fields ship; the
-        legacy ``cost_basis`` key keeps existing callers working.
+        Both cost-basis fields ship because a lone ``cost_basis``
+        (the post-sale residual) is ambiguous after a partial
+        sale: ``cost_basis: $50`` on a lot bought for $100 reads
+        as either the purchase cost or what's left of it. The
+        ``cost_basis`` key keeps existing callers working.
         """
         raw = self._lot_decimals(lot)
         remaining_cb = _format_number(

@@ -491,9 +491,9 @@ def _validate_tool_modules() -> None:
 
 
 # Track which ``gnucash_mcp.tools.<file>`` modules have already had
-# their ``register()`` called. The old heuristic — "skip if any tool
-# from this module is already registered" — broke after the
-# restructure: post-rebucket, ``void_transaction`` is in Core's tool
+# their ``register()`` called. A "skip if any tool
+# from this module is already registered" heuristic
+# breaks here: ``void_transaction`` is in Core's tool
 # list but lives in ``tools/reconciliation.py``. With reconciliation
 # loaded first, ``any(t in registered for t in TOOL_MODULES['core'])``
 # returns True (because void_transaction is registered) — so

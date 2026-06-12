@@ -39,9 +39,9 @@ class QueryMixin:
 
         Every filter maps to an indexable WHERE clause against the
         SQLite backing store — one query returns exactly the rows the
-        caller needs, replacing the Python-side
+        caller needs, rather than a Python-side
         ``for txn in book.transactions: if date_match`` pattern that
-        used to touch every row in the book regardless of relevance.
+        touches every row in the book regardless of relevance.
 
         The query yields ORM objects (not raw num/denom pairs) so
         callers can aggregate ``split.quantity`` / ``split.value`` as

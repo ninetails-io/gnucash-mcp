@@ -280,10 +280,10 @@ class SchedulingMixin:
             # this immediately because the SX row references its
             # GUID via ``template_act_guid``. If any of the
             # subsequent inserts (SX row, Recurrence, Slot) fail,
-            # the template account is already on disk — pre-fix the
-            # caller would retry with the same name and hit the
+            # the template account is already on disk — without
+            # cleanup, a retry with the same name passes the
             # duplicate-name check fine, but a "ghost" template
-            # account with no scheduled-transaction owner would sit
+            # account with no scheduled-transaction owner sits
             # under ``root_template`` forever.
             #
             # Wrap the whole sequence in try/except so partial-

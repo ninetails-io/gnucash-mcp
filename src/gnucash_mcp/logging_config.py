@@ -1405,8 +1405,7 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
 def _fmt_bill_post(entry: dict) -> list[str]:
     """Bill POST — same shape as invoice POST but with the right
     label so the audit log doesn't mis-categorize a vendor bill
-    as a customer invoice. Pre-fix the (invoice, POST) handler
-    fired for both because ``post_invoice`` accepts either."""
+    as a customer invoice (``post_invoice`` accepts either)."""
     lines = _fmt_invoice_post(entry)
     if lines:
         lines[0] = lines[0].replace("POST INVOICE", "POST BILL")

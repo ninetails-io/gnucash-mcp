@@ -78,22 +78,12 @@ def _is_voided(split) -> bool:
     validate lot positions must filter voided splits out — they
     are zombies, not part of the user's active ledger.
 
-    Single source of truth for "is this split voided." Pre-v1.3
-    release five iteration sites disagreed:
-
-    - ``get_unreconciled_splits`` used ``state != "y"`` (admitting
-      voided as "unreconciled")
-    - ``get_book_summary``'s reconciliation backlog count: same bug
-    - ``set_reconcile_state`` had no state guard (could move a
-      voided split to ``"y"``, defeating ``unvoid_transaction``)
-    - ``assign_split_to_lot`` had no state guard (let voided
-      splits attach to lots)
-    - ``_lot_decimals`` had no explicit filter (worked by
-      coincidence because voided splits contribute 0 either side
-      of its branch, but didn't document the intent or guard
-      against the corruption case)
-
-    Routing every site through this predicate enforces the
+    Single source of truth for "is this split voided." Ad-hoc
+    per-site checks drift (``state != "y"`` admits voided splits
+    as "unreconciled"; a missing guard lets a voided split be
+    re-reconciled or attached to a lot; value-based checks work
+    only by coincidence). Routing every site through this
+    predicate enforces the
     convention exactly once. The check is intentionally state-only;
     if a split has ``state == "v"`` but ``value != 0`` (data
     corruption from a partially-applied void) this still returns
@@ -725,13 +715,8 @@ def _transaction_to_compact_line(
     ``_SPLIT_COLLAPSE_KEEP`` by ``|value|`` followed by ``+N more``.
     The full breakdown is always available via ``get_transaction(guid)``.
 
-    History note: earlier prereleases of this server used an
-    ``exclude_account`` variant of this function that stripped the
-    filtered split silently, which made the filtered output look like
-    it was missing the description (when really the description had
-    shifted into a column the reader was parsing as splits). Register
-    form fixes that ambiguity structurally and makes the filtered
-    account's amount first-class — the field readers care about most.
+    The register form makes the filtered account's amount
+    first-class — the field readers care about most.
 
     Args:
         transaction: piecash Transaction object.
@@ -863,16 +848,16 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     """
 
     # Tables that support GUID resolution. Each entry maps table
-    # name → its prefix-lookup SQL. The dispatch dict eliminates
-    # the f-string interpolation in ``_resolve_guid`` — pre-fix
-    # the query was built as ``f"SELECT guid FROM {table} ..."``,
-    # safe via the ``_GUID_TABLES`` allowlist but a fragile pattern
-    # if a future contributor added a table without re-validating.
+    # name → its prefix-lookup SQL. The dispatch dict avoids
+    # f-string interpolation in ``_resolve_guid`` — an
+    # ``f"SELECT guid FROM {table} ..."`` build is
+    # safe under the ``_GUID_TABLES`` allowlist but a fragile pattern
+    # if a future contributor adds a table without re-validating.
     # Storing the full statement per-table makes the validation
     # implicit (no entry → no lookup) and gives each table room to
     # diverge if its schema warrants it.
     #
-    # Coverage extended to ``prices`` and ``entries`` (both have
+    # ``prices`` and ``entries`` are included (both have
     # ``guid`` columns and may surface as short prefixes from any
     # tool that emits them). ``slots`` is intentionally absent —
     # slots have no primary GUID; they're keyed by ``obj_guid``
@@ -1272,11 +1257,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         short) or ambiguous prefixes — the caller can catch and surface
         a better error message.
 
-        Template-filter chokepoint: pre-v1.3 release the template check
-        was only applied on the path branch (via :meth:`_find_account`).
-        ``%short`` and full-GUID input bypassed it, so the same logical
-        account resolved to two different values depending on input
-        form — letting ``update_account`` / ``move_account`` /
+        Template-filter chokepoint: applying the template check
+        only on the path branch (via :meth:`_find_account`) would let
+        ``%short`` and full-GUID input bypass it — the same logical
+        account resolving to two different values depending on input
+        form, letting ``update_account`` / ``move_account`` /
         ``delete_account`` silently mutate template-tree rows when
         called with a non-path ref. The post-dispatch check below
         applies the filter uniformly regardless of input shape.

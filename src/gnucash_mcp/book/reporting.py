@@ -504,9 +504,10 @@ class ReportingMixin:
             including the Unrealized line so totals balance).
         """
         # Sum splits across every relevant type in one SQL-filtered
-        # pass. The old code opened Python loops per account; now we
-        # hit the splits table once with an IN() clause and bucket the
-        # results in memory. Net income (Income - Expenses) is
+        # pass — the splits table is hit
+        # once with an IN() clause and bucketed
+        # in memory, not looped per account in
+        # Python. Net income (Income - Expenses) is
         # retained-earnings-equivalent and rolls into equity below.
         all_types = (
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
@@ -664,13 +665,13 @@ class ReportingMixin:
                 programmatic callers don't have to parse the triplet.
 
                 All numeric outputs flow through ``_format_number``
-                (currency-style: 2 decimals always padded). Pre-fix
-                the per-account values leaked Decimal precision noise
+                (currency-style: 2 decimals always padded) so
+                per-account values don't leak Decimal precision noise
                 (e.g. ``"612011.489832"``) into responses.
                 """
-                # Default-currency mnemonic for the triplet rendering.
-                # Pre-fix this hardcoded "USD"; on a CNY-default book
-                # that lied about the currency on every investment row.
+                # Default-currency mnemonic for the triplet rendering
+                # — a hardcoded "USD" lies about the currency on
+                # every investment row of a non-USD-default book.
                 ccy_mnemonic = default_currency.mnemonic
                 rows = []
                 for name, info in sorted(accounts_dict.items()):
@@ -704,9 +705,8 @@ class ReportingMixin:
                             )
                         # ``default_currency_value`` carries the
                         # parseable amount in the book's default
-                        # currency. Pre-fix this field was named
-                        # ``usd_value`` — a lie on non-USD books.
-                        # Renamed to reflect the actual semantics.
+                        # currency (a ``usd_value`` name would be
+                        # a lie on non-USD books).
                         rows.append({
                             "account": name,
                             "balance": balance_str,
@@ -845,8 +845,8 @@ class ReportingMixin:
             # split contributes a different default-currency value at
             # each boundary (factor × quantity for boundaries that
             # have a rate on file, split.value fallback for boundaries
-            # that don't). We can't carry a single ``running`` total
-            # forward like the pre-fix algorithm did; instead we track
+            # that don't). A single ``running`` total can't be carried
+            # forward under per-boundary rates; instead we track
             # per-account quantity AND value running totals and
             # convert at snapshot time using that boundary's factors.
             # Cost: O(splits + boundaries × accounts_with_splits) —
@@ -1264,8 +1264,8 @@ class ReportingMixin:
 
         with self.open(readonly=True) as book:
             # Capture the book's default currency for the compact
-            # formatter — pre-fix this method emitted ``$`` regardless
-            # of book setting, breaking on non-USD books.
+            # formatter — a hardcoded ``$`` breaks
+            # on non-USD books.
             default_currency_mnemonic = (
                 self._require_default_currency(book).mnemonic
             )
@@ -1291,9 +1291,9 @@ class ReportingMixin:
             # foreign-currency debt is valued in the book default
             # currency (rate × quantity, cost-basis fallback) instead
             # of summing raw foreign units. "Now" report → today's
-            # rates. Pre-fix this summed raw split.quantity, the lone
-            # reporting-layer method that bypassed the FX helper used by
-            # balance_sheet / net_worth / cash_flow.
+            # rates. Same FX helper as
+            # balance_sheet / net_worth / cash_flow — no
+            # reporting-layer method may bypass it.
             debt_factors = self._account_conversion_factors(
                 book, date.today()
             )
@@ -1305,9 +1305,9 @@ class ReportingMixin:
                     continue
                 debt_typed_account_count += 1
 
-                # Materialize ``account.slots`` into a dict once. Pre-fix,
-                # each ``account[key]`` access (apr, minimum_payment,
-                # credit_limit — three per account) went through piecash's
+                # Materialize ``account.slots`` into a dict once. Each
+                # ``account[key]`` access (apr, minimum_payment,
+                # credit_limit — three per account) goes through piecash's
                 # slot-helper path, hitting the slots collection
                 # independently per key. One iteration + three dict gets
                 # is cheaper.
@@ -1435,9 +1435,9 @@ class ReportingMixin:
                     "balance": balance,
                     "apr": apr,
                     # Pre-compute monthly rate once per debt. _run_avalanche's
-                    # inner loop iterates up to 1200 months, and pre-fix
-                    # recomputed apr/100/12 every iteration for every debt
-                    # that still had a balance.
+                    # inner loop iterates up to 1200 months; recomputing
+                    # apr/100/12 every iteration for every debt
+                    # that still has a balance is pure waste.
                     "monthly_rate": apr / Decimal("100") / Decimal("12"),
                     "min_payment": min_payment,
                     "credit_limit": credit_limit,

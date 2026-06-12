@@ -32,9 +32,9 @@ from gnucash_mcp._format import _apply_limit
 def _commodity_quantum(commodity) -> Decimal:
     """Smallest representable unit of a commodity, as a Decimal quantum.
 
-    Pre-fix, every cross-currency conversion in this module hardcoded
-    ``Decimal("0.01")`` — implicitly assuming 2-decimal currencies
-    (USD, EUR, GBP, CNY). The hardcode silently corrupts:
+    A hardcoded ``Decimal("0.01")`` quantum — implicitly assuming
+    2-decimal currencies
+    (USD, EUR, GBP, CNY) — silently corrupts:
 
     - **JPY** (``fraction=1``): a ¥1,234.50 conversion would round to
       ¥1,234.50 stored, but JPY can't represent half-yen — every
@@ -43,7 +43,7 @@ def _commodity_quantum(commodity) -> Decimal:
       input is silently rounded to 100.12, losing 3 mils per
       conversion.
 
-    Now derives the quantum from ``commodity.fraction`` (piecash
+    Derives the quantum from ``commodity.fraction`` (piecash
     stores 100 for USD, 1 for JPY, 1000 for BHD, 10000 for shares).
     """
     fraction = getattr(commodity, "fraction", 100)
@@ -247,9 +247,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
             # Two phrasings — "X days past due" reads as contractual
             # (the user agreed to a date and missed it), "X days past
             # 30-day default" anchors the duration to the assumption
-            # we made when no term was set. Pre-fix the templating
-            # concatenated "days past " with another "past due" so
-            # the contractual case rendered as "days past past due".
+            # we made when no term was set.
             if r.get("no_terms"):
                 days_str = f"  {days} days past 30-day default"
             else:
@@ -730,13 +728,11 @@ class BusinessMixin:
         (transaction currency) is the rate that was in force at
         posting.
 
-        Pre-fix this method took just ``(post_txn,
-        invoice_currency)`` and returned the rate of the FIRST
-        non-invoice-currency split — which in a multi-cross-currency
-        post (e.g., EUR invoice with USD income + GBP A/R) would
-        silently pick whichever split happened to come first. Now
-        requires an explicit target so the caller gets the rate they
-        actually want.
+        The explicit target matters: returning the rate of the
+        FIRST
+        non-invoice-currency split would, in a multi-cross-currency
+        post (e.g., EUR invoice with USD income + GBP A/R),
+        silently pick whichever split happens to come first.
 
         Returns the Decimal rate, or None if no matching split is
         present (caller should fall back to the price table at
@@ -876,9 +872,9 @@ class BusinessMixin:
         # Convert to the book default currency before booking — the FX
         # account has commodity=default, and a quantity in any other
         # commodity would be silently treated as default by every
-        # report that reads this account. Pre-fix triple-currency case
-        # (book=USD, invoice=EUR, pay=GBP): a £5 GBP gain landed on a
-        # USD-commodity FX account as quantity=5, rendered as "$5
+        # report that reads this account. Triple-currency case
+        # (book=USD, invoice=EUR, pay=GBP): a £5 GBP gain landing on a
+        # USD-commodity FX account as quantity=5 renders as "$5
         # gain" — silently wrong.
         if pay_acct.commodity != default_currency:
             pay_to_default_rate = self._find_exchange_rate(
@@ -1136,10 +1132,10 @@ class BusinessMixin:
             # customer invoices (owner_type=2) AND job-attached
             # invoices whose job has owner_type=2.
             #
-            # Pre-fix: ``add_invoice_entry`` /
-            # ``delete_invoice`` / etc. all filter by
-            # owner_type=2 and would have failed with "Invoice
-            # not found" on any invoice attached to a job. Fix:
+            # Without the job branch, ``add_invoice_entry`` /
+            # ``delete_invoice`` / etc. (which all filter by
+            # owner_type=2) would fail with "Invoice
+            # not found" on any invoice attached to a job. So:
             # build a subquery of job GUIDs matching the
             # requested owner_type and OR it in.
             #
@@ -1638,11 +1634,11 @@ class BusinessMixin:
             # Empty entries (ValueError from
             # ``_get_invoice_entries_and_total``), missing currency
             # attr, or arithmetic on a None — render "?" so the
-            # listing line still produces a row. Pre-fix the bare
-            # ``except Exception`` would have swallowed programming
+            # listing line still produces a row. A bare
+            # ``except Exception`` would swallow programming
             # errors (KeyError / NameError / etc.) silently too;
-            # tightened to the predictable shapes that "? amount"
-            # is the right rendering for.
+            # the catch is limited to the predictable shapes that
+            # "? amount" is the right rendering for.
             amount_str = "?"
 
         return (
@@ -1818,9 +1814,10 @@ class BusinessMixin:
         row preserved. Filtering them here matches the void-aware
         treatment ``unpost_invoice`` uses for "are there real
         payments on this lot?" and the lot-listing helpers use for
-        active-position math. Pre-fix this method summed every
-        split (voided ones contribute zero so the SUM was right by
-        accident), which left the helper out of step with the rest
+        active-position math. Summing every
+        split would be right by
+        accident (voided ones contribute zero) but out of step with
+        the rest
         of the codebase's void semantics — a future caller might
         reasonably check ``len(lot.splits)`` against this balance
         and get inconsistent answers.
@@ -3942,12 +3939,12 @@ class BusinessMixin:
                 #      no currency set (shouldn't happen with piecash
                 #      owners, but defensive).
                 #
-                # Pre-fix this fallback used book default unconditionally,
-                # which broke cross-currency posting for any book with
+                # Falling back to the book default unconditionally
+                # breaks cross-currency posting for any book with
                 # foreign customers/vendors: bills against a USD vendor
-                # on a CNY book got created in CNY, then ``post_invoice``
-                # saw inv.currency == account.commodity and skipped the
-                # rate-conversion path entirely. $500 was then booked
+                # on a CNY book get created in CNY, then ``post_invoice``
+                # sees inv.currency == account.commodity and skips the
+                # rate-conversion path entirely — $500 booked
                 # as ¥500.
                 owner_currency = getattr(owner, "currency", None)
                 if owner_currency is not None:
@@ -5229,10 +5226,10 @@ class BusinessMixin:
                 total = Decimal(0)
 
             # Three-way owner lookup — vouchers route to employees,
-            # bills to vendors, invoices to customers. Pre-fix this
-            # was a binary "is_bill → vendor else customer" check
-            # that returned None for vouchers because employees
-            # weren't in the dispatch.
+            # bills to vendors, invoices to customers. A binary
+            # "is_bill → vendor else customer" check
+            # returns None for vouchers because employees
+            # aren't in the dispatch.
             owner = self._find_invoice_owner_by_guid(
                 book, inv.owner_type, inv.owner_guid,
             )
@@ -5571,8 +5568,8 @@ class BusinessMixin:
             # is treated as "use an empty description on purpose"
             # so the caller can deliberately blank the field
             # without inheriting the owner name. Same pattern
-            # ``pay_invoice`` uses; pre-fix here was ``or owner_name``
-            # which collapsed "" into the fallback.
+            # ``pay_invoice`` uses; an ``or owner_name`` fallback
+            # would collapse "" into the fallback.
             txn_desc = description if description is not None else owner_name
 
             parsed_due = (
@@ -6071,9 +6068,8 @@ class BusinessMixin:
             # explicitly when they want a blank transaction
             # description — e.g., to avoid leaking the customer
             # name into a memo. ``description=None`` (the default)
-            # falls back to the owner's name, preserving the
-            # historical default. Pre-fix ``""`` was indistinguish-
-            # able from ``None``.
+            # falls back to the owner's name. With ``or``, ``""``
+            # would be indistinguishable from ``None``.
             txn_desc = description if description is not None else owner_name
 
             # Cross-currency payment: when the payment account's
@@ -6086,11 +6082,11 @@ class BusinessMixin:
             # ``quantity`` reflects the actual amount in its own
             # commodity.
             #
-            # Pre-fix, ``pay_invoice`` only converted the bank-side
-            # quantity. ``post_invoice`` correctly converted the A/R
-            # side via ``_qty_for_split(post_acct, ...)``; the pay
-            # path didn't, so a USD A/R holding a EUR invoice was
-            # liquidated in EUR-as-USD on payment.
+            # BOTH legs convert — converting only the bank-side
+            # quantity (leaving the A/R
+            # side in raw invoice-currency units)
+            # liquidates a USD A/R holding a EUR invoice
+            # in EUR-as-USD on payment.
             # ``post_invoice`` and ``pay_invoice`` share
             # the cross-currency rate-lookup + quantization
             # chokepoint via ``_convert_invoice_amount``. Pay
@@ -6154,11 +6150,12 @@ class BusinessMixin:
             # The lot balance is signed: positive for A/R invoices,
             # negative for A/P bills, flipped for credit notes.
             # Normalize to "amount still owed" via effective_is_bill
-            # and reject any payment beyond it. Pre-fix nothing
-            # compared amount to remaining: an overpayment drove the
-            # lot negative, lot-close (== 0 exactly) never fired, and
-            # downstream abs() calls inverted the sign — a customer
-            # who overpaid by $1,000 rendered as still OWING $1,000
+            # and reject any payment beyond it. Without this guard
+            # nothing compares amount to remaining: an overpayment
+            # drives the
+            # lot negative, lot-close (== 0 exactly) never fires, and
+            # downstream abs() calls invert the sign — a customer
+            # who overpaid by $1,000 renders as still OWING $1,000
             # in the collections list.
             remaining_before_pay = self._calculate_lot_balance(lot_obj)
             if effective_is_bill:
@@ -7819,15 +7816,15 @@ class BusinessMixin:
 
                 # Signed arithmetic keeps amount_paid honest in the
                 # overpaid case: grand 3500, due −1000 → paid 4500
-                # (the pre-fix abs() derivation showed paid 2500).
+                # (an abs() derivation would show paid 2500).
                 amount_paid = grand_total - amount_due
 
                 # Owner lookup via the polymorphic dispatcher —
                 # routes customer/vendor/employee/job (chasing
                 # owner_type=3 through the Job to the underlying
-                # counterparty). Pre-fix this used the direct
-                # customer/vendor finders keyed off ``is_bill``,
-                # which returned None for job-attached invoices
+                # counterparty). The direct
+                # customer/vendor finders keyed off ``is_bill``
+                # return None for job-attached invoices
                 # because inv.owner_guid points at a Job, not a
                 # customer/vendor row.
                 owner = self._find_invoice_owner_by_guid(
@@ -8099,8 +8096,7 @@ class BusinessMixin:
 
         with self.open() as book:
             # Capture default currency for the compact formatter —
-            # pre-fix the table emitted ``$`` regardless of book
-            # setting.
+            # a hardcoded ``$`` breaks on non-USD books.
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
@@ -8180,8 +8176,8 @@ class BusinessMixin:
                     )["grand_total"]
                 except ValueError:
                     # Empty/corrupted entries — fall back to the
-                    # lot balance (computed above). Pre-fix this
-                    # silently substituted Decimal(0), which made
+                    # lot balance (computed above). Silently
+                    # substituting Decimal(0) would make
                     # ``total_billed`` understate by the bill's
                     # full amount on any data-corruption case. The
                     # lot balance reflects the actual outstanding
