@@ -111,13 +111,10 @@ def _now_utc() -> datetime:
 def _format_ts(ts: datetime) -> str:
     """Format a UTC timestamp for filenames (colons stripped).
 
-    Includes microseconds. At second resolution,
-    two ``create_backup`` calls within the same second produce the
-    same filename — and SQLite's ``connection.backup(dest_conn)``
-    truncates an existing dest, so the second snapshot silently
-    overwrites the first. Microsecond resolution makes collisions
-    practically impossible; the explicit ``Path.exists()`` check in
-    ``create_backup`` is the second line of defense.
+    Microsecond resolution: at second resolution two same-second
+    backups share a filename, and SQLite's backup() truncates an
+    existing dest — silently overwriting the first snapshot. The
+    Path.exists() check in create_backup is the second defense.
     """
     return ts.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
@@ -132,14 +129,11 @@ def _parse_ts(ts_str: str) -> datetime:
 
 
 def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
-    """Human-readable age string for listings — 'just now', '3 days ago', etc.
+    """Human-readable age string — 'just now', '3 days ago', etc.
 
-    Rounds to nearest unit rather than floor — flooring displays
-    a 59.9-minute
-    age as "59 minutes ago" (one unit short of the next
-    boundary). Round-half-up makes the boundary cases honest:
-    59m30s reads as "60 minutes ago" → which then promotes to "1
-    hour ago" via the next-bucket check.
+    Rounds to nearest unit, not floor: 59m30s reads as "1 hour ago"
+    via the next-bucket promotion rather than the dishonest
+    "59 minutes ago".
     """
     now = reference or _now_utc()
     delta = now - ts
@@ -217,12 +211,10 @@ def _write_state(backups_dir: Path, state: dict[str, datetime]) -> None:
 
 # ── Auto-backup attempt status (separate file) ───────────────────────
 #
-# Decoupled from .state.json on purpose: the per-stage timestamp file
-# advances only on successful backup, so it can't tell us "we tried
-# 6 hours ago and it failed." A separate ``.last_attempt.json``
-# captures every attempt — success or failure — so get_book_summary
-# can surface backup-chain breaks the bookkeeper would otherwise
-# discover only by reading debug logs.
+# Decoupled from .state.json: the per-stage file advances only on
+# success, so it can't say "we tried 6 hours ago and failed."
+# .last_attempt.json captures every attempt so get_book_summary can
+# surface chain breaks otherwise buried in debug logs.
 
 
 def _attempt_path(backups_dir: Path) -> Path:
@@ -367,30 +359,25 @@ class BackupMixin:
         stage: str = _MANUAL_STAGE_NAME,
         label: str | None = None,
     ) -> dict:
-        """Write a fresh snapshot of the book via SQLite's online
-        backup API and verify it with PRAGMA integrity_check.
+        """Write a fresh snapshot via SQLite's online backup API and
+        verify it with PRAGMA integrity_check.
 
         Args:
-            stage: One of ``session``, ``weekly``, ``monthly``,
-                ``manual``. Auto stages are driven by the retention
-                policy; manual is user-invoked and has unlimited
-                retention.
-            label: Optional free-text label (sanitized to
-                ``[A-Za-z0-9_-]``) appended to the filename. Useful for
-                "pre-big-reorg" style human markers.
+            stage: ``session`` / ``weekly`` / ``monthly`` (policy-
+                driven) or ``manual`` (user-invoked, unlimited
+                retention).
+            label: Optional marker (sanitized to ``[A-Za-z0-9_-]``)
+                appended to the filename — "pre-big-reorg" style.
 
         Returns:
-            Dict with ``status``, ``stage``, ``path``, ``size_bytes``,
-            ``integrity``, and ``restore_hint``. All paths are absolute
-            strings.
+            ``{status, stage, path, size_bytes, integrity,
+            restore_hint}``.
 
         Raises:
-            ValueError: If the stage is unknown.
-            RuntimeError: If the integrity check fails after the copy
-                (the bad backup file is deleted before raising so the
-                caller never has to clean up).
-            OSError: If the backup directory can't be created or
-                written.
+            ValueError: Unknown stage.
+            RuntimeError: Integrity check failed (the bad file is
+                deleted before raising).
+            OSError: Backup directory not creatable/writable.
         """
         if stage not in _ALL_STAGE_NAMES:
             raise ValueError(
@@ -411,11 +398,8 @@ class BackupMixin:
         filename += ".gnucash"
         backup_path = backups_dir / filename
 
-        # Defense in depth against filename collisions. The microsecond
-        # resolution in ``_format_ts`` makes this practically
-        # impossible, but ``sqlite3.connect(path)`` would happily
-        # truncate an existing file — so refuse to overwrite explicitly
-        # rather than silently destroy a prior snapshot.
+        # Refuse to overwrite — sqlite3.connect(path) would happily
+        # truncate an existing snapshot (see _format_ts).
         if backup_path.exists():
             raise RuntimeError(
                 f"Backup path already exists, refusing to overwrite: "
@@ -423,25 +407,18 @@ class BackupMixin:
                 f"collision; retry."
             )
 
-        # Perform the SQLite online backup. We open the source via
-        # piecash's readonly context (no write lock on the live book)
-        # and reach into the underlying sqlite3 connection. SQLite's
-        # backup() copies pages in chunks without blocking readers.
+        # Source opened readonly (no write lock on the live book);
+        # SQLite's backup() copies pages without blocking readers.
         with self.open(readonly=True) as book:
             source_conn = book.session.connection().connection
             dest_conn = sqlite3.connect(str(backup_path))
             try:
                 source_conn.backup(dest_conn)
             except Exception:
-                # Disk-full (or any other) failure mid-copy leaves
-                # a partial/empty file at backup_path. Closing the
-                # connection alone would leave the
-                # truncated file on disk, surfacing
-                # in ``list_backups`` as a "valid backup" until the
-                # next ``PRAGMA integrity_check`` (which only runs
-                # in the success path). Best to fail loud: close
-                # the connection, unlink the partial file, and
-                # propagate the original exception.
+                # A mid-copy failure leaves a partial file that
+                # list_backups would show as a "valid backup" (the
+                # integrity check only runs on success). Unlink it
+                # and propagate.
                 dest_conn.close()
                 try:
                     backup_path.unlink()
@@ -449,15 +426,11 @@ class BackupMixin:
                     pass
                 raise
             finally:
-                # Idempotent: safe to call after the explicit close
-                # in the except branch — sqlite3.connection.close()
-                # is no-op on a closed connection.
+                # Idempotent — close() is a no-op on a closed conn.
                 dest_conn.close()
 
-        # Verify the backup with PRAGMA integrity_check before
-        # declaring success. If the check fails, delete the bad file
-        # so we never leave a broken snapshot masquerading as a valid
-        # recovery option.
+        # Verify before declaring success; a failed check deletes
+        # the file so no broken snapshot masquerades as recovery.
         verify_conn = sqlite3.connect(str(backup_path))
         try:
             row = verify_conn.execute("PRAGMA integrity_check").fetchone()
@@ -476,17 +449,11 @@ class BackupMixin:
 
         size_bytes = backup_path.stat().st_size
 
-        # Route path-bearing fields through ``redact_paths``
-        # (imported at module top). Pass-through unless
-        # ``GNUCASH_REDACT_PATHS=1``; when set, paths collapse to
-        # basename so responses are safe to share externally
-        # without leaking filesystem layout.
-
-        # Shell-quote interpolated paths. Paths with spaces
-        # or shell metachars would otherwise break the command —
-        # and if a future code path ever passes a user-influenced
-        # path component, an unquoted f-string is a latent
-        # injection.
+        # Path-bearing fields route through redact_paths (opt-in
+        # via GNUCASH_REDACT_PATHS). Paths are shell-quoted —
+        # spaces/metachars break the command, and an unquoted
+        # f-string is a latent injection if a future path component
+        # is user-influenced.
         restore_hint = (
             "Restore by stopping the server, then: "
             f"mv {shlex.quote(str(self.book_path))} "
@@ -525,12 +492,8 @@ class BackupMixin:
             try:
                 size = path.stat().st_size
             except OSError as e:
-                # Most common case: a broken symlink (target moved
-                # or deleted). Dropping it silently would show
-                # N-1 entries in ``list_backups`` and
-                # ``prune_backups`` would never clean the broken
-                # link. Logging surfaces the issue at the next
-                # debug-log inspection without breaking the listing.
+                # Usually a broken symlink — log rather than drop
+                # silently, so the issue is findable.
                 debug_logger.warning(
                     f"Backup file unstattable, skipping: {path} ({e})"
                 )
@@ -668,14 +631,9 @@ class BackupMixin:
             would_keep.extend(keep)
             would_delete.extend(drop)
 
-        # Sort would_keep by stage-then-timestamp-desc so a multi-
-        # stage prune groups sessions/weeklies/monthlies together
-        # (newest-first within each stage). Plain
-        # timestamp-desc interleaves stages — readable for
-        # single-stage prunes, awkward for the ``stage=None`` (all
-        # auto stages) case. Two-pass stable sort: timestamp-desc
-        # first so the within-stage order is newest-first, then
-        # by stage to group.
+        # Group by stage, newest-first within each (two-pass stable
+        # sort) — plain timestamp-desc interleaves stages in the
+        # all-auto-stages case.
         would_keep.sort(key=lambda e: e["timestamp"], reverse=True)
         would_keep.sort(key=lambda e: e["stage"])
         would_delete.sort(key=lambda e: e["timestamp"], reverse=True)
@@ -710,23 +668,17 @@ class BackupMixin:
 
     def _maybe_auto_backup(self) -> None:
         """Called once per process, before the first write, from the
-        audit decorator. Creates a backup tagged with the highest-
-        priority due stage (if any stages are due) and prunes each
-        auto stage down to its ``keep_last_n``.
+        audit decorator: backs up under the highest-priority due
+        stage (if any) and prunes each auto stage to its
+        ``keep_last_n``.
 
-        Silently returns on any failure: an auto-backup that errors
-        must never fail the user's write. The audit debug log records
-        the reason.
-
-        This method is safe to call multiple times within a process —
-        ``_backup_checked_in_process`` gates it — but the audit
-        decorator already enforces that contract at its layer.
+        Silently returns on any failure — an auto-backup error must
+        never fail the user's write; the debug log records why.
+        Safe to call repeatedly (``_backup_checked_in_process``
+        gates it).
         """
-        # Serialize the gate so concurrent first-writes can't both
-        # pass the check before either flips the flag. Without the
-        # lock, two threads racing on the very first write would each
-        # call ``create_backup`` — and with file-level naming they'd
-        # collide on the same path.
+        # Lock so concurrent first-writes can't both pass the gate
+        # and collide on the same backup filename.
         with self._backup_check_lock:
             if self._backup_checked_in_process:
                 return

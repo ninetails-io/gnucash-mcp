@@ -93,13 +93,12 @@ class SchedulingMixin:
         if last_occur is not None and last_occur > after:
             after = last_occur
 
-        # Anchor each occurrence to ``start_date + (n × period)`` rather
-        # than chaining ``occurrence += delta``. ``relativedelta`` clamps
-        # to month-end on day-of-month overflow, so a monthly schedule
-        # starting Jan 31 chained as Jan 31 → Feb 28 → Mar 28 → … (drift
-        # never recovers). Anchored from start_date: Feb 28 → Mar 31 →
-        # Apr 30 → May 31, preserving the bookkeeper's "31st of every
-        # month, falling back to month-end where needed" intent.
+        # Anchor each occurrence to ``start_date + (n × period)``,
+        # never chained ``occurrence += delta``: relativedelta clamps
+        # on month-end overflow, so a Jan-31 monthly chain drifts
+        # Jan 31 → Feb 28 → Mar 28 → … and never recovers. Anchored:
+        # Feb 28 → Mar 31 → Apr 30, preserving "31st, falling back
+        # to month-end".
         delta_for = {
             "weekly": lambda n: relativedelta(weeks=n),
             "biweekly": lambda n: relativedelta(weeks=2 * n),
@@ -242,8 +241,7 @@ class SchedulingMixin:
             date.fromisoformat(end_date) if end_date else None
         )
 
-        # _to_decimal routes any stray float (direct caller bypassing the
-        # tool-layer SplitInput model) through Python's shortest-repr so
+        # _to_decimal rescues stray floats from direct callers so
         # the balance check doesn't fail on IEEE-754 noise.
         total = Decimal("0")
         for s in splits:
@@ -276,32 +274,20 @@ class SchedulingMixin:
 
             sx_guid = uuid.uuid4().hex
 
-            # Create template account under root_template. We flush
-            # this immediately because the SX row references its
-            # GUID via ``template_act_guid``. If any of the
-            # subsequent inserts (SX row, Recurrence, Slot) fail,
-            # the template account is already on disk — without
-            # cleanup, a retry with the same name passes the
-            # duplicate-name check fine, but a "ghost" template
-            # account with no scheduled-transaction owner sits
-            # under ``root_template`` forever.
-            #
-            # Wrap the whole sequence in try/except so partial-
-            # failure cleans up the orphan template account before
-            # propagating the error.
+            # Template account flushed first (the SX row references
+            # its GUID). If a later insert fails, the account is
+            # already on disk — the try/except below cleans up the
+            # orphan, or a ghost template sits under root_template
+            # forever.
             template_acct = piecash.Account(
                 name=name,
                 type="BANK",
                 parent=book.root_template,
                 commodity=self._require_default_currency(book),
             )
-            # ``book.session.add(template_acct)`` would be
-            # redundant — piecash's Account auto-registers via
-            # the parent relationship. Documented in CLAUDE.md
-            # under "piecash gotchas." The flush is kept because
-            # the next block does a raw SQL INSERT against the
-            # scheduled-transaction table and needs the template
-            # account row to exist first.
+            # No session.add — piecash Accounts auto-register via
+            # the parent relationship. The flush is needed: the raw
+            # SQL INSERT below requires the template row on disk.
             book.session.flush()
 
             try:
@@ -344,13 +330,10 @@ class SchedulingMixin:
                     f"Recurrence for scheduled transaction '{name}'",
                 )
 
-                # Store split templates as JSON in a slot. Normalize
-                # `amount` through _to_decimal → str so the persisted
-                # JSON is always a clean decimal string, even if the
-                # caller handed us a float. Otherwise a float would
-                # survive json.dumps as a numeric literal, and every
-                # future instantiation would replay the IEEE-754
-                # epsilon.
+                # amount normalized via _to_decimal → str so the
+                # persisted JSON is a clean decimal string — a float
+                # surviving json.dumps would replay its IEEE-754
+                # epsilon on every future instantiation.
                 splits_json = json.dumps([
                     {
                         "account": s["account"],
@@ -375,10 +358,8 @@ class SchedulingMixin:
 
                 book.save()
             except Exception:
-                # Cleanup the orphan template account so a retry
-                # doesn't accumulate unowned template scaffolding.
-                # Swallow cleanup failures — the original error is
-                # what the caller needs to see.
+                # Clean up the orphan template; swallow cleanup
+                # failures — the original error is what matters.
                 try:
                     book.session.delete(template_acct)
                     book.save()
@@ -453,21 +434,13 @@ class SchedulingMixin:
         self, book, days: int = 7,
     ) -> dict:
         """Summary stats for scheduled transactions due within
-        ``days`` days from today.
+        ``days`` days: ``{"count": int, "total": Decimal}``.
 
-        Returns ``{"count": int, "total": Decimal}``. The total is
-        the sum of positive split amounts across each upcoming
-        occurrence — same convention ``get_upcoming_transactions``
-        uses for its per-row ``amount`` field.
-
-        Designed for the ``get_book_summary`` orientation line
-        ("Scheduled: 13 recurring, 3 due in next 7 days (CNY
-        15,650)"). Single pass over scheduled transactions; cheap
-        enough to compute on every summary call. Lives in
-        SchedulingMixin so a book class built without the
-        scheduling module simply doesn't have the method, and
-        ``get_book_summary`` skips the upcoming-line render via
-        ``hasattr`` (no cross-mixin tight coupling).
+        Total = sum of positive split amounts per occurrence (same
+        convention as ``get_upcoming_transactions``). Feeds the
+        get_book_summary Scheduled line; lives here so a book class
+        built without scheduling lacks the method and the summary
+        skips the line via ``hasattr``.
         """
 
         today = date.today()
@@ -506,16 +479,11 @@ class SchedulingMixin:
                 continue
 
             count += 1
-            # splits-json amounts are in the book default currency by
-            # construction: create_scheduled_transaction pins the
-            # template transaction to the default currency, and
-            # create_transaction_from_scheduled instantiates with no
-            # currency override — so every stored amount is a default-
-            # currency value. Summing them needs no FX conversion, and
-            # get_book_summary's single "{default_currency} N" label is
-            # correct. (A foreign-currency SX would require a native-
-            # GnuCash template, which carries no splits-json slot and so
-            # contributes nothing here.)
+            # splits-json amounts are in the book default currency
+            # by construction (create pins the default; instantiate
+            # passes no override), so no FX conversion is needed. A
+            # foreign-currency SX would be a native-GnuCash template
+            # with no splits-json slot — it contributes nothing here.
             for s in self._get_sx_splits(book, sx):
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
@@ -619,54 +587,38 @@ class SchedulingMixin:
     ) -> dict:
         """Create an actual transaction from a scheduled template.
 
-        Three-phase write to keep the schedule advance and the
+        Three-phase write keeping the schedule advance and the
         transaction in lockstep:
 
-        1. **Read-only** session: resolve the scheduled-transaction
-           row, compute the target ``txn_date``, validate
-           preflight (frequency known, date past ``last_occur``,
-           splits non-empty). Captures everything needed for the
-           write without mutating anything.
-        2. ``self.create_transaction(...)`` runs in its own session.
-           On success this lands a transaction; on a raise the
-           schedule has not advanced and the caller's retry is
-           safe; on ``status="rejected"`` the duplicate detector
-           found an equivalent prior transaction (so an
-           equivalent transaction DOES exist for this period —
-           we treat that as a successful no-op and still advance
-           the schedule).
-        3. **Read-write** session: advance ``last_occur`` and
-           ``instance_count``. Reached only when phase 2 returned
-           without raising — so the schedule-advance-vs-transaction-
-           existence invariant holds in both the success and
-           duplicate-detected branches.
+        1. **Read-only**: resolve the SX, compute ``txn_date``,
+           validate preflight. No mutation.
+        2. ``self.create_transaction(...)`` in its own session. A
+           raise leaves the schedule unadvanced (retry-safe);
+           ``status="rejected"`` means an equivalent transaction
+           already exists for this period — a successful no-op,
+           and the schedule still advances.
+        3. **Read-write**: advance ``last_occur`` /
+           ``instance_count``, reached only when phase 2 didn't
+           raise.
 
-        Advancing the schedule BEFORE the transaction call is the
-        trap: any raise in phase 2 leaves the schedule moved with
-        no transaction posted, and a re-run skips the period
-        entirely.
+        Advancing BEFORE the transaction call is the trap: a raise
+        would leave the schedule moved with nothing posted, and a
+        re-run skips the period.
 
         Args:
-            guid: Scheduled transaction GUID.
-            transaction_date: Date for the transaction (YYYY-MM-DD).
-                            Defaults to next occurrence date.
+            transaction_date: Defaults to the next occurrence date.
 
         Returns:
-            Dict with ``transaction_guid``, ``scheduled_transaction``
-            name, ``transaction_date``, ``instance_count``, and
-            ``status``. When the duplicate detector caught an
-            equivalent transaction, ``status="rejected"`` and a
-            ``reason="duplicate_exists"`` field is included so
-            downstream LLMs have explicit evidence to stop and
-            move on rather than retry the call. The duplicate
-            detector's ``duplicates`` TSV is forwarded too when
-            present, naming the matching prior transaction(s).
+            ``{transaction_guid, scheduled_transaction,
+            transaction_date, instance_count, status}``. On a
+            duplicate rejection, ``reason="duplicate_exists"`` (and
+            the ``duplicates`` TSV) is included — explicit evidence
+            for downstream LLMs to stop rather than retry.
 
         Raises:
-            ValueError: If scheduled transaction not found,
-                disabled, no upcoming occurrence, txn_date not
-                past last_occur, or splits empty. None of these
-                paths advance the schedule.
+            ValueError: SX not found, disabled, no upcoming
+                occurrence, txn_date not past last_occur, or splits
+                empty. None of these advance the schedule.
         """
         # ── Phase 1: read-only resolution. No mutation. ─────────
         with self.open(readonly=True) as book:
@@ -714,11 +666,9 @@ class SchedulingMixin:
                         "No upcoming occurrence (past end date)"
                     )
 
-            # Preflight: refuse to instantiate an occurrence on or
-            # before last_occur. GnuCash desktop's "Since Last Run"
-            # updates last_occur when it auto-creates transactions;
-            # running this tool with a prior date would silently
-            # create a duplicate.
+            # Refuse dates on or before last_occur — desktop's
+            # "Since Last Run" may have advanced it, and a prior
+            # date would silently duplicate.
             if last and txn_date <= last:
                 raise ValueError(
                     f"Transaction date {txn_date.isoformat()} is not "
@@ -734,18 +684,9 @@ class SchedulingMixin:
                     "transaction"
                 )
 
-            # Capture the few fields the later phases need so we
-            # don't have to re-resolve.
             sx_name = sx.name
 
-        # ── Phase 2: create the transaction. ────────────────────
-        # On raise: schedule is unchanged (phase 3 not reached).
-        # On status="rejected": duplicate detector caught an
-        # equivalent prior transaction — for schedule-advance
-        # purposes that
-        # transaction IS the one for this period, so we proceed
-        # to advance the schedule and forward the rejection signal
-        # to the caller in the response.
+        # ── Phase 2: create the transaction (see docstring). ─────
         txn_result = self.create_transaction(
             description=sx_name,
             splits=splits,
@@ -753,39 +694,24 @@ class SchedulingMixin:
         )
 
         # ── Phase 3: advance the schedule. ──────────────────────
-        # Re-resolve under a read-write session and apply both
-        # mutations in one commit. We re-find by guid (the prior
-        # ORM object was detached when phase-1's session closed).
+        # Re-find by guid — the phase-1 ORM object detached when
+        # its session closed.
         with self.open(readonly=False) as book:
             sx = self._find_scheduled_transaction(book, guid)
             if not sx:
-                # Edge case: schedule deleted concurrently between
-                # phases 1 and 3. The transaction exists; we
-                # surface a clean response noting the orphan
-                # rather than crash. Single-threaded MCP makes
-                # this practically unreachable but the defense
-                # is cheap.
+                # SX deleted concurrently between phases — the
+                # transaction exists; respond cleanly rather than
+                # crash. Practically unreachable single-threaded.
                 instance_count = None
             else:
-                # ``last`` was captured under the readonly session;
-                # if desktop pre-created ahead while phase 2 ran,
-                # use whatever's current. Never rewind.
                 current_last = sx.last_occur
                 if isinstance(current_last, datetime):
                     current_last = current_last.date()
-                # Only advance + increment when ``txn_date`` is
-                # actually beyond the current marker. If a
-                # concurrent writer covered this period between
-                # phases 2 and 3 (desktop's "Since Last Run", or
-                # another tool invocation), the schedule already
-                # registered the period — incrementing
-                # ``instance_count`` again would double-count.
-                # The MCP server runs
-                # single-threaded so this is practically
-                # unreachable today, but the gate is cheap and the
-                # invariant ("instance_count equals the number of
-                # distinct periods this schedule has produced")
-                # holds under any future multi-writer scenario.
+                # Advance + increment only when txn_date is beyond
+                # the current marker — a concurrent writer may have
+                # registered the period already, and a second
+                # increment would break "instance_count = distinct
+                # periods produced". Never rewind.
                 if current_last is None or txn_date > current_last:
                     sx.last_occur = txn_date
                     sx.instance_count += 1
@@ -793,8 +719,6 @@ class SchedulingMixin:
                 instance_count = sx.instance_count
 
         # ── Build response. ─────────────────────────────────────
-        # Not a write phase — the docstring describes three
-        # write phases; this is the response-shaping step.
         response = {
             "transaction_guid": txn_result.get("guid"),
             "scheduled_transaction": sx_name,
@@ -803,14 +727,9 @@ class SchedulingMixin:
             "status": txn_result.get("status", "created"),
         }
         if txn_result.get("status") == "rejected":
-            # Explicit evidence for downstream LLMs (including
-            # dumber models that might retry status="rejected"
-            # by default) that the rejection is the *correct*
-            # outcome — a transaction for this period already
-            # exists. Without this, the natural retry instinct
-            # would either re-trigger the dupe detector (best
-            # case) or, with --force_create, create the very
-            # duplicate the detector was preventing.
+            # Evidence that the rejection is the CORRECT outcome —
+            # without it, the natural retry instinct re-triggers the
+            # detector or (with force_create) creates the duplicate.
             response["reason"] = "duplicate_exists"
             if "duplicates" in txn_result:
                 response["duplicates"] = txn_result["duplicates"]
@@ -827,19 +746,11 @@ class SchedulingMixin:
         Args:
             guid: Scheduled transaction GUID.
             enabled: Enable or disable.
-            end_date: Set end date (YYYY-MM-DD), or empty string
-                (``""``) to clear an existing end date back to None.
-                The empty-string sentinel is unusual — Python's
-                idiomatic ``None`` would mean "no change" here, so
-                we needed a second sentinel for "clear it." MCP
-                tool schemas don't easily express tagged unions or
-                three-state strings, so the empty-string convention
-                is the path of least friction. Pass ``"YYYY-MM-DD"``
-                to set, ``""`` to clear, omit / pass ``None`` to
-                leave unchanged.
-
-        Returns:
-            Dict with updated scheduled transaction details.
+            end_date: ``"YYYY-MM-DD"`` to set, ``""`` to clear,
+                ``None`` (default) to leave unchanged. The
+                empty-string sentinel exists because ``None``
+                already means "no change" and MCP schemas don't
+                express three-state strings cleanly.
 
         Raises:
             ValueError: If not found.
@@ -851,9 +762,8 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
-            # Stage prior state for the audit log so the bookkeeper
-            # can see what changed (enable/disable; end-date set/clear).
-            # Without this, the log only knows the new state.
+            # Audit before-state — without it the log only knows
+            # the new state.
             self._stage_audit_before({
                 "name": sx.name,
                 "enabled": bool(sx.enabled),
@@ -894,10 +804,8 @@ class SchedulingMixin:
                     f"Scheduled transaction not found: {guid}"
                 )
 
-            # Stage SX snapshot for the audit log BEFORE delete so the
-            # bookkeeper can recover the schedule's identity from the
-            # log if the delete was a mistake. _sx_to_dict captures
-            # frequency / start_date / end_date / instance_count.
+            # Snapshot BEFORE delete so a mistaken delete is
+            # recoverable from the audit log.
             try:
                 self._stage_audit_before(self._sx_to_dict(sx))
             except Exception:
@@ -916,9 +824,7 @@ class SchedulingMixin:
                 "status": "deleted",
             }
 
-            # Delete the splits-json slot via SQLAlchemy Core — column /
-            # table renames surface as AttributeError at import, not as
-            # silent runtime failures.
+            # splits-json slot deleted via Core.
             book.session.execute(
                 Slot.__table__.delete().where(
                     (Slot.__table__.c.obj_guid == sx.guid)
@@ -935,12 +841,10 @@ class SchedulingMixin:
             template_acct = sx.template_account
             book.session.delete(sx)
             if template_acct:
-                # Desktop-created SXs store the split recipe as real
-                # Transaction rows posted to the template account;
-                # our splits-json design leaves it empty. Delete the
-                # recipe transactions first — deleting the account
-                # alone would orphan their splits (or fail the FK
-                # check at save).
+                # Desktop SXs store the recipe as real Transactions
+                # on the template account (ours leave it empty).
+                # Delete those first or the account delete orphans
+                # their splits / fails the FK check.
                 recipe_txns = {
                     s.transaction for s in list(template_acct.splits)
                 }
