@@ -426,7 +426,6 @@ def _account_to_dict(account: piecash.Account) -> dict:
     }
 
 
-# Mapping of top-level parent to "obvious" account types that need no annotation
 # Top-level account names paired with their default types — used by
 # ``_account_to_compact_line`` to suppress ``[TYPE]`` annotations
 # when the type is implied by the conventional GnuCash hierarchy
@@ -438,9 +437,8 @@ def _account_to_dict(account: piecash.Account) -> dict:
 # created with non-English chart-of-accounts templates ("Activos",
 # "Activités", "資産", etc.) won't match — every account in those
 # books gets the redundant ``[ASSET]`` annotation. Acceptable for
-# now (the bookkeeper's testing covers the English-default case);
-# a future localization pass would add lookup-by-account-type
-# instead of by-name.
+# English-default books; a localization pass would add
+# lookup-by-account-type instead of by-name.
 _DEFAULT_TYPES = {
     "Assets": {"ASSET"},
     "Liabilities": {"LIABILITY"},

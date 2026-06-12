@@ -32,16 +32,15 @@ from gnucash_mcp._format import _format_number
 # Account-type groups used across the reports. Defined at module level
 # so the SQL IN() clauses share a single canonical definition rather
 # than drifting across methods.
-# Type sets for balance_sheet / net_worth bucketing.
 #
 # RECEIVABLE and PAYABLE belong here despite GnuCash treating them
 # as their own first-class account types. Accounting-wise, A/R is
 # an asset (someone owes us money) and A/P is a liability (we owe
 # someone money); both flow through the balance sheet's totals and
 # the canonical "net worth = total assets − total liabilities"
-# identity. Pre-v1.3.0 these were excluded — invoices issued to
-# customers were invisible on balance_sheet, breaking A = L + E by
-# the outstanding-invoice amount.
+# identity. Excluding them makes invoices issued to customers
+# invisible on balance_sheet, breaking A = L + E by the
+# outstanding-invoice amount.
 _ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
 _LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
@@ -719,12 +718,12 @@ class ReportingMixin:
                 return rows
 
             # as_of_date is also an input echo, but it's cheap and
-            # useful when a log is reviewed out of context. `balanced`
-            # ``balanced`` is derivable (assets == liabilities + equity)
-            # and was dropped in an earlier audit pass. Rollup totals
-            # flow through ``_format_number`` (2 decimals, currency
-            # style) so the response no longer leaks Decimal precision
-            # noise like ``"612011.489832"``.
+            # useful when a log is reviewed out of context. A
+            # ``balanced`` field would be derivable (assets ==
+            # liabilities + equity) and is deliberately omitted.
+            # Rollup totals flow through ``_format_number`` (2
+            # decimals, currency style) so the response doesn't leak
+            # Decimal precision noise like ``"612011.489832"``.
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {

@@ -21,14 +21,14 @@ Single source of truth for:
   some date?" — :meth:`CurrencyMixin._find_exchange_rate`.
 
 All helpers skip piecash's auto-created ``type='transaction'`` price
-placeholders via :func:`gnucash_mcp.book._base._is_market_price` —
-those rows capture the effective rate of one specific cross-currency
-transaction and would shadow real user-supplied market quotes.
+placeholders via :func:`_is_market_price` (defined below; re-exported
+through ``book._base``) — those rows capture the effective rate of one
+specific cross-currency transaction and would shadow real user-supplied
+market quotes.
 
-The indexed query primitive :meth:`CurrencyMixin._find_prices` is
-provided here for future call-site migration; the rate-collecting
-helpers above still walk ``book.prices`` directly today (the v1.3
-performance sweep replaces those walks).
+The indexed query primitive :meth:`CurrencyMixin._find_prices` pushes
+the commodity/currency filters into SQL; the rate-collecting helpers
+above still walk ``book.prices`` directly.
 """
 
 import os

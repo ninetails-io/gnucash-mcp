@@ -2873,14 +2873,15 @@ class BusinessMixin:
     #
     # A multi-entry taxtable (e.g., GST 5% + PST 7%) produces N tax
     # splits per line at posting time, one per entry to its own
-    # account — see commit 3's posting math. This commit is pure
-    # data CRUD; the wire-up into entries (commit 4) and into
-    # ``_get_invoice_entries_and_total`` (commit 3) happens later.
+    # account — ``_compute_entry_tax`` and
+    # ``_get_invoice_entries_and_total`` carry the posting math;
+    # ``_add_entry`` wires entries to taxtables.
     #
     # **Refcount discipline.** GnuCash desktop maintains
     # ``Taxtable.refcount`` as the number of entries referencing the
     # taxtable. piecash does not auto-maintain it; we manage it
-    # manually on entry create/delete in commit 4. For lifecycle
+    # manually on entry create/delete (``_add_entry`` /
+    # ``_delete_invoice_or_bill``). For lifecycle
     # checks here (delete guard, update warning), we use
     # ``_compute_taxtable_refcount`` — an indexed SQL count over the
     # ``entries`` table, authoritative regardless of the stored

@@ -1869,8 +1869,8 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     # entity_type swap (the lifecycle tools register as
     # ``entity_type="invoice"`` and the audit-decorator's
     # polymorphism handler rewrites it when the response type
-    # is "credit_note"). APPLY is the netting tool added
-    # alongside this commit.
+    # is "credit_note"). APPLY is the netting operation
+    # (``apply_credit_note``).
     ("credit_note", "CREATE"): _fmt_credit_note_create,
     ("credit_note", "DELETE"): _fmt_credit_note_delete,
     ("credit_note", "POST"): _fmt_credit_note_post,
@@ -2045,7 +2045,7 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
 
     Args:
         result: JSON string returned by tool
-        entity_type: "transaction", "account", or "split"
+        entity_type: Audit entity type (e.g. "transaction", "invoice")
 
     Returns:
         State dict with guid, or None.
@@ -2080,9 +2080,11 @@ def audit_log(
 
     Args:
         classification: "read" or "write"
-        operation: For writes: "create", "update", "delete", "void", "unvoid",
-                   "reconcile", "set_state"
-        entity_type: "transaction", "account", or "split"
+        operation: For writes: the operation verb ("create", "update",
+                   "delete", "void", "post", "pay", ...) — uppercased to
+                   match the (entity_type, operation) dispatch table.
+        entity_type: Entity-type key in the audit dispatch table
+                     ("transaction", "account", "invoice", "budget", ...).
     """
 
     def decorator(func: Callable) -> Callable:

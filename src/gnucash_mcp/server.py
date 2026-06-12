@@ -75,10 +75,9 @@ SAFETY: Reconciled splits are protected (use force=true to override). Prefer voi
 # MODULE_GROUPS — composition aliases that expand to one or more modules.
 #
 # Lets ``--modules=core`` (or any group name) expand to a set of underlying
-# module keys. Today the dict is empty — no behavior change vs. the
-# pre-restructure baseline. Populated in subsequent commits as the
-# role-aligned partition (Core / Personal / Portfolio / Investor /
-# Freelancer / Business) takes shape.
+# module keys. The groups define the role-aligned partition: ``core``
+# (always-on ledger primitives), ``bookkeeper``, ``investor``, and
+# ``business``.
 #
 # Expansion is single-pass (groups don't reference other groups). The
 # partition is deliberately flat; if nesting becomes useful later we'll
@@ -204,7 +203,7 @@ MODULE_BACKED_BY: dict[str, set[str]] = {
 TOOL_MODULES: dict[str, list[str]] = {
     # ── Core ledger sub-modules (composed via MODULE_GROUPS["core"]) ──
     # Each is independently selectable via --modules but normally all
-    # eight are loaded together because the ``core`` group alias is
+    # nine are loaded together because the ``core`` group alias is
     # always force-added.
     "summary": [
         "get_book_summary",
@@ -960,13 +959,11 @@ Logs are stored alongside the book file:
     # import), leave the existing instance alone; otherwise subsequent
     # get_book() calls will use this class.
     global _book_class
-    # Expand each loaded module to its backing mixin set. With the
-    # Core restructure (void/unvoid + admin tools + backups migrated
-    # into Core), the mixin layer still owns those methods in their
-    # original files — Core needs CoreMixin + ReconciliationMixin +
-    # AdminMixin + BackupMixin composed together to back its 26
-    # tools. ``MODULE_BACKED_BY`` provides the mapping; modules not
-    # listed there default to 1:1 (the legacy convention).
+    # Expand each loaded module to its backing mixin set. The mixin
+    # layer owns Core's methods in their original files — Core needs
+    # CoreMixin + ReconciliationMixin + AdminMixin + BackupMixin
+    # composed together to back its tools. ``MODULE_BACKED_BY``
+    # provides the mapping; modules not listed there default to 1:1.
     backing_mixins: set[str] = set()
     for mod_name in loaded_modules:
         backing_mixins.update(

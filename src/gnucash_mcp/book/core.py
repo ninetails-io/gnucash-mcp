@@ -1667,13 +1667,12 @@ class CoreMixin:
         wrong on any book with foreign-currency income/expense.
         """
         today = date.today()
-        # Single factors map applied uniformly across the 12-month
-        # trajectory. Strictly per-month historical rates would
-        # require the same per-boundary restructure SB-1 calls for
-        # in net_worth's time series; deferred to keep this commit
-        # focused on the dropped-default-as_of fix. Threading
-        # ``today`` here documents the current uniform behavior
-        # rather than hiding it behind the old default.
+        # Single factors map applied uniformly across the window.
+        # Strictly per-month historical rates would require the same
+        # per-boundary restructure net_worth's time series uses; this
+        # summary surface deliberately applies today's rates to every
+        # month. Threading ``today`` here documents the uniform
+        # behavior explicitly.
         factors = self._account_conversion_factors(book, today)
 
         # Build the calendar-month windows, oldest → newest. Plain
