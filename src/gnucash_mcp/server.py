@@ -702,13 +702,31 @@ Options:
 
 Environment variables:
   GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required)
-  GNUCASH_MCP_MODULES        Tool modules to load (e.g., "core,reporting")
+  GNUCASH_MCP_MODULES        Tool modules to load — same values as
+                             --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_LOG_DIR            Override the .mcp storage directory (audit,
+                             debug, backups). Default: {book_path}.mcp
+  GNUCASH_REDACT_PATHS=1     Collapse absolute paths to basenames in tool
+                             responses and error messages (safe to share)
+  GNUCASH_FX_GUARD_DAYS      Refuse a cross-currency invoice/bill post or pay
+                             when the chosen rate is this many days from the
+                             document's own date (default 7; force=true
+                             overrides, up to the staleness cap)
+  GNUCASH_FX_STALENESS_DAYS  Max distance in days a price may sit from the
+                             valuation/as-of date before it is rejected
+                             (default 90; 0 or negative disables the cap)
+  GNUCASH_WRITE_RATE_LIMIT   Write throttle in tokens/sec (token bucket).
+                             Absent or non-positive disables limiting
+  GNUCASH_WRITE_BURST        Token-bucket size for the write throttle
+                             (default 10; applies only when the rate is set)
 
-Logs are stored alongside the book file:
+Logs and backups live under the .mcp directory — beside the book file by
+default, or at GNUCASH_LOG_DIR if set:
   {book_path}.mcp/audit/YYYY-MM-DD.txt
   {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
+  {book_path}.mcp/backups/               (auto + manual snapshots)
 """)
         sys.exit(0)
 

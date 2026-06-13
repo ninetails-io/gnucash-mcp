@@ -5256,11 +5256,10 @@ class BusinessMixin:
             # Normalize to "amount still owed" via effective_is_bill
             # and reject any payment beyond it. Without this guard
             # nothing compares amount to remaining: an overpayment
-            # drives the
-            # lot negative, lot-close (== 0 exactly) never fires, and
-            # downstream abs() calls invert the sign — a customer
-            # who overpaid by $1,000 renders as still OWING $1,000
-            # in the collections list.
+            # drives the lot negative, lot-close (== 0 exactly) never
+            # fires, and downstream abs() calls invert the sign — a
+            # customer who overpaid by $1,000 renders as still OWING
+            # $1,000 in the collections list.
             remaining_before_pay = self._calculate_lot_balance(lot_obj)
             if effective_is_bill:
                 remaining_before_pay = -remaining_before_pay
