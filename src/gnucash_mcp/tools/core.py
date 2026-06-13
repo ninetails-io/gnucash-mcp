@@ -89,23 +89,10 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         date_obj = _parse_iso_date(as_of_date)
-        # Resolve once to capture the canonical fullname for the
-        # response. Echoing the path the caller passed in (or, when
-        # they passed a %short, resolving to the readable form they'd
-        # rather see back) gives a uniform contract: every tool that
-        # echoes an account responds with the canonical full path.
-        #
-        # MP-6: this double-fetch (get_account here + get_balance
-        # below) is a deliberate trade-off. Dropping the get_account
-        # call would shave one indexed query per ``get_balance`` —
-        # cheap on its own — but it would also break the "every
-        # tool echoes canonical paths" contract that
-        # ``TestCanonicalAccountEcho`` locks in PR #56's bookkeeper
-        # work. The contract wins: a caller who passed ``%2e78c86``
-        # gets back ``Assets:Current Assets:Savings`` and instantly
-        # confirms which account they were asking about, with zero
-        # ambiguity if they fat-fingered the prefix. The extra
-        # query is the cost of that disambiguation.
+        # Deliberate double-fetch (get_account + get_balance): the
+        # extra indexed query buys the canonical-fullname echo that
+        # TestCanonicalAccountEcho (tests/test_book.py) locks in —
+        # a %short caller instantly confirms which account answered.
         account_dict = book.get_account(account_name)
         if account_dict is None:
             raise ValueError(f"Account not found: {account_name}")

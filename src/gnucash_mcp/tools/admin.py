@@ -15,11 +15,10 @@ from gnucash_mcp.tools._helpers import _json, safe_tool
 
 # Audit log filenames are exactly ``YYYY-MM-DD.txt``. Validate
 # ``log_date`` against this shape before constructing the path —
-# pre-fix, ``Path(audit_dir) / f"{log_date}.txt"`` would happily
+# unvalidated, ``Path(audit_dir) / f"{log_date}.txt"`` would happily
 # interpolate ``../../../../etc/passwd`` and read arbitrary
 # ``*.txt`` files. Prompt injection through any free-text field
-# that surfaces into the audit log was the attack vector
-# (SB-15 from specs/CODE_REVIEW_v1_3.md).
+# that surfaces into the audit log is the attack vector.
 _LOG_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
@@ -121,19 +120,11 @@ def register(mcp, get_book) -> None:
 
         audit_dir = log_dir / "audit"
         target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
-        # SB-15 path-traversal gate. ``target_date`` is
-        # interpolated into the log path; reject anything that
-        # isn't a literal ``YYYY-MM-DD`` before the join so
-        # ``../../../../etc/passwd`` style inputs can't escape
-        # the audit directory.
-        #
-        # Raise rather than build the JSON envelope inline so
-        # ``safe_tool`` handles the rejection through its standard
-        # path: same JSON shape, plus the boundary-layer logger
-        # warning AND path redaction applied to the error message
-        # (``redact_paths`` in safe_tool's ValueError branch).
-        # Copilot-flagged on PR #97 — inline envelope duplicated
-        # the shape and skipped redaction.
+        # Path-traversal gate: target_date is interpolated into the
+        # log path, so anything that isn't a literal YYYY-MM-DD
+        # rejects before the join. Raise (rather than build the JSON
+        # envelope inline) so safe_tool applies its standard shape,
+        # logging, and path redaction.
         if not _LOG_DATE_RE.fullmatch(target_date):
             raise ValueError(
                 f"Invalid log_date {target_date!r}: must be "
@@ -144,13 +135,9 @@ def register(mcp, get_book) -> None:
         if not log_file.exists():
             return f"No audit log for {target_date}"
 
-        # Cap the size we'll read in one shot. A long-lived
-        # deployment with daily growth could produce multi-MB
-        # files; reading one in full to slice the last ``limit``
-        # blocks is wasteful (and on truly huge files would chew
-        # memory). 2 MB covers ~10k typical audit entries — well
-        # past any reasonable ``limit`` request. Files larger
-        # than the cap get tail-only treatment.
+        # Read cap: 2 MB covers ~10k audit entries — well past any
+        # reasonable limit request; larger files get tail-only
+        # treatment instead of a full in-memory read.
         _AUDIT_READ_CAP_BYTES = 2 * 1024 * 1024
         try:
             file_size = log_file.stat().st_size

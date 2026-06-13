@@ -13,8 +13,8 @@ from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported f
 # GnuCash's KVP store rather than flat keys. The MCP-facing
 # account-slot tools only manage flat keys (``apr``,
 # ``credit_limit``, ``minimum_payment``, etc.), so we restrict
-# user input to a safe alphabet up-front. Pre-fix a key like
-# ``credit/limit`` silently created a sub-slot under ``credit`` —
+# user input to a safe alphabet up-front. A key like
+# ``credit/limit`` would silently create a sub-slot under ``credit`` —
 # invisible to ``get_account_slots`` keyed lookups.
 #
 # Note: internal slot keys (set by our own book methods, not
@@ -29,8 +29,7 @@ _SLOT_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 # statement-close-day, structured JSON config blobs) — well past
 # what real bookkeeping needs but short enough that a malicious
 # or runaway caller can't exhaust the book file with a single
-# slot write. Pre-fix slot values were unbounded; HP-9 from
-# specs/CODE_REVIEW_v1_3.md.
+# slot write.
 _SLOT_VALUE_MAX_BYTES = 64 * 1024
 
 
@@ -106,7 +105,7 @@ class AdminMixin:
                 f"Embedded '/' would create hierarchical sub-slots; "
                 f"use flat keys."
             )
-        # HP-9 length cap. Encode to UTF-8 to count bytes (so a
+        # Length cap. Encode to UTF-8 to count bytes (so a
         # multi-byte unicode payload can't sneak past a char-count
         # check). 64 KiB is generous for any real per-account
         # metadata. Compute the byte length once; reusing
@@ -152,11 +151,11 @@ class AdminMixin:
             ValueError: If account not found, key contains disallowed
                 characters, or key not found.
         """
-        # Same regex gate as ``set_account_slot``. Pre-fix delete
-        # skipped the validator, so a user could target internal
-        # namespaced slots (``gnc-mcp/applies-to-invoice``, etc.)
-        # that the credit-note linkage and other internal features
-        # depend on. HP-11 from specs/CODE_REVIEW_v1_3.md.
+        # Same regex gate as ``set_account_slot``. Without it,
+        # delete could target internal namespaced slots
+        # (``gnc-mcp/applies-to-invoice``, etc.) that the
+        # credit-note linkage and other internal features
+        # depend on.
         if not _SLOT_KEY_RE.fullmatch(key):
             raise ValueError(
                 f"Invalid slot key {key!r}: must match [A-Za-z0-9_.-]+. "

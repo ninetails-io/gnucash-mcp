@@ -53,15 +53,9 @@ def _slot_value_str(value) -> str:
 
     piecash returns either a typed wrapper with a ``.value``
     attribute (``SlotString``, ``SlotInt64``, etc.) or the raw
-    value depending on slot type. Centralizing the access keeps
-    every caller agreeing on the same extraction.
-
-    Hoisted to ``_base`` from ``admin`` in v1.3 — the credit-note
-    slot helpers in ``BusinessMixin`` need the same access pattern,
-    and a sideways import from ``business`` into ``admin`` would
-    add a coupling that doesn't reflect the dependency direction
-    (admin is the slot-tool mixin; business is also a slot
-    consumer; both should pull a shared utility from ``_base``).
+    value depending on slot type. Lives in ``_base`` because both
+    AdminMixin and BusinessMixin consume slots, and a sideways
+    import between them wouldn't reflect the dependency direction.
     """
     if hasattr(value, "value"):
         return str(value.value)
@@ -71,36 +65,16 @@ def _slot_value_str(value) -> str:
 def _is_voided(split) -> bool:
     """True iff ``split`` carries GnuCash's voided marker.
 
-    GnuCash's void operation preserves the split for audit trail
-    purposes: ``reconcile_state`` is set to ``"v"`` and both
-    ``value`` and ``quantity`` are zeroed. Code that iterates
-    splits to compute balances, surface unreconciled counts, or
-    validate lot positions must filter voided splits out — they
-    are zombies, not part of the user's active ledger.
+    GnuCash's void preserves the split for audit trail —
+    ``reconcile_state="v"``, value/quantity zeroed. Balance sums,
+    unreconciled counts, and lot validation must filter these
+    zombies out; this predicate is the single source of truth
+    (ad-hoc per-site checks drift).
 
-    Single source of truth for "is this split voided." Pre-v1.3
-    release five iteration sites disagreed:
-
-    - ``get_unreconciled_splits`` used ``state != "y"`` (admitting
-      voided as "unreconciled")
-    - ``get_book_summary``'s reconciliation backlog count: same bug
-    - ``set_reconcile_state`` had no state guard (could move a
-      voided split to ``"y"``, defeating ``unvoid_transaction``)
-    - ``assign_split_to_lot`` had no state guard (let voided
-      splits attach to lots)
-    - ``_lot_decimals`` had no explicit filter (worked by
-      coincidence because voided splits contribute 0 either side
-      of its branch, but didn't document the intent or guard
-      against the corruption case)
-
-    Routing every site through this predicate enforces the
-    convention exactly once. The check is intentionally state-only;
-    if a split has ``state == "v"`` but ``value != 0`` (data
-    corruption from a partially-applied void) this still returns
-    True and callers treat it as voided. The inverse — ``value ==
-    0`` with ``state != "v"`` — is treated as not voided (legitimate
-    zero-value splits exist, e.g. informational splits a user adds
-    by hand to a transaction).
+    Intentionally state-only, covering both corruption directions:
+    ``state="v"`` with non-zero values (partial void) still reads
+    as voided; ``value=0`` with another state is NOT voided
+    (legitimate zero-value splits exist).
     """
     return split.reconcile_state == "v"
 
@@ -108,52 +82,28 @@ def _is_voided(split) -> bool:
 def _is_unreconciled(split) -> bool:
     """True iff ``split`` counts as pending reconciliation work.
 
-    Single source of truth for "is this split unreconciled" — the
-    same predicate ``get_unreconciled_splits`` (the detail tool)
-    and ``_account_reconciliation_status`` (the dashboard count)
-    both consult. Routing both sites through this helper enforces
-    HP-8's convergence structurally instead of by docstring promise.
+    The shared predicate behind ``get_unreconciled_splits`` (detail
+    tool) and ``_account_reconciliation_status`` (dashboard count)
+    — chokepointed so the two surfaces agree by construction.
 
-    ``state == "n"`` (new) and ``state == "c"`` (cleared) both
-    count — cleared splits are not finalized; they're the
-    bookkeeper's tentative state before a final ``"y"`` mark.
-    ``state == "y"`` (reconciled) and voided zombies are excluded.
+    ``"n"`` (new) and ``"c"`` (cleared) both count — cleared is the
+    bookkeeper's tentative state before a final ``"y"``. Reconciled
+    and voided splits are excluded.
 
-    Pre-HP-8 the dashboard count and the detail tool disagreed on
-    pre-``latest_y_date`` unreconciled splits (the dashboard scoped
-    its count to splits AFTER the most recent ``y``; the detail
-    tool returned all non-y). The fix landed at both sites by
-    hand-aligning the predicate; this helper chokepoints it so a
-    future change can't recreate HP-8 in a new shape.
-
-    Scope: this is the **as-of-today** predicate. The dashboard
-    surface (``_account_reconciliation_status`` →
-    ``get_book_summary``) is the morning-check view and
-    intentionally has no historical-tie-out parameter. The detail
-    tool (``get_unreconciled_splits``) accepts a separate
-    ``as_of_date`` arg that filters out post-``as_of`` splits — a
-    different scoping concern layered ON TOP of this predicate, not
-    a reason to thread date into the chokepoint. Counts at the two
-    surfaces agree by construction when ``as_of_date`` is unset;
-    they're expected to diverge when it's used, and that's the
-    detail tool's contract — the morning-check view doesn't reach
-    into history.
+    Scope: this is the **as-of-today** predicate. The detail tool's
+    ``as_of_date`` filter is a separate scoping concern layered on
+    top, not a reason to thread a date into the chokepoint; the
+    dashboard intentionally has no historical-tie-out parameter.
     """
     return split.reconcile_state != "y" and not _is_voided(split)
 
 
 def _looks_like_guid_ref(value) -> bool:
     """True iff ``value`` is a string worth resolving via
-    ``_resolve_account`` — short GUID (``%xxxxxxx``) or 32-char
-    hex full GUID.
-
-    Path strings are already canonical and skip the resolve;
-    non-strings and empty strings short-circuit to False.
-
-    Lives at module level so callers outside BaseGnuCashBook
-    (audit log, dashboard echoes, future display surfaces) can
-    cheaply check whether a value is worth a book lookup before
-    opening a session.
+    ``_resolve_account`` — short GUID (``%xxxxxxx``) or 32-char hex
+    full GUID. Paths are already canonical and skip the resolve.
+    Module-level so display surfaces can check before opening a
+    session.
     """
     if not isinstance(value, str) or not value:
         return False
@@ -171,23 +121,14 @@ def _looks_like_guid_ref(value) -> bool:
 def _to_decimal(value) -> Decimal:
     """Safe Decimal construction for user-supplied monetary values.
 
-    Routes through ``Decimal(str(value))`` so a ``float`` that slipped
-    past the pydantic boundary (e.g. because the MCP client sent a bare
-    JSON number instead of the advertised string) decimalizes via
-    Python's shortest-repr algorithm — `str(94.87) == "94.87"` —
-    instead of directly via ``Decimal(float)``, which would embed the
-    IEEE-754 epsilon (`0.8699999999999999955591...`) in the result and
-    break the sum-to-zero balance check.
+    Routes through ``Decimal(str(value))`` so a float that slipped
+    past the pydantic boundary decimalizes via shortest-repr
+    (``str(94.87) == "94.87"``) instead of embedding the IEEE-754
+    epsilon and breaking the sum-to-zero check. Exact inputs
+    (str/int/Decimal) round-trip unchanged.
 
-    Exact-decimal inputs (``str``, ``int``, ``Decimal``) round-trip
-    unchanged; only ``float`` is rescued.
-
-    Use everywhere a user-supplied monetary value hits ``Decimal(...)``.
-    This is belt-and-suspenders against the boundary contract: even
-    when the pydantic schema enforces ``str`` at the tool layer,
-    direct callers (tests, scripts) bypass that coercion, and the
-    book methods themselves should never corrupt storage if someone
-    hands them a float.
+    Use everywhere user-supplied money hits ``Decimal(...)`` —
+    direct callers (tests, scripts) bypass the pydantic coercion.
     """
     if isinstance(value, Decimal):
         return value
@@ -251,11 +192,9 @@ def _verify_delete(
     Raises RuntimeError if matching rows still exist.
 
     Shape-matches ``_verify_composite_write``: the ``table`` argument
-    is a SQLAlchemy Core Table (``Entity.__table__``). The previous
-    signature hardcoded ``FROM slots`` via raw SQL, which kept this
-    helper scoped to slot deletes; generalizing to any table lets us
-    pair deletes-with-verification for Entry / Invoice / Customer /
-    Vendor cleanup too.
+    is a SQLAlchemy Core Table (``Entity.__table__``), so the helper
+    pairs deletes-with-verification for any table — slots, Entry,
+    Invoice, Customer, and Vendor cleanup alike.
     """
     from sqlalchemy import select, func, and_
 
@@ -277,23 +216,16 @@ def _verify_delete(
 
 # ── GUID prefix protection ────────────────────────────────────────
 #
-# Every compact-output formatter emits a GUID prefix the LLM can later
-# feed back to a tool that accepts GUIDs (via _resolve_guid). The old
-# blanket `guid[:8]` truncation is unsafe at scale: the birthday problem
-# puts the collision rate at ~1-2% by ~10,000 entries and rises fast
-# from there. A colliding prefix emitted in one response would fail the
-# ambiguity check the next time the LLM references it.
+# Compact formatters emit GUID prefixes the LLM feeds back through
+# _resolve_guid. Blanket `guid[:8]` truncation is unsafe at scale —
+# the birthday problem puts collisions at ~1-2% by ~10k entries, and
+# a colliding prefix fails the ambiguity check on the next reference.
+# _guid_prefix_map gives each GUID its shortest unique prefix (≥ 8;
+# only collisions extend further).
 #
-# _guid_prefix_map computes, for a set of GUIDs, each one's shortest
-# prefix (≥ 8 chars) that is unique within the set. Most GUIDs still
-# get 8; only collisions push out to 9, 10, etc. Theoretically to 32
-# if two GUIDs were identical (impossible for uuid4).
-#
-# Callers should pass the full relevant table (e.g., all transaction
-# GUIDs when formatting transaction lines), not just the filtered
-# batch — prefixes emitted to the LLM must be globally unambiguous
-# against _resolve_guid's table-wide LIKE search, not just unique
-# within the current response.
+# Callers must pass the FULL relevant table, not the filtered batch —
+# emitted prefixes must be unambiguous against _resolve_guid's
+# table-wide LIKE search, not just within the current response.
 
 
 def _lcp_length(a: str, b: str) -> int:
@@ -308,26 +240,13 @@ def _lcp_length(a: str, b: str) -> int:
 def _guid_prefix_map(
     guids: Iterable[str], min_len: int = 8
 ) -> dict[str, str]:
-    """Map each GUID to its shortest prefix that is unique within the set.
+    """Map each GUID to its shortest prefix (>= ``min_len``) that is
+    unique within the set; colliding GUIDs extend until they diverge.
 
-    The returned prefix is at least `min_len` characters long. When two
-    GUIDs share a prefix of length >= min_len, both get extended until
-    they diverge. Duplicate inputs map to the same prefix (the full GUID).
-
-    Algorithm: one sort + one linear pass. For each GUID, the minimum
-    unique prefix length equals max(LCP-with-left-neighbor,
-    LCP-with-right-neighbor) + 1, clamped to [min_len, len(guid)].
-    O(N log N) in the size of the input.
-
-    Args:
-        guids: Iterable of full GUID strings (typically all GUIDs from
-               one table — e.g., `[t.guid for t in book.transactions]`).
-        min_len: Minimum prefix length. Default 8, matching
-                 `_resolve_guid`'s minimum acceptable input length.
-
-    Returns:
-        Dict mapping each input GUID to a unique prefix of length
-        >= min_len. Input order is not preserved.
+    One sort + one linear pass: the minimum unique prefix length is
+    max(LCP with either sorted neighbor) + 1, clamped to
+    [min_len, len(guid)]. ``min_len`` defaults to 8, matching
+    ``_resolve_guid``'s minimum input length.
     """
     unique_guids = sorted(set(guids))
     result: dict[str, str] = {}
@@ -348,29 +267,13 @@ def _guid_prefix_map(
 def _unique_prefix(
     guid: str, siblings: Iterable[str], min_len: int = 8
 ) -> str:
-    """Shortest prefix of `guid` unique among `siblings`, min `min_len` chars.
+    """Shortest prefix of ``guid`` unique among ``siblings``
+    (>= ``min_len`` chars, lowercase).
 
-    Single-GUID counterpart to `_guid_prefix_map` — optimized for the
-    write-tool-response case where we only need one prefix, not a full
-    table map. Callers pass the target guid plus an iterable of the
-    relevant table's other guids (e.g., every transaction guid in the
-    book when returning a transaction write response).
-
-    Fast path: if no sibling shares the `min_len` prefix, return that
-    `min_len`-char slice directly — no LCP math needed. Only when the
-    birthday problem actually bites (rare under ~10k entries, common at
-    scale) do we extend.
-
-    Args:
-        guid: Full GUID to shorten.
-        siblings: Iterable of every other GUID in the same table. Safe
-                  to include `guid` itself (it is filtered out).
-        min_len: Minimum prefix length. Default 8, matching
-                 `_resolve_guid`'s minimum acceptable input length.
-
-    Returns:
-        Lowercase prefix of `guid`, length >= `min_len`, guaranteed
-        unique against `siblings` under `_resolve_guid`'s LIKE match.
+    Single-GUID counterpart to ``_guid_prefix_map`` for write-tool
+    responses — pass the relevant table's other GUIDs as
+    ``siblings`` (safe to include ``guid`` itself; it's filtered).
+    Fast path returns the ``min_len`` slice when nothing shares it.
     """
     guid_lower = guid.lower()
     min_prefix = guid_lower[:min_len]
@@ -426,21 +329,15 @@ def _account_to_dict(account: piecash.Account) -> dict:
     }
 
 
-# Mapping of top-level parent to "obvious" account types that need no annotation
-# Top-level account names paired with their default types — used by
+# Default type per conventional top-level name — used by
 # ``_account_to_compact_line`` to suppress ``[TYPE]`` annotations
-# when the type is implied by the conventional GnuCash hierarchy
-# (``Assets:Checking [ASSET]`` reads as redundant noise; the
-# annotation only fires when the type DEPARTS from the convention,
-# e.g. ``Assets:Old Loan [LIABILITY]``).
+# except where the type departs from convention
+# (``Assets:Old Loan [LIABILITY]``).
 #
-# **Localization note:** keys are GnuCash's English defaults. Books
-# created with non-English chart-of-accounts templates ("Activos",
-# "Activités", "資産", etc.) won't match — every account in those
-# books gets the redundant ``[ASSET]`` annotation. Acceptable for
-# now (the bookkeeper's testing covers the English-default case);
-# a future localization pass would add lookup-by-account-type
-# instead of by-name.
+# Localization: keys are GnuCash's English defaults; non-English
+# charts ("Activos", "資産") don't match and get the redundant
+# annotation everywhere. Acceptable until a localization pass keys
+# by account type instead.
 _DEFAULT_TYPES = {
     "Assets": {"ASSET"},
     "Liabilities": {"LIABILITY"},
@@ -485,15 +382,9 @@ def _split_to_dict(
 ) -> dict:
     """Convert a piecash Split to a full serializable dict.
 
-    When ``split_prefixes`` / ``lot_prefixes`` are provided, the
-    emitted ``guid`` and ``lot_guid`` fields are truncated to
-    collision-safe short forms (typically 8 chars) via lookup in
-    the prefix maps. When omitted, falls back to full 32-char
-    GUIDs — preserved for any caller that hasn't migrated to the
-    prefix-aware path. v1.3.1 bookkeeper feedback drove the
-    prefix path on read tools (get_transaction, verbose
-    list_transactions) where the full GUIDs were dead-weight
-    tokens the LLM never used.
+    With ``split_prefixes`` / ``lot_prefixes``, the emitted ``guid``
+    and ``lot_guid`` are collision-safe short forms; omitted, full
+    32-char GUIDs (back-compat for unmigrated callers).
     """
     rec_date = split.reconcile_date
     if rec_date and rec_date.year <= 1970:
@@ -523,28 +414,14 @@ def _split_to_dict(
 
 
 def _split_to_compact_dict(split: piecash.Split) -> dict:
-    """Tight serialization of a Split for history / audit contexts.
+    """Tight serialization of a Split for history / audit contexts
+    (~40-60 chars vs ~140 for the full dict).
 
-    Emits only what's useful to an LLM reading a splits-before list:
-
-    - ``account`` — what was it categorized as
-    - ``value`` — how much (in transaction currency)
-    - ``quantity`` — only when it differs from value (cross-currency)
-    - ``memo`` — only when non-empty
-    - ``reconcile_state`` — only when non-default (not ``'n'``)
-
-    Omits:
-
-    - ``guid`` — the splits being described are replaced / gone, so
-      the LLM can't act on their GUIDs anyway
-    - ``reconcile_date`` — rarely meaningful on its own
-    - ``lot_guid`` — domain-specific; ``previous_splits`` callers today
-      don't use it
-
-    Compatible with ``_format_splits_text`` in the audit log formatter
-    (that helper reads ``account`` and ``value`` / ``amount``).
-
-    Per-split payload: ~40-60 chars vs. ~140 for the full dict.
+    Emits ``account`` and ``value`` always; ``quantity`` only when
+    cross-currency, ``memo`` / ``reconcile_state`` only when
+    non-default. Omits ``guid`` (the described splits are gone —
+    unaddressable), ``reconcile_date``, and ``lot_guid``. Compatible
+    with the audit formatter's ``_format_splits_text``.
     """
     result = {
         "account": split.account.fullname,
@@ -567,15 +444,9 @@ def _transaction_to_dict(
 ) -> dict:
     """Convert a piecash Transaction to a serializable dict.
 
-    When the three prefix maps are provided (typically by callers
-    that have access to the BaseGnuCashBook cached prefix
-    helpers), the emitted ``guid`` field on the transaction and
-    on each nested split is truncated to its collision-safe short
-    form. When omitted, full 32-char GUIDs are emitted — a back-
-    compat fallback for any caller that hasn't been migrated.
-
-    All three maps come from the same book-mtime-keyed cache, so
-    repeated calls against an unchanged book skip the rebuild.
+    With the prefix maps (from the BaseGnuCashBook mtime-keyed
+    caches), emitted transaction and split GUIDs are collision-safe
+    short forms; omitted, full GUIDs (back-compat).
     """
     txn_guid = (
         txn_prefixes.get(transaction.guid, transaction.guid)
@@ -584,7 +455,7 @@ def _transaction_to_dict(
     )
     result = {
         "guid": txn_guid,
-        # Null post_date is a legal old-book artifact (A9); render
+        # Null post_date is a legal old-book artifact; render
         # as None rather than crashing the whole listing.
         "date": (
             transaction.post_date.isoformat()
@@ -684,15 +555,11 @@ def _format_splits_collapsed(
 ) -> str:
     """Render a split list, collapsing long tails.
 
-    <= ``_SPLIT_COLLAPSE_THRESHOLD`` splits render in full, original
-    iteration order. Longer lists sort by ``|value|`` (transaction
-    currency — consistent across cross-currency splits) and render the
-    top ``_SPLIT_COLLAPSE_KEEP`` followed by ``+N more``.
-
-    Sorting by ``|value|`` rather than ``|quantity|`` avoids the cross-
-    currency pitfall where "10 shares" would outrank "$1250 cash" just
-    because 10 > 1250 in share magnitude is false but the reverse comparison
-    between incommensurable units still leads to misleading orderings.
+    <= ``_SPLIT_COLLAPSE_THRESHOLD`` splits render in full; longer
+    lists render the top ``_SPLIT_COLLAPSE_KEEP`` by ``|value|``
+    plus ``+N more``. Ranking by ``|value|`` (transaction currency),
+    not ``|quantity|`` — quantities across commodities are
+    incommensurable and produce misleading orderings.
     """
     if len(splits) <= _SPLIT_COLLAPSE_THRESHOLD:
         return ", ".join(_format_one_split(s, transaction) for s in splits)
@@ -711,45 +578,26 @@ def _transaction_to_compact_line(
 ) -> str:
     """Convert a piecash Transaction to a compact tab-separated line.
 
-    Two output shapes, one per calling use case:
+    Two output shapes:
 
-    - **Unfiltered** (``focus_account is None`` — e.g. ``search_transactions``)::
+    - **Unfiltered** (``focus_account is None``)::
 
-          YYYY-MM-DD<TAB>guid<TAB>Description<TAB>Account amount, Account amount[, ...][, +N more]
+          YYYY-MM-DD<TAB>guid<TAB>Description<TAB>Account amount[, ...][, +N more]
 
-    - **Register** (``focus_account`` set — ``list_transactions(account=X)``)::
+    - **Register** (``focus_account`` set)::
 
           YYYY-MM-DD<TAB>guid<TAB>±Amount<TAB>Description<TAB>Other splits[, +N more]
 
-      The register form is the "checking register" view: column 3 is
-      the signed impact on the filtered account (what a reconciler
-      actually reads), and the filtered account's own name is dropped
-      from the split list because the caller supplied it. Column 4 is
-      always the description.
+      The checking-register view: column 3 is the signed impact on
+      the filtered account (what a reconciler reads), whose own
+      splits are summed into it and dropped from the split list.
 
-    Both shapes collapse the split list when it has more than
-    ``_SPLIT_COLLAPSE_THRESHOLD`` items, emitting the top
-    ``_SPLIT_COLLAPSE_KEEP`` by ``|value|`` followed by ``+N more``.
-    The full breakdown is always available via ``get_transaction(guid)``.
-
-    History note: earlier prereleases of this server used an
-    ``exclude_account`` variant of this function that stripped the
-    filtered split silently, which made the filtered output look like
-    it was missing the description (when really the description had
-    shifted into a column the reader was parsing as splits). Register
-    form fixes that ambiguity structurally and makes the filtered
-    account's amount first-class — the field readers care about most.
-
-    Args:
-        transaction: piecash Transaction object.
-        focus_account: If set, render register form filtered by this
-            account's full path. All splits matching this path are
-            summed into column 3 and dropped from the splits column.
-        prefixes: Optional map from full transaction GUID to
-            collision-safe prefix (built via ``_guid_prefix_map``).
-            Defaults to raw 8-char truncation when absent.
+    Both shapes collapse long split lists via
+    ``_format_splits_collapsed``; the full breakdown is always one
+    ``get_transaction(guid)`` away. ``prefixes`` defaults to raw
+    8-char truncation when absent.
     """
-    # Null post_date is a legal old-book artifact (A9).
+    # Null post_date is a legal old-book artifact.
     date_str = (
         transaction.post_date.isoformat()
         if transaction.post_date else "(no date)"
@@ -855,35 +703,21 @@ def _upcoming_to_compact_line(
 class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     """Thread-safe wrapper for piecash book operations.
 
-    Holds the universal helpers used by every mixin. Module-specific
-    mixins (AdminMixin, ReportingMixin, etc.) are combined with this
-    base via `build_book_class` in gnucash_mcp.book.__init__.
+    Holds the universal helpers used by every mixin; module-specific
+    mixins combine with this base via ``build_book_class``.
 
-    Inherits from :class:`CurrencyMixin` (cross-commodity helpers:
-    ``_rates_as_of``, ``_account_conversion_factors``,
-    ``_split_in_default_currency``, ``_market_value``,
-    ``_find_exchange_rate``) and :class:`QueryMixin` (the indexed
-    SQL split query, ``_query_filtered_splits``). Both are
-    composed unconditionally because they're cross-cutting
-    infrastructure, not module features — they're needed by
-    multiple mixins regardless of which ``--modules`` are enabled.
+    Inherits :class:`CurrencyMixin` (cross-commodity helpers) and
+    :class:`QueryMixin` (indexed SQL split query) unconditionally —
+    they're cross-cutting infrastructure needed regardless of which
+    ``--modules`` are enabled.
     """
 
-    # Tables that support GUID resolution. Each entry maps table
-    # name → its prefix-lookup SQL. The dispatch dict eliminates
-    # the f-string interpolation in ``_resolve_guid`` — pre-fix
-    # the query was built as ``f"SELECT guid FROM {table} ..."``,
-    # safe via the ``_GUID_TABLES`` allowlist but a fragile pattern
-    # if a future contributor added a table without re-validating.
-    # Storing the full statement per-table makes the validation
-    # implicit (no entry → no lookup) and gives each table room to
-    # diverge if its schema warrants it.
-    #
-    # Coverage extended to ``prices`` and ``entries`` (both have
-    # ``guid`` columns and may surface as short prefixes from any
-    # tool that emits them). ``slots`` is intentionally absent —
-    # slots have no primary GUID; they're keyed by ``obj_guid``
-    # (the parent entity) plus name.
+    # Tables that support GUID resolution, each with its full
+    # prefix-lookup SQL — no f-string table interpolation in
+    # ``_resolve_guid`` (safe under an allowlist, fragile when a
+    # future table skips re-validation; no entry → no lookup).
+    # ``slots`` is intentionally absent: slots have no primary GUID,
+    # only ``obj_guid`` + name.
     _GUID_TABLE_QUERIES: dict[str, str] = {
         "transactions": "SELECT guid FROM transactions WHERE guid LIKE ?",
         "splits": "SELECT guid FROM splits WHERE guid LIKE ?",
@@ -909,13 +743,10 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         Raises:
             FileNotFoundError: If the book path doesn't exist.
         """
-        # Resolve to an absolute path with ``..`` segments collapsed.
-        # The audit / debug / backups directories are derived from
-        # ``book_path.parent``; without resolution a path containing
-        # ``..`` would write logs and snapshots outside the
-        # bookkeeper's intended directory. ``Path.resolve(strict=True)``
-        # raises FileNotFoundError if the path doesn't exist, which
-        # subsumes the explicit existence check below.
+        # Resolve to an absolute path: audit/debug/backup dirs derive
+        # from book_path.parent, and an unresolved ``..`` would write
+        # them outside the intended directory. resolve(strict=True)
+        # also covers the existence check.
         try:
             self.book_path = Path(book_path).resolve(strict=True)
         except FileNotFoundError:
@@ -924,26 +755,14 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             raise FileNotFoundError(
                 f"GnuCash book path is not a regular file: {book_path}"
             )
-        # Thread-local staging buffer for audit-log before_state.
-        # Write book methods call `_stage_audit_before(...)` while their
-        # session is open; `@audit_log` reads it back via
-        # `_consume_audit_before()` after the tool returns. This avoids
-        # a second read-only book open per write (~40-100ms).
+        # Thread-local staging buffer for audit-log before_state:
+        # write methods stage on their open session; @audit_log
+        # consumes after the tool returns — no second book open.
         self._audit_tls = threading.local()
-        # Cache for the full-table transaction prefix map. Three call
-        # sites (``list_transactions``, ``search_transactions``,
-        # ``_collect_create_signals``) build the same map over every
-        # transaction GUID; the map is correct as long as the book
-        # hasn't been mutated since last build. Gate on
-        # ``book_path.stat().st_mtime_ns`` — SQLite touches the file
-        # on every commit, so a write through this server (or any
-        # other writer) invalidates the cache on the next request.
-        # Shape: ``(mtime_ns, prefix_dict)`` or ``None`` when empty.
+        # GUID-prefix-map caches, ``(mtime_ns, dict)`` — SQLite
+        # touches the file on every commit, so mtime_ns invalidates
+        # on any write by this server or another process.
         self._txn_prefix_cache: tuple[int, dict[str, str]] | None = None
-        # Same cache shape for split and lot GUID prefix maps — used
-        # by get_transaction and verbose list_transactions to emit
-        # collision-safe short GUIDs alongside transaction prefixes.
-        # All three caches invalidate on book mtime change together.
         self._split_prefix_cache: tuple[int, dict[str, str]] | None = None
         self._lot_prefix_cache: tuple[int, dict[str, str]] | None = None
 
@@ -976,31 +795,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     ) -> str:
         """Resolve a partial GUID prefix to a full 32-character GUID.
 
-        Validates the input (length min_len..32, hex characters only)
-        before touching the database — malformed inputs raise
-        immediately rather than round-tripping through SQLite to
-        discover they don't match anything. Uppercase hex is accepted
-        and normalized to lowercase.
+        Validates (length min_len..32, hex only, uppercase
+        normalized) before touching the database. Raw read-only
+        SQLite — no piecash session needed.
 
-        Uses raw SQLite in read-only mode — no piecash session needed.
-
-        Args:
-            table: Database table name (e.g., "transactions", "splits").
-            partial: Full or partial GUID. ``min_len``..32 hex characters
-                     (case-insensitive on input, stored as lowercase).
-            min_len: Minimum acceptable prefix length. Defaults to 8 for
-                     transactions/splits/etc. The accounts table uses
-                     7 (paired with the ``%`` short-guid prefix in tool
-                     I/O) — only ~1k accounts in a typical book, so
-                     birthday collisions at 7 hex chars are below 0.2%.
+        ``min_len`` defaults to 8; the accounts table uses 7 (paired
+        with the ``%`` marker; ~1k accounts keeps 7-char collisions
+        below 0.2%).
 
         Returns:
             Full 32-character lowercase-hex GUID.
 
         Raises:
-            ValueError: If table invalid, prefix too short, too long,
-                        contains non-hex characters, no match, or
-                        multiple matches.
+            ValueError: invalid table, malformed prefix, no match,
+                or multiple matches.
         """
         if table not in self._GUID_TABLES:
             raise ValueError(f"Invalid table: {table}")
@@ -1101,19 +909,12 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _find_account(self, book: piecash.Book, fullname: str) -> piecash.Account | None:
         """Find an account by its full name path.
 
-        Path-only lookup. For user-supplied input (which may be a path,
-        ``%short`` GUID, or full GUID), call :meth:`_resolve_account`
-        instead. This method is the path-lookup leaf that
-        ``_resolve_account`` falls through to.
+        Path-only leaf that ``_resolve_account`` falls through to;
+        user-supplied refs go through ``_resolve_account``.
 
-        Scheduled-transaction template accounts (under
-        ``book.root_template``) are never returned — they're GnuCash
-        internals, not part of the user's chart of accounts. Callers
-        that legitimately need to touch a template (currently only
-        ``create_scheduled_transaction`` / ``delete_scheduled_transaction``)
-        access it through piecash's typed relationships
-        (``sx.template_account``, ``book.root_template.children``),
-        not by name.
+        Template accounts are never returned — callers that
+        legitimately touch templates (the scheduled-transaction
+        CRUD) use piecash's typed relationships, not name lookup.
         """
         template_guids = self._template_account_guids(book)
         for account in book.accounts:
@@ -1125,21 +926,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
     # ── Short account GUIDs ───────────────────────────────────────────
     #
-    # A book typically holds ~10²–10³ accounts but ~10⁴–10⁵ transactions.
-    # Account paths like "Assets:Current Assets:Savings Account" are
-    # stable and human-readable but verbose — every tool call repeats
-    # them. The short GUID format is "%XXXXXXX" (a literal "%" followed
-    # by ≥7 hex chars), small enough to be cheap on the wire while still
-    # collision-safe under the birthday problem at typical chart sizes.
-    #
-    # The "%" prefix is significant. It distinguishes short GUIDs from:
-    #   - account paths (which can contain ":", letters, spaces — but
-    #     never start with "%" by convention)
-    #   - transaction GUID prefixes (raw 8+ hex with no marker)
-    #
-    # Tools that accept account references should call _resolve_account,
-    # which understands all three input shapes (path, %short, full GUID)
-    # and returns an Account or None.
+    # Format "%XXXXXXX" (literal "%" + ≥7 hex chars) — cheap on the
+    # wire, collision-safe at typical chart sizes. The "%" marker
+    # distinguishes short account GUIDs from paths and from bare-hex
+    # transaction prefixes; accounts are the one entity with a
+    # path-vs-GUID disambiguation problem at the input boundary.
+    # Tools that accept account refs call _resolve_account, which
+    # handles all three shapes.
 
     _SHORT_ACCOUNT_GUID_PREFIX = "%"
     _SHORT_ACCOUNT_GUID_MIN_LEN = 7
@@ -1183,24 +976,12 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     ) -> dict[str, str]:
         """Return the full-table transaction-GUID prefix map, cached.
 
-        Multiple read paths (``list_transactions``, ``search_transactions``,
-        the duplicate-detection signal collector) all emit short
-        prefixes that must be collision-safe against
-        ``_resolve_guid``'s table-wide LIKE lookup. Each independently
-        called ``_guid_prefix_map(t.guid for t in book.transactions)``
-        — paying the iteration plus the sort-and-map-build cost on
-        every request.
-
-        Cache invariant: the prefix map is correct as long as no
-        transaction has been added, removed, or had its GUID changed.
-        SQLite touches the book file on every commit, so
-        ``book_path.stat().st_mtime_ns`` is a sufficient proxy —
-        any mutation (this process or any other writer) bumps mtime
-        and forces a rebuild on the next request.
-
-        Same-nanosecond writes after a request could theoretically
-        serve a stale map, but mtime precision is nanoseconds on
-        modern filesystems and request rate is well below that.
+        Several read paths emit short prefixes that must be
+        collision-safe against ``_resolve_guid``'s table-wide LIKE
+        lookup; this shares one build. Cache invariant: correct
+        until any transaction mutates — SQLite bumps the file mtime
+        on every commit, so ``st_mtime_ns`` is a sufficient proxy
+        for writes by this process or any other.
         """
         mtime_ns = self.book_path.stat().st_mtime_ns
         if (
@@ -1218,11 +999,6 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         """Return the full-table split-GUID prefix map, cached.
 
         Same mtime-keyed pattern as ``_transaction_prefix_map``.
-        Used by ``get_transaction`` and verbose ``list_transactions``
-        to emit collision-safe short split GUIDs in responses. Pre-
-        v1.3.1 these surfaces emitted full 32-char split GUIDs —
-        24 wasted chars per split per call, identified by the
-        bookkeeper as token bloat in real LLM workflows.
         """
         mtime_ns = self.book_path.stat().st_mtime_ns
         if (
@@ -1241,10 +1017,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     ) -> dict[str, str]:
         """Return the full-table lot-GUID prefix map, cached.
 
-        Sibling to ``_transaction_prefix_map`` / ``_split_prefix_map``.
-        Lots are nested under accounts; same mtime invalidation
-        applies because any lot change goes through the same SQLite
-        write path.
+        Same mtime-keyed pattern as ``_transaction_prefix_map``.
         """
         mtime_ns = self.book_path.stat().st_mtime_ns
         if (
@@ -1263,33 +1036,19 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     ) -> piecash.Account | None:
         """Resolve a path, ``%short``, or full 32-hex GUID to an Account.
 
-        Three input shapes:
+        Three input shapes: ``"%XXXXXXX"`` → ``_resolve_guid`` (min
+        7 hex chars); 32-char hex → direct lookup; anything else →
+        path via ``_find_account``.
 
-        1. ``"%XXXXXXX"`` (or longer) — short GUID. The "%" is stripped
-           and the rest is resolved via :meth:`_resolve_guid` (min 7 chars,
-           hex only). Ambiguous prefixes raise ``ValueError``.
-        2. 32-char hex string — full GUID, looked up directly.
-        3. anything else — treated as an account path (``Account.fullname``)
-           and dispatched to :meth:`_find_account`.
+        Returns ``None`` for a well-formed ref that matches nothing
+        OR resolves into the template subtree. Raises ``ValueError``
+        on malformed or ambiguous short GUIDs.
 
-        Returns ``None`` when the ref is well-formed but matches nothing,
-        OR when the ref resolves to an account in the scheduled-transaction
-        template subtree (those are GnuCash internals, not part of the
-        user's chart of accounts — see :meth:`_template_account_guids`).
-        Raises ``ValueError`` for malformed short GUIDs (non-hex, too
-        short) or ambiguous prefixes — the caller can catch and surface
-        a better error message.
-
-        Template-filter chokepoint: pre-v1.3 release the template check
-        was only applied on the path branch (via :meth:`_find_account`).
-        ``%short`` and full-GUID input bypassed it, so the same logical
-        account resolved to two different values depending on input
-        form — letting ``update_account`` / ``move_account`` /
-        ``delete_account`` silently mutate template-tree rows when
-        called with a non-path ref. The post-dispatch check below
+        Template-filter chokepoint: filtering only on the path
+        branch would let ``%short`` / full-GUID input bypass it and
+        silently mutate template-tree rows; the post-dispatch check
         applies the filter uniformly regardless of input shape.
         """
-        # ── Branch dispatch ──
         if ref.startswith(self._SHORT_ACCOUNT_GUID_PREFIX):
             suffix = ref[len(self._SHORT_ACCOUNT_GUID_PREFIX):]
             try:
@@ -1317,11 +1076,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         else:
             acct = self._find_account(book, ref)
 
-        # ── Template-filter chokepoint ──
-        # The path branch's _find_account already filters templates,
-        # so this is redundant for that path — but the cost is one
-        # set membership check and it keeps the invariant declared
-        # exactly once, where every input shape converges.
+        # Template-filter chokepoint — where every input shape
+        # converges (redundant for the path branch; cost is one
+        # set-membership check).
         if acct is not None and acct.guid in self._template_account_guids(book):
             return None
         return acct
@@ -1334,43 +1091,19 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         """Resolve any short / full-GUID account refs in ``params``
         to canonical full paths.
 
-        Used by display surfaces (audit log, dashboard echoes) that
-        receive raw param dicts from the MCP tool layer and want to
-        render them human-readably. The audit log is the one human-
-        facing surface in the app — a reviewer shouldn't have to
-        look up ``%2e78c86`` to know what got reconciled.
+        For display surfaces — the audit log is the human-facing
+        one, and a reviewer shouldn't have to look up ``%2e78c86``
+        to know what got reconciled.
 
-        R-3: chokepoint for the account-ref-to-fullname rewrite
-        pattern. Pre-fix this lived as
-        ``_normalize_account_refs_for_audit`` inside
-        ``logging_config.py`` and opened its own book session per
-        audit-log render via ``_get_book_func()``. Moving the book
-        mechanics into BaseGnuCashBook puts the work next to
-        ``_resolve_account`` — the other chokepoint it relies on —
-        and lets future display surfaces route through the same
-        primitive without re-deriving the session-open + walk-splits
-        + resolve loop.
-
-        ``keys_to_normalize`` is supplied by the caller because the
-        set of params that carry account refs is caller-specific
-        (audit logs care about ``account`` / ``post_account`` /
-        ``new_parent`` / conditional ``name``; a future dashboard
-        echo might care about different keys). The book layer
-        provides the *mechanics* of resolving refs; the caller
-        provides the *config* of which params to walk.
-
-        Args:
-            params: The raw param dict (typically from an audit-log
-                entry or tool-call record).
-            keys_to_normalize: Top-level keys whose string values
-                should be treated as account refs. ``splits`` is
-                ALWAYS walked when present (its dicts carry
-                ``account`` keys that universally hold refs).
+        The book layer provides the *mechanics*; the caller provides
+        the *config*: ``keys_to_normalize`` names the top-level keys
+        carrying refs (caller-specific), while ``splits`` is ALWAYS
+        walked when present (its dicts universally carry ``account``
+        refs).
 
         Returns:
-            A new dict (non-destructive) with ref strings replaced
-            by canonical fullnames where resolution succeeded.
-            Unresolvable refs are left in place so downstream
+            A new dict (non-destructive) with resolved refs replaced
+            by fullnames; unresolvable refs stay in place so
             rendering still has something to show.
         """
         if not params:
@@ -1392,9 +1125,6 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         # Pass 2: one book open, resolve everything.
         resolved: dict[str, str] = {}
-        # Defer the import to dodge the audit-log surfaces that
-        # don't always have ``logging_config`` already loaded
-        # (tests, scripts using GnuCashBook directly).
         from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
         debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
         try:
@@ -1405,11 +1135,9 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                         if account is not None:
                             resolved[ref] = account.fullname
                     except Exception as e:
-                        # Stale, ambiguous, malformed — leave the
-                        # raw ref in place; the log line is still
-                        # useful. Surface in debug log so a post-hoc
-                        # reader who notices a raw ``%xxxxxxx``
-                        # instead of a fullname can find the cause.
+                        # Stale/ambiguous/malformed — leave the raw
+                        # ref; the log line is still useful, and the
+                        # debug entry explains the raw %xxxxxxx.
                         debug_logger.warning(
                             f"Account ref normalization: could not "
                             f"resolve {ref!r} for canonical rendering "
@@ -1428,9 +1156,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         def _replace(s):
             return resolved.get(s, s) if isinstance(s, str) else s
 
-        # Pass 3: rewrite. Non-destructive — return a new dict so
-        # any prior log line that already captured the original
-        # params is unaffected.
+        # Pass 3: rewrite, non-destructively.
         out: dict = {}
         for key, value in params.items():
             if key in keys_to_normalize:
@@ -1544,19 +1270,12 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
     def _template_account_guids(self, book: piecash.Book) -> set[str]:
         """GUIDs for every account in the scheduled-transaction
-        template subtree (``book.root_template`` and all descendants).
+        template subtree (``book.root_template`` and descendants).
 
-        GnuCash persists scheduled-transaction split templates as real
-        Account rows rooted at ``root_template``. Piecash surfaces
-        them in ``book.accounts`` alongside the user's chart of
-        accounts, but they're bookkeeping scaffolding — not
-        transactions the user posts to or a balance they care about.
-        Every user-facing account iteration path should filter this
-        set out before serving results.
-
-        Returns an empty set when the book has no template root
-        (books created by very old GnuCash versions, or freshly-created
-        books that haven't materialized the template root yet).
+        GnuCash persists SX split templates as real Account rows that
+        piecash surfaces in ``book.accounts`` — scaffolding, not the
+        user's chart. Every user-facing account iteration filters
+        this set out. Empty set when the book has no template root.
         """
         rt = book.root_template
         if rt is None:
@@ -1571,16 +1290,11 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _is_template_transaction(txn, template_guids: set) -> bool:
         """True iff ``txn`` is a scheduled-transaction template recipe.
 
-        GnuCash desktop persists each SX's split recipe as a real
-        Transaction row whose splits post to accounts under
-        ``root_template``. Our own ``create_scheduled_transaction``
-        uses a splits-json slot instead, so server-built books never
-        produce these rows — but books touched by the desktop UI are
-        full of them, and they render indistinguishably from real
-        events unless filtered. Single predicate so every
-        transaction-iteration surface applies the same rule
-        (companion to ``_template_account_guids`` for account
-        iterations).
+        GnuCash desktop persists each SX recipe as a real Transaction
+        whose splits post under ``root_template`` (our own SX path
+        uses a splits-json slot instead). Unfiltered, they render
+        indistinguishably from real events. Single predicate —
+        companion to ``_template_account_guids``.
         """
         return any(
             s.account.guid in template_guids for s in txn.splits
@@ -1590,7 +1304,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     def _own_splits_balance(account, as_of: "date | None" = None):
         """Balance of the account's OWN splits in its own commodity.
 
-        The one rule every own-splits sum shares (C8 read-side):
+        The one rule every own-splits sum shares:
 
         - voided splits are excluded by **state**, not value. A
           well-formed void contributes 0 either way; the corrupted
@@ -1601,7 +1315,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         - ``as_of`` (inclusive) caps to posted-by-then transactions;
           ``None`` means no date bound — callers that intentionally
           include future-dated transactions pass nothing.
-        - null ``post_date`` rows (old-book artifact, A9) are
+        - null ``post_date`` rows (an old-book artifact) are
           excluded — same rule ``_query_filtered_splits`` applies,
           so this sum agrees with the SQL-backed reports.
         """

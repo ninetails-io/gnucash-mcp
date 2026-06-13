@@ -1,7 +1,7 @@
 """Shared helpers for MCP tool wrappers.
 
-These used to live in server.py; they are now shared across every
-tool-registration module under gnucash_mcp/tools/.
+Shared across every tool-registration module under
+gnucash_mcp/tools/.
 """
 
 import json
@@ -24,8 +24,8 @@ def _parse_iso_date(s: str | None) -> date | None:
     to surface at the MCP boundary unchanged
     (``ValueError: Invalid isoformat string: '2025-01-XX'``).
 
-    R-4: chokepoints the ``date.fromisoformat(x) if x else None``
-    pattern that recurred at ~21 tool-wrapper sites. Required
+    Chokepoints the ``date.fromisoformat(x) if x else None``
+    pattern that recurs across the tool wrappers. Required
     dates (where the caller has already guaranteed non-None) keep
     calling ``date.fromisoformat`` directly — the distinction is
     explicit at the call site.
@@ -67,28 +67,16 @@ ScheduledTransactionGuid = Annotated[
 ]
 
 
-# ── Business-entity free-text caps (MP-5) ─────────────────────────
+# ── Business-entity free-text caps ────────────────────────────────
 #
-# The book-layer ``_validate_business_freetext`` chokepoint rejects
-# oversize input correctly — but it runs INSIDE the tool body,
-# AFTER ``@audit_log`` fires ``_maybe_auto_backup``. On the first
-# write of a session against a large book, that backup can take
-# seconds-to-minutes; from the caller's seat, a 5000-byte ``notes``
-# value looks like a hang before the validation rejects.
-#
-# Plumb Bob (bookkeeper validation, 2026-06-04) flagged this:
-# "for a defense-in-depth input gate, a hang is worse than the
-# unbounded write it was meant to prevent." Pydantic Field
-# constraints validate at the FastMCP schema layer — BEFORE any
-# decorator runs, including auto-backup — so an oversize value
-# rejects in milliseconds with the correct error shape.
-#
-# Cap is in characters (Pydantic's ``max_length`` semantics);
-# UTF-8 byte length is at most ~4× character length for the
-# pathological multi-byte case, so the effective byte ceiling is
-# ~16 KiB even for the worst-case input. Book-layer byte check
-# stays as belt-and-suspenders for direct callers (scripts,
-# tests) that bypass the MCP boundary.
+# The book-layer byte check runs INSIDE the tool body, AFTER
+# @audit_log fires _maybe_auto_backup — so an oversize ``notes``
+# value looks like a hang while a first-write backup runs, then
+# rejects. Pydantic Field constraints validate at the schema layer,
+# BEFORE any decorator, rejecting in milliseconds. Caps are in
+# characters (max_length semantics; worst-case UTF-8 byte ceiling
+# ~4×); the book-layer byte check stays for direct callers that
+# bypass the MCP boundary.
 
 BusinessNotes = Annotated[
     str,
@@ -145,25 +133,13 @@ class BusinessAddressInput(BaseModel):
 
 # ── Split payload schema ──────────────────────────────────────────
 #
-# Transaction-creating tools (create_transaction, update_transaction,
-# replace_splits, create_scheduled_transaction) all take a list of
-# split dicts. Before this model existed, the tool signature was
-# ``splits: list[dict]`` — pydantic doesn't descend into bare ``dict``,
-# so the inner ``amount`` / ``quantity`` values round-tripped through
-# whatever type the JSON parser produced. When a client sent a bare
-# JSON number (``"amount": 94.87``), the parser emitted a float, and
-# ``Decimal(split["amount"])`` inside the book method inherited the
-# IEEE-754 epsilon ( ``0.8699999999999999955591...`` ) — causing
-# spurious "splits do not balance" errors on non-dyadic decimals.
-#
-# ``SplitInput`` enforces ``amount`` / ``quantity`` as strings at the
-# MCP boundary. With ``coerce_numbers_to_str=True`` pydantic routes a
-# stray JSON number through Python's ``str()`` (shortest-repr) before
-# we ever construct a Decimal — so ``94.87`` becomes ``"94.87"``, not
-# a noisy float. Internal book methods also wrap every
-# user-derived ``Decimal(...)`` call with ``_to_decimal(...)`` as
-# belt-and-suspenders for direct callers (tests, scripts) that
-# bypass this layer.
+# A bare ``splits: list[dict]`` signature is the trap: pydantic
+# doesn't descend into bare dict, so a client sending a JSON number
+# (``"amount": 94.87``) hands the book method a float whose IEEE-754
+# epsilon breaks the sum-to-zero check. SplitInput enforces strings;
+# ``coerce_numbers_to_str=True`` routes stray numbers through
+# shortest-repr str() first. Book methods also use ``_to_decimal``
+# as belt-and-suspenders for callers that bypass this layer.
 
 
 class SplitInput(BaseModel):
@@ -176,14 +152,9 @@ class SplitInput(BaseModel):
     currency), and ``memo`` (optional).
     """
 
-    # ``extra="forbid"`` matches the server-global setting on
-    # ``ArgModelBase`` (set in server.py at import time). Pre-fix
-    # this used ``extra="ignore"``, which silently dropped typo'd
-    # keys: ``{"quantitiy": "10"}`` instead of ``{"quantity": "10"}``
-    # would discard the quantity entirely and the transaction would
-    # post with cross-currency value/quantity mismatch (or with the
-    # default-zero behavior, depending on the path). HP-10 from
-    # specs/CODE_REVIEW_v1_3.md.
+    # extra="forbid" matches the server-global ArgModelBase setting
+    # — "ignore" would silently drop a typo'd ``quantitiy`` key and
+    # post a cross-currency value/quantity mismatch.
     model_config = ConfigDict(
         coerce_numbers_to_str=True,
         extra="forbid",
@@ -282,8 +253,6 @@ def _json(obj) -> str:
     ``\\uXXXX`` form. The escape behavior is technically valid JSON
     but makes the wire format unreadable for human reviewers and
     breaks any downstream substring match on the original text.
-    Bookkeeper-flagged on a CNY-default test book where every
-    SSE/SZSE commodity name came back as escape sequences.
     """
     return json.dumps(
         _strip_noise(obj), separators=(",", ":"), ensure_ascii=False,
@@ -294,45 +263,26 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
     """Enforce the Freelancer/Business module split at the
     ``owner_type`` boundary.
 
-    Shared-lifecycle invoice/bill/voucher tools (post_invoice,
-    unpost_invoice, pay_invoice, list_invoices, get_invoice,
-    get_outstanding_invoices) live in the Freelancer module
-    because customer-facing invoicing is the natural Freelancer
-    surface. Vendor bills (``owner_type='vendor'``) and employee
-    expense vouchers (``owner_type='employee'``) travel through
-    the same tools via owner_type dispatch — but the Business
-    module owns BOTH vendor and employee management. A user with
-    only Freelancer loaded should never be able to touch either.
+    The shared-lifecycle invoice tools live in Freelancer, but
+    vendor bills and employee vouchers travel through them via
+    owner_type dispatch — and Business owns both vendor and
+    employee management.
 
     Three cases:
 
-    - **Explicit ``owner_type='vendor'`` or ``'employee'`` without
-      Business loaded:** reject with a clear error. The user is
-      explicitly asking for behavior they didn't enable.
-    - **``owner_type`` omitted or ``'customer'`` without Business:**
-      coerce to ``'customer'``. The tool only sees customer
-      entities. Any vendor/employee-ID collision is treated as
-      "not found" at the lookup layer (book methods filter on
-      owner_type).
-    - **Business loaded:** pass through unchanged; all three halves
-      available.
+    - Explicit ``'vendor'`` / ``'employee'`` without Business:
+      reject with a clear error.
+    - Omitted or ``'customer'`` without Business: coerce to
+      ``'customer'`` — the tool only sees customer entities.
+    - Business loaded: pass through unchanged.
 
-    Returns the (possibly coerced) owner_type the book method should
-    receive. Caller passes the return value through to ``book.X(...,
-    owner_type=...)``.
-
-    Imports server lazily to avoid an import-time cycle (server.py
-    imports from tools.* via lazy-load).
+    Returns the (possibly coerced) owner_type for the book method.
+    Imports server lazily to avoid an import-time cycle.
     """
     from gnucash_mcp.server import is_module_enabled
 
-    # ``business_complete`` is the leaf that owns vendor + employee
-    # management. The ``business`` MODULE_GROUPS alias expands to
-    # ``freelancer + business_complete`` for the small-business
-    # persona, so ``--modules=business`` enables both naturally.
-    # Gate-check the leaf directly so a user who explicitly picked
-    # only ``business_complete`` (uncommon but valid) also gets
-    # vendor/employee functionality unlocked.
+    # Gate on the business_complete LEAF (not the group alias) so an
+    # explicit business_complete-only selection also unlocks.
     if is_module_enabled("business_complete"):
         return owner_type  # All three halves available; no gating.
 
@@ -352,14 +302,9 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
             "(or add business_complete to your current selection) "
             "or omit owner_type to operate on customer invoices only."
         )
-    # Only None and 'customer' fall through to "customer" coercion.
-    # Anything else (typos like 'venddor', unknown future types) is
-    # rejected here so the LLM gets a clear validation error instead
-    # of a silent coercion that masks the typo as "search customer
-    # invoices, find nothing, return not-found." Pre-fix: 'venddor'
-    # → coerced to 'customer' → book-layer lookup against customer
-    # invoices → "invoice not found", with no indication the input
-    # was misspelled. (Copilot review on PR #86.)
+    # Only None / 'customer' coerce; anything else (typos, unknown
+    # future types) rejects loudly rather than masquerading as
+    # "searched customer invoices, found nothing".
     if owner_type is not None and owner_type != "customer":
         raise ValueError(
             f"Invalid owner_type {owner_type!r}. Must be 'customer' "
@@ -464,16 +409,10 @@ def safe_tool(func: Callable) -> Callable:
                 "error_type": "validation_error",
             })
         except RuntimeError as e:
-            # ``_verify_write`` / ``_verify_composite_write`` /
-            # ``_verify_delete`` and the per-method
-            # ``_verify_transaction_state`` raise ``RuntimeError``
-            # specifically for "the write didn't land" — a critical
-            # correctness signal that should NOT collapse into the
-            # generic "unexpected_error" bucket. Pre-fix this
-            # masked write-verification failures behind the same
-            # error_type as e.g. ``KeyError`` lookup failures, so
-            # callers couldn't tell "the write failed" from "we
-            # tried to read a missing key."
+            # The _verify_* helpers raise RuntimeError for "the
+            # write didn't land" — a correctness signal that must
+            # not collapse into the generic unexpected_error bucket,
+            # or callers can't tell a failed write from a KeyError.
             msg = str(e)
             if "verification failed" in msg.lower():
                 logger.error(

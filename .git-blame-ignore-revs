@@ -1,0 +1,15 @@
+# Comment-sweep commits (comment/docstring-only churn across src/).
+# To make git blame skip them:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+5dca761e1adede5f338f1c1dd1a8dec1de2cc1c7
+94cb36fc112e265dc63835bd8249b37f7fa66d9b
+bab8f4e0f20f2bcd02bf38fdeef50961cf8eefa6
+adc0d9738a75b1457aeb11b093851f7572d620ea
+f12ca909c463e8326d17e9e87479fbc377240f0e
+f3997610e62de09e3a7e9c13f0f88d28f9b499b5
+# Brevity-pass commits (rule 8; comment/docstring-only churn).
+ef67c8d691e0b11967e241400553c471d29ab02b
+60b269a47ef3d4c60d4e732d8297ec811c03f2ca
+aa4891d6c5ad5d40b03e71cde99ae8063177ca81
+505c2c27589407e421652f327920817235be87ba
+dd67ded94ac45f0ff8f20efd4faeef5177f4f0fc

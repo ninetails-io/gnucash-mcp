@@ -90,10 +90,10 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         # Distinguish "not provided" (None → today) from "provided
-        # but empty/garbage" (raise). Pre-fix, an empty-string
-        # ``as_of_date=""`` silently fell back to today — a caller
-        # bug that produced silently wrong-dated reports. Copilot
-        # PR #92 review caught this; the strict-kwargs pattern
+        # but empty/garbage" (raise). An empty-string
+        # ``as_of_date=""`` silently falling back to today is a
+        # caller bug that produces silently wrong-dated reports;
+        # the strict-kwargs pattern
         # extends to the value, not just the parameter name.
         if as_of_date is None:
             d = date.today()

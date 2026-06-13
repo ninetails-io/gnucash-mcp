@@ -85,12 +85,9 @@ class ReconciliationMixin:
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
 
-            # Reject state changes on voided splits. Pre-fix the input
-            # gate accepted any of {n, c, y} regardless of current
-            # state, so a voided split could be moved to ``y`` — which
-            # zeroed the void marker and defeated
-            # ``unvoid_transaction``'s recovery path. To re-reconcile
-            # a previously-voided split the user must unvoid first.
+            # Reject state changes on voided splits — moving one to
+            # 'y' erases the void marker and defeats
+            # unvoid_transaction's recovery path. Unvoid first.
             if _is_voided(split):
                 raise ValueError(
                     f"Cannot change reconcile state of voided split "
@@ -115,10 +112,9 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Response carries a collision-safe short prefix of the split
-            # GUID plus context the LLM only had a GUID for (account,
-            # amount). The requested state is echo — dropped. reconcile_date
-            # stays because it's computed (today if not provided).
+            # Short split prefix + context the LLM only had a GUID
+            # for. The requested state is an echo — dropped;
+            # reconcile_date stays (computed when not provided).
             all_split_guids = (
                 s.guid for txn in book.transactions for s in txn.splits
             )
@@ -140,36 +136,22 @@ class ReconciliationMixin:
     ) -> dict | str:
         """Get unreconciled splits for an account.
 
-        Returns up to ``limit`` splits (default 50) ordered by post-date
-        ascending. The cleared / uncleared totals reflect the **full**
-        unreconciled set on the account, not just the truncated slice —
-        so the summary footer still tells you how far behind the
-        reconciliation is even when individual lines are clipped.
+        Returns up to ``limit`` splits (default 50, capped 250),
+        post-date ascending. The cleared/uncleared totals always
+        reflect the **full** unreconciled set, not the truncated
+        slice.
 
-        **Currency unit:** ``cleared_total`` and ``uncleared_total``
-        are in the **account's commodity** (sum of ``split.quantity``,
-        not ``split.value``). For a USD account on a USD-default
-        book they're indistinguishable; for a EUR-denominated A/R
-        account on a USD book the totals are in EUR. Compare to
-        the bank statement in the same currency the account holds.
+        **Currency unit:** the totals are in the **account's
+        commodity** (sum of ``split.quantity``, not ``split.value``)
+        — compare to the bank statement in the currency the account
+        holds.
 
         Args:
-            account_name: Full account path.
+            account_name: Account ref.
             as_of_date: Only include splits on or before this date.
-            compact: If True (default), return a compact newline-separated
-                     string with one line per split plus a summary footer.
-                     If False, return the full dict with splits list.
-            limit: Maximum splits to return. Defaults to 50, capped at
-                   250 server-side. The full count is always reflected
-                   in the summary footer / ``count`` field.
-
-        Returns:
-            If compact: newline-separated string of split lines + footer
-                + optional truncation notice.
-            If not compact: dict with account info, splits list (possibly
-                truncated), totals reflecting the full unreconciled set,
-                ``count`` (truncated length), ``total`` (untruncated),
-                and ``notice`` (truncation message or None).
+            compact: One line per split + summary footer (default),
+                or the dict envelope {account, splits, totals,
+                count, total, notice}.
 
         Raises:
             ValueError: If account not found.
@@ -192,13 +174,9 @@ class ReconciliationMixin:
                 if as_of_date and split.transaction.post_date > as_of_date:
                     continue
 
-                # Skip reconciled and voided splits — only states
-                # ``n`` (new) and ``c`` (cleared) count as pending
-                # bookkeeping work. ``_is_unreconciled`` is the
-                # chokepoint shared with the dashboard count
-                # (``_account_reconciliation_status``) so HP-8
-                # convergence is structural rather than
-                # docstring-promised.
+                # ``_is_unreconciled`` is the chokepoint shared with
+                # the dashboard count, so the two surfaces agree by
+                # construction.
                 if not _is_unreconciled(split):
                     continue
                 split_dict = {
@@ -238,9 +216,8 @@ class ReconciliationMixin:
             }
 
             if compact:
-                # Prefix uniqueness spans every split in the book because
-                # set_reconcile_state / reconcile_account resolve split
-                # GUIDs table-wide — not scoped to the current account.
+                # Prefixes span every split in the book — the
+                # consuming tools resolve GUIDs table-wide.
                 all_split_guids = (
                     s.guid for txn in book.transactions for s in txn.splits
                 )
@@ -275,59 +252,32 @@ class ReconciliationMixin:
 
         Two operating modes:
 
-        - **Targeted** (``split_guids=[...]``, ``reconcile_all=False``):
-          reconcile exactly the listed splits. Use when statement and
-          book disagree and the caller needs to pick a subset.
+        - **Targeted** (``split_guids=[...]``): reconcile exactly
+          the listed splits.
         - **Bulk** (``reconcile_all=True``): reconcile every
-          unreconciled split on the account. The common case for
-          OFX-import workflows — one tool call, no GUID round-trip.
-          Pass ``through_date`` to restrict to splits on or before
-          a specific date; by default no date filter is applied
-          (the bookkeeper-validated semantics — pre-fix this
-          defaulted to ``statement_date`` and silently excluded
-          payment splits dated after the statement, which the
-          tester hit on a CareCredit payoff). Reject if
-          ``split_guids`` is also given to avoid ambiguity.
+          unreconciled split on the account — the OFX-import common
+          case. ``through_date`` optionally bounds the sweep; the
+          default is NO date filter (defaulting to statement_date
+          would silently exclude payments dated after the
+          statement). ``except_guids`` excludes named splits ("the
+          statement covers everything except this pending ACH");
+          non-resolving prefixes are silently ignored.
 
-        Both modes verify the resulting reconciled balance ties to
-        ``statement_balance`` before mutating; mismatch raises with
-        the discrepancy amount.
+        The two modes are mutually exclusive, and both verify the
+        resulting reconciled balance ties to ``statement_balance``
+        BEFORE mutating; mismatch raises with the discrepancy.
 
         Args:
-            account_name: Account reference (path, ``%short`` GUID,
-                or full 32-char GUID).
+            account_name: Account ref (path, ``%short``, or GUID).
             statement_date: Statement ending date.
-            statement_balance: Expected balance from statement
-                (as string).
-            split_guids: List of split GUIDs to mark reconciled
-                (8+ char prefixes accepted). Required for targeted
-                mode; omit (or pass ``None``) for bulk mode.
-            reconcile_all: When True, reconcile every unreconciled
-                split on the account (optionally bounded by
-                ``through_date``). Mutually exclusive with a
-                non-empty ``split_guids``.
-            through_date: Optional upper-date filter for bulk mode.
-                When set, only splits with
-                ``transaction.post_date <= through_date`` are
-                included. When ``None`` (default), no date filter
-                is applied — every unreconciled split gets
-                reconciled, regardless of date.
-            except_guids: Optional list of split GUID prefixes to
-                exclude from the bulk reconcile. Useful when the
-                statement covers "everything except this one
-                pending ACH" — 2 tokens for the exclusion instead
-                of 100+ for an explicit ``split_guids`` listing.
-                Only valid with ``reconcile_all=True``. Prefixes
-                that don't resolve are silently ignored (no
-                effect on the reconcile set anyway).
+            statement_balance: Expected balance, as string.
 
         Returns:
-            Dict with reconciliation results: ``splits_reconciled``,
-            ``new_reconciled_balance``, ``status``.
+            ``{splits_reconciled, new_reconciled_balance, status}``.
 
         Raises:
-            ValueError: If account not found, mode ambiguous, split
-                not found, split on wrong account, or balance
+            ValueError: account not found, mode ambiguous, split
+                missing / on the wrong account / voided, or balance
                 mismatch.
         """
         expected_balance = _to_decimal(statement_balance)
@@ -364,12 +314,8 @@ class ReconciliationMixin:
             reconciling_total = Decimal("0")
 
             if reconcile_all:
-                # Pre-resolve except_guids prefixes to full GUIDs so
-                # the per-split skip check is a fast set lookup. A
-                # prefix that doesn't resolve to any split is
-                # silently dropped — the goal is "exclude these if
-                # present", and a non-resolving entry has no effect
-                # on the reconcile set.
+                # Pre-resolve except_guids to full GUIDs for a fast
+                # set lookup; non-resolving prefixes drop silently.
                 exempt_guids: set[str] = set()
                 if except_guids:
                     for prefix in except_guids:
@@ -377,21 +323,12 @@ class ReconciliationMixin:
                         if found is not None:
                             exempt_guids.add(found.guid)
 
-                # Walk the account's own splits — by construction every
-                # entry is on this account, so no membership check
-                # needed. Apply the optional date filter only when the
-                # caller explicitly set ``through_date``; the default
-                # is "every unreconciled split, no date bound" so the
-                # bookkeeper can match a statement balance regardless
-                # of when payments cleared.
                 for split in account.splits:
                     if split.reconcile_state == "y":
                         continue
-                    # Voided splits are zombies, not pending work —
-                    # flipping one to 'y' is the exact mutation
-                    # set_reconcile_state rejects, and it defeats
-                    # unvoid_transaction (C8). The sweep skips them
-                    # silently; they were never reconcilable.
+                    # Voided splits were never reconcilable; the
+                    # sweep skips them silently (the targeted mode
+                    # below refuses loudly instead).
                     if _is_voided(split):
                         continue
                     if split.guid in exempt_guids:
@@ -408,11 +345,9 @@ class ReconciliationMixin:
                     split = self._find_split(book, guid)
                     if not split:
                         raise ValueError(f"Split not found: {guid}")
-                    # Compare by GUID against the resolved account so
-                    # ``account_name`` accepts ``%short`` and full-GUID
-                    # input. Pre-fix the check compared against the raw
-                    # input string, rejecting any shortcut form even
-                    # when it resolved to the right account.
+                    # Compare by GUID against the resolved account —
+                    # comparing the raw input string would reject
+                    # %short/GUID forms that resolve correctly.
                     if split.account.guid != account.guid:
                         raise ValueError(
                             f"Split {guid} belongs to account "
@@ -421,9 +356,8 @@ class ReconciliationMixin:
                         )
                     if split.reconcile_state == "y":
                         raise ValueError(f"Split {guid} is already reconciled")
-                    # Explicitly-targeted voided split: refuse loudly
-                    # (same contract as set_reconcile_state) rather
-                    # than silently skipping a split the caller named.
+                    # Refuse loudly on a named voided split — same
+                    # contract as set_reconcile_state.
                     if _is_voided(split):
                         raise ValueError(
                             f"Split {guid} is voided. Voided splits "
@@ -435,14 +369,9 @@ class ReconciliationMixin:
                     reconciling_total += split.quantity
 
             # Quantize both sides to the account commodity's
-            # smallest fraction before comparing. Pre-fix a user
-            # typing ``"1234.567"`` against a 2-decimal book
-            # produced a perpetual 0.007 mismatch with no clear
-            # error — every reconciliation attempt failed even
-            # when the books agreed at the cent. Now the
-            # statement balance and computed balance are both
-            # normalized to the commodity's smallest unit (USD ->
-            # 2 decimals, JPY -> 0, BHD -> 3) before equality.
+            # smallest fraction before comparing — otherwise
+            # "1234.567" against a 2-decimal book is a perpetual
+            # 0.007 mismatch even when the books agree at the cent.
             fraction = getattr(account.commodity, "fraction", 100)
             quantum = (
                 Decimal(1) / Decimal(fraction) if fraction > 1 else Decimal(1)
@@ -458,11 +387,8 @@ class ReconciliationMixin:
                     f"Difference: {expected_q - new_balance}"
                 )
 
-            # Stage pre-reconcile state for the audit log. Shape mirrors
-            # the multi-split payload the audit formatter expects for
-            # RECONCILE operations: {"splits": [state_dict, ...]} so it
-            # can display per-split context (description, amount) next
-            # to each short GUID in the reconciled list.
+            # Audit before-state in the multi-split shape the
+            # RECONCILE formatter expects: {"splits": [...]}.
             self._stage_audit_before(
                 {"splits": [_split_state_dict(s) for s in splits_to_reconcile]}
             )
@@ -474,9 +400,8 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Return only the computed info — the audit log reads inputs
-            # (account_name, statement_date, statement_balance) from tool
-            # params, so we don't echo them here.
+            # Computed info only — the audit log reads the inputs
+            # from tool params.
             return {
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
@@ -486,43 +411,26 @@ class ReconciliationMixin:
     def void_transaction(self, guid: str, reason: str) -> dict:
         """Void a transaction (proper accounting void, not delete).
 
-        Voiding preserves the transaction for audit purposes but zeroes out
-        all split values. Original values are stored in slots for potential
-        unvoiding.
+        Preserves the transaction for audit, zeroes the split
+        values, and stashes the originals in slots for unvoiding.
 
-        When the transaction contains reconciled splits, voiding them
-        breaks the reconciliation balance for the affected accounts —
-        the bank statement that originally reconciled is no longer
-        accurate. The void proceeds (audit trail trumps bookkeeping
-        cleanliness), but the result includes a ``warning`` field
-        listing the affected accounts so the caller can re-reconcile
-        or investigate as needed. Unlike ``delete_transaction`` (which
-        blocks on reconciled splits absent ``force=True``), voiding is
-        an audit operation that should never be silently rejected —
-        the warning is informational, not gating.
+        Voiding reconciled splits breaks the affected accounts'
+        reconciliation balance. The void proceeds anyway — it's an
+        audit operation that must never be silently rejected (unlike
+        ``delete_transaction``, which gates on force) — and the
+        result carries a ``warning`` naming the affected accounts.
 
         Args:
             guid: Transaction GUID to void.
-            reason: Reason for voiding (required for audit trail).
-
-        Returns:
-            Dict with transaction details and status. When reconciled
-            splits were affected, also includes ``warning`` describing
-            the reconciliation impact.
+            reason: Required for the audit trail.
 
         Raises:
             ValueError: If transaction not found or already voided.
         """
         if not reason or not reason.strip():
             raise ValueError("Void reason is required")
-        # HP-9 length cap. 4 KiB covers any realistic void
-        # explanation — multi-paragraph context, audit trail
-        # notes, references to ticket numbers — while keeping a
-        # malicious or runaway caller from exhausting the book
-        # file with a single void. Byte-count (not char-count)
-        # so unicode payloads can't sneak past. Compute the byte
-        # length once; ``reason.encode(...)`` would allocate a
-        # fresh copy of the already-large string.
+        # 4 KiB byte-cap (not chars — unicode payloads can't sneak
+        # past): room for any real explanation, no runaway bloat.
         _VOID_REASON_MAX_BYTES = 4 * 1024
         reason_bytes = len(reason.encode("utf-8"))
         if reason_bytes > _VOID_REASON_MAX_BYTES:
@@ -553,14 +461,9 @@ class ReconciliationMixin:
             # description (date)" plus the original splits from it.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
-            # GnuCash slot keys for void info. Use a tz-aware
-            # local time (mirroring the audit-log convention) so a
-            # later reader can reconstruct "when was this voided"
-            # unambiguously across DST transitions and timezone
-            # changes. Pre-fix this stored a naive ``datetime.now()``
-            # whose interpretation depended on the host's current
-            # zone — same string would mean different absolute times
-            # before/after a DST shift.
+            # tz-aware local time (audit-log convention) — a naive
+            # datetime.now() means different absolute times across
+            # DST shifts and zone changes.
             transaction["void-reason"] = reason
             transaction["void-time"] = (
                 datetime.now().astimezone().isoformat()
@@ -619,12 +522,9 @@ class ReconciliationMixin:
                 raise ValueError(f"Transaction {guid} is not voided")
 
             # Validate up-front that EVERY voided split has its
-            # void-former slots present. Pre-fix partial corruption
-            # (e.g., a split missing its void-former-value but with
-            # void-former-quantity present) silently produced a
-            # partial unvoid — the value-missing split would stay
-            # at zero while its sibling was restored. Better to
-            # refuse and surface the corruption explicitly.
+            # void-former slots — otherwise partial corruption
+            # produces a partial unvoid (one split restored, its
+            # sibling stuck at zero). Refuse and surface it.
             missing_slots = []
             for split in transaction.splits:
                 if split.reconcile_state != "v":
@@ -667,10 +567,8 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Restored splits ARE new info (they were zeroed while
-            # voided, values stashed in slots). Emit them compactly —
-            # full _split_to_dict would carry guid/reconcile_state="n"/
-            # reconcile_date=None/lot_guid=None per split, all noise.
+            # Restored splits ARE new info (zeroed while voided);
+            # emitted compactly.
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
             )

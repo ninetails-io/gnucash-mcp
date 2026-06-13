@@ -1,24 +1,15 @@
 """ReportingMixin — balance sheet, spending/income breakdowns, cash flow, debt payoff.
 
-All methods are read-only (no `book.save()`). The debt_payoff_plan
-method reads `apr` / `minimum_payment` / `credit_limit` slots on
-CREDIT/LIABILITY accounts via piecash's account[key] shortcut, so
-it does not depend on AdminMixin's slot tools.
+All methods are read-only (no ``book.save()``). debt_payoff_plan
+reads apr / minimum_payment / credit_limit slots directly, so it
+doesn't depend on AdminMixin's slot tools.
 
-The five transaction-scanning reports (``spending_by_category``,
-``income_by_source``, ``balance_sheet``, ``net_worth``, ``cash_flow``)
-push date and account-type filters into indexed SQL via
-``_query_filtered_splits``. Aggregation stays in Python so amounts
-are summed as exact Decimals (quantity is stored as num/denom integer
-pairs that SQLite can't aggregate without lossy float conversion).
-
-The ``net_worth`` time-series uses a single-sweep cumulative sum —
-one pass over all relevant splits ordered by post_date, running
-total snapshotted at each interval boundary. Reduces a 60-month
-series from O(intervals × splits) to O(splits + intervals).
-
-Depends on shared helpers from BaseGnuCashBook:
-  - self.open, self._find_account
+The transaction-scanning reports push date and account-type filters
+into indexed SQL via ``_query_filtered_splits``; aggregation stays
+in Python so amounts sum as exact Decimals. The ``net_worth``
+time-series is a single sweep over post_date-ordered splits with
+per-boundary snapshots — O(splits + intervals), not
+O(intervals × splits).
 """
 
 from datetime import date
@@ -29,19 +20,11 @@ import piecash
 from gnucash_mcp.book._base import _is_voided, _to_decimal
 from gnucash_mcp._format import _format_number
 
-# Account-type groups used across the reports. Defined at module level
-# so the SQL IN() clauses share a single canonical definition rather
-# than drifting across methods.
-# Type sets for balance_sheet / net_worth bucketing.
-#
-# RECEIVABLE and PAYABLE belong here despite GnuCash treating them
-# as their own first-class account types. Accounting-wise, A/R is
-# an asset (someone owes us money) and A/P is a liability (we owe
-# someone money); both flow through the balance sheet's totals and
-# the canonical "net worth = total assets − total liabilities"
-# identity. Pre-v1.3.0 these were excluded — invoices issued to
-# customers were invisible on balance_sheet, breaking A = L + E by
-# the outstanding-invoice amount.
+# Account-type groups shared by the reports' SQL IN() clauses — one
+# canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
+# asset and A/P a liability; excluding them makes posted invoices
+# invisible on balance_sheet and breaks A = L + E by the
+# outstanding-invoice amount.
 _ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
 _LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
@@ -55,15 +38,10 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
     Format::
 
         Business              22,336.90  39.3%
-        Taxes                  9,479.04  16.7%
-        ...
         TOTAL                 56,944.26
 
-    Account names render as their leaf component when unambiguous —
-    spending breakdowns at depth=1 typically yield "Expenses:Business",
-    "Expenses:Taxes", etc., which all share the "Expenses:" prefix and
-    read better with the prefix stripped. Width-padded so the amount /
-    percent columns align.
+    A common leading prefix ("Expenses:") is stripped when every row
+    shares it; columns are width-aligned.
     """
     if not rows:
         return f"TOTAL  {total:,.2f}"
@@ -99,17 +77,9 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
 def _money_compact(value: Decimal, currency: str = "USD") -> str:
     """Format a monetary amount for compact-mode reports.
 
-    Whole-currency-unit values render without decimals
-    (``"USD 13,091"``), partial values render with two
-    (``"USD 1,125.50"``). Negative values use leading-minus rather
-    than parens.
-
-    The ``currency`` argument carries the book's default currency
-    mnemonic (``"USD"``, ``"CNY"``, ``"EUR"``, etc.) — matches
-    ``get_book_summary``'s ``"USD 6700.00"`` rendering style and
-    works for non-USD books out of the box. Pre-fix this helper
-    hardcoded ``$`` and broke as soon as the bookkeeper pointed it
-    at a CNY-default book.
+    Whole values render without decimals (``"USD 13,091"``), partial
+    with two; negatives use leading-minus. ``currency`` is the book
+    default mnemonic — a hardcoded ``$`` breaks non-USD books.
     """
     quantized = value.quantize(Decimal("0.01"))
     if quantized == quantized.to_integral_value():
@@ -133,34 +103,21 @@ def _format_debt_payoff_compact(
 ) -> str:
     """Render the avalanche-payoff plan as a compact text table.
 
-    Currency prefix flows from the book's default currency — works
-    for USD, CNY, EUR, anything piecash represents. Layout::
+    Layout::
 
         Kill order (USD 10,000/mo → debt-free Apr 2030, USD 59,022 interest):
           1. Business Amex    USD 13,091  24.49%  payoff: mo 8   interest: USD 1,125
-          2. Chase Sapphire   USD 22,127  21.49%  payoff: mo 18  interest: USD 5,034
-          ...
         YETI at this budget: 1.59x (USD 1 spent costs USD 1.59 in total debt impact)
         Total interest: USD 59,022
         Debt-free: April 2030
-
-    Replaces the verbose dict (with multi-line YETI ``explanation`` per
-    account) that was the heaviest single response in Abe's audit.
-    Verbose mode preserves the dict for programmatic consumers.
     """
-    # Account names: leaf-name only when path is unambiguous (saves
-    # context vs. echoing "Liabilities:Credit Card:Business Amex" on
-    # every row). Width-pads to the widest leaf so columns align.
+    # Leaf names + width-padded columns.
     leaf_names = [d["name"].split(":")[-1] for d in results]
     name_width = max(len(n) for n in leaf_names) if leaf_names else 0
-
-    # Balance column width — pad to widest balance for alignment.
     balance_strs = [
         _money_compact(orig_balances[d["name"]], currency) for d in results
     ]
     balance_width = max(len(b) for b in balance_strs) if balance_strs else 0
-
-    # Interest column width — same trick.
     interest_strs = [
         _money_compact(d["interest_paid"], currency) for d in results
     ]
@@ -168,7 +125,6 @@ def _format_debt_payoff_compact(
         max(len(s) for s in interest_strs) if interest_strs else 0
     )
 
-    # Header tells the reader the inputs that drove the schedule.
     payoff_month_name = payoff_date.strftime("%b %Y")
     header = (
         f"Kill order ({_money_compact(monthly_budget, currency)}/mo → "
@@ -176,7 +132,6 @@ def _format_debt_payoff_compact(
         f"{_money_compact(total_interest, currency)} interest):"
     )
 
-    # Body rows.
     lines = [header]
     for i, d in enumerate(results, start=1):
         leaf = leaf_names[i - 1]
@@ -191,9 +146,7 @@ def _format_debt_payoff_compact(
             f"interest: {interest:>{interest_width}}"
         )
 
-    # Footer: YETI plus totals. The YETI line speaks plainly because
-    # it's the actionable signal — "this purchase costs you X.XX times
-    # more than its sticker because of the interest your debt accrues".
+    # YETI speaks plainly — it's the actionable signal.
     lines.append(
         f"YETI at this budget: {yeti_multiplier}x "
         f"({_money_compact(purchase_amount, currency)} spent costs "
@@ -246,29 +199,17 @@ class ReportingMixin:
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
-        Internal transfers are NOT filtered here (unlike
-        ``cash_flow``): every EXPENSE split is real spending by
-        definition. The cash-flow framing's transfer concept
-        doesn't apply.
+        Internal transfers are NOT filtered (unlike ``cash_flow``):
+        every EXPENSE split is real spending by definition.
 
         Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping. ``1`` returns the
-                top-level expense buckets (``Expenses:Food``,
-                ``Expenses:Transport``); ``2`` adds one level of
-                children (``Expenses:Food:Groceries``,
-                ``Expenses:Food:Restaurants``). Deeper values
-                surface progressively finer leaves; values greater
-                than the account-tree depth are clamped to the leaf
-                level.
-            compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4C).
-                     Verbose mode returns the structured dict.
-
-        Returns:
-            If compact: string with one line per category plus a TOTAL.
-            If not compact: dict with ``total`` and ``categories`` list.
+            start_date / end_date: Period bounds (inclusive).
+            depth: Grouping depth — ``1`` = top-level buckets
+                (``Expenses:Food``), ``2`` adds one level of
+                children; values past the tree depth clamp to the
+                leaf.
+            compact: Aligned text table (default) or the structured
+                dict.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -278,31 +219,22 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
-            # Convert each split to the book's default currency at
-            # rates as of the period's end. Pre-v1.3 release the
-            # factors call omitted ``as_of`` and silently used
-            # today's rates regardless of the historical period
-            # being reported — wrong for any historical multi-
-            # currency view.
+            # Rates anchored to the period's end — historical
+            # periods must not value at today's rates.
             factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Expense splits are positive when money is spent; a
-                # refund / return / intra-type reclassification posts a
-                # NEGATIVE amount to the expense account. Accumulate the
-                # signed amount so contra entries net against spending
-                # within a category. Dropping non-positive splits here
-                # would report GROSS spend, overstating any category that
-                # had a refund.
+                # Accumulate SIGNED amounts so refunds net against
+                # spending within a category — dropping negatives
+                # would report GROSS spend.
                 amount = self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
                 # ``depth`` (not ``depth - 1``): path[0] is the type
-                # root ("Expenses"), so the documented "depth 1 =
-                # top-level buckets (Expenses:Food)" needs path[1].
-                # Pre-fix the off-by-one collapsed the entire default
-                # report to a single "Expenses 100%" row (A7).
+                # root ("Expenses"), so "depth 1 = Expenses:Food"
+                # needs path[1]. The off-by-one collapses the whole
+                # report to one "Expenses 100%" row.
                 group_account = self._get_account_at_depth(
                     account, depth
                 )
@@ -311,14 +243,11 @@ class ReportingMixin:
                     account_name, Decimal("0")
                 ) + amount
 
-            # Net decision is made AFTER aggregation, not per split. A
-            # category whose net spend is < 0 (net-refunded for the
-            # period) isn't a spend LINE, but its net still belongs in
-            # the TOTAL — dropping it made the total change with the
-            # ``depth`` parameter (a net-negative leaf nets against
-            # siblings at low depth, vanishes at high depth) and untied
-            # income − spending from net income (C6). Net-negative
-            # groups surface explicitly instead of vanishing.
+            # Net decision AFTER aggregation: a net-refunded category
+            # isn't a spend LINE but still belongs in the TOTAL —
+            # dropping it makes the total depth-dependent and unties
+            # income − spending from net income. Net-negative groups
+            # surface explicitly instead of vanishing.
             displayed = {n: a for n, a in totals.items() if a > 0}
             excluded = {n: a for n, a in totals.items() if a < 0}
             total = (
@@ -371,17 +300,13 @@ class ReportingMixin:
     ) -> dict | str:
         """Get income breakdown by source.
 
-        Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
-            compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4C).
-                     Verbose mode returns the structured dict.
+        Mirror of ``spending_by_category`` (same depth semantics,
+        same net-after-aggregation rule) with income's sign flipped.
 
-        Returns:
-            If compact: string with one line per source plus a TOTAL.
-            If not compact: dict with ``total`` and ``sources`` list.
+        Args:
+            start_date / end_date: Period bounds (inclusive).
+            depth: Grouping depth (1 = top-level).
+            compact: Aligned text table (default) or structured dict.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -391,27 +316,18 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
-            # Convert each split to the book's default currency at
-            # rates as of the period's end — same historical-rates
-            # rationale as spending_by_category.
             factors = self._account_conversion_factors(book, end_date)
 
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Income splits are stored negative (money coming in);
-                # flip to positive for the "how much did I earn" view. A
-                # NEGATIVE contribution inside an income account — a
-                # realized capital loss in Capital Gains, an income
-                # reversal/clawback — flips to a negative amount.
-                # Accumulate the signed amount so losses net against
-                # gains within a source. Dropping them per split would
-                # report GROSS income, overstating the source (a
-                # gains-minus-loss account would show only the gains).
+                # Income is stored negative; flip. Signed
+                # accumulation so losses/clawbacks net against gains
+                # within a source — see spending_by_category.
                 amount = -self._split_in_default_currency(
                     split, account, factors.get(account.guid),
                 )
-                # ``depth`` (not ``depth - 1``) — same A7 off-by-one
-                # fix as spending_by_category.
+                # ``depth`` not ``depth - 1`` — same off-by-one
+                # hazard as spending_by_category.
                 group_account = self._get_account_at_depth(
                     account, depth
                 )
@@ -420,12 +336,8 @@ class ReportingMixin:
                     account_name, Decimal("0")
                 ) + amount
 
-            # Net decision is made AFTER aggregation, not per split. A
-            # source whose net is < 0 (net loss for the period) isn't
-            # an income LINE, but its net still belongs in the TOTAL
-            # so the total stays depth-invariant and income − spending
-            # ties to net income (C6). Net-loss sources surface
-            # explicitly instead of vanishing.
+            # Net decision AFTER aggregation — see
+            # spending_by_category.
             displayed = {n: a for n, a in totals.items() if a > 0}
             excluded = {n: a for n, a in totals.items() if a < 0}
             total = (
@@ -476,49 +388,33 @@ class ReportingMixin:
 
         Equity includes a computed **Unrealized gain/loss** line —
         the residual that makes ``A = L + E`` hold by construction.
-        Assets render at market value (factor × quantity for
-        commodities and foreign-currency cash) while equity rolls
-        up from raw split values (historical cost). The residual
-        captures two effects under one heading:
+        Assets render at market value while equity rolls up from raw
+        split values (historical cost); the residual captures both
+        investment market drift (shares × price vs cost basis) and
+        FX translation adjustment on foreign-currency accounts.
+        Both are accumulated-OCI items under GAAP; decomposing them
+        is a future feature — the single line preserves the identity
+        for any mix.
 
-        - Investment market drift on STOCK/MUTUAL holdings
-          (shares × current_price vs. cost basis recorded as
-          split.value).
-        - FX translation adjustment on foreign-currency accounts
-          (current default-currency value vs. historical default-
-          currency equivalent at post time).
-
-        Both are accumulated-other-comprehensive-income items
-        under GAAP. Surfacing the decomposition is a future
-        feature; the single line preserves the balance-sheet
-        identity for any mix.
-
-        Args:
-            as_of_date: Date to calculate balances as of. The
-                inclusive upper bound — transactions posted on
-                ``as_of_date`` are included. FX rates and
-                commodity prices are anchored to the same date for
-                a coherent historical view.
+        ``as_of_date`` is the inclusive upper bound; FX rates and
+        commodity prices anchor to the same date for a coherent
+        historical view.
 
         Returns:
-            Dict with ``assets``, ``liabilities``, ``equity``
-            sections (each a list of account rows) and ``totals``
-            (assets, liabilities, equity, with ``equity`` already
-            including the Unrealized line so totals balance).
+            Dict with ``assets`` / ``liabilities`` / ``equity``
+            sections, each carrying a total and account rows;
+            equity already includes the Unrealized line so the
+            totals balance.
         """
-        # Sum splits across every relevant type in one SQL-filtered
-        # pass. The old code opened Python loops per account; now we
-        # hit the splits table once with an IN() clause and bucket the
-        # results in memory. Net income (Income - Expenses) is
-        # retained-earnings-equivalent and rolls into equity below.
+        # One SQL-filtered pass over every relevant type, bucketed in
+        # memory. Net income (retained-earnings-equivalent) rolls
+        # into equity below.
         all_types = (
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
         )
         with self.open(readonly=True) as book:
-            # Historical balance_sheet must use rates as of the same
-            # date the balances are computed for. Pre-v1.3 release
-            # this fetched today's rates against historical
-            # quantities — SB-2.
+            # Rates as of the report date — never today's rates
+            # against historical quantities.
             factors = self._account_conversion_factors(book, as_of_date)
             rows = self._query_filtered_splits(
                 book,
@@ -526,33 +422,26 @@ class ReportingMixin:
                 account_types=all_types,
             )
 
-            # Track per-account: (acct_type, USD-converted balance,
-            # commodity-quantity, account ref). The quantity / commodity
-            # bits are needed to render the "230.7600 VTSAX @ 156.23
-            # (USD 36,043.66)" triplet for non-default-currency accounts
-            # (Phase 4B). Currency-default accounts ignore that detail.
+            # Per-account: type, converted balance, plus quantity /
+            # commodity for the "230.76 VTSAX @ 156.23 (USD …)"
+            # triplet on non-default-currency rows.
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
                 # Voided by state, not value: a well-formed void
                 # contributes 0 anyway; the corrupted partial-void
                 # shape (state='v', non-zero values) must not move
-                # the sheet when cash_flow / lots can't see it (C8).
+                # the sheet when cash_flow / lots can't see it.
                 if _is_voided(split):
                     continue
                 # Placeholder accounts are NOT skipped: there is no
                 # roll-up in this report, so direct splits on a
                 # placeholder — rare but legal — are real money no
-                # other row represents. The SB-8 skip guarded a
+                # other row represents. Skipping them would guard a
                 # double-count this code never produces; with the
-                # balancing-residual equity line it silently deleted
-                # the dropped asset instead (adversarial pass 2, C1).
-                # Same own-splits-per-account rule as ``net_worth``
-                # and ``_compute_net_worth_at``.
-                # Value the split in the book's default currency so
-                # investment shares (VTSAX @ $128, etc.) and foreign-
-                # currency holdings contribute their market/USD value
-                # to balance-sheet totals rather than raw share counts.
+                # balancing-residual equity line it silently deletes
+                # the dropped asset instead. Same own-splits rule as
+                # ``net_worth`` and ``_compute_net_worth_at``.
                 amt = self._split_in_default_currency(
                     split, account, factors.get(account.guid)
                 )
@@ -573,19 +462,10 @@ class ReportingMixin:
                 balances[key]["quantity"] += split.quantity
 
             default_currency = self._require_default_currency(book)
-            # Latest market rates keyed by commodity guid — same data
-            # ``_market_value`` in get_book_summary uses for the per-
-            # account display. ``_rates_as_of`` excludes piecash
-            # auto-created ``type='transaction'`` prices. ``as_of=
-            # as_of_date`` so a historical balance sheet renders
-            # each non-default-currency holding at the rate it would
-            # have been valued at on the report date — not today's
-            # rate (SB-2).
+            # Display rates anchored to the report date, market
+            # prices only (see _rates_as_of).
             latest_rates = self._rates_as_of(book, as_of_date)
-            # Provenance for any rate synthesized through an
-            # intermediate currency (issue #94), so a chained value
-            # renders "@ rate (… via USD)" — distinguishing a derived
-            # cross from a directly-quoted rate the reader entered.
+            # "(via …)" provenance for chained rates.
             rate_via = self._rate_provenance(
                 book, as_of_date, default_currency,
             )
@@ -618,32 +498,11 @@ class ReportingMixin:
             )
 
             # ── Unrealized gain/loss (balancing adjustment) ──────────
-            # Assets render at market value (factor × quantity for
-            # commodities and foreign-currency cash). Equity rolls
-            # up from the splits' raw values, which capture the
-            # historical-cost view. The two views differ by:
-            #
-            # 1. **Investment market drift** — STOCK/MUTUAL holdings
-            #    on a default-currency-denominated brokerage have
-            #    market value (shares × current_price) above or
-            #    below the recorded cost basis (split.value, in
-            #    default currency).
-            # 2. **FX translation adjustment** — foreign-currency
-            #    accounts have current default-currency value
-            #    (quantity × current_FX_rate) that drifts from the
-            #    historical default-currency equivalent at post
-            #    time. Same effect on both sides of foreign-
-            #    currency transactions, but cross-currency
-            #    settlements introduce per-currency imbalances.
-            #
-            # Both effects belong under the same equity adjustment in
-            # GAAP terms (accumulated other comprehensive income).
-            # Computed as the balancing residual so A = L + E holds
-            # by construction, regardless of the underlying mix.
-            # Surfacing the decomposition (how much is investment
-            # drift vs. how much is FX) is a separate feature; for
-            # the balance sheet's purpose ("does it balance?"), the
-            # single line is sufficient.
+            # Computed as the residual
+            # assets − liabilities − equity − net_income, so
+            # A = L + E holds by construction regardless of the mix
+            # of investment drift and FX translation — see the
+            # docstring for the decomposition.
             equity_acct_total = (
                 sum(i["usd"] for i in equity.values()) if equity else Decimal("0")
             )
@@ -656,25 +515,13 @@ class ReportingMixin:
             def format_accounts(accounts_dict: dict[str, dict]) -> list[dict]:
                 """Render each account row with the right balance shape.
 
-                Currency-default accounts:
-                  ``{"account": name, "balance": "5234.56"}``.
-                  No ``usd_value`` — it would just repeat ``balance``.
-
-                Non-currency accounts (STOCK / MUTUAL / FUND): the
-                ``balance`` field shows the human-readable triplet
-                ``"230.7600 VTSAX @ 156.23 (USD 36,043.66)"`` — same
-                format ``get_book_summary`` uses — and ``usd_value``
-                carries the parseable number rounded to 2 decimals so
-                programmatic callers don't have to parse the triplet.
-
-                All numeric outputs flow through ``_format_number``
-                (currency-style: 2 decimals always padded). Pre-fix
-                the per-account values leaked Decimal precision noise
-                (e.g. ``"612011.489832"``) into responses.
+                Default-currency accounts: ``{"account", "balance"}``.
+                Non-currency accounts: ``balance`` is the readable
+                triplet ``"230.76 VTSAX @ 156.23 (USD 36,043.66)"``
+                and ``default_currency_value`` carries the parseable
+                number. Numbers flow through ``_format_number`` so
+                responses don't leak Decimal precision noise.
                 """
-                # Default-currency mnemonic for the triplet rendering.
-                # Pre-fix this hardcoded "USD"; on a CNY-default book
-                # that lied about the currency on every investment row.
                 ccy_mnemonic = default_currency.mnemonic
                 rows = []
                 for name, info in sorted(accounts_dict.items()):
@@ -700,17 +547,12 @@ class ReportingMixin:
                                 f"{via_note})"
                             )
                         else:
-                            # No price on file — fall back to cost basis
-                            # already accumulated in ``info['usd']``.
+                            # No price — cost basis already
+                            # accumulated in info['usd'].
                             balance_str = (
                                 f"{qty} {sym} ({ccy_mnemonic} "
                                 f"{info['usd']:,.2f}, no price data)"
                             )
-                        # ``default_currency_value`` carries the
-                        # parseable amount in the book's default
-                        # currency. Pre-fix this field was named
-                        # ``usd_value`` — a lie on non-USD books.
-                        # Renamed to reflect the actual semantics.
                         rows.append({
                             "account": name,
                             "balance": balance_str,
@@ -718,13 +560,9 @@ class ReportingMixin:
                         })
                 return rows
 
-            # as_of_date is also an input echo, but it's cheap and
-            # useful when a log is reviewed out of context. `balanced`
-            # ``balanced`` is derivable (assets == liabilities + equity)
-            # and was dropped in an earlier audit pass. Rollup totals
-            # flow through ``_format_number`` (2 decimals, currency
-            # style) so the response no longer leaks Decimal precision
-            # noise like ``"612011.489832"``.
+            # as_of_date is an input echo, kept — cheap and useful
+            # when a log is reviewed out of context. A ``balanced``
+            # field would be derivable and is deliberately omitted.
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {
@@ -744,13 +582,8 @@ class ReportingMixin:
                         }]
                         if net_income != 0 else []
                     ) + (
-                        # Synthetic — closes A = L + E when assets
-                        # render at market value. Single signed line
-                        # (positive = unrealized gain; negative =
-                        # unrealized loss) keeps the report compact
-                        # and matches how analytical accounting
-                        # treats it under "Accumulated OCI" before
-                        # a mark-to-market entry is booked.
+                        # Synthetic, signed line — positive =
+                        # unrealized gain (see docstring).
                         [{
                             "account": "Unrealized Gain/Loss",
                             "balance": _format_number(unrealized, decimals=2),
@@ -791,15 +624,10 @@ class ReportingMixin:
                 )
                 total = Decimal("0")
                 for split, _txn, account in rows:
-                    # Voided-by-state filter — same rule as
-                    # balance_sheet (C8 read-side).
                     if _is_voided(split):
                         continue
-                    # Liabilities are stored negative, so adding the
-                    # converted amount directly gives assets minus
-                    # liabilities. Investments and foreign-currency
-                    # holdings are valued in the book's default
-                    # currency via their latest market price.
+                    # Liabilities are stored negative, so a direct
+                    # sum gives assets minus liabilities.
                     total += self._split_in_default_currency(
                         split, account, factors.get(account.guid)
                     )
@@ -821,9 +649,8 @@ class ReportingMixin:
                 "year": relativedelta(years=1),
             }[interval]
 
-            # Build the list of interval boundaries up-front. Every
-            # boundary gets a net_worth snapshot below; end_date is
-            # appended if the interval didn't land on it naturally.
+            # Interval boundaries up-front; end_date appended if the
+            # interval didn't land on it naturally.
             boundaries: list[date] = []
             cursor = start_date
             while cursor <= end_date:
@@ -832,31 +659,19 @@ class ReportingMixin:
             if not boundaries or boundaries[-1] != end_date:
                 boundaries.append(end_date)
 
-            # Per-boundary factors. Pre-v1.3 (and through commit 4 of
-            # this branch) this method computed a single factors map
-            # outside the sweep and applied it uniformly to every
-            # boundary — wrong, because each historical snapshot
-            # should be valued at the rate of its own date, not
-            # today's (SB-1). Pre-computing here trades O(boundaries)
-            # extra factors-builds for correctness: each call walks
-            # ``book.prices`` once with a different upper-bound date.
+            # Per-boundary factors — each historical snapshot values
+            # at the rate of its own date, not today's. Costs
+            # O(boundaries) factors-builds; correctness over speed.
             factors_by_boundary: dict[date, dict[str, Decimal | None]] = {
                 b: self._account_conversion_factors(book, b)
                 for b in boundaries
             }
 
-            # Pull every asset/liability split up through end_date in
-            # post_date order. With per-boundary factors the same
-            # split contributes a different default-currency value at
-            # each boundary (factor × quantity for boundaries that
-            # have a rate on file, split.value fallback for boundaries
-            # that don't). We can't carry a single ``running`` total
-            # forward like the pre-fix algorithm did; instead we track
-            # per-account quantity AND value running totals and
-            # convert at snapshot time using that boundary's factors.
-            # Cost: O(splits + boundaries × accounts_with_splits) —
-            # still much cheaper than the original O(intervals × splits)
-            # and correct under per-boundary rates.
+            # Single pass in post_date order. Under per-boundary
+            # rates a single running total can't be carried forward;
+            # track per-account quantity AND value totals and convert
+            # at snapshot time with that boundary's factors. Cost:
+            # O(splits + boundaries × accounts_with_splits).
             rows = self._query_filtered_splits(
                 book,
                 end_date=end_date,
@@ -868,13 +683,10 @@ class ReportingMixin:
             running_value: dict[str, Decimal] = {}
 
             def _snapshot_at(boundary: date) -> Decimal:
-                """Net worth at ``boundary`` using factors as of that
-                date. Per-account: factor × quantity when a rate is
-                on file; cost-basis fallback (split.value sum)
-                otherwise — same disambiguation
-                ``_split_in_default_currency`` uses per-split, lifted
-                to per-account so the boundary sweep stays a single
-                pass over the splits."""
+                """Net worth at ``boundary`` using that date's
+                factors: per-account factor × quantity, cost-basis
+                fallback — ``_split_in_default_currency``'s
+                disambiguation lifted to account level."""
                 factors_here = factors_by_boundary[boundary]
                 total = Decimal("0")
                 for acct_guid, qty in running_qty.items():
@@ -889,7 +701,7 @@ class ReportingMixin:
             b_idx = 0
 
             for split, txn, account in rows:
-                # MP-8: snapshot every boundary STRICTLY BEFORE
+                # Snapshot every boundary STRICTLY BEFORE
                 # this split. The strict ``>`` is correct and
                 # deliberate: a boundary equal to a split's
                 # post_date includes that split in its snapshot
@@ -912,14 +724,11 @@ class ReportingMixin:
                         "net_worth": str(_snapshot_at(boundaries[b_idx])),
                     })
                     b_idx += 1
-                # Voided-by-state filter (C8 read-side) — placed
-                # after the boundary advance so a voided split still
-                # flushes due snapshots, just never accumulates.
+                # Voided filter placed after the boundary advance so
+                # a voided split still flushes due snapshots, just
+                # never accumulates.
                 if _is_voided(split):
                     continue
-                # Accumulate per-account quantity AND value. Both are
-                # kept so ``_snapshot_at`` can pick the right view
-                # (rate-based vs cost-basis) at each boundary.
                 acct_guid = account.guid
                 running_qty[acct_guid] = (
                     running_qty.get(acct_guid, Decimal("0"))
@@ -930,8 +739,8 @@ class ReportingMixin:
                     + Decimal(str(split.value))
                 )
 
-            # Drain any boundaries past the last split — same running
-            # totals, but each boundary still uses its own factors.
+            # Drain boundaries past the last split — each still uses
+            # its own factors.
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
@@ -955,57 +764,34 @@ class ReportingMixin:
     ) -> dict:
         """Calculate cash flow (inflows and outflows) for a period.
 
-        Scope: aggregates over BANK and CASH accounts only (the
-        ``_CASH_TYPES`` set). Credit-card movements are liability
-        changes, investment movements are asset rearrangements —
-        neither is "cash flow" in the bookkeeper's sense and they
-        belong on balance-sheet-style reports, not here. A caller
-        passing an explicit ``account=`` of any type still works
-        (that's their choice), but the default scope is intentionally
-        narrow.
+        Scope: BANK and CASH accounts only. Credit-card movements
+        are liability changes and investment movements asset
+        rearrangements — not "cash flow" in the bookkeeper's sense.
+        An explicit ``account=`` of any type still works.
 
-        By default, internal transfers between cash/bank accounts
-        are filtered out. A transaction with no INCOME or EXPENSE
-        leg is a pure rearrangement — transfer to savings, currency
-        wallet shuffle, paying down a credit card from checking —
-        neither inflow nor outflow in cash-flow terms. Filtering
-        that noise is what makes the totals answer "where did money
-        come from and where did it go?" rather than "every debit
-        and credit that touched a cash account, including same-
-        pocket reshuffling." SB-5.
-
-        Invoice/bill settlements (lot-linked A/R / A/P legs) count
-        as real flow despite having no income/expense split — the
-        income was recognized at post time, and the payment is when
-        the cash actually moved (C4). See ``_cashflow_txn_guids``.
+        By default, internal transfers (transactions with no INCOME
+        or EXPENSE leg — savings transfers, wallet shuffles, card
+        paydowns) are filtered out so the totals answer "where did
+        money come from and go?" rather than echoing same-pocket
+        reshuffling. Invoice/bill settlements still count as real
+        flow despite having no income/expense split — see
+        ``_cashflow_txn_guids``.
 
         Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            account: Optional account to filter to a single
-                cash/bank account.
-            include_transfers: When ``False`` (default), skip
-                transactions with no INCOME or EXPENSE split. When
-                ``True``, include every cash/bank movement — useful
-                for reconciliation against a bank statement, which
-                shows every debit and credit regardless of category.
+            start_date / end_date: Period bounds (inclusive).
+            account: Optional single-account filter.
+            include_transfers: True includes every cash movement —
+                useful for reconciling against a bank statement.
 
         Returns:
-            Dict with ``account``, ``inflows``, ``outflows``, and —
-            when any transfers were filtered —
-            ``transfers_excluded``: the count of distinct
-            cash-touching transactions skipped as transfers (each
-            counted once regardless of how many cash-side splits it
-            has; pure-rearrangement transactions that don't touch a
-            BANK/CASH account aren't reachable from this report and
-            therefore can't appear in the count). Surfaced so the
-            LLM can mention the ``include_transfers=true`` escape
-            hatch when relevant.
+            ``{account, inflows, outflows}`` plus, when transfers
+            were filtered, ``transfers_excluded`` — the count of
+            distinct cash-touching transactions skipped (surfaced so
+            the LLM can mention the ``include_transfers`` escape
+            hatch).
         """
         with self.open(readonly=True) as book:
-            # Two filter modes: a named account (one-GUID IN() clause)
-            # or the default "all cash/bank accounts" (account-type
-            # IN() clause). Both push the filter to SQL.
+            # Named-account or all-cash filter; both push to SQL.
             if account:
                 target_account = self._resolve_account(book, account)
                 if not target_account:
@@ -1024,13 +810,8 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
-            # SB-5: build the set of transaction GUIDs in the
-            # period that have at least one INCOME or EXPENSE
-            # split — the "real" cash flow events. Transactions
-            # outside this set are internal transfers (pure
-            # asset/liability/equity rearrangement) and get
-            # filtered unless include_transfers is True. One
-            # indexed SQL query — no N+1 over txn.splits.
+            # GUIDs of "real" cash-flow transactions; everything
+            # else is a transfer unless include_transfers.
             if not include_transfers:
                 cashflow_txn_guids = self._cashflow_txn_guids(
                     book, start_date, end_date
@@ -1038,20 +819,14 @@ class ReportingMixin:
             else:
                 cashflow_txn_guids = None  # don't filter
 
-            # Factors anchored to ``end_date`` — same historical-
-            # rates discipline as the period breakdowns.
             factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
             outflows = Decimal("0")
             transfers_excluded: set[str] = set()
             for split, txn, acct in rows:
-                # Voided splits (state='v', value=quantity=0) are
-                # zombies, not active cash flow. Skip before the
-                # transfer-vs-real classification so they don't
-                # inflate ``transfers_excluded`` for voided-transfer
-                # txns or pollute the inflow/outflow accumulators
-                # for voided-income/expense txns — symmetric
-                # treatment regardless of which leg type was voided.
+                # Skip voided splits BEFORE the transfer-vs-real
+                # classification so they neither inflate
+                # transfers_excluded nor pollute the accumulators.
                 if _is_voided(split):
                     continue
                 if cashflow_txn_guids is not None \
@@ -1066,12 +841,9 @@ class ReportingMixin:
                 elif amt < 0:
                     outflows += -amt
 
-            # period is input echo (LLM supplied dates), net is derivable
-            # (inflows - outflows). Both dropped.
-            #
-            # Echo the canonical fullname rather than the raw input —
-            # so callers passing %short or full-GUID input always see
-            # a readable account name in the response.
+            # period (input echo) and net (derivable) are dropped.
+            # The canonical fullname is echoed so %short/GUID input
+            # still yields a readable name.
             result = {
                 "account": (
                     target_account.fullname if account
@@ -1091,33 +863,25 @@ class ReportingMixin:
         end_date: date,
     ) -> set[str]:
         """Set of transaction GUIDs in the period that count as real
-        cash-flow events rather than internal transfers.
+        cash-flow events rather than internal transfers (the
+        ``cash_flow`` filter).
 
-        Used by ``cash_flow`` to filter "internal transfer" noise
-        from the default report — see that method's docstring
-        for the rationale (SB-5).
+        Two qualifying shapes:
 
-        Two qualifying shapes (C4):
+        1. A non-voided INCOME or EXPENSE split — ordinary
+           earn/spend.
+        2. A non-voided **lot-linked** RECEIVABLE/PAYABLE split —
+           an invoice/bill settlement. Structurally a transfer, but
+           it IS the revenue receipt; an income/expense-only filter
+           drops it unless FX drift happens to add a realized-FX
+           split, making classification depend on rate movement.
+           The lot link is deterministic; manual A/R adjustments
+           without a lot stay transfers.
 
-        1. A non-voided INCOME or EXPENSE split — the ordinary
-           earn/spend event.
-        2. A non-voided **lot-linked** RECEIVABLE / PAYABLE split —
-           an invoice/bill settlement. Income was recognized at post
-           time (A/R ↔ Income never touches cash), so the payment is
-           A/R ↔ bank: structurally a transfer, but it IS the
-           revenue receipt. Pre-fix these were filtered out — unless
-           FX drift happened to add a realized-FX income split,
-           which rescued that one payment and made classification
-           depend on rate movement. Keying on the lot link is
-           deterministic and pulls every settlement into the flow;
-           manual A/R adjustments without a lot stay transfers.
-
-        Routes through ``_query_filtered_splits`` to inherit the
-        date-bound fix, template-account exclusion, and null-
-        post_date filter — the chokepoint discipline this project
-        adopted in Branch 1. The voided-split filter is applied
-        Python-side so a voided salary or expense doesn't
-        rescue a zombie transaction from the transfer filter.
+        Routes through ``_query_filtered_splits`` for the inclusive
+        bound and template/null-date filters; the voided filter is
+        Python-side so a voided leg can't rescue a zombie
+        transaction.
         """
         rows = self._query_filtered_splits(
             book,
@@ -1222,38 +986,24 @@ class ReportingMixin:
         additional_purchase: str | None = None,
         compact: bool = True,
     ) -> dict | str:
-        """Calculate an avalanche-method debt payoff schedule with YETI multiplier.
+        """Calculate an avalanche-method debt payoff schedule with
+        YETI multiplier.
 
-        Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
-
-        YETI (Your Expense's True Impact) answers: "A $1.00 purchase will cost
-        you $X.XX by the time your debt is paid off."
+        Auto-discovers CREDIT/LIABILITY accounts with an 'apr' slot.
+        YETI (Your Expense's True Impact) answers: "a $1.00 purchase
+        will cost you $X.XX by the time your debt is paid off."
 
         Args:
-            monthly_budget: Total monthly amount available for all debt payments.
-            additional_purchase: Dollar amount to calculate YETI for (default "1.00").
-            compact: If True (default), return a compact text-table summary
-                     suitable for the LLM context window — kill order,
-                     totals, YETI all in ~10 lines. Verbose mode returns
-                     the full structured dict (the legacy shape) for
-                     programmatic consumers.
-
-        Returns:
-            If compact: text summary, e.g.::
-
-                Kill order ($10,000/mo → debt-free Apr 2030, $59,022 interest):
-                  1. Business Amex    $13,091  24.49%  payoff: mo 8   interest: $1,125
-                  2. Chase Sapphire   $22,127  21.49%  payoff: mo 18  interest: $5,034
-                  ...
-                YETI at this budget: 1.59x ($1 spent costs $1.59 in total debt impact)
-                Total interest: $59,022
-                Debt-free: April 2030
-
-            If not compact: dict with the original full structure.
+            monthly_budget: Total monthly amount for all debt payments.
+            additional_purchase: Amount to compute YETI for
+                (default "1.00").
+            compact: Kill-order text table (default — see
+                ``_format_debt_payoff_compact`` for the layout) or
+                the full structured dict.
 
         Raises:
-            ValueError: If no debt accounts found, budget invalid, or budget
-                        less than sum of minimum payments.
+            ValueError: no debt accounts found, invalid budget, or
+                budget below the sum of minimum payments.
         """
         budget = _to_decimal(monthly_budget)
         if budget <= 0:
@@ -1268,37 +1018,23 @@ class ReportingMixin:
             raise ValueError("additional_purchase must be a positive number")
 
         with self.open(readonly=True) as book:
-            # Capture the book's default currency for the compact
-            # formatter — pre-fix this method emitted ``$`` regardless
-            # of book setting, breaking on non-USD books.
             default_currency_mnemonic = (
                 self._require_default_currency(book).mnemonic
             )
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
-            # MP-9: track whether ANY debt-typed account exists, so
-            # the no-debts error can distinguish "no CREDIT/LIABILITY
+            # Counted so the no-debts error distinguishes "no debt
             # accounts at all" from "they exist but lack the apr
-            # slot" — the user's next action differs sharply
-            # between those cases.
+            # slot" — the user's next action differs.
             debt_typed_account_count = 0
 
-            # Template accounts (scheduled-transaction
-            # scaffolding) inherit type=CREDIT/LIABILITY from
-            # their parent in the user's chart and could
-            # technically carry an ``apr`` slot if anyone managed
-            # to set one — pathological but possible. Filter
-            # upfront so the avalanche schedule never includes
-            # template balances. Defense-in-depth, not a bug fix.
+            # Defense-in-depth template filter (a template could
+            # theoretically carry an apr slot).
             template_guids = self._template_account_guids(book)
 
-            # FX chokepoint: per-account conversion factors so a
-            # foreign-currency debt is valued in the book default
-            # currency (rate × quantity, cost-basis fallback) instead
-            # of summing raw foreign units. "Now" report → today's
-            # rates. Pre-fix this summed raw split.quantity, the lone
-            # reporting-layer method that bypassed the FX helper used by
-            # balance_sheet / net_worth / cash_flow.
+            # FX factors so a foreign-currency debt values in the
+            # book default instead of raw foreign units. "Now"
+            # report → today's rates.
             debt_factors = self._account_conversion_factors(
                 book, date.today()
             )
@@ -1310,12 +1046,8 @@ class ReportingMixin:
                     continue
                 debt_typed_account_count += 1
 
-                # Materialize ``account.slots`` into a dict once. Pre-fix,
-                # each ``account[key]`` access (apr, minimum_payment,
-                # credit_limit — three per account) went through piecash's
-                # slot-helper path, hitting the slots collection
-                # independently per key. One iteration + three dict gets
-                # is cheaper.
+                # Materialize slots once — three account[key]
+                # accesses each re-walk the slots collection.
                 slot_by_name = {s.name: s for s in account.slots}
 
                 apr_val = slot_by_name.get("apr")
@@ -1330,13 +1062,9 @@ class ReportingMixin:
                 if apr <= 0:
                     continue
 
-                # Calculate current balance in the book default currency
-                # (negate because liabilities are stored negative).
-                # "Now" report: future-dated transactions are excluded
-                # (C5) — a payment scheduled for next week hasn't
-                # reduced today's payoff balance — and voided splits
-                # are excluded by state. Null post_date rows (old-book
-                # artifact) can't be dated, so they're skipped too.
+                # Balance in book default, today-capped (a payment
+                # scheduled next week hasn't reduced today's payoff
+                # balance); voided and null-date splits excluded.
                 today = date.today()
                 balance = Decimal("0")
                 for split in account.splits:
@@ -1355,9 +1083,8 @@ class ReportingMixin:
 
                 min_payment = None
 
-                # 1. Check minimum_payment slot (user override).
-                #    Wins for both CREDIT and LIABILITY — the user has
-                #    declared the contractual amount.
+                # 1. minimum_payment slot — user-declared contractual
+                #    amount wins for both types.
                 mp_val = slot_by_name.get("minimum_payment")
                 if mp_val is not None:
                     try:
@@ -1365,14 +1092,10 @@ class ReportingMixin:
                         min_payment = Decimal(mp_str)
                     except InvalidOperation:
                         pass
-                # Slots store untagged scalars; the convention is
-                # the ACCOUNT's commodity (matching the dashboard's
-                # utilization math, which compares credit_limit to
-                # the account-commodity balance). The plan's math
-                # runs in book default currency, so convert with the
-                # same factor the balance used (A3) — pre-fix a
-                # ¥2,000 minimum was treated as $2,000 and skewed
-                # the feasibility gate and the avalanche schedule.
+                # Slot scalars are in the ACCOUNT's commodity by
+                # convention; the plan's math runs in book default —
+                # convert with the balance's factor, or a ¥2,000
+                # minimum reads as $2,000 and skews the schedule.
                 if min_payment is not None:
                     slot_factor = debt_factors.get(account.guid)
                     if slot_factor is not None and slot_factor != 1:
@@ -1380,15 +1103,10 @@ class ReportingMixin:
                             min_payment * slot_factor
                         ).quantize(Decimal("0.01"))
 
-                # 2. Type-aware fallback. Credit cards and amortizing
-                #    loans have very different minimum-payment shapes:
-                #    CREDIT cards charge ~2% of balance (revolving,
-                #    no fixed term), while LIABILITY loans are
-                #    contractually fixed payments derived from
-                #    principal × rate × term (mortgage, auto, student).
-                #    Applying the 2% rule to a mortgage produces a
-                #    minimum that's ~3-4× the actual payment, which
-                #    makes the budget-vs-minimums gate trip on any
+                # 2. Type-aware fallback: CREDIT cards charge ~2% of
+                #    balance; LIABILITY loans amortize. Applying the
+                #    2% rule to a mortgage yields ~3-4× the actual
+                #    payment and trips the budget gate on any
                 #    realistic household budget.
                 if min_payment is None:
                     if account.type == "CREDIT":
@@ -1399,14 +1117,11 @@ class ReportingMixin:
                         if balance < Decimal("25"):
                             min_payment = balance
                     else:
-                        # LIABILITY: standard amortization formula.
-                        # PMT = P × r(1+r)^n / ((1+r)^n − 1)
-                        # Term defaults: 30 years if "mortgage" appears
-                        # anywhere in the account path (Liabilities:
-                        # Mortgage, Loans:Mortgage:Principal, etc.),
-                        # else 5 years (auto, personal, etc.). Users
-                        # with non-standard terms should set the
-                        # minimum_payment slot explicitly.
+                        # LIABILITY: amortization formula
+                        # PMT = P × r(1+r)^n / ((1+r)^n − 1).
+                        # Term: 30y when "mortgage" appears in the
+                        # path, else 5y; non-standard terms should
+                        # set the minimum_payment slot.
                         is_mortgage = "mortgage" in account.fullname.lower()
                         term_months = 360 if is_mortgage else 60
                         monthly_rate = (
@@ -1421,7 +1136,7 @@ class ReportingMixin:
                         if min_payment > balance:
                             min_payment = balance
 
-                credit_limit = None  # account-ccy slot; converted below (A3)
+                credit_limit = None  # account-ccy slot; converted below
                 cl_val = slot_by_name.get("credit_limit")
                 if cl_val is not None:
                     try:
@@ -1439,18 +1154,14 @@ class ReportingMixin:
                     "name": account.fullname,
                     "balance": balance,
                     "apr": apr,
-                    # Pre-compute monthly rate once per debt. _run_avalanche's
-                    # inner loop iterates up to 1200 months, and pre-fix
-                    # recomputed apr/100/12 every iteration for every debt
-                    # that still had a balance.
+                    # Pre-computed once — _run_avalanche's loop runs
+                    # up to 1200 months per debt.
                     "monthly_rate": apr / Decimal("100") / Decimal("12"),
                     "min_payment": min_payment,
                     "credit_limit": credit_limit,
                 })
 
         if not debts:
-            # MP-9: distinguish the two failure modes so the LLM's
-            # next action is right.
             if debt_typed_account_count == 0:
                 raise ValueError(
                     "No CREDIT or LIABILITY accounts found in the "

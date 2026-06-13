@@ -32,19 +32,10 @@ from gnucash_mcp._format import _apply_limit
 def _commodity_quantum(commodity) -> Decimal:
     """Smallest representable unit of a commodity, as a Decimal quantum.
 
-    Pre-fix, every cross-currency conversion in this module hardcoded
-    ``Decimal("0.01")`` — implicitly assuming 2-decimal currencies
-    (USD, EUR, GBP, CNY). The hardcode silently corrupts:
-
-    - **JPY** (``fraction=1``): a ¥1,234.50 conversion would round to
-      ¥1,234.50 stored, but JPY can't represent half-yen — every
-      cross-currency JPY transaction loses the rounding direction.
-    - **BHD / KWD** (``fraction=1000``, 3 decimals): a 100.123 BHD
-      input is silently rounded to 100.12, losing 3 mils per
-      conversion.
-
-    Now derives the quantum from ``commodity.fraction`` (piecash
-    stores 100 for USD, 1 for JPY, 1000 for BHD, 10000 for shares).
+    Derived from ``commodity.fraction`` (piecash stores 100 for USD,
+    1 for JPY, 1000 for BHD, 10000 for shares). A hardcoded
+    ``Decimal("0.01")`` would silently corrupt non-2-decimal
+    currencies — half-yen amounts on JPY, lost mils on BHD/KWD.
     """
     fraction = getattr(commodity, "fraction", 100)
     if fraction <= 1:
@@ -55,28 +46,15 @@ def _commodity_quantum(commodity) -> Decimal:
 def _safe_invoice_date(inv, attr: str):
     """Read an invoice datetime column defensively.
 
-    Returns the datetime when the named column holds a real value,
-    or ``None`` when it's NULL, empty, or malformed enough that
-    piecash's ``_DateTime`` TypeDecorator raises ``ValueError`` on
-    access.
+    Returns the datetime when the named column holds a real value;
+    ``None`` when it's NULL, empty, or malformed enough that
+    piecash's ``_DateTime`` TypeDecorator raises ``ValueError``.
 
-    The bookkeeper hit the underlying piecash bug on Alex
-    Chen-Morales's book: a freshly auto-id'd bill's
-    ``date_posted`` came back as ``''`` in SQL. SQLAlchemy's
-    regex-based DATETIME parser raises "Couldn't parse datetime
-    string" when reading that — a hard crash on a never-posted
-    document. Same failure mode applies verbatim to
-    ``date_opened`` (and any future ``_DateTime``-typed column on
-    invoices). One helper, parameterized on the attribute name,
-    covers every caller.
-
-    Args:
-        inv: piecash Invoice / Bill ORM object.
-        attr: Attribute name — typically ``"date_posted"`` or
-            ``"date_opened"``.
-
-    Returns:
-        Datetime when populated and parseable, ``None`` otherwise.
+    The piecash hazard: a freshly auto-id'd bill's ``date_posted``
+    can come back as ``''`` in SQL, and SQLAlchemy's regex-based
+    DATETIME parser hard-crashes reading it. Same failure mode for
+    ``date_opened`` and any other ``_DateTime`` column; one helper,
+    parameterized on the attribute name, covers every caller.
     """
     try:
         value = getattr(inv, attr)
@@ -88,10 +66,9 @@ def _safe_invoice_date(inv, attr: str):
 def _is_invoice_posted(inv) -> bool:
     """True iff ``inv`` has a real datetime in ``date_posted``.
 
-    Single chokepoint for "is this document posted?" across the
-    business module. Built on ``_safe_invoice_date`` so the
-    tolerant semantics (None / "" / unparseable values all read
-    as not-posted) apply uniformly.
+    The single "is this document posted?" chokepoint. Built on
+    ``_safe_invoice_date``, so None / "" / unparseable all read
+    as not-posted.
     """
     return _safe_invoice_date(inv, "date_posted") is not None
 
@@ -112,9 +89,8 @@ def _format_vendor_spending_compact(
         JetBrains      1 bill     USD 289 billed    USD 289 paid  USD 0 outstanding
         TOTAL          5 bills  USD 2,089 billed  USD 2,089 paid  USD 0 outstanding
 
-    Currency prefix flows from the book's default currency. "1 bill" vs
-    "N bills" pluralization keeps the line natural to read. Width-padded
-    so the four amount columns align across rows.
+    Currency prefix is the book's default; the amount columns are
+    width-aligned across rows.
     """
     if not vendors_list:
         return "No vendor activity in period."
@@ -171,23 +147,14 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     Format per row:
 
         000028  Berlin Digital GmbH  EUR 4,200  posted:2026-02-01  due:2026-03-03  55 days past due
-        000011  BookkeepingCo (BILL)  USD 450  posted:2026-03-15  due:2026-04-14  13 days past due
-        000035  Emerald Analytics (CN)  USD 500  posted:2026-05-15  credit available
 
-    Action columns are the win here: ``due:`` and the days-past-due
-    count tell the bookkeeper exactly which invoice is bleeding the
-    most days, without forcing a separate calculation. ``(BILL)`` is
-    appended to vendor-bill owners so receivables and payables don't
-    get confused at a glance. ``(CN)`` marks credit notes — their
-    ``amount_due`` represents the unsettled credit balance
-    (available to apply via ``apply_credit_note`` or refund via
-    ``pay_invoice``), not money owed by the customer/vendor. The
-    "due_date" column reads as "credit available" instead of a
-    past-due count to make that semantic distinction explicit.
-
-    When the due date came from the 30-day default (``no_terms`` flag),
-    the days count is anchored to the assumption ("days past 30-day
-    default") rather than reading as contractual.
+    ``(BILL)`` tags vendor bills so receivables and payables read
+    apart at a glance. ``(CN)`` marks credit notes — their amount is
+    unsettled credit available to apply or refund, not money owed,
+    so the due column reads "credit available" instead of an aging
+    count. When the due date came from the 30-day default
+    (``no_terms``), the days count says "past 30-day default" so it
+    doesn't read as contractual.
     """
     if not rows:
         return ""
@@ -195,23 +162,14 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
     for r in rows:
         owner = r.get("owner_name") or f"#{r['id']}"
         is_credit_note = r.get("is_credit_note", False)
-        # Owner suffix communicates the document side. Credit
-        # notes win over BILL because the credit-note semantic
-        # is more important — a "(CN)" tag tells the reader the
-        # whole amount column reads as "available credit" not
-        # "amount owed."
+        # (CN) wins over (BILL): the credit-note tag changes how
+        # the whole amount column reads.
         if is_credit_note:
             owner = f"{owner} (CN)"
         elif r.get("type") == "bill":
             owner = f"{owner} (BILL)"
-        # Job annotation — appended after any (CN)/(BILL) tag
-        # so a row that's both a credit note AND job-attached
-        # reads as ``Customer (CN) (job:JOB-001)``, or a plain
-        # vendor bill in a job as ``Vendor (BILL) (job:JOB-001)``.
-        # ``(CN)`` and ``(BILL)`` are mutually exclusive per the
-        # if/elif above — credit notes are flagged via (CN)
-        # regardless of side. (Copilot PR #88 review caught the
-        # original comment showing them together.)
+        # Job annotation appends after any (CN)/(BILL) tag:
+        # ``Customer (CN) (job:JOB-001)``.
         job_id = r.get("job_id")
         if job_id:
             owner = f"{owner} (job:{job_id})"
@@ -220,11 +178,8 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         amount_dec = Decimal(r.get("amount_due") or "0")
         amount_str = f"{int(amount_dec):,}" if amount_dec == int(amount_dec) else f"{amount_dec:,.2f}"
         posted = r.get("date_posted") or "?"
-        # Credit notes don't have a "due date" concept the way
-        # invoices/bills do — they sit as available credit until
-        # applied or refunded. Replace the due column with that
-        # semantic so a reviewer scanning the list immediately
-        # sees the difference.
+        # Credit notes have no due date — they sit as available
+        # credit until applied or refunded.
         if is_credit_note:
             action_str = "  credit available"
             lines.append(
@@ -234,7 +189,7 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
             continue
         # Overpaid doc: the counterparty holds a credit, so the
         # aging-clock columns would invite double-collection.
-        # Surface the direction explicitly instead (C2).
+        # Surface the direction explicitly instead.
         if r.get("overpaid"):
             lines.append(
                 f"{r['id']}\t{owner}\t{ccy} {amount_str}\t"
@@ -246,12 +201,8 @@ def _format_outstanding_invoices_compact(rows: list[dict]) -> str:
         if days is None:
             days_str = ""
         elif days > 0:
-            # Two phrasings — "X days past due" reads as contractual
-            # (the user agreed to a date and missed it), "X days past
-            # 30-day default" anchors the duration to the assumption
-            # we made when no term was set. Pre-fix the templating
-            # concatenated "days past " with another "past due" so
-            # the contractual case rendered as "days past past due".
+            # "past due" reads as contractual; "past 30-day default"
+            # anchors to the assumption when no term was set.
             if r.get("no_terms"):
                 days_str = f"  {days} days past 30-day default"
             else:
@@ -276,10 +227,9 @@ class BusinessMixin:
     def _find_customer(book, customer_id: str):
         """Find a customer by their human-readable ID (e.g., '000001').
 
-        Uses an indexed ``filter_by`` query rather than scanning
-        ``book.customers``. The ORM-backed CallableList iteration
-        was a real hot-path cost in business workflows that look up
-        the same customer multiple times per write.
+        Indexed ``filter_by`` query, not a ``book.customers`` scan —
+        a real hot-path cost in workflows that look up the same
+        customer repeatedly.
         """
         from piecash.business.person import Customer
         return book.session.query(Customer).filter_by(id=customer_id).first()
@@ -311,18 +261,14 @@ class BusinessMixin:
     @staticmethod
     def _find_invoice_owner_by_guid(book, owner_type: int, guid: str):
         """Find any invoice/bill/voucher owner by their (type, guid)
-        pair. Picks the right table to query based on owner_type.
+        pair. ``invoices.owner_guid`` is a generic FK — the row
+        points at the customer/vendor/employee/job table depending
+        on ``owner_type``; this helper picks the right table.
 
-        ``invoices.owner_guid`` is a generic FK — the row points at
-        the customer/vendor/employee/job table depending on
-        ``owner_type``. Centralizing the picker keeps the four-way
-        dispatch out of every callsite that needs the owner's name.
-
-        For owner_type=3 (Job), the helper chases through the Job
-        to return the underlying customer/vendor — that's the
-        counterparty a bookkeeper cares about. Callers that need
-        the Job itself (e.g. to surface ``job: {id, name}``)
-        should query Job directly via ``_find_job_by_guid``.
+        For owner_type=3 (Job), chases through the Job to the
+        underlying customer/vendor — the counterparty a bookkeeper
+        cares about. Callers that need the Job itself should use
+        ``_find_job_by_guid``.
         """
         if owner_type == 2:
             return BusinessMixin._find_customer_by_guid(book, guid)
@@ -347,12 +293,10 @@ class BusinessMixin:
     FX_GAIN_LOSS_PATH = "Income:Foreign Exchange Gain/Loss"
 
     # Substrings that identify a user-named FX gain/loss account on
-    # the leaf-name match below. Books in the wild use a wide range
-    # of names — "FX Gain Loss", "Currency Translation", "Foreign
-    # Exchange Gain/Loss", etc. — and the canonical name above is
-    # only one convention among many. Bare ``currency`` is excluded
-    # deliberately: too many books have accounts like "Foreign
-    # Currency Cash" that aren't gain/loss accounts.
+    # the leaf-name match. Books in the wild use many conventions
+    # ("FX Gain Loss", "Currency Translation", …). Bare ``currency``
+    # is excluded deliberately — accounts like "Foreign Currency
+    # Cash" aren't gain/loss accounts.
     _FX_NAME_KEYWORDS = (
         "fx",
         "forex",
@@ -366,17 +310,12 @@ class BusinessMixin:
 
     # ── Early-payment discount account convention ────────────────────
     #
-    # Standard small-business GAAP routing for early-payment discounts.
-    # Customer-side: discount given is an expense to the seller (the
-    # cost of getting paid faster). Vendor-side: discount taken on a
-    # supplier bill is income (a cost reduction).
-    #
+    # Standard small-business GAAP routing: a discount given to a
+    # customer is an expense (the cost of getting paid faster); a
+    # discount taken on a supplier bill is income (a cost reduction).
     # Larger businesses sometimes prefer contra-revenue / contra-
-    # expense treatment (Income:Sales Discounts Given as a negative
-    # against Revenue). The bookkeeper's call for v1.3 was the small-
-    # business convention below; the user can override via the
-    # ``discount_account`` parameter on pay_invoice if they want
-    # contra accounts instead.
+    # expense treatment — the ``discount_account`` parameter on
+    # pay_invoice overrides the default routing.
     SALES_DISCOUNTS_PATH = "Expenses:Sales Discounts"
     PURCHASE_DISCOUNTS_PATH = "Income:Purchase Discounts Taken"
 
@@ -398,37 +337,29 @@ class BusinessMixin:
     def _get_or_create_fx_account(self, book, fx_account: str | None = None):
         """Find or lazily create the FX-gain/loss account.
 
-        Returns ``(account, notice)`` where ``notice`` is ``None`` in
-        the unambiguous cases and a dict describing the ambiguity
-        when the fuzzy match found multiple candidates and we fell
-        back to the canonical default.
+        Returns ``(account, notice)``; ``notice`` is ``None`` except
+        when the fuzzy match found multiple candidates and fell back
+        to the canonical default.
 
         Resolution order:
 
         1. **Explicit ``fx_account``** (path, ``%short``, or full
-           GUID) — caller wants a specific account. Validated for
-           existence and INCOME/EXPENSE type, then used.
+           GUID) — validated for existence and INCOME/EXPENSE type.
         2. **Fuzzy match**, leaf-name substring against
            ``_FX_NAME_KEYWORDS`` over INCOME/EXPENSE accounts:
-           - Exactly one match → use it.
-           - Zero matches → fall through to the canonical default
-             (existing path lookup, then auto-create if absent).
-           - More than one match → fall through to the canonical
-             default *and* return a notice asking the caller to
-             pass ``fx_account`` next time. Don't guess between
-             user-created accounts.
+           exactly one match → use it; zero → fall through; more
+           than one → fall through *and* return a notice asking the
+           caller to pass ``fx_account``. Don't guess between
+           user-created accounts.
         3. **Canonical default**: existing ``Income:Foreign Exchange
-           Gain/Loss`` if present, else auto-create it under
-           ``Income``.
-
-        Created on first cross-currency pay whose post-date rate
-        differs from its pay-date rate, so books without foreign-
-        currency activity never accumulate an unused account.
+           Gain/Loss``, else auto-create it under ``Income`` — so
+           books without foreign-currency activity never accumulate
+           an unused account.
 
         Raises:
-            ValueError: If ``fx_account`` is supplied but doesn't
-                exist or isn't INCOME/EXPENSE; or if no fuzzy match
-                exists and the parent ``Income`` account is missing.
+            ValueError: ``fx_account`` supplied but missing or not
+                INCOME/EXPENSE; or no ``Income`` parent to create
+                under.
         """
         # Layer 1: caller-supplied account wins.
         if fx_account is not None:
@@ -516,24 +447,15 @@ class BusinessMixin:
     ):
         """Find or lazily create the early-payment-discount account.
 
-        Direct parallel to ``_get_or_create_fx_account`` — same three-
-        layer resolution (explicit > fuzzy match > canonical default
-        with optional auto-create).
+        Direct parallel to ``_get_or_create_fx_account`` — same
+        three-layer resolution (explicit > fuzzy match > canonical
+        default with auto-create) and the same ``(account, notice)``
+        return shape.
 
-        Args:
-            owner_type_is_bill: When True, we're paying a vendor bill
-                (or refunding a customer credit note) and the discount
-                is INCOME (Purchase Discounts Taken). When False,
-                customer invoice payment and the discount is EXPENSE
-                (Sales Discounts). Same effective_is_bill the rest of
-                pay_invoice uses.
-            discount_account: Optional override (path, %short, full
-                GUID). Validated for existence and INCOME/EXPENSE
-                type.
-
-        Returns ``(account, notice)`` where ``notice`` is None unless
-        the fuzzy match found multiple candidates and we fell back to
-        the canonical default — same shape as the FX helper.
+        ``owner_type_is_bill`` selects the side: True → vendor-bill
+        payment (or customer credit-note refund), discount is INCOME
+        (Purchase Discounts Taken); False → customer invoice
+        payment, discount is EXPENSE (Sales Discounts).
         """
         if owner_type_is_bill:
             canonical_path = self.PURCHASE_DISCOUNTS_PATH
@@ -629,12 +551,9 @@ class BusinessMixin:
     def _get_invoice_billterm(self, book, inv):
         """Return the piecash Billterm linked to the invoice, or None.
 
-        Reads the ``terms`` column via raw SQL — same pattern as
-        :meth:`_resolve_invoice_due_date`, because the ORM
-        ``inv.terms`` relationship has historical reliability issues
-        depending on access path. Returns the Billterm ORM object so
-        the caller can read ``.duedays``, ``.discountdays``,
-        ``.discount`` directly.
+        Reads the ``terms`` column via raw SQL — the ORM
+        ``inv.terms`` relationship is reliable only through specific
+        access paths (same pattern as ``_resolve_invoice_due_date``).
         """
         from sqlalchemy import text
         from piecash.business.invoice import Billterm
@@ -656,31 +575,24 @@ class BusinessMixin:
         """Return discount summary for an invoice, or None when not
         applicable.
 
-        The summary is what ``get_invoice`` verbose mode surfaces and
-        what ``pay_invoice`` validation references. Pure read; no
-        side effects. None when:
-        - Invoice isn't posted (date_posted needed for the window
-          calculation)
-        - Invoice has no billterm linkage
-        - Billterm has no discount configured (discountdays == 0 or
-          discount == 0)
+        Surfaced by ``get_invoice`` verbose mode and referenced by
+        ``pay_invoice`` validation. Pure read. None when the invoice
+        isn't posted, has no billterm, or the billterm has no
+        discount configured.
 
         Returned dict shape::
 
             {
                 "discount_days": int,
                 "discount_percent": Decimal,
-                "expected_discount": Decimal,  # subtotal × pct / 100,
-                                                # in invoice currency,
-                                                # quantized
+                "expected_discount": Decimal,  # in invoice currency
                 "eligible_until": date,
-                "currency": str,                # invoice currency mnemonic
+                "currency": str,
             }
 
-        ``expected_discount`` is computed off the pre-tax ``subtotal``
-        per the bookkeeper-validated convention: GST/PST is collected
-        on behalf of the tax authority at the gross rate and is NOT
-        reduced by the discount. Discounting tax would short the
+        ``expected_discount`` is computed off the pre-tax
+        ``subtotal`` deliberately: tax is collected on behalf of the
+        authority at the gross rate; discounting it would short the
         remittance.
         """
         if not _is_invoice_posted(inv):
@@ -726,23 +638,17 @@ class BusinessMixin:
     @staticmethod
     def _rate_from_post_transaction(post_txn, target_commodity):
         """Derive the exchange rate from post_txn currency to
-        ``target_commodity`` by inspecting the post transaction's
-        splits for one whose account commodity matches the target.
-        The ratio of |quantity| (account commodity) to |value|
-        (transaction currency) is the rate that was in force at
-        posting.
+        ``target_commodity`` from the post transaction's own splits:
+        the ratio |quantity| / |value| on a split whose account
+        commodity matches the target is the rate in force at posting.
 
-        Pre-fix this method took just ``(post_txn,
-        invoice_currency)`` and returned the rate of the FIRST
-        non-invoice-currency split — which in a multi-cross-currency
-        post (e.g., EUR invoice with USD income + GBP A/R) would
-        silently pick whichever split happened to come first. Now
-        requires an explicit target so the caller gets the rate they
-        actually want.
+        The explicit target matters: taking the FIRST
+        non-invoice-currency split would, in a multi-cross-currency
+        post (EUR invoice with USD income + GBP A/R), silently pick
+        whichever split comes first.
 
         Returns the Decimal rate, or None if no matching split is
-        present (caller should fall back to the price table at
-        post-date).
+        present (caller falls back to the price table at post-date).
         """
         for s in post_txn.splits:
             if s.account.commodity != target_commodity:
@@ -772,84 +678,50 @@ class BusinessMixin:
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
 
-        When ``pay_invoice`` settles a foreign-currency invoice and the
-        exchange rate has moved between post-date and pay-date, the
-        actual amount received (customer) or spent (vendor) differs
-        from what was originally recorded as income/expense at posting.
-        That delta is realized FX gain or loss; this helper computes
-        it, converts to book-default currency, and prepares the split
-        that ``pay_invoice`` will append to the payment transaction.
+        When ``pay_invoice`` settles a foreign-currency invoice and
+        the rate moved between post-date and pay-date, the amount
+        actually received/spent differs from what was recorded at
+        posting. This helper computes that delta, converts it to the
+        book default currency, and prepares the split
+        ``pay_invoice`` appends to the payment transaction.
 
-        Caller invariants: ``exchange_rate`` is non-None (the cross-
-        currency path is already taken); ``pay_quantity`` and
-        ``payment_amount`` have been quantized to their respective
-        commodities; ``inv.post_txn`` exists (the invoice is posted).
+        Caller invariants: ``exchange_rate`` is non-None (the
+        cross-currency path is already taken); ``pay_quantity`` and
+        ``payment_amount`` are already quantized; ``inv.post_txn``
+        exists.
 
-        Args:
-            book: Open piecash book.
-            inv: Posted Invoice / Bill ORM object.
-            is_bill: True for vendor bills, False for customer invoices.
-            pay_acct: piecash Account being debited or credited
-                (the bank/cash side of the payment).
-            payment_amount: Payment value in invoice currency.
-            pay_quantity: Payment quantity in ``pay_acct.commodity``.
-            parsed_date: Payment date.
-            exchange_rate: The pay-date rate from invoice currency to
-                pay-account commodity (already applied to compute
-                ``pay_quantity``).
-            fx_account: Optional override account ref for the FX
-                gain/loss split. Resolved via
-                :meth:`_get_or_create_fx_account`.
-            default_currency: The book's default currency commodity.
-            discount_amount: Early-payment discount in invoice
-                currency (``0`` when no discount applied).
-            discount_quantity: The discount split's unsigned quantity
-                in ``discount_commodity`` (booked at the pay-date
-                rate). ``None`` when no discount.
-            discount_commodity: The discount account's commodity.
-                The discount leg's drift — ``discount ×
-                (pay_rate − post_rate)`` — is realized FX exactly
-                like the payment leg's; pre-fix it was booked
-                nowhere, leaving assets ≠ equity by that amount on
-                any cross-currency discount settlement (C10
-                companion).
+        The discount leg (``discount_amount`` / ``discount_quantity``
+        / ``discount_commodity``) carries the same drift as the
+        payment leg — ``discount × (pay_rate − post_rate)`` is
+        realized FX too; leaving it unbooked puts assets ≠ equity by
+        that amount on any cross-currency discount settlement.
 
         Returns:
-            ``None`` when no FX split should be booked:
-
-            - No rate-at-post available (the post transaction had no
-              matching split and the price table has nothing on the
-              invoice's post date). Pay-side amount still records
-              correctly; FX delta is simply not surfaced.
-            - Realized delta is below the smallest representable unit
-              in default currency (e.g., < $0.01 USD, < ¥1 JPY).
-
-            Otherwise returns a dict::
+            ``None`` when no FX split should be booked: no
+            rate-at-post available (post txn had no matching split
+            and no price on the post date — the payment still
+            records; the delta just isn't surfaced), or the delta is
+            below the default currency's smallest unit. Otherwise::
 
                 {
-                    "split": piecash.Split,        # ready to append
-                    "fx_diff_default": Decimal,     # signed delta in default ccy
-                    "fx_acct": piecash.Account,     # account the split posts to
-                    "fx_notice": str | None,        # set when the matcher
-                                                    # found multiple candidates
-                                                    # and fell back to canonical
+                    "split": piecash.Split,     # ready to append
+                    "fx_diff_default": Decimal, # signed, default ccy
+                    "fx_acct": piecash.Account,
+                    "fx_notice": str | None,    # multi-candidate fallback
                 }
 
-            Sign convention on ``fx_diff_default``: positive means the
-            **pay-side commodity received more units than expected at
-            the post-date rate**. For customer invoices that's a gain;
-            for vendor bills it's a loss. The Split's ``quantity``
-            sign-flips appropriately so the account ends up credited
-            (gain) or debited (loss) in the conventional direction.
+            Sign convention on ``fx_diff_default``: positive means
+            the pay-side commodity received more units than expected
+            at the post-date rate — a gain for customer invoices, a
+            loss for vendor bills. The Split's ``quantity`` sign
+            flips so the account is credited (gain) or debited
+            (loss) conventionally.
         """
-        # Find the rate that was applied at posting (invoice currency
-        # → pay_acct.commodity). First try the post transaction's own
-        # splits — most accurate, because if the price table was re-
-        # quoted after posting the realized gain should use the
-        # original posting rate. When the post txn has no split in
-        # ``pay_acct.commodity`` (third-currency pay account case:
-        # post used a different non-invoice commodity for A/R or
-        # income), fall back to the price table at post-date.
+        # Rate at posting: prefer the post transaction's own splits
+        # (if the price table was re-quoted after posting, realized
+        # gain must still use the original posting rate); fall back
+        # to the price table at post-date when the post txn has no
+        # split in ``pay_acct.commodity`` (third-currency pay account).
         rate_at_post = self._rate_from_post_transaction(
             inv.post_txn, pay_acct.commodity,
         )
@@ -876,13 +748,10 @@ class BusinessMixin:
         ).quantize(_commodity_quantum(pay_acct.commodity))
         fx_diff_pay = pay_quantity - expected_at_post
 
-        # Convert to the book default currency before booking — the FX
-        # account has commodity=default, and a quantity in any other
-        # commodity would be silently treated as default by every
-        # report that reads this account. Pre-fix triple-currency case
-        # (book=USD, invoice=EUR, pay=GBP): a £5 GBP gain landed on a
-        # USD-commodity FX account as quantity=5, rendered as "$5
-        # gain" — silently wrong.
+        # Convert to book default before booking: the FX account's
+        # commodity is the default, so a quantity in any other
+        # commodity (book=USD, invoice=EUR, pay=GBP: a £5 gain)
+        # would render as "$5" — silently wrong.
         if pay_acct.commodity != default_currency:
             pay_to_default_rate = self._find_exchange_rate(
                 book,
@@ -891,17 +760,11 @@ class BusinessMixin:
                 as_of=parsed_date,
             )
             if pay_to_default_rate is None:
-                # HP-5: missing third-currency rate. Mirror the
-                # ``rate_at_post`` branch above (which returns
-                # None when no rate is available) — skip the FX
-                # booking gracefully instead of raising. The
-                # payment itself still records correctly; only
-                # the realized FX delta is not surfaced. Raising
-                # here blocked the entire payment write path for
-                # the rare triple-currency case (book=USD,
-                # invoice=EUR, pay=GBP, no GBP→USD rate on file)
-                # which is worse than silently omitting the
-                # gain/loss split.
+                # Missing third-currency rate: skip the FX booking
+                # gracefully (mirror the rate_at_post branch above).
+                # Raising here would block the entire payment over
+                # an unsurfaced gain/loss split — worse than
+                # omitting it.
                 return None
             fx_diff_default = (
                 fx_diff_pay * pay_to_default_rate
@@ -909,15 +772,10 @@ class BusinessMixin:
         else:
             fx_diff_default = fx_diff_pay
 
-        # Discount leg (C10 companion). Same shape as the payment
-        # leg: the discount expense/income was booked at the
-        # pay-date rate while the A/R it helped relieve was carried
-        # at the post-date rate; the difference is realized FX.
-        # Skipped when the discount is denominated in the invoice
-        # currency itself (no conversion → no drift) or when a
-        # needed rate is missing (mirror the graceful-skip
-        # convention above — the payment still records, only the
-        # delta isn't surfaced).
+        # Discount leg: booked at the pay-date rate while the A/R it
+        # relieved was carried at the post-date rate — the difference
+        # is realized FX. Skipped when the discount is in the invoice
+        # currency (no drift) or a needed rate is missing.
         if (
             discount_amount > 0
             and discount_quantity is not None
@@ -1004,10 +862,9 @@ class BusinessMixin:
     def _find_job(book, job_id: str):
         """Find a job by its human-readable ID (e.g., '000001').
 
-        Indexed lookup. Returns None if no job has the given ID.
-        Unlike invoices, job IDs are unambiguous across owner
-        types — a single ``counter_job`` advances regardless of
-        whether the job is for a customer or vendor.
+        Unlike invoices, job IDs are unambiguous across owner types
+        — a single ``counter_job`` advances for customer and vendor
+        jobs alike.
         """
         from piecash.business.invoice import Job
         return book.session.query(Job).filter_by(id=job_id).first()
@@ -1016,10 +873,8 @@ class BusinessMixin:
     def _find_taxtable(book, name: str):
         """Find a Taxtable by exact name.
 
-        Taxtables are keyed by name across the book — there is no
-        per-jurisdiction or per-entity namespace. A book has at most
-        one taxtable named "GST 5%" and lookups are O(log n) via the
-        unique-name index. Returns None if not found; callers raise.
+        Taxtable names are unique book-wide — no per-jurisdiction
+        namespace. Returns None if not found; callers raise.
         """
         from piecash.business.tax import Taxtable
         return book.session.query(Taxtable).filter_by(name=name).first()
@@ -1045,19 +900,10 @@ class BusinessMixin:
     def _parse_owner_type(owner_type: str | None) -> int | None:
         """Map an owner_type string to its piecash integer code.
 
-        ``None`` → ``None`` (caller wants no filter).
-        ``"customer"`` → 2.
-        ``"vendor"`` → 4.
-        ``"employee"`` → 5.
-
-        Anything else raises ``ValueError`` with a message that
-        names the three valid options. ``"employee"`` (added in
-        v1.3 with the vouchers feature) is the third counterparty
-        type in piecash's invoice/bill/voucher polymorphic
-        table — see ``counter_exp_voucher`` in piecash's Book
-        model. Pre-vouchers this returned a "not yet supported"
-        error explicitly to give the LLM a useful hint; now it's
-        a first-class type.
+        ``None`` → ``None`` (no filter); ``"customer"`` → 2;
+        ``"vendor"`` → 4; ``"employee"`` → 5 (the third counterparty
+        type in piecash's polymorphic invoice table). Anything else
+        raises ``ValueError`` naming the valid options.
         """
         if owner_type is None:
             return None
@@ -1076,46 +922,31 @@ class BusinessMixin:
     def _find_invoice(book, invoice_id: str, owner_type: int | None = None):
         """Find an invoice/bill by human-readable ID.
 
-        Self-heals malformed ``date_posted=''`` values to NULL on
-        writable sessions before the ORM query runs. piecash's
-        ``_DateTime`` TypeDecorator's regex parser raises
-        ``ValueError: Couldn't parse datetime string: ''`` when
-        loading a row whose ``date_posted`` is an empty string —
-        a hard crash that blocks every subsequent invoice/bill
-        operation. The bookkeeper hit this on Alex Chen-Morales's
-        book where a freshly auto-id'd bill's ``date_posted``
-        landed as ``''`` instead of NULL through some persistence
-        path. Coercing to NULL upstream of the query is the only
-        reliable fix; the ORM never sees the malformed value.
-
-        piecash doesn't expose a readonly flag, so the heal is
-        always attempted; the try/except absorbs the failure when
-        the session is readonly. Books that need healing must be
-        touched through a write operation at least once; after
-        that, the cleanup persists and readonly operations
-        succeed too.
+        Self-heals malformed ``date_posted=''`` values to NULL
+        before the ORM query runs: piecash's ``_DateTime``
+        TypeDecorator hard-crashes loading a row whose
+        ``date_posted`` is an empty string (a state some persistence
+        paths leave on auto-id'd bills), blocking every subsequent
+        invoice operation. piecash exposes no readonly flag, so the
+        heal is always attempted and the try/except absorbs the
+        failure on readonly sessions — one write operation heals the
+        book permanently.
 
         Args:
             book: piecash Book instance.
             invoice_id: Human-readable ID (e.g., '000001').
             owner_type: Filter by owner type (2=customer, 4=vendor).
-                        None requires the ID to be unambiguous across
-                        types — see Raises.
+                        None requires the ID to be unambiguous —
+                        see Raises.
 
         Raises:
             ValueError: When ``owner_type=None`` and the ID matches
-                both a customer invoice *and* a vendor bill. GnuCash
-                runs the two as separate ID sequences sharing one
-                ``invoices`` table, so collisions are normal — both
-                can legitimately be id ``"000003"``. Pre-fix this
-                returned whichever row the query happened to surface
-                first, silently routing reads/writes to the wrong
-                document. The bookkeeper hit this on a CNY book
-                where ``get_invoice("000003")`` returned a customer
-                invoice's CNY currency for what was actually a USD
-                vendor bill. The error lists candidates with their
-                type and currency so the caller can pass
-                ``owner_type`` to disambiguate.
+                multiple documents. Customer and vendor sequences
+                share one ``invoices`` table, so collisions are
+                normal; returning whichever row surfaces first would
+                silently route writes to the wrong document. The
+                error lists candidates so the caller can pass
+                ``owner_type``.
         """
         from piecash.business.invoice import Invoice
         from sqlalchemy import text
@@ -1136,26 +967,13 @@ class BusinessMixin:
 
         query = book.session.query(Invoice).filter(Invoice.id == invoice_id)
         if owner_type is not None:
-            # Job-attached invoices have owner_type=3 internally
-            # — the owner_guid points at a Job, which in turn
-            # points at the customer or vendor. From the
-            # bookkeeper's perspective, those invoices are still
-            # customer/vendor invoices (just grouped). So an
-            # owner_type=2 lookup must match BOTH direct
-            # customer invoices (owner_type=2) AND job-attached
-            # invoices whose job has owner_type=2.
-            #
-            # Pre-fix: ``add_invoice_entry`` /
-            # ``delete_invoice`` / etc. all filter by
-            # owner_type=2 and would have failed with "Invoice
-            # not found" on any invoice attached to a job. Fix:
-            # build a subquery of job GUIDs matching the
-            # requested owner_type and OR it in.
-            #
-            # Employee (owner_type=5) is exempt — piecash's job
-            # model is customer/vendor only, so vouchers can't
-            # be job-attached. The lookup degrades to the
-            # original direct-match filter.
+            # An owner_type=2/4 lookup must match BOTH direct
+            # documents AND job-attached ones (owner_type=3 whose
+            # Job carries the requested owner_type) — without the
+            # job-GUID subquery, every owner_type-filtered tool
+            # fails "not found" on job-attached invoices. Employee
+            # (owner_type=5) is exempt: piecash jobs are
+            # customer/vendor only.
             from sqlalchemy import and_, or_
             from piecash.business.invoice import Job
             if owner_type in (2, 4):
@@ -1171,18 +989,14 @@ class BusinessMixin:
                 )).first()
             return query.filter(Invoice.owner_type == owner_type).first()
 
-        # owner_type=None: caller didn't disambiguate. Pull all
-        # matches and fail loud on collision rather than silently
-        # picking the first one (which depends on row order /
-        # piecash internals — non-deterministic from the caller's
-        # perspective).
+        # owner_type=None: pull all matches and fail loud on
+        # collision rather than returning a row-order-dependent pick.
         matches = query.all()
         if len(matches) <= 1:
             return matches[0] if matches else None
 
         candidates = []
-        # Three-way label dispatch — collisions can now include
-        # vouchers since v1.3 added the third owner_type.
+        # Collisions can include vouchers — label all three types.
         _COLLISION_LABELS = {
             2: "customer invoice",
             4: "vendor bill",
@@ -1202,22 +1016,15 @@ class BusinessMixin:
 
     @staticmethod
     def _address_to_dict(entity) -> dict:
-        """Build an address dict from a piecash Customer/Vendor, omitting
-        any empty fields and dropping the `fax` field entirely (it's 2026).
+        """Build an address dict from a piecash Customer/Vendor,
+        omitting empty fields and dropping ``fax`` entirely.
 
-        Returns {} when no address data is set — caller should drop the
-        whole "address" key rather than emit an empty dict, since
-        _strip_noise leaves empty dicts in place.
+        Returns {} when no address data is set — caller should drop
+        the whole "address" key rather than emit an empty dict.
 
-        **Note on round-trips:** if a caller passes ``fax`` to
-        ``create_customer`` / ``update_customer`` (and the symmetric
-        vendor / employee paths) the value is accepted by piecash
-        and stored on disk, but it does NOT round-trip back through
-        this serializer. ``get_customer`` / ``list_customers`` won't
-        return it. Intentional — fax exists in piecash's schema for
-        compatibility with old GnuCash books but isn't a field
-        modern bookkeepers use. If a real workflow needs fax
-        readback, this serializer would gain a ``fax`` line.
+        ``fax`` is write-only by design: the create/update paths
+        accept and store it, but it never round-trips back through
+        this serializer.
         """
         fields = {
             "name": entity.addr_name,
@@ -1234,12 +1041,11 @@ class BusinessMixin:
     def _customer_to_dict(customer) -> dict:
         """Convert a piecash Customer to a serializable dict.
 
-        Business-object GUIDs are deliberately omitted from the
-        response. Bookkeeper-validated finding: every consumer
-        addresses customers via ``id`` (human-readable, like
-        "000001"); the 32-char GUID is dead weight on every read.
-        Same treatment applies to vendor, employee, job, billterm,
-        taxtable, invoice, and entry response shapes.
+        Business-object GUIDs are omitted from responses: every
+        consumer addresses these entities by human-readable ``id``,
+        so the 32-char GUID is dead weight. The same rule covers
+        vendor, employee, job, billterm, taxtable, invoice, and
+        entry response shapes.
         """
         result = {
             "id": customer.id,
@@ -1275,13 +1081,10 @@ class BusinessMixin:
     def _employee_to_dict(employee) -> dict:
         """Convert a piecash Employee to a serializable dict.
 
-        Employee's schema has no ``notes`` column (unlike Customer
-        and Vendor — see specs/PIECASH_REFERENCE.md), so the response
-        shape omits the ``notes`` key. Employee-specific fields
-        (``acl`` / ``language`` / ``workday`` / ``rate``) are out of
-        scope for the 1.3.0 CRUD surface and are not serialized.
-
-        ``guid`` omitted — see _customer_to_dict for the rationale.
+        Employee's schema has no ``notes`` column (unlike Customer/
+        Vendor), so the response omits the key. Employee-specific
+        fields (``acl``/``language``/``workday``/``rate``) are not
+        serialized. ``guid`` omitted — see _customer_to_dict.
         """
         result = {
             "id": employee.id,
@@ -1313,22 +1116,16 @@ class BusinessMixin:
     def _job_to_dict(job, owner_name: str | None = None) -> dict:
         """Convert a piecash Job to a serializable dict.
 
-        The job's ``owner_type`` is stored as the underlying
-        customer (2) or vendor (4) — we surface that as a
-        human-readable ``owner_type`` string for symmetry with
-        every other tool's owner-typed response. ``owner_name``
-        is resolved by the caller (static-method shape can't
-        query the session).
-
-        ``guid`` omitted — see _customer_to_dict for the rationale.
+        The stored ``owner_type`` (2/4) is surfaced as the
+        human-readable string for symmetry with other owner-typed
+        responses. ``owner_name`` is resolved by the caller (a
+        staticmethod can't query the session). ``guid`` omitted.
         """
         return {
             "id": job.id,
             "name": job.name,
             "reference": job.reference or "",
             "active": bool(job.active),
-            # Map back to the human label — Customer/Vendor only
-            # since piecash's PersonType is {Vendor:4, Customer:2}.
             "owner_type": (
                 "customer" if job.owner_type == 2 else "vendor"
             ),
@@ -1339,12 +1136,9 @@ class BusinessMixin:
     def _job_to_compact_line(job, owner_name: str | None = None) -> str:
         """One-line compact: ``id  name  CUSTOMER/VENDOR  owner_name``.
 
-        The owner tag (CUSTOMER / VENDOR) is the differentiator
-        a bookkeeper would scan for — customer jobs and vendor
-        jobs serve different purposes (revenue-side vs cost-side).
-        Active/inactive isn't shown — list_jobs filters by
-        active_only at the call site, so a row appearing in the
-        list is implicitly active unless include_inactive was set.
+        The owner tag is what a bookkeeper scans for — customer jobs
+        are revenue-side, vendor jobs cost-side. Active state isn't
+        shown; list_jobs filters by active_only upstream.
         """
         owner_tag = (
             "CUSTOMER" if job.owner_type == 2 else "VENDOR"
@@ -1377,13 +1171,10 @@ class BusinessMixin:
     ) -> dict:
         """Serialize a TaxtableEntry to a dict.
 
-        Args:
-            tte: piecash TaxtableEntry object.
-            account_paths: Optional ``{account_guid: fullname}`` map.
-                When present, the entry's ``account`` field is the
-                resolved path (readable); otherwise the raw GUID
-                appears as ``account_guid``. Same pattern as
-                ``_entry_to_dict``.
+        When ``account_paths`` (``{account_guid: fullname}``) is
+        given, the entry's ``account`` field is the resolved path;
+        otherwise the raw GUID appears as ``account_guid``. Same
+        pattern as ``_entry_to_dict``.
         """
         result = {
             "id": tte.id,
@@ -1406,16 +1197,11 @@ class BusinessMixin:
     ) -> dict:
         """Serialize a Taxtable to a dict.
 
-        Args:
-            tt: piecash Taxtable object.
-            account_paths: Optional ``{account_guid: fullname}`` map
-                covering every entry's account. Pre-built by the
-                caller (one query rather than N).
-            refcount: Optional computed-from-SQL refcount. The
-                stored ``Taxtable.refcount`` column tracks GnuCash
-                desktop's bookkeeping; the SQL-computed value is
-                authoritative for lifecycle checks. When given,
-                replaces the stored value in the response.
+        ``account_paths`` is pre-built by the caller (one query
+        rather than N). ``refcount``, when given, replaces the
+        stored ``Taxtable.refcount`` column in the response — the
+        stored value tracks GnuCash desktop's bookkeeping; the
+        SQL-computed value is authoritative for lifecycle checks.
         """
         entries = [
             BusinessMixin._taxtable_entry_to_dict(
@@ -1436,21 +1222,14 @@ class BusinessMixin:
     def _decimal_to_num_denom(value: Decimal) -> tuple[int, int]:
         """Convert a Decimal to numerator/denominator pair.
 
-        Uses the decimal's exponent to determine appropriate denominator.
         E.g., ``Decimal("25.50")`` → ``(2550, 100)``.
 
-        Defensive normalization through ``Decimal(str(value))`` guards
-        against scientific-notation Decimals
-        (``Decimal("1.5E-3")``) where ``as_tuple().exp`` reports the
-        scientific exponent rather than the printed decimal places.
-        Practically unreachable from current call sites — entry
-        quantities and prices come through ``_to_decimal(str(...))``
-        which produces clean fixed-point Decimals — but the
-        normalization makes the helper safe in isolation if a
-        future caller hands in a sci-notation value.
+        Normalizes through ``Decimal(str(value))`` first: a
+        scientific-notation Decimal (``1.5E-3``) reports the
+        scientific exponent in ``as_tuple().exp``, not the printed
+        decimal places. Unreachable from current call sites, but
+        the normalization keeps the helper safe in isolation.
         """
-        # Normalize: Decimal(str(value)) re-parses through the
-        # printed form, so 1.5E-3 becomes 0.0015 with exp=-4.
         value = Decimal(str(value))
         sign, digits, exp = value.as_tuple()
         if exp < 0:
@@ -1472,51 +1251,24 @@ class BusinessMixin:
     ) -> dict:
         """Convert a piecash Invoice to a serializable dict.
 
-        ``owner_type`` (numeric 2/4/5) was redundant with the
-        human-readable ``type`` field and is dropped. ``is_posted``
-        is derivable from ``date_posted`` (non-null = posted) and
-        is dropped too. Phase 3C: ``owner_guid`` (raw 32-char hex)
-        is dropped in favor of ``owner_name`` resolved by the caller
-        — the same readability swap we did for entry account refs.
+        Dropped fields: numeric ``owner_type`` (redundant with
+        ``type``), ``is_posted`` (derivable from ``date_posted``),
+        ``owner_guid`` (replaced by caller-resolved ``owner_name``),
+        ``guid``.
 
-        Credit-note keys (``is_credit_note``, ``applies_to``) are
-        emitted only when set, so normal invoices/bills/vouchers
-        get the same shape they had before v1.3.
+        Conditional keys — emitted only when set, so normal
+        documents keep their original shape: ``is_credit_note`` /
+        ``applies_to`` (credit notes), ``job`` (job-attached
+        invoices), ``entries``, ``tax_summary``.
 
-        Job linkage (``job`` field) is emitted only when the
-        invoice is grouped under a Job (owner_type=3). The
-        ``type`` field stays semantic (invoice/bill) — for
-        job-attached invoices we look through the Job to its
-        underlying customer/vendor to decide whether this is a
-        customer invoice or vendor bill. From the bookkeeper's
-        perspective, "Berlin Digital's invoice under the API
-        Rewrite job" is still an invoice; the job is grouping
-        metadata.
-
-        Args:
-            invoice: piecash Invoice object.
-            entries: Optional list of entry dicts. If ``None``, entries
-                are not included.
-            owner_name: Resolved customer/vendor/employee name.
-                For job-attached invoices, this is the underlying
-                customer/vendor name (the job's owner), resolved
-                by the caller through ``_find_invoice_owner_by_guid``
-                which chases owner_type=3 through to the real owner.
-            applies_to: For credit notes only, the ``{id, type}`` dict
-                naming the source invoice.
-            job: For job-attached invoices only, the ``{id, name}``
-                dict naming the grouping job. Caller resolves via
-                ``_find_job_by_guid(book, invoice.owner_guid)``
-                when ``invoice.owner_type == 3``.
+        For job-attached invoices the ``type`` field stays semantic
+        (invoice/bill per the job's underlying customer/vendor); the
+        ``job`` kwarg carries the caller's resolution (a staticmethod
+        can't query the session), and ``owner_name`` is the
+        underlying counterparty via ``_find_invoice_owner_by_guid``.
         """
-        # Type resolution: owner_type 2/4/5 maps directly. For
-        # owner_type=3 (Job), the semantic type follows the job's
-        # underlying owner — customer-job → "invoice", vendor-job
-        # → "bill". The ``job`` kwarg carries that resolution from
-        # the caller (we can't query the session from a staticmethod).
         if invoice.owner_type == 3 and job is not None:
-            # The job dict carries 'owner_type' as a string —
-            # 'customer' or 'vendor' — from the caller's lookup.
+            # job['owner_type'] is the string form from the caller.
             type_field = (
                 "invoice" if job.get("owner_type") == "customer"
                 else "bill"
@@ -1543,27 +1295,16 @@ class BusinessMixin:
             "active": bool(invoice.active),
             "currency": invoice.currency.mnemonic if invoice.currency else None,
         }
-        # Credit-note keys conditionally included so the response
-        # shape for normal documents is byte-identical to pre-v1.3.
-        # Both keys present together when the credit-note flag is
-        # set; ``applies_to`` further conditional on whether the
-        # link is set (a credit note that floats without a source
-        # link is unusual but valid).
+        # ``applies_to`` further requires the link to be set —
+        # floating credit notes are unusual but valid.
         if BusinessMixin._get_is_credit_note(invoice):
             result["is_credit_note"] = True
             if applies_to:
                 result["applies_to"] = applies_to
-        # Job link present iff caller threaded a job dict. The
-        # ``id`` and ``name`` are the surface a bookkeeper wants;
-        # ``owner_type`` lives on the parent caller's
-        # ``_job_to_dict`` output if they need it.
         if job is not None:
             result["job"] = {"id": job["id"], "name": job["name"]}
         if entries is not None:
             result["entries"] = entries
-        # Tax summary conditional on the invoice having any
-        # tax-bearing lines. Non-tax invoices keep their pre-v1.3
-        # response shape byte-identical.
         if tax_summary is not None:
             result["tax_summary"] = tax_summary
         return result
@@ -1573,30 +1314,15 @@ class BusinessMixin:
 
             ``id  TYPE  owner_name  CCY total  date_opened  status``
 
-        Pre-Phase-3B this rendered as ``"000027  INV  2026-05-01
-        posted"`` — no owner, no amount, useless for scanning. With
-        owner and total in place a bookkeeper can scan a hundred
-        invoices and immediately spot what's outstanding for whom.
-
-        Currency is shown when present so multi-currency books read
-        unambiguously. Bills get the ``BILL`` tag (was already there).
+        Owner and total are what make a hundred-invoice list
+        scannable; currency keeps multi-currency books unambiguous.
         """
-        # Type tag: INV/BILL/VCHR per owner_type, plus a "(CN)"
-        # suffix when the credit-note flag is set. Compact-line
-        # consumers can grep for the tag to filter (e.g. "CN" to
-        # find every credit note in a list). The suffix preserves
-        # the owner-side info that a bare "CN" tag would hide.
-        # For job-attached invoices (owner_type=3), the tag
-        # follows the underlying side (INV/BILL via the job's
-        # owner_type) rather than a generic "JOB" tag — what
-        # matters for filtering is "is this a customer invoice
-        # or a vendor bill", with the job link a separate
-        # annotation appended via the owner column.
-        #
-        # Single Job lookup via ``_resolve_owner_type_and_job``
-        # — both the type tag and the job annotation come from
-        # the same Job row. (Copilot PR #88 review flagged the
-        # original two-call pattern as redundant.)
+        # Type tag: INV/BILL/VCHR per owner_type, "(CN)" suffix for
+        # credit notes (greppable, and preserves the owner-side info
+        # a bare CN tag would hide). Job-attached invoices tag by
+        # the underlying side — one Job lookup via
+        # ``_resolve_owner_type_and_job`` feeds both the tag and the
+        # job annotation.
         effective_ot, job = self._resolve_owner_type_and_job(
             book, invoice,
         )
@@ -1611,21 +1337,15 @@ class BusinessMixin:
         )
         status = "posted" if _is_invoice_posted(invoice) else "open"
 
-        # Owner lookup — customers/vendors/employees/jobs share
-        # the same ``owner_guid`` namespace shape across four
-        # tables. ``_find_invoice_owner_by_guid`` dispatches on
-        # owner_type and chases owner_type=3 through the Job to
-        # the underlying customer/vendor.
+        # ``_find_invoice_owner_by_guid`` dispatches on owner_type,
+        # chasing owner_type=3 through the Job to the counterparty.
         owner = self._find_invoice_owner_by_guid(
             book, invoice.owner_type, invoice.owner_guid,
         )
         owner_name = owner.name if owner else "?"
 
-        # Job annotation: append ``(job:XXXXXX)`` to the owner
-        # column so a bookkeeper scanning a long invoice list
-        # can immediately see which project each row belongs to.
-        # Using the job's ID (not name) keeps the column narrow
-        # — the name surfaces in ``get_job(job_id)`` if needed.
+        # Job ID (not name) keeps the owner column narrow; the
+        # name surfaces in get_job if needed.
         if job is not None:
             owner_name = f"{owner_name} (job:{job.id})"
 
@@ -1645,14 +1365,9 @@ class BusinessMixin:
             else:
                 amount_str = f"{ccy} {grand_total:,.2f}".strip()
         except (ValueError, AttributeError, TypeError):
-            # Empty entries (ValueError from
-            # ``_get_invoice_entries_and_total``), missing currency
-            # attr, or arithmetic on a None — render "?" so the
-            # listing line still produces a row. Pre-fix the bare
-            # ``except Exception`` would have swallowed programming
-            # errors (KeyError / NameError / etc.) silently too;
-            # tightened to the predictable shapes that "? amount"
-            # is the right rendering for.
+            # Limited to the predictable shapes "?" is right for —
+            # a bare ``except Exception`` would swallow programming
+            # errors (KeyError/NameError) silently too.
             amount_str = "?"
 
         return (
@@ -1669,20 +1384,12 @@ class BusinessMixin:
     ) -> dict:
         """Convert an entry row (from raw SQL) to a serializable dict.
 
-        Args:
-            entry_row: SQLAlchemy row from entries table.
-            is_bill: If True, read b_* columns; otherwise read i_* columns.
-            account_paths: Optional mapping of account-GUID to fullname.
-                When provided, the response uses ``account`` (path) in
-                place of ``account_guid`` (raw 32-char hex). The caller
-                builds this map once per invoice and passes it through;
-                this keeps the static-method shape while letting the
-                response be readable to humans/LLMs.
-            taxtable_names: Optional ``{taxtable_guid: name}`` map for
-                resolving the entry's applied taxtable to its readable
-                name. Tax fields (taxable, tax_included, taxtable) are
-                emitted only when the entry is taxable — non-tax
-                entries keep their pre-v1.3 shape exactly.
+        ``is_bill`` selects the ``b_*`` vs ``i_*`` column group.
+        ``account_paths`` / ``taxtable_names`` are caller-built
+        GUID→name maps (one query per invoice, not per entry); when
+        present the response carries readable names, otherwise raw
+        GUIDs. Tax fields are emitted only when the entry is
+        taxable, so non-tax entries keep their original shape.
         """
         q_num = entry_row.quantity_num or 0
         q_denom = entry_row.quantity_denom or 1
@@ -1715,9 +1422,7 @@ class BusinessMixin:
         else:
             date_str = str(raw_date.date())
 
-        # ``guid`` omitted — entries are nested under invoices and
-        # have no standalone tool surface (no delete_entry,
-        # update_entry, etc.). Bookkeeper-validated: never used.
+        # ``guid`` omitted — entries have no standalone tool surface.
         result = {
             "date": date_str,
             "description": entry_row.description or "",
@@ -1726,7 +1431,7 @@ class BusinessMixin:
             "total": str(total),
         }
         if account_paths is not None and acct_guid:
-            # Phase 3C: surface the readable path. Falls back to the
+            # Surface the readable path. Falls back to the
             # raw GUID when a stale entry references a deleted account.
             result["account"] = account_paths.get(
                 acct_guid, acct_guid,
@@ -1734,9 +1439,6 @@ class BusinessMixin:
         else:
             result["account_guid"] = acct_guid or ""
 
-        # Tax fields conditional on taxable=1 — non-tax entries
-        # keep their byte-identical pre-v1.3 shape so existing
-        # consumers see no diff.
         if taxable:
             result["taxable"] = True
             result["tax_included"] = tax_included
@@ -1820,20 +1522,14 @@ class BusinessMixin:
     def _calculate_lot_balance(lot) -> Decimal:
         """Sum of split values in a lot, skipping voided splits.
 
-        For A/R lots: positive = outstanding receivable.
-        For A/P lots: negative = outstanding payable.
+        A/R lots: positive = outstanding receivable. A/P lots:
+        negative = outstanding payable.
 
         Voided splits (``reconcile_state == 'v'``) are GnuCash's
-        zombie audit-trail records — value/quantity zeroed but the
-        row preserved. Filtering them here matches the void-aware
-        treatment ``unpost_invoice`` uses for "are there real
-        payments on this lot?" and the lot-listing helpers use for
-        active-position math. Pre-fix this method summed every
-        split (voided ones contribute zero so the SUM was right by
-        accident), which left the helper out of step with the rest
-        of the codebase's void semantics — a future caller might
-        reasonably check ``len(lot.splits)`` against this balance
-        and get inconsistent answers.
+        zombie audit-trail records — zeroed but preserved. Skipping
+        them matches the void-aware treatment everywhere else;
+        summing them would be right only by accident, and
+        inconsistent with callers that count splits.
         """
         total = Decimal(0)
         for split in lot.splits:
@@ -1847,11 +1543,9 @@ class BusinessMixin:
         """Sum of split QUANTITIES in a lot, skipping voided splits.
 
         Companion to :meth:`_calculate_lot_balance` (which sums
-        ``value``, i.e. invoice-currency units). Quantities are in
-        the post account's commodity — when that commodity differs
-        from the invoice currency, this is what the receivable /
-        payable account actually carries, and it's the number a
-        settlement must relieve exactly (C10).
+        invoice-currency ``value``). Quantities are in the post
+        account's commodity — what the receivable/payable account
+        actually carries, and what a settlement must relieve exactly.
         """
         total = Decimal(0)
         for split in lot.splits:
@@ -1866,30 +1560,22 @@ class BusinessMixin:
     ) -> tuple[date | None, bool]:
         """Resolve an invoice/bill due date through three sources.
 
-        Returns ``(due_date, no_terms_flag)``. ``due_date`` is ``None``
-        when the invoice isn't posted yet. ``no_terms_flag`` is True
-        when the 30-day default was used (so callers can annotate the
-        rendering as approximated).
+        Returns ``(due_date, no_terms_flag)``; ``due_date`` is None
+        when the invoice isn't posted. ``no_terms_flag`` is True
+        when the 30-day default was used, so callers annotate the
+        rendering as approximated.
 
         Resolution order — first source that resolves wins:
 
-        1. ``trans-date-due`` slot on the posting transaction. Present
-           only when the user explicitly passed ``due_date`` to
-           ``post_invoice``.
-        2. ``Invoice.terms`` reference. Present when the user posted
-           with a billterm (e.g., "Net 30"). Read raw via SQL because
-           ``inv.terms`` exposes a relationship that's reliable only
-           through specific paths; raw SQL matches the pattern used
-           elsewhere in this codebase for slot-style reads. The
-           billterm's ``duedays`` is added to ``date_posted``.
-        3. 30-day default. Anchors the days count to the assumption.
-           Callers should annotate any "overdue" rendering as
-           approximated when this branch fires.
+        1. ``trans-date-due`` slot on the posting transaction
+           (present when the user passed ``due_date`` explicitly).
+        2. ``Invoice.terms`` billterm — ``duedays`` added to
+           ``date_posted``. Read raw via SQL; the ORM relationship
+           is unreliable through some access paths.
+        3. 30-day default.
 
-        This helper exists so the warnings collector and
+        Single chokepoint so the warnings collector and
         ``get_outstanding_invoices`` produce identical due-date math.
-        Without it the two were diverging — warnings used the full
-        three-step chain, ``get_outstanding_invoices`` had nothing.
         """
         from sqlalchemy import text
 
@@ -1954,38 +1640,25 @@ class BusinessMixin:
 
     def _get_invoice_entries_and_total(self, book, inv):
         """Query entries for an invoice/bill and compute totals,
-        absorbing per-line tax math.
+        absorbing per-line tax math (via ``_compute_entry_tax``).
 
-        For each entry, looks up its taxtable (when ``i_taxable``
-        or ``b_taxable`` is set) and invokes ``_compute_entry_tax``
-        to derive pretax / tax / gross + per-tax-account splits.
-        Aggregates revenue/expense AND tax-payable account amounts
-        into a single ``acct_totals`` dict so the downstream
-        ``post_invoice`` loop emits one split per account without
-        knowing about tax specifically.
+        Aggregates revenue/expense AND tax-payable amounts into one
+        ``acct_totals`` dict so ``post_invoice`` emits one split per
+        account without knowing about tax.
 
         Returns:
             Dict with keys:
 
-            - ``rows``: raw SQL rows from the entries table
-              (unchanged interface; callers don't read them
-              directly).
+            - ``rows``: raw SQL rows from the entries table.
             - ``acct_totals``: ``{account_guid: Decimal}`` covering
-              revenue/expense accounts AND tax-payable accounts
-              together. Used by ``post_invoice`` to emit splits.
-            - ``grand_total``: ``Decimal`` — gross customer-facing
-              total (sum of per-line gross). Includes tax for
-              tax-bearing entries.
-            - ``subtotal``: ``Decimal`` — sum of per-line pretax
-              amounts.
-            - ``tax_breakdown``: ``{account_guid: Decimal}`` — the
-              tax-only portion, available separately for display
-              surfaces that want to render a tax summary.
+              revenue/expense AND tax-payable accounts together.
+            - ``grand_total``: gross customer-facing total
+              (includes tax).
+            - ``subtotal``: sum of per-line pretax amounts.
+            - ``tax_breakdown``: ``{account_guid: Decimal}`` —
+              tax-only portion, for display surfaces.
             - ``tax_by_taxtable``: ``{taxtable_guid: Decimal}`` —
-              tax aggregated by the taxtable that produced it,
-              for surfaces that want to render a "Tax — GST 5%:
-              $15, BC GST+PST: $7" rollup. A taxtable with zero
-              tax-bearing lines on this invoice does not appear.
+              tax by source taxtable; zero-tax taxtables absent.
 
         Raises:
             ValueError: when the invoice has no entries.
@@ -2085,10 +1758,8 @@ class BusinessMixin:
                 acct_totals.get(acct_guid, Decimal(0))
                 + tax_result["pretax"]
             )
-            # Tax-payable accounts get their per-entry components.
-            # Composite taxtables that route to the same account
-            # already collapse inside _compute_entry_tax; we just
-            # fold the result into the global acct_totals here.
+            # Tax-payable accounts get their per-entry components
+            # (same-account composites already collapse upstream).
             for tax_acct, tax_amount in (
                 tax_result["tax_by_acct"].items()
             ):
@@ -2101,10 +1772,7 @@ class BusinessMixin:
                     + tax_amount
                 )
 
-            # Per-taxtable rollup: when this line was tax-bearing,
-            # attribute its total tax to the source taxtable so
-            # display surfaces can render "GST 5%: $15, BC GST+PST:
-            # $7" without re-deriving from row data.
+            # Per-taxtable rollup for display surfaces.
             if taxtable_guid and tax_result["tax_total"] != 0:
                 tax_by_taxtable[taxtable_guid] = (
                     tax_by_taxtable.get(taxtable_guid, Decimal(0))
@@ -2137,37 +1805,20 @@ class BusinessMixin:
     ) -> dict:
         """Shared create path for Customer / Vendor / Employee.
 
-        Currency resolution (user-specified mnemonic or book default),
-        optional Address construction from a dict, entity instantiation,
-        ``book.save()``, and the canonical
-        ``{guid, id, name, status}`` response — all in one place.
+        Currency resolution (explicit mnemonic or book default),
+        optional Address construction, entity instantiation, save,
+        and the canonical create response — in one place.
 
-        Class-specific fields are passed via ``**extra_kwargs`` so the
-        helper stays agnostic of what each subclass accepts. Customer
-        and Vendor take ``notes=""``; Employee has no ``notes`` column
-        and rejects the kwarg — see specs/PIECASH_REFERENCE.md for the
-        full shape divergence. Callers build their own kwargs dict and
-        the helper passes it through unexamined.
-
-        Args:
-            cls: ``Customer``, ``Vendor``, or ``Employee`` (piecash).
-            book: An open piecash book session (readonly=False).
-            name: Entity display name.
-            currency: ISO currency code. Defaults to book's default.
-            address: Optional dict with keys: name, addr1, addr2,
-                addr3, addr4, phone, fax, email. Empty / missing
-                fields render as empty strings in the Address record.
-            **extra_kwargs: Class-specific fields passed through to
-                ``cls(...)``. Use for ``notes`` (Customer/Vendor),
-                ``acl`` / ``language`` / ``workday`` / ``rate``
-                (Employee), etc.
+        Class-specific fields pass through ``**extra_kwargs``
+        unexamined: Customer and Vendor take ``notes=""``; Employee
+        has no ``notes`` column and rejects the kwarg.
 
         Returns:
-            ``{"guid": ..., "id": ..., "name": ..., "status": "created"}``
+            ``{"id": ..., "name": ..., "currency": ..., "status": "created"}``
         """
         from piecash.business.person import Address
 
-        # MP-5: cap free-text byte lengths up front.
+        # Cap free-text byte lengths up front.
         notes_kwarg = extra_kwargs.get("notes")
         self._validate_business_freetext(
             notes=notes_kwarg, address=address,
@@ -2206,9 +1857,8 @@ class BusinessMixin:
         )
         book.save()
 
-        # v1.3.1: business-object ``guid`` dropped from write
-        # responses (bookkeeper-validated as unused on the LLM
-        # surface). ``id`` is the working handle.
+        # Business-object ``guid`` is omitted from write
+        # responses — ``id`` is the working handle.
         return {
             "id": entity.id,
             "name": entity.name,
@@ -2224,12 +1874,10 @@ class BusinessMixin:
         "phone", "fax", "email",
     )
 
-    # MP-5: free-text caps on business-entity fields. Same shape as
-    # HP-9's caps on ``void_transaction(reason)`` and
-    # ``set_account_slot(value)`` — prevents a misbehaving LLM (or
-    # a user copy-pasting a multi-MB blob) from bloating the
-    # business-entity rows. Notes can be paragraphs; address sub-
-    # fields are typically one-liners; the bounds reflect that.
+    # Free-text caps on business-entity fields — same shape as the
+    # caps on ``void_transaction(reason)`` and
+    # ``set_account_slot(value)``. Notes can be paragraphs; address
+    # sub-fields are one-liners; the bounds reflect that.
     _NOTES_MAX_BYTES = 4 * 1024
     _ADDRESS_FIELD_MAX_BYTES = 1024
 
@@ -2240,13 +1888,10 @@ class BusinessMixin:
         notes: str | None = None,
         address: dict | None = None,
     ) -> None:
-        """MP-5: validate notes / address sub-field byte lengths
-        before they reach the ORM. UTF-8 byte length, not character
-        length — the storage backing is SQLite TEXT and the byte
-        cap is what matters for serialization.
-
-        Raises ValueError naming the offending field so the LLM
-        can shorten and retry. Empty / missing values pass through.
+        """Validate notes / address sub-field byte lengths before
+        they reach the ORM. UTF-8 byte length, not characters — the
+        backing store is SQLite TEXT. Raises ValueError naming the
+        offending field; empty/missing values pass through.
         """
         if notes is not None:
             byte_len = len(notes.encode("utf-8"))
@@ -2289,49 +1934,26 @@ class BusinessMixin:
     ) -> dict:
         """Shared update path for Customer / Vendor / Employee.
 
-        Mutates only the fields the caller supplies; everything else
-        is left alone. Diff-style response: returns ``{guid, id,
-        status, ...changed_fields}`` so the caller sees exactly what
-        landed without echoing the full entity record.
+        Mutates only the fields the caller supplies. Diff-style
+        response: ``{id, status, ...changed_fields}`` — no full
+        entity echo; address changes show only the sub-fields that
+        actually changed.
 
-        Address handling:
+        Address handling: ``address=None`` leaves the record
+        untouched; ``address={...}`` merges the supplied sub-fields
+        onto the existing record (creating one if absent). Missing
+        sub-keys are unchanged; **to clear a sub-field, pass an
+        empty string explicitly**. Unknown keys raise so a typo
+        doesn't silently no-op.
 
-        - ``address=None`` → don't touch the address record.
-        - ``address={...}`` → for each provided sub-field, set it on
-          the existing Address record (creating one if the entity
-          has no address yet). Missing sub-keys are left unchanged;
-          to clear a sub-field, pass an empty string explicitly.
-
-        Args:
-            book: Open piecash book session (readonly=False).
-            entity: Resolved Customer / Vendor / Employee instance.
-            entity_label: ``"Customer"`` / ``"Vendor"`` / ``"Employee"``
-                — for error messages.
-            name: New display name. ``None`` means no change.
-            currency: New ISO currency code. ``None`` means no change;
-                pass a new mnemonic to switch (rare — currency on a
-                business person is essentially their default trading
-                currency, changing it doesn't touch existing
-                invoices/bills).
-            notes: New notes text. Customer/Vendor only — Employee
-                will raise via piecash's natural attribute check.
-                Pass empty string to clear.
-            active: New active flag. Use ``False`` to deactivate
-                (archive without deleting).
-            address: Partial address update dict — see above. Keys:
-                ``name``, ``addr1``..``addr4``, ``phone``, ``fax``,
-                ``email``. Unknown keys raise ``ValueError`` so a
-                typo doesn't silently no-op.
-
-        Returns:
-            Dict with the entity GUID, id, ``status: "updated"``, and
-            the diff of changed top-level fields. Address changes
-            render under an ``address`` key showing only the
-            sub-fields that actually changed.
+        Other semantics: ``currency`` sets the default trading
+        currency only (existing documents untouched); ``notes`` is
+        Customer/Vendor only (Employee has no notes column);
+        ``active=False`` archives without deleting.
 
         Raises:
-            ValueError: If currency unknown, address dict contains
-                unknown keys, or no fields were provided to update.
+            ValueError: Currency unknown, unknown address keys,
+                notes on Employee, or no fields supplied.
         """
         # Validate address keys upfront — a typo like ``"addresss":
         # "..."`` would silently no-op without this check.
@@ -2343,10 +1965,8 @@ class BusinessMixin:
                     f"Valid keys: {', '.join(self._ADDRESS_FIELDS)}."
                 )
 
-        # Stage pre-update state for the audit log. Mirrors the
-        # update_account precedent — the audit decorator reads
-        # before_state from this thread-local rather than reopening
-        # the book.
+        # Stage audit before-state — the decorator reads it from
+        # the thread-local rather than reopening the book.
         before = {
             "id": entity.id,
             "name": entity.name,
@@ -2369,10 +1989,8 @@ class BusinessMixin:
             changed["name"] = name
 
         if currency is not None:
-            # ``_get_or_create_currency`` auto-loads ISO codes the book
-            # hasn't seen before (matches the ``create_price`` fix
-            # earlier in this release). Users shouldn't have to
-            # pre-load EUR before switching a vendor to EUR.
+            # ``_get_or_create_currency`` auto-loads unseen ISO codes
+            # (same convention as ``create_price``).
             try:
                 new_currency = self._get_or_create_currency(book, currency)
             except ValueError:
@@ -2388,7 +2006,7 @@ class BusinessMixin:
                     f"{entity_label} has no notes field — drop "
                     f"``notes=`` from the update call."
                 )
-            # MP-5: cap notes byte length up front.
+            # Cap notes byte length up front.
             self._validate_business_freetext(notes=notes)
             current_notes = entity.notes or ""
             if current_notes != notes:
@@ -2400,7 +2018,7 @@ class BusinessMixin:
             changed["active"] = bool(active)
 
         if address is not None:
-            # MP-5: cap address-field byte lengths up front.
+            # Cap address-field byte lengths up front.
             self._validate_business_freetext(address=address)
             # piecash's ``Address`` is a composite view over raw
             # ``addr_*`` columns on the Customer / Vendor / Employee
@@ -2430,7 +2048,7 @@ class BusinessMixin:
 
         book.save()
 
-        # v1.3.1: ``guid`` dropped — see _create_business_person.
+        # ``guid`` omitted — see _create_business_person.
         return {
             "id": entity.id,
             "status": "updated",
@@ -2454,7 +2072,7 @@ class BusinessMixin:
                      addr3, addr4, phone, fax, email.
 
         Returns:
-            Dict with guid, id, name, status.
+            Dict with id, name, currency, status.
         """
         from piecash.business.person import Customer
 
@@ -2524,7 +2142,7 @@ class BusinessMixin:
                      addr3, addr4, phone, fax, email.
 
         Returns:
-            Dict with guid, id, name, status.
+            Dict with id, name, currency, status.
         """
         from piecash.business.person import Vendor
 
@@ -2585,10 +2203,8 @@ class BusinessMixin:
     ) -> dict:
         """Create a new employee.
 
-        Employee has no ``notes`` field (unlike Customer and Vendor).
-        Employee-specific fields (``acl`` / ``language`` / ``workday``
-        / ``rate``) are out of scope for the 1.3.0 release. See
-        specs/PIECASH_REFERENCE.md for the full schema shape.
+        Employee has no ``notes`` field (unlike Customer/Vendor);
+        ``acl``/``language``/``workday``/``rate`` are not exposed.
 
         Args:
             name: Employee name.
@@ -2597,7 +2213,7 @@ class BusinessMixin:
                      addr3, addr4, phone, fax, email.
 
         Returns:
-            Dict with guid, id, name, status.
+            Dict with id, name, currency, status.
         """
         from piecash.business.person import Employee
 
@@ -2661,31 +2277,11 @@ class BusinessMixin:
     ) -> dict:
         """Update an existing customer's mutable fields.
 
-        Mutates only the fields the caller supplies. Existing
-        invoices and bills are unaffected — currency change here
-        only sets the customer's *default* trading currency for
-        future documents, not the currency of historical activity.
-
-        See ``_update_business_person`` for address-merge semantics
-        and full kwarg behavior.
-
-        Args:
-            customer_id: Human-readable ID (e.g., '000001').
-            name: New display name. ``None`` = no change.
-            currency: New default ISO currency code. ``None`` = no change.
-            notes: New notes. Pass empty string to clear. ``None`` = no change.
-            active: ``False`` to deactivate (archive), ``True`` to
-                reactivate. ``None`` = no change.
-            address: Partial address dict. Sub-fields supplied are
-                merged onto the existing address record (or create
-                one if absent).
-
-        Returns:
-            Dict with guid, id, status, and the diff of changed fields.
-
-        Raises:
-            ValueError: If customer not found, currency unknown, or
-                no fields supplied to update.
+        ``None`` = no change on every parameter; pass an empty
+        string to clear ``notes``. Currency change sets the
+        customer's *default* trading currency for future documents
+        only. See ``_update_business_person`` for address-merge
+        semantics, the diff-style response, and failure modes.
         """
         with self.open(readonly=False) as book:
             customer = self._find_customer(book, customer_id)
@@ -2708,23 +2304,8 @@ class BusinessMixin:
     ) -> dict:
         """Update an existing vendor's mutable fields.
 
-        Same semantics as ``update_customer``. See
-        ``_update_business_person`` for address-merge details.
-
-        Args:
-            vendor_id: Human-readable ID (e.g., '000001').
-            name: New display name. ``None`` = no change.
-            currency: New default ISO currency code. ``None`` = no change.
-            notes: New notes. Pass empty string to clear. ``None`` = no change.
-            active: ``False`` to deactivate, ``True`` to reactivate.
-            address: Partial address dict.
-
-        Returns:
-            Dict with guid, id, status, and changed-field diff.
-
-        Raises:
-            ValueError: If vendor not found, currency unknown, or
-                no fields supplied.
+        Same semantics as ``update_customer``; see
+        ``_update_business_person`` for details.
         """
         with self.open(readonly=False) as book:
             vendor = self._find_vendor(book, vendor_id)
@@ -2746,23 +2327,8 @@ class BusinessMixin:
     ) -> dict:
         """Update an existing employee's mutable fields.
 
-        Employee has no ``notes`` column (unlike Customer / Vendor)
-        — the parameter is omitted from the signature accordingly.
-        Otherwise identical to ``update_customer``.
-
-        Args:
-            employee_id: Human-readable ID (e.g., '000001').
-            name: New display name. ``None`` = no change.
-            currency: New default ISO currency code. ``None`` = no change.
-            active: ``False`` to deactivate, ``True`` to reactivate.
-            address: Partial address dict.
-
-        Returns:
-            Dict with guid, id, status, and changed-field diff.
-
-        Raises:
-            ValueError: If employee not found, currency unknown, or
-                no fields supplied.
+        Employee has no ``notes`` column, so the parameter is
+        omitted. Otherwise identical to ``update_customer``.
         """
         with self.open(readonly=False) as book:
             employee = self._find_employee(book, employee_id)
@@ -2792,7 +2358,7 @@ class BusinessMixin:
             discount_percent: Early payment discount percentage.
 
         Returns:
-            Dict with guid, name, due_days, status.
+            Dict with name, due_days, status.
         """
         import uuid
         from piecash.business.invoice import Billterm
@@ -2832,7 +2398,7 @@ class BusinessMixin:
 
             book.save()
 
-            # v1.3.1: ``guid`` dropped — billterms addressed by ``name``.
+            # ``guid`` omitted — billterms addressed by ``name``.
             return {
                 "name": name,
                 "due_days": due_days,
@@ -2865,27 +2431,21 @@ class BusinessMixin:
 
     # ── Taxtable CRUD ─────────────────────────────────────────────
     #
-    # Taxtables route sales-tax math on invoice/bill/voucher/credit-
-    # note line entries. A taxtable holds one or more
-    # ``TaxtableEntry`` rows; each entry contributes either a
-    # percentage rate (5.00 means 5%) or a flat value (5.00 means a
-    # fixed $5 surcharge) routed to a specific GL account.
-    #
-    # A multi-entry taxtable (e.g., GST 5% + PST 7%) produces N tax
-    # splits per line at posting time, one per entry to its own
-    # account — see commit 3's posting math. This commit is pure
-    # data CRUD; the wire-up into entries (commit 4) and into
-    # ``_get_invoice_entries_and_total`` (commit 3) happens later.
+    # Taxtables route sales-tax math on document line entries. Each
+    # ``TaxtableEntry`` contributes either a percentage rate (5.00 =
+    # 5%) or a flat value routed to a specific GL account; a
+    # multi-entry taxtable (GST 5% + PST 7%) produces N tax splits
+    # per line at posting (math in ``_compute_entry_tax`` /
+    # ``_get_invoice_entries_and_total``; ``_add_entry`` wires
+    # entries to taxtables).
     #
     # **Refcount discipline.** GnuCash desktop maintains
-    # ``Taxtable.refcount`` as the number of entries referencing the
-    # taxtable. piecash does not auto-maintain it; we manage it
-    # manually on entry create/delete in commit 4. For lifecycle
-    # checks here (delete guard, update warning), we use
-    # ``_compute_taxtable_refcount`` — an indexed SQL count over the
-    # ``entries`` table, authoritative regardless of the stored
-    # ``refcount`` column. Voided invoices still pin their taxtables
-    # because their entry rows persist for audit trail.
+    # ``Taxtable.refcount``; piecash does not. We bump it manually
+    # on entry create/delete for desktop interop, but every
+    # lifecycle check here uses ``_compute_taxtable_refcount`` — an
+    # indexed COUNT over ``entries``, authoritative regardless of
+    # the stored column. Voided invoices still pin their taxtables
+    # (their entry rows persist for audit trail).
 
     @staticmethod
     def _compute_taxtable_refcount(book, taxtable_guid: str) -> int:
@@ -2923,35 +2483,20 @@ class BusinessMixin:
     ) -> list[dict]:
         """Validate a list of taxtable-entry dicts and resolve their
         accounts. Returns piecash-ready ``{type, amount, account}``
-        records.
+        records (``amount`` as Decimal, ``account`` as the piecash
+        object). Raises ValueError naming the failing entry's index.
 
         Validations:
           - non-empty list
-          - each entry has ``type`` in ``{"value", "percentage"}``
-          - amount parses to ``Decimal`` and is > 0
-          - percentage amount < 100 (rates expressed as percent,
-            not fraction; >=100% is almost certainly user error)
-          - account resolves and has type ASSET or LIABILITY
-            (sales-tax payable / input-tax-credit receivable —
-            anything else would book tax into the wrong section)
-          - all entries reference accounts in the same commodity
-            (multi-commodity taxtables are rejected per spec; one
-            taxtable per jurisdiction/commodity is the supported
-            model)
-
-        Args:
-            book: open piecash book session.
-            entries: list of ``{type, amount, account}`` dicts as
-                they arrive from the MCP tool layer.
-
-        Returns:
-            List of resolved records with ``amount`` as ``Decimal``
-            and ``account`` as the piecash ``Account`` object.
-
-        Raises:
-            ValueError on any validation failure, with the entry
-            index in the message so the caller can pinpoint which
-            entry was the problem.
+          - ``type`` in ``{"value", "percentage"}``
+          - amount parses to Decimal, > 0; percentage < 100 (rates
+            are percent, not fraction — >=100% is almost certainly
+            user error)
+          - account resolves and is ASSET or LIABILITY (sales-tax
+            payable / input-tax-credit receivable; anything else
+            books tax into the wrong section)
+          - all entries share one commodity (one taxtable per
+            jurisdiction/commodity is the supported model)
         """
         if not entries:
             raise ValueError(
@@ -3078,17 +2623,13 @@ class BusinessMixin:
         all entries.
 
         Args:
-            quantity, price: line-item quantity and unit price as
-                ``Decimal``.
             taxable: whether this line has a taxtable applied.
-            tax_included: whether ``Q × P`` represents gross
-                (tax-inclusive) or pre-tax (tax-exclusive).
-            taxtable_entries: resolved taxtable entries as dicts
-                with ``type``, ``amount`` (``Decimal``), and
-                ``account_guid`` keys.
-            quantum: smallest representable unit of the currency
-                (typically ``Decimal('0.01')``; derived from
-                ``_commodity_quantum`` on the invoice currency).
+            tax_included: whether ``Q × P`` is gross (tax-inclusive)
+                or pre-tax (tax-exclusive).
+            taxtable_entries: resolved ``{type, amount, account_guid}``
+                dicts.
+            quantum: smallest unit of the invoice currency (from
+                ``_commodity_quantum``).
 
         Returns:
             ``{pretax, tax_total, tax_by_acct, gross}`` — all
@@ -3201,34 +2742,22 @@ class BusinessMixin:
     ) -> dict:
         """Create a new tax table.
 
-        A taxtable holds one or more entries. Each entry contributes
-        either a percentage rate (``type='percentage'``,
-        ``amount=5.00`` means 5%) or a flat value
-        (``type='value'``, ``amount=5.00`` means a fixed $5
-        surcharge) routed to a specific ASSET or LIABILITY account.
-
-        Multi-entry taxtables (e.g., GST 5% + PST 7%) are
-        supported. At posting time each entry produces its own
-        split to its own account. All entries on a single taxtable
-        must reference accounts in the same commodity.
+        Entries contribute either a percentage rate
+        (``type='percentage'``, ``amount=5.00`` = 5%) or a flat
+        value, each routed to an ASSET or LIABILITY account; at
+        posting each entry produces its own split. Validation rules
+        (account types, same-commodity constraint, amount bounds)
+        live on ``_validate_taxtable_entries``.
 
         Args:
             name: Taxtable name. Must be unique within the book.
             entries: List of ``{type, amount, account}`` dicts.
-                ``type`` is ``'value'`` or ``'percentage'``.
-                ``amount`` is a positive Decimal as string;
-                percentages are expressed as the rate (``5.00`` =
-                5%, not ``0.05``). ``account`` is a path,
-                ``%short-guid``, or full GUID; must resolve to an
-                ASSET or LIABILITY account.
 
         Returns:
-            ``{guid, name, entry_count, entries, status='created'}``.
+            ``{name, entry_count, entries, status='created'}``.
 
         Raises:
-            ValueError: duplicate name; empty entries; invalid
-                type/amount/account; wrong account type;
-                multi-currency entry mix.
+            ValueError: duplicate name or any validation failure.
         """
         from piecash.business.tax import Taxtable, TaxtableEntry
 
@@ -3274,7 +2803,7 @@ class BusinessMixin:
 
             book.save()
 
-            # v1.3.1: ``guid`` dropped — taxtables addressed by ``name``.
+            # ``guid`` omitted — taxtables addressed by ``name``.
             return {
                 "name": tt_name,
                 "entry_count": len(entry_dicts),
@@ -3287,18 +2816,10 @@ class BusinessMixin:
     ) -> list[dict] | str:
         """List all tax tables.
 
-        Args:
-            compact: When True (default), return a newline-separated
-                string with one line per taxtable. Each line is
-                ``name<TAB>N entry/entries: summary`` where the
-                summary is a comma-separated rendering of each
-                entry (e.g., ``5%→GST Payable, 7%→PST Payable``).
-                When False, return a list of full dicts including
-                resolved account paths and computed refcount.
-
-        Returns:
-            Compact string or verbose list, as documented above.
-            Empty taxtable list returns empty string / empty list.
+        Compact (default): one line per taxtable,
+        ``name<TAB>N entries: 5%→GST Payable, 7%→PST Payable``.
+        Verbose: list of full dicts with resolved account paths and
+        computed refcount. Empty book → empty string / empty list.
         """
         from piecash.business.tax import Taxtable
 
@@ -3338,14 +2859,9 @@ class BusinessMixin:
     def get_taxtable(self, name: str) -> dict:
         """Full details for a tax table.
 
-        Args:
-            name: Taxtable name.
-
-        Returns:
-            ``{guid, name, refcount, entries: [...]}`` with resolved
-            account paths on each entry. ``refcount`` is the
-            SQL-computed count of Entry rows referencing this
-            taxtable.
+        Returns ``{name, refcount, entries: [...]}`` with resolved
+        account paths; ``refcount`` is the SQL-computed count of
+        Entry rows referencing this taxtable.
 
         Raises:
             ValueError: taxtable not found.
@@ -3376,33 +2892,25 @@ class BusinessMixin:
 
         Diff-style response: only changed fields are returned.
 
-        **Entry replacement on an in-use taxtable** is destructive
-        to FUTURE entries' tax math (existing posted invoices
-        retain their splits — splits are stored, not derived). When
-        the SQL-computed refcount > 0 and ``entries`` is given,
-        ``force=True`` is required. The check uses the SQL refcount
-        not the stored ``refcount`` column, so voided invoices that
-        still pin the taxtable are honored.
+        **Entry replacement on an in-use taxtable rewrites the
+        displayed tax math live**: posted documents keep their
+        stored splits, but their displayed totals recompute from
+        the new entries. When the SQL-computed refcount > 0
+        (voided invoices count too), replacing entries requires
+        ``force=True``; prefer creating a new taxtable for future
+        documents instead.
 
         Args:
             name: Current taxtable name.
-            new_name: New name (optional). Rejected if it collides
-                with another taxtable.
-            entries: Replacement entry list (optional). Validated
-                with the same rules as ``create_taxtable``.
-                Old entries are deleted via the relation's
-                ``delete-orphan`` cascade.
+            new_name: New name; rejected on collision.
+            entries: Replacement list, validated like
+                ``create_taxtable``. Old entries delete via the
+                relation's ``delete-orphan`` cascade.
             force: Required to replace entries when refcount > 0.
-                Has no effect on name-only updates.
-
-        Returns:
-            ``{guid, name, status, changed}`` where ``changed``
-            lists only the fields that actually changed.
 
         Raises:
-            ValueError: taxtable not found; no fields supplied;
-                new_name collision; entry validation failure;
-                in-use taxtable without ``force=True``.
+            ValueError: not found; no fields supplied; name
+                collision; validation failure; in-use without force.
         """
         if new_name is None and entries is None:
             raise ValueError(
@@ -3512,7 +3020,7 @@ class BusinessMixin:
             book.save()
 
             if not changed:
-                # v1.3.1: ``guid`` dropped.
+                # ``guid`` omitted.
                 return {
                     "name": name,
                     "status": "unchanged",
@@ -3528,21 +3036,12 @@ class BusinessMixin:
     def delete_taxtable(self, name: str) -> dict:
         """Delete a tax table.
 
-        Refuses when the SQL-computed refcount is > 0 — see the
-        Refcount Discipline note in the section header. Voided
-        invoices still pin their taxtables. The entries-relation
-        ``cascade="all, delete-orphan"`` cleans up child
-        TaxtableEntry rows automatically.
-
-        Args:
-            name: Taxtable name.
-
-        Returns:
-            ``{guid, name, status='deleted'}``.
+        Refuses when the SQL-computed refcount > 0 (voided invoices
+        still pin their taxtables — see the section header). Child
+        TaxtableEntry rows clean up via the delete-orphan cascade.
 
         Raises:
-            ValueError: taxtable not found, or refcount > 0 with a
-                clear message naming the count.
+            ValueError: taxtable not found, or refcount > 0.
         """
         from piecash.business.tax import Taxtable
 
@@ -3629,10 +3128,8 @@ class BusinessMixin:
     }
 
     # ── Owner-type label helpers ─────────────────────────────────
-    # The legacy two-way "is_bill = owner_type == 4" idiom doesn't
-    # extend cleanly to three counterparty types. These small
-    # helpers replace the binary check with a three-way lookup so
-    # rendering / dispatch code stays readable.
+    # Three counterparty types — binary "is_bill = owner_type == 4"
+    # idioms mislabel vouchers; these maps keep dispatch three-way.
 
     # Response ``type`` field — lowercase, used by the audit log
     # decorator to swap entity_type for the post/pay/unpost
@@ -3656,9 +3153,7 @@ class BusinessMixin:
     def _is_bill_side(owner_type: int) -> bool:
         """Bills (4) and vouchers (5) both represent "company owes
         someone" semantics — same posting direction, same entry
-        column group (``b_*``), same allowed account types. The
-        legacy code used ``inv.owner_type == 4`` to mean this; the
-        rename to ``_is_bill_side`` captures the truth.
+        column group (``b_*``), same allowed account types.
 
         For job-attached invoices (owner_type=3), pass the job's
         owner_type instead — see ``_effective_owner_type``.
@@ -3669,22 +3164,14 @@ class BusinessMixin:
     def _effective_owner_type(book, invoice) -> int:
         """Resolve a document's "semantic" owner_type.
 
-        Direct customer invoices / vendor bills / vouchers
-        return their owner_type unchanged (2/4/5). Job-attached
-        invoices (owner_type=3) chase through the Job to its
-        underlying owner_type (2 or 4) — that's the side every
-        side-aware check (posting direction, account-type
-        validation, label dispatch) actually cares about.
+        Direct documents return owner_type unchanged (2/4/5);
+        job-attached invoices (owner_type=3) chase through the Job
+        to its underlying 2/4 — the side every posting-direction /
+        validation / label check actually cares about. Falls back
+        to the raw owner_type on a dangling owner_guid.
 
-        Returns the underlying owner_type, falling back to the
-        raw owner_type if the job lookup fails (dangling
-        owner_guid). Same defensive shape as
-        ``_find_invoice_owner_by_guid``.
-
-        For callers that also need the Job itself (e.g. to
-        surface a (job:JOB-X) annotation), use
-        ``_resolve_owner_type_and_job`` instead — single Job
-        query, both outputs.
+        Callers that also need the Job should use
+        ``_resolve_owner_type_and_job`` (single query, both outputs).
         """
         if invoice.owner_type != 3:
             return invoice.owner_type
@@ -3695,21 +3182,13 @@ class BusinessMixin:
 
     @staticmethod
     def _resolve_owner_type_and_job(book, invoice):
-        """Single-query variant of ``_effective_owner_type``
-        that also returns the Job object when one is linked.
+        """Single-query variant of ``_effective_owner_type`` that
+        also returns the linked Job.
 
-        Returns ``(effective_owner_type, job_or_none)``. For
-        direct documents (owner_type 2/4/5) the Job is None.
-        For job-attached docs (owner_type=3), both are derived
-        from a single Job lookup — avoids the redundant query
-        pattern Copilot flagged on PR #88 where callsites in
-        ``_invoice_to_compact_line`` and
-        ``get_outstanding_invoices`` were doing
-        ``_effective_owner_type`` AND ``_find_job_by_guid``
-        side-by-side (each chasing the same Job row).
-
-        Defensive fallback to (raw_owner_type, None) on dangling
-        owner_guid — same shape as the original helper.
+        Returns ``(effective_owner_type, job_or_none)`` — Job is
+        None for direct documents and on dangling owner_guid.
+        Callers needing both should use this rather than two
+        side-by-side lookups chasing the same Job row.
         """
         if invoice.owner_type != 3:
             return invoice.owner_type, None
@@ -3718,11 +3197,7 @@ class BusinessMixin:
             return invoice.owner_type, None
         return job.owner_type, job
 
-    # Human-readable document label for use in error messages,
-    # status returns, and audit log entries. Title-case canonical
-    # form. Three-way (Invoice / Bill / Voucher) replaces the
-    # legacy binary ``"Bill" if is_bill else "Invoice"`` which
-    # mislabeled vouchers as bills. (Copilot PR #86 review.)
+    # Title-case document label for errors / status / audit entries.
     _OWNER_TYPE_TO_DOC_LABEL = {2: "Invoice", 4: "Bill", 5: "Voucher"}
 
     @staticmethod
@@ -3840,31 +3315,20 @@ class BusinessMixin:
         extra_slots: dict | None = None,
         job_id: str | None = None,
     ) -> dict:
-        """Shared create path for customer invoice and vendor bill.
+        """Shared create path for invoices, bills, and vouchers.
 
-        Both hit the ``invoices`` table with the same 18-column insert,
-        differing only in ``owner_type`` and the label / counter /
-        finder conventions captured in ``_BUSINESS_DOC_CONFIG``. The
-        helper opens the book, resolves owner + currency + billterm,
-        handles the custom-ID-vs-auto-counter branch, writes the row
-        with ``_verify_write``, and returns the canonical response.
+        All three hit the ``invoices`` table with the same insert,
+        differing only in the label / counter / finder conventions
+        in ``_BUSINESS_DOC_CONFIG``. Resolves owner + currency +
+        billterm, handles custom-ID vs auto-counter, writes with
+        ``_verify_write``.
 
-        Args:
-            owner_type: 2 = customer invoice, 4 = vendor bill,
-                5 = employee voucher.
-            owner_id: Customer ID or vendor ID (human-readable '000001').
-            date_opened: ISO date; defaults to now.
-            notes: Free-text notes.
-            currency: ISO currency code; defaults to the owner's
-                currency (set when the customer/vendor was created),
-                falling back to the book's default if the owner has
-                no currency set.
-            term: Billterm name; optional.
-            doc_id: Custom invoice/bill number; auto-generated from the
-                relevant counter when omitted.
+        Currency resolution when ``currency`` is omitted: the
+        owner's trading currency first, book default as fallback —
+        a USD vendor's bill should be USD even on a CNY book.
 
         Returns:
-            ``{guid, id, <owner_id_key>, date_opened, status}``
+            ``{id, <owner_id_key>, date_opened, status}``
         """
         import uuid
         from piecash.business.invoice import Billterm, Invoice
@@ -3887,16 +3351,11 @@ class BusinessMixin:
                     f"{config['owner_label']} not found: {owner_id}"
                 )
 
-            # Job linkage: when ``job_id`` is given, the invoice
-            # is grouped under a Job. The job must (a) exist,
-            # (b) belong to the same customer/vendor the caller
-            # named, and (c) match the owner_type (customer-
-            # invoice → customer-job; vendor-bill → vendor-job).
-            # On success, we override the insert's owner_type to
-            # 3 (Job) and owner_guid to job.guid — GnuCash's
-            # polymorphic owner_guid encoding. The customer/
-            # vendor relationship is preserved indirectly: the
-            # Job row itself carries the underlying owner.
+            # Job linkage: the job must exist, belong to the named
+            # owner, and match the owner_type. On success the insert
+            # uses owner_type=3 / owner_guid=job.guid (GnuCash's
+            # polymorphic owner encoding); the customer/vendor
+            # relationship is preserved through the Job row.
             job_obj = None
             if job_id:
                 if owner_type == 5:
@@ -3945,23 +3404,12 @@ class BusinessMixin:
                     raise ValueError(f"Currency not found: {currency}")
                 currency_guid = currency_obj.guid
             else:
-                # Resolution order when currency isn't passed explicitly:
-                #   1. Owner's currency (customer/vendor) — every
-                #      business document inherits the trading
-                #      relationship's currency by default. A USD
-                #      vendor's bill should be USD, not the book's
-                #      default. This matches GnuCash desktop UI
-                #      behavior and the bookkeeper's mental model.
-                #   2. Book default — fallback for owners that have
-                #      no currency set (shouldn't happen with piecash
-                #      owners, but defensive).
-                #
-                # Pre-fix this fallback used book default unconditionally,
-                # which broke cross-currency posting for any book with
-                # foreign customers/vendors: bills against a USD vendor
-                # on a CNY book got created in CNY, then ``post_invoice``
-                # saw inv.currency == account.commodity and skipped the
-                # rate-conversion path entirely. $500 was then booked
+                # Owner currency first, book default as defensive
+                # fallback (see docstring). Falling back to the book
+                # default unconditionally breaks cross-currency
+                # posting: a USD vendor's bill on a CNY book would be
+                # created in CNY, post_invoice would see matching
+                # commodities and skip rate conversion — $500 booked
                 # as ¥500.
                 owner_currency = getattr(owner, "currency", None)
                 if owner_currency is not None:
@@ -3995,27 +3443,13 @@ class BusinessMixin:
                     )
             else:
                 # Auto-generate the next document ID. The book
-                # counter (``counter_invoice`` / ``counter_bill``)
-                # SHOULD be the canonical source, but it can drift
-                # below the actual MAX(id) — e.g. when historical
-                # documents are imported via raw SQL without
-                # bumping the counter, or when the file was edited
-                # outside the MCP server's lifecycle. The
-                # bookkeeper hit this on Alex's synthetic book:
-                # 2025 bills sat at IDs 000006 / 000007 but the
-                # counter was lower, so a new 2026 ``create_bill``
-                # auto-assigned 000006 — colliding with the
-                # 2025 row and breaking every subsequent
-                # ``post_invoice`` / ``get_outstanding_invoices``
-                # lookup that resolved to the wrong record.
-                #
-                # Fix: take the max of (book counter, actual max
-                # numeric ID in the table for this owner_type) and
-                # use that + 1. Re-sync the book counter so the
-                # next auto-id picks up where this one left off.
-                # Non-numeric existing IDs (custom strings the
-                # user supplied) are skipped — they're irrelevant
-                # to numeric auto-numbering.
+                # counter SHOULD be canonical, but it can drift below
+                # the table's actual MAX(id) (raw-SQL imports,
+                # out-of-band edits); trusting it alone auto-assigns
+                # a colliding ID that routes every subsequent lookup
+                # to the wrong record. Use max(counter, max numeric
+                # id) + 1 and re-sync the counter. Non-numeric custom
+                # IDs are skipped.
                 book_counter = getattr(book, config["counter_attr"])
                 existing_ids = book.session.query(Invoice.id).filter(
                     Invoice.owner_type == owner_type
@@ -4064,11 +3498,8 @@ class BusinessMixin:
                 f"{config['doc_label']} '{doc_id}'",
             )
 
-            # Apply caller-supplied slots BEFORE save so the slot
-            # writes and the row insert land in a single
-            # transaction. The credit-note feature uses this to
-            # set ``credit-note`` and ``gnc-mcp/applies-to-invoice``
-            # without opening a second write session — preserves
+            # Apply caller-supplied slots BEFORE save so slot writes
+            # and the row insert land in one transaction — preserves
             # the "one book open per write" invariant.
             if extra_slots:
                 new_inv = book.session.query(Invoice).filter_by(
@@ -4079,7 +3510,7 @@ class BusinessMixin:
 
             book.save()
 
-            # v1.3.1: ``guid`` dropped — invoices/bills/vouchers/
+            # ``guid`` omitted — invoices/bills/vouchers/
             # credit notes addressed by ``id``.
             return {
                 "id": doc_id,
@@ -4102,28 +3533,19 @@ class BusinessMixin:
 
         Args:
             customer_id: Customer ID (e.g., '000001').
-            date_opened: Date in ISO format. Defaults to today.
+            date_opened: ISO date. Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to the customer's
-                currency, falling back to the book's default. Pass
-                explicitly to override (rare — most invoices are in
-                the customer's currency).
+            currency: ISO code. Defaults to the customer's currency,
+                then the book default — see
+                ``_create_business_document``.
             term: Billterm name (e.g., 'Net 30'). Optional.
-            invoice_id: Custom invoice number. If omitted, auto-generates
-                from the book's invoice counter.
-            job_id: Optional Job ID to group this invoice under.
-                The job must belong to the same customer and be
-                a customer-job (created with owner_type='customer').
-                When set, the invoice's owner_type becomes 3 (Job)
-                with owner_guid pointing at the Job, per GnuCash's
-                polymorphic owner encoding; the customer
-                relationship is preserved indirectly through the
-                Job row.
+            invoice_id: Custom invoice number; auto-generated when
+                omitted.
+            job_id: Optional Job to group this invoice under. Must
+                be a customer-job belonging to the same customer.
 
         Returns:
-            Dict with guid, id, customer_id, status (plus a
-            ``job: {id, name}`` field surfaces in ``get_invoice``
-            responses when linked).
+            Dict with id, customer_id, date_opened, status.
         """
         return self._create_business_document(
             owner_type=2,
@@ -4150,22 +3572,16 @@ class BusinessMixin:
 
         Args:
             vendor_id: Vendor ID (e.g., '000001').
-            date_opened: Date in ISO format. Defaults to today.
+            date_opened: ISO date. Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to the vendor's
-                currency, falling back to the book's default. Pass
-                explicitly to override (rare — most bills are in the
-                vendor's currency).
-            term: Billterm name (e.g., 'Net 30'). Optional.
-            bill_id: Custom bill number. If omitted, auto-generates
-                from the book's bill counter.
-            job_id: Optional Job ID to group this bill under. The
-                job must belong to the same vendor and be a
-                vendor-job. Same polymorphic routing as
-                ``create_invoice``'s ``job_id``.
+            currency: ISO code. Defaults to the vendor's currency,
+                then the book default.
+            term: Billterm name. Optional.
+            bill_id: Custom bill number; auto-generated when omitted.
+            job_id: Optional vendor-job to group this bill under.
 
         Returns:
-            Dict with guid, id, vendor_id, status.
+            Dict with id, vendor_id, date_opened, status.
         """
         return self._create_business_document(
             owner_type=4,
@@ -4190,26 +3606,20 @@ class BusinessMixin:
         """Create an employee expense voucher.
 
         A voucher is the document an employee submits for
-        reimbursement of out-of-pocket business expenses. Posts as
-        a liability ("company owes employee") just like a vendor
-        bill, then ``pay_invoice`` settles it from a cash account.
+        reimbursement; it posts as a liability like a vendor bill
+        and ``pay_invoice`` settles it.
 
         Args:
             employee_id: Employee ID (e.g., '000001').
-            date_opened: Date in ISO format. Defaults to today.
+            date_opened: ISO date. Defaults to today.
             notes: Optional notes.
-            currency: ISO currency code. Defaults to the employee's
-                currency, falling back to the book's default. Pass
-                explicitly to override.
-            term: Billterm name (e.g., 'Net 30'). Optional —
-                vouchers rarely use payment terms but the field
-                accepts them for symmetry with bills.
-            voucher_id: Custom voucher number. If omitted,
-                auto-generates from the book's
-                ``counter_exp_voucher``.
+            currency: ISO code. Defaults to the employee's currency,
+                then the book default.
+            term: Billterm name. Optional.
+            voucher_id: Custom number; auto-generated when omitted.
 
         Returns:
-            Dict with guid, id, employee_id, status.
+            Dict with id, employee_id, date_opened, status.
         """
         return self._create_business_document(
             owner_type=5,
@@ -4223,45 +3633,31 @@ class BusinessMixin:
 
     # ── Credit-note resolution ─────────────────────────────────
     #
-    # Credit notes share the ``invoices`` table with their non-
-    # credit twins; what distinguishes them is the ``credit-note``
-    # slot. Tools like ``add_credit_note_entry`` and
-    # ``delete_credit_note`` need to look up a document by ID,
-    # validate it IS a credit note (not a regular invoice/bill
-    # that happens to share the ID space), and report a clear
-    # error otherwise. This helper centralizes that lookup +
-    # validation.
+    # Credit notes share the ``invoices`` table with their
+    # non-credit twins; the ``credit-note`` slot is the only
+    # differentiator. This helper centralizes lookup + validation.
 
     def _resolve_credit_note(
         self, book, credit_note_id: str, owner_type: str | None = None,
     ):
-        """Find a credit note by ID, validating that the document
-        is in fact flagged as a credit note.
+        """Find a credit note by ID, validating the document IS
+        flagged as a credit note.
 
-        Args:
-            book: Open piecash book session.
-            credit_note_id: Human-readable ID.
-            owner_type: Optional 'customer' or 'vendor' for
-                disambiguation when the ID collides across owner
-                types. None lets ``_find_invoice`` either resolve
-                an unambiguous match or raise its collision error.
-
-        Returns:
-            piecash Invoice object (the credit-note row).
+        ``owner_type`` disambiguates ID collisions; None lets
+        ``_find_invoice`` resolve or raise its collision error.
+        Employee owner_type raises — credit notes are
+        customer/vendor only (see ``create_credit_note``).
 
         Raises:
-            ValueError: If not found, found but not a credit note,
-                or ambiguous across owner types.
+            ValueError: not found, not a credit note, or ambiguous.
         """
         int_ot = (
             self._parse_owner_type(owner_type)
             if owner_type else None
         )
         if int_ot == 5:
-            # Employee credit notes are deliberately excluded —
-            # the create path rejects them, but a caller could
-            # still try to use this helper with owner_type='employee'.
-            # Surface the same constraint here.
+            # The create path rejects employee credit notes;
+            # surface the same constraint on lookup.
             raise ValueError(
                 "Credit notes are not supported for employees. "
                 "Use unpost_invoice + edit on the original voucher "
@@ -4275,12 +3671,9 @@ class BusinessMixin:
                 f"Credit note not found: {credit_note_id}"
             )
         if not self._get_is_credit_note(inv):
-            # Found the ID but it's a regular invoice/bill/voucher.
-            # Name the right tool to use instead so the LLM can
-            # correct course in one hop. Three-way dispatch
-            # (Copilot PR #87 review): the legacy binary "INV vs
-            # BILL" branch would have suggested add_bill_entry /
-            # delete_bill for a voucher (owner_type=5) — wrong.
+            # Regular invoice/bill/voucher with this ID: name the
+            # right tool so the LLM course-corrects in one hop.
+            # Three-way — a binary branch would misname voucher tools.
             _ENTRY_TOOLS = {
                 2: "add_invoice_entry",
                 4: "add_bill_entry",
@@ -4322,59 +3715,37 @@ class BusinessMixin:
         A credit note is the audit-trail-preserving way to reverse
         part or all of a posted invoice. At post time the posting
         direction reverses: customer credit notes debit Income and
-        credit A/R (reducing what the customer owes you); vendor
-        credit notes debit A/P and credit Expense (reducing what
-        you owe the vendor).
+        credit A/R; vendor credit notes debit A/P and credit
+        Expense.
 
-        **Linking**: when ``applies_to_invoice_id`` is given, the
-        credit note is linked to the source. Validation ensures
-        the source has the same owner_id and currency. The link is
-        stored as a custom slot (``gnc-mcp/applies-to-invoice``)
-        and surfaced in ``get_invoice`` / ``list_invoices``
-        responses. Highly recommended for audit trail; can be
-        omitted for floating credit notes the bookkeeper will
-        attach to a future invoice via ``apply_credit_note``.
+        **Linking**: ``applies_to_invoice_id`` ties the credit note
+        to its source (stored as the ``gnc-mcp/applies-to-invoice``
+        slot, surfaced as ``applies_to={id, type}``). The source
+        must exist, belong to the same owner, not itself be a
+        credit note, and match any explicit ``currency``; when
+        ``currency`` is omitted the source's is inherited. Omit the
+        link for floating credit notes applied later via
+        ``apply_credit_note``.
 
-        **Employees deliberately excluded**: GnuCash desktop has
-        no UI for employee credit notes. Supporting them at the
-        MCP layer would create documents the desktop app couldn't
-        view or edit. For employee corrections, use
-        ``unpost_invoice`` + edit on the original voucher.
+        **Employees excluded**: GnuCash desktop has no UI for
+        employee credit notes; creating them here would produce
+        documents the desktop can't view. Use ``unpost_invoice`` +
+        edit instead.
 
         Args:
-            owner_id: Customer or vendor ID (e.g., '000001').
+            owner_id: Customer or vendor ID.
             owner_type: 'customer' or 'vendor'.
-            applies_to_invoice_id: Optional source invoice/bill ID.
-                Must belong to the same owner and use the same
-                currency. Stored as a GUID slot for robustness;
-                resolved back to ``{id, type}`` for display.
-            date_opened: ISO date; defaults to today.
-            notes: Free-text notes (e.g., "Credit for out-of-scope
-                work on invoice 000028").
-            currency: ISO currency code. Defaults to the source
-                invoice's currency when ``applies_to_invoice_id``
-                is given, else the owner's currency, else the
-                book's default.
-            term: Billterm name. Rarely used for credit notes but
-                accepted for symmetry.
-            credit_note_id: Custom ID. If omitted, auto-generates
-                from ``counter_invoice`` (customer) or
-                ``counter_bill`` (vendor) — GnuCash desktop shares
-                the invoice/bill counter with credit notes rather
-                than maintaining a separate sequence.
+            credit_note_id: Custom ID; auto-generates from the
+                invoice/bill counter (GnuCash shares the sequence
+                with credit notes).
 
         Returns:
-            Dict with ``guid``, ``id``, ``customer_id`` /
-            ``vendor_id``, ``date_opened``, ``status='created'``,
-            ``is_credit_note=True``, and ``applies_to={id, type}``
-            when linked.
+            Create response plus ``is_credit_note=True`` and
+            ``applies_to`` when linked.
 
         Raises:
-            ValueError: If owner_type is invalid or 'employee'; if
-                applies_to_invoice_id is given but the source
-                doesn't exist, belongs to a different owner, or
-                has a currency that conflicts with an explicit
-                ``currency`` argument.
+            ValueError: invalid/employee owner_type, or any
+                source-link validation failure.
         """
         int_owner_type = self._parse_owner_type(owner_type)
         if int_owner_type == 5:
@@ -4398,9 +3769,8 @@ class BusinessMixin:
         extra_slots: dict = {self._CREDIT_NOTE_SLOT_KEY: 1}
         applies_to_dict: dict | None = None
 
-        # Validate + capture data from the source invoice if linked.
-        # This is a read-only lookup so it doesn't conflict with
-        # the create path's separate write session.
+        # Source validation is a read-only lookup — no conflict
+        # with the create path's separate write session.
         if applies_to_invoice_id:
             with self.open(readonly=True) as book:
                 source = self._find_invoice(
@@ -4433,12 +3803,8 @@ class BusinessMixin:
                         f"Credit notes must apply to a document "
                         f"from the same customer/vendor."
                     )
-                # Source must be a regular invoice/bill, not
-                # itself a credit note. Credit-note-against-
-                # credit-note is semantically meaningless: a
-                # credit reverses a posted document; chaining
-                # them doesn't represent anything in real
-                # bookkeeping. (Copilot PR #87 review.)
+                # Chaining credit notes is semantically meaningless
+                # — a credit reverses a posted document.
                 if self._get_is_credit_note(source):
                     raise ValueError(
                         f"Source {applies_to_invoice_id} is "
@@ -4452,9 +3818,8 @@ class BusinessMixin:
                 )
                 source_guid = source.guid
 
-            # Currency rules:
-            #  - If caller passed currency, it must match source's.
-            #  - If caller omitted currency, inherit source's.
+            # Explicit currency must match the source's; omitted
+            # currency inherits it.
             if currency and source_currency_mnemonic and currency != source_currency_mnemonic:
                 raise ValueError(
                     f"Credit note currency {currency!r} doesn't "
@@ -4486,10 +3851,8 @@ class BusinessMixin:
             extra_slots=extra_slots,
         )
 
-        # Augment the standard response with credit-note keys.
-        # The owner_id key from _create_business_document is
-        # ``customer_id`` (for owner_type=2) or ``vendor_id``
-        # (for owner_type=4) per _BUSINESS_DOC_CONFIG; we keep it.
+        # Augment with credit-note keys; the customer_id/vendor_id
+        # key from _create_business_document is kept.
         result["is_credit_note"] = True
         if applies_to_dict:
             result["applies_to"] = applies_to_dict
@@ -4508,40 +3871,16 @@ class BusinessMixin:
     ) -> dict:
         """Add a line item to a credit note.
 
-        Mirrors ``add_invoice_entry`` / ``add_bill_entry`` but
-        validates the target IS a credit note before delegating
-        to ``_add_entry``. The flag is the gate; a regular invoice
-        with the same ID gets a clear "not a credit note" error
-        naming the right tool to use instead.
-
-        The underlying entry shape is identical to a non-credit
-        document of the same owner_type: customer credit notes
-        accept INCOME accounts (the reversal reduces revenue);
-        vendor credit notes accept EXPENSE/ASSET (the reversal
-        reduces the recognized expense / capitalized inventory).
-
-        Args:
-            credit_note_id: Credit note ID (e.g., '000032').
-            account: Account path. INCOME for customer credit
-                notes, EXPENSE or ASSET for vendor credit notes.
-            description: Line item description.
-            quantity: Quantity as decimal string.
-            price: Unit price as decimal string. Positive even on
-                a credit note — the credit-note flag inverts the
-                posting direction at post time, so the entry
-                shape stays the same as a normal document.
-            owner_type: Optional 'customer' or 'vendor'. Required
-                only when the credit_note_id collides across owner
-                types (rare). Auto-detect otherwise.
-
-        Returns:
-            Dict with ``guid``, ``credit_note_id``, ``description``,
-            ``quantity``, ``price``, ``total``, ``status='created'``.
+        Validates the target IS a credit note, then delegates to
+        ``_add_entry`` — the entry shape is identical to the
+        corresponding regular document; only post-time direction
+        differs. ``price`` stays positive; the credit-note flag
+        inverts posting. Account types per side: INCOME for
+        customer credit notes, EXPENSE/ASSET for vendor.
 
         Raises:
-            ValueError: If the credit note isn't found, isn't a
-                credit note, account type is wrong for the owner
-                type, or the credit note is already posted.
+            ValueError: not found, not a credit note, wrong account
+                type, or already posted.
         """
         with self.open(readonly=True) as book:
             inv = self._resolve_credit_note(
@@ -4549,11 +3888,6 @@ class BusinessMixin:
             )
             resolved_owner_type = inv.owner_type
 
-        # Delegate to _add_entry with the resolved owner_type.
-        # The helper's allowed-account-type validation is the same
-        # for credit notes as for the corresponding regular
-        # document (the entry shape is identical; only the post-
-        # time direction differs).
         result = self._add_entry(
             owner_type=resolved_owner_type,
             doc_id=credit_note_id,
@@ -4564,9 +3898,7 @@ class BusinessMixin:
             taxtable=taxtable,
             tax_included=tax_included,
         )
-        # Surface the credit_note_id key in the response (the
-        # base helper returns invoice_id / bill_id based on
-        # owner_type config; we re-key for credit-note clarity).
+        # Re-key invoice_id/bill_id → credit_note_id for clarity.
         legacy_key = (
             "invoice_id" if resolved_owner_type == 2 else "bill_id"
         )
@@ -4581,23 +3913,12 @@ class BusinessMixin:
     ) -> dict:
         """Delete an unposted credit note.
 
-        Mirrors ``delete_invoice`` / ``delete_bill`` but validates
-        the target IS a credit note before delegating to
-        ``_delete_invoice_or_bill``. Posted credit notes cannot be
-        deleted — unpost first via ``unpost_invoice``, then delete.
-
-        Args:
-            credit_note_id: Credit note ID.
-            owner_type: Optional disambiguator when the ID collides
-                across customer/vendor sides.
-
-        Returns:
-            Dict with ``id``, ``guid``, ``entries_deleted``,
-            ``type='credit_note'``, ``status='deleted'``.
+        Validates the target IS a credit note, then delegates to
+        ``_delete_invoice_or_bill``. Posted credit notes must be
+        unposted first via ``unpost_invoice``.
 
         Raises:
-            ValueError: If not found, not a credit note, or
-                posted.
+            ValueError: not found, not a credit note, or posted.
         """
         with self.open(readonly=True) as book:
             inv = self._resolve_credit_note(
@@ -4608,9 +3929,7 @@ class BusinessMixin:
         result = self._delete_invoice_or_bill(
             credit_note_id, owner_type=resolved_owner_type,
         )
-        # Re-key the response: base returns ``type`` of
-        # ``invoice``/``bill``; for a credit note the truth is
-        # ``credit_note`` (the slot was the differentiator).
+        # Re-key type: the slot, not owner_type, is the truth here.
         result["type"] = "credit_note"
         return result
 
@@ -4676,33 +3995,24 @@ class BusinessMixin:
         taxtable: str | None = None,
         tax_included: bool = False,
     ) -> dict:
-        """Shared implementation behind ``add_invoice_entry`` and
-        ``add_bill_entry``. The two methods were 90% duplicated
-        (the only differences: which side of the entries-table
-        column pair gets the price/account, the owner_type code,
-        the allowed account types, and the response id key). This
-        helper takes ``owner_type`` (2=customer invoice, 4=vendor
-        bill), looks up the per-doc config in ``_ENTRY_CONFIG``,
-        and writes the entry.
+        """Write a line-item entry on an invoice, bill, voucher, or
+        credit note.
 
-        **Taxtable wire-up (commit 4 of the v1.3 taxtable arc):**
+        ``owner_type`` (2/4/5) selects the per-doc config in
+        ``_ENTRY_CONFIG``: which entries-table column side gets the
+        price/account, the allowed account types, and the response
+        id key.
 
-        When ``taxtable`` is given, the entry is marked taxable and
-        the resolved taxtable's GUID is written to ``i_taxtable``
-        or ``b_taxtable`` (side-dependent). ``tax_included`` flags
-        whether the line price represents pre-tax (False, default)
-        or gross (True) — the posting math in
-        ``_get_invoice_entries_and_total`` uses this to decide
-        whether to extract pretax from gross or add tax on top.
+        Taxtable wire-up: ``taxtable`` marks the entry taxable and
+        writes the resolved GUID to ``i_taxtable``/``b_taxtable``;
+        ``tax_included`` flags whether the price is pre-tax (False)
+        or gross (True) for the posting math.
+        ``tax_included=True`` without ``taxtable`` raises — a
+        silent no-op would drop the caller's signal that they
+        thought tax was enabled.
 
-        ``tax_included=True`` without ``taxtable`` raises — silently
-        treating it as no-op would drop the caller's signal that
-        they thought they were enabling tax.
-
-        The taxtable's stored ``refcount`` column is incremented
-        post-insert to keep GnuCash desktop's bookkeeping in sync
-        (our own lifecycle checks use SQL-computed counts, but the
-        desktop UI reads the stored value).
+        Side effect: the taxtable's stored ``refcount`` is bumped
+        for desktop interop (our checks use SQL-computed counts).
         """
         import uuid
         from piecash.business.invoice import Entry
@@ -4714,11 +4024,8 @@ class BusinessMixin:
             )
 
         cfg = self._ENTRY_CONFIG[owner_type]
-        # Both vendor bills (4) and employee expense vouchers (5)
-        # route through the ``b_*`` column group and the ``bill``
-        # FK — GnuCash's schema treats them as the same "company
-        # owes someone" shape. Only owner_type on the parent row
-        # distinguishes them.
+        # Bills (4) and vouchers (5) share the ``b_*`` / ``bill``
+        # column group — see the note on _ENTRY_CONFIG[5].
         is_bill_side = owner_type in (4, 5)
         qty = _to_decimal(quantity)
         unit_price = _to_decimal(price)
@@ -4731,16 +4038,10 @@ class BusinessMixin:
                 raise ValueError(
                     f"{cfg['label']} not found: {doc_id}"
                 )
-            # Side-check: the invoice's "effective" owner_type
-            # is owner_type directly when 2/4/5; for owner_type=3
-            # (job-attached) it's the underlying job's
-            # owner_type. ``_find_invoice`` already filters by
-            # both direct and job-attached for owner_type 2/4,
-            # so reaching here with the wrong side means a true
-            # caller mistake (customer-id passed to
-            # add_bill_entry, e.g.).
-            # Centralize via _effective_owner_type — Copilot PR
-            # #88 flagged this as duplicate logic with the helper.
+            # _find_invoice already matches job-attached documents
+            # for the requested side, so a mismatch here is a true
+            # caller mistake (e.g. an invoice ID passed to
+            # add_bill_entry).
             effective_owner_type = self._effective_owner_type(
                 book, inv,
             )
@@ -4772,9 +4073,8 @@ class BusinessMixin:
             entry_guid = uuid.uuid4().hex
 
             # Resolve the taxtable upfront so a missing-taxtable
-            # error fires before any write. The resolved Taxtable
-            # is also captured so we can bump its refcount after
-            # the INSERT succeeds.
+            # error fires before any write; kept for the refcount
+            # bump below.
             tt_obj = None
             if taxtable:
                 tt_obj = self._find_taxtable(book, taxtable)
@@ -4787,16 +4087,9 @@ class BusinessMixin:
             taxincl_int = 1 if tax_included else 0
             tt_guid = tt_obj.guid if tt_obj else None
 
-            # The Entries table has parallel ``i_*`` (invoice side)
-            # and ``b_*`` (bill side) column groups. Exactly one
-            # group carries values for any given entry; the other
-            # is zeroed/NULL. Voucher entries (owner_type=5) share
-            # the ``b_*`` / ``bill`` group with vendor bills — see
-            # ``is_bill_side`` above.
-            #
-            # Tax fields land on the same side as the price/account
-            # — invoice-side entries write ``i_taxtable``, bill-side
-            # write ``b_taxtable``. The other side stays zeroed.
+            # Parallel ``i_*`` / ``b_*`` column groups: exactly one
+            # side carries values, the other stays zeroed/NULL. Tax
+            # fields land on the same side as the price/account.
             if is_bill_side:
                 values = dict(
                     i_acct=None, i_price_num=0, i_price_denom=1,
@@ -4848,19 +4141,15 @@ class BusinessMixin:
                 f"{cfg['label'].lower()} {doc_id}",
             )
 
-            # Refcount maintenance: GnuCash desktop reads
-            # Taxtable.refcount to know whether a taxtable is in
-            # use. Our own lifecycle checks use the SQL-computed
-            # count (authoritative), but we keep the stored value
-            # in sync so desktop interop stays clean.
+            # Keep the stored refcount in sync for GnuCash desktop;
+            # our own lifecycle checks use SQL-computed counts.
             if tt_obj is not None:
                 tt_obj.refcount = (tt_obj.refcount or 0) + 1
 
             book.save()
 
             total = qty * unit_price
-            # v1.3.1: entry ``guid`` dropped — no tool surface
-            # consumes a standalone entry GUID.
+            # Entry ``guid`` omitted — no standalone tool surface.
             return {
                 cfg["id_param"]: doc_id,
                 "description": description,
@@ -4921,15 +4210,10 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '50.00').
-            taxtable: Optional taxtable name. When given, the entry
-                contributes tax components per the taxtable's entries
-                at posting time.
-            tax_included: If True, ``price`` is treated as gross
-                (tax-inclusive); pretax extracted. If False (default),
-                ``price`` is pre-tax and tax adds on top.
+            taxtable, tax_included: See ``_add_entry``.
 
         Returns:
-            Dict with guid, bill_id, total, status.
+            Dict with bill_id, total, status.
         """
         return self._add_entry(
             owner_type=4,
@@ -4954,26 +4238,20 @@ class BusinessMixin:
     ) -> dict:
         """Add a line item entry to an employee expense voucher.
 
-        Voucher entries are typically one-per-expense-category
-        (meals, supplies, travel, etc.) on a single submission. The
-        underlying storage uses the same ``b_*`` column group as
-        vendor bills — see ``_add_entry``.
+        Storage uses the same ``b_*`` column group as vendor bills
+        — see ``_add_entry``.
 
         Args:
             voucher_id: Voucher ID (e.g., '000001').
-            account: Expense account full path (e.g.,
-                'Expenses:Meals & Entertainment'). Must be an
-                EXPENSE or ASSET account.
+            account: EXPENSE or ASSET account path (e.g.,
+                'Expenses:Meals & Entertainment').
             description: Line item description.
             quantity: Quantity as string (e.g., '1').
             price: Unit price as string (e.g., '42.50').
-            taxtable: Optional taxtable name. Same semantics as
-                ``add_bill_entry``.
-            tax_included: If True, ``price`` is gross; pretax
-                extracted at posting.
+            taxtable, tax_included: See ``_add_entry``.
 
         Returns:
-            Dict with guid, voucher_id, total, status.
+            Dict with voucher_id, total, status.
         """
         return self._add_entry(
             owner_type=5,
@@ -4997,23 +4275,15 @@ class BusinessMixin:
         """List invoices and/or bills.
 
         Args:
-            owner_type: Filter by type: 'customer', 'vendor', or None for all.
-            status: Filter by status: 'posted', 'open', or None for all.
-            compact: If True, return compact one-line-per-invoice string.
-            limit: Maximum invoices to return. Defaults to 50, capped at
-                   250 server-side. Pre-fix this method dumped every
-                   invoice in the book regardless of caller intent.
-            job_id: Filter to invoices grouped under a specific job
-                — useful for the per-engagement listing pattern
-                (e.g., "what invoices are part of the API Rewrite
-                project?"). Job-attached invoices have
-                ``owner_type=3`` with ``owner_guid`` pointing at
-                the job; this filter resolves the job and matches
-                against its GUID.
+            owner_type: 'customer', 'vendor', or None for all.
+            status: 'posted', 'open', or None for all.
+            compact: If True, one line per invoice.
+            limit: Defaults to 50, capped at 250 server-side.
+            job_id: Filter to invoices grouped under a specific job.
 
         Returns:
-            Compact string (with optional truncation notice) or list of
-            dicts (truncated silently — caller has ``len()``).
+            Compact string (with optional truncation notice) or the
+            verbose envelope ``{invoices, count, total, notice}``.
         """
         from piecash.business.invoice import Invoice
 
@@ -5021,13 +4291,10 @@ class BusinessMixin:
         with self.open() as book:
             query = book.session.query(Invoice)
 
-            # job_id filter trumps owner_type for the SQL query —
-            # job-attached invoices have owner_type=3 regardless
-            # of whether the underlying counterparty is customer
-            # or vendor. We rewrite the filter to "owner_guid =
-            # <job.guid>" and skip the owner_type filter (or
-            # cross-check it against the job's underlying type
-            # if the caller passed both).
+            # job_id trumps owner_type in SQL: job-attached invoices
+            # are owner_type=3 regardless of side, so the filter
+            # becomes owner_guid == job.guid (cross-checked against
+            # an explicit owner_type when both were passed).
             if job_id:
                 job = self._find_job(book, job_id)
                 if not job:
@@ -5070,16 +4337,9 @@ class BusinessMixin:
                     lines.append(notice)
                 return "\n".join(lines)
             else:
-                # Verbose path: resolve owner per invoice so each dict
-                # carries the readable name. ``owner_guid`` was dropped
-                # from the dict shape in Phase 3C.
-                #
-                # Job preload — avoids the N+1 query pattern Copilot
-                # flagged on PR #88. Single query for every Job
-                # referenced by job-attached invoices in the result
-                # set, indexed by GUID, then in-memory lookup per
-                # row. With 100 job-attached invoices spanning 5
-                # jobs, this is 1 query instead of 100.
+                # Verbose path resolves owner names per invoice.
+                # Jobs are preloaded in one query (not N+1) and
+                # looked up in memory per row.
                 from piecash.business.invoice import Job
                 job_attached_guids = [
                     i.owner_guid for i in invoices
@@ -5109,14 +4369,10 @@ class BusinessMixin:
                             job=j_dict,
                         )
                     )
-                # Envelope shape matches ``get_unreconciled_splits`` and
-                # ``get_prices`` so verbose-mode callers see truncation
-                # signal in the response. The bookkeeper noticed verbose
-                # was the odd one out: compact got the [Showing N of M]
-                # notice appended, but the dict version had no count /
-                # total / notice fields at all. ``count`` = truncated
-                # length, ``total`` = full filter set size, ``notice``
-                # is the same string compact appends (or None).
+                # Envelope matches get_unreconciled_splits /
+                # get_prices: ``count`` = truncated length,
+                # ``total`` = full filter-set size, ``notice`` = the
+                # same string compact appends (or None).
                 return {
                     "invoices": results,
                     "count": len(results),
@@ -5163,23 +4419,15 @@ class BusinessMixin:
                     {"guid": inv.guid},
                 ).fetchall()
 
-            # Phase 3C: build a guid → fullname map once (covers every
-            # account referenced by entries on this invoice), then
-            # thread it through ``_entry_to_dict`` so each entry shows
-            # ``account: "Income:LLC Revenue"`` instead of an opaque
-            # 32-char hex GUID. One query, ``account_paths`` shared
-            # across all entries.
+            # One guid→fullname map shared across entries — readable
+            # ``account`` paths instead of 32-char GUIDs.
             account_paths: dict[str, str] = {}
             for a in book.accounts:
                 account_paths[a.guid] = a.fullname
 
-            # Build taxtable_guid → name map only for taxtables
-            # actually referenced by this invoice's entries — skip
-            # the query entirely when no entries are tax-bearing,
-            # and otherwise filter to just the needed GUIDs. Saves
-            # an O(N-taxtables-in-book) scan on every get_invoice
-            # call against a large book. Same preload pattern as
-            # the Job lookup in list_invoices.
+            # Taxtable names: query only the GUIDs this invoice's
+            # entries reference; skip entirely when none are
+            # tax-bearing. Same preload pattern as list_invoices.
             if is_bill:
                 needed_tt_guids = {
                     r.b_taxtable for r in rows if r.b_taxtable
@@ -5206,12 +4454,9 @@ class BusinessMixin:
                 for r in rows
             ]
 
-            # Tax summary: compute via the seam so the math
-            # matches what posting would produce. Empty entries
-            # raises ValueError on the seam — guarded by the
-            # outer rows check. If no entries are tax-bearing,
-            # tax_summary stays None and the response shape
-            # matches pre-v1.3 byte-for-byte.
+            # Tax summary via the posting-math seam so displayed
+            # numbers match what posting produces. None when no
+            # entries are tax-bearing (original response shape).
             tax_summary = None
             if rows:
                 totals = self._get_invoice_entries_and_total(
@@ -5240,36 +4485,23 @@ class BusinessMixin:
                         },
                         "total": str(totals["grand_total"]),
                     }
-                # Customer-facing total uses the seam's
-                # grand_total (gross). Non-tax invoices fold to
-                # the same Q×P sum they had pre-v1.3.
+                # Customer-facing total is the seam's gross grand_total.
                 total = totals["grand_total"]
             else:
                 total = Decimal(0)
 
-            # Three-way owner lookup — vouchers route to employees,
-            # bills to vendors, invoices to customers. Pre-fix this
-            # was a binary "is_bill → vendor else customer" check
-            # that returned None for vouchers because employees
-            # weren't in the dispatch.
+            # Three-way owner lookup — a binary is_bill check would
+            # return None for vouchers.
             owner = self._find_invoice_owner_by_guid(
                 book, inv.owner_type, inv.owner_guid,
             )
             owner_name = owner.name if owner else None
 
-            # Resolve applies_to for credit notes — the source
-            # link is stored as a GUID slot; we render it as the
-            # human-readable ``{id, type}`` pair. ``_invoice_to_dict``
-            # only emits the ``applies_to`` key when the credit-note
-            # flag is also set, so normal invoices/bills get the
-            # same shape they did pre-v1.3.
+            # applies_to renders the GUID slot as {id, type}; only
+            # emitted when the credit-note flag is set.
             applies_to = self._resolve_applies_to(book, inv)
-            # Resolve job linkage for job-attached invoices
-            # (owner_type=3 means owner_guid points at a Job).
-            # _invoice_to_dict uses the dict to compute the
-            # type field (invoice vs bill based on the job's
-            # underlying owner) AND to emit the surface
-            # ``job: {id, name}`` field.
+            # The job dict feeds both the type field and the
+            # surface ``job: {id, name}`` in _invoice_to_dict.
             job_dict = None
             if inv.owner_type == 3:
                 job_obj = self._find_job_by_guid(
@@ -5287,20 +4519,12 @@ class BusinessMixin:
             )
             result["total"] = str(total)
 
-            # Forward signal: when this invoice has discount terms,
-            # surface the eligible-until date and the dollar amount
-            # of discount available. Makes get_invoice actionable for
-            # the LLM as a bookkeeper — "you can save $X if you pay
-            # this by Y" — without the caller having to read the
-            # billterm separately and do the math.
-            #
-            # Three states:
-            #   - No discount terms → no block
-            #   - Discount terms + within window → ``discount_available``
-            #     block with the amount + deadline
-            #   - Discount terms + past deadline → ``discount_expired``
-            #     block with the same fields so the audit-log reader
-            #     can see what was offered
+            # Forward signal: surface available (or just-expired)
+            # early-payment discount so get_invoice is actionable
+            # ("save $X by paying before Y") without the caller
+            # reading the billterm and doing the math. Within the
+            # window → ``discount_available``; past it →
+            # ``discount_expired`` (same fields, for audit readers).
             disc_summary = self._compute_discount_summary(book, inv)
             if disc_summary is not None:
                 today = date.today()
@@ -5333,54 +4557,37 @@ class BusinessMixin:
         """Convert ``amount`` (in invoice currency) to the target
         commodity, quantized to that commodity's smallest fraction.
 
-        R-2: shared chokepoint for the cross-currency math that
-        ``post_invoice`` and ``pay_invoice`` previously did with
-        nearly-identical inline closures (``_qty_for_split`` and
-        ``_convert``). One helper, two callers, same error shape
-        — so a future fix to the rate-lookup or quantization
-        cascade hits both paths without re-derivation.
+        Shared chokepoint for the cross-currency math behind
+        ``post_invoice`` and ``pay_invoice`` — one helper, two
+        callers, same error shape.
 
-        **FX freshness guard.** Because GnuCash etches the exchange
-        rate at post/pay time and ``create_price`` does not update an
-        already-posted document, this chokepoint refuses to apply a
-        rate whose price is more than ``GNUCASH_FX_GUARD_DAYS``
-        (default 7) from ``as_of`` — the document's own date —
-        unless ``force=True``. The age axis is the same as the
-        90-day staleness cap inside ``_find_exchange_rate``, giving
-        three bands: ≤7 proceed, 7–90 refuse-but-forceable, >90 the
-        cap hard-errors (no rate returned at all).
+        **FX freshness guard.** GnuCash etches the exchange rate at
+        post/pay time; ``create_price`` can't update an
+        already-posted document. So this chokepoint refuses a rate
+        more than ``GNUCASH_FX_GUARD_DAYS`` (default 7) from
+        ``as_of`` unless ``force=True``. Together with the 90-day
+        staleness cap in ``_find_exchange_rate`` that gives three
+        bands: ≤7 proceed, 7–90 refuse-but-forceable, >90 hard
+        error (no rate at all).
 
         Args:
-            book: Open piecash session (passed through to
-                ``_find_exchange_rate_aged``).
-            amount: The value in invoice currency.
-            invoice_currency: The invoice's currency commodity.
-            target_commodity: The commodity to convert TO (e.g.
-                an A/R or bank account's commodity).
-            as_of: Date for the rate lookup (post_date or
-                payment_date).
+            as_of: Date for the rate lookup (post or payment date).
             context: ``"posting"`` or ``"payment"`` — embedded in
-                the no-rate-found and stale-rate errors so the LLM
-                sees which operation needs the rate.
-            force: When True, apply a stale (7–90 day) rate anyway
-                and return its details in the third tuple slot for
-                the caller to surface as an ``fx_stale`` block.
+                errors so the LLM sees which operation needs the
+                rate.
+            force: Apply a stale (7–90 day) rate anyway; its
+                details come back in ``stale_meta``.
 
         Returns:
-            ``(quantized_amount, rate, stale_meta)``. ``rate`` is the
-            applied exchange rate, or ``None`` for same-currency (the
-            input ``amount`` is returned untouched — no quantize, no
-            rate). ``stale_meta`` is ``None`` unless ``force=True``
-            overrode the freshness guard, in which case it is the
-            ``fx_stale`` dict (currency, rate_used, rate_date,
-            age_days, forced).
+            ``(quantized_amount, rate, stale_meta)``. ``rate`` is
+            None for same-currency (``amount`` returned untouched).
+            ``stale_meta`` is None unless ``force`` overrode the
+            guard — then it's the ``fx_stale`` dict.
 
         Raises:
-            ValueError: When the currencies differ and no exchange
-                rate is on file within the staleness cap.
-            StaleFXRateError: When the rate is 7–90 days from
-                ``as_of`` and ``force`` is False. Carries a
-                structured ``fx_detail`` for the tool layer.
+            ValueError: no rate on file within the staleness cap.
+            StaleFXRateError: rate in the 7–90 band and ``force``
+                is False; carries structured ``fx_detail``.
         """
         if target_commodity == invoice_currency:
             return amount, None, None
@@ -5499,25 +4706,14 @@ class BusinessMixin:
         )
 
         with self.open(readonly=False) as book:
-            # GnuCash uses separate ID sequences for customer
-            # invoices (owner_type=2) and vendor bills
-            # (owner_type=4) but stores both in the ``invoices``
-            # table. IDs collide across sequences (a $5K Emerald
-            # Analytics invoice and a $250 Office Depot bill can
-            # both be id=000010). Without an owner_type filter,
-            # ``_find_invoice`` returns whichever row hits first
-            # — the bookkeeper hit this on Alex's book trying to
-            # post a vendor bill 000010 and getting back an
-            # already-posted customer invoice 000010, raising
-            # spurious "already posted".
-            #
-            # When the caller didn't specify ``owner_type``,
-            # disambiguate by reading the post_account type:
-            # a RECEIVABLE account can only receive customer
-            # invoices, a PAYABLE only vendor bills. The
-            # post_account validation later in this method already
-            # uses the same predicate; using it upstream for the
-            # lookup eliminates the collision class entirely.
+            # Customer-invoice and vendor-bill ID sequences collide
+            # in the shared ``invoices`` table — without an
+            # owner_type filter, posting bill 000010 can fetch an
+            # already-posted invoice 000010 and raise a spurious
+            # "already posted". When the caller didn't pass
+            # owner_type, infer it from the post account's type:
+            # RECEIVABLE → customer invoice, PAYABLE → vendor bill
+            # (the same predicate the later validation uses).
             if ot is None:
                 pa = self._resolve_account(book, post_account)
                 if pa is not None:
@@ -5532,20 +4728,8 @@ class BusinessMixin:
                     f"Document not found: {invoice_id}"
                 )
 
-            # Truthy check rather than ``is not None``: piecash's
-            # _DateTime TypeDecorator can return falsy non-None
-            # values (empty string in some persistence paths) for
-            # never-posted documents. The bookkeeper hit this on
-            # Alex's book where freshly auto-id'd bill 000008 had
-            # ``date_posted=""`` in SQL and post_invoice raised
-            # "already posted" on it. ``if inv.date_posted`` treats
-            # both None and "" as "not posted"; only a real
-            # datetime is truthy. Same fix applied to all other
-            # date_posted checks in this module — see also
-            # ``add_invoice_entry``, ``add_bill_entry``,
-            # ``pay_invoice``, ``list_invoices`` filter,
-            # ``_delete_invoice_or_bill``, and the dependency
-            # check in ``_invoice_dependency_check``.
+            # ``_is_invoice_posted`` treats None/"" as not-posted —
+            # see _safe_invoice_date for the piecash hazard.
             if _is_invoice_posted(inv):
                 raise ValueError(
                     f"{self._doc_label_for(inv.owner_type)} "
@@ -5575,9 +4759,9 @@ class BusinessMixin:
                 account=post_acct,
                 is_closed=0,
             )
-            # MP-11: see investments.py — Lot auto-registers via
-            # the account back-pop; the explicit session.add was
-            # redundant.
+            # Lot auto-registers via the account back-pop —
+            # an explicit session.add would be redundant (see
+            # the matching note in investments.py).
 
             # GnuCash UI uses the customer/vendor name, not "Invoice NNNNNN"
             if is_bill:
@@ -5587,27 +4771,20 @@ class BusinessMixin:
                     book, inv.owner_guid
                 )
             owner_name = owner.name if owner else f"Invoice {inv.id}"
-            # ``description=None`` (the default) falls back to the
-            # owner's name — historical behavior. An explicit ``""``
-            # is treated as "use an empty description on purpose"
-            # so the caller can deliberately blank the field
-            # without inheriting the owner name. Same pattern
-            # ``pay_invoice`` uses; pre-fix here was ``or owner_name``
-            # which collapsed "" into the fallback.
+            # description=None falls back to the owner name (GnuCash
+            # UI convention); an explicit "" deliberately blanks the
+            # field — ``or owner_name`` would collapse "" into the
+            # fallback. Same pattern as pay_invoice.
             txn_desc = description if description is not None else owner_name
 
             parsed_due = (
                 date.fromisoformat(due_date) if due_date else None
             )
 
-            # Helper: convert a value in invoice currency to the
-            # equivalent quantity in the given account's commodity.
-            # R-2: routes through ``_convert_invoice_amount`` so
-            # post and pay share one rate-lookup + quantization
-            # chokepoint. The rate is unused here (post doesn't
-            # need it for downstream FX-gain math); ``stale_meta``
-            # is collected so the response can surface ``fx_stale``
-            # when ``force`` overrode the freshness guard.
+            # Converts invoice-currency values to each account's
+            # commodity via the shared ``_convert_invoice_amount``
+            # chokepoint; collects stale_meta so the response can
+            # surface ``fx_stale`` on forced overrides.
             fx_stale_overrides: list[dict] = []
 
             def _qty_for_split(acct, value_in_invoice_ccy):
@@ -5717,11 +4894,9 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                # When the credit-note flag is set, surface
-                # ``type='credit_note'`` so the audit log
-                # decorator swaps entity_type accordingly.
-                # Otherwise the owner-type-driven label
-                # (invoice/bill/voucher) wins.
+                # Credit notes surface type='credit_note' so the
+                # audit decorator swaps entity_type; the owner-type
+                # label wins otherwise.
                 "type": (
                     "credit_note"
                     if is_credit_note
@@ -5732,11 +4907,8 @@ class BusinessMixin:
                 "status": "posted",
                 "total": str(grand_total),
                 "post_date": str(parsed_date),
-                # Transaction + lot GUIDs are USED by consumers
-                # (e.g. bookkeeper passes transaction_guid to
-                # get_transaction to verify splits). Emit short
-                # prefixes via the cached prefix maps — every
-                # tool accepts 8+ char prefixes via _resolve_guid.
+                # GUIDs emitted as short prefixes — consumers pass
+                # them back through _resolve_guid (8+ chars accepted).
                 "transaction_guid": _unique_prefix(
                     txn.guid,
                     self._transaction_prefix_map(book).keys(),
@@ -5764,32 +4936,24 @@ class BusinessMixin:
     ) -> dict:
         """Unpost a previously-posted invoice or bill.
 
-        Reverses ``post_invoice`` cleanly: deletes the posting
-        transaction and its splits, removes the posting lot, and
-        clears the invoice's posted-state metadata
-        (``date_posted``, ``post_txn``, ``post_lot``,
-        ``post_account``). The invoice returns to "open" state and
-        is editable again — entries can be added/changed and the
-        invoice can be re-posted.
+        Reverses ``post_invoice``: deletes the posting transaction
+        and lot, clears the posted-state metadata. The document
+        returns to "open" — editable and re-postable.
 
-        Refuses if the invoice has any payments applied (the lot
-        contains splits beyond the original A/R posting). Unposting
-        a partially-paid invoice would orphan the payment splits
-        and corrupt the lot's balance accounting; the caller must
-        void payments first.
+        Refuses if the invoice has live payments applied —
+        unposting a partially-paid invoice would orphan the payment
+        splits and corrupt the lot's balance. Void payments first.
 
         Args:
             invoice_id: Human-readable ID (e.g., '000001').
             owner_type: 'customer' or 'vendor' for cross-sequence
-                ID disambiguation. Required when the same numeric
-                ID exists for both an invoice and a bill.
+                ID disambiguation.
 
         Returns:
             ``{"id": "000015", "type": "invoice", "status": "unposted"}``.
 
         Raises:
-            ValueError: If the invoice/bill isn't found, isn't posted,
-                or has payments applied.
+            ValueError: not found, not posted, or payments applied.
         """
         ot = self._parse_owner_type(owner_type)
 
@@ -5807,15 +4971,13 @@ class BusinessMixin:
                 )
 
             is_bill = self._is_bill_side(self._effective_owner_type(book, inv))
-            # Three-way label dispatch — was a binary "Bill if
-            # is_bill else Invoice" that mislabeled vouchers as
-            # bills (Copilot PR #86 review).
+            # Three-way label dispatch — a binary "Bill if
+            # is_bill else Invoice" mislabels vouchers as
+            # bills.
             doc_label = self._doc_label_for(inv.owner_type)
 
-            # Capture before-state for the audit log: the user wants
-            # to see what they unposted ("was posted: 2026-04-01,
-            # post_account: Assets:Receivables:..."). Read pre-clear
-            # so the values are still set on the ORM object.
+            # Audit before-state, read pre-clear while the values
+            # are still set ("was posted 2026-04-01 to Assets:...").
             prev_post_date = _safe_invoice_date(inv, "date_posted")
             prev_post_account = (
                 inv.post_account.fullname if inv.post_account else None
@@ -5838,18 +5000,12 @@ class BusinessMixin:
             txn = inv.post_txn
             lot = inv.post_lot
 
-            # Reject when there are *live* (non-voided) payment splits
-            # in the lot. The lot starts with one split — the A/R
-            # debit/credit from the posting transaction. Each
-            # ``pay_invoice`` call adds one more split. A voided
-            # transaction in GnuCash preserves its splits with zeroed
-            # values for audit-trail purposes, so a naive
-            # ``len(lot.splits) > 1`` check counts voided payments as
-            # still-applied — which contradicts GnuCash's void
-            # semantics ("voided" means "neutralize the economic
-            # effect, preserve the record"). Filter to splits that
-            # are (a) not part of the posting transaction itself and
-            # (b) carry non-zero value.
+            # Only *live* payment splits block unposting. The lot
+            # always holds the posting split; each pay_invoice adds
+            # one more. Voided payments keep zeroed splits for audit
+            # trail, so a naive ``len(lot.splits) > 1`` would count
+            # them as still-applied — filter to non-posting,
+            # non-zero-value splits.
             posting_txn_guid = txn.guid if txn else None
             real_payment_splits = []
             if lot is not None:
@@ -5868,30 +5024,25 @@ class BusinessMixin:
                     f"Void payments first, then unpost."
                 )
 
-            # Clear the invoice's posted-state pointers BEFORE
-            # deleting the underlying transaction/lot. Otherwise the
-            # ORM cascade may resurrect the references via the
-            # relationships and trip on dangling FKs at flush.
+            # Clear posted-state pointers BEFORE deleting the
+            # transaction/lot — the ORM cascade can otherwise
+            # resurrect references and trip dangling FKs at flush.
             inv.date_posted = None
             inv.post_txn = None
             inv.post_lot = None
             inv.post_account = None
             book.flush()
 
-            # Capture the credit-note flag BEFORE we delete the
-            # posting transaction / lot. Post-save, slot reads on
-            # the invoice can flake with the "Multiple rows
-            # returned with uselist=False" piecash quirk when
-            # lots and transactions are being deleted in the
-            # same session. Reading the flag now and stashing it
-            # avoids the state-disturbance window.
+            # Read the credit-note flag BEFORE deleting: slot reads
+            # can flake ("Multiple rows returned with uselist=False")
+            # while lots/transactions are being deleted in the same
+            # session.
             is_credit_note = self._get_is_credit_note(inv)
             inv_id_snapshot = inv.id
             owner_type_snapshot = inv.owner_type
 
-            # Delete the posting transaction (which cascades its
-            # splits) and the lot (now empty after the inv.post_lot
-            # = None nullified the only split-lot link).
+            # The transaction delete cascades its splits; the lot is
+            # empty now that the posted-state pointers are cleared.
             if txn is not None:
                 book.session.delete(txn)
             if lot is not None:
@@ -5926,81 +5077,38 @@ class BusinessMixin:
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
-        Creates a payment transaction and assigns the A/R or A/P split
-        to the invoice's lot for balance tracking. Partial payments
-        are supported.
+        Creates a payment transaction and assigns the A/R or A/P
+        split to the invoice's lot. Partial payments are supported.
 
-        ``amount`` is always in the **invoice's currency**. For same-
-        currency payments (invoice currency == payment account commodity)
-        the payment account is credited/debited with the same amount. For
-        cross-currency payments the payment account's quantity is
-        computed from the book's price table at ``payment_date`` (most
-        recent price on or before the date, falling back to closest
-        after). A clear error is raised if no matching price exists.
+        ``amount`` is always in the **invoice's currency**. For
+        cross-currency payments the pay account's quantity comes
+        from the book's price table at ``payment_date`` (via
+        ``_convert_invoice_amount``, which also enforces the FX
+        freshness guard), and any post→pay rate drift books a
+        realized FX gain/loss split — account routing per
+        ``_get_or_create_fx_account``, override via ``fx_account``.
 
-        For cross-currency payments where the rate moved between
-        post-date and pay-date, a realized FX gain/loss split is
-        booked to an income/expense account. Routing rules (highest
-        priority first):
-
-        1. ``fx_account`` if supplied — must exist, must be
-           INCOME or EXPENSE.
-        2. Otherwise, the unique INCOME/EXPENSE account whose leaf
-           name matches one of "fx", "forex", "foreign exchange",
-           "currency gain/loss", "exchange gain/loss", "currency
-           translation".
-        3. Otherwise (zero matches OR multiple matches) the canonical
-           ``Income:Foreign Exchange Gain/Loss`` account, auto-
-           created if not present. If there were multiple
-           candidates, the result includes an ``fx_notice`` field
-           listing them so the caller can pass ``fx_account``
-           explicitly next time.
-
-        Args:
-            invoice_id: Human-readable ID (e.g., '000001').
-            payment_account: Bank or cash account path.
-            amount: Payment amount in the invoice currency (e.g., '500.00').
-            payment_date: ISO date (YYYY-MM-DD). Defaults to today.
-            description: Description for the payment transaction.
-            owner_type: 'customer' or 'vendor' for disambiguation.
-            fx_account: Optional account to receive any realized FX
-                gain/loss (cross-currency payments only). Accepts a
-                full path, ``%short`` GUID, or full 32-char GUID.
-                Must be an INCOME or EXPENSE account.
-            apply_discount: When True, settle this invoice using the
-                early-payment discount from its billterm. The tool
-                validates that the invoice has discount terms, the
-                payment date is within the discount window, and the
-                shortfall (remaining lot balance − amount) matches
-                the expected discount on pre-tax principal. Each
-                failure mode rejects with a specific error rather
-                than silently downgrading to a partial payment.
-                Default False — explicit opt-in surfaces caller
-                intent.
-            discount_account: Optional account to receive the
-                discount split. Accepts a full path, ``%short`` GUID,
-                or full 32-char GUID. Must be INCOME or EXPENSE.
-                Auto-resolved when omitted (same pattern as
-                ``fx_account``): explicit > name-match in book >
-                canonical default
-                (``Expenses:Sales Discounts`` for customer payments,
-                ``Income:Purchase Discounts Taken`` for vendor bill
-                payments; auto-created on first use).
+        ``apply_discount=True`` settles using the billterm's
+        early-payment discount: the shortfall (remaining balance −
+        amount) must match the expected discount on pre-tax
+        principal (``_compute_discount_summary``), within the
+        window. Explicit opt-in; each failed precondition rejects
+        with a specific error rather than downgrading to a partial
+        payment. ``discount_account`` overrides the routed account
+        (resolution mirrors ``fx_account``).
 
         Returns:
-            Dict with payment details and remaining balance. For cross-
-            currency payments also includes ``exchange_rate`` and
-            ``payment_account_amount``. For discount-eligible
-            payments also includes a ``discount`` block describing
-            the amount booked and the discount account it landed in.
+            Payment details and remaining balance; plus
+            ``exchange_rate`` / ``payment_account_amount`` /
+            ``fx_realized`` on cross-currency, and a ``discount``
+            block when a discount was booked.
 
         Raises:
-            ValueError: If invoice not found, not posted, invalid account,
-                cross-currency payment with no exchange rate available,
-                ``fx_account`` is supplied but invalid, or
-                ``apply_discount=True`` fails any of its validation
-                checks (no terms, no discount field, outside window,
-                amount mismatch, partial payment, credit-note target).
+            ValueError: not found, not posted, invalid account, no
+                exchange rate, invalid ``fx_account``, or any
+                ``apply_discount`` precondition failure (no terms,
+                no discount, outside window, amount mismatch,
+                overpayment, credit-note target).
         """
         ot = self._parse_owner_type(owner_type)
 
@@ -6055,15 +5163,11 @@ class BusinessMixin:
                     f"Lot not found for invoice {invoice_id}"
                 )
 
-            # Refuse to pay against a voided posting transaction.
-            # GnuCash's void zeroes split values but preserves rows
-            # with ``reconcile_state='v'``. ``_calculate_lot_balance``
-            # would compute remaining=0 (post-fix it skips voided
-            # splits explicitly), and the lot would auto-close on
-            # save — leaving the new payment split assigned to a
-            # closed lot. Block the operation up front so the user
-            # has to ``unvoid_transaction`` (or unpost + re-post)
-            # first.
+            # Refuse to pay against a voided posting transaction:
+            # voided splits read as zero, so the lot balance is 0
+            # and the lot would auto-close on save with the new
+            # payment split attached to it. Require unvoid (or
+            # unpost + re-post) first.
             if inv.post_txn is not None:
                 voided_post = all(
                     s.reconcile_state == "v"
@@ -6087,40 +5191,20 @@ class BusinessMixin:
                     book, inv.owner_guid
                 )
             owner_name = owner.name if owner else ""
-            # ``description if not None`` (vs. ``description or
-            # owner_name``) lets the caller pass an empty string
-            # explicitly when they want a blank transaction
-            # description — e.g., to avoid leaking the customer
-            # name into a memo. ``description=None`` (the default)
-            # falls back to the owner's name, preserving the
-            # historical default. Pre-fix ``""`` was indistinguish-
-            # able from ``None``.
+            # description: None → owner name; explicit "" blanks the
+            # field deliberately. Same pattern as post_invoice.
             txn_desc = description if description is not None else owner_name
 
-            # Cross-currency payment: when the payment account's
-            # commodity OR the A/R/A/P account's commodity differs
-            # from the invoice currency, find the exchange rate from
-            # book.prices and convert quantity. The transaction
-            # currency stays as the invoice currency so all split
-            # ``value``s remain in invoice currency (transaction
-            # balances in EUR for an EUR invoice); each account's
-            # ``quantity`` reflects the actual amount in its own
-            # commodity.
-            #
-            # Pre-fix, ``pay_invoice`` only converted the bank-side
-            # quantity. ``post_invoice`` correctly converted the A/R
-            # side via ``_qty_for_split(post_acct, ...)``; the pay
-            # path didn't, so a USD A/R holding a EUR invoice was
-            # liquidated in EUR-as-USD on payment.
-            # R-2: ``post_invoice`` and ``pay_invoice`` share
-            # the cross-currency rate-lookup + quantization
-            # chokepoint via ``_convert_invoice_amount``. Pay
-            # consumes both the converted quantity AND the
-            # rate (the rate feeds ``_compute_fx_gain_loss``
-            # below). ``stale_meta`` is collected so the response
-            # can surface ``fx_stale`` when ``force`` overrode the
-            # freshness guard; ``_convert`` keeps its 2-tuple shape
-            # so the unpack sites below are unchanged.
+            # Cross-currency: the transaction currency stays the
+            # invoice currency (values balance in EUR for a EUR
+            # invoice); each account's quantity reflects its own
+            # commodity. BOTH legs convert — converting only the
+            # bank side would liquidate a USD A/R holding a EUR
+            # invoice in EUR-as-USD on payment. Rate lookup +
+            # quantization route through _convert_invoice_amount;
+            # pay also consumes the rate (it feeds
+            # _compute_fx_gain_loss below) and collects stale_meta
+            # for the fx_stale response block.
             fx_stale_overrides: list[dict] = []
 
             def _convert(amount, target_commodity):
@@ -6144,12 +5228,9 @@ class BusinessMixin:
                 payment_amount, post_acct.commodity,
             )
 
-            # Guard against extreme-rate-quantize-to-zero. With a
-            # tiny exchange rate (< quantum / payment_amount) the
-            # converted quantity rounds to zero — a "successful"
-            # payment that records nothing on the bank side and
-            # silently fails to clear the lot. Refuse to build a
-            # zero-quantity payment split.
+            # A tiny exchange rate can quantize the converted
+            # quantity to zero — a "successful" payment recording
+            # nothing on the bank side. Refuse.
             if pay_quantity == 0 or post_quantity == 0:
                 raise ValueError(
                     f"Cross-currency payment quantizes to zero in "
@@ -6163,25 +5244,22 @@ class BusinessMixin:
                     f"{pay_acct.commodity.mnemonic}."
                 )
 
-            # Credit-note refund direction reverses: paying a
-            # customer credit note means SENDING cash to the
-            # customer (refund), so signs flip versus a normal
-            # customer invoice payment. Same XOR trick as
-            # post_invoice — a credit note swaps the is_bill
-            # branch.
+            # Credit-note refund reverses direction: paying a
+            # customer credit note SENDS cash. Same XOR trick as
+            # post_invoice.
             is_credit_note = self._get_is_credit_note(inv)
             effective_is_bill = is_bill ^ is_credit_note
 
-            # ── Overpayment guard (adversarial pass 2, C2) ────────
+            # ── Overpayment guard ─────────────────────────────────
             # The lot balance is signed: positive for A/R invoices,
             # negative for A/P bills, flipped for credit notes.
             # Normalize to "amount still owed" via effective_is_bill
-            # and reject any payment beyond it. Pre-fix nothing
-            # compared amount to remaining: an overpayment drove the
-            # lot negative, lot-close (== 0 exactly) never fired, and
-            # downstream abs() calls inverted the sign — a customer
-            # who overpaid by $1,000 rendered as still OWING $1,000
-            # in the collections list.
+            # and reject any payment beyond it. Without this guard
+            # nothing compares amount to remaining: an overpayment
+            # drives the lot negative, lot-close (== 0 exactly) never
+            # fires, and downstream abs() calls invert the sign — a
+            # customer who overpaid by $1,000 renders as still OWING
+            # $1,000 in the collections list.
             remaining_before_pay = self._calculate_lot_balance(lot_obj)
             if effective_is_bill:
                 remaining_before_pay = -remaining_before_pay
@@ -6201,12 +5279,10 @@ class BusinessMixin:
                 )
 
             # ── Early-payment discount validation ────────────────
-            # Five rejection cases, each with a distinct error so
-            # the caller can see exactly which precondition failed.
-            # Per the spec: discount is an explicit opt-in (no
-            # auto-detect from coincidental shortfall) — when
-            # apply_discount=True, the call either honors all
-            # invariants and books the discount split, or rejects.
+            # Five rejection cases, each with a distinct error.
+            # Explicit opt-in: apply_discount=True either honors
+            # all invariants and books the discount split, or
+            # rejects.
             discount_split: piecash.Split | None = None
             discount_acct = None
             discount_notice = None
@@ -6262,14 +5338,10 @@ class BusinessMixin:
                         f"audit trail."
                     )
 
-                # Use the CURRENT remaining lot balance as the
-                # principal to settle — not the original grand_total.
-                # This makes the closing-payment-of-a-multi-pay-
-                # invoice case work naturally: customer paid $500
-                # earlier without discount, now pays $480 with
-                # apply_discount=True → remaining=$500, amount=$480,
-                # shortfall=$20, expected=$20 (on original $1000) →
-                # honored.
+                # Principal = CURRENT remaining lot balance, not the
+                # original grand_total — so the closing payment of a
+                # multi-pay invoice discount-settles naturally
+                # (remaining 500, pay 480, shortfall 20 = expected).
                 remaining_before = abs(
                     self._calculate_lot_balance(lot_obj)
                 )
@@ -6303,23 +5375,15 @@ class BusinessMixin:
                         f"apply_discount for a partial payment."
                     )
 
-                # Book the discount at the ACTUAL shortfall, not the
-                # computed expectation. The tolerance above admits a
-                # 1-quantum mismatch (rounding of the user's payment);
-                # booking ``expected`` then left the splits off by
-                # that quantum and the transaction died later with an
-                # opaque GncImbalanceError after the validator had
-                # blessed the input (A5). A/R clears
-                # ``remaining_before`` and the bank brings
-                # ``payment_amount``, so the discount leg must be
-                # exactly their difference.
+                # Book the ACTUAL shortfall, not the computed
+                # expectation: the tolerance above admits a 1-quantum
+                # mismatch, and booking ``expected`` would leave the
+                # splits off by that quantum — an opaque
+                # GncImbalanceError after validation blessed the input.
                 expected = shortfall.quantize(quantum)
 
-                # All validation passed — resolve the discount account
-                # and build the split. Quantize to the discount
-                # account's commodity quantum after cross-currency
-                # conversion (rare but possible — discount account
-                # commodity might differ from invoice currency).
+                # Validation passed — resolve the discount account
+                # and build the split.
                 discount_acct, discount_notice = (
                     self._get_or_create_discount_account(
                         book,
@@ -6341,11 +5405,9 @@ class BusinessMixin:
                 )
                 discount_amount_invoice_ccy = expected
 
-                # When discount applies, the A/R/A/P side absorbs the
-                # FULL remaining_balance — not just payment_amount.
-                # The discount split makes up the difference so the
-                # transaction balances. Recompute the A/R-side
-                # quantity in the post account's commodity.
+                # With a discount the A/R side absorbs the FULL
+                # remaining balance; the discount split makes up the
+                # difference so the transaction balances.
                 full_settle_amount = remaining_before
                 full_settle_post_qty, _ = _convert(
                     full_settle_amount, post_acct.commodity,
@@ -6354,16 +5416,13 @@ class BusinessMixin:
                 full_settle_amount = payment_amount
                 full_settle_post_qty = post_quantity
 
-            # C10: when the A/R-A/P account's commodity differs from
-            # the invoice currency, relieve the lot at the rate it is
-            # CARRIED at — proportional to the lot's remaining
-            # quantity — never at the pay-date rate. Pay-date relief
-            # left the post→pay drift in the account's quantity
-            # balance forever (a permanent phantom A/R on a fully
-            # settled invoice) while the same drift was also booked
-            # as the explicit FX split. A full settlement relieves
-            # the remaining quantity exactly; a partial one relieves
-            # pro-rata in invoice-currency terms.
+            # When the post account's commodity differs from the
+            # invoice currency, relieve the lot at the rate it is
+            # CARRIED at (full settle → remaining quantity exactly;
+            # partial → pro-rata), never the pay-date rate —
+            # pay-date relief leaves the drift as a permanent
+            # phantom A/R on a settled invoice while the same drift
+            # is also booked as the explicit FX split.
             if (
                 post_acct.commodity != inv.currency
                 and remaining_before_pay > 0
@@ -6385,10 +5444,7 @@ class BusinessMixin:
 
             if effective_is_bill:
                 # Pay vendor bill (or refund customer credit note):
-                # debit A/P (positive), credit bank (negative). When
-                # apply_discount=True, A/P clears FULL outstanding
-                # balance (full_settle_amount); the discount split
-                # absorbs the difference.
+                # debit A/P, credit bank.
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=full_settle_amount,
@@ -6404,9 +5460,7 @@ class BusinessMixin:
                 )
             else:
                 # Receive customer payment (or refund-in from a
-                # vendor credit note): credit A/R (negative),
-                # debit bank (positive). With apply_discount=True,
-                # A/R clears FULL outstanding balance.
+                # vendor credit note): credit A/R, debit bank.
                 ar_ap_split = piecash.Split(
                     account=post_acct,
                     value=-full_settle_amount,
@@ -6421,30 +5475,21 @@ class BusinessMixin:
                     memo="",
                 )
 
-            # Realized FX gain/loss: when cross-currency and the rate
-            # moved between post-date and pay-date, the actual amount
-            # received/spent differs from what was originally recorded
-            # as income/expense. That delta is taxable FX gain (or
-            # loss); book it to an auto-created Income:FX Gain/Loss
-            # account. The split has value=0 in the transaction
-            # currency (so EUR/GBP/etc. balance is preserved) but
-            # non-zero quantity in the FX account's commodity (book
-            # default). Same account for both directions; sign
-            # determines gain vs loss. Logic factored into
-            # :meth:`_compute_fx_gain_loss` so the four sign
-            # quadrants are testable as unit cases rather than only
-            # via end-to-end ``pay_invoice``.
+            # Realized FX gain/loss on post→pay rate drift, factored
+            # into _compute_fx_gain_loss (the four sign quadrants
+            # are unit-testable there). The split is value=0 in the
+            # transaction currency, non-zero quantity in the FX
+            # account's commodity (book default). One account both
+            # directions; sign decides gain vs loss.
             splits = [ar_ap_split, bank_split]
             if discount_split is not None:
                 splits.append(discount_split)
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
-                # FX gain/loss direction follows the effective
-                # is_bill of THIS payment — a customer credit
-                # note refund behaves like a vendor bill payment
-                # from the FX-direction perspective (cash leaving
-                # the company on the bank side).
+                # Direction follows THIS payment's effective_is_bill
+                # — a customer credit-note refund behaves like a
+                # bill payment (cash leaving on the bank side).
                 fx_result = self._compute_fx_gain_loss(
                     book,
                     inv=inv,
@@ -6491,11 +5536,10 @@ class BusinessMixin:
 
             book.save()
 
-            # Direction-normalized remaining: positive = still owed.
-            # Never abs() a lot balance — with the overpayment guard
-            # above this is always >= 0 via pay_invoice, but if some
-            # other path left the lot negative, a credit must surface
-            # as negative rather than masquerade as money owed (C2).
+            # Direction-normalized: positive = still owed. Never
+            # abs() a lot balance — if some other path left it
+            # negative, a credit must surface as negative rather
+            # than masquerade as money owed.
             remaining_directional = (
                 -remaining if effective_is_bill else remaining
             )
@@ -6529,22 +5573,18 @@ class BusinessMixin:
                 result["payment_account_currency"] = pay_acct.commodity.mnemonic
                 if fx_result is not None:
                     fx_diff_default = fx_result["fx_diff_default"]
-                    # effective_is_bill, not is_bill: a cross-currency
-                    # credit-note refund pays out like a bill, so the
-                    # label must follow the same direction the ledger
-                    # split was booked with (_compute_fx_gain_loss is
-                    # called with effective_is_bill above). Pre-fix a
-                    # booked FX loss on a customer credit-note refund
-                    # was labeled "gain" (adversarial pass 2, A4).
+                    # Label follows effective_is_bill (the direction
+                    # the split was booked with) — keyed on is_bill,
+                    # an FX loss on a customer credit-note refund
+                    # would be labeled "gain".
                     direction = (
                         "loss" if (effective_is_bill and fx_diff_default > 0)
                         or (not effective_is_bill and fx_diff_default < 0)
                         else "gain"
                     )
                     result["fx_realized"] = {
-                        # Amount on the FX account is in the book's
-                        # default currency — that's the account's
-                        # commodity and the unit every report uses.
+                        # In the book default — the FX account's
+                        # commodity.
                         "amount": str(
                             abs(fx_diff_default).quantize(
                                 _commodity_quantum(default_currency)
@@ -6557,11 +5597,8 @@ class BusinessMixin:
                     if fx_result["fx_notice"] is not None:
                         result["fx_notice"] = fx_result["fx_notice"]
             if discount_split is not None:
-                # Surface what was booked so the caller can confirm the
-                # discount applied without re-reading the transaction.
-                # ``account`` is the canonical full path (handles the
-                # case where the auto-resolver picked an account the
-                # caller didn't supply explicitly).
+                # ``account`` is the canonical path — the resolver
+                # may have picked an account the caller didn't pass.
                 result["discount"] = {
                     "amount": str(discount_amount_invoice_ccy),
                     "currency": inv.currency.mnemonic,
@@ -6586,50 +5623,22 @@ class BusinessMixin:
         owner_type: str | None = None,
     ) -> dict:
         """Net a posted credit note against a posted invoice/bill
-        from the same owner. No cash moves — the credit balance
-        transfers between lots on the same A/R or A/P account.
+        from the same owner. No cash moves — the credit transfers
+        between lots on the same A/R or A/P account.
 
-        This is the "Process Payment with both checked" workflow
-        from GnuCash desktop, factored into a dedicated tool for
-        LLM legibility. ``pay_invoice`` continues to handle the
-        cash-refund case (when the customer was already paid and
-        the credit note represents money owed BACK to them).
+        This is GnuCash desktop's "Process Payment with both
+        checked" workflow as a dedicated tool. ``pay_invoice``
+        handles the cash-refund case.
 
-        Booking shape:
+        Booking shape: two splits on the post account, summing to
+        zero — one settles the credit note's lot, the other reduces
+        the target's. Customer side debits the CN lot / credits the
+        target lot; vendor side is symmetric.
 
-        - **Customer side**: two splits on the A/R account, summing
-          to zero. One debit assigned to the credit note's lot
-          (settles the negative balance there); one credit assigned
-          to the target invoice's lot (reduces what's still owed).
-        - **Vendor side**: symmetric — two splits on the A/P
-          account, credit on the credit note's lot (settles the
-          positive balance), debit on the target's lot (reduces
-          what's still owed to the vendor).
-
-        Validation:
-
-        - Both documents must be posted (nothing to net otherwise).
-        - Same owner (customer A's credit note can't net B's bill).
-        - Same currency (cross-currency netting would create FX
-          adjustments outside GnuCash's tracking).
-        - Same A/R or A/P post account.
-        - Target must be a regular invoice/bill (not another credit
-          note — credits don't net against credits).
-        - ``amount`` (if supplied) must not exceed the lesser of
-          the two remaining balances.
-
-        Args:
-            credit_note_id: The credit note to apply (must be
-                posted).
-            applies_to_invoice_id: The target invoice/bill to net
-                against (must be posted, same owner, same currency).
-            amount: Amount to apply, as a decimal string in the
-                document currency. Defaults to ``min(credit_note_
-                remaining, target_remaining)`` — apply as much as
-                possible.
-            apply_date: ISO date for the netting transaction.
-                Defaults to today.
-            owner_type: Optional disambiguator for ID collisions.
+        Validation: both posted; same owner; same currency; same
+        post account; target not itself a credit note; ``amount``
+        (when given) within the lesser of the two remaining
+        balances. Defaults to applying as much as possible.
 
         Returns:
             Dict with ``credit_note_id``, ``applies_to_invoice_id``,
@@ -6638,9 +5647,8 @@ class BusinessMixin:
             ``apply_date``, ``status='applied'``.
 
         Raises:
-            ValueError: For any of the validation failures above,
-                or if ``amount`` rounds to zero in the target
-                commodity.
+            ValueError: any validation failure, or ``amount``
+                quantizing to zero in the post-account commodity.
         """
         from datetime import datetime as _dt
         # piecash Transaction.post_date wants a ``date`` object, not
@@ -6727,20 +5735,12 @@ class BusinessMixin:
 
             post_acct = cn.post_account
 
-            # Cross-currency apply isn't supported here — the
-            # netting transaction is in the post account's
-            # commodity, so the document currency must match.
-            # In practice every well-formed book has per-currency
-            # A/R accounts (Alex has 'Accounts Receivable',
-            # 'Accounts Receivable EUR', 'Accounts Receivable
-            # CAD'), so EUR documents post to EUR A/R and the
-            # commodity equals the document currency. The case
-            # this catches: someone deliberately posted a EUR
-            # invoice to a USD A/R account (unusual, but
-            # ``post_invoice`` supports it via FX rates). For
-            # those, apply_credit_note rejects with a clear
-            # message rather than silently producing wrong split
-            # values. (Copilot PR #87 review.)
+            # The netting transaction is in the post account's
+            # commodity, so the document currency must match it.
+            # Well-formed books keep per-currency A/R accounts; the
+            # case caught here is a EUR invoice deliberately posted
+            # to USD A/R (post_invoice allows that via FX rates) —
+            # reject rather than write wrong split values.
             if cn.currency_guid != post_acct.commodity.guid:
                 raise ValueError(
                     f"Cross-currency apply not supported: credit "
@@ -6768,10 +5768,8 @@ class BusinessMixin:
                     f"or target — book may be inconsistent."
                 )
 
-            # Lot balances. Customer-side: target_lot is positive
-            # (receivable), cn_lot is negative (credit). Vendor
-            # side: signs reversed. Either way, ``abs()`` gives
-            # the available amount on each side.
+            # Signed lot balances (A/R positive, A/P negative);
+            # abs() gives the available amount on each side.
             cn_remaining = abs(self._calculate_lot_balance(cn_lot))
             target_remaining = abs(
                 self._calculate_lot_balance(target_lot)
@@ -6809,14 +5807,9 @@ class BusinessMixin:
                         f"or less."
                     )
 
-            # Quantize the apply amount to the post account's
-            # commodity. Defensive guard against a sub-quantum
-            # amount (e.g. ``amount="0.001"`` on a USD account
-            # with 0.01 quantum) producing a no-op netting
-            # transaction that reports success while moving
-            # nothing. Same shape as the cross-currency
-            # quantize-to-zero guard in pay_invoice.
-            # (Copilot PR #87 review.)
+            # Sub-quantum amounts ("0.001" on a 0.01-quantum
+            # account) would produce a no-op netting transaction
+            # that reports success. Same guard shape as pay_invoice.
             quantum_pre = _commodity_quantum(post_acct.commodity)
             apply_amount = apply_amount.quantize(quantum_pre)
             if apply_amount == 0:
@@ -6828,12 +5821,8 @@ class BusinessMixin:
                     f"divisible unit."
                 )
 
-            # Build the netting transaction:
-            #   Customer side: cn_lot gets +apply_amount (settles
-            #     credit toward zero from negative); target_lot
-            #     gets -apply_amount (reduces receivable).
-            #   Vendor side: cn_lot gets -apply_amount; target_lot
-            #     gets +apply_amount. Symmetric.
+            # Customer side: +apply on the CN lot (settles toward
+            # zero), −apply on the target lot. Vendor side symmetric.
             is_bill_side = self._is_bill_side(cn.owner_type)
             if is_bill_side:
                 cn_split_value = -apply_amount
@@ -6881,15 +5870,10 @@ class BusinessMixin:
 
             book.flush()
 
-            # Mark txn as a payment-type transaction (GnuCash UI
-            # convention) so desktop knows to render it under
-            # the lot's payment activity.
+            # Payment-type marker (GnuCash UI convention).
             txn["trans-txn-type"] = "P"
 
-            # Close lots that reached zero. A fully-settled credit
-            # note (apply == cn_remaining) closes its lot. A
-            # fully-settled target (apply == target_remaining)
-            # closes its lot. Either or both can close.
+            # Close whichever lots reached zero.
             new_cn_remaining = abs(
                 self._calculate_lot_balance(cn_lot)
             )
@@ -6903,10 +5887,8 @@ class BusinessMixin:
 
             book.save()
 
-            # Quantize all amounts to the post-account's commodity
-            # so the response shape stays consistent regardless
-            # of whether the lot-balance Decimals carried extra
-            # precision. "$100.00" not "$100".
+            # Quantize response amounts to the post-account
+            # commodity — "$100.00", not "$100".
             return {
                 "credit_note_id": credit_note_id,
                 "applies_to_invoice_id": applies_to_invoice_id,
@@ -6917,8 +5899,7 @@ class BusinessMixin:
                 "target_remaining": str(
                     new_target_remaining.quantize(quantum)
                 ),
-                # Short prefix for the netting transaction GUID —
-                # see pay_invoice for the rationale.
+                # Short prefix — see post_invoice.
                 "transaction_guid": _unique_prefix(
                     txn.guid,
                     self._transaction_prefix_map(book).keys(),
@@ -7015,25 +5996,18 @@ class BusinessMixin:
 
             inv_guid = inv.guid
 
-            # Entry cleanup — count first so the response can report how
-            # many were removed, then delete via SQLAlchemy Core. A column
-            # rename of ``entries.invoice`` or ``entries.bill`` in a
-            # future GnuCash release surfaces as AttributeError at import.
+            # Count first so the response reports how many entries
+            # were removed; then delete via Core.
             entry_count = book.session.execute(
                 select(func.count())
                 .select_from(Entry.__table__)
                 .where(entry_fk_col == inv_guid)
             ).scalar()
             if entry_count:
-                # Refcount maintenance: before deleting tax-bearing
-                # entries, tally per-taxtable counts and decrement
-                # the stored ``Taxtable.refcount`` so desktop interop
-                # stays clean. Both ``i_taxtable`` and ``b_taxtable``
-                # columns are checked — the side depends on
-                # owner_type, but a defensive UNION covers any
-                # legacy data oddities. SQL-computed counts in our
-                # own logic are unaffected by this step (they query
-                # the entries table fresh).
+                # Decrement stored Taxtable.refcount per-table before
+                # deleting tax-bearing entries (desktop interop only;
+                # our logic uses live SQL counts). Both i_/b_ columns
+                # checked defensively.
                 from sqlalchemy import text
                 tax_refs = book.session.execute(
                     text(
@@ -7048,19 +6022,13 @@ class BusinessMixin:
                     {"guid": inv_guid},
                 ).fetchall()
                 for ref in tax_refs:
-                    # Intentionally NOT paired with a _verify_*: the
-                    # stored ``refcount`` column has no in-process
-                    # consumer (every refcount decision goes through
-                    # ``_compute_taxtable_refcount``'s live COUNT(*)),
-                    # ``MAX(0, …)`` makes any miss a harmless no-op, and
-                    # ``taxtable_guid`` is read from the same entry rows
-                    # being deleted in this transaction. This is a
-                    # best-effort cache decrement, not a source of truth.
-                    # (Review L3: corruption harm refuted; the contract
-                    # scanner covers ``Table.__table__`` DML, not raw
-                    # text() — broadening it to every text() statement
-                    # would flag the many legitimately-unverified slot
-                    # operations, so that is deliberately out of scope.)
+                    # Deliberately NOT paired with a _verify_*: the
+                    # stored refcount has no in-process consumer
+                    # (checks use _compute_taxtable_refcount's live
+                    # COUNT), and MAX(0, …) makes a miss a harmless
+                    # no-op. The write-verification contract test
+                    # scans Table.__table__ DML, not raw text() —
+                    # this site is deliberately outside its scope.
                     book.session.execute(
                         text(
                             "UPDATE taxtables "
@@ -7092,12 +6060,9 @@ class BusinessMixin:
                 f"{type_label} '{doc_id}'",
             )
 
-            # Slot cleanup (A6): credit-note flag, the
-            # gnc-mcp/applies-to-invoice linkage, and any date
-            # slots live in the slots table keyed by this guid with
-            # no ON DELETE CASCADE — the raw-SQL row delete above
-            # would orphan them. Same explicit-cleanup pattern as
-            # ``_delete_business_person``.
+            # Slots (credit-note flag, applies-to link, date slots)
+            # have no ON DELETE CASCADE on obj_guid — clean up
+            # explicitly, same as _delete_business_person.
             from piecash.kvp import Slot
 
             book.session.execute(
@@ -7132,36 +6097,20 @@ class BusinessMixin:
     ) -> dict:
         """Shared delete path for Customer / Vendor / Employee.
 
-        Skeleton:
-          1. Open the book (readwrite).
-          2. Find the entity via ``find_entity_method``; raise if absent.
-          3. Run the caller's ``dependency_check(book, entity_guid)``
-             if provided — customer/vendor both block on existing
-             documents; Employee may or may not, depending on schema.
-             The callback raises ValueError with its own message.
-          4. Clean up the ``slots`` table via SQLAlchemy Core +
-             ``_verify_delete`` (Customer / Vendor / Employee rows can
-             accumulate slots over their lifetime — no ON DELETE
-             CASCADE on ``obj_guid``, so we clean up explicitly).
-          5. ORM-delete the entity; save.
-          6. Return the canonical ``{id, guid, name, type, status}``
-             response dict.
+        Runs the caller's ``dependency_check(book, entity_guid)``
+        (raises ValueError to block deletion), cleans up the
+        ``slots`` table explicitly (business-person rows accumulate
+        slots and there's no ON DELETE CASCADE on ``obj_guid``),
+        then ORM-deletes the entity.
 
         Args:
-            entity_id: Human-readable ID ('000001').
-            entity_label: "Customer" / "Vendor" / "Employee" — used
-                in error messages and the response's ``type`` key
-                (lowercased).
-            find_entity_method: Name of the finder method on ``self``;
-                resolved via ``getattr``.
-            dependency_check: Optional callable
-                ``(book, entity_guid) -> None`` that raises
-                ``ValueError`` if the entity has dependent rows that
-                block deletion. When None, the entity is deleted
-                unconditionally after slot cleanup.
+            entity_label: "Customer" / "Vendor" / "Employee" — error
+                messages and the response ``type`` key (lowercased).
+            find_entity_method: Finder method name on ``self``.
+            dependency_check: Optional; None deletes unconditionally.
 
         Returns:
-            ``{id, guid, name, type, status}``
+            ``{id, name, type, status}``
         """
         from piecash.kvp import Slot
 
@@ -7180,10 +6129,6 @@ class BusinessMixin:
             if dependency_check is not None:
                 dependency_check(book, entity_guid)
 
-            # Slot cleanup via SQLAlchemy Core. Slots on business-person
-            # rows (notes, tax info, etc.) have no ON DELETE CASCADE
-            # on ``obj_guid``, so we clean them explicitly before the
-            # ORM delete.
             book.session.execute(
                 Slot.__table__.delete().where(
                     Slot.__table__.c.obj_guid == entity_guid
@@ -7199,7 +6144,7 @@ class BusinessMixin:
             book.session.delete(entity)
             book.save()
 
-            # v1.3.1: ``guid`` dropped from delete responses too.
+            # ``guid`` omitted from delete responses too.
             return {
                 "id": entity_id,
                 "name": entity_name,
@@ -7211,12 +6156,9 @@ class BusinessMixin:
     def _invoice_dependency_check(
         entity_label: str, owner_type: int, doc_label: str,
     ):
-        """Build a dependency_check callback for business-person delete.
-
-        Used by Customer and Vendor delete paths (and potentially
-        Employee, if Employees own documents). Returns a closure that
-        queries Invoice rows matching the owner_type and raises a
-        ValueError with posted/unposted-specific wording if any exist.
+        """Build a dependency_check callback for business-person
+        delete: raises ValueError (posted/unposted-specific wording)
+        if any Invoice rows match the owner_type.
         """
         from piecash.business.invoice import Invoice
 
@@ -7255,7 +6197,7 @@ class BusinessMixin:
             customer_id: Customer ID (e.g., '000001').
 
         Returns:
-            Dict with id, guid, name, status.
+            Dict with id, name, type, status.
 
         Raises:
             ValueError: If customer not found or has invoices.
@@ -7281,7 +6223,7 @@ class BusinessMixin:
             vendor_id: Vendor ID (e.g., '000001').
 
         Returns:
-            Dict with id, guid, name, status.
+            Dict with id, name, type, status.
 
         Raises:
             ValueError: If vendor not found or has bills.
@@ -7309,7 +6251,7 @@ class BusinessMixin:
             employee_id: Employee ID (e.g., '000001').
 
         Returns:
-            Dict with id, guid, name, status.
+            Dict with id, name, type, status.
 
         Raises:
             ValueError: If employee not found.
@@ -7353,27 +6295,20 @@ class BusinessMixin:
     ) -> dict:
         """Create a job for a customer or vendor.
 
-        A job groups invoices (or bills) from one counterparty
-        under a project-level container. The financial lifecycle
-        stays on the invoices; the job is organizational only —
-        no posted state, no posting math, just ``active``/
-        ``inactive``.
+        A job groups documents from one counterparty under a
+        project-level container — organizational only, no posted
+        state. Employees are not supported (see the Job CRUD
+        section header).
 
         Args:
             owner_id: Customer or vendor ID (e.g., '000001').
-            owner_type: 'customer' or 'vendor'. Employees are not
-                supported (piecash's PersonType has no Employee
-                entry; GnuCash desktop has no Employee Job UI).
+            owner_type: 'customer' or 'vendor'.
             name: Human-readable job name (e.g., 'API Rewrite').
             reference: Optional reference string (PO number, etc.).
 
-        Returns:
-            Dict with guid, id, name, reference, active,
-            owner_type, status='created'.
-
         Raises:
-            ValueError: If owner_type is invalid, 'employee', or
-                the named owner doesn't exist.
+            ValueError: invalid/employee owner_type, or owner not
+                found.
         """
         from piecash.business.invoice import Job
 
@@ -7406,11 +6341,9 @@ class BusinessMixin:
                 )
                 raise ValueError(f"{label} not found: {owner_id}")
 
-            # The Job constructor handles owner_type, owner_guid,
-            # and (on book.add) the auto-id assignment. The
-            # ``if owner.book:`` branch in piecash's __init__ adds
-            # the job to the book automatically, so we don't need
-            # a separate ``book.session.add(job)``.
+            # The Job constructor handles owner_type/owner_guid and
+            # auto-id (advances counter_job); piecash adds it to the
+            # book via the owner relationship — no session.add needed.
             job = Job(
                 name=name,
                 owner=owner,
@@ -7420,16 +6353,15 @@ class BusinessMixin:
 
             book.save()
 
-            # Verify the row landed (consistency with the rest of
-            # the business module's "every write is verified"
-            # invariant).
+            # Row-landed check, consistent with the module's
+            # raw-SQL verification posture.
             from gnucash_mcp.book._base import _verify_write
             _verify_write(
                 book.session, Job.__table__, job.guid,
                 f"Job '{name}'",
             )
 
-            # v1.3.1: ``guid`` dropped — jobs addressed by ``id``.
+            # ``guid`` omitted — jobs addressed by ``id``.
             return {
                 "id": job.id,
                 "name": name,
@@ -7450,20 +6382,11 @@ class BusinessMixin:
         owner_id.
 
         Args:
-            owner_type: Filter by 'customer' or 'vendor'. Omit
-                for all.
-            owner_id: Filter by specific customer or vendor ID
-                (requires owner_type to disambiguate the lookup;
-                rejected otherwise to avoid ambiguous cross-
-                sequence ID matches).
+            owner_type: 'customer' or 'vendor'; omit for all.
+            owner_id: Requires owner_type (customer and vendor IDs
+                share a sequence space).
             active_only: If True (default), exclude inactive jobs.
-            compact: If True (default), return tab-separated
-                one-line-per-job string; otherwise a list of
-                dicts.
-
-        Returns:
-            Compact string or list of dicts depending on
-            ``compact``.
+            compact: One line per job (default) or list of dicts.
         """
         from piecash.business.invoice import Job
 
@@ -7471,9 +6394,8 @@ class BusinessMixin:
             self._parse_owner_type(owner_type) if owner_type else None
         )
         if int_owner_type == 5:
-            # Symmetric with create_job — surface the constraint
-            # at the filter boundary too rather than silently
-            # returning an empty list.
+            # Surface the no-employee-jobs constraint at the filter
+            # boundary too, rather than silently returning [].
             raise ValueError(
                 "Jobs are not supported for employees; "
                 "owner_type='employee' has no jobs to list."
@@ -7562,9 +6484,8 @@ class BusinessMixin:
             result = self._job_to_dict(
                 job, owner_name=owner.name if owner else None,
             )
-            # Linked invoices: owner_type=3 + owner_guid=job.guid
-            # is the polymorphic linkage. Sort by ID for stable
-            # output.
+            # owner_type=3 + owner_guid=job.guid is the polymorphic
+            # link. Sorted by ID for stable output.
             linked = book.session.query(Invoice).filter(
                 Invoice.owner_type == 3,
                 Invoice.owner_guid == job.guid,
@@ -7584,20 +6505,9 @@ class BusinessMixin:
     ) -> dict:
         """Update a job's name, reference, or active state.
 
-        Any subset of fields can be passed; unspecified fields
-        are left unchanged. Returns a diff-style response
-        (changed fields only) following the same convention as
-        ``update_account`` / ``update_transaction``.
-
-        Args:
-            job_id: Job ID.
-            name: New name (optional).
-            reference: New reference (optional).
-            active: New active flag (optional).
-
-        Returns:
-            Dict with id, guid, status='updated', plus only the
-            fields that changed.
+        Any subset of fields; unspecified fields unchanged.
+        Diff-style response (changed fields only), same convention
+        as ``update_account``.
 
         Raises:
             ValueError: If job not found or no fields supplied.
@@ -7633,7 +6543,7 @@ class BusinessMixin:
 
             book.save()
 
-            # v1.3.1: ``guid`` dropped from update responses.
+            # ``guid`` omitted from update responses.
             return {
                 "id": job.id,
                 "status": "updated",
@@ -7643,25 +6553,16 @@ class BusinessMixin:
     def delete_job(self, job_id: str, force: bool = False) -> dict:
         """Delete a job.
 
-        Refuses by default when invoices/bills are linked to the
-        job — data-loss prevention. ``force=True`` re-parents
-        every linked invoice back to its underlying customer/
-        vendor (reverses the indirection by rewriting
-        owner_type/owner_guid) before deleting the job row,
-        preserving invoice history.
-
-        Args:
-            job_id: Job ID.
-            force: If True, re-parent linked invoices instead of
-                refusing. Default False.
+        Refuses by default when documents are linked. ``force=True``
+        re-parents every linked invoice back to the underlying
+        customer/vendor (rewriting owner_type/owner_guid) before
+        deleting, preserving invoice history.
 
         Returns:
-            Dict with id, guid, name, reparented_count (0 unless
-            force was used), status='deleted'.
+            Dict with id, name, reparented_count, status.
 
         Raises:
-            ValueError: If job not found, or linked invoices
-                exist and ``force`` is False.
+            ValueError: not found, or linked documents without force.
         """
         from piecash.business.invoice import Invoice, Job
         with self.open(readonly=False) as book:
@@ -7689,11 +6590,9 @@ class BusinessMixin:
                         f"job, or unlink/delete the documents "
                         f"first."
                     )
-                # Re-parent: rewrite owner_type/owner_guid on
-                # each linked invoice to point at the customer
-                # or vendor the job was for. This preserves the
-                # invoice history while removing the
-                # intermediate Job row.
+                # Re-parent each linked invoice to the job's
+                # underlying owner — history preserved, indirection
+                # removed.
                 for inv in linked:
                     inv.owner_type = underlying_owner_type
                     inv.owner_guid = underlying_owner_guid
@@ -7708,7 +6607,7 @@ class BusinessMixin:
                 f"Job '{job_id}'",
             )
 
-            # v1.3.1: ``guid`` dropped from delete response.
+            # ``guid`` omitted from delete response.
             return {
                 "id": job_id,
                 "name": job_name,
@@ -7728,23 +6627,15 @@ class BusinessMixin:
         """Get all posted invoices/bills with outstanding balances.
 
         Args:
-            owner_type: Filter by 'customer' or 'vendor'. Omit for all.
+            owner_type: 'customer' or 'vendor'; omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
-            compact: If True (default), return a compact one-line-per-doc
-                     string with action columns: due date, days past due,
-                     currency, BILL tag, owner. Verbose mode returns the
-                     structured list dicts kept for ``pay_invoice``
-                     workflows.
-
-        Returns:
-            If compact: newline-separated lines, each
-                ``"id  owner  CCY amount  posted:YYYY-MM-DD  due:YYYY-MM-DD  N days past due"``,
-                ordered most-overdue-first. Bills tagged ``(BILL)``.
-                Empty string when nothing is outstanding.
-            If not compact: list of dicts (caller pays the wire cost
-                in exchange for the full ``original_amount`` /
-                ``amount_paid`` / ``amount_due`` breakdown).
+            compact: One line per doc with action columns (due
+                date, days past due, (BILL)/(CN) tags),
+                most-overdue first; empty string when nothing is
+                outstanding. Verbose returns dicts with the full
+                original_amount / amount_paid / amount_due
+                breakdown.
         """
         from piecash.business.invoice import Invoice
 
@@ -7785,12 +6676,9 @@ class BusinessMixin:
 
             results = []
             for inv in invoices:
-                # Single Job query via _resolve_owner_type_and_job
-                # — Copilot PR #88 review caught the original
-                # ``_effective_owner_type`` + ``_find_job_by_guid``
-                # side-by-side as redundant. Resolved up front
-                # because the lot-balance direction below needs the
-                # effective side too.
+                # One Job query feeds both the job annotation and
+                # the effective side (which drives the lot-balance
+                # direction below).
                 is_credit_note = self._get_is_credit_note(inv)
                 effective_ot, job_for_inv = (
                     self._resolve_owner_type_and_job(book, inv)
@@ -7820,14 +6708,10 @@ class BusinessMixin:
                     continue
 
                 # Direction-normalize the signed lot balance to
-                # "amount still owed" (or, for a credit note, credit
-                # still available): A/R invoice lots run positive,
-                # A/P bill lots negative, credit notes flipped.
-                # NEGATIVE here means overpaid — the counterparty
-                # holds a credit. Pre-fix this was abs()'d, so an
-                # overpaid invoice rendered as money still OWED in a
-                # collections list, inviting double-collection
-                # (adversarial pass 2, C2).
+                # "amount still owed" (credit notes: credit still
+                # available). NEGATIVE means overpaid — never abs()
+                # it, or an overpaid invoice renders as money owed
+                # and invites double-collection.
                 amount_due = -balance if (is_bill ^ is_credit_note) else balance
                 overpaid = amount_due < 0 and not is_credit_note
 
@@ -7840,31 +6724,22 @@ class BusinessMixin:
 
                 # Signed arithmetic keeps amount_paid honest in the
                 # overpaid case: grand 3500, due −1000 → paid 4500
-                # (the pre-fix abs() derivation showed paid 2500).
+                # (an abs() derivation would show paid 2500).
                 amount_paid = grand_total - amount_due
 
-                # Owner lookup via the polymorphic dispatcher —
-                # routes customer/vendor/employee/job (chasing
-                # owner_type=3 through the Job to the underlying
-                # counterparty). Pre-fix this used the direct
-                # customer/vendor finders keyed off ``is_bill``,
-                # which returned None for job-attached invoices
-                # because inv.owner_guid points at a Job, not a
-                # customer/vendor row.
+                # Polymorphic owner dispatch — the direct finders
+                # return None on job-attached invoices (owner_guid
+                # points at a Job).
                 owner = self._find_invoice_owner_by_guid(
                     book, inv.owner_type, inv.owner_guid,
                 )
                 owner_name = owner.name if owner else None
 
                 posted_dt = _safe_invoice_date(inv, "date_posted")
-                # Resolve the due date through the same three-step
-                # chain the warnings collector uses, so the bookkeeper
-                # sees identical numbers in both places. No aging
-                # clock on credit notes (money the business OWES has
-                # no past-due concept) or overpaid docs (nothing left
-                # to collect) — pre-fix an unapplied credit note
-                # carried ``days_past_due: 238`` in a collections
-                # list (C2).
+                # Same three-step due-date chain as the warnings
+                # collector. No aging clock on credit notes (nothing
+                # past due about money the business owes) or
+                # overpaid docs (nothing left to collect).
                 due_date, no_terms = self._resolve_invoice_due_date(
                     book, inv,
                 )
@@ -7878,11 +6753,8 @@ class BusinessMixin:
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
-                # Credit-note row: type stays as the owner-type
-                # tag ('invoice' / 'bill'), but the is_credit_note
-                # flag lets the compact formatter distinguish. The
-                # amount-due is the unsettled credit balance —
-                # what's still available to apply or refund.
+                # type stays the owner-type tag; is_credit_note lets
+                # the formatter distinguish.
                 row = {
                     "id": inv.id,
                     "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
@@ -7908,8 +6780,7 @@ class BusinessMixin:
                     row["overpaid"] = True
                 results.append(row)
 
-            # Sort: most overdue first (largest days_past_due), so the
-            # bookkeeper sees the urgent receivables / bills at the top.
+            # Most overdue first — urgent receivables at the top.
             results.sort(
                 key=lambda r: -(r["days_past_due"] or 0),
             )
@@ -7920,43 +6791,22 @@ class BusinessMixin:
 
     def get_job_report(self, job_id: str) -> dict:
         """Per-job summary: billed / paid / outstanding totals
-        across all linked invoices, plus the per-invoice
-        breakdown.
+        across all linked invoices, plus the per-invoice breakdown.
 
-        **Currency handling**: a job's linked invoices CAN span
-        multiple currencies (a project that bills mostly in EUR
-        but had one USD reimbursement on the same engagement),
-        so totals are returned as a dict keyed by currency
-        rather than a single scalar. Single-currency jobs render
-        as a one-key dict — the shape is consistent regardless
-        of cardinality, which is friendlier for LLMs that would
-        otherwise have to branch on whether ``totals_by_currency``
-        is flat or keyed.
+        **Currency**: a job's invoices can span currencies, so
+        totals come back as ``totals_by_currency`` — ``{ccy:
+        {billed, paid, outstanding}}`` — even for single-currency
+        jobs (a consistent shape beats branching on cardinality).
 
-        **Posted vs unposted**: both are included. Posted
-        invoices contribute to ``billed`` / ``paid`` /
-        ``outstanding`` via their lot balance. Unposted (draft)
-        invoices contribute the entry-computed face value as
-        ``billed`` and ``outstanding``, with ``paid=0`` — a
-        bookkeeper looking at a job's pipeline wants drafts in
-        the picture too, not just what's been formalized.
-
-        Args:
-            job_id: Job ID.
+        **Posted vs unposted**: both included. Posted invoices use
+        their lot balance; drafts contribute face value as billed
+        and outstanding with paid=0 — a job's pipeline includes
+        drafts.
 
         Returns:
-            Dict with:
-
-            - ``job_id``, ``job_name``, ``owner_type``,
-              ``owner_name`` — job identity context
-            - ``linked_invoices_count`` — total invoices linked
-            - ``posted_count``, ``open_count`` — status breakdown
-            - ``totals_by_currency`` — ``{ccy: {billed, paid,
-              outstanding}}`` per currency present in the
-              linked invoices
-            - ``invoices`` — per-invoice list of ``{id, status,
-              currency, billed, paid, outstanding, date_opened,
-              date_posted}``
+            ``{job_id, job_name, owner_type, owner_name,
+            linked_invoices_count, posted_count, open_count,
+            totals_by_currency, invoices}``.
 
         Raises:
             ValueError: If job not found.
@@ -7973,13 +6823,10 @@ class BusinessMixin:
             owner_type = (
                 "customer" if job.owner_type == 2 else "vendor"
             )
-            # Lot-balance direction for every invoice linked to this
-            # job follows the job's side: A/R lots run positive, A/P
-            # lots negative (credit notes flip per-invoice below).
+            # Lot-balance direction follows the job's side; credit
+            # notes flip per-invoice below.
             job_is_bill = self._is_bill_side(job.owner_type)
 
-            # Linked invoices: polymorphic owner pointer where
-            # owner_type=3 and owner_guid=job.guid. Indexed query.
             invoices = book.session.query(Invoice).filter(
                 Invoice.owner_type == 3,
                 Invoice.owner_guid == job.guid,
@@ -7992,10 +6839,8 @@ class BusinessMixin:
 
             for inv in invoices:
                 ccy = inv.currency.mnemonic if inv.currency else "?"
-                # Face value: sum of (qty * price) across entries.
-                # Falls back to 0 on entry-load failure rather
-                # than aborting the whole report — matches the
-                # _invoice_to_compact_line defensive shape.
+                # Face value falls back to 0 on entry-load failure
+                # rather than aborting the whole report.
                 try:
                     billed = self._get_invoice_entries_and_total(
                         book, inv,
@@ -8005,13 +6850,10 @@ class BusinessMixin:
 
                 if _is_invoice_posted(inv):
                     posted_count += 1
-                    # Posted: paid = billed - outstanding (from the
-                    # lot balance). Direction-normalized, NOT abs()'d:
-                    # an overpaid invoice carries a NEGATIVE
-                    # outstanding (credit held by the counterparty),
-                    # which keeps ``paid`` honest instead of
-                    # understating it by twice the credit
-                    # (adversarial pass 2, C2).
+                    # paid = billed − outstanding from the lot.
+                    # Direction-normalized, NOT abs()'d: an overpaid
+                    # invoice carries NEGATIVE outstanding, keeping
+                    # ``paid`` honest.
                     post_acct_guid = inv.post_acc_guid
                     post_acct = book.session.query(
                         piecash.Account
@@ -8034,9 +6876,8 @@ class BusinessMixin:
                         )
                         paid = billed - outstanding
                     else:
-                        # Defensive: lot not found despite
-                        # posted state — treat as fully owed
-                        # rather than crashing the report.
+                        # Lot missing despite posted state — treat
+                        # as fully owed rather than crash.
                         outstanding = billed
                         paid = Decimal("0")
                     status = "posted"
@@ -8097,23 +6938,15 @@ class BusinessMixin:
     ) -> dict | str:
         """Get spending breakdown by vendor for a period.
 
-        Analyzes posted vendor bills to show total billed, paid,
-        and outstanding amounts per vendor.
+        Analyzes posted vendor bills: total billed, paid, and
+        outstanding per vendor, converted to the book's default
+        currency at period-end rates.
 
         Args:
-            start_date: Start of period (YYYY-MM-DD).
-            end_date: End of period (YYYY-MM-DD).
-            vendor_id: Optional filter to specific vendor.
-            compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4D).
-                     Verbose mode returns the structured dict.
-
-        Returns:
-            If compact: text table (one line per vendor + TOTAL).
-            If not compact: dict with vendor breakdown and grand totals.
-            The Phase 4D spec dropped the ``period`` echo (it duplicated
-            input the caller already has); verbose mode no longer
-            includes it either.
+            start_date / end_date: Period bounds (YYYY-MM-DD).
+            vendor_id: Optional filter to one vendor.
+            compact: Aligned text table with TOTAL row (default),
+                or the structured dict.
         """
         from piecash.business.invoice import Invoice
 
@@ -8122,15 +6955,12 @@ class BusinessMixin:
 
         with self.open() as book:
             # Capture default currency for the compact formatter —
-            # pre-fix the table emitted ``$`` regardless of book
-            # setting.
+            # a hardcoded ``$`` breaks on non-USD books.
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            # Latest market rates for FX conversion as of the
-            # report period's end. Pre-v1.3 release this omitted
-            # ``as_of`` and used today's rates against historical
-            # vendor periods — SB-3.
+            # Rates as of period end — historical periods must not
+            # be valued at today's rates.
             latest_rates = self._rates_as_of(book, parsed_end)
 
             query = book.session.query(Invoice).filter(
@@ -8150,9 +6980,8 @@ class BusinessMixin:
 
             bills = query.all()
 
-            # Filter by date range. ``_safe_invoice_date`` returns
-            # None for records where date_posted is missing or
-            # malformed (empty-string state) — those drop out.
+            # ``_safe_invoice_date`` returns None for missing or
+            # malformed date_posted; those rows drop out.
             filtered_bills = []
             for b in bills:
                 posted = _safe_invoice_date(b, "date_posted")
@@ -8163,11 +6992,10 @@ class BusinessMixin:
             bills = filtered_bills
 
             vendor_data: dict[str, dict] = {}
-            # FX chokepoint: bills whose currency has no rate on file are
-            # NOT folded into the default-currency totals (that silently
-            # corrupts the sum). They're tracked here per currency and
-            # surfaced via a warning so the figure is honest about what
-            # it excludes.
+            # Bills with no rate on file are EXCLUDED from
+            # default-currency totals (folding raw foreign units
+            # corrupts the sum); tracked per currency and surfaced
+            # as a warning.
             unconverted: dict[str, dict] = {}
             for bill in bills:
                 v = self._find_vendor_by_guid(
@@ -8203,44 +7031,31 @@ class BusinessMixin:
                         book, bill,
                     )["grand_total"]
                 except ValueError:
-                    # Empty/corrupted entries — fall back to the
-                    # lot balance (computed above). Pre-fix this
-                    # silently substituted Decimal(0), which made
-                    # ``total_billed`` understate by the bill's
-                    # full amount on any data-corruption case. The
-                    # lot balance reflects the actual outstanding
-                    # liability so the vendor's row stays sane.
+                    # Empty/corrupted entries: fall back to the lot
+                    # balance. Substituting 0 would understate
+                    # total_billed by the bill's full amount.
                     total = abs(balance)
 
                 outstanding = abs(balance)
                 paid = total - outstanding
 
-                # Convert each per-bill total from the bill's own
-                # currency to the book default before summing. A
-                # USD-default book with a EUR bill: bill.currency
-                # is EUR, total is in EUR; we multiply by the
-                # current EUR→USD rate (or 1 if same-currency).
-                # Without conversion the grand totals mixed
-                # currencies — a EUR €2,500 bill and a USD $3,000
-                # bill summed to "5,500" of nothing in particular.
+                # Convert per-bill totals to the book default before
+                # summing — unconverted, a €2,500 bill and a $3,000
+                # bill sum to "5,500" of nothing in particular.
                 converted_ok = True
                 if bill.currency != default_currency:
                     rate = latest_rates.get(bill.currency.guid)
                     if rate is not None:
-                        # Quantize the FX products to the default
-                        # currency's precision: the verbose path emits
-                        # these via str(), so an unquantized product
-                        # would expose a long fractional tail (the
-                        # compact path masks it via _money's 2dp). L4.
+                        # Quantize FX products to default-currency
+                        # precision: verbose emits via str(), which
+                        # would expose a long fractional tail.
                         q = _commodity_quantum(default_currency)
                         total = (total * rate).quantize(q)
                         paid = (paid * rate).quantize(q)
                         outstanding = (outstanding * rate).quantize(q)
                     else:
-                        # No rate on file: exclude from the default-
-                        # currency totals rather than summing raw
-                        # foreign units. Accumulate per currency so the
-                        # excluded amount can be reported explicitly.
+                        # No rate: exclude and accumulate per
+                        # currency for explicit reporting.
                         converted_ok = False
                         u = unconverted.setdefault(
                             bill.currency.mnemonic,

@@ -1,34 +1,17 @@
 """Cross-commodity currency-conversion mixin.
 
-Composed into :class:`BaseGnuCashBook` unconditionally so every
-module — ``reporting``, ``budgets``, ``business``, ``core`` — gets
-the same conversion path regardless of which ``--modules`` the user
-enabled. Currency conversion is cross-cutting infrastructure, not a
-feature flag.
+Composed into :class:`BaseGnuCashBook` unconditionally — currency
+conversion is cross-cutting infrastructure, not a feature flag.
 
-Single source of truth for:
-
-- "What's the latest market price for commodity X in the book's
-  default currency?" — :meth:`CurrencyMixin._rates_as_of`.
-- "What factor converts each account's quantity to the default
-  currency?" — :meth:`CurrencyMixin._account_conversion_factors`.
-- "What's one split's value in the default currency?" —
-  :meth:`CurrencyMixin._split_in_default_currency`.
-- "What's a whole account's quantity worth, with a display annotation
-  and a cost-basis fallback when no rate is on file?" —
-  :meth:`CurrencyMixin._market_value`.
-- "What's the exchange rate between two non-default currencies near
-  some date?" — :meth:`CurrencyMixin._find_exchange_rate`.
+Single source of truth for rates as-of a date (``_rates_as_of``),
+per-account conversion factors (``_account_conversion_factors``),
+split valuation (``_split_in_default_currency``), account valuation
+with cost-basis fallback (``_market_value``), and pairwise exchange
+rates (``_find_exchange_rate``).
 
 All helpers skip piecash's auto-created ``type='transaction'`` price
-placeholders via :func:`gnucash_mcp.book._base._is_market_price` —
-those rows capture the effective rate of one specific cross-currency
-transaction and would shadow real user-supplied market quotes.
-
-The indexed query primitive :meth:`CurrencyMixin._find_prices` is
-provided here for future call-site migration; the rate-collecting
-helpers above still walk ``book.prices`` directly today (the v1.3
-performance sweep replaces those walks).
+placeholders via :func:`_is_market_price` (re-exported through
+``book._base``) — those would shadow real user-supplied quotes.
 """
 
 import os
@@ -38,34 +21,22 @@ from decimal import Decimal
 import piecash
 
 
-# ── FX staleness cap (Plumb Bob validation, 2026-06-04) ───────────
+# ── FX staleness cap ───────────────────────────────────────────────
 #
-# Pre-fix ``_find_exchange_rate`` would happily use the temporally-
-# closest price regardless of distance from ``as_of`` — a 2027
-# invoice could silently use a 2026 rate, a 2020 invoice could
-# silently use a 2025 rate. The error message promised a price "on
-# or near DATE" but the function had no proximity bound, so the
-# error was effectively unreachable for any currency with at least
-# one price on file.
-#
-# The cap below filters candidates to ``|days_offset| <=
-# _FX_STALENESS_DAYS``. When no price within the window exists,
-# the function returns ``None`` and the caller's existing
-# "Add a price with create_price, then retry" error fires correctly
-# (now with a real chance to fire).
-#
-# Default 90 days matches a typical bookkeeping cadence (monthly
-# statement close + a grace period). The
-# ``GNUCASH_FX_STALENESS_DAYS`` env var overrides it; ``0`` or
-# negative disables the cap entirely (pre-fix behavior).
+# Without the cap, ``_find_exchange_rate`` would use the temporally
+# closest price at any distance — a 2027 invoice silently rated from
+# 2026 — making the "on or near DATE" promise in the no-rate error
+# unreachable. Candidates beyond ``|days_offset| <= cap`` are
+# excluded; with none inside the window the function returns None
+# and the caller's create_price-then-retry error fires. Default 90
+# days (monthly close + grace); ``GNUCASH_FX_STALENESS_DAYS``
+# overrides, 0 or negative disables.
 
 
 def _fx_staleness_days() -> int:
     """Read the FX staleness cap from the environment.
 
-    Resolved per-call rather than cached because the env var can
-    change between server starts (and tests need to monkey-patch
-    it). The lookup is O(1) so the cost is negligible.
+    Resolved per-call (tests monkey-patch it; lookup is O(1)).
     """
     raw = os.environ.get("GNUCASH_FX_STALENESS_DAYS")
     if raw is None:
@@ -73,9 +44,8 @@ def _fx_staleness_days() -> int:
     try:
         return int(raw)
     except ValueError:
-        # Malformed value falls back to the default. We don't
-        # want a startup typo to silently disable the cap (which
-        # would happen if we returned 0).
+        # Malformed → default, not 0 — a startup typo must not
+        # silently disable the cap.
         return 90
 
 
@@ -130,22 +100,14 @@ def _to_date(dt: date | datetime) -> date:
 
 
 def _is_market_price(price) -> bool:
-    """True iff ``price`` is a real market quote, not a piecash auto-
-    placeholder.
+    """True iff ``price`` is a real market quote, not a piecash
+    auto-placeholder.
 
-    On any cross-currency transaction, piecash auto-creates a Price
-    row with ``type='transaction'`` capturing the effective rate of
-    that one transaction. These are bookkeeping artifacts, NOT
-    user-supplied market quotes — every helper that walks
-    ``book.prices`` to value holdings or pick exchange rates must
-    skip them, or they shadow real quotes the user has on file.
-
-    Centralized here so every call site
-    (core's ``_collect_warnings``, this module's ``_rates_as_of`` and
-    ``_find_exchange_rate``, investments' price-delete safety check)
-    all answer the question the same way. Adding
-    ``"transaction-currency"`` or any future placeholder type only
-    needs one change.
+    piecash auto-creates a ``type='transaction'`` Price row on every
+    cross-currency transaction — a bookkeeping artifact, not a user
+    quote. Every helper that walks ``book.prices`` must skip these
+    or they shadow real quotes. Centralized so all call sites answer
+    the same way; a future placeholder type needs one change.
     """
     return getattr(price, "type", None) != "transaction"
 
@@ -167,25 +129,12 @@ class CurrencyMixin:
         currency_guid: str | None = None,
         market_only: bool = True,
     ) -> list:
-        """Indexed lookup over ``book.prices``.
+        """Indexed lookup over ``book.prices``, newest first.
 
-        Replaces the ``for p in book.prices: if p.commodity == ...``
-        linear walks scattered across the codebase. The query hits
-        the SQLAlchemy session directly, ordered most-recent-first.
-
-        Args:
-            book: Open piecash book.
-            commodity_guid: When set, restrict to prices of this
-                commodity (the held instrument).
-            currency_guid: When set, restrict to prices denominated
-                in this currency (the quote side).
-            market_only: When True (default), skip piecash's
-                ``type='transaction'`` auto-placeholders via
-                :func:`_is_market_price`.
-
-        Returns:
-            List of :class:`piecash.core.commodity.Price` rows,
-            newest first.
+        Replaces the linear ``for p in book.prices`` walks.
+        ``commodity_guid`` filters the held instrument,
+        ``currency_guid`` the quote side; ``market_only`` (default)
+        skips ``type='transaction'`` auto-placeholders.
         """
         from piecash.core.commodity import Price
 
@@ -217,10 +166,8 @@ class CurrencyMixin:
 
         Every report-level caller of ``_account_conversion_factors``
         and ``_rates_as_of`` runs its ``as_of`` through this helper
-        first so the convention is enforced exactly once. Pre-v1.3
-        release the convention was implicit in the ``as_of=None``
-        default; now that the default is gone, the helper is the
-        explicit home for it.
+        first so the convention is enforced exactly once; this
+        helper is the convention's explicit home.
         """
         return date.max if as_of >= date.today() else as_of
 
@@ -230,48 +177,25 @@ class CurrencyMixin:
         as_of: date,
         default_currency: piecash.Commodity | None = None,
     ) -> dict[str, Decimal]:
-        """Latest user-supplied rate per non-default-currency commodity,
-        as of a specific date.
+        """Latest user-supplied rate per non-default-currency
+        commodity, as of a specific date.
 
-        Returns ``{commodity_guid: Decimal rate}``. Each rate is the
-        most recent market price (skipping ``type='transaction'``
-        auto-placeholders) of the commodity quoted in the book's
-        default currency, filtered to dates per
-        :meth:`_anchor_for_as_of` — past anchors stay literal,
-        anchors at or beyond today fold to ``date.max`` so future-
-        dated forecast prices are included (convention).
+        Returns ``{commodity_guid: Decimal rate}`` — the most recent
+        market price of each commodity quoted in the default
+        currency, date-filtered per :meth:`_anchor_for_as_of`.
+        Commodities with no qualifying price are absent; callers
+        fall back to cost basis.
 
-        **Intermediate-currency chaining (issue #94).** A commodity
-        with no price *directly* in the default currency, but
-        reachable through an intermediate, is resolved via
-        :meth:`_market_rate_to_default` (direct → inverse → single
-        pivot, then a security-priced-in-foreign-currency outer hop).
-        This covers a fund priced in USD inside an AED book
-        (fund→USD→AED), a foreign-cash balance whose pair is only
-        quoted through a vehicle currency (GBP→USD→AED), and the
-        3-hop composition. Every leg reuses the market-price filter,
-        so ``type='transaction'`` auto-placeholders never pollute a
-        chained rate. Commodities with no resolvable path stay absent
-        (caller falls back to cost basis).
+        Commodities with no *direct* default-currency price chain
+        through intermediates via
+        :meth:`_market_rate_to_default_with_path` — see its docstring
+        for the resolution cases. Every leg reuses the market-price
+        filter, so auto-placeholders never pollute a chained rate.
 
-        Args:
-            book: Open piecash book.
-            as_of: Upper bound on the price date. **Required** — pre-
-                v1.3 release this defaulted to ``None`` (no upper
-                bound, i.e. always-latest rates). Five historical-
-                report sites passed nothing and silently used today's
-                rates regardless of report date; the default has been
-                dropped so every caller must declare its intent. Pass
-                the report's as_of / end_date; the
-                ``_anchor_for_as_of`` helper handles the "include
-                future forecasts at now-or-future anchors" convention.
-            default_currency: The book's default currency. Computed
-                via :meth:`_require_default_currency` when ``None``.
-
-        Returns:
-            ``{commodity_guid: Decimal rate}``. Commodities without any
-            qualifying price don't appear; callers fall back to
-            ``split.value`` (cost basis) or skip the account.
+        ``as_of`` is **required** deliberately: a default
+        (always-latest) would let historical-report callers silently
+        use today's rates. Pass the report's as_of / end_date;
+        ``_anchor_for_as_of`` handles the forecast-price convention.
         """
         anchor = self._anchor_for_as_of(as_of)
         if default_currency is None:
@@ -291,31 +215,21 @@ class CurrencyMixin:
                 latest[key] = (p_date, Decimal(str(p.value)))
         result = {guid: rate for guid, (_d, rate) in latest.items()}
 
-        # Issue #94: chain pass. For every commodity referenced by a
-        # market price that the direct pass above couldn't rate, try
-        # to reach the default currency through an intermediate. Only
-        # commodities with at least one market price are candidates —
-        # one with no price at all has no leg to chain and stays on
-        # cost basis. Each resolution memoizes nothing here; the
-        # per-commodity cost is a few indexed price walks, run only
-        # for the non-direct minority.
-        # Past anchors forbid after-anchor fallbacks in the chain
-        # legs (C7): the direct pass above hard-filters future
-        # prices for historical reports, and a chained commodity
-        # must honor the same convention — not value a 2025-06-30
-        # sheet at a rate first quoted in September. Now/future
-        # anchors fold to date.max, where every price is "before"
-        # and the flag is moot (forecasts included by convention).
+        # Chain pass for commodities the direct pass couldn't rate
+        # (only priced commodities are candidates — no price, no leg).
+        # Past anchors forbid after-anchor fallbacks in the legs: the
+        # direct pass hard-filters future prices for historical
+        # reports, and a chained commodity must honor the same
+        # convention. Now/future anchors fold to date.max, where the
+        # flag is moot.
         allow_after = anchor >= date.today()
         for commodity in self._commodities_with_market_prices(book):
             if commodity.guid in result or commodity == default_currency:
                 continue
-            # Use the future-folded ``anchor`` (not raw ``as_of``) so a
-            # chained commodity applies the same "now/future anchors
-            # include forecast prices" convention as the direct pass
-            # above. The chain legs run with the staleness cap disabled,
-            # so an anchor of ``date.max`` selects the latest available
-            # rate rather than excluding everything as stale.
+            # Future-folded ``anchor`` (not raw as_of) keeps the
+            # chain on the same forecast convention as the direct
+            # pass; the legs run cap-free, so date.max selects the
+            # latest rate rather than excluding everything as stale.
             chained = self._market_rate_to_default(
                 book, commodity, default_currency, anchor,
                 allow_after=allow_after,
@@ -374,25 +288,17 @@ class CurrencyMixin:
         intermediate path: direct, inverse, or single-pivot.
 
         ``1 unit of from_commodity == rate units of to_commodity``.
+        Returns ``(rate, intermediates)`` — ``[]`` for direct/inverse,
+        ``[P.mnemonic]`` for a pivot — feeding the ``(via …)``
+        provenance note.
 
-        Returns ``(rate, intermediates)`` where ``intermediates`` is
-        the list of pivot-currency mnemonics strictly between source
-        and target — ``[]`` for a direct/inverse hit, ``[P.mnemonic]``
-        for a single-pivot triangulation. The path feeds the ``(via
-        …)`` provenance annotation so a reader can tell a synthesized
-        cross from a directly-quoted rate.
+        Candidate pivots are scored by **freshest worst leg** (ties
+        by mnemonic) so the choice is deterministic. Single pivot
+        only — no graph search, no cycles, bounded cost.
+        ``from_commodity`` may be a security (``from→P`` resolves its
+        quote-currency price).
 
-        Direct/inverse delegates to :meth:`_find_exchange_rate` (skips
-        ``type='transaction'``, enforces the staleness cap). Otherwise
-        each candidate pivot ``P`` with both ``from→P`` and ``P→to``
-        resolving is scored by its **freshest worst leg** (ties broken
-        by pivot mnemonic) so the choice is deterministic. Single pivot
-        only — no graph search, so no cycles and bounded cost.
-
-        ``from_commodity`` may be a security: ``from→P`` resolves to
-        the security's quote-currency price (the first leg of case A).
-
-        Valuation-only — invoice posting deliberately does **not** use
+        Valuation-only — invoice posting deliberately does NOT use
         this; a posted rate must be a real quote, not a synthesized
         cross.
         """
@@ -462,24 +368,18 @@ class CurrencyMixin:
         allow_after: bool = True,
     ) -> tuple[Decimal, list[str]] | None:
         """Market rate converting one unit of ``commodity`` to the
-        book default currency, with the intermediate path, chaining
-        when there is no direct price (issue #94).
+        book default, with the intermediate path, chaining when
+        there is no direct price.
 
-        Resolution order:
+        Resolution: (1) :meth:`_cross_rate_with_path` ``commodity →
+        default`` (direct/inverse, pivot triangulation, security
+        whose quote currency is a pivot leg); (2) security-outer
+        fallback — newest price of ``commodity`` in quote currency
+        ``X`` × rate(X → default), the 3-hop case (fund priced in
+        GBP, GBP only reachable via USD).
 
-        1. :meth:`_cross_rate_with_path` ``commodity → default`` —
-           handles a direct/inverse default-currency price, a currency
-           that triangulates through a pivot (case B), and a security
-           whose quote currency *is* a pivot leg (case A).
-        2. Security-outer fallback: for the newest market price of
-           ``commodity`` in some quote currency ``X`` that itself
-           reaches the default, return ``price(commodity in X) ×
-           rate(X → default)`` with path ``[X] + rest`` — the 3-hop
-           case C (fund priced in GBP, GBP only reachable via USD).
-
-        Returns ``(rate, intermediates)`` or ``None`` when no path
-        exists (caller keeps cost basis). ``intermediates`` is ``[]``
-        only for a direct default-currency price.
+        Returns ``(rate, intermediates)`` or ``None`` (caller keeps
+        cost basis); ``[]`` only for a direct default-currency price.
         """
         if commodity == default_currency:
             return (Decimal("1"), [])
@@ -493,7 +393,7 @@ class CurrencyMixin:
             book, commodity_guid=commodity.guid, market_only=True,
         ):
             # Newest-first list with no date bound; the outer hop
-            # honors the same anchor convention as the legs (C7) —
+            # honors the same anchor convention as the legs —
             # past anchors never price off a future quote.
             if not allow_after and _to_date(p.date) > as_of:
                 continue
@@ -547,20 +447,16 @@ class CurrencyMixin:
         default_currency: piecash.Commodity,
     ) -> dict[str, str]:
         """``{commodity_guid: "via …"}`` for every commodity whose
-        default-currency rate is *synthesized* through an intermediate.
+        default-currency rate is *synthesized* through an
+        intermediate; directly-priced commodities are absent.
 
-        Directly-priced commodities are absent (no provenance to
-        surface). Same family as ``fx_stale`` / ``discount_available``:
-        a confidence signal so the reader distinguishes a rate they
-        entered from one the system derived across two legs, each with
-        its own staleness and rounding. Computed only for the chained
-        minority, so it's cheap (and empty on single-currency books).
+        A confidence signal — the reader distinguishes a rate they
+        entered from one derived across legs, each with its own
+        staleness and rounding.
         """
-        # Fold the anchor exactly as ``_rates_as_of`` does, and apply
-        # the same past-anchor allow_after rule — otherwise the
-        # provenance pass can resolve a DIFFERENT path than the one
-        # that produced the rate and the "(via …)" note lies (C7
-        # cosmetic relative).
+        # Fold the anchor and apply allow_after exactly as
+        # ``_rates_as_of`` does — otherwise this pass can resolve a
+        # DIFFERENT path than the rate's and the "(via …)" note lies.
         anchor = self._anchor_for_as_of(as_of)
         allow_after = anchor >= date.today()
         provenance: dict[str, str] = {}
@@ -583,29 +479,19 @@ class CurrencyMixin:
         book: piecash.Book,
         as_of: date,
     ) -> dict[str, Decimal | None]:
-        """Map ``{account_guid: factor}`` for default-currency conversion
-        as of ``as_of``.
+        """Map ``{account_guid: factor}`` for default-currency
+        conversion as of ``as_of``.
 
-        ``factor * split.quantity = amount in default currency``.
+        ``factor * split.quantity = amount in default currency``:
+        ``Decimal("1")`` for default-currency accounts; the
+        most-recent rate ≤ ``as_of`` otherwise; ``None`` when no
+        rate is on file (callers fall back to ``split.value`` —
+        cost basis for default-currency buys, graceful degradation
+        for foreign holdings).
 
-        - ``Decimal("1")`` — the account is already in default currency.
-        - A non-unit ``Decimal`` — the most recent market rate ≤
-          ``as_of`` for the account's commodity in default currency.
-        - ``None`` — no qualifying rate on file. Callers should fall
-          back to ``split.value`` (transaction-currency amount), which
-          equals cost basis for default-currency-denominated
-          investment buys and degrades gracefully for foreign-currency
-          holdings.
-
-        ``as_of`` is required: pre-v1.3 release this took only
-        ``book`` and silently fetched today's rates regardless of the
-        caller's report date. Every caller now declares the date its
-        valuation is anchored to — historical reports use historical
-        rates, "now" helpers pass ``date.today()`` explicitly.
-
-        Template accounts (under ``book.root_template``) are excluded
-        from the map — they're scheduled-transaction scaffolding, not
-        user-facing accounts.
+        ``as_of`` is required so every caller declares its valuation
+        date — historical reports must not silently use today's
+        rates. Template accounts are excluded.
         """
         default_currency = self._require_default_currency(book)
         rates = self._rates_as_of(
@@ -650,35 +536,23 @@ class CurrencyMixin:
         with_cost_fallback: bool = True,
         provenance: dict[str, str] | None = None,
     ) -> tuple[Decimal, str | None]:
-        """Value an account-level quantity with a display annotation.
-
-        Used by ``get_book_summary``'s per-account display where the
-        annotation tells the LLM whether the number came from a market
-        rate or a cost-basis fallback. Sibling to
+        """Value an account-level quantity with a display annotation
+        (market rate vs cost-basis fallback). Sibling to
         :meth:`_split_in_default_currency` — same conversion model,
-        different aggregation level.
+        account-level aggregation.
 
         Args:
-            account: piecash Account whose commodity is being valued.
-            quantity: Quantity in ``account.commodity``, already summed
-                by the caller.
-            rates: ``{commodity_guid: Decimal}`` map from
-                :meth:`_rates_as_of`. Passed in (not re-fetched) so
-                callers control the price-map build once per report.
-            default_currency: The book's default currency commodity.
-            today: Cost-basis fallback ignores splits dated after this
-                so trajectory snapshots don't pick up future-dated
-                buys. When ``None``, no date filter is applied.
-            with_cost_fallback: When True (default), missing rate falls
-                back to summing ``split.value`` across the account
-                (cost basis). When False, missing rate returns
-                ``Decimal("0")`` with a ``"no price data"`` note —
-                useful for callers that want a clear empty signal
-                instead of a silent cost-basis substitute.
+            rates: Map from :meth:`_rates_as_of`, passed in so the
+                price-map builds once per report.
+            today: Cost-basis fallback ignores splits dated after
+                this; ``None`` applies no date filter.
+            with_cost_fallback: When False, a missing rate returns
+                ``Decimal("0")`` with a "no price data" note instead
+                of a silent cost-basis substitute.
 
         Returns:
-            ``(value_in_default_currency, display_note)``.
-            ``display_note`` is ``None`` for default-currency accounts.
+            ``(value_in_default_currency, display_note)``;
+            ``display_note`` is None for default-currency accounts.
         """
         if account.commodity == default_currency:
             return quantity, None
@@ -739,52 +613,34 @@ class CurrencyMixin:
 
         Preference order:
 
-        1. Direct price (``commodity=from, currency=to``) dated on or
-           before ``as_of``, closest to ``as_of``.
-        2. Inverse price (``commodity=to, currency=from``) dated on or
-           before, closest. Returned as ``1 / p.value``.
+        1. Direct price (``commodity=from, currency=to``) on or
+           before ``as_of``, closest.
+        2. Inverse price, on or before, closest (``1 / p.value``).
         3. Direct after ``as_of``, closest.
-        4. Inverse after ``as_of``, closest.
+        4. Inverse after, closest.
 
-        **Staleness cap (Plumb Bob, 2026-06-04):** candidates more
-        than ``GNUCASH_FX_STALENESS_DAYS`` (default 90) from
-        ``as_of`` are excluded. Pre-fix the function would happily
-        return a 5-year-old rate on a 2027 invoice; the documented
-        "on or near DATE" promise was effectively unreachable.
-        Setting the env var to ``0`` or a negative value disables
-        the cap (restores pre-fix behavior). ``respect_staleness_cap=
-        False`` disables it per-call — used by the valuation chain
-        (issue #94), which must value a holding at its latest
-        available rate regardless of age (matching the cap-free
-        direct path in ``_rates_as_of``); the separate stale-price
-        warning, not a hard cap, is what flags age for reporting. The
-        cap stays on for invoice posting, where a stale rate is etched
-        and must be refused.
+        **Staleness cap:** candidates beyond
+        ``GNUCASH_FX_STALENESS_DAYS`` (default 90) from ``as_of``
+        are excluded — without it a 5-year-old rate could serve a
+        current invoice. ``respect_staleness_cap=False`` disables it
+        per-call for the valuation chain, which values holdings at
+        the latest available rate regardless of age (the stale-price
+        warning flags age there); the cap stays ON for invoice
+        posting, where a stale rate gets etched.
 
-        ``allow_after=False`` drops preference 3 and 4 entirely —
-        no price dated after ``as_of`` is ever considered. Used by
-        the valuation chain for PAST anchors (C7): the direct pass in
-        ``_rates_as_of`` hard-filters future prices for historical
-        reports, and the chain legs must honor the same convention or
-        a commodity first priced after the report date silently
-        values at that future rate while its directly-priced sibling
-        falls back to cost basis.
+        ``allow_after=False`` drops preferences 3–4 — used by the
+        valuation chain for PAST anchors so a commodity first priced
+        after the report date doesn't silently value at that future
+        rate.
 
-        Skips piecash's auto-created ``type='transaction'`` rows —
-        those are 1.0 placeholders generated on cross-currency invoice
-        post and would mask the absence of a real market rate.
-
-        Skips zero-or-negative prices on either branch (the inverse
-        branch needs the guard to avoid div-by-zero; the direct branch
-        gets the same guard for consistent failure signaling).
+        Skips ``type='transaction'`` placeholders and
+        zero-or-negative prices (div-by-zero guard on the inverse
+        branch; same guard on direct for consistent signaling).
 
         Returns:
-            ``(rate, age_days, price_date)`` where ``age_days`` is the
-            absolute day distance ``|price_date - as_of|`` of the
-            chosen price and ``price_date`` is that price's date — the
-            inputs the freshness guard needs to judge staleness. Same-
-            commodity returns ``(Decimal("1"), 0, as_of)``. ``None``
-            when no usable price exists within the staleness window.
+            ``(rate, age_days, price_date)`` — the freshness guard's
+            inputs. Same-commodity → ``(Decimal("1"), 0, as_of)``;
+            ``None`` when nothing usable exists within the window.
         """
         if from_commodity == to_commodity:
             return (Decimal("1"), 0, as_of)
