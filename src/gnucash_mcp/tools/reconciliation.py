@@ -10,6 +10,7 @@ from gnucash_mcp.tools._helpers import (
     SplitGuid,
     TransactionGuid,
     _json,
+    _parse_iso_date,
     safe_tool,
 )
 
@@ -33,7 +34,7 @@ def register(mcp, get_book) -> None:
             reconcile_date: Date in ISO format (YYYY-MM-DD). Required for 'y', defaults to today.
         """
         book = get_book()
-        rec_date = date.fromisoformat(reconcile_date) if reconcile_date else None
+        rec_date = _parse_iso_date(reconcile_date)
         result = book.set_reconcile_state(
             split_guid=split_guid,
             state=state,
@@ -67,7 +68,7 @@ def register(mcp, get_book) -> None:
             limit: Maximum splits to return. Defaults to 50, capped at 250.
         """
         book = get_book()
-        date_obj = date.fromisoformat(as_of_date) if as_of_date else None
+        date_obj = _parse_iso_date(as_of_date)
         result = book.get_unreconciled_splits(
             account_name=account,
             as_of_date=date_obj,
@@ -85,27 +86,96 @@ def register(mcp, get_book) -> None:
         account: str,
         statement_date: str,
         statement_balance: str,
-        split_guids: Annotated[list[str], Field(description="List of split GUIDs to mark as reconciled (8+ char prefixes accepted)")],
+        split_guids: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "List of split GUIDs to reconcile (8+ char prefixes "
+                    "accepted). Required for targeted mode; omit when "
+                    "using reconcile_all=true."
+                ),
+                default=None,
+            ),
+        ] = None,
+        reconcile_all: Annotated[
+            bool,
+            Field(
+                description=(
+                    "When true, reconcile every unreconciled split on "
+                    "the account. Avoids the ~300-token GUID round-"
+                    "trip for OFX-import workflows. Pass through_date "
+                    "to add an upper-date filter; by default no date "
+                    "filter is applied. Mutually exclusive with "
+                    "split_guids."
+                ),
+                default=False,
+            ),
+        ] = False,
+        through_date: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional upper-date filter for reconcile_all "
+                    "(YYYY-MM-DD). When set, only splits with "
+                    "post_date <= through_date are included. Default "
+                    "is no filter — every unreconciled split is "
+                    "reconciled regardless of date."
+                ),
+                default=None,
+            ),
+        ] = None,
+        except_guids: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Optional list of split GUID prefixes to "
+                    "exclude from the bulk reconcile. Useful for "
+                    "\"everything on the statement except this "
+                    "pending ACH\" — 2 tokens vs the 100+ a "
+                    "full split_guids listing would cost. Only "
+                    "valid with reconcile_all=true; prefixes "
+                    "that don't resolve are silently ignored."
+                ),
+                default=None,
+            ),
+        ] = None,
     ) -> str:
-        """Reconcile multiple splits against a statement balance.
+        """Reconcile splits against a statement balance.
 
-        Marks all specified splits as reconciled if the resulting balance matches
-        the statement balance. This is an atomic operation - either all splits are
-        reconciled or none are.
+        Two modes:
+
+        - **Targeted** (`split_guids=[...]`): reconcile exactly the
+          listed splits. Use when statement and book disagree and
+          you need to pick a subset.
+        - **Bulk** (`reconcile_all=true`): reconcile every
+          unreconciled split on the account. One call, no GUID
+          round-trip — the common case for OFX-import workflows.
+          By default no date filter is applied; pass through_date
+          to restrict to splits on or before a specific date.
+
+        Both modes verify the resulting reconciled balance ties to
+        statement_balance before mutating; mismatch rejects with
+        the discrepancy amount.
 
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             statement_date: Statement ending date (YYYY-MM-DD)
             statement_balance: Expected balance from statement (as string, e.g., '1234.56')
-            split_guids: List of split GUIDs to mark as reconciled (8+ char prefixes accepted)
+            split_guids: List of split GUIDs to reconcile (targeted mode). Omit for bulk mode.
+            reconcile_all: When true, reconcile all unreconciled splits up to through_date.
+            through_date: Date filter for bulk mode (YYYY-MM-DD); defaults to statement_date.
         """
         book = get_book()
         stmt_date = date.fromisoformat(statement_date)
+        through = _parse_iso_date(through_date)
         result = book.reconcile_account(
             account_name=account,
             statement_date=stmt_date,
             statement_balance=statement_balance,
             split_guids=split_guids,
+            reconcile_all=reconcile_all,
+            through_date=through,
+            except_guids=except_guids,
         )
         return _json(result)
 

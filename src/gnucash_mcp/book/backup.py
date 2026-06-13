@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import piecash
+
+from gnucash_mcp.logging_config import redact_paths
 
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
@@ -108,13 +111,10 @@ def _now_utc() -> datetime:
 def _format_ts(ts: datetime) -> str:
     """Format a UTC timestamp for filenames (colons stripped).
 
-    Includes microseconds. Pre-fix, second-resolution timestamps meant
-    two ``create_backup`` calls within the same second produced the
-    same filename — and SQLite's ``connection.backup(dest_conn)``
-    truncates an existing dest, so the second snapshot silently
-    overwrote the first. Microsecond resolution makes collisions
-    practically impossible; the explicit ``Path.exists()`` check in
-    ``create_backup`` is the second line of defense.
+    Microsecond resolution: at second resolution two same-second
+    backups share a filename, and SQLite's backup() truncates an
+    existing dest — silently overwriting the first snapshot. The
+    Path.exists() check in create_backup is the second defense.
     """
     return ts.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
@@ -129,13 +129,11 @@ def _parse_ts(ts_str: str) -> datetime:
 
 
 def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
-    """Human-readable age string for listings — 'just now', '3 days ago', etc.
+    """Human-readable age string — 'just now', '3 days ago', etc.
 
-    Rounds to nearest unit rather than floor — pre-fix a 59.9-minute
-    age displayed as "59 minutes ago" (one unit short of the next
-    boundary). Round-half-up makes the boundary cases honest:
-    59m30s reads as "60 minutes ago" → which then promotes to "1
-    hour ago" via the next-bucket check.
+    Rounds to nearest unit, not floor: 59m30s reads as "1 hour ago"
+    via the next-bucket promotion rather than the dishonest
+    "59 minutes ago".
     """
     now = reference or _now_utc()
     delta = now - ts
@@ -213,12 +211,10 @@ def _write_state(backups_dir: Path, state: dict[str, datetime]) -> None:
 
 # ── Auto-backup attempt status (separate file) ───────────────────────
 #
-# Decoupled from .state.json on purpose: the per-stage timestamp file
-# advances only on successful backup, so it can't tell us "we tried
-# 6 hours ago and it failed." A separate ``.last_attempt.json``
-# captures every attempt — success or failure — so get_book_summary
-# can surface backup-chain breaks the bookkeeper would otherwise
-# discover only by reading debug logs.
+# Decoupled from .state.json: the per-stage file advances only on
+# success, so it can't say "we tried 6 hours ago and failed."
+# .last_attempt.json captures every attempt so get_book_summary can
+# surface chain breaks otherwise buried in debug logs.
 
 
 def _attempt_path(backups_dir: Path) -> Path:
@@ -330,12 +326,30 @@ class BackupMixin:
     def _backups_dir(self) -> Path:
         """Where backups live: ``{book_path}.mcp/backups/``.
 
-        Consistent with audit / debug log locations so users backing up
-        their GnuCash folder (e.g., via Time Machine) pick up the
-        snapshots automatically.
+        Resolved via the shared ``resolve_mcp_dir`` helper so the
+        ``GNUCASH_LOG_DIR`` env override + parent-dir permission
+        check apply to backup storage the same way they apply to
+        audit / debug logs. Consistent location means users
+        backing up their GnuCash folder (Time Machine, etc.)
+        pick up the snapshots automatically.
         """
-        book_path = self.book_path
-        return book_path.parent / f"{book_path.name}.mcp" / "backups"
+        from gnucash_mcp.logging_config import resolve_mcp_dir
+        return resolve_mcp_dir(self.book_path) / "backups"
+
+    def _resolve_backup_path(self, entry: dict) -> Path:
+        """Absolute on-disk path for a backup listing entry.
+
+        Pruning must never trust ``entry["path"]`` directly: under
+        ``GNUCASH_REDACT_PATHS=1`` ``list_backups`` redacts that field
+        to the bare basename, so ``Path(entry["path"]).unlink()``
+        would resolve against the process CWD — a silent no-op, or a
+        delete of an unrelated same-named file there. Reconstruct from
+        the backups dir + the filename so a prune only ever deletes a
+        file that actually lives in the backups directory, redaction on
+        or off. (``list_backups`` lists only direct children of the
+        backups dir, so the basename round-trips cleanly.)
+        """
+        return self._backups_dir() / Path(entry["path"]).name
 
     # ── Core primitive: create a backup ──────────────────────────
 
@@ -345,30 +359,25 @@ class BackupMixin:
         stage: str = _MANUAL_STAGE_NAME,
         label: str | None = None,
     ) -> dict:
-        """Write a fresh snapshot of the book via SQLite's online
-        backup API and verify it with PRAGMA integrity_check.
+        """Write a fresh snapshot via SQLite's online backup API and
+        verify it with PRAGMA integrity_check.
 
         Args:
-            stage: One of ``session``, ``weekly``, ``monthly``,
-                ``manual``. Auto stages are driven by the retention
-                policy; manual is user-invoked and has unlimited
-                retention.
-            label: Optional free-text label (sanitized to
-                ``[A-Za-z0-9_-]``) appended to the filename. Useful for
-                "pre-big-reorg" style human markers.
+            stage: ``session`` / ``weekly`` / ``monthly`` (policy-
+                driven) or ``manual`` (user-invoked, unlimited
+                retention).
+            label: Optional marker (sanitized to ``[A-Za-z0-9_-]``)
+                appended to the filename — "pre-big-reorg" style.
 
         Returns:
-            Dict with ``status``, ``stage``, ``path``, ``size_bytes``,
-            ``integrity``, and ``restore_hint``. All paths are absolute
-            strings.
+            ``{status, stage, path, size_bytes, integrity,
+            restore_hint}``.
 
         Raises:
-            ValueError: If the stage is unknown.
-            RuntimeError: If the integrity check fails after the copy
-                (the bad backup file is deleted before raising so the
-                caller never has to clean up).
-            OSError: If the backup directory can't be created or
-                written.
+            ValueError: Unknown stage.
+            RuntimeError: Integrity check failed (the bad file is
+                deleted before raising).
+            OSError: Backup directory not creatable/writable.
         """
         if stage not in _ALL_STAGE_NAMES:
             raise ValueError(
@@ -389,11 +398,8 @@ class BackupMixin:
         filename += ".gnucash"
         backup_path = backups_dir / filename
 
-        # Defense in depth against filename collisions. The microsecond
-        # resolution in ``_format_ts`` makes this practically
-        # impossible, but ``sqlite3.connect(path)`` would happily
-        # truncate an existing file — so refuse to overwrite explicitly
-        # rather than silently destroy a prior snapshot.
+        # Refuse to overwrite — sqlite3.connect(path) would happily
+        # truncate an existing snapshot (see _format_ts).
         if backup_path.exists():
             raise RuntimeError(
                 f"Backup path already exists, refusing to overwrite: "
@@ -401,25 +407,18 @@ class BackupMixin:
                 f"collision; retry."
             )
 
-        # Perform the SQLite online backup. We open the source via
-        # piecash's readonly context (no write lock on the live book)
-        # and reach into the underlying sqlite3 connection. SQLite's
-        # backup() copies pages in chunks without blocking readers.
+        # Source opened readonly (no write lock on the live book);
+        # SQLite's backup() copies pages without blocking readers.
         with self.open(readonly=True) as book:
             source_conn = book.session.connection().connection
             dest_conn = sqlite3.connect(str(backup_path))
             try:
                 source_conn.backup(dest_conn)
             except Exception:
-                # Disk-full (or any other) failure mid-copy leaves
-                # a partial/empty file at backup_path. Pre-fix the
-                # try/finally only closed the connection — the
-                # truncated file stayed on disk and would surface
-                # in ``list_backups`` as a "valid backup" until the
-                # next ``PRAGMA integrity_check`` (which only runs
-                # in the success path). Best to fail loud: close
-                # the connection, unlink the partial file, and
-                # propagate the original exception.
+                # A mid-copy failure leaves a partial file that
+                # list_backups would show as a "valid backup" (the
+                # integrity check only runs on success). Unlink it
+                # and propagate.
                 dest_conn.close()
                 try:
                     backup_path.unlink()
@@ -427,15 +426,11 @@ class BackupMixin:
                     pass
                 raise
             finally:
-                # Idempotent: safe to call after the explicit close
-                # in the except branch — sqlite3.connection.close()
-                # is no-op on a closed connection.
+                # Idempotent — close() is a no-op on a closed conn.
                 dest_conn.close()
 
-        # Verify the backup with PRAGMA integrity_check before
-        # declaring success. If the check fails, delete the bad file
-        # so we never leave a broken snapshot masquerading as a valid
-        # recovery option.
+        # Verify before declaring success; a failed check deletes
+        # the file so no broken snapshot masquerades as recovery.
         verify_conn = sqlite3.connect(str(backup_path))
         try:
             row = verify_conn.execute("PRAGMA integrity_check").fetchone()
@@ -453,17 +448,26 @@ class BackupMixin:
             )
 
         size_bytes = backup_path.stat().st_size
+
+        # Path-bearing fields route through redact_paths (opt-in
+        # via GNUCASH_REDACT_PATHS). Paths are shell-quoted —
+        # spaces/metachars break the command, and an unquoted
+        # f-string is a latent injection if a future path component
+        # is user-influenced.
+        restore_hint = (
+            "Restore by stopping the server, then: "
+            f"mv {shlex.quote(str(self.book_path))} "
+            f"{shlex.quote(str(self.book_path) + '.broken')} && "
+            f"cp {shlex.quote(str(backup_path))} "
+            f"{shlex.quote(str(self.book_path))}"
+        )
         return {
             "status": "created",
             "stage": stage,
-            "path": str(backup_path),
+            "path": redact_paths(str(backup_path)),
             "size_bytes": size_bytes,
             "integrity": integrity,
-            "restore_hint": (
-                "Restore by stopping the server, then: "
-                f"mv {self.book_path} {self.book_path}.broken && "
-                f"cp {backup_path} {self.book_path}"
-            ),
+            "restore_hint": redact_paths(restore_hint),
         }
 
     # ── Listing ──────────────────────────────────────────────────
@@ -488,12 +492,8 @@ class BackupMixin:
             try:
                 size = path.stat().st_size
             except OSError as e:
-                # Most common case: a broken symlink (target moved
-                # or deleted). Pre-fix this was silently dropped —
-                # ``list_backups`` showed N-1 entries and
-                # ``prune_backups`` would never clean the broken
-                # link. Logging surfaces the issue at the next
-                # debug-log inspection without breaking the listing.
+                # Usually a broken symlink — log rather than drop
+                # silently, so the issue is findable.
                 debug_logger.warning(
                     f"Backup file unstattable, skipping: {path} ({e})"
                 )
@@ -504,7 +504,8 @@ class BackupMixin:
                 "age": _describe_age(ts, now),
                 "size_bytes": size,
                 "label": label,
-                "path": str(path),
+                # Opt-in path redaction.
+                "path": redact_paths(str(path)),
             })
 
         entries.sort(key=lambda e: e["timestamp"], reverse=True)
@@ -552,9 +553,13 @@ class BackupMixin:
         # against data loss. Refuse to wipe them all in one call;
         # require the caller to step through deliberately (small
         # keep_last_n + a label filter, or use ``dry_run=True`` to
-        # see the plan first). Auto-stage zero-retention is still
-        # allowed because those have policy-driven retention and
-        # the user can always rebuild them.
+        # see the plan first). Per-stage auto zero-retention is
+        # still allowed because those have policy-driven retention
+        # and the user can always rebuild them; the symmetric
+        # guard below catches the "all auto stages at once" case
+        # which is a different shape of footgun (the user typed
+        # ``keep_last_n=0`` to free disk space, not realizing the
+        # default scope is every auto stage).
         if (
             stage == _MANUAL_STAGE_NAME
             and keep_last_n == 0
@@ -568,6 +573,35 @@ class BackupMixin:
                 "Use dry_run=True to review the plan, or pass a "
                 "non-zero keep_last_n (e.g. keep_last_n=5 to keep "
                 "the 5 most recent manual backups)."
+            )
+
+        # Symmetric footgun guard for the auto stages.
+        # ``prune_backups(keep_last_n=0)`` without an explicit
+        # ``stage`` deletes every session / weekly / monthly
+        # backup in one call. The user typed it intending "free up
+        # disk space"; the intent was almost certainly per-stage,
+        # not "wipe all auto backups." Auto backups rebuild over
+        # time (sessions on next write, weekly on next Monday,
+        # monthly on next 1st), but until then the recoverability
+        # window is gone — and the user has no way to recover
+        # backups they didn't realize they were deleting. Mirror
+        # the manual-stage guard: require the caller to opt in
+        # explicitly by naming the stage.
+        if (
+            stage is None
+            and keep_last_n == 0
+            and not dry_run
+        ):
+            raise ValueError(
+                "Refusing to delete every auto backup at once. "
+                "``prune_backups(keep_last_n=0)`` without an "
+                "explicit ``stage`` wipes session, weekly, AND "
+                "monthly auto backups in a single call — the "
+                "recoverability window is gone until each stage's "
+                "next scheduled rebuild. Use dry_run=True to "
+                "review the plan, pass an explicit ``stage`` "
+                "(e.g. ``stage='session'``) to scope the delete, "
+                "or pass a non-zero ``keep_last_n``."
             )
 
         all_backups = self.list_backups()
@@ -597,14 +631,9 @@ class BackupMixin:
             would_keep.extend(keep)
             would_delete.extend(drop)
 
-        # Sort would_keep by stage-then-timestamp-desc so a multi-
-        # stage prune groups sessions/weeklies/monthlies together
-        # (newest-first within each stage). Pre-fix it was just
-        # timestamp-desc, which interleaved stages — readable for
-        # single-stage prunes, awkward for the ``stage=None`` (all
-        # auto stages) case. Two-pass stable sort: timestamp-desc
-        # first so the within-stage order is newest-first, then
-        # by stage to group.
+        # Group by stage, newest-first within each (two-pass stable
+        # sort) — plain timestamp-desc interleaves stages in the
+        # all-auto-stages case.
         would_keep.sort(key=lambda e: e["timestamp"], reverse=True)
         would_keep.sort(key=lambda e: e["stage"])
         would_delete.sort(key=lambda e: e["timestamp"], reverse=True)
@@ -621,7 +650,7 @@ class BackupMixin:
         deleted: list[dict] = []
         kept: list[dict] = list(would_keep)
         for entry in would_delete:
-            p = Path(entry["path"])
+            p = self._resolve_backup_path(entry)
             try:
                 p.unlink()
                 deleted.append(entry)
@@ -639,23 +668,17 @@ class BackupMixin:
 
     def _maybe_auto_backup(self) -> None:
         """Called once per process, before the first write, from the
-        audit decorator. Creates a backup tagged with the highest-
-        priority due stage (if any stages are due) and prunes each
-        auto stage down to its ``keep_last_n``.
+        audit decorator: backs up under the highest-priority due
+        stage (if any) and prunes each auto stage to its
+        ``keep_last_n``.
 
-        Silently returns on any failure: an auto-backup that errors
-        must never fail the user's write. The audit debug log records
-        the reason.
-
-        This method is safe to call multiple times within a process —
-        ``_backup_checked_in_process`` gates it — but the audit
-        decorator already enforces that contract at its layer.
+        Silently returns on any failure — an auto-backup error must
+        never fail the user's write; the debug log records why.
+        Safe to call repeatedly (``_backup_checked_in_process``
+        gates it).
         """
-        # Serialize the gate so concurrent first-writes can't both
-        # pass the check before either flips the flag. Without the
-        # lock, two threads racing on the very first write would each
-        # call ``create_backup`` — and with file-level naming they'd
-        # collide on the same path.
+        # Lock so concurrent first-writes can't both pass the gate
+        # and collide on the same backup filename.
         with self._backup_check_lock:
             if self._backup_checked_in_process:
                 return
@@ -708,8 +731,9 @@ class BackupMixin:
                 )
         except Exception as e:
             # Failure path: the user's write is still allowed to
-            # proceed, but the bookkeeper needs to find out — pre-fix,
-            # OSError-on-disk-full was silently swallowed for weeks.
+            # proceed, but the user needs to find out — a silently
+            # swallowed OSError-on-disk-full leaves no recovery
+            # option the day it matters.
             # We persist the failure so get_book_summary's Warnings
             # section can surface it on the next read.
             debug_logger.warning(f"Auto-backup skipped: {e}")
@@ -773,7 +797,7 @@ class BackupMixin:
             entries = by_stage.get(stage.name, [])
             for old_entry in entries[stage.keep_last_n:]:
                 try:
-                    Path(old_entry["path"]).unlink()
+                    self._resolve_backup_path(old_entry).unlink()
                 except OSError as e:
                     debug_logger.warning(
                         f"Prune skipped {old_entry['path']}: {e}"

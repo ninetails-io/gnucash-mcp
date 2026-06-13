@@ -1,24 +1,15 @@
 """ReportingMixin — balance sheet, spending/income breakdowns, cash flow, debt payoff.
 
-All methods are read-only (no `book.save()`). The debt_payoff_plan
-method reads `apr` / `minimum_payment` / `credit_limit` slots on
-CREDIT/LIABILITY accounts via piecash's account[key] shortcut, so
-it does not depend on AdminMixin's slot tools.
+All methods are read-only (no ``book.save()``). debt_payoff_plan
+reads apr / minimum_payment / credit_limit slots directly, so it
+doesn't depend on AdminMixin's slot tools.
 
-The five transaction-scanning reports (``spending_by_category``,
-``income_by_source``, ``balance_sheet``, ``net_worth``, ``cash_flow``)
-push date and account-type filters into indexed SQL via
-``_query_filtered_splits``. Aggregation stays in Python so amounts
-are summed as exact Decimals (quantity is stored as num/denom integer
-pairs that SQLite can't aggregate without lossy float conversion).
-
-The ``net_worth`` time-series uses a single-sweep cumulative sum —
-one pass over all relevant splits ordered by post_date, running
-total snapshotted at each interval boundary. Reduces a 60-month
-series from O(intervals × splits) to O(splits + intervals).
-
-Depends on shared helpers from BaseGnuCashBook:
-  - self.open, self._find_account
+The transaction-scanning reports push date and account-type filters
+into indexed SQL via ``_query_filtered_splits``; aggregation stays
+in Python so amounts sum as exact Decimals. The ``net_worth``
+time-series is a single sweep over post_date-ordered splits with
+per-boundary snapshots — O(splits + intervals), not
+O(intervals × splits).
 """
 
 from datetime import date
@@ -26,14 +17,16 @@ from decimal import Decimal, InvalidOperation
 
 import piecash
 
-from gnucash_mcp.book._base import _is_market_price, _to_decimal
+from gnucash_mcp.book._base import _is_voided, _to_decimal
 from gnucash_mcp._format import _format_number
 
-# Account-type groups used across the reports. Defined at module level
-# so the SQL IN() clauses share a single canonical definition rather
-# than drifting across methods.
-_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL"})
-_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT"})
+# Account-type groups shared by the reports' SQL IN() clauses — one
+# canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
+# asset and A/P a liability; excluding them makes posted invoices
+# invisible on balance_sheet and breaks A = L + E by the
+# outstanding-invoice amount.
+_ASSET_TYPES = frozenset({"ASSET", "BANK", "CASH", "STOCK", "MUTUAL", "RECEIVABLE"})
+_LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
 _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
@@ -45,15 +38,10 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
     Format::
 
         Business              22,336.90  39.3%
-        Taxes                  9,479.04  16.7%
-        ...
         TOTAL                 56,944.26
 
-    Account names render as their leaf component when unambiguous —
-    spending breakdowns at depth=1 typically yield "Expenses:Business",
-    "Expenses:Taxes", etc., which all share the "Expenses:" prefix and
-    read better with the prefix stripped. Width-padded so the amount /
-    percent columns align.
+    A common leading prefix ("Expenses:") is stripped when every row
+    shares it; columns are width-aligned.
     """
     if not rows:
         return f"TOTAL  {total:,.2f}"
@@ -89,17 +77,9 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
 def _money_compact(value: Decimal, currency: str = "USD") -> str:
     """Format a monetary amount for compact-mode reports.
 
-    Whole-currency-unit values render without decimals
-    (``"USD 13,091"``), partial values render with two
-    (``"USD 1,125.50"``). Negative values use leading-minus rather
-    than parens.
-
-    The ``currency`` argument carries the book's default currency
-    mnemonic (``"USD"``, ``"CNY"``, ``"EUR"``, etc.) — matches
-    ``get_book_summary``'s ``"USD 6700.00"`` rendering style and
-    works for non-USD books out of the box. Pre-fix this helper
-    hardcoded ``$`` and broke as soon as the bookkeeper pointed it
-    at a CNY-default book.
+    Whole values render without decimals (``"USD 13,091"``), partial
+    with two; negatives use leading-minus. ``currency`` is the book
+    default mnemonic — a hardcoded ``$`` breaks non-USD books.
     """
     quantized = value.quantize(Decimal("0.01"))
     if quantized == quantized.to_integral_value():
@@ -123,34 +103,21 @@ def _format_debt_payoff_compact(
 ) -> str:
     """Render the avalanche-payoff plan as a compact text table.
 
-    Currency prefix flows from the book's default currency — works
-    for USD, CNY, EUR, anything piecash represents. Layout::
+    Layout::
 
         Kill order (USD 10,000/mo → debt-free Apr 2030, USD 59,022 interest):
           1. Business Amex    USD 13,091  24.49%  payoff: mo 8   interest: USD 1,125
-          2. Chase Sapphire   USD 22,127  21.49%  payoff: mo 18  interest: USD 5,034
-          ...
         YETI at this budget: 1.59x (USD 1 spent costs USD 1.59 in total debt impact)
         Total interest: USD 59,022
         Debt-free: April 2030
-
-    Replaces the verbose dict (with multi-line YETI ``explanation`` per
-    account) that was the heaviest single response in Abe's audit.
-    Verbose mode preserves the dict for programmatic consumers.
     """
-    # Account names: leaf-name only when path is unambiguous (saves
-    # context vs. echoing "Liabilities:Credit Card:Business Amex" on
-    # every row). Width-pads to the widest leaf so columns align.
+    # Leaf names + width-padded columns.
     leaf_names = [d["name"].split(":")[-1] for d in results]
     name_width = max(len(n) for n in leaf_names) if leaf_names else 0
-
-    # Balance column width — pad to widest balance for alignment.
     balance_strs = [
         _money_compact(orig_balances[d["name"]], currency) for d in results
     ]
     balance_width = max(len(b) for b in balance_strs) if balance_strs else 0
-
-    # Interest column width — same trick.
     interest_strs = [
         _money_compact(d["interest_paid"], currency) for d in results
     ]
@@ -158,7 +125,6 @@ def _format_debt_payoff_compact(
         max(len(s) for s in interest_strs) if interest_strs else 0
     )
 
-    # Header tells the reader the inputs that drove the schedule.
     payoff_month_name = payoff_date.strftime("%b %Y")
     header = (
         f"Kill order ({_money_compact(monthly_budget, currency)}/mo → "
@@ -166,7 +132,6 @@ def _format_debt_payoff_compact(
         f"{_money_compact(total_interest, currency)} interest):"
     )
 
-    # Body rows.
     lines = [header]
     for i, d in enumerate(results, start=1):
         leaf = leaf_names[i - 1]
@@ -181,9 +146,7 @@ def _format_debt_payoff_compact(
             f"interest: {interest:>{interest_width}}"
         )
 
-    # Footer: YETI plus totals. The YETI line speaks plainly because
-    # it's the actionable signal — "this purchase costs you X.XX times
-    # more than its sticker because of the interest your debt accrues".
+    # YETI speaks plainly — it's the actionable signal.
     lines.append(
         f"YETI at this budget: {yeti_multiplier}x "
         f"({_money_compact(purchase_amount, currency)} spent costs "
@@ -223,167 +186,7 @@ class ReportingMixin:
             return account
         return path[target_depth]
 
-    # ── Cross-commodity conversion helpers ────────────────────────────
-    #
-    # For reports that aggregate asset balances across accounts with
-    # different commodities (e.g. USD Checking + VTSAX shares + EUR
-    # Savings), split.quantity lives in each account's own commodity
-    # and can't be summed directly. Convert each account's quantity
-    # to the book's default currency at the latest user-supplied
-    # market price before aggregating. Fallback: split.value (which
-    # is in the transaction currency, generally the book default for
-    # USD-denominated investment buys) is used when no price is on
-    # file — that yields cost basis, which is a reasonable default
-    # when no market price has been loaded.
-
-    def _latest_market_rates(
-        self, book: piecash.Book
-    ) -> dict[str, Decimal]:
-        """Return {commodity_guid: Decimal} — latest user-supplied
-        price for each non-default-currency commodity in the book
-        currency. Skips piecash's auto-created ``type='transaction'``
-        prices (they capture the effective rate of a cross-currency
-        txn; we want explicit market prices).
-        """
-        default_currency = self._require_default_currency(book)
-        latest: dict[str, tuple] = {}  # guid → (date, Decimal rate)
-        for p in book.prices:
-            if p.currency != default_currency:
-                continue
-            if not _is_market_price(p):
-                continue
-            p_date = p.date
-            if hasattr(p_date, "date") and callable(p_date.date):
-                p_date = p_date.date()
-            key = p.commodity.guid
-            existing = latest.get(key)
-            if existing is None or p_date > existing[0]:
-                latest[key] = (p_date, Decimal(str(p.value)))
-        return {guid: rate for guid, (_date, rate) in latest.items()}
-
-    def _account_conversion_factors(
-        self, book: piecash.Book
-    ) -> dict[str, Decimal | None]:
-        """Return {account_guid: Decimal factor or None}.
-
-        ``factor * split.quantity = amount in default currency``.
-        A factor of 1 means the account is already in the default
-        currency. ``None`` means no rate is available — callers
-        should fall back to ``split.value`` (transaction-currency
-        amount), which correctly reflects cost basis for USD-
-        denominated investment buys.
-
-        Template accounts (under ``book.root_template``) are
-        excluded from the map. Today no caller looks up template
-        GUIDs in the result — they all start from
-        ``_resolve_account``-validated GUIDs that already exclude
-        templates — so this is hygiene rather than a bug fix.
-        Keeps the map honest about what it represents (user
-        chart only) and prevents a future caller from accidentally
-        getting a factor for scaffolding.
-        """
-        default_currency = self._require_default_currency(book)
-        rates = self._latest_market_rates(book)
-        template_guids = self._template_account_guids(book)
-        factors: dict[str, Decimal | None] = {}
-        for acct in book.accounts:
-            if acct.guid in template_guids:
-                continue
-            if acct.commodity == default_currency:
-                factors[acct.guid] = Decimal("1")
-            else:
-                factors[acct.guid] = rates.get(acct.commodity.guid)
-        return factors
-
-    @staticmethod
-    def _split_in_default_currency(
-        split,
-        account,
-        factor: Decimal | None,
-    ) -> Decimal:
-        """Value a single split in the book's default currency.
-
-        Uses ``factor * quantity`` when a factor is available. Falls
-        back to ``split.value`` otherwise — correct for STOCK/MUTUAL
-        splits whose transaction currency is the book default, and a
-        reasonable cost-basis approximation for other cases.
-        """
-        if factor is not None:
-            return Decimal(str(split.quantity)) * factor
-        return Decimal(str(split.value))
-
     # ── SQL-filtered split iterator ───────────────────────────────────
-
-    def _query_filtered_splits(
-        self,
-        book: piecash.Book,
-        *,
-        start_date: date | None = None,
-        end_date: date | None = None,
-        account_types: frozenset[str] | set[str] | None = None,
-        account_guids: frozenset[str] | set[str] | None = None,
-        order_by_post_date: bool = False,
-    ):
-        """Build an indexed SQL query over ``(Split, Transaction, Account)``
-        rows matching the given filters.
-
-        Every filter maps to an indexable WHERE clause against the
-        SQLite backing store — one query returns exactly the rows the
-        caller needs, replacing the Python-side
-        ``for txn in book.transactions: if date_match`` pattern that
-        used to touch every row in the book regardless of relevance.
-
-        The query yields ORM objects (not raw num/denom pairs) so
-        callers can aggregate ``split.quantity`` / ``split.value`` as
-        exact ``Decimal`` values in Python. Aggregating in SQL via
-        ``SUM(num * 1.0 / denom)`` would collapse to IEEE-754 floats,
-        which is unacceptable for financial arithmetic.
-
-        Null ``post_date`` rows (an old-book artifact) are excluded so
-        they don't show up in date-ranged reports.
-
-        Args:
-            book: An open piecash session.
-            start_date: Include only transactions with
-                ``post_date >= start_date``. ``None`` disables the
-                lower bound.
-            end_date: Include only transactions with
-                ``post_date <= end_date``. ``None`` disables the upper
-                bound.
-            account_types: Restrict to accounts whose
-                ``type in account_types`` (e.g., ``_ASSET_TYPES``).
-                ``None`` disables the filter.
-            account_guids: Restrict to accounts whose ``guid`` is in
-                the given set. Used by ``cash_flow`` when filtering to
-                a single named account.
-            order_by_post_date: When ``True``, rows come back sorted
-                ascending by ``post_date``. Required for the
-                cumulative-sum trick used by the ``net_worth``
-                time-series.
-
-        Returns:
-            A SQLAlchemy ``Query`` object the caller can iterate.
-        """
-        from piecash.core.account import Account
-        from piecash.core.transaction import Split, Transaction
-
-        q = (
-            book.session.query(Split, Transaction, Account)
-            .join(Transaction, Split.transaction_guid == Transaction.guid)
-            .join(Account, Split.account_guid == Account.guid)
-            .filter(Transaction.post_date.isnot(None))
-        )
-        if start_date is not None:
-            q = q.filter(Transaction.post_date >= start_date)
-        if end_date is not None:
-            q = q.filter(Transaction.post_date <= end_date)
-        if account_types is not None:
-            q = q.filter(Account.type.in_(list(account_types)))
-        if account_guids is not None:
-            q = q.filter(Account.guid.in_(list(account_guids)))
-        if order_by_post_date:
-            q = q.order_by(Transaction.post_date)
-        return q
 
     # ── Period breakdowns ─────────────────────────────────────────────
 
@@ -396,17 +199,17 @@ class ReportingMixin:
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
-        Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
-            compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4C).
-                     Verbose mode returns the structured dict.
+        Internal transfers are NOT filtered (unlike ``cash_flow``):
+        every EXPENSE split is real spending by definition.
 
-        Returns:
-            If compact: string with one line per category plus a TOTAL.
-            If not compact: dict with ``total`` and ``categories`` list.
+        Args:
+            start_date / end_date: Period bounds (inclusive).
+            depth: Grouping depth — ``1`` = top-level buckets
+                (``Expenses:Food``), ``2`` adds one level of
+                children; values past the tree depth clamp to the
+                leaf.
+            compact: Aligned text table (default) or the structured
+                dict.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -416,24 +219,43 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
+            # Rates anchored to the period's end — historical
+            # periods must not value at today's rates.
+            factors = self._account_conversion_factors(book, end_date)
+
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Expense splits are positive when money is spent.
-                amount = split.quantity
-                if amount <= 0:
-                    continue
+                # Accumulate SIGNED amounts so refunds net against
+                # spending within a category — dropping negatives
+                # would report GROSS spend.
+                amount = self._split_in_default_currency(
+                    split, account, factors.get(account.guid),
+                )
+                # ``depth`` (not ``depth - 1``): path[0] is the type
+                # root ("Expenses"), so "depth 1 = Expenses:Food"
+                # needs path[1]. The off-by-one collapses the whole
+                # report to one "Expenses 100%" row.
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision AFTER aggregation: a net-refunded category
+            # isn't a spend LINE but still belongs in the TOTAL —
+            # dropping it makes the total depth-dependent and unties
+            # income − spending from net income. Net-negative groups
+            # surface explicitly instead of vanishing.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             categories = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -443,14 +265,31 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(categories, total, "account")
+                out = _format_breakdown_tsv(categories, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-refunded "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "categories": categories,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     def income_by_source(
         self,
@@ -461,17 +300,13 @@ class ReportingMixin:
     ) -> dict | str:
         """Get income breakdown by source.
 
-        Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            depth: Hierarchy depth for grouping (1 = top-level, 2 = subcategories).
-            compact: If True (default), return an aligned text table
-                     suitable for direct LLM consumption (Phase 4C).
-                     Verbose mode returns the structured dict.
+        Mirror of ``spending_by_category`` (same depth semantics,
+        same net-after-aggregation rule) with income's sign flipped.
 
-        Returns:
-            If compact: string with one line per source plus a TOTAL.
-            If not compact: dict with ``total`` and ``sources`` list.
+        Args:
+            start_date / end_date: Period bounds (inclusive).
+            depth: Grouping depth (1 = top-level).
+            compact: Aligned text table (default) or structured dict.
         """
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
@@ -481,25 +316,36 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
+            factors = self._account_conversion_factors(book, end_date)
+
             totals: dict[str, Decimal] = {}
             for split, _txn, account in rows:
-                # Income splits are stored negative (money coming in);
-                # flip to positive for the "how much did I earn" view.
-                amount = -split.quantity
-                if amount <= 0:
-                    continue
+                # Income is stored negative; flip. Signed
+                # accumulation so losses/clawbacks net against gains
+                # within a source — see spending_by_category.
+                amount = -self._split_in_default_currency(
+                    split, account, factors.get(account.guid),
+                )
+                # ``depth`` not ``depth - 1`` — same off-by-one
+                # hazard as spending_by_category.
                 group_account = self._get_account_at_depth(
-                    account, depth - 1
+                    account, depth
                 )
                 account_name = group_account.fullname
                 totals[account_name] = totals.get(
                     account_name, Decimal("0")
                 ) + amount
 
-            total = sum(totals.values()) if totals else Decimal("0")
+            # Net decision AFTER aggregation — see
+            # spending_by_category.
+            displayed = {n: a for n, a in totals.items() if a > 0}
+            excluded = {n: a for n, a in totals.items() if a < 0}
+            total = (
+                sum(totals.values()) if totals else Decimal("0")
+            )
             sources = []
             for account_name, amount in sorted(
-                totals.items(), key=lambda x: x[1], reverse=True
+                displayed.items(), key=lambda x: x[1], reverse=True
             ):
                 percent = (
                     (amount / total * 100) if total > 0 else Decimal("0")
@@ -509,54 +355,93 @@ class ReportingMixin:
                     "amount": str(amount),
                     "percent": str(percent.quantize(Decimal("0.1"))),
                 })
+            excluded_rows = [
+                {"account": n, "amount": str(a)}
+                for n, a in sorted(excluded.items(), key=lambda x: x[1])
+            ]
 
             if compact:
-                return _format_breakdown_tsv(sources, total, "account")
+                out = _format_breakdown_tsv(sources, total, "account")
+                if excluded_rows:
+                    netted = ", ".join(
+                        f"{r['account']} {Decimal(r['amount']):,.2f}"
+                        for r in excluded_rows
+                    )
+                    out += (
+                        f"\n({len(excluded_rows)} net-loss "
+                        f"netted into TOTAL: {netted})"
+                    )
+                return out
             # period is an input echo — LLM supplied start/end dates.
-            return {
+            result = {
                 "total": str(total),
                 "sources": sources,
             }
+            if excluded_rows:
+                result["net_negative_netted"] = excluded_rows
+            return result
 
     # ── Balance sheet and net worth ──────────────────────────────────
 
     def balance_sheet(self, as_of_date: date) -> dict:
         """Generate a balance sheet as of a specific date.
 
-        Args:
-            as_of_date: Date to calculate balances as of.
+        Equity includes a computed **Unrealized gain/loss** line —
+        the residual that makes ``A = L + E`` hold by construction.
+        Assets render at market value while equity rolls up from raw
+        split values (historical cost); the residual captures both
+        investment market drift (shares × price vs cost basis) and
+        FX translation adjustment on foreign-currency accounts.
+        Both are accumulated-OCI items under GAAP; decomposing them
+        is a future feature — the single line preserves the identity
+        for any mix.
+
+        ``as_of_date`` is the inclusive upper bound; FX rates and
+        commodity prices anchor to the same date for a coherent
+        historical view.
 
         Returns:
-            Dict with assets, liabilities, equity sections and totals.
+            Dict with ``assets`` / ``liabilities`` / ``equity``
+            sections, each carrying a total and account rows;
+            equity already includes the Unrealized line so the
+            totals balance.
         """
-        # Sum splits across every relevant type in one SQL-filtered
-        # pass. The old code opened Python loops per account; now we
-        # hit the splits table once with an IN() clause and bucket the
-        # results in memory. Net income (Income - Expenses) is
-        # retained-earnings-equivalent and rolls into equity below.
+        # One SQL-filtered pass over every relevant type, bucketed in
+        # memory. Net income (retained-earnings-equivalent) rolls
+        # into equity below.
         all_types = (
             _ASSET_TYPES | _LIABILITY_TYPES | _EQUITY_TYPES | _NET_INCOME_TYPES
         )
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
+            # Rates as of the report date — never today's rates
+            # against historical quantities.
+            factors = self._account_conversion_factors(book, as_of_date)
             rows = self._query_filtered_splits(
                 book,
                 end_date=as_of_date,
                 account_types=all_types,
             )
 
-            # Track per-account: (acct_type, USD-converted balance,
-            # commodity-quantity, account ref). The quantity / commodity
-            # bits are needed to render the "230.7600 VTSAX @ 156.23
-            # (USD 36,043.66)" triplet for non-default-currency accounts
-            # (Phase 4B). Currency-default accounts ignore that detail.
+            # Per-account: type, converted balance, plus quantity /
+            # commodity for the "230.76 VTSAX @ 156.23 (USD …)"
+            # triplet on non-default-currency rows.
             balances: dict[str, dict] = {}
             net_income = Decimal("0")
             for split, _txn, account in rows:
-                # Value the split in the book's default currency so
-                # investment shares (VTSAX @ $128, etc.) and foreign-
-                # currency holdings contribute their market/USD value
-                # to balance-sheet totals rather than raw share counts.
+                # Voided by state, not value: a well-formed void
+                # contributes 0 anyway; the corrupted partial-void
+                # shape (state='v', non-zero values) must not move
+                # the sheet when cash_flow / lots can't see it.
+                if _is_voided(split):
+                    continue
+                # Placeholder accounts are NOT skipped: there is no
+                # roll-up in this report, so direct splits on a
+                # placeholder — rare but legal — are real money no
+                # other row represents. Skipping them would guard a
+                # double-count this code never produces; with the
+                # balancing-residual equity line it silently deletes
+                # the dropped asset instead. Same own-splits rule as
+                # ``net_worth`` and ``_compute_net_worth_at``.
                 amt = self._split_in_default_currency(
                     split, account, factors.get(account.guid)
                 )
@@ -577,11 +462,13 @@ class ReportingMixin:
                 balances[key]["quantity"] += split.quantity
 
             default_currency = self._require_default_currency(book)
-            # Latest market rates keyed by commodity guid — same data
-            # ``_market_value`` in get_book_summary uses for the per-
-            # account display. ``_latest_market_rates`` already excludes
-            # piecash auto-created ``type='transaction'`` prices.
-            latest_rates = self._latest_market_rates(book)
+            # Display rates anchored to the report date, market
+            # prices only (see _rates_as_of).
+            latest_rates = self._rates_as_of(book, as_of_date)
+            # "(via …)" provenance for chained rates.
+            rate_via = self._rate_provenance(
+                book, as_of_date, default_currency,
+            )
 
             assets: dict[str, dict] = {}
             liabilities: dict[str, dict] = {}
@@ -609,33 +496,32 @@ class ReportingMixin:
                 sum(i["usd"] for i in liabilities.values())
                 if liabilities else Decimal("0")
             )
-            equity_total = (
-                (sum(i["usd"] for i in equity.values()) if equity else Decimal("0"))
-                + net_income
+
+            # ── Unrealized gain/loss (balancing adjustment) ──────────
+            # Computed as the residual
+            # assets − liabilities − equity − net_income, so
+            # A = L + E holds by construction regardless of the mix
+            # of investment drift and FX translation — see the
+            # docstring for the decomposition.
+            equity_acct_total = (
+                sum(i["usd"] for i in equity.values()) if equity else Decimal("0")
             )
+            unrealized = (
+                assets_total - liabilities_total
+                - equity_acct_total - net_income
+            )
+            equity_total = equity_acct_total + net_income + unrealized
 
             def format_accounts(accounts_dict: dict[str, dict]) -> list[dict]:
                 """Render each account row with the right balance shape.
 
-                Currency-default accounts:
-                  ``{"account": name, "balance": "5234.56"}``.
-                  No ``usd_value`` — it would just repeat ``balance``.
-
-                Non-currency accounts (STOCK / MUTUAL / FUND): the
-                ``balance`` field shows the human-readable triplet
-                ``"230.7600 VTSAX @ 156.23 (USD 36,043.66)"`` — same
-                format ``get_book_summary`` uses — and ``usd_value``
-                carries the parseable number rounded to 2 decimals so
-                programmatic callers don't have to parse the triplet.
-
-                All numeric outputs flow through ``_format_number``
-                (currency-style: 2 decimals always padded). Pre-fix
-                the per-account values leaked Decimal precision noise
-                (e.g. ``"612011.489832"``) into responses.
+                Default-currency accounts: ``{"account", "balance"}``.
+                Non-currency accounts: ``balance`` is the readable
+                triplet ``"230.76 VTSAX @ 156.23 (USD 36,043.66)"``
+                and ``default_currency_value`` carries the parseable
+                number. Numbers flow through ``_format_number`` so
+                responses don't leak Decimal precision noise.
                 """
-                # Default-currency mnemonic for the triplet rendering.
-                # Pre-fix this hardcoded "USD"; on a CNY-default book
-                # that lied about the currency on every investment row.
                 ccy_mnemonic = default_currency.mnemonic
                 rows = []
                 for name, info in sorted(accounts_dict.items()):
@@ -653,22 +539,20 @@ class ReportingMixin:
                         sym = commodity.mnemonic
                         qty = info["quantity"]
                         if rate is not None:
+                            via = rate_via.get(commodity.guid)
+                            via_note = f", {via}" if via else ""
                             balance_str = (
                                 f"{qty} {sym} @ {rate} "
-                                f"({ccy_mnemonic} {info['usd']:,.2f})"
+                                f"({ccy_mnemonic} {info['usd']:,.2f}"
+                                f"{via_note})"
                             )
                         else:
-                            # No price on file — fall back to cost basis
-                            # already accumulated in ``info['usd']``.
+                            # No price — cost basis already
+                            # accumulated in info['usd'].
                             balance_str = (
                                 f"{qty} {sym} ({ccy_mnemonic} "
                                 f"{info['usd']:,.2f}, no price data)"
                             )
-                        # ``default_currency_value`` carries the
-                        # parseable amount in the book's default
-                        # currency. Pre-fix this field was named
-                        # ``usd_value`` — a lie on non-USD books.
-                        # Renamed to reflect the actual semantics.
                         rows.append({
                             "account": name,
                             "balance": balance_str,
@@ -676,13 +560,9 @@ class ReportingMixin:
                         })
                 return rows
 
-            # as_of_date is also an input echo, but it's cheap and
-            # useful when a log is reviewed out of context. `balanced`
-            # ``balanced`` is derivable (assets == liabilities + equity)
-            # and was dropped in an earlier audit pass. Rollup totals
-            # flow through ``_format_number`` (2 decimals, currency
-            # style) so the response no longer leaks Decimal precision
-            # noise like ``"612011.489832"``.
+            # as_of_date is an input echo, kept — cheap and useful
+            # when a log is reviewed out of context. A ``balanced``
+            # field would be derivable and is deliberately omitted.
             return {
                 "as_of_date": as_of_date.isoformat(),
                 "assets": {
@@ -701,6 +581,14 @@ class ReportingMixin:
                             "balance": _format_number(net_income, decimals=2),
                         }]
                         if net_income != 0 else []
+                    ) + (
+                        # Synthetic, signed line — positive =
+                        # unrealized gain (see docstring).
+                        [{
+                            "account": "Unrealized Gain/Loss",
+                            "balance": _format_number(unrealized, decimals=2),
+                        }]
+                        if unrealized != 0 else []
                     ),
                 },
             }
@@ -726,10 +614,9 @@ class ReportingMixin:
         nw_types = _ASSET_TYPES | _LIABILITY_TYPES
 
         with self.open(readonly=True) as book:
-            factors = self._account_conversion_factors(book)
-
             # --- Point-in-time: one filtered SQL query, sum in Python.
             if not start_date or not interval:
+                factors = self._account_conversion_factors(book, end_date)
                 rows = self._query_filtered_splits(
                     book,
                     end_date=end_date,
@@ -737,11 +624,10 @@ class ReportingMixin:
                 )
                 total = Decimal("0")
                 for split, _txn, account in rows:
-                    # Liabilities are stored negative, so adding the
-                    # converted amount directly gives assets minus
-                    # liabilities. Investments and foreign-currency
-                    # holdings are valued in the book's default
-                    # currency via their latest market price.
+                    if _is_voided(split):
+                        continue
+                    # Liabilities are stored negative, so a direct
+                    # sum gives assets minus liabilities.
                     total += self._split_in_default_currency(
                         split, account, factors.get(account.guid)
                     )
@@ -750,7 +636,7 @@ class ReportingMixin:
                     "net_worth": str(total),
                 }
 
-            # --- Time series: single sweep, cumulative sum.
+            # --- Time series: single sweep, per-boundary valuation.
             if interval not in ("month", "quarter", "year"):
                 raise ValueError(
                     f"Invalid interval: {interval}. "
@@ -763,9 +649,8 @@ class ReportingMixin:
                 "year": relativedelta(years=1),
             }[interval]
 
-            # Build the list of interval boundaries up-front. Every
-            # boundary gets a net_worth snapshot below; end_date is
-            # appended if the interval didn't land on it naturally.
+            # Interval boundaries up-front; end_date appended if the
+            # interval didn't land on it naturally.
             boundaries: list[date] = []
             cursor = start_date
             while cursor <= end_date:
@@ -774,11 +659,19 @@ class ReportingMixin:
             if not boundaries or boundaries[-1] != end_date:
                 boundaries.append(end_date)
 
-            # Pull every asset/liability split up through end_date in
-            # post_date order, then sweep once: as we cross each
-            # boundary, snapshot the running total. This replaces what
-            # was previously T × N (intervals × accounts × splits) with
-            # a single O(splits + intervals) pass.
+            # Per-boundary factors — each historical snapshot values
+            # at the rate of its own date, not today's. Costs
+            # O(boundaries) factors-builds; correctness over speed.
+            factors_by_boundary: dict[date, dict[str, Decimal | None]] = {
+                b: self._account_conversion_factors(book, b)
+                for b in boundaries
+            }
+
+            # Single pass in post_date order. Under per-boundary
+            # rates a single running total can't be carried forward;
+            # track per-account quantity AND value totals and convert
+            # at snapshot time with that boundary's factors. Cost:
+            # O(splits + boundaries × accounts_with_splits).
             rows = self._query_filtered_splits(
                 book,
                 end_date=end_date,
@@ -786,33 +679,72 @@ class ReportingMixin:
                 order_by_post_date=True,
             )
 
+            running_qty: dict[str, Decimal] = {}
+            running_value: dict[str, Decimal] = {}
+
+            def _snapshot_at(boundary: date) -> Decimal:
+                """Net worth at ``boundary`` using that date's
+                factors: per-account factor × quantity, cost-basis
+                fallback — ``_split_in_default_currency``'s
+                disambiguation lifted to account level."""
+                factors_here = factors_by_boundary[boundary]
+                total = Decimal("0")
+                for acct_guid, qty in running_qty.items():
+                    factor = factors_here.get(acct_guid)
+                    if factor is not None:
+                        total += qty * factor
+                    else:
+                        total += running_value[acct_guid]
+                return total
+
             series: list[dict] = []
-            running = Decimal("0")
             b_idx = 0
 
             for split, txn, account in rows:
-                # For each boundary that sits before this split's
-                # post_date, the running total is already correct —
-                # snapshot it and advance.
+                # Snapshot every boundary STRICTLY BEFORE
+                # this split. The strict ``>`` is correct and
+                # deliberate: a boundary equal to a split's
+                # post_date includes that split in its snapshot
+                # (the boundary is "end of day", so a transaction
+                # posted that day has happened by then). The
+                # cumulative running totals above this loop
+                # advance after the snapshot is taken, so the
+                # snapshot reflects every prior split AND every
+                # split posted on the boundary date — matching
+                # the inclusive-end semantics ``_query_filtered_splits``
+                # enforces at the SQL boundary. A ``>=`` here
+                # would exclude same-day splits, silently breaking
+                # the trajectory's tie to ``balance_sheet(as_of)``.
                 while (
                     b_idx < len(boundaries)
                     and txn.post_date > boundaries[b_idx]
                 ):
                     series.append({
                         "date": boundaries[b_idx].isoformat(),
-                        "net_worth": str(running),
+                        "net_worth": str(_snapshot_at(boundaries[b_idx])),
                     })
                     b_idx += 1
-                running += self._split_in_default_currency(
-                    split, account, factors.get(account.guid)
+                # Voided filter placed after the boundary advance so
+                # a voided split still flushes due snapshots, just
+                # never accumulates.
+                if _is_voided(split):
+                    continue
+                acct_guid = account.guid
+                running_qty[acct_guid] = (
+                    running_qty.get(acct_guid, Decimal("0"))
+                    + Decimal(str(split.quantity))
+                )
+                running_value[acct_guid] = (
+                    running_value.get(acct_guid, Decimal("0"))
+                    + Decimal(str(split.value))
                 )
 
-            # Drain any boundaries past the last split — they all see
-            # the final running total.
+            # Drain boundaries past the last split — each still uses
+            # its own factors.
             while b_idx < len(boundaries):
                 series.append({
                     "date": boundaries[b_idx].isoformat(),
-                    "net_worth": str(running),
+                    "net_worth": str(_snapshot_at(boundaries[b_idx])),
                 })
                 b_idx += 1
 
@@ -828,21 +760,38 @@ class ReportingMixin:
         start_date: date,
         end_date: date,
         account: str | None = None,
+        include_transfers: bool = False,
     ) -> dict:
         """Calculate cash flow (inflows and outflows) for a period.
 
+        Scope: BANK and CASH accounts only. Credit-card movements
+        are liability changes and investment movements asset
+        rearrangements — not "cash flow" in the bookkeeper's sense.
+        An explicit ``account=`` of any type still works.
+
+        By default, internal transfers (transactions with no INCOME
+        or EXPENSE leg — savings transfers, wallet shuffles, card
+        paydowns) are filtered out so the totals answer "where did
+        money come from and go?" rather than echoing same-pocket
+        reshuffling. Invoice/bill settlements still count as real
+        flow despite having no income/expense split — see
+        ``_cashflow_txn_guids``.
+
         Args:
-            start_date: Start of period (inclusive).
-            end_date: End of period (inclusive).
-            account: Optional account to filter (e.g., specific bank account).
+            start_date / end_date: Period bounds (inclusive).
+            account: Optional single-account filter.
+            include_transfers: True includes every cash movement —
+                useful for reconciling against a bank statement.
 
         Returns:
-            Dict with inflows, outflows, and net cash flow.
+            ``{account, inflows, outflows}`` plus, when transfers
+            were filtered, ``transfers_excluded`` — the count of
+            distinct cash-touching transactions skipped (surfaced so
+            the LLM can mention the ``include_transfers`` escape
+            hatch).
         """
         with self.open(readonly=True) as book:
-            # Two filter modes: a named account (one-GUID IN() clause)
-            # or the default "all cash/bank accounts" (account-type
-            # IN() clause). Both push the filter to SQL.
+            # Named-account or all-cash filter; both push to SQL.
             if account:
                 target_account = self._resolve_account(book, account)
                 if not target_account:
@@ -861,10 +810,29 @@ class ReportingMixin:
                     account_types=_CASH_TYPES,
                 )
 
-            factors = self._account_conversion_factors(book)
+            # GUIDs of "real" cash-flow transactions; everything
+            # else is a transfer unless include_transfers.
+            if not include_transfers:
+                cashflow_txn_guids = self._cashflow_txn_guids(
+                    book, start_date, end_date
+                )
+            else:
+                cashflow_txn_guids = None  # don't filter
+
+            factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
             outflows = Decimal("0")
-            for split, _txn, acct in rows:
+            transfers_excluded: set[str] = set()
+            for split, txn, acct in rows:
+                # Skip voided splits BEFORE the transfer-vs-real
+                # classification so they neither inflate
+                # transfers_excluded nor pollute the accumulators.
+                if _is_voided(split):
+                    continue
+                if cashflow_txn_guids is not None \
+                        and txn.guid not in cashflow_txn_guids:
+                    transfers_excluded.add(txn.guid)
+                    continue
                 amt = self._split_in_default_currency(
                     split, acct, factors.get(acct.guid)
                 )
@@ -873,13 +841,10 @@ class ReportingMixin:
                 elif amt < 0:
                     outflows += -amt
 
-            # period is input echo (LLM supplied dates), net is derivable
-            # (inflows - outflows). Both dropped.
-            #
-            # Echo the canonical fullname rather than the raw input —
-            # so callers passing %short or full-GUID input always see
-            # a readable account name in the response.
-            return {
+            # period (input echo) and net (derivable) are dropped.
+            # The canonical fullname is echoed so %short/GUID input
+            # still yields a readable name.
+            result = {
                 "account": (
                     target_account.fullname if account
                     else "All cash/bank accounts"
@@ -887,6 +852,58 @@ class ReportingMixin:
                 "inflows": str(inflows),
                 "outflows": str(outflows),
             }
+            if transfers_excluded:
+                result["transfers_excluded"] = len(transfers_excluded)
+            return result
+
+    def _cashflow_txn_guids(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> set[str]:
+        """Set of transaction GUIDs in the period that count as real
+        cash-flow events rather than internal transfers (the
+        ``cash_flow`` filter).
+
+        Two qualifying shapes:
+
+        1. A non-voided INCOME or EXPENSE split — ordinary
+           earn/spend.
+        2. A non-voided **lot-linked** RECEIVABLE/PAYABLE split —
+           an invoice/bill settlement. Structurally a transfer, but
+           it IS the revenue receipt; an income/expense-only filter
+           drops it unless FX drift happens to add a realized-FX
+           split, making classification depend on rate movement.
+           The lot link is deterministic; manual A/R adjustments
+           without a lot stay transfers.
+
+        Routes through ``_query_filtered_splits`` for the inclusive
+        bound and template/null-date filters; the voided filter is
+        Python-side so a voided leg can't rescue a zombie
+        transaction.
+        """
+        rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=_NET_INCOME_TYPES,
+        )
+        guids = {
+            txn.guid for split, txn, _acct in rows
+            if not _is_voided(split)
+        }
+        settlement_rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=frozenset({"RECEIVABLE", "PAYABLE"}),
+        )
+        guids.update(
+            txn.guid for split, txn, _acct in settlement_rows
+            if not _is_voided(split) and split.lot is not None
+        )
+        return guids
 
     # ── Debt Payoff ───────────────────────────────────────────────
 
@@ -921,12 +938,14 @@ class ReportingMixin:
         while any(d["balance"] > 0 for d in working) and month < max_months:
             month += 1
 
-            # Step 1: Apply monthly interest to each balance
+            # Step 1: Apply monthly interest to each balance. Rate is
+            # pre-computed per debt in ``debt_payoff_plan`` (apr/100/12);
+            # this loop runs up to 1200 × N times and recomputing the
+            # division each iteration was pure waste.
             for d in working:
                 if d["balance"] <= 0:
                     continue
-                monthly_rate = d["apr"] / Decimal("100") / Decimal("12")
-                interest = (d["balance"] * monthly_rate).quantize(Decimal("0.01"))
+                interest = (d["balance"] * d["monthly_rate"]).quantize(Decimal("0.01"))
                 d["balance"] += interest
                 d["interest_paid"] += interest
 
@@ -967,38 +986,24 @@ class ReportingMixin:
         additional_purchase: str | None = None,
         compact: bool = True,
     ) -> dict | str:
-        """Calculate an avalanche-method debt payoff schedule with YETI multiplier.
+        """Calculate an avalanche-method debt payoff schedule with
+        YETI multiplier.
 
-        Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
-
-        YETI (Your Expense's True Impact) answers: "A $1.00 purchase will cost
-        you $X.XX by the time your debt is paid off."
+        Auto-discovers CREDIT/LIABILITY accounts with an 'apr' slot.
+        YETI (Your Expense's True Impact) answers: "a $1.00 purchase
+        will cost you $X.XX by the time your debt is paid off."
 
         Args:
-            monthly_budget: Total monthly amount available for all debt payments.
-            additional_purchase: Dollar amount to calculate YETI for (default "1.00").
-            compact: If True (default), return a compact text-table summary
-                     suitable for the LLM context window — kill order,
-                     totals, YETI all in ~10 lines. Verbose mode returns
-                     the full structured dict (the legacy shape) for
-                     programmatic consumers.
-
-        Returns:
-            If compact: text summary, e.g.::
-
-                Kill order ($10,000/mo → debt-free Apr 2030, $59,022 interest):
-                  1. Business Amex    $13,091  24.49%  payoff: mo 8   interest: $1,125
-                  2. Chase Sapphire   $22,127  21.49%  payoff: mo 18  interest: $5,034
-                  ...
-                YETI at this budget: 1.59x ($1 spent costs $1.59 in total debt impact)
-                Total interest: $59,022
-                Debt-free: April 2030
-
-            If not compact: dict with the original full structure.
+            monthly_budget: Total monthly amount for all debt payments.
+            additional_purchase: Amount to compute YETI for
+                (default "1.00").
+            compact: Kill-order text table (default — see
+                ``_format_debt_payoff_compact`` for the layout) or
+                the full structured dict.
 
         Raises:
-            ValueError: If no debt accounts found, budget invalid, or budget
-                        less than sum of minimum payments.
+            ValueError: no debt accounts found, invalid budget, or
+                budget below the sum of minimum payments.
         """
         budget = _to_decimal(monthly_budget)
         if budget <= 0:
@@ -1013,44 +1018,64 @@ class ReportingMixin:
             raise ValueError("additional_purchase must be a positive number")
 
         with self.open(readonly=True) as book:
-            # Capture the book's default currency for the compact
-            # formatter — pre-fix this method emitted ``$`` regardless
-            # of book setting, breaking on non-USD books.
             default_currency_mnemonic = (
                 self._require_default_currency(book).mnemonic
             )
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
+            # Counted so the no-debts error distinguishes "no debt
+            # accounts at all" from "they exist but lack the apr
+            # slot" — the user's next action differs.
+            debt_typed_account_count = 0
 
-            # Template accounts (scheduled-transaction
-            # scaffolding) inherit type=CREDIT/LIABILITY from
-            # their parent in the user's chart and could
-            # technically carry an ``apr`` slot if anyone managed
-            # to set one — pathological but possible. Filter
-            # upfront so the avalanche schedule never includes
-            # template balances. Defense-in-depth, not a bug fix.
+            # Defense-in-depth template filter (a template could
+            # theoretically carry an apr slot).
             template_guids = self._template_account_guids(book)
+
+            # FX factors so a foreign-currency debt values in the
+            # book default instead of raw foreign units. "Now"
+            # report → today's rates.
+            debt_factors = self._account_conversion_factors(
+                book, date.today()
+            )
 
             for account in book.accounts:
                 if account.guid in template_guids:
                     continue
                 if account.type not in debt_types:
                     continue
+                debt_typed_account_count += 1
 
+                # Materialize slots once — three account[key]
+                # accesses each re-walk the slots collection.
+                slot_by_name = {s.name: s for s in account.slots}
+
+                apr_val = slot_by_name.get("apr")
+                if apr_val is None:
+                    continue
                 try:
-                    apr_val = account["apr"]
                     apr_str = str(apr_val.value) if hasattr(apr_val, "value") else str(apr_val)
                     apr = Decimal(apr_str)
-                except (KeyError, InvalidOperation):
+                except InvalidOperation:
                     continue
 
                 if apr <= 0:
                     continue
 
-                # Calculate current balance (negate because liabilities are stored negative)
+                # Balance in book default, today-capped (a payment
+                # scheduled next week hasn't reduced today's payoff
+                # balance); voided and null-date splits excluded.
+                today = date.today()
                 balance = Decimal("0")
                 for split in account.splits:
-                    balance += split.quantity
+                    if _is_voided(split):
+                        continue
+                    post_date = split.transaction.post_date
+                    if post_date is None or post_date > today:
+                        continue
+                    balance += self._split_in_default_currency(
+                        split, account, debt_factors.get(account.guid)
+                    )
                 balance = -balance  # Convert to positive amount owed
 
                 if balance <= 0:
@@ -1058,25 +1083,30 @@ class ReportingMixin:
 
                 min_payment = None
 
-                # 1. Check minimum_payment slot (user override).
-                #    Wins for both CREDIT and LIABILITY — the user has
-                #    declared the contractual amount.
-                try:
-                    mp_val = account["minimum_payment"]
-                    mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
-                    min_payment = Decimal(mp_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                # 1. minimum_payment slot — user-declared contractual
+                #    amount wins for both types.
+                mp_val = slot_by_name.get("minimum_payment")
+                if mp_val is not None:
+                    try:
+                        mp_str = str(mp_val.value) if hasattr(mp_val, "value") else str(mp_val)
+                        min_payment = Decimal(mp_str)
+                    except InvalidOperation:
+                        pass
+                # Slot scalars are in the ACCOUNT's commodity by
+                # convention; the plan's math runs in book default —
+                # convert with the balance's factor, or a ¥2,000
+                # minimum reads as $2,000 and skews the schedule.
+                if min_payment is not None:
+                    slot_factor = debt_factors.get(account.guid)
+                    if slot_factor is not None and slot_factor != 1:
+                        min_payment = (
+                            min_payment * slot_factor
+                        ).quantize(Decimal("0.01"))
 
-                # 2. Type-aware fallback. Credit cards and amortizing
-                #    loans have very different minimum-payment shapes:
-                #    CREDIT cards charge ~2% of balance (revolving,
-                #    no fixed term), while LIABILITY loans are
-                #    contractually fixed payments derived from
-                #    principal × rate × term (mortgage, auto, student).
-                #    Applying the 2% rule to a mortgage produces a
-                #    minimum that's ~3-4× the actual payment, which
-                #    makes the budget-vs-minimums gate trip on any
+                # 2. Type-aware fallback: CREDIT cards charge ~2% of
+                #    balance; LIABILITY loans amortize. Applying the
+                #    2% rule to a mortgage yields ~3-4× the actual
+                #    payment and trips the budget gate on any
                 #    realistic household budget.
                 if min_payment is None:
                     if account.type == "CREDIT":
@@ -1087,14 +1117,11 @@ class ReportingMixin:
                         if balance < Decimal("25"):
                             min_payment = balance
                     else:
-                        # LIABILITY: standard amortization formula.
-                        # PMT = P × r(1+r)^n / ((1+r)^n − 1)
-                        # Term defaults: 30 years if "mortgage" appears
-                        # anywhere in the account path (Liabilities:
-                        # Mortgage, Loans:Mortgage:Principal, etc.),
-                        # else 5 years (auto, personal, etc.). Users
-                        # with non-standard terms should set the
-                        # minimum_payment slot explicitly.
+                        # LIABILITY: amortization formula
+                        # PMT = P × r(1+r)^n / ((1+r)^n − 1).
+                        # Term: 30y when "mortgage" appears in the
+                        # path, else 5y; non-standard terms should
+                        # set the minimum_payment slot.
                         is_mortgage = "mortgage" in account.fullname.lower()
                         term_months = 360 if is_mortgage else 60
                         monthly_rate = (
@@ -1109,26 +1136,46 @@ class ReportingMixin:
                         if min_payment > balance:
                             min_payment = balance
 
-                credit_limit = None
-                try:
-                    cl_val = account["credit_limit"]
-                    cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
-                    credit_limit = Decimal(cl_str)
-                except (KeyError, InvalidOperation):
-                    pass
+                credit_limit = None  # account-ccy slot; converted below
+                cl_val = slot_by_name.get("credit_limit")
+                if cl_val is not None:
+                    try:
+                        cl_str = str(cl_val.value) if hasattr(cl_val, "value") else str(cl_val)
+                        credit_limit = Decimal(cl_str)
+                        slot_factor = debt_factors.get(account.guid)
+                        if slot_factor is not None and slot_factor != 1:
+                            credit_limit = (
+                                credit_limit * slot_factor
+                            ).quantize(Decimal("0.01"))
+                    except InvalidOperation:
+                        pass
 
                 debts.append({
                     "name": account.fullname,
                     "balance": balance,
                     "apr": apr,
+                    # Pre-computed once — _run_avalanche's loop runs
+                    # up to 1200 months per debt.
+                    "monthly_rate": apr / Decimal("100") / Decimal("12"),
                     "min_payment": min_payment,
                     "credit_limit": credit_limit,
                 })
 
         if not debts:
+            if debt_typed_account_count == 0:
+                raise ValueError(
+                    "No CREDIT or LIABILITY accounts found in the "
+                    "chart of accounts. Create the debt account(s) "
+                    "first via create_account, then set their APR "
+                    "via set_account_slot."
+                )
             raise ValueError(
-                "No debt accounts found with 'apr' slot set. "
-                "Use set_account_slot to set APR on your CREDIT/LIABILITY accounts."
+                f"Found {debt_typed_account_count} CREDIT/LIABILITY "
+                f"account(s) but none have an 'apr' slot set "
+                f"(or every APR is <= 0, or every balance is "
+                f"<= 0). Use set_account_slot to set 'apr' on the "
+                f"debt accounts you want included in the payoff "
+                f"plan."
             )
 
         total_minimums = sum(d["min_payment"] for d in debts)

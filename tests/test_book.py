@@ -153,10 +153,26 @@ class TestGetBookSummary:
         assert "Currency: USD" in result
 
     def test_get_book_summary_book_path(self, test_book: Path):
-        """Should include the book file path."""
+        """Should include the book filename only, no directory leak.
+
+        Privacy hardening shipped in v1.3.0: the "Book:" line used
+        to expose the full absolute path on every orientation call,
+        leaking the user's filesystem layout into every transcript.
+        Filename alone is enough for the LLM to confirm which book
+        is loaded — see ``_book_display_name``.
+        """
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.get_book_summary()
-        assert f"Book: {test_book}" in result
+        # First line should be ``Book: <filename>``.
+        first_line = result.split("\n", 1)[0]
+        assert first_line == f"Book: {test_book.name}", (
+            f"unexpected Book line: {first_line!r}"
+        )
+        # And the directory components must NOT appear anywhere.
+        parent_path = str(test_book.parent)
+        assert parent_path not in result, (
+            f"directory leaked into summary: {parent_path!r}"
+        )
 
     def test_data_range_uses_transaction_dates_not_prices(
         self, test_book: Path,
@@ -338,6 +354,35 @@ class TestGetBookSummaryReconciliation:
                     s.reconcile_date = _dt.combine(on_date, _dt.min.time())
             book.save()
 
+    def _reconcile_all_unreconciled(
+        self,
+        gc: GnuCashBook,
+        account: str,
+        as_of: date | None = None,
+    ) -> None:
+        """Mark every currently-unreconciled split on the account as
+        reconciled. Used to clear the test_book fixture's pre-seeded
+        Jan 2024 activity so bucket-behavior tests exercise the
+        scenario their name describes — without the leftover
+        unreconciled clutter inflating the dashboard lag.
+
+        Under the post-self-review semantics (lag from OLDEST
+        unreconciled), the fixture's Jan 2024 splits would push
+        Checking permanently into the "stale" bucket regardless of
+        any later reconciliation — correct behavior in real life,
+        but it overrides what these tests are scoped to verify.
+        """
+        from datetime import datetime as _dt
+        anchor = as_of or date.today()
+        with gc.open(readonly=False) as book:
+            acct = gc._find_account(book, account)
+            assert acct is not None, account
+            for s in acct.splits:
+                if s.reconcile_state != "y":
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(anchor, _dt.min.time())
+            book.save()
+
     def test_unreconciled_count_removed_from_transactions_line(
         self, test_book: Path,
     ):
@@ -376,6 +421,12 @@ class TestGetBookSummaryReconciliation:
         marker on that line; current accounts are by definition
         not behind."""
         gc = GnuCashBook(str(test_book))
+        # Clear the fixture's Jan 2024 unreconciled splits — under
+        # the post-self-review semantics they'd push Checking to
+        # stale via the oldest-unreconciled lag regardless of
+        # later activity. This test exercises bucket logic, not
+        # backlog reporting; we want a clean baseline.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         recent = date.today() - timedelta(days=10)
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
@@ -412,9 +463,20 @@ class TestGetBookSummaryReconciliation:
         self, test_book: Path,
     ):
         """Account whose last reconcile is well past 45 days shows
-        '(N months behind) ⚠'."""
+        '(N months behind) ⚠'. With no unreconciled work hanging,
+        the lag falls back to the latest_y_date — the original
+        pre-self-review semantics for the fully-caught-up case."""
         gc = GnuCashBook(str(test_book))
         old = date.today() - timedelta(days=120)
+        # Reconcile the fixture's Jan 2024 splits back-dated to the
+        # same OLD reference date so latest_y_date stays at ``old``
+        # and unreconciled_count = 0 (fully caught up). Without
+        # this, the new test transaction's reconciled split would
+        # NOT dominate latest_y_date over a fresher fixture state,
+        # and the Jan 2024 splits would push the lag to years.
+        self._reconcile_all_unreconciled(
+            gc, "Assets:Checking", as_of=old,
+        )
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
             opening = gc._find_account(book, "Equity:Opening Balance")
@@ -440,9 +502,15 @@ class TestGetBookSummaryReconciliation:
         self, test_book: Path,
     ):
         """The 45-59 day window uses days, not months — months
-        scale only kicks in at 60+."""
+        scale only kicks in at 60+. Tests the fully-caught-up-but-
+        stale-by-latest_y path."""
         gc = GnuCashBook(str(test_book))
         d50 = date.today() - timedelta(days=50)
+        # Reconcile fixture splits back-dated to d50 so unreconciled
+        # count is 0 and latest_y_date drives the lag (50 days).
+        self._reconcile_all_unreconciled(
+            gc, "Assets:Checking", as_of=d50,
+        )
         with gc.open(readonly=False) as book:
             checking = gc._find_account(book, "Assets:Checking")
             opening = gc._find_account(book, "Equity:Opening Balance")
@@ -533,6 +601,10 @@ class TestGetBookSummaryReconciliation:
         Per-account-distinct info stays per-account; identical-
         across-accounts info collapses to a count."""
         gc = GnuCashBook(str(test_book))
+        # Clear fixture's pre-seeded Jan 2024 unreconciled splits on
+        # Checking so the "Current bucket" assertion below holds —
+        # otherwise oldest-unreconciled lag pushes Checking to stale.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         # Never-reconciled bucket: add Visa with activity, no recon.
         gc.create_account(
             name="Visa", account_type="CREDIT", parent="Liabilities",
@@ -603,6 +675,10 @@ class TestGetBookSummaryReconciliation:
         plural 's'. Symmetric grammar with the never-reconciled
         bucket."""
         gc = GnuCashBook(str(test_book))
+        # Clear fixture's pre-seeded Jan 2024 unreconciled splits on
+        # Checking so it can land in the current bucket alongside
+        # the newly-added Savings account.
+        self._reconcile_all_unreconciled(gc, "Assets:Checking")
         # Add a second BANK account.
         gc.create_account(
             name="Savings", account_type="BANK", parent="Assets",
@@ -2567,6 +2643,42 @@ class TestGetBookSummaryWarnings:
         assert "20 days overdue" not in warnings_block
         assert "(posted without terms)" not in warnings_block
 
+    def test_credit_note_never_ages_into_dashboard_warnings(
+        self, business_book: Path,
+    ):
+        """Live-test minor finding: the dashboard listed an unapplied
+        credit note as 'N days past 30-day default' and counted it in
+        the overdue tally, while get_outstanding_invoices correctly
+        exempted it. A credit note is money the business OWES — it
+        stays in the open counts but never ages."""
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Emerald Analytics", currency="USD")
+        cn = gc.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            date_opened=(date.today() - timedelta(days=238)).isoformat(),
+        )
+        gc.add_credit_note_entry(
+            credit_note_id=cn["id"],
+            account="Income:Sales",
+            description="Service credit",
+            quantity="1", price="500",
+        )
+        gc.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+            post_date=(date.today() - timedelta(days=238)).isoformat(),
+        )
+
+        result = gc.get_book_summary()
+        # No past-due warning line for the credit note (it's the only
+        # posted document in this book).
+        assert "Past due" not in result, result
+        assert "past 30-day default" not in result
+        # Counted as open, never as overdue.
+        assert "1 overdue" not in result
+
+
     def test_past_due_invoice_uses_term_duedays_no_terms_annotation(
         self, business_book: Path,
     ):
@@ -2903,18 +3015,27 @@ class TestGetBookSummaryUpcomingScheduled:
 
 
 class TestGetBookSummaryReconciliationSplitCount:
-    """Stale reconciliation lines now carry "47 splits unreconciled
-    since DATE" instead of just "through DATE". The split count
-    tells the LLM the *scope* of the work — 12 splits is one
-    sitting; 400 is "let's narrow by month."
+    """Stale reconciliation lines carry "47 splits unreconciled
+    (4 months behind, oldest: 2020-03-15)" — the count tells the
+    LLM the *scope* of the work (12 splits is one sitting; 400 is
+    "let's narrow by month"), and the lag is computed from the
+    OLDEST unreconciled split so "behind" measures the true scope
+    of work, not just time-since-last-reconcile.
+
+    Pre-self-review the lag was computed from ``latest_y_date``,
+    which could understate scope by years: an account reconciled
+    through 2025-12-30 with 40 unreconciled splits from 2020
+    rendered as "(4 months behind)" — the bookkeeper would plan
+    for a one-session catch-up and discover they need six years of
+    statements.
     """
 
     def test_stale_account_shows_split_count(
         self, multi_currency_book: Path,
     ):
         """Reconcile a checking-account split partway, then add new
-        unreconciled activity in the future. The summary should
-        show the count of unreconciled splits."""
+        unreconciled activity. The summary should show the count of
+        unreconciled splits with the "(lag, oldest: DATE)" suffix."""
         from datetime import date as _date, timedelta
         gc = GnuCashBook(str(multi_currency_book))
 
@@ -2953,18 +3074,219 @@ class TestGetBookSummaryReconciliationSplitCount:
         recon_line = next(
             (
                 l for l in result.splitlines()
-                if "Checking" in l and "unreconciled since" in l
+                if "Checking" in l and "oldest:" in l
             ),
             None,
         )
         assert recon_line is not None, (
-            f"Expected 'unreconciled since' line for Checking; "
+            f"Expected 'oldest:' line for Checking; "
             f"got summary:\n{result}"
         )
         # Count appears in the line.
-        assert "splits unreconciled since" in recon_line
+        assert "splits unreconciled" in recon_line
+        assert "oldest:" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
+
+
+class TestReconciliationLagFromOldestUnreconciled:
+    """The lag rendered for an account with pending reconciliation
+    work must reflect the OLDEST unreconciled split, not the
+    LATEST reconciled split. The bookkeeper plans against the
+    scope of work — "4 months behind" implies one sitting; "6
+    years behind" implies six years of statements. Misreporting
+    the lag costs a day of mismatched expectations.
+    """
+
+    def test_lag_reflects_oldest_unreconciled_not_latest_y(
+        self, test_book: Path,
+    ):
+        """Reconcile a RECENT split; leave an OLD split unreconciled.
+        The dashboard lag should describe the old gap, not the
+        recent reconciliation date.
+        """
+        from datetime import date as _date, timedelta, datetime as _dt
+        gc = GnuCashBook(str(test_book))
+
+        # Add an OLD unreconciled split (5 years ago).
+        old_date = _date.today() - timedelta(days=5 * 365)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Old skipped deposit",
+                post_date=old_date,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("100")),
+                    piecash.Split(account=opening, value=Decimal("-100")),
+                ],
+            ))
+            book.save()
+
+        # Reconcile a RECENT split (10 days ago) on Checking.
+        recent_date = _date.today() - timedelta(days=10)
+        with gc.open(readonly=False) as book:
+            checking = gc._find_account(book, "Assets:Checking")
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Recent reconciled deposit",
+                post_date=recent_date,
+                splits=[
+                    piecash.Split(account=checking, value=Decimal("50")),
+                    piecash.Split(account=opening, value=Decimal("-50")),
+                ],
+            ))
+            book.save()
+            for s in checking.splits:
+                if s.transaction.post_date == recent_date:
+                    s.reconcile_state = "y"
+                    s.reconcile_date = _dt.combine(
+                        recent_date, _dt.min.time(),
+                    )
+            book.save()
+
+        result = gc.get_book_summary()
+        recon_line = next(
+            l for l in result.splitlines()
+            if "Checking" in l and "oldest:" in l
+        )
+        # Lag must NOT be "10 days behind" / "1 week behind" — that
+        # would describe the gap to ``latest_y_date``, not the real
+        # scope of work.
+        assert "10 days behind" not in recon_line, (
+            f"lag computed from latest_y_date instead of oldest "
+            f"unreconciled: {recon_line!r}"
+        )
+        # It should land in the "years" branch — 5 years ago.
+        assert (
+            "5 years behind" in recon_line
+            or "4 years behind" in recon_line
+        ), (
+            f"expected years-scale lag from oldest unreconciled; "
+            f"got: {recon_line!r}"
+        )
+        # And the oldest date itself appears in the line.
+        assert old_date.isoformat() in recon_line, (
+            f"oldest date {old_date} not surfaced in line: "
+            f"{recon_line!r}"
+        )
+
+
+class TestGetBookSummaryBusinessSignals:
+    """Bookkeeper-asked-for additions to the summary (v1.3 blocker):
+
+      - Receivables / Payables lines append ``(N invoice(s), M
+        overdue)`` — actionable signal beyond the "USD 13,500" total.
+      - ``Jobs: N active`` line emitted conditionally when the
+        feature is in use; absent when no jobs exist.
+    """
+
+    def _setup_overdue_invoice(self, gb):
+        """Create + post one invoice dated 60 days ago with a
+        30-day term, so it lands as overdue today."""
+        from datetime import date as _date, timedelta
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(name="Net 30", due_days=30)
+        opened = _date.today() - timedelta(days=60)
+        gb.create_invoice(
+            customer_id="000001",
+            date_opened=opened.isoformat(),
+            term="Net 30",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Widget",
+            quantity="1",
+            price="500",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=opened.isoformat(),
+        )
+
+    def _setup_current_bill(self, gb):
+        """Create + post one bill dated today (not overdue)."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+
+    def test_receivables_signal_shows_overdue(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_overdue_invoice(gc)
+        result = gc.get_book_summary()
+        recv = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Receivables:")
+        )
+        assert "1 invoice" in recv
+        assert "1 overdue" in recv
+
+    def test_payables_signal_shows_open_count(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        self._setup_current_bill(gc)
+        result = gc.get_book_summary()
+        pay = next(
+            ln for ln in result.splitlines()
+            if ln.startswith("Payables:")
+        )
+        assert "1 bill" in pay
+        assert "0 overdue" in pay
+
+    def test_jobs_line_present_when_active(
+        self, business_book: Path,
+    ):
+        gc = GnuCashBook(str(business_book))
+        gc.create_customer(name="Acme")
+        gc.create_job(
+            owner_id="000001",
+            owner_type="customer",
+            name="API Rewrite",
+        )
+        result = gc.get_book_summary()
+        # One active job — exact "1 active" since "1" pluralizes
+        # to nothing extra in the rendered line.
+        assert "Jobs: 1 active" in result
+
+    def test_jobs_line_absent_when_none(
+        self, business_book: Path,
+    ):
+        """No jobs created — the line is omitted entirely.
+        Absence is the signal (per bookkeeper: 'Jobs existing
+        doesn't need attention')."""
+        gc = GnuCashBook(str(business_book))
+        result = gc.get_book_summary()
+        assert "Jobs:" not in result
+
+    def test_no_business_no_signals(self, test_book: Path):
+        """A non-business book (no posted invoices) still produces
+        a clean summary — no spurious '0 invoices' phrase, no
+        Jobs line. The signals only appear when there's something
+        to act on."""
+        gc = GnuCashBook(str(test_book))
+        result = gc.get_book_summary()
+        # No invoice/bill activity → no signal phrases.
+        assert "0 invoices" not in result
+        assert "0 bills" not in result
+        assert "Jobs:" not in result
 
 
 class TestMissingDefaultCurrency:
@@ -4895,6 +5217,68 @@ class TestAutoFillTransaction:
                 description="Never Seen Before XYZ123",
             )
 
+    def _add_empty_description_txn(self, gc_book) -> None:
+        """Post a (legal) empty-description transaction dated most
+        recent, mimicking the A/P transaction that triggered the
+        live-test blocker."""
+        gc_book.create_transaction(
+            description="",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "1242.50"},
+                {"account": "Assets:Checking", "amount": "-1242.50"},
+            ],
+            trans_date=date(2024, 2, 20),
+            check_duplicates=False,
+        )
+
+    def test_no_match_guard_fires_despite_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Live-test blocker regression: an empty-description
+        transaction in the book desc-matched EVERY proposal ("" is a
+        substring of everything), so a no-match auto-fill cloned that
+        unrelated transaction under the caller's description instead
+        of raising. The guard must fire and nothing must be written."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(
+                description="Never Seen Before XYZ123",
+            )
+        # No phantom landed in the book.
+        phantom = gc_book.search_transactions(
+            query="Never Seen Before XYZ123", field="description",
+            compact=False,
+        )
+        assert phantom == []
+
+    def test_real_match_beats_empty_description_txn(
+        self, test_book: Path,
+    ):
+        """Positive control: matching still works with the empty-
+        description transaction present (and more recent) — the real
+        description match is the source, not the empty one."""
+        gc_book = GnuCashBook(str(test_book))
+        self._add_empty_description_txn(gc_book)
+
+        result = gc_book.create_transaction(
+            description="Weekly Groceries",
+            trans_date=date(2024, 3, 1),
+            check_duplicates=False,
+        )
+        assert result["auto_filled_from"]["description"] == "Weekly Groceries"
+
+    def test_empty_proposal_does_not_match_everything(
+        self, test_book: Path,
+    ):
+        """An empty PROPOSED description carries no match signal
+        either — pre-fix it substring-matched every transaction in
+        the book and auto-filled from the most recent one."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="No matching transaction found"):
+            gc_book.create_transaction(description="")
+
     def test_auto_fill_with_dry_run(self, test_book: Path):
         """Should auto-fill and report the source in dry run mode.
 
@@ -5572,6 +5956,32 @@ class TestUpdateAccount:
         # Verify new name exists
         assert gc_book.get_account("Expenses:Food & Groceries") is not None
 
+    def test_update_account_rename_rejects_invalid_names(
+        self, test_book: Path
+    ):
+        """M5 regression: the rename branch must reject ':' (path
+        separator), control chars, and whitespace-only names — the same
+        MP-14 validation create_account enforces. Pre-fix the rename
+        path was an unguarded parallel entry point that would corrupt
+        the account's fullname for downstream path parsing.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="cannot contain ':'"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Foo:Bar",
+            )
+        with pytest.raises(ValueError, match="cannot be empty"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="   ",
+            )
+        with pytest.raises(ValueError, match="control characters"):
+            gc_book.update_account(
+                name="Expenses:Groceries", new_name="Bad\x01Name",
+            )
+        # Account unchanged after the rejected renames.
+        assert gc_book.get_account("Expenses:Groceries") is not None
+
     def test_update_account_description(self, test_book: Path):
         """Should update account description."""
         gc_book = GnuCashBook(str(test_book))
@@ -6218,6 +6628,58 @@ class TestUpdateTransaction:
         )
         assert result["status"] == "updated"
         assert result["description"] == "Updated Groceries"
+
+    def test_update_splits_validates_before_mutating(
+        self, multi_currency_book: Path,
+    ):
+        """Bad input on the second split must NOT leave the first
+        split's value already mutated. v1.3 Stage 2: validation is
+        now extracted into ``_validate_transaction_splits`` and runs
+        before any ``split.value`` assignment. Pre-extraction the
+        mutation loop interleaved validation with writes — the first
+        split's value was reassigned before the sibling's
+        cross-currency quantity was checked, so a rejected update
+        could leave partial state if the session didn't roll back.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+
+        # Find the cross-currency transfer (USD checking → EUR savings).
+        txns = gc_book.search_transactions("Transfer to EUR", compact=False)
+        assert txns, "Test setup: cross-currency transfer not found"
+        tx = txns[0]
+        checking_split = next(
+            s for s in tx["splits"] if s["account"] == "Assets:Checking"
+        )
+        eur_split = next(
+            s for s in tx["splits"] if s["account"] == "Assets:Euro Savings"
+        )
+        original_checking_value = checking_split["value"]
+        original_eur_value = eur_split["value"]
+
+        # Submit an update where the EUR split's quantity is missing —
+        # validator must reject before either split is touched. Pre-fix,
+        # the checking split's value would have been mutated to -2200
+        # already by the time the EUR-split error fired.
+        with pytest.raises(ValueError, match="requires 'quantity'"):
+            gc_book.update_transaction(
+                guid=tx["guid"],
+                splits=[
+                    {"account": "Assets:Checking", "amount": "-2200"},
+                    # No quantity provided for the cross-currency split.
+                    {"account": "Assets:Euro Savings", "amount": "2200"},
+                ],
+            )
+
+        # Re-read and confirm original values are intact.
+        after = gc_book.get_transaction(tx["guid"])
+        after_checking = next(
+            s for s in after["splits"] if s["account"] == "Assets:Checking"
+        )
+        after_eur = next(
+            s for s in after["splits"] if s["account"] == "Assets:Euro Savings"
+        )
+        assert after_checking["value"] == original_checking_value
+        assert after_eur["value"] == original_eur_value
 
 
 class TestReplaceSplits:
@@ -7044,6 +7506,293 @@ class TestReconcileAccount:
                     split_guids=[expense_split],
                 )
 
+    def test_reconcile_account_accepts_short_guid_account_ref(
+        self, test_book: Path,
+    ):
+        """``account_name`` must accept ``%shortguid`` form like every
+        other tool. Pre-fix, the per-split membership check compared
+        against the raw input string, so a valid short-GUID reference
+        resolved correctly via ``_resolve_account`` but then rejected
+        every one of its own splits with "belongs to account X, not
+        %xxxxxxx" — flagged three times in production.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # Build a short GUID for Assets:Checking, then reconcile via it.
+        with gc_book.open(readonly=True) as book:
+            checking = next(
+                a for a in book.accounts if a.fullname == "Assets:Checking"
+            )
+            short = gc_book._account_short_guid(book, checking)
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        # The actual assertion: shortcut + targeted mode together.
+        result = gc_book.reconcile_account(
+            account_name=short,
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            split_guids=guids,
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == len(guids)
+
+    def test_reconcile_all_bulk_mode(self, test_book: Path):
+        """``reconcile_all=True`` reconciles every unreconciled split
+        on the account whose post_date is on or before through_date
+        (defaulting to statement_date), in one tool call. Avoids the
+        ~300-token GUID round-trip the bookkeeper hit on every
+        reconciliation in production.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled["splits"])
+
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == expected_count
+
+        # Verify all splits are now in 'y' state.
+        unreconciled_after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert unreconciled_after["splits"] == []
+
+    def test_reconcile_all_no_default_date_filter(self, test_book: Path):
+        """Bulk mode must NOT default to a date filter — the
+        bookkeeper's CareCredit payoff scenario had payment splits
+        dated AFTER the statement_date, and the test fixture's
+        analogue is splits across Jan 1 / 15 / 20 reconciled against
+        a Jan 10 statement. Pre-fix the default ``through_date =
+        statement_date`` excluded Jan 15 and Jan 20 splits silently;
+        post-fix every unreconciled split is included regardless of
+        date when no ``through_date`` is passed.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled_all = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled_all["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled_all["splits"])
+        # The test fixture has at least one split AFTER the early
+        # statement date; if not, this assertion documents the gap.
+        early_cutoff = date(2024, 1, 10)
+        after_cutoff = [
+            s for s in unreconciled_all["splits"]
+            if date.fromisoformat(s["date"]) > early_cutoff
+        ]
+        assert after_cutoff, (
+            "Test setup: expected at least one split after the "
+            "early statement date to exercise the no-default-filter "
+            "behavior."
+        )
+
+        # statement_date is BEFORE some splits, but no through_date
+        # is passed — every unreconciled split must be included.
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=early_cutoff,
+            statement_balance=str(total),
+            reconcile_all=True,
+        )
+        assert result["splits_reconciled"] == expected_count
+
+    def test_reconcile_all_respects_through_date(self, test_book: Path):
+        """When ``through_date`` is set, ``reconcile_all`` only touches
+        splits on or before it. Lets the user reconcile a statement
+        window while leaving post-statement transactions unreconciled.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        # The test_book fixture has transactions on 2024-01-01,
+        # 2024-01-15, and 2024-01-20. Reconcile only through Jan 16.
+        cutoff = date(2024, 1, 16)
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False, as_of_date=cutoff,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        expected_count = len(unreconciled["splits"])
+        assert expected_count >= 1, "Test setup: expected at least one split through cutoff"
+
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+            through_date=cutoff,
+        )
+        assert result["splits_reconciled"] == expected_count
+
+        # Post-cutoff splits should still be unreconciled.
+        unreconciled_after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled_after["splits"]) >= 1
+
+    def test_reconcile_all_rejects_combined_with_split_guids(
+        self, test_book: Path,
+    ):
+        """Passing both ``reconcile_all=True`` and a non-empty
+        ``split_guids`` is ambiguous — reject loudly rather than
+        silently picking one.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        guids = [s["guid"] for s in unreconciled["splits"]]
+
+        with pytest.raises(ValueError, match="Cannot combine reconcile_all"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+                split_guids=guids,
+                reconcile_all=True,
+            )
+
+    def test_reconcile_account_requires_one_of_modes(self, test_book: Path):
+        """Calling with neither ``split_guids`` nor ``reconcile_all=True``
+        must reject with a clear error rather than silently
+        reconciling zero splits.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Must provide split_guids"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+            )
+
+    def test_reconcile_all_bulk_balance_mismatch(self, test_book: Path):
+        """Bulk mode must verify against the statement balance just
+        like targeted mode. A wrong balance rejects with the
+        discrepancy, no mutation.
+        """
+        gc_book = GnuCashBook(str(test_book))
+
+        with pytest.raises(ValueError, match="Balance mismatch"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="9999999.99",
+                reconcile_all=True,
+            )
+        # No mutation occurred.
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled["splits"]) >= 1
+
+    def test_except_guids_requires_reconcile_all(self, test_book: Path):
+        """``except_guids`` only makes sense with bulk mode — in
+        targeted mode the caller already controls which splits
+        get reconciled."""
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="only valid with reconcile_all"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 31),
+                statement_balance="0",
+                split_guids=["deadbeef00000000"],
+                except_guids=["cafef00d00000000"],
+            )
+
+    def test_except_guids_skips_listed_splits(self, test_book: Path):
+        """The common case: reconcile everything except one
+        pending split. Bookkeeper's example was a CareCredit
+        payoff with one ACH still in flight — list it in
+        except_guids and the statement balance ties cleanly."""
+        gc_book = GnuCashBook(str(test_book))
+
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        assert len(unreconciled["splits"]) >= 2, (
+            "Test setup: need at least 2 unreconciled splits."
+        )
+        # Pick one to exclude — use its short prefix to also
+        # exercise the prefix-resolution path.
+        excluded = unreconciled["splits"][0]
+        excluded_guid = excluded["guid"]
+        excluded_amt = Decimal(excluded["amount"])
+        # Statement balance = sum of everything except the excluded.
+        remaining_total = sum(
+            (
+                Decimal(s["amount"])
+                for s in unreconciled["splits"]
+                if s["guid"] != excluded_guid
+            ),
+            Decimal("0"),
+        )
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(remaining_total),
+            reconcile_all=True,
+            except_guids=[excluded_guid[:8]],
+        )
+        assert result["status"] == "reconciled"
+        assert result["splits_reconciled"] == (
+            len(unreconciled["splits"]) - 1
+        )
+        # The excluded split is still unreconciled.
+        after = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        remaining_guids = {s["guid"] for s in after["splits"]}
+        assert excluded_guid in remaining_guids
+
+    def test_except_guids_unknown_prefix_ignored(self, test_book: Path):
+        """A prefix that doesn't resolve to any split is silently
+        dropped — the goal is \"exclude these if present\", and
+        a non-matching prefix has no effect on the set."""
+        gc_book = GnuCashBook(str(test_book))
+        unreconciled = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )
+        total = sum(
+            (Decimal(s["amount"]) for s in unreconciled["splits"]),
+            Decimal("0"),
+        )
+        # Bogus prefix — well-formed hex but doesn't exist.
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(total),
+            reconcile_all=True,
+            except_guids=["deadbeef" * 4],
+        )
+        # All splits reconciled despite the bogus exclusion.
+        assert result["splits_reconciled"] == len(unreconciled["splits"])
+
 
 class TestVoidTransaction:
     """Tests for void_transaction method."""
@@ -7266,6 +8015,166 @@ class TestSpendingByCategory:
         assert result["total"] == "0"
         assert result["categories"] == []
 
+    def test_spending_by_category_nets_refunds(self, tmp_path: Path):
+        """Regression: a refund (negative split) nets against spending
+        within its category instead of being dropped. Pre-fix the
+        per-split ``amount <= 0: continue`` discarded the refund, so the
+        category reported GROSS spend (overstated)."""
+        import piecash
+        bp = tmp_path / "refund.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        shopping = piecash.Account(name="Shopping", type="EXPENSE",
+                                   parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=opening, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Buy", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=shopping, value=Decimal("500")),
+                    piecash.Split(account=checking, value=Decimal("-500"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Return", post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=shopping, value=Decimal("-200")),
+                    piecash.Split(account=checking, value=Decimal("200"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("300")  # 500 - 200, net
+        assert len(result["categories"]) == 1
+        assert Decimal(result["categories"][0]["amount"]) == Decimal("300")
+
+    @staticmethod
+    def _travel_refund_book(tmp_path: Path) -> Path:
+        """Travel 2,000 spend + Travel:Refunds −900 + Food 1,000 —
+        the C6 live shape: a net-negative LEAF under a positive
+        parent, plus an unrelated category."""
+        import piecash
+        bp = tmp_path / "depth_invariant.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        travel = piecash.Account(name="Travel", type="EXPENSE",
+                                 parent=exp, commodity=usd)
+        refunds = piecash.Account(name="Refunds", type="EXPENSE",
+                                  parent=travel, commodity=usd)
+        food = piecash.Account(name="Food", type="EXPENSE",
+                               parent=exp, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening", post_date=date(2025, 1, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("10000")),
+                    piecash.Split(account=opening, value=Decimal("-10000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Flights", post_date=date(2025, 2, 1),
+            splits=[piecash.Split(account=travel, value=Decimal("2000")),
+                    piecash.Split(account=checking, value=Decimal("-2000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Airline refund",
+            post_date=date(2025, 2, 15),
+            splits=[piecash.Split(account=refunds, value=Decimal("-900")),
+                    piecash.Split(account=checking, value=Decimal("900"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Groceries", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=food, value=Decimal("1000")),
+                    piecash.Split(account=checking, value=Decimal("-1000"))]))
+        book.save()
+        return bp
+
+    def test_total_is_depth_invariant(self, tmp_path: Path):
+        """C6 regression (adversarial pass 2): the TOTAL must not
+        change with the ``depth`` grouping knob. Pre-fix the −900
+        refund leaf netted against Travel at depth 1 but was DROPPED
+        at leaf depth, so the same period reported two different
+        totals."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        totals = set()
+        for depth in (1, 2, 3, 5):
+            result = gc.spending_by_category(
+                compact=False,
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 12, 31),
+                depth=depth,
+            )
+            totals.add(Decimal(result["total"]))
+        assert totals == {Decimal("2100")}, (
+            f"TOTAL varies with depth: {sorted(totals)}"
+        )
+
+    def test_net_negative_group_surfaced_not_dropped(
+        self, tmp_path: Path,
+    ):
+        """C6: at leaf depth the net-refunded category is excluded
+        from the spend lines but surfaced explicitly — an erased
+        real signal pre-fix."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        netted = result["net_negative_netted"]
+        assert len(netted) == 1
+        assert netted[0]["account"] == "Expenses:Travel:Refunds"
+        assert Decimal(netted[0]["amount"]) == Decimal("-900")
+        # Compact mode carries the same signal.
+        compact = gc.spending_by_category(
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=3,
+        )
+        assert "netted into TOTAL" in compact
+        assert "Refunds" in compact
+
+    def test_depth_one_groups_to_top_level_buckets(
+        self, tmp_path: Path,
+    ):
+        """A7 regression (adversarial pass 2): the documented
+        contract is depth 1 = top-level buckets (Expenses:Travel),
+        depth 2 = their children. Pre-fix the off-by-one collapsed
+        the whole default report to a single 'Expenses 100%' row."""
+        gc = GnuCashBook(str(self._travel_refund_book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 12, 31),
+            depth=1,
+        )
+        names = {c["account"] for c in result["categories"]}
+        assert names == {"Expenses:Travel", "Expenses:Food"}, names
+        by_name = {c["account"]: c for c in result["categories"]}
+        # Refund leaf nets against its Travel parent at this depth.
+        assert Decimal(
+            by_name["Expenses:Travel"]["amount"]
+        ) == Decimal("1100")
+
 
 class TestIncomeBySource:
     """Tests for income_by_source method."""
@@ -7283,6 +8192,43 @@ class TestIncomeBySource:
         assert "total" in result
         assert "sources" in result
         assert Decimal(result["total"]) > 0
+
+    def test_income_by_source_nets_losses(self, tmp_path: Path):
+        """Regression: a realized loss (negative contribution) in an
+        income account nets against gains in that source instead of
+        being dropped. Pre-fix the per-split ``amount <= 0: continue``
+        discarded the loss, so the source reported GROSS gains."""
+        import piecash
+        bp = tmp_path / "loss.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        inc = piecash.Account(name="Income", type="INCOME", parent=root,
+                              commodity=usd, placeholder=True)
+        capgains = piecash.Account(name="Capital Gains", type="INCOME",
+                                   parent=inc, commodity=usd)
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Gain", post_date=date(2025, 3, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("1000")),
+                    piecash.Split(account=capgains, value=Decimal("-1000"))]))
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Loss", post_date=date(2025, 4, 1),
+            splits=[piecash.Split(account=checking, value=Decimal("-300")),
+                    piecash.Split(account=capgains, value=Decimal("300"))]))
+        book.save()
+
+        result = GnuCashBook(str(bp)).income_by_source(
+            compact=False,
+            start_date=date(2025, 1, 1), end_date=date(2025, 12, 31),
+        )
+        assert Decimal(result["total"]) == Decimal("700")  # 1000 - 300, net
+        assert len(result["sources"]) == 1
+        assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
 
 
 class TestBalanceSheet:
@@ -7353,6 +8299,159 @@ class TestBalanceSheetNumericContract:
             )
 
 
+class TestBalanceSheetEquationCloses:
+    """Pre-v1.3.0, ``balance_sheet`` could fail the fundamental
+    accounting identity A = L + E for two unrelated reasons:
+
+    1. ``_ASSET_TYPES`` / ``_LIABILITY_TYPES`` excluded RECEIVABLE
+       and PAYABLE — outstanding invoices issued to customers were
+       invisible in the totals.
+    2. Assets render at market value (factor × quantity for
+       commodities and foreign-currency cash) while equity rolls
+       up at historical-cost split values. The gap between the
+       two views (investment market drift + FX translation
+       adjustment) had no home on the equity side.
+
+    Both fixes land together: A/R / A/P join the right buckets,
+    and a synthetic "Unrealized Gain/Loss" equity line absorbs the
+    remaining mark-to-market gap. After v1.3.0, A = L + E holds by
+    construction on every book.
+    """
+
+    def test_equation_closes_on_simple_usd_book(self, test_book: Path):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Strict equality — no rounding slop.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_equation_closes_on_multi_currency_book(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        # Cross-currency transfer ($1100 USD → €1000 EUR) puts the
+        # current EUR balance at a different USD value than the
+        # historical post-time rate. The synthetic equity line
+        # absorbs that translation adjustment.
+        assert A - L - E == 0, f"A={A} L={L} E={E}, gap={A - L - E}"
+
+    def test_unrealized_line_present_when_book_has_market_drift(
+        self, multi_currency_book: Path,
+    ):
+        from decimal import Decimal
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Lock a EUR price that differs from the historical post-time
+        # rate so unrealized != 0.
+        with gc_book.open(readonly=False) as book:
+            eur = next(c for c in book.commodities if c.mnemonic == "EUR")
+            piecash.Price(
+                commodity=eur,
+                currency=book.default_currency,
+                date=date(2024, 12, 31),
+                value=Decimal("1.20"),  # vs. historical 1.10
+                type="last",
+                source="user:price",
+            )
+            book.save()
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" in eq_names, (
+            f"missing synthetic line on book with FX drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+    def test_unrealized_line_omitted_when_no_drift(
+        self, test_book: Path,
+    ):
+        # Single-currency USD test book with no investments — market
+        # == cost trivially, so the synthetic line should be absent.
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        eq_names = [a["account"] for a in result["equity"]["accounts"]]
+        assert "Unrealized Gain/Loss" not in eq_names, (
+            f"synthetic line present despite no drift: "
+            f"equity accounts = {eq_names}"
+        )
+
+
+class TestBalanceSheetIncludesReceivablePayable:
+    """RECEIVABLE and PAYABLE join the asset / liability buckets in
+    v1.3.0 so balance_sheet reflects outstanding business activity.
+    Pre-fix, every posted invoice was invisible on the balance
+    sheet by the amount of the receivable.
+    """
+
+    def _setup_book_with_invoice(self, tmp_path: Path) -> Path:
+        from decimal import Decimal
+        book_path = tmp_path / "ar.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        ar = piecash.Account(
+            name="Accounts Receivable", type="RECEIVABLE",
+            parent=assets, commodity=usd,
+        )
+        income = piecash.Account(
+            name="Consulting", type="INCOME", parent=root, commodity=usd,
+        )
+        equity_p = piecash.Account(
+            name="Equity", type="EQUITY", parent=root, commodity=usd,
+            placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity_p, commodity=usd,
+        )
+        book.save()
+        # Single posted-invoice transaction: $1500 to A/R, $1500
+        # revenue. Both sides default currency, so nothing exotic.
+        t = piecash.Transaction(
+            currency=usd,
+            description="Posted invoice",
+            post_date=date(2024, 6, 1),
+            splits=[
+                piecash.Split(account=ar, value=Decimal("1500")),
+                piecash.Split(account=income, value=Decimal("-1500")),
+            ],
+        )
+        book.session.add(t)
+        book.save()
+        return book_path
+
+    def test_receivable_appears_in_assets(self, tmp_path: Path):
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        asset_names = [a["account"] for a in result["assets"]["accounts"]]
+        assert any("Receivable" in n for n in asset_names), (
+            f"A/R missing from assets section: {asset_names}"
+        )
+
+    def test_receivable_book_balances(self, tmp_path: Path):
+        from decimal import Decimal
+        path = self._setup_book_with_invoice(tmp_path)
+        gc_book = GnuCashBook(str(path))
+        result = gc_book.balance_sheet(as_of_date=date(2024, 12, 31))
+        A = Decimal(result["assets"]["total"])
+        L = Decimal(result["liabilities"]["total"])
+        E = Decimal(result["equity"]["total"])
+        assert A == Decimal("1500.00")
+        assert A - L - E == 0
+
+
 class TestCrossToolPriceAgreement:
     """Bookkeeper-flagged: ``get_book_summary`` was using stale prices
     (latest <= today) while ``balance_sheet`` used the absolute latest
@@ -7414,6 +8513,240 @@ class TestCrossToolPriceAgreement:
         # Trajectory's "now" anchor should reflect the same rate too:
         # 6700 USD Checking + 1500 USD Euro Savings = 8200.
         assert "now: USD 8,200" in summary
+
+    @staticmethod
+    def _foreign_liability_book(tmp_path: Path) -> Path:
+        """USD-default book with a EUR-denominated credit card.
+
+        Checking holds 1000 USD; the EUR Visa carries a -500 EUR
+        balance; EUR/USD is 1.20. So the card is worth 600 USD and
+        net worth is 1000 - 600 = 400 USD. The raw foreign quantity
+        (500) is the canary: it only surfaces if a tool skips FX
+        conversion on the liability.
+        """
+        import piecash
+        from piecash import factories
+
+        book_path = tmp_path / "foreign_liability.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        root = book.root_account
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        visa_eur = piecash.Account(
+            name="Visa EUR", type="CREDIT", parent=liabilities,
+            commodity=eur,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=equity, commodity=usd,
+        )
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel_eur = piecash.Account(
+            name="Travel", type="EXPENSE", parent=expenses, commodity=eur,
+        )
+        book.save()
+
+        # Checking opening balance: +1000 USD.
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=opening, value=Decimal("-1000")),
+            ],
+        ))
+        # Charge 500 EUR on the card (EUR transaction; value==quantity).
+        book.session.add(piecash.Transaction(
+            currency=eur, description="Hotel in Berlin",
+            post_date=date(2024, 1, 10),
+            splits=[
+                piecash.Split(
+                    account=visa_eur,
+                    value=Decimal("-500"), quantity=Decimal("-500"),
+                ),
+                piecash.Split(
+                    account=travel_eur,
+                    value=Decimal("500"), quantity=Decimal("500"),
+                ),
+            ],
+        ))
+        # EUR/USD = 1.20 (past-dated so every "now" tool picks it).
+        book.session.add(piecash.Price(
+            commodity=eur, currency=usd, date=date(2024, 2, 1),
+            value="1.20", source="user:test", type="nav",
+        ))
+        book.save()
+        return book_path
+
+    def test_summary_and_reports_agree_on_foreign_liability(
+        self, tmp_path: Path,
+    ):
+        """H1 regression: ``get_book_summary`` must FX-convert
+        foreign-currency liabilities, matching ``balance_sheet`` and
+        ``net_worth``. Pre-fix the dashboard summed raw account-
+        commodity quantity for CREDIT/LIABILITY while the report tools
+        converted — so a EUR credit card diverged by the FX delta on
+        the surface the LLM calls first.
+        """
+        from datetime import date as date_cls
+
+        gc_book = GnuCashBook(str(self._foreign_liability_book(tmp_path)))
+        today = date_cls.today()
+
+        # balance_sheet converts the card: 500 EUR × 1.20 = 600 USD.
+        bs = gc_book.balance_sheet(as_of_date=today)
+        card_row = next(
+            a for a in bs["liabilities"]["accounts"]
+            if a["account"] == "Liabilities:Visa EUR"
+        )
+        assert Decimal(card_row["default_currency_value"]) == Decimal("600.00")
+
+        # net_worth point-in-time: 1000 - 600 = 400 USD. (Book-layer
+        # methods take date objects; the MCP wrapper parses ISO strings.)
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("400.00")
+
+        # The dashboard must agree on BOTH arms:
+        summary = gc_book.get_book_summary()
+        # (a) _collect_summary_balance_sheet: the rendered card value is
+        #     the converted 600.00, NOT the raw 500.
+        assert "Credit cards (1): USD 600.00" in summary, (
+            f"dashboard did not FX-convert the EUR credit card; "
+            f"saw:\n{summary}"
+        )
+        assert "USD 500.00" not in summary  # canary: raw EUR quantity
+        # (b) _compute_net_worth_at trajectory "now" anchor: 400.
+        assert "now: USD 400" in summary, (
+            f"trajectory 'now' net worth did not convert the EUR "
+            f"liability; saw:\n{summary}"
+        )
+
+    @staticmethod
+    def _checking_1000_book(tmp_path: Path) -> Path:
+        """USD book with a single 1000 USD Checking balance."""
+        import piecash
+
+        book_path = tmp_path / "own_splits.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Opening", type="EQUITY", parent=root, commodity=usd,
+        )
+        book.save()
+        book.session.add(piecash.Transaction(
+            currency=usd, description="Opening",
+            post_date=date(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("1000")),
+                piecash.Split(account=equity, value=Decimal("-1000")),
+            ],
+        ))
+        book.save()
+        return book_path
+
+    def _assert_all_surfaces_report_1000(self, gc_book) -> None:
+        """All three net-worth surfaces must count Checking's own
+        splits: balance_sheet, net_worth, and the dashboard's
+        trajectory "now" anchor (``_compute_net_worth_at``) plus its
+        per-account display (``_collect_summary_balance_sheet``)."""
+        from datetime import date as date_cls
+
+        today = date_cls.today()
+        bs = gc_book.balance_sheet(as_of_date=today)
+        assert Decimal(bs["assets"]["total"]) == Decimal("1000.00")
+        assert any(
+            a["account"] == "Assets:Checking"
+            for a in bs["assets"]["accounts"]
+        ), "Checking's own splits dropped from balance_sheet"
+
+        nw = gc_book.net_worth(end_date=today)
+        assert Decimal(nw["net_worth"]) == Decimal("1000.00")
+
+        summary = gc_book.get_book_summary()
+        assert "now: USD 1,000" in summary, (
+            f"trajectory 'now' dropped Checking's own splits; "
+            f"saw:\n{summary}"
+        )
+        assert "Checking: USD 1000.00" in summary, (
+            f"dashboard assets section dropped Checking; saw:\n{summary}"
+        )
+
+    def test_parent_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): an account's own splits
+        must count even after it gains a child. Pre-fix, creating one
+        EMPTY sub-account under Checking silently dropped Checking's
+        entire balance from the dashboard's net-worth anchor (leaf-only
+        iteration) while balance_sheet / net_worth kept it — three
+        surfaces, three scopes.
+        """
+        import piecash
+
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            piecash.Account(
+                name="Sub", type="BANK", parent=checking,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
+
+    def test_placeholder_with_direct_splits_counted_everywhere(
+        self, tmp_path: Path,
+    ):
+        """C1 regression (adversarial pass 2): a placeholder's direct
+        splits are real money — rare but legal. Pre-fix, marking
+        Checking a placeholder deleted its balance from balance_sheet
+        (where the unrealized residual silently re-balanced the sheet)
+        and from the dashboard anchor, while net_worth kept it.
+        """
+        book_path = self._checking_1000_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as b:
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            checking.placeholder = 1
+            b.save()
+
+        self._assert_all_surfaces_report_1000(gc_book)
 
 
 class TestNonUsdDefaultCurrency:
@@ -7740,6 +9073,92 @@ class TestCashFlow:
                 end_date=date(2024, 12, 31),
                 account="Nonexistent:Account",
             )
+
+
+class TestCashFlowInternalTransferFilter:
+    """SB-5: cash_flow's default report filters out internal
+    transfers — transactions with no INCOME or EXPENSE leg.
+
+    The multi_currency fixture is ideal: t1 (opening balance,
+    equity-side) and t3 (cross-currency wallet shuffle) are both
+    pure rearrangements; t2 (salary, INCOME leg) and t4 (groceries,
+    EXPENSE leg) are real cash flow events. Default = only t2 and
+    t4 counted; ``include_transfers=True`` = all four counted.
+    """
+
+    def test_default_filters_internal_transfers(
+        self, multi_currency_book: Path,
+    ):
+        """Default report excludes equity-side opening balance and
+        the cross-currency wallet shuffle. Inflows = salary only;
+        outflows = groceries only.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+        )
+        # Salary inflow only (t2): 3000. Opening (t1, equity) and
+        # cross-currency transfer (t3) filtered.
+        assert Decimal(result["inflows"]) == Decimal("3000")
+        # Groceries outflow only (t4): 200.
+        assert Decimal(result["outflows"]) == Decimal("200")
+        # Two transactions were filtered as transfers (t1 + t3).
+        assert result["transfers_excluded"] == 2
+
+    def test_include_transfers_restores_gross(
+        self, multi_currency_book: Path,
+    ):
+        """With ``include_transfers=True`` the totals match the
+        pre-SB-5 behavior — useful for bank statement reconciliation
+        where every debit/credit matters regardless of category.
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            include_transfers=True,
+        )
+        assert Decimal(result["inflows"]) == Decimal("9100")
+        assert Decimal(result["outflows"]) == Decimal("1300")
+        # No transfers filtered → field omitted.
+        assert "transfers_excluded" not in result
+
+    def test_transfers_excluded_omitted_when_zero(
+        self, test_book: Path,
+    ):
+        """The ``transfers_excluded`` field only appears when at
+        least one transaction was filtered. Keeps the response
+        compact when there's nothing to surface.
+        """
+        gc_book = GnuCashBook(str(test_book))
+        # Empty range — no transactions touched, nothing filtered.
+        result = gc_book.cash_flow(
+            start_date=date(2030, 1, 1),
+            end_date=date(2030, 1, 31),
+        )
+        assert "transfers_excluded" not in result
+
+    def test_account_filter_with_transfer_filter(
+        self, multi_currency_book: Path,
+    ):
+        """When ``account`` is specified, transfer filtering still
+        applies. Running on Checking alone with the default: the
+        salary deposit counts (INCOME leg present), but the cross-
+        currency outflow to EUR Savings does not (no INCOME/EXPENSE
+        leg on that transaction).
+        """
+        gc_book = GnuCashBook(str(multi_currency_book))
+        result = gc_book.cash_flow(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            account="Assets:Checking",
+        )
+        # Salary +3000 = inflow. Groceries -200 = outflow.
+        # Opening +5000 and cross-currency -1100 both filtered.
+        assert Decimal(result["inflows"]) == Decimal("3000")
+        assert Decimal(result["outflows"]) == Decimal("200")
+        assert result["transfers_excluded"] == 2
 
 
 class TestListCommodities:
@@ -8083,11 +9502,16 @@ class TestMultiCurrencyBalances:
         """Cash flow aggregates USD-equivalent amounts across cash
         and bank accounts (using cost basis as fallback when no
         market rate is on file).
+
+        Asserts the gross numbers via ``include_transfers=True`` so
+        the test exercises the FX-conversion path without being
+        coupled to the default transfer-filter (SB-5).
         """
         gc_book = GnuCashBook(str(multi_currency_book))
         result = gc_book.cash_flow(
             start_date=date(2024, 1, 1),
             end_date=date(2024, 12, 31),
+            include_transfers=True,
         )
         inflows = Decimal(result["inflows"])
         outflows = Decimal(result["outflows"])
@@ -8120,6 +9544,376 @@ class TestMultiCurrencyBalances:
         assert result["total"] == "3000"
         assert len(result["sources"]) == 1
         assert result["sources"][0]["account"] == "Income:Salary"
+
+    def test_spending_by_category_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Bookkeeper-found bug (v1.3 blocker): EUR-denominated
+        expense splits used to be summed as raw EUR alongside USD
+        — silent wrong totals on multi-currency books. With the
+        ``_split_in_default_currency`` conversion in place, the
+        EUR amount converts at the book's EUR/USD price."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR-denominated expense account and one EUR
+        # expense transaction, plus a EUR/USD price the converter
+        # can use.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            expenses = next(
+                a for a in bk.accounts
+                if a.fullname == "Expenses"
+            )
+            travel_eur = piecash.Account(
+                name="Travel EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add(travel_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin trip — €100",
+                post_date=date(2024, 6, 15),
+                splits=[
+                    piecash.Split(
+                        account=travel_eur,
+                        value="100", quantity="100",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="-100", quantity="-110",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD groceries: $200. New EUR travel: €100 ×
+        # 1.10 = $110. Total in default currency: $310.
+        result = gc_book.spending_by_category(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("310")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["categories"]
+        }
+        assert amounts["Expenses:Groceries"] == Decimal("200")
+        assert amounts["Expenses:Travel EUR"] == Decimal("110")
+
+    def test_income_by_source_converts_foreign_currency(
+        self, multi_currency_book: Path,
+    ):
+        """Mirror of the spending fix on the income side."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        with gc_book.open(readonly=False) as bk:
+            eur = next(
+                c for c in bk.commodities if c.mnemonic == "EUR"
+            )
+            usd = bk.default_currency
+            income = next(
+                a for a in bk.accounts
+                if a.fullname == "Income"
+            )
+            consulting_eur = piecash.Account(
+                name="Consulting EUR", type="INCOME",
+                parent=income, commodity=eur,
+            )
+            bk.session.add(consulting_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            checking = next(
+                a for a in bk.accounts
+                if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin client — €500",
+                post_date=date(2024, 7, 1),
+                splits=[
+                    piecash.Split(
+                        account=consulting_eur,
+                        value="-500", quantity="-500",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="500", quantity="550",
+                    ),
+                ],
+            ))
+            bk.save()
+        # Existing USD salary: $3000. New EUR consulting: €500 ×
+        # 1.10 = $550. Total in default currency: $3550.
+        result = gc_book.income_by_source(
+            compact=False,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 12, 31),
+            depth=2,
+        )
+        assert Decimal(result["total"]) == Decimal("3550")
+        amounts = {
+            r["account"]: Decimal(r["amount"])
+            for r in result["sources"]
+        }
+        assert amounts["Income:Salary"] == Decimal("3000")
+        assert amounts["Income:Consulting EUR"] == Decimal("550")
+
+
+class TestMultiCurrencyDashboardHelpers:
+    """v1.3.0 follow-up to the spending/income FX-conversion fix:
+    three dashboard helpers (``_monthly_net_income``,
+    ``_daily_expense_burn``, ``_budget_headline``) and one report
+    (``vendor_spending_report``) were summing ``split.value`` /
+    ``split.quantity`` raw across currencies. Same class of bug —
+    silently wrong on any book with foreign-currency activity.
+
+    The helpers feed get_book_summary's monthly-net section, runway
+    calculation, and budget headline; vendor_spending_report is a
+    standalone tool the bookkeeper uses. After v1.3.0 each routes
+    through ``_split_in_default_currency`` / latest-rate conversion
+    so foreign-currency activity contributes the default-currency-
+    equivalent amount, not raw foreign-currency quantities.
+    """
+
+    def _add_eur_consulting_income(
+        self,
+        book_path: Path,
+        amount_eur: str,
+        on_date: date,
+        rate: str = "1.10",
+    ) -> None:
+        """Seed a EUR income transaction + EUR/USD rate."""
+        import piecash
+        gc_book = GnuCashBook(str(book_path))
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            income = next(a for a in bk.accounts if a.fullname == "Income")
+            consulting_eur = next(
+                (a for a in bk.accounts if a.fullname == "Income:Consulting EUR"),
+                None,
+            )
+            if consulting_eur is None:
+                consulting_eur = piecash.Account(
+                    name="Consulting EUR", type="INCOME",
+                    parent=income, commodity=eur,
+                )
+                bk.session.add(consulting_eur)
+            ar_eur = next(
+                (a for a in bk.accounts if a.fullname == "Assets:A/R EUR"),
+                None,
+            )
+            if ar_eur is None:
+                assets = next(a for a in bk.accounts if a.fullname == "Assets")
+                ar_eur = piecash.Account(
+                    name="A/R EUR", type="ASSET",
+                    parent=assets, commodity=eur,
+                )
+                bk.session.add(ar_eur)
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=on_date, value=rate, type="last",
+            ))
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description=f"EUR consulting €{amount_eur}",
+                post_date=on_date,
+                splits=[
+                    piecash.Split(
+                        account=consulting_eur,
+                        value=f"-{amount_eur}", quantity=f"-{amount_eur}",
+                    ),
+                    piecash.Split(
+                        account=ar_eur,
+                        value=amount_eur, quantity=amount_eur,
+                    ),
+                ],
+            ))
+            bk.save()
+
+    def test_monthly_net_converts_foreign_currency_income(
+        self, multi_currency_book: Path,
+    ):
+        """Pre-fix, a EUR income split for €1,000 contributed
+        Decimal('1000') to that month's net — mixing units. Post-
+        fix, it contributes €1,000 × EUR/USD rate."""
+        today = date.today()
+        first_of_month = date(today.year, today.month, 1)
+        # Seed €1,000 of EUR consulting income this month.
+        self._add_eur_consulting_income(
+            multi_currency_book,
+            amount_eur="1000",
+            on_date=first_of_month,
+            rate="1.20",
+        )
+        gc_book = GnuCashBook(str(multi_currency_book))
+        summary = gc_book.get_book_summary()
+        # Find the current-month "(MTD)" line and parse the net.
+        mtd_line = next(
+            (l for l in summary.split("\n") if "(MTD)" in l),
+            None,
+        )
+        assert mtd_line is not None, (
+            f"no MTD line in summary:\n{summary}"
+        )
+        # Net = EUR income €1,000 × 1.20 = $1,200 (in USD).
+        # Pre-fix this would have rendered as +1,000 (raw EUR).
+        assert "+1,200" in mtd_line, (
+            f"expected +1,200 in MTD line, got: {mtd_line!r}"
+        )
+
+    def test_daily_expense_burn_converts_foreign_currency_expense(
+        self, multi_currency_book: Path,
+    ):
+        """Runway's daily-burn divisor must reflect foreign-currency
+        expenses at their USD value, not raw foreign quantity."""
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        today = date.today()
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
+            travel_eur = piecash.Account(
+                name="Travel EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add(travel_eur)
+            checking = next(
+                a for a in bk.accounts if a.fullname == "Assets:Checking"
+            )
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=today, value="1.50", type="last",
+            ))
+            # €200 expense today.
+            bk.session.add(piecash.Transaction(
+                currency=eur,
+                description="Berlin trip",
+                post_date=today,
+                splits=[
+                    piecash.Split(
+                        account=travel_eur,
+                        value="200", quantity="200",
+                    ),
+                    piecash.Split(
+                        account=checking,
+                        value="-200", quantity="-300",
+                    ),
+                ],
+            ))
+            bk.save()
+            # _daily_expense_burn is an instance method requiring a
+            # book session — call it within an open block.
+            transactions = list(bk.transactions)
+            from datetime import timedelta
+            burn = gc_book._daily_expense_burn(
+                bk, transactions, days=30,
+            )
+            # €200 × 1.50 = $300 of expense in default currency.
+            # Without conversion it'd have been raw 200. Allow
+            # other USD expenses in the fixture to contribute too;
+            # what matters is the EUR side converts.
+            from decimal import Decimal as Dec
+            assert burn >= Dec("300") / Dec("30"), (
+                f"burn too low — EUR expense not converted: {burn}"
+            )
+
+    def test_vendor_spending_converts_foreign_currency_bills(
+        self, multi_currency_book: Path,
+    ):
+        """Each bill's grand_total is in the BILL's currency. Pre-
+        fix, EUR bills and USD bills were summed raw alongside USD
+        bills, producing meaningless grand totals. Post-fix, each
+        bill's total converts to default currency at the latest
+        market rate before summing.
+
+        Copilot PR #92 review caught that the original version of
+        this test used ``inspect.getsource`` to look for the
+        helper references — brittle against renames/refactors,
+        and didn't catch regressions where the function still
+        contained the string but applied conversion incorrectly.
+        Replaced with an end-to-end test that posts a EUR vendor
+        bill, runs the report, and asserts on the USD-converted
+        grand totals.
+        """
+        import piecash
+        gc_book = GnuCashBook(str(multi_currency_book))
+        # Build a EUR vendor, an A/P account, a EUR-denominated
+        # posted bill, and a EUR/USD price. After posting we run
+        # vendor_spending_report and assert the totals come back
+        # in USD (the book default), not raw EUR.
+        with gc_book.open(readonly=False) as bk:
+            eur = next(c for c in bk.commodities if c.mnemonic == "EUR")
+            usd = bk.default_currency
+            assets = next(a for a in bk.accounts if a.fullname == "Assets")
+            liabilities = piecash.Account(
+                name="Liabilities", type="LIABILITY", parent=bk.root_account,
+                commodity=usd, placeholder=True,
+            )
+            ap = piecash.Account(
+                name="Accounts Payable", type="PAYABLE",
+                parent=liabilities, commodity=usd,
+            )
+            expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
+            office_eur = piecash.Account(
+                name="Office Supplies EUR", type="EXPENSE",
+                parent=expenses, commodity=eur,
+            )
+            bk.session.add_all([liabilities, ap, office_eur])
+            bk.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2024, 6, 1),
+                value="1.10", type="last",
+            ))
+            bk.save()
+        # Create the vendor + EUR bill via the public API.
+        gc_book.create_vendor(name="Berlin Supplies", currency="EUR")
+        gc_book.create_bill(vendor_id="000001", currency="EUR")
+        gc_book.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies EUR",
+            description="EUR supplies",
+            quantity="1", price="500.00",
+        )
+        gc_book.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+            # Pin to the rate date — this test checks report-time
+            # currency conversion, not FX freshness at posting.
+            post_date="2024-06-01",
+        )
+        # Run the report; verify totals come back as USD-converted.
+        result = gc_book.vendor_spending_report(
+            start_date="2024-01-01", end_date="2024-12-31",
+            compact=False,
+        )
+        # €500 × 1.10 = $550. Pre-fix the report would have summed
+        # 500 raw — wrong unit.
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("550.00")
+        assert Decimal(result["totals"]["outstanding"]) == Decimal("550.00")
+        # Per-vendor row also in USD.
+        berlin = next(
+            v for v in result["vendors"] if v["vendor_name"] == "Berlin Supplies"
+        )
+        assert Decimal(berlin["total_billed"]) == Decimal("550.00")
 
 
 class TestCreateCommodity:
@@ -9076,3 +10870,230 @@ class TestShortGuidRoundTripClosure:
         # downstream resolver path that powers all write tools.
         baseline = gc_book.get_balance(short_acct)
         assert baseline is not None
+
+
+class TestIssue94IntermediateCurrencyChain:
+    """balance_sheet (and every report via ``_rates_as_of``) must value
+    a commodity reachable only through an intermediate currency —
+    issue #94. Covers the whole class:
+
+      A. security → foreign ccy → default       (fund priced USD)
+      B. foreign ccy → pivot → default          (GBP via USD)
+      C. security → foreign ccy → pivot → default (fund priced GBP)
+
+    plus a direct-priced control and an unreachable control, and the
+    ``type='transaction'`` trap (the cross-currency GBP funding stamps
+    a non-market GBP/AED rate of 5.0 that the chain must ignore in
+    favour of the GBP→USD→AED market legs = 4.664075).
+    """
+
+    def _build(self, tmp_path) -> GnuCashBook:
+        from datetime import date as d
+        path = tmp_path / "issue94.gnucash"
+        book = piecash.create_book(
+            str(path), currency="AED", overwrite=True,
+        )
+        root = book.root_account
+        aed = book.default_currency
+
+        def ccy(m, n):
+            c = piecash.Commodity(
+                namespace="CURRENCY", mnemonic=m, fullname=n, fraction=100,
+            )
+            book.session.add(c)
+            return c
+
+        usd, gbp, jpy = ccy("USD", "US Dollar"), ccy("GBP", "Pound"), ccy("JPY", "Yen")
+
+        def fund(m, n):
+            c = piecash.Commodity(
+                namespace="FUND", mnemonic=m, fullname=n, fraction=10000,
+            )
+            book.session.add(c)
+            return c
+
+        gfund = fund("GLOBALFUND", "Global")   # A: priced USD
+        ufund = fund("UKFUND", "UK")           # C: priced GBP
+        lfund = fund("LOCALFUND", "Local")     # D: priced AED (direct)
+        ofund = fund("ORPHANFUND", "Orphan")   # E: priced JPY (unreachable)
+
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=aed, placeholder=True,
+        )
+        checking = piecash.Account(
+            name="Checking", type="BANK", parent=assets, commodity=aed,
+        )
+        gbpcash = piecash.Account(
+            name="GBP Cash", type="BANK", parent=assets, commodity=gbp,
+        )
+        hg = piecash.Account(
+            name="Global Holding", type="STOCK", parent=assets, commodity=gfund,
+        )
+        hu = piecash.Account(
+            name="UK Holding", type="STOCK", parent=assets, commodity=ufund,
+        )
+        hl = piecash.Account(
+            name="Local Holding", type="STOCK", parent=assets, commodity=lfund,
+        )
+        ho = piecash.Account(
+            name="Orphan Holding", type="STOCK", parent=assets, commodity=ofund,
+        )
+        eq = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=aed, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening", type="EQUITY", parent=eq, commodity=aed,
+        )
+        book.session.add_all(
+            [assets, checking, gbpcash, hg, hu, hl, ho, eq, opening]
+        )
+        book.save()
+
+        book.session.add(piecash.Transaction(
+            currency=aed, description="open", post_date=d(2024, 1, 1),
+            splits=[
+                piecash.Split(account=checking, value=Decimal("100000")),
+                piecash.Split(account=opening, value=Decimal("-100000")),
+            ],
+        ))
+        book.save()
+
+        def buy(holding, shares, cost):
+            book.session.add(piecash.Transaction(
+                currency=aed, description="buy", post_date=d(2024, 3, 1),
+                splits=[
+                    piecash.Split(
+                        account=checking,
+                        value=Decimal(str(-cost)), quantity=Decimal(str(-cost)),
+                    ),
+                    piecash.Split(
+                        account=holding,
+                        value=Decimal(str(cost)), quantity=Decimal(str(shares)),
+                    ),
+                ],
+            ))
+
+        buy(hg, 100, 5500)
+        buy(hu, 90, 8000)
+        buy(hl, 50, 2500)
+        buy(ho, 10, 1000)
+        book.save()
+
+        # GBP funded cross-currency at an effective 5.0 AED/GBP →
+        # piecash stamps a type='transaction' GBP/AED price of 5.0.
+        book.session.add(piecash.Transaction(
+            currency=aed, description="gbp", post_date=d(2024, 3, 1),
+            splits=[
+                piecash.Split(
+                    account=checking,
+                    value=Decimal("-4000"), quantity=Decimal("-4000"),
+                ),
+                piecash.Split(
+                    account=gbpcash,
+                    value=Decimal("4000"), quantity=Decimal("800"),
+                ),
+            ],
+        ))
+        book.save()
+
+        def price(c, cur, v):
+            book.session.add(piecash.Price(
+                commodity=c, currency=cur, date=d(2024, 6, 1),
+                value=v, type="last",
+            ))
+
+        price(usd, aed, "3.6725")    # pivot leg
+        price(gbp, usd, "1.27")      # triangulation leg
+        price(gfund, usd, "15")      # A
+        price(ufund, gbp, "20")      # C
+        price(lfund, aed, "50")      # D direct
+        price(ofund, jpy, "1000")    # E unreachable
+        book.save()
+        book.close()
+        return GnuCashBook(str(path))
+
+    def _holdings(self, gb: GnuCashBook) -> dict:
+        bs = gb.balance_sheet(date(2024, 6, 30))
+        return {
+            a["account"].split(":")[-1]: a
+            for a in bs["assets"]["accounts"]
+        }
+
+    def test_case_a_security_via_pivot(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Global Holding"]
+        assert h["default_currency_value"] == "5508.75"  # 100×15×3.6725
+        assert "no price data" not in h["balance"]
+        # Provenance: derived through USD, flagged for the reader.
+        assert "via USD" in h["balance"]
+
+    def test_case_b_triangulation_ignores_transaction_price(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["GBP Cash"]
+        # 800 × 1.27 × 3.6725 = 3731.26 — NOT 4000 (the 5.0 txn rate).
+        assert h["default_currency_value"] == "3731.26"
+        assert "via USD" in h["balance"]
+
+    def test_case_c_three_hop(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["UK Holding"]
+        assert h["default_currency_value"] == "8395.34"  # 90×20×1.27×3.6725
+        # 3-hop provenance names both legs.
+        assert "via GBP→USD" in h["balance"]
+
+    def test_direct_priced_control_unchanged(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Local Holding"]
+        assert h["default_currency_value"] == "2500.00"  # 50×50 direct
+        # Direct rate — no provenance annotation.
+        assert "via" not in h["balance"]
+
+    def test_unreachable_falls_back_to_cost_basis(self, tmp_path):
+        h = self._holdings(self._build(tmp_path))["Orphan Holding"]
+        assert h["default_currency_value"] == "1000.00"
+        assert "no price data" in h["balance"]
+
+    def test_cross_rate_direct_and_triangulated(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            usd = next(c for c in bk.commodities if c.mnemonic == "USD")
+            gbp = next(c for c in bk.commodities if c.mnemonic == "GBP")
+            jpy = next(c for c in bk.commodities if c.mnemonic == "JPY")
+            as_of = date(2024, 6, 30)
+            assert gb._cross_rate(bk, usd, aed, as_of) == Decimal("3.6725")
+            assert gb._cross_rate(bk, gbp, aed, as_of) == (
+                Decimal("1.27") * Decimal("3.6725")
+            )
+            # JPY has no leg to AED → no cross rate.
+            assert gb._cross_rate(bk, jpy, aed, as_of) is None
+
+    def test_market_rate_none_for_unreachable(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            ofund = next(
+                c for c in bk.commodities if c.mnemonic == "ORPHANFUND"
+            )
+            assert gb._market_rate_to_default(
+                bk, ofund, aed, date(2024, 6, 30),
+            ) is None
+
+    def test_format_via(self, tmp_path):
+        gb = self._build(tmp_path)
+        assert gb._format_via([]) is None              # direct → no note
+        assert gb._format_via(["USD"]) == "via USD"
+        assert gb._format_via(["GBP", "USD"]) == "via GBP→USD"
+
+    def test_rate_provenance_map(self, tmp_path):
+        gb = self._build(tmp_path)
+        with gb.open(readonly=True) as bk:
+            aed = bk.default_currency
+            prov = gb._rate_provenance(bk, date(2024, 6, 30), aed)
+            by_mnem = {
+                c.mnemonic: prov.get(c.guid)
+                for c in bk.commodities
+            }
+            assert by_mnem["GLOBALFUND"] == "via USD"      # A
+            assert by_mnem["GBP"] == "via USD"             # B
+            assert by_mnem["UKFUND"] == "via GBP→USD"      # C
+            assert by_mnem["LOCALFUND"] is None            # D direct
+            assert by_mnem["ORPHANFUND"] is None           # E unreachable

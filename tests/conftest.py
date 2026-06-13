@@ -1,10 +1,12 @@
 """Pytest fixtures for gnucash-mcp tests."""
 
+import typing
+
 import pytest
 import piecash
 from piecash import factories
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 
@@ -1002,3 +1004,296 @@ def debt_book(tmp_path: Path) -> Path:
     book.close()
 
     return book_path
+
+
+class PathologicalBook(typing.NamedTuple):
+    """Handle returned by the ``pathological_book`` fixture.
+
+    Bundles the book path with the GUIDs tests need to assert that
+    specific pathological rows never resurface in report output.
+    """
+
+    path: Path
+    voided_txn_guid: str
+    template_txn_guid: str
+    usd_invoice_id: str
+    eur_invoice_id: str
+
+
+@pytest.fixture
+def pathological_book(tmp_path: Path) -> PathologicalBook:
+    """A book of legal-but-unexercised shapes the synthetic sample
+    books structurally cannot produce.
+
+    The final adversarial review of v1.3.1 observed that every
+    confirmed defect lived in a shape neither Alex's nor Lin Wei's
+    book contains — the bookkeeper loop and the sample corpus can't
+    reach them. This fixture packs all of those shapes into one
+    small USD book so the report surfaces can be regression-tested
+    against the combination:
+
+    1. **Parent with direct splits** — Assets:Checking holds real
+       money AND has a child (``Sub``). Leaf-only iteration drops
+       its balance (review C1).
+    2. **Placeholder with direct splits** — Assets:Savings is
+       ``placeholder=1`` with a direct 500 split (raw piecash; the
+       wrapper refuses placeholder targets by design). Placeholder
+       skips delete real money (C1).
+    3. **Properly voided transaction** — a 150.00 grocery run,
+       voided via the API. Zombie splits must stay out of every
+       aggregate.
+    4. **Overpaid invoice lot** — 500.00 invoice, 400 paid via
+       ``pay_invoice``, then a manual −300 payment split assigned
+       to the lot (the guard added for C2 blocks overpaying through
+       the API, but legacy/desktop data can carry negative lots).
+    5. **Foreign-denominated A/R** — EUR receivable account in a
+       USD book, EUR 1,000 invoice posted at 1.10 (C10 territory).
+    6. **Desktop-created SX template** — a real Transaction whose
+       splits post to an account under ``book.root_template``,
+       exactly as the GnuCash desktop UI persists scheduled-
+       transaction recipes. Our MCP uses a splits-json slot
+       instead, so server-built books never contain these rows
+       (C9).
+
+    Whole-dollar amounts keep cross-surface expectations exact:
+
+    - Checking 10,000 − 500 + 400 + 300 = 10,200.00
+    - Savings (placeholder) 500.00
+    - A/R USD 500 − 400 − 300 = −200.00 (overpaid)
+    - A/R EUR 1,000 × 1.10 = 1,100.00
+    - **Assets total 11,600.00**, liabilities 0, net worth
+      11,600.00, retained earnings 1,600.00.
+    """
+    from gnucash_mcp.book import GnuCashBook
+
+    book_path = tmp_path / "pathological.gnucash"
+    book = piecash.create_book(
+        str(book_path), currency="USD", overwrite=True,
+    )
+    usd = book.default_currency
+    root = book.root_account
+
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    # Shape 1: Checking is a PARENT — it has both direct splits
+    # (below) and this child.
+    piecash.Account(
+        name="Sub", type="BANK", parent=checking, commodity=usd,
+    )
+    # Shape 2: will carry a direct split, then get flipped to
+    # placeholder below — piecash refuses new splits against an
+    # account that is ALREADY a placeholder, so the shape can only
+    # arise in this order (which is also how it arises in the wild:
+    # desktop GnuCash lets you mark any account placeholder later).
+    savings = piecash.Account(
+        name="Savings", type="BANK", parent=assets, commodity=usd,
+    )
+    piecash.Account(
+        name="Accounts Receivable", type="RECEIVABLE",
+        parent=assets, commodity=usd,
+    )
+    eur = factories.create_currency_from_ISO("EUR")
+    book.session.add(eur)
+    # Shape 5: receivable denominated in a foreign currency.
+    piecash.Account(
+        name="Accounts Receivable EUR", type="RECEIVABLE",
+        parent=assets, commodity=eur,
+    )
+    income = piecash.Account(
+        name="Income", type="INCOME", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    piecash.Account(
+        name="Sales", type="INCOME", parent=income, commodity=usd,
+    )
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    piecash.Account(
+        name="Groceries", type="EXPENSE", parent=expenses,
+        commodity=usd,
+    )
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root,
+        commodity=usd, placeholder=True,
+    )
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity,
+        commodity=usd,
+    )
+    book.session.add(piecash.Price(
+        commodity=eur, currency=usd, date=date(2026, 3, 10),
+        value="1.10", source="user:test", type="nav",
+    ))
+    book.save()
+
+    book.session.add(piecash.Transaction(
+        currency=usd, description="Opening balance",
+        post_date=date(2026, 1, 5),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("10000")),
+            piecash.Split(account=opening, value=Decimal("-10000")),
+        ],
+    ))
+    # Direct split on the placeholder (wrapper validation refuses
+    # placeholder targets, so this only arises from desktop GnuCash
+    # or legacy data — built raw here on purpose).
+    book.session.add(piecash.Transaction(
+        currency=usd, description="Transfer to savings",
+        post_date=date(2026, 1, 15),
+        splits=[
+            piecash.Split(account=savings, value=Decimal("500")),
+            piecash.Split(account=checking, value=Decimal("-500")),
+        ],
+    ))
+    # Shape 6: desktop-style SX template — real Transaction rows
+    # against an account under root_template (see
+    # ``_seed_template_transaction`` in test_book.py for the
+    # original recipe). Dated 2020 so an unfiltered surface that
+    # counts it visibly stretches the book's first-activity date.
+    template_acct = piecash.Account(
+        name="Mortgage Template", type="BANK",
+        parent=book.root_template, commodity=usd,
+    )
+    book.session.add(template_acct)
+    # Desktop GnuCash also creates a ``template`` pseudo-commodity
+    # and denominates template accounts in it. A second template
+    # account holds it here so the commodity surfaces
+    # (list_commodities, the dashboard Commodities line, stale-price
+    # warnings) can be probed for the leak.
+    template_commodity = piecash.Commodity(
+        namespace="template", mnemonic="template",
+        fullname="template", fraction=1,
+    )
+    book.session.add(template_commodity)
+    piecash.Account(
+        name="Recipe Holder", type="BANK",
+        parent=book.root_template, commodity=template_commodity,
+    )
+    book.flush()
+    template_txn = piecash.Transaction(
+        currency=usd, description="Mortgage Payment",
+        post_date=date(2020, 1, 1),
+        splits=[
+            piecash.Split(account=template_acct, value=Decimal("2485")),
+            piecash.Split(account=template_acct, value=Decimal("-2485")),
+        ],
+    )
+    book.session.add(template_txn)
+    book.save()
+    # Now that Savings carries a real split, freeze it (shape 2).
+    savings.placeholder = 1
+    book.save()
+    template_txn_guid = template_txn.guid
+    book.close()
+
+    gb = GnuCashBook(str(book_path))
+
+    # Shape 3: voided transaction. Created and voided through the
+    # API so the slot bookkeeping matches what the server produces.
+    created = gb.create_transaction(
+        description="Groceries run",
+        splits=[
+            {"account": "Expenses:Groceries", "amount": "150.00"},
+            {"account": "Assets:Checking", "amount": "-150.00"},
+        ],
+        trans_date=date(2026, 2, 1),
+        check_duplicates=False,
+    )
+    voided_txn_guid = created["guid"]
+    gb.void_transaction(guid=voided_txn_guid, reason="entered twice")
+
+    # Shape 4: overpaid invoice lot.
+    gb.create_customer(name="Acme Corp")
+    usd_invoice = gb.create_invoice(
+        customer_id="000001", date_opened="2026-03-01",
+    )
+    usd_invoice_id = usd_invoice["id"]
+    gb.add_invoice_entry(
+        invoice_id=usd_invoice_id,
+        account="Income:Sales",
+        description="Consulting",
+        quantity="1", price="500.00",
+    )
+    gb.post_invoice(
+        invoice_id=usd_invoice_id,
+        post_account="Assets:Accounts Receivable",
+        post_date="2026-03-01",
+    )
+    gb.pay_invoice(
+        invoice_id=usd_invoice_id,
+        payment_account="Assets:Checking",
+        amount="400", payment_date="2026-04-01",
+    )
+    # Drive the lot negative the only way still possible — a manual
+    # payment transaction assigned to the lot from outside
+    # ``pay_invoice`` (its overpayment guard can't see this one).
+    with gb.open(readonly=False) as b:
+        ar = next(
+            a for a in b.accounts
+            if a.fullname == "Assets:Accounts Receivable"
+        )
+        chk = next(
+            a for a in b.accounts if a.fullname == "Assets:Checking"
+        )
+        lot_obj = ar.lots[0]
+        ar_split = piecash.Split(account=ar, value=Decimal("-300"))
+        piecash.Transaction(
+            currency=b.default_currency,
+            description="Manual overpayment",
+            post_date=date(2026, 5, 1),
+            splits=[
+                ar_split,
+                piecash.Split(account=chk, value=Decimal("300")),
+            ],
+        )
+        ar_split.lot = lot_obj
+        b.save()
+
+    # Shape 5 (continued): EUR invoice posted to the EUR receivable.
+    gb.create_customer(name="Berlin Digital", currency="EUR")
+    eur_invoice = gb.create_invoice(
+        customer_id="000002", currency="EUR",
+        date_opened="2026-03-10",
+    )
+    eur_invoice_id = eur_invoice["id"]
+    gb.add_invoice_entry(
+        invoice_id=eur_invoice_id,
+        account="Income:Sales",
+        description="EUR consulting",
+        quantity="1", price="1000.00",
+    )
+    gb.post_invoice(
+        invoice_id=eur_invoice_id,
+        post_account="Assets:Accounts Receivable EUR",
+        post_date="2026-03-10",
+    )
+
+    # Shape 7 (C5): a future-dated transaction — entered ahead of
+    # time, a workflow the server supports. Every "now" surface
+    # (balance_sheet/net_worth/dashboard/get_balance/runway/low-cash/
+    # debt payoff) must exclude it, so the cross-surface totals above
+    # hold with this row present; the register surfaces still show it.
+    gb.create_transaction(
+        description="Scheduled rent (future)",
+        splits=[
+            {"account": "Expenses:Groceries", "amount": "1000.00"},
+            {"account": "Assets:Checking", "amount": "-1000.00"},
+        ],
+        trans_date=date.today() + timedelta(days=10),
+        check_duplicates=False,
+    )
+
+    return PathologicalBook(
+        path=book_path,
+        voided_txn_guid=voided_txn_guid,
+        template_txn_guid=template_txn_guid,
+        usd_invoice_id=usd_invoice_id,
+        eur_invoice_id=eur_invoice_id,
+    )

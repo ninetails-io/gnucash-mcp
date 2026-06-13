@@ -16,12 +16,14 @@ from datetime import date
 from decimal import Decimal
 
 import piecash
+from piecash.core.commodity import Price
 from piecash.core.transaction import Lot
 
 from gnucash_mcp.book._base import (
     _commodity_to_compact_line,
     _guid_prefix_map,
     _is_market_price,
+    _is_voided,
     _lot_to_compact_line,
     _to_date,
     _to_decimal,
@@ -49,16 +51,25 @@ class InvestmentsMixin:
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
 
-            # Build a map of latest prices by commodity
-            latest_prices: dict[str, tuple] = {}
+            # One pass over book.prices builds the latest-quote map.
+            # _is_market_price is required — a newer
+            # type='transaction' placeholder would otherwise shadow
+            # the user's last nav quote.
+            latest_market: dict[str, tuple[date, "Price"]] = {}
             for p in book.prices:
-                key = f"{p.commodity.namespace}:{p.commodity.mnemonic}"
+                if not _is_market_price(p):
+                    continue
+                key = p.commodity.guid
                 p_date = _to_date(p.date)
-                if key not in latest_prices or p_date > latest_prices[key][0]:
-                    latest_prices[key] = (p_date, p)
+                existing = latest_market.get(key)
+                if existing is None or p_date > existing[0]:
+                    latest_market[key] = (p_date, p)
 
             for commodity in book.commodities:
                 ns = commodity.namespace
+                # 'template' = GnuCash's SX-scaffolding pseudo-commodity.
+                if ns.lower() == "template":
+                    continue
                 if ns not in by_namespace:
                     by_namespace[ns] = []
 
@@ -68,9 +79,8 @@ class InvestmentsMixin:
                     "fraction": commodity.fraction,
                 }
 
-                key = f"{ns}:{commodity.mnemonic}"
-                if key in latest_prices:
-                    _, price = latest_prices[key]
+                if commodity.guid in latest_market:
+                    _, price = latest_market[commodity.guid]
                     entry["latest_price"] = {
                         "value": str(price.value),
                         "currency": price.currency.mnemonic,
@@ -122,6 +132,39 @@ class InvestmentsMixin:
         Raises:
             ValueError: If commodity already exists in that namespace.
         """
+        # Validate up front — useful errors instead of an
+        # IntegrityError or silent corruption downstream.
+        if not mnemonic or not mnemonic.strip():
+            raise ValueError("Commodity mnemonic cannot be empty")
+        if not fullname or not fullname.strip():
+            raise ValueError("Commodity fullname cannot be empty")
+        if not namespace or not namespace.strip():
+            raise ValueError("Commodity namespace cannot be empty")
+        for label, value in (
+            ("mnemonic", mnemonic),
+            ("fullname", fullname),
+            ("namespace", namespace),
+        ):
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+                raise ValueError(
+                    f"Commodity {label} contains control characters. "
+                    f"Got: {value!r}."
+                )
+        if cusip is not None and any(
+            ord(ch) < 0x20 or ord(ch) == 0x7f for ch in cusip
+        ):
+            raise ValueError(
+                f"Commodity cusip contains control characters. "
+                f"Got: {cusip!r}."
+            )
+        # fraction must be a positive integer — zero or negative
+        # breaks every quantity computation that divides by it.
+        if not isinstance(fraction, int) or fraction <= 0:
+            raise ValueError(
+                f"Commodity fraction must be a positive integer. "
+                f"Got: {fraction!r}."
+            )
+
         with self.open(readonly=False) as book:
             existing = self._find_commodity(book, mnemonic, namespace)
             if existing:
@@ -161,24 +204,22 @@ class InvestmentsMixin:
         """Record a price for a commodity (stock price, NAV, exchange rate).
 
         Args:
-            commodity: Symbol of the commodity (e.g., "VTSAX", "AAPL").
-            namespace: Namespace of the commodity (e.g., "FUND", "NASDAQ").
-            value: Price per unit as decimal string (e.g., "250.45").
-            currency: Currency the price is denominated in. Defaults to
-                the book's default currency. For non-USD-default books
-                (e.g. CNY) the default makes ``create_price(commodity=
-                "USD", value="7.30")`` mean "1 USD = 7.30 CNY", which
-                matches the bookkeeper's mental model. Pass explicitly
-                to store cross-currency pairs that don't involve the
-                book default.
-            price_date: Price date. Defaults to today.
-            price_type: Type of price: "nav", "last", "bid", "ask", "unknown".
-                        Default "nav".
+            commodity: Symbol (e.g., "VTSAX", "USD").
+            namespace: Namespace (e.g., "FUND", "CURRENCY").
+            value: Price per unit as decimal string.
+            currency: Quote currency; defaults to the book default
+                (on a CNY book, ``commodity="USD", value="7.30"``
+                means 1 USD = 7.30 CNY). Pass explicitly for pairs
+                that don't involve the book default.
+            price_date: Defaults to today.
+            price_type: "nav" (default), "last", "bid", "ask",
+                "unknown".
             source: Source identifier. Default "user:price".
 
         Returns:
-            Dict with commodity, date, value, type, currency (the
-            resolved currency mnemonic, not the input), and status.
+            Dict echoing the RESOLVED currency mnemonic, plus
+            status "updated" (same commodity/currency/date/source
+            existed) or "created".
 
         Raises:
             ValueError: If commodity not found or invalid currency.
@@ -193,12 +234,10 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
-            # Resolve currency: explicit input wins; otherwise default
-            # to the book's currency. Pre-fix, an unspecified currency
-            # silently became "USD" — which on a non-USD-default book
-            # stored prices like ``commodity=USD currency=USD`` (1 USD
-            # = X USD, nonsense), invisible to ``_find_exchange_rate``
-            # and silently shadowed by older valid prices on lookup.
+            # Default to the BOOK's currency, never a hardcoded
+            # "USD" — that stores nonsense like commodity=USD
+            # currency=USD on non-USD books, invisible to
+            # _find_exchange_rate.
             if currency is None:
                 resolved_currency = self._require_default_currency(book)
             else:
@@ -206,11 +245,8 @@ class InvestmentsMixin:
                     book, currency,
                 )
 
-            # Check for existing price (same commodity/currency/date/source).
-            # Indexed query — pre-fix this walked every price in the book
-            # for every create_price call. On a book with thousands of
-            # historical prices that's a measurable hot path.
-            from piecash.core.commodity import Price
+            # Same commodity/currency/date/source → update in place.
+            # Indexed query, not a full book.prices walk.
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
                 currency_guid=resolved_currency.guid,
@@ -241,9 +277,7 @@ class InvestmentsMixin:
             result = {
                 "commodity": commodity,
                 "namespace": namespace,
-                # Echo the resolved mnemonic, not the input — the input
-                # might have been None (book default). This way the
-                # caller sees what was actually stored.
+                # Resolved mnemonic, not the (possibly None) input.
                 "currency": resolved_currency.mnemonic,
                 "date": price_date.isoformat(),
                 "value": value,
@@ -260,32 +294,21 @@ class InvestmentsMixin:
         price_date: date,
         source: str | None = None,
     ) -> dict:
-        """Delete a single price entry.
+        """Delete a single price entry, identified by
+        ``(commodity, namespace, date)``.
 
-        Identifies the price by ``(commodity, namespace, date)``.
-        When the same date has multiple prices for one commodity
-        (different sources, e.g. one user-entered and one fetched
-        from a feed), ``source`` disambiguates. If ``source`` is
-        omitted and multiple matches exist, raises with a list of
-        the matches so the caller can retry with the right source.
-
-        Args:
-            commodity: Symbol (e.g., "VTSAX", "USD", "EUR").
-            namespace: Namespace (e.g., "FUND", "CURRENCY").
-            price_date: Date of the price to delete.
-            source: Optional source tag (e.g., "user:price",
-                "user:yfinance"). Required to disambiguate when
-                multiple prices exist on the same commodity+date.
+        ``source`` disambiguates when the same date holds multiple
+        prices (user-entered vs feed-fetched); omitted with
+        multiple matches, the error lists them for a retry.
 
         Returns:
-            Dict with the deleted price's commodity, date, value,
-            and ``status: "deleted"``. Echoing the value lets the
-            caller confirm they removed the right one.
+            The deleted price's identity plus ``value`` — echoed so
+            the caller can confirm they removed the right one —
+            and ``status: "deleted"``.
 
         Raises:
-            ValueError: If commodity not found, no matching price,
-                or multiple prices match without a ``source``
-                disambiguator.
+            ValueError: commodity not found, no matching price, or
+                multiple matches without ``source``.
         """
         with self.open(readonly=False) as book:
             comm = self._find_commodity(book, commodity, namespace)
@@ -298,7 +321,6 @@ class InvestmentsMixin:
             # The date filter stays in Python because piecash's date
             # column is a DateTime under the hood; comparing on the
             # date portion is awkward in raw SQLAlchemy.
-            from piecash.core.commodity import Price
             filters = {"commodity_guid": comm.guid}
             if source is not None:
                 filters["source"] = source
@@ -317,9 +339,6 @@ class InvestmentsMixin:
                 )
 
             if len(matches) > 1:
-                # source omitted but multiple sources match — the
-                # caller's call would have been destructive without
-                # disambiguation. List what's there so they can retry.
                 summary = ", ".join(
                     f"{p.source} ({p.value})" for p in matches
                 )
@@ -330,8 +349,6 @@ class InvestmentsMixin:
                 )
 
             target = matches[0]
-            # Capture before-state for audit log: source + value
-            # tell the human reader exactly what was deleted.
             result = {
                 "commodity": commodity,
                 "namespace": namespace,
@@ -373,8 +390,7 @@ class InvestmentsMixin:
             end_date: Optional end date filter.
             currency: Optional currency filter (e.g., "USD").
             limit: Maximum prices to return. Defaults to 50, capped at
-                   250 server-side. Pre-fix this method dumped every
-                   matching price regardless of caller intent.
+                   250 server-side.
 
         Returns:
             Dict with ``prices`` (list, possibly truncated), ``count``
@@ -393,10 +409,8 @@ class InvestmentsMixin:
                     f"Commodity not found: {namespace}:{commodity}"
                 )
 
-            # Indexed query: filter by commodity_guid up front so we
-            # don't iterate every price in the book. Currency filter
-            # stays in Python because it's optional.
-            from piecash.core.commodity import Price
+            # Indexed by commodity_guid; the optional filters stay
+            # in Python.
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
             ).all()
@@ -436,11 +450,8 @@ class InvestmentsMixin:
             if not compact:
                 return full
 
-            # Compact format: one line per price, columns aligned.
-            # Format::
-            #
-            #     2026-04-30  273.43  USD  last      yfinance
-            #     2026-03-31  253.79  USD  last      yfinance
+            # Compact: "2026-04-30  273.43  USD  last  yfinance",
+            # columns aligned.
             if not prices:
                 return notice or "No prices found."
             value_w = max(len(p["value"]) for p in prices)
@@ -468,20 +479,15 @@ class InvestmentsMixin:
         """Get the most recent price for a commodity.
 
         Args:
-            commodity: Symbol of the commodity (e.g., "VTSAX").
-            namespace: Namespace of the commodity (e.g., "FUND").
-            currency: Currency for the price. Defaults to the book's
-                default currency. Pre-fix the default was hardcoded
-                ``"USD"``, which silently returned None for every
-                price on a non-USD-default book (CNY, EUR, etc.) —
-                same USD-default-everywhere assumption the v1.2.1
-                multi-currency hardening pass fixed for
-                ``create_price`` but missed here. Pass explicitly
-                to get a non-default-currency price (e.g., the USD
-                price of a stock on a CNY-default book).
+            commodity: Symbol (e.g., "VTSAX").
+            namespace: Namespace (e.g., "FUND").
+            currency: Defaults to the book default — a hardcoded
+                "USD" would silently return None on non-USD books.
+                Pass explicitly for a non-default-currency quote.
 
         Returns:
-            Price dict with date, value, type, and source, or None if no price exists.
+            Price dict with date, value, currency, type, source —
+            or None if no price exists.
 
         Raises:
             ValueError: If commodity not found.
@@ -497,7 +503,6 @@ class InvestmentsMixin:
                 currency = self._require_default_currency(book).mnemonic
 
             # Indexed query — only iterate prices for this commodity.
-            from piecash.core.commodity import Price
             candidates = book.session.query(Price).filter_by(
                 commodity_guid=comm.guid,
             ).all()
@@ -506,16 +511,10 @@ class InvestmentsMixin:
             for p in candidates:
                 if p.currency.mnemonic != currency:
                     continue
-                # Skip piecash's auto-created ``type='transaction'``
-                # placeholder rows (effective rate of one cross-
-                # currency transaction, source=``user:split-register``).
-                # Every other valuation path in the codebase
-                # (``get_book_summary``, ``_rates_as_of``,
-                # ``_find_exchange_rate``, ``_latest_market_rates``,
-                # stale-price warnings) excludes them; this single-
-                # answer "what's the latest price" tool was the one
-                # exception, returning a transaction artifact when
-                # the user expected their nav quote.
+                # Skip type='transaction' placeholders — every other
+                # valuation path excludes them, and this tool must
+                # not return a transaction artifact where the user
+                # expects their nav quote.
                 if not _is_market_price(p):
                     continue
                 p_date = _to_date(p.date)
@@ -567,6 +566,11 @@ class InvestmentsMixin:
         sale_quantity = Decimal(0)
 
         for split in lot.splits:
+            # Skip voided splits by state — well-formed voids
+            # contribute 0 only by coincidence, and partial
+            # corruption (state=v, quantity != 0) must not count.
+            if _is_voided(split):
+                continue
             if split.quantity > 0:
                 purchase_quantity += Decimal(str(split.quantity))
                 purchase_value += Decimal(str(split.value))
@@ -607,12 +611,11 @@ class InvestmentsMixin:
             remaining_cost_basis, original_cost_basis,
             cost_per_share, and is_closed.
 
-        Pre-fix the field name was just ``cost_basis`` (the
-        post-sale residual). After a partial sale the reading
-        ``cost_basis: $50`` on a lot bought for $100 was
-        ambiguous — was the lot bought for $50, or is $50 what's
-        left of the original cost? Now both fields ship; the
-        legacy ``cost_basis`` key keeps existing callers working.
+        Both cost-basis fields ship because a lone ``cost_basis``
+        (the post-sale residual) is ambiguous after a partial
+        sale: ``cost_basis: $50`` on a lot bought for $100 reads
+        as either the purchase cost or what's left of it. The
+        ``cost_basis`` key keeps existing callers working.
         """
         raw = self._lot_decimals(lot)
         remaining_cb = _format_number(
@@ -671,7 +674,8 @@ class InvestmentsMixin:
                 notes=notes,
                 is_closed=0,
             )
-            book.session.add(lot)
+            # No session.add — the Lot auto-registers via the
+            # Account.lots back-populate.
             book.save()
 
             all_lot_guids = [
@@ -717,16 +721,10 @@ class InvestmentsMixin:
                 if not include_closed and lot.is_closed:
                     continue
                 summary = self._lot_summary(lot)
-                # Skip lots with no remaining position in the default
-                # (open-positions) view. This catches three cases that
-                # all read the same to a portfolio manager: voided
-                # buys (GnuCash zeros the splits but preserves them
-                # in the lot), never-assigned lots, and lots that
-                # round-tripped to zero without being closed. All
-                # three appear as "0 shares, 0 cost basis" rows that
-                # add noise to a holdings listing. Available via
-                # ``include_closed=True`` for callers who need the
-                # full audit trail.
+                # The open-positions view also skips zero-position
+                # lots (voided buys, never-assigned, round-tripped
+                # to zero) — noise rows in a holdings listing.
+                # include_closed=True restores the full audit trail.
                 if (
                     not include_closed
                     and Decimal(summary["quantity"]) == 0
@@ -740,9 +738,8 @@ class InvestmentsMixin:
                 })
 
             if compact:
-                # _resolve_guid("lots", ...) searches the whole lots table,
-                # so the prefix map has to span every lot in the book — not
-                # just lots on this account.
+                # Prefix map spans every lot in the book —
+                # _resolve_guid searches table-wide.
                 all_lot_guids = [
                     row[0]
                     for row in book.session.query(Lot.guid).all()
@@ -772,10 +769,8 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {guid}")
 
-            # Build a collision-safe prefix map across every split in
-            # the book — the LLM can paste any short prefix back into
-            # ``set_reconcile_state`` / ``assign_split_to_lot`` etc.
-            # and ``_resolve_guid("splits", ...)`` will resolve it.
+            # Split prefixes span the whole book — they feed back
+            # into table-wide _resolve_guid lookups.
             all_split_guids = (
                 s.guid for txn in book.transactions for s in txn.splits
             )
@@ -783,16 +778,25 @@ class InvestmentsMixin:
 
             splits = []
             for split in lot.splits:
-                splits.append({
+                row = {
                     "guid": prefixes.get(split.guid, split.guid),
-                    "date": split.transaction.post_date.isoformat(),
+                    "date": (
+                        split.transaction.post_date.isoformat()
+                        if split.transaction.post_date else None
+                    ),
                     "description": split.transaction.description,
                     "quantity": str(split.quantity),
                     "value": str(split.value),
-                })
+                }
+                # The summary already excludes voided zombies; an
+                # unmarked 0-row here would read as a real event the
+                # summary then contradicts.
+                if _is_voided(split):
+                    row["voided"] = True
+                splits.append(row)
 
             summary = self._lot_summary(lot)
-            # Phase 6A: ``is_closed`` already lives at the top level
+            # ``is_closed`` already lives at the top level
             # of this response. Drop it from the nested ``summary``
             # so callers see the field once, not twice.
             summary_compact = {k: v for k, v in summary.items() if k != "is_closed"}
@@ -833,6 +837,15 @@ class InvestmentsMixin:
             if not split:
                 raise ValueError(f"Split not found: {split_guid}")
 
+            # Reject voided splits — a zero-contribution row would
+            # trip the auto-close check and produce a degenerate lot.
+            if _is_voided(split):
+                raise ValueError(
+                    f"Cannot assign voided split {split_guid} to "
+                    f"a lot. Unvoid the transaction first, or "
+                    f"assign a different (active) split."
+                )
+
             lot = self._find_lot(book, lot_guid)
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
@@ -863,11 +876,9 @@ class InvestmentsMixin:
                 book.save()
                 auto_closed = True
 
-            # split_guid and lot_guid are echoed inputs — dropped.
-            # ``is_closed`` is included on this response (Phase 6A
-            # removed it from ``_lot_summary``, but the auto-close
-            # behavior of this tool is exactly what the caller wants
-            # to know about — keep it surfaced here).
+            # Input GUIDs are echoes — dropped. ``is_closed`` is
+            # surfaced because the auto-close is what the caller
+            # wants to know about.
             return {
                 "status": "assigned",
                 **summary,
@@ -907,11 +918,9 @@ class InvestmentsMixin:
             remaining = raw["remaining"]
 
             if remaining <= 0:
-                # Distinguish "lot ran to zero through sales" (normal,
-                # closed lot) from "lot has voided splits zeroing its
-                # purchase quantity" (likely an accounting mistake the
-                # caller should know about). GnuCash marks voided
-                # splits with reconcile_state='v'.
+                # Distinguish "sold to zero" (normal) from "voided
+                # splits zeroed the quantity" (likely a mistake the
+                # caller should know about).
                 voided_split_count = sum(
                     1 for s in lot.splits if s.reconcile_state == "v"
                 )
@@ -934,38 +943,52 @@ class InvestmentsMixin:
             else:
                 shares_to_sell = remaining
 
+            default_ccy = self._require_default_currency(book)
+
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
-                # Look up latest price inline (we're inside an open
-                # session). Indexed by commodity so we don't iterate
-                # every price in the book.
+                # Latest market price in the book default —
+                # _find_prices applies both required filters
+                # (market-only, currency) at one chokepoint.
                 commodity = lot.account.commodity
-                from piecash.core.commodity import Price
-                candidates = book.session.query(Price).filter_by(
+                recent = self._find_prices(
+                    book,
                     commodity_guid=commodity.guid,
-                ).all()
-                latest_price = None
-                latest_date = None
-                for p in candidates:
-                    p_date = _to_date(p.date)
-                    if latest_date is None or p_date > latest_date:
-                        latest_date = p_date
-                        latest_price = p
-                if latest_price is None:
+                    currency_guid=default_ccy.guid,
+                )
+                if not recent:
                     raise ValueError(
                         f"No price found for {commodity.mnemonic}. "
                         "Provide sale_price explicitly."
                     )
-                price = Decimal(str(latest_price.value))
+                price = Decimal(str(recent[0].value))
 
-            # Prorate cost basis on shares-to-sell. Avoids the precision
-            # loss of ``cost_per_share * shares`` for non-round
-            # per-share costs (e.g., $100 / 3 shares: prorate gives
-            # exactly $100 for selling all 3, while the divide-then-
-            # multiply path gives $99.99...). Tax-relevant.
+            # Cost basis must match the proceeds' currency.
+            # split.value is in TRANSACTION currency — a foreign-
+            # denominated buy converts at its historical purchase
+            # date or the tax-relevant gain is off by the full FX
+            # factor. Missing rate degrades to the raw value.
+            purchase_value_default = Decimal("0")
+            for split in lot.splits:
+                if _is_voided(split) or split.quantity <= 0:
+                    continue
+                value = Decimal(str(split.value))
+                txn_ccy = split.transaction.currency
+                if txn_ccy != default_ccy:
+                    rate = self._cross_rate(
+                        book, txn_ccy, default_ccy,
+                        as_of=split.transaction.post_date,
+                    )
+                    if rate is not None:
+                        value = value * rate
+                purchase_value_default += value
+
+            # Prorate on shares-to-sell, never cost_per_share ×
+            # shares — divide-then-multiply loses precision ($100/3
+            # shares × 3 = $99.99…). Tax-relevant.
             cost_basis = (
-                raw["purchase_value"] * shares_to_sell
+                purchase_value_default * shares_to_sell
                 / raw["purchase_quantity"]
             )
             proceeds = price * shares_to_sell
@@ -977,10 +1000,6 @@ class InvestmentsMixin:
                 "cost_basis": _format_number(cost_basis, decimals=2),
                 "sale_proceeds": _format_number(proceeds, decimals=2),
                 "capital_gain": _format_number(gain, decimals=2),
-                # The 26-digit case the spec called out — ``(gain /
-                # cost_basis) * 100`` produces an unbounded repeating
-                # decimal in the general case. 2 decimal places is
-                # what humans and reports actually use.
                 "gain_percent": _format_number(gain_pct, decimals=2),
             }
 

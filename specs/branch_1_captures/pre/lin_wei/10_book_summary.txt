@@ -1,0 +1,51 @@
+Book: lin-wei.gnucash
+Currency: CNY
+Data range: 2025-01-01 to 2025-12-31
+Last entry: 2025-12-31 (154 days behind) ⚠
+Warnings:
+  ⚠ Past due invoice: Pacific Trade Solutions 145 days overdue, USD 3,000
+  ⚠ Stale price: USD last updated 184 days ago
+  ⚠ Stale price: HKD last updated 184 days ago
+  ⚠ Stale price: EUR last updated 184 days ago
+  ⚠ Stale price: 600519 last updated 184 days ago
+  ⚠ Stale price: 510300 last updated 184 days ago
+  ⚠ Stale price: 300750 last updated 184 days ago
+  ⚠ Stale price: 159915 last updated 184 days ago
+Accounts: 88 total
+Assets: 13 accounts, CNY 4978440.00
+  Apartment: CNY 4200000.00
+  Checking Account: CNY 270652.00
+  Vehicle: CNY 180000.00
+  Savings Account: CNY 150000.00
+  Housing Fund: CNY 81200.00
+  CSI300: 8000 510300 @ 4.16 (CNY 33280.00)
+  ChiNext: 6000 159915 @ 2.4 (CNY 14400.00)
+  Moutai: 6 600519 @ 1810 (CNY 10860.00)
+  CATL: 35 300750 @ 275 (CNY 9625.00)
+  Alipay: CNY 2671.00
+  Cash: CNY 2000.00
+  WeChat Pay: CNY 1852.00
+Liabilities: 5 accounts, CNY 2859482.04
+  Credit cards (2): CNY 31380.02
+  Loans (2): CNY 2826316.00
+  Top 3: Mortgage CNY 2729518.00, Auto Loan CNY 96798.00, CMB Credit Card CNY 19385.02
+Receivables: 1 account, CNY 21900.00 (1 invoice, 1 overdue)
+  Accounts Receivable USD: CNY 21900.00
+Payables: 1 account, CNY 1786.02
+  Accounts Payable: CNY 1786.02
+Income: 6 active (10 total)
+Expenses: 29 active (46 total)
+Reconciliation:
+  Checking Account: through 2025-12-31 (5 months behind) ⚠
+  8 accounts never reconciled ⚠
+Net worth trajectory:
+  12mo ago: CNY 1,894,152
+   6mo ago: CNY 2,078,710
+   3mo ago: CNY 2,118,958
+   1mo ago: CNY 2,118,958
+       now: CNY 2,118,958
+Runway: 4584 days (CNY 576,540 liquid / CNY 126/day burn)
+Transactions: 1961
+Business: 3 customers, 3 vendors
+Budgets: 1
+Commodities: 159915, 300750, 510300, 600519, CNY, EUR, HKD, USD

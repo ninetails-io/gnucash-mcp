@@ -128,9 +128,22 @@ module contributes zero tools to the MCP surface.
   `type='transaction'` auto-defaults created by piecash on
   cross-currency transactions are skipped — they'd shadow user-
   supplied market prices.
-- **Every write is verified.** `_verify_write` /
-  `_verify_composite_write` read back what was written and raise if
-  the round-trip doesn't match.
+- **Every raw-SQL write is verified.** Two-tier contract:
+  - **ORM writes** (`book.session.add(obj)`, attribute mutation,
+    `book.session.delete(obj)`) rely on SQLAlchemy's commit-side
+    verification — constraint violations, missing FKs, and stale-
+    object failures raise during `book.save()`. Explicit
+    `_verify_*` would be redundant.
+  - **Raw-SQL writes** (`book.session.execute(Table.__table__.
+    insert/update/delete(...))`) need explicit verification —
+    SQLAlchemy executes the SQL but can't tell whether the WHERE
+    clause matched any rows or the INSERT actually landed.
+    `_verify_write` / `_verify_composite_write` / `_verify_delete`
+    read back the affected row and raise if the round-trip doesn't
+    match.
+  Locked by `tests/test_contract_integrity.py::TestWriteVerificationCoverage`
+  — every raw-SQL DML site in `book/*.py` must have a paired
+  `_verify_*` call within 40 lines.
 - **Template accounts filtered everywhere they shouldn't appear.**
   `book.root_template` and its descendants are real Account rows in
   `book.accounts`. Any iteration that aggregates balances, surfaces
@@ -193,7 +206,25 @@ existed.
   (`entity.addr_addr1 = "..."`) on update.
 - **Slot ORM conflicts**: polymorphic relationships on the Slot
   table make direct ORM queries fail. Use raw SQL via
-  `sqlalchemy.text()` for slot reads/deletes.
+  `sqlalchemy.text()` for slot reads/deletes. For slot **writes
+  and per-entity reads**, the `entity[key] = value` /
+  `entity[key]` accessors work — piecash handles the polymorphism
+  internally. Use `_slot_value_str(...)` from `book/_base.py` to
+  extract a stable string from typed slot wrappers
+  (`SlotString`, `SlotInt64`, etc.).
+- **Slot key naming convention**: bare keys for universal
+  financial concepts (`apr`, `credit_limit`,
+  `statement_close_day`, `reward_rate`); namespaced
+  `gnc-mcp/<key>` prefix for tool-specific state where collisions
+  with another tool's convention are plausible (e.g.
+  `gnc-mcp/applies-to-invoice` for our credit-note linkage).
+  Test for which side: *could a reasonable developer arrive at
+  this exact key independently?* Yes → bare. No → namespaced.
+  Path-style keys (containing `/`) create hierarchical sub-slots
+  in GnuCash's KVP store; that's what the namespace prefix
+  exploits. The `_SLOT_KEY_RE` validator in `book/admin.py`
+  gates USER input to flat keys only — internal slot keys set
+  by book methods bypass that gate by design.
 - **KVP_Type enum**: `SlotType` TypeDecorator expects `KVP_Type`
   enum values (e.g., `KVP_Type.KVP_TYPE_STRING`), not raw ints.
 - **Detached instances**: ORM object attributes are only accessible
@@ -332,6 +363,12 @@ For live verification against a personal GnuCash book, ensure
 - `## Summary` with bullet points, then `## Test plan` with checklist.
 - Merge with `--merge --delete-branch` (no squash — preserves feature
   commit history under the merge commit).
+- After addressing Copilot review threads (reply + fix), resolve
+  them with `uv run python scripts/resolve_pr_threads.py <PR>` —
+  bots don't resolve their own threads, so author-resolve keeps
+  the PR conversation tab clean. `--dry-run` previews; `--all`
+  resolves regardless of author for the rare case a human
+  reviewer leaves threads open after agreeing in chat.
 
 ### Staging
 

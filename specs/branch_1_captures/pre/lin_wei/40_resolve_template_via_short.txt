@@ -1,0 +1,12 @@
+{
+  "ref": "%6fe7267",
+  "resolved": {
+    "commodity": "CNY",
+    "description": "",
+    "fullname": "Chen Yu Salary",
+    "guid": "6fe72672c4ce4c61a86f2c1dfb5aee4f",
+    "name": "Chen Yu Salary",
+    "placeholder": false,
+    "type": "BANK"
+  }
+}

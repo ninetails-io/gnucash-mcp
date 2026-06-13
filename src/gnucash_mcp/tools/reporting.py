@@ -3,7 +3,7 @@
 from datetime import date
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import _json, _parse_iso_date, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -74,16 +74,32 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def balance_sheet(as_of_date: str) -> str:
+    def balance_sheet(as_of_date: str | None = None) -> str:
         """Generate a balance sheet as of a specific date.
 
         Shows assets, liabilities, and equity with account breakdowns.
+        A = L + E holds by construction; non-zero unrealized P&L
+        appears as a synthetic equity row.
 
         Args:
-            as_of_date: Date to calculate balances as of (YYYY-MM-DD)
+            as_of_date: Date in ISO format (YYYY-MM-DD). Defaults to
+                today — matching ``get_book_summary``'s implicit
+                cutoff so cross-tool comparisons agree without
+                threading the same date into both calls. Pass an
+                explicit date for historical snapshots.
         """
         book = get_book()
-        result = book.balance_sheet(as_of_date=date.fromisoformat(as_of_date))
+        # Distinguish "not provided" (None → today) from "provided
+        # but empty/garbage" (raise). An empty-string
+        # ``as_of_date=""`` silently falling back to today is a
+        # caller bug that produces silently wrong-dated reports;
+        # the strict-kwargs pattern
+        # extends to the value, not just the parameter name.
+        if as_of_date is None:
+            d = date.today()
+        else:
+            d = date.fromisoformat(as_of_date)
+        result = book.balance_sheet(as_of_date=d)
         return _json(result)
 
     @mcp.tool()
@@ -106,7 +122,7 @@ def register(mcp, get_book) -> None:
         book = get_book()
         result = book.net_worth(
             end_date=date.fromisoformat(end_date),
-            start_date=date.fromisoformat(start_date) if start_date else None,
+            start_date=_parse_iso_date(start_date),
             interval=interval,
         )
         return _json(result)
@@ -118,19 +134,38 @@ def register(mcp, get_book) -> None:
         start_date: str,
         end_date: str,
         account: str | None = None,
+        include_transfers: bool = False,
     ) -> str:
         """Calculate cash flow (inflows and outflows) for a period.
+
+        Scope is BANK and CASH accounts by default. Credit-card and
+        investment movements are not cash flow (they're liability /
+        asset changes — use balance_sheet). An explicit ``account=``
+        of any type works but the default scope is narrow.
+
+        Internal transfers (transactions with no INCOME or EXPENSE
+        leg — transfer to savings, currency wallet shuffle, paying
+        a credit card from checking) are filtered by default. The
+        default totals answer "where did money come from and where
+        did it go?" rather than "every debit and credit." Pass
+        ``include_transfers=true`` for the gross flow (e.g. for
+        reconciling against a bank statement).
 
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
-            account: Optional specific account to analyze (defaults to all cash/bank accounts)
+            account: Optional specific account to analyze (defaults
+                to all cash/bank accounts)
+            include_transfers: When False (default), filter internal
+                transfers. When True, include every cash/bank
+                movement regardless of category.
         """
         book = get_book()
         result = book.cash_flow(
             start_date=date.fromisoformat(start_date),
             end_date=date.fromisoformat(end_date),
             account=account,
+            include_transfers=include_transfers,
         )
         return _json(result)
 

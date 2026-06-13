@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import pytest
 
-from gnucash_mcp.tools._helpers import _apply_limit, _format_number
+from gnucash_mcp.tools._helpers import _apply_limit, _format_number, _resolve_id_alias
 
 
 class TestFormatNumber:
@@ -250,3 +250,40 @@ class TestSafeToolWriteVerificationRouting:
 
         result = json.loads(fake_tool())
         assert result["error_type"] == "validation_error"
+
+
+class TestResolveIdAlias:
+    """``_resolve_id_alias`` lets delete_invoice / delete_bill /
+    delete_voucher / delete_credit_note accept both ``id`` (the
+    standard name across get_invoice / post_invoice / unpost_invoice /
+    pay_invoice) and the legacy ``<entity>_id`` parameter for
+    back-compat.
+
+    Required because ``extra="forbid"`` on tool arg models (shipped
+    on PR #92) forbids silent kwarg aliasing — both names have to be
+    declared parameters on the wrapper, and the helper picks the
+    right one.
+    """
+
+    def test_prefers_id_when_only_id_set(self):
+        assert _resolve_id_alias("000001", None, "invoice_id") == "000001"
+
+    def test_accepts_legacy_when_only_legacy_set(self):
+        assert _resolve_id_alias(None, "000001", "invoice_id") == "000001"
+
+    def test_rejects_both_set(self):
+        with pytest.raises(ValueError, match="exactly one"):
+            _resolve_id_alias("000001", "000002", "invoice_id")
+
+    def test_rejects_both_missing(self):
+        with pytest.raises(ValueError, match="Missing required parameter"):
+            _resolve_id_alias(None, None, "invoice_id")
+
+    def test_error_message_names_the_legacy_parameter(self):
+        # Useful for the LLM debug loop — the error needs to say
+        # which alias it was looking for so the caller can fix
+        # their call.
+        with pytest.raises(ValueError, match="bill_id"):
+            _resolve_id_alias(None, None, "bill_id")
+        with pytest.raises(ValueError, match="voucher_id"):
+            _resolve_id_alias("a", "b", "voucher_id")

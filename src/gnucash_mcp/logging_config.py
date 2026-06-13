@@ -8,6 +8,7 @@ Logs are stored alongside the GnuCash book file:
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -30,6 +31,239 @@ _book_path_str: str | None = None
 def get_log_dir() -> Path | None:
     """Get the configured log directory path."""
     return _log_dir
+
+
+class _WriteRateLimiter:
+    """Token-bucket rate limiter for MCP write operations.
+
+    Refills at ``rate`` tokens/sec up to ``burst`` capacity — the
+    bucket accommodates honest bursts (posting 5 invoices quickly)
+    while throttling sustained runaway loops. ``consume()`` is
+    thread-safe and returns a retry hint when denied.
+    """
+
+    def __init__(self, rate: float, burst: int):
+        import threading
+        self.rate = float(rate)
+        self.burst = int(burst)
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> tuple[bool, float]:
+        """Try to consume one token.
+
+        Returns ``(allowed, retry_after_sec)``; the retry value is
+        meaningful only when denied.
+        """
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(
+                self.burst,
+                self.tokens + elapsed * self.rate,
+            )
+            self.last_refill = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, 0.0
+            retry = (1.0 - self.tokens) / self.rate
+            return False, retry
+
+
+# Lazy module-level cache. Reset via reset_write_rate_limiter()
+# (callers: tests, ``setup_logging`` restart paths).
+_write_limiter: _WriteRateLimiter | None = None
+_write_limiter_initialized: bool = False
+
+
+def _get_write_rate_limiter() -> _WriteRateLimiter | None:
+    """Resolve the write rate limiter from env, caching the result.
+
+    ``GNUCASH_WRITE_RATE_LIMIT`` (tokens/sec; absent or
+    non-positive disables limiting — the cached None makes the
+    per-call check a fast nullity test) and
+    ``GNUCASH_WRITE_BURST`` (bucket size, default 10).
+    """
+    global _write_limiter, _write_limiter_initialized
+    if _write_limiter_initialized:
+        return _write_limiter
+
+    rate_str = os.environ.get("GNUCASH_WRITE_RATE_LIMIT")
+    if not rate_str:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    try:
+        rate = float(rate_str)
+    except ValueError:
+        # Non-numeric → unset, with a warning so the typo is seen.
+        logging.getLogger(DEBUG_LOGGER_NAME).warning(
+            f"GNUCASH_WRITE_RATE_LIMIT={rate_str!r} is not a "
+            f"valid number; rate limiting disabled."
+        )
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    if rate <= 0:
+        _write_limiter = None
+        _write_limiter_initialized = True
+        return None
+
+    burst_str = os.environ.get("GNUCASH_WRITE_BURST", "10")
+    try:
+        burst = max(1, int(burst_str))
+    except ValueError:
+        burst = 10
+
+    _write_limiter = _WriteRateLimiter(rate=rate, burst=burst)
+    _write_limiter_initialized = True
+    return _write_limiter
+
+
+def reset_write_rate_limiter() -> None:
+    """Drop the cached rate limiter so the next call re-reads env.
+
+    Test seam — production code reads env once per process start.
+    """
+    global _write_limiter, _write_limiter_initialized
+    _write_limiter = None
+    _write_limiter_initialized = False
+
+
+def redact_paths(text: str) -> str:
+    """Replace absolute filesystem paths with their basename when
+    ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
+
+    Opt-in (default off): paths in errors are usually the most
+    useful local-debugging signal; redaction is for messages shared
+    externally. Basename-only — the user still needs to know
+    *which* file errored; the directory structure is the sensitive
+    bit. POSIX and Windows absolute paths match; relative paths
+    pass through (they don't leak layout).
+    """
+    if os.environ.get("GNUCASH_REDACT_PATHS") != "1":
+        return text
+
+    import re
+
+    # POSIX absolute paths: /foo/bar/baz.ext
+    # Stop at whitespace, quotes, or common delimiter chars.
+    posix_re = re.compile(r"/(?:[^\s/'\"<>]+/)+[^\s/'\"<>]+")
+    # Windows: C:\foo\bar.ext or C:/foo/bar.ext
+    win_re = re.compile(
+        r"[A-Za-z]:[/\\](?:[^\s'\"<>]+[/\\])*[^\s'\"<>]+"
+    )
+
+    def to_basename(m):
+        # Split on either separator so Windows paths matched on a
+        # POSIX-running host (where ``Path("C:\\...").name`` would
+        # return the whole string) still extract the leaf.
+        full = m.group(0).replace("\\", "/")
+        return full.rsplit("/", 1)[-1]
+
+    # Windows first (more specific prefix); then POSIX.
+    text = win_re.sub(to_basename, text)
+    text = posix_re.sub(to_basename, text)
+    return text
+
+
+def resolve_mcp_dir(book_path: Path | str) -> Path:
+    """Resolve the ``.mcp`` directory for audit / debug / backup storage.
+
+    ``GNUCASH_LOG_DIR`` set → that path is used directly, bypassing
+    all checks (explicit user opt-in). Otherwise the directory is
+    ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
+    sanity checks fire:
+
+      1. The parent must not be group- or world-writable — no
+         sticky-bit exemption: that bit prevents non-owner
+         deletion, but anyone with write access can still *create*
+         a malicious ``.mcp`` symlink.
+      2. An existing ``.mcp`` entry must be a real directory owned
+         by the current uid — not a symlink, not another owner.
+
+    Together these block the symlink-hijack vector: a hostile
+    co-located process pre-creating ``{book}.mcp`` as a symlink to
+    attacker-controlled storage, which the subsequent
+    ``mkdir(exist_ok=True)`` would follow. On Windows the checks
+    are skipped (mode bits / uid don't map); set
+    ``GNUCASH_LOG_DIR`` if hardening is needed there.
+
+    Raises:
+        ValueError: unsafe parent permissions, ``.mcp`` symlink,
+            or foreign-uid ``.mcp``.
+    """
+    env_override = os.environ.get("GNUCASH_LOG_DIR")
+    if env_override:
+        return Path(env_override).expanduser()
+
+    book_path = Path(book_path)
+    parent = book_path.parent
+    mcp_dir = parent / f"{book_path.name}.mcp"
+
+    if os.name == "posix":
+        try:
+            mode = parent.stat().st_mode
+            # 0o020 = group-write, 0o002 = world-write.
+            # Reject regardless of sticky bit: the sticky bit
+            # prevents non-owner *deletion/rename*, but any
+            # principal with write access to the parent can
+            # still *create* a new entry (e.g. a symlink named
+            # ``{book}.mcp`` pointing to attacker-controlled
+            # storage) before this process runs. The subsequent
+            # mkdir(parents=True, exist_ok=True) would follow
+            # that symlink. Sticky-bit-protected dirs like /tmp
+            # are explicitly unsafe for this use; set
+            # GNUCASH_LOG_DIR if the book really lives there.
+            if mode & 0o022:
+                raise ValueError(
+                    f"Refusing to use {parent} for logs/backups: "
+                    f"directory is group- or world-writable "
+                    f"(mode={oct(mode & 0o777)}). A hostile co-"
+                    f"located process could pre-create a "
+                    f"malicious .mcp symlink redirecting log "
+                    f"writes. Either tighten permissions "
+                    f"(chmod go-w {parent}) or set "
+                    f"GNUCASH_LOG_DIR to a user-private location."
+                )
+        except FileNotFoundError:
+            # Parent missing — let downstream mkdir surface
+            # the issue naturally with its own error.
+            pass
+
+        # Defense in depth: if a ``.mcp`` already exists at the
+        # derived path, require it to be a real directory owned
+        # by the current user. Catches the case where an earlier
+        # attack already pre-created the symlink and the parent
+        # has since been re-tightened.
+        try:
+            if mcp_dir.exists() or mcp_dir.is_symlink():
+                if mcp_dir.is_symlink():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: path is a "
+                        f"symlink. Logs/backups must live in a "
+                        f"real directory you own; a symlink "
+                        f"could redirect writes elsewhere. "
+                        f"Remove or replace it, or set "
+                        f"GNUCASH_LOG_DIR to a different path."
+                    )
+                st = mcp_dir.stat()
+                if st.st_uid != os.geteuid():
+                    raise ValueError(
+                        f"Refusing to use {mcp_dir}: directory "
+                        f"is owned by uid={st.st_uid}, not the "
+                        f"current user (uid={os.geteuid()}). "
+                        f"Logs/backups go to a directory you "
+                        f"own; mismatched ownership suggests an "
+                        f"earlier symlink/hijack attempt."
+                    )
+        except FileNotFoundError:
+            pass
+
+    return mcp_dir
 
 
 def setup_logging(
@@ -77,10 +311,9 @@ def setup_logging(
             "Set GNUCASH_BOOK_PATH environment variable."
         )
 
-    # Log directory lives alongside the book file
-    # e.g., /path/to/finances.gnucash -> /path/to/finances.gnucash.mcp/
-    book_path_obj = Path(book_path)
-    log_dir = book_path_obj.parent / f"{book_path_obj.name}.mcp"
+    # Lives alongside the book (or GNUCASH_LOG_DIR); the helper
+    # also runs the symlink-hijack sanity checks.
+    log_dir = resolve_mcp_dir(book_path)
     _log_dir = log_dir
 
     now_local = datetime.now().astimezone()
@@ -108,13 +341,9 @@ def setup_logging(
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
 
-        # Restrict the audit file to owner read/write. Audit logs
-        # contain transaction descriptions, account paths, dollar
-        # amounts — not appropriate for the host's default umask
-        # (which would commonly leave the file group/other
-        # readable on multi-user systems). os.chmod is best-effort:
-        # platforms without POSIX permission bits (Windows) silently
-        # no-op, which is fine — the host's own ACLs apply there.
+        # Owner read/write only — audit logs carry financial data
+        # the default umask would leave group/other readable.
+        # Best-effort: Windows no-ops and its ACLs apply.
         try:
             import os as _os
             _os.chmod(audit_file, 0o600)
@@ -203,34 +432,21 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
 def _resolve_entry_field(
     entry: dict, field: str, params_key: str | None = None
 ):
-    """Look up a field in an audit entry, falling back through sources.
+    """Look up a field in an audit entry, falling back through
+    sources — write responses are trimmed, so fields the log wants
+    (splits, description, date) may be absent from ``after_state``.
 
-    Write tool responses are trimmed for LLM token efficiency — several
-    fields the human-readable audit log wants to display (splits,
-    description, date) may not appear in ``after_state``. This helper
-    unifies the lookup order:
+    Lookup order:
 
     1. ``after_state`` — the tool's response, richest when present
-    2. ``params`` — the tool's inputs; for most write ops this is the
-       same information the LLM would have put in the response
-    3. ``before_state`` — the pre-write snapshot captured by the
-       audit decorator (useful for REPLACE_SPLITS where description /
-       date aren't in response OR params)
+    2. ``params`` — the tool's inputs (``params_key`` names them
+       when they differ, e.g. response "date" vs params
+       "transaction_date")
+    3. ``before_state`` — the pre-write snapshot
 
-    A falsy value ("", [], {}, None) in any source is treated as "not
-    present" and falls through to the next. Callers that need to
-    distinguish "really empty" from "missing" should consult the
-    individual sources directly.
-
-    Args:
-        entry: The audit entry dict.
-        field: Key to look up in ``after_state`` and ``before_state``.
-        params_key: Alternate key in ``params`` when the response and
-                    params use different names (e.g. response: "date",
-                    params: "transaction_date"). Defaults to ``field``.
-
-    Returns:
-        The resolved value, or None if not found in any source.
+    Falsy values fall through to the next source; callers needing
+    "really empty" vs "missing" consult the sources directly.
+    Returns None when nothing resolves.
     """
     sources = (
         (entry.get("after_state") or {}, field),
@@ -246,15 +462,10 @@ def _resolve_entry_field(
 
 # ── Audit text-format dispatcher ───────────────────────────────────
 #
-# Write operations render to the human-readable audit log as short
-# multi-line blocks. Each (entity_type, operation) pair has its own
-# tiny handler that pulls what it needs from the entry (params,
-# before_state, after_state) and returns a list of lines.
-#
-# Adding a new entity type is a dict entry, not another ``elif`` in a
-# 380-line chain. Unknown keys degrade to empty output so new audit
-# classifications added in book code don't crash log rendering before
-# a handler lands.
+# Each (entity_type, operation) pair has a tiny handler returning a
+# list of lines. Adding an entity type is one dict row, not another
+# elif; unknown keys degrade to empty output so a new classification
+# can't crash log rendering before its handler lands.
 
 _INDENT = "          "  # 10 spaces; every handler indents its detail lines here
 _INDENT_SPLITS = _INDENT + "  "  # nested indent for split blocks
@@ -269,12 +480,9 @@ def _extract_time(entry: dict) -> str:
 
 
 def _transaction_guid(entry: dict) -> str:
-    """GUID for a transaction log line — short prefix if upstream supplied one.
-
-    Book methods emit collision-safe prefixes via ``_unique_prefix`` on
-    write responses. We display whatever was provided — re-truncating
-    here would undo any birthday-problem extension (e.g., collapse a
-    9-char safe prefix back to a colliding 8).
+    """GUID for a transaction log line — displayed as provided.
+    Re-truncating would undo a birthday-problem extension (collapse
+    a 9-char safe prefix back to a colliding 8).
     """
     params = entry.get("params") or {}
     return entry.get("entity_guid") or params.get("guid", "")
@@ -518,10 +726,8 @@ def _fmt_split_reconcile(entry: dict) -> list[str]:
         f"{_INDENT}Splits reconciled ({len(split_guids)}):",
     ]
 
-    # Show first 10 reconciled splits with description + amount if the
-    # before_state carried the per-split context. Prefix/full GUID
-    # tolerance: params may be an 8+-char prefix, before_state carries
-    # full GUIDs from the book method's staged snapshot. Match either way.
+    # First 10 splits with context. GUID matching tolerates prefix
+    # vs full forms (params may carry prefixes; before_state full).
     for guid in split_guids[:10]:
         split_info = next(
             (
@@ -640,12 +846,9 @@ def _fmt_person_delete(
 def _fmt_person_update(entry: dict, type_label: str) -> list[str]:
     """Shared UPDATE renderer for customer / vendor / employee.
 
-    Header line carries the entity id. Each field that actually
-    changed renders as ``before → after``, with ``address``
-    expanded to per-sub-field lines so a phone-number tweak is
-    visible at a glance. Fields that didn't change are omitted —
-    the response from the book layer is already a diff, so the
-    audit log mirrors that shape.
+    Changed fields render ``before → after`` (address expanded
+    per-sub-field); unchanged fields are omitted — the book
+    response is already a diff and the log mirrors it.
     """
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -718,6 +921,69 @@ def _fmt_employee_delete(entry: dict) -> list[str]:
     return _fmt_person_delete(entry, "employee", "employee_id")
 
 
+# ── Job formatters ───────────────────────────────────────────
+# Jobs aren't business-persons (no currency/address), so they get
+# their own formatters; the owner surfaces so a reviewer sees the
+# counterparty without a lookup.
+
+
+def _fmt_job_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    job_id = after.get("id", "")
+    name = after.get("name", params.get("name", ""))
+    owner_type = (
+        after.get("owner_type") or params.get("owner_type", "")
+    )
+    owner_id = params.get("owner_id", "")
+    ref = after.get("reference") or params.get("reference", "")
+    lines = [
+        f"{time_part}  CREATE JOB  id:{job_id}",
+        f'{_INDENT}name: "{name}"  {owner_type}: {owner_id}',
+    ]
+    if ref:
+        lines.append(f"{_INDENT}reference: {ref}")
+    return lines
+
+
+def _fmt_job_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    after = entry.get("after_state") or {}
+    job_id = params.get("job_id", "")
+    lines = [f"{time_part}  UPDATE JOB  id:{job_id}"]
+    # after_state carries only changed keys.
+    for key in ("name", "reference", "active"):
+        if key in after:
+            old_val = before.get(key, "?")
+            new_val = after[key]
+            lines.append(
+                f"{_INDENT}{key}: {old_val!r} → {new_val!r}"
+            )
+    return lines
+
+
+def _fmt_job_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    job_id = params.get("job_id", "")
+    name = after.get("name", "")
+    reparented = after.get("reparented_count", 0)
+    lines = [f"{time_part}  DELETE JOB  id:{job_id}"]
+    if name:
+        lines.append(f'{_INDENT}name: "{name}"')
+    if reparented:
+        # force=True changed invoice owners as a side effect —
+        # call it out.
+        lines.append(
+            f"{_INDENT}reparented invoices: {reparented}"
+        )
+    return lines
+
+
 def _fmt_billterm_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
@@ -728,6 +994,87 @@ def _fmt_billterm_create(entry: dict) -> list[str]:
         f"{time_part}  CREATE BILLTERM",
         f'{_INDENT}name: "{name}"  due: {due_days} days',
     ]
+
+
+def _fmt_taxtable_entry_line(e: dict) -> str:
+    """Render one taxtable entry as ``5%→GST Payable`` /
+    ``$5→Eco Fee`` — mirrors ``_taxtable_entry_summary`` so audit
+    rows match ``list_taxtables``. Leaf names deliberately: the
+    fullname-canonicalization rule covers account *parameters*;
+    this is taxtable *structure*.
+    """
+    type_val = e.get("type", "")
+    amount = e.get("amount", "")
+    # "account" (path-resolved) preferred; "account_guid" defensive.
+    acct = e.get("account") or e.get("account_guid", "?")
+    if ":" in acct:
+        acct = acct.rsplit(":", 1)[-1]
+    if type_val == "percentage":
+        return f"{amount}%→{acct}"
+    return f"${amount}→{acct}"
+
+
+def _fmt_taxtable_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    entries = after.get("entries") or params.get("entries") or []
+    lines = [
+        f"{time_part}  CREATE TAXTABLE",
+        f'{_INDENT}name: "{name}"  entries: {len(entries)}',
+    ]
+    for e in entries:
+        lines.append(f"{_INDENT}  {_fmt_taxtable_entry_line(e)}")
+    return lines
+
+
+def _fmt_taxtable_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = params.get("name", "")
+    lines = [f'{time_part}  UPDATE TAXTABLE  name: "{name}"']
+    changed = after.get("changed") or {}
+    if "name" in changed:
+        old = changed["name"].get("before", "?")
+        new = changed["name"].get("after", "?")
+        lines.append(f"{_INDENT}name: {old!r} → {new!r}")
+    if "entries" in changed:
+        before_entries = changed["entries"].get("before") or []
+        after_entries = changed["entries"].get("after") or []
+        lines.append(
+            f"{_INDENT}entries: {len(before_entries)} → "
+            f"{len(after_entries)}"
+        )
+        if before_entries:
+            lines.append(f"{_INDENT}  before:")
+            for e in before_entries:
+                lines.append(
+                    f"{_INDENT}    {_fmt_taxtable_entry_line(e)}"
+                )
+        if after_entries:
+            lines.append(f"{_INDENT}  after:")
+            for e in after_entries:
+                lines.append(
+                    f"{_INDENT}    {_fmt_taxtable_entry_line(e)}"
+                )
+    return lines
+
+
+def _fmt_taxtable_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    name = params.get("name", "")
+    entries = before.get("entries") or []
+    lines = [
+        f'{time_part}  DELETE TAXTABLE  name: "{name}"',
+        f"{_INDENT}removed entries: {len(entries)}",
+    ]
+    for e in entries:
+        lines.append(f"{_INDENT}  {_fmt_taxtable_entry_line(e)}")
+    return lines
 
 
 def _fmt_invoice_create(entry: dict) -> list[str]:
@@ -747,12 +1094,33 @@ def _fmt_invoice_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
-    lines = [f"{time_part}  DELETE INVOICE  id:{params.get('invoice_id', '')}"]
+    # ``id`` is the preferred alias, ``invoice_id`` back-compat;
+    # "" so the formatter never renders ``id:None``.
+    inv_id = params.get("id") or params.get("invoice_id") or ""
+    lines = [f"{time_part}  DELETE INVOICE  id:{inv_id}"]
     if after:
         entries = after.get("entries_deleted", 0)
         if entries:
             lines.append(f"{_INDENT}entries removed: {entries}")
     return lines
+
+
+def _fx_stale_lines(entry: dict) -> list[str]:
+    """Render the FX freshness-guard override line when present —
+    ``fx_stale`` appears only when ``force=True`` overrode the
+    guard, and the "forced" record gives the bookkeeper a trace.
+    Shared by the post/pay formatters (every variant delegates to
+    them). Empty list when no override.
+    """
+    after = entry.get("after_state") or {}
+    fx = after.get("fx_stale")
+    if not fx:
+        return []
+    return [
+        f"{_INDENT}FX: {fx.get('currency', '')} rate "
+        f"{fx.get('rate_used', '')} — {fx.get('age_days', '')} days "
+        f"stale, forced (quoted {fx.get('rate_date', '')})"
+    ]
 
 
 def _fmt_invoice_post(entry: dict) -> list[str]:
@@ -769,6 +1137,53 @@ def _fmt_invoice_post(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}account: {params.get('post_account', '')}  txn:{txn_guid}"
         )
+    lines += _fx_stale_lines(entry)
+    return lines
+
+
+# ── Investment handlers ───────────────────────────────────────────
+
+
+def _fmt_commodity_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    ns = after.get("namespace", params.get("namespace", ""))
+    mnem = after.get("mnemonic", params.get("mnemonic", ""))
+    lines = [f"{time_part}  CREATE COMMODITY  {ns}:{mnem}"]
+    fullname = after.get("fullname", params.get("fullname", ""))
+    if fullname:
+        lines.append(f'{_INDENT}fullname: "{fullname}"')
+    fraction = after.get("fraction", params.get("fraction"))
+    if fraction is not None:
+        lines.append(f"{_INDENT}fraction: {fraction}")
+    return lines
+
+
+def _fmt_price_create(entry: dict) -> list[str]:
+    """``create_price`` returns ``status="updated"`` when a price at
+    the same (commodity, currency, date, source) already existed and
+    was overwritten; ``"created"`` otherwise. Surface that in the
+    header verb so a human reading the log can tell a fresh write
+    from an overwrite."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    ns = after.get("namespace", params.get("namespace", ""))
+    comm = after.get("commodity", params.get("commodity", ""))
+    status = after.get("status", "")
+    verb = "UPDATE" if status == "updated" else "CREATE"
+    lines = [f"{time_part}  {verb} PRICE  {ns}:{comm}"]
+    date_str = after.get("date", params.get("price_date", "") or "")
+    value = after.get("value", params.get("value", ""))
+    currency = after.get("currency", params.get("currency", "") or "")
+    if date_str or value:
+        parts = []
+        if date_str:
+            parts.append(f"date: {date_str}")
+        if value:
+            parts.append(f"value: {value}{' ' + currency if currency else ''}")
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
     return lines
 
 
@@ -789,6 +1204,53 @@ def _fmt_price_delete(entry: dict) -> list[str]:
             f"{_INDENT}date: {date_str}  value: {value}  source: {source}",
         ]
     return [head]
+
+
+def _fmt_lot_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    title = after.get("title", params.get("title", ""))
+    lines = [f'{time_part}  CREATE LOT  "{title}"']
+    account = after.get("account", params.get("account", ""))
+    if account:
+        lines.append(f"{_INDENT}account: {account}")
+    notes = after.get("notes", params.get("notes", ""))
+    if notes:
+        lines.append(f'{_INDENT}notes: "{notes}"')
+    return lines
+
+
+def _fmt_lot_update(entry: dict) -> list[str]:
+    """Two operations register as ``lot:UPDATE`` —
+    ``assign_split_to_lot`` (status=``"assigned"``) and
+    ``close_lot`` (status=``"closed"``). The header verb branches on
+    response status so the human reader can tell them apart at a
+    glance."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    status = after.get("status", "")
+
+    if status == "closed":
+        title = after.get("title", "")
+        if title:
+            return [f'{time_part}  CLOSE LOT  "{title}"']
+        return [f"{time_part}  CLOSE LOT  {params.get('guid', '')}"]
+
+    # Default: assign_split_to_lot
+    lines = [f"{time_part}  ASSIGN SPLIT TO LOT"]
+    split_guid = params.get("split_guid", "")
+    lot_guid = params.get("lot_guid", "")
+    if split_guid:
+        lines.append(f"{_INDENT}split: {split_guid}")
+    if lot_guid:
+        lines.append(f"{_INDENT}lot: {lot_guid}")
+    if after.get("is_closed"):
+        lines.append(
+            f"{_INDENT}lot auto-closed (quantity reached zero)"
+        )
+    return lines
 
 
 def _fmt_invoice_unpost(entry: dict) -> list[str]:
@@ -821,14 +1283,14 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+    lines += _fx_stale_lines(entry)
     return lines
 
 
 def _fmt_bill_post(entry: dict) -> list[str]:
     """Bill POST — same shape as invoice POST but with the right
     label so the audit log doesn't mis-categorize a vendor bill
-    as a customer invoice. Pre-fix the (invoice, POST) handler
-    fired for both because ``post_invoice`` accepts either."""
+    as a customer invoice (``post_invoice`` accepts either)."""
     lines = _fmt_invoice_post(entry)
     if lines:
         lines[0] = lines[0].replace("POST INVOICE", "POST BILL")
@@ -869,7 +1331,180 @@ def _fmt_bill_delete(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
-    lines = [f"{time_part}  DELETE BILL  id:{params.get('bill_id', '')}"]
+    # See _fmt_invoice_delete — same id/bill_id alias issue.
+    bill_id = params.get("id") or params.get("bill_id") or ""
+    lines = [f"{time_part}  DELETE BILL  id:{bill_id}"]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+# ── Voucher formatters ───────────────────────────────────────
+# Vouchers reach these via the decorator's entity_type swap (the
+# lifecycle tools register as "invoice"; the response's ``type``
+# field is the truth). Same shape as the bill formatters.
+
+
+def _fmt_voucher_post(entry: dict) -> list[str]:
+    lines = _fmt_invoice_post(entry)
+    if lines:
+        lines[0] = lines[0].replace("POST INVOICE", "POST VOUCHER")
+    return lines
+
+
+def _fmt_voucher_unpost(entry: dict) -> list[str]:
+    lines = _fmt_invoice_unpost(entry)
+    if lines:
+        lines[0] = lines[0].replace("UNPOST INVOICE", "UNPOST VOUCHER")
+    return lines
+
+
+def _fmt_voucher_pay(entry: dict) -> list[str]:
+    lines = _fmt_invoice_pay(entry)
+    if lines:
+        lines[0] = lines[0].replace("PAY INVOICE", "PAY VOUCHER")
+    return lines
+
+
+def _fmt_voucher_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    voucher_id = after.get("id", "")
+    employee_id = after.get("employee_id", params.get("employee_id", ""))
+    return [
+        f"{time_part}  CREATE VOUCHER  id:{voucher_id}",
+        f"{_INDENT}employee: {employee_id}",
+    ]
+
+
+def _fmt_voucher_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    # See _fmt_invoice_delete — same id/voucher_id alias issue.
+    voucher_id = params.get("id") or params.get("voucher_id") or ""
+    lines = [
+        f"{time_part}  DELETE VOUCHER  "
+        f"id:{voucher_id}"
+    ]
+    if after:
+        entries = after.get("entries_deleted", 0)
+        if entries:
+            lines.append(f"{_INDENT}entries removed: {entries}")
+    return lines
+
+
+# ── Credit-note formatters ───────────────────────────────────
+# The audit line surfaces the side (customer/vendor) so a reviewer
+# doesn't cross-reference the source ID; ``applies_to`` shows when
+# linked.
+
+
+def _fmt_credit_note_post(entry: dict) -> list[str]:
+    lines = _fmt_invoice_post(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "POST INVOICE", "POST CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_unpost(entry: dict) -> list[str]:
+    lines = _fmt_invoice_unpost(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "UNPOST INVOICE", "UNPOST CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_pay(entry: dict) -> list[str]:
+    """REFUND label — pay_invoice on a credit note is the
+    cash-refund path; a reviewer must not mistake it for a normal
+    payment."""
+    lines = _fmt_invoice_pay(entry)
+    if lines:
+        lines[0] = lines[0].replace(
+            "PAY INVOICE", "REFUND CREDIT NOTE",
+        )
+    return lines
+
+
+def _fmt_credit_note_apply(entry: dict) -> list[str]:
+    """APPLY — the no-cash netting of a credit note against an
+    invoice/bill from the same owner."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    cn_id = params.get("credit_note_id", "")
+    target_id = params.get("applies_to_invoice_id", "")
+    amount = after.get("amount_applied", "")
+    cn_remaining = after.get("credit_note_remaining", "")
+    target_remaining = after.get("target_remaining", "")
+    lines = [
+        f"{time_part}  APPLY CREDIT NOTE  id:{cn_id}",
+        (
+            f"{_INDENT}applied: {amount}  "
+            f"against: {target_id}"
+        ),
+    ]
+    # Decimal comparison, not string equality — the response holds
+    # quantized strings ("0.00") that "== '0'" would mishandle.
+    from decimal import Decimal as _D, InvalidOperation as _IO
+    def _is_zero(s: str) -> bool:
+        if not s:
+            return True
+        try:
+            return _D(s) == 0
+        except _IO:
+            return False
+    if not _is_zero(cn_remaining):
+        lines.append(
+            f"{_INDENT}credit note remaining: {cn_remaining}"
+        )
+    if not _is_zero(target_remaining):
+        lines.append(
+            f"{_INDENT}target remaining: {target_remaining}"
+        )
+    return lines
+
+
+def _fmt_credit_note_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    cn_id = after.get("id", "")
+    owner_type = params.get("owner_type", "")
+    # The owner_id key is side-dependent (customer_id / vendor_id).
+    owner_id = (
+        after.get("customer_id")
+        or after.get("vendor_id")
+        or params.get("owner_id", "")
+    )
+    lines = [f"{time_part}  CREATE CREDIT NOTE  id:{cn_id}"]
+    detail = f"{_INDENT}{owner_type}: {owner_id}"
+    applies_to = after.get("applies_to")
+    if applies_to:
+        detail += f"  applies to: {applies_to.get('id', '')}"
+    lines.append(detail)
+    return lines
+
+
+def _fmt_credit_note_delete(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state")
+
+    # See _fmt_invoice_delete — same id/credit_note_id alias issue.
+    cn_id = params.get("id") or params.get("credit_note_id") or ""
+    lines = [
+        f"{time_part}  DELETE CREDIT NOTE  "
+        f"id:{cn_id}"
+    ]
     if after:
         entries = after.get("entries_deleted", 0)
         if entries:
@@ -883,7 +1518,14 @@ def _fmt_entry_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     desc = after.get("description", params.get("description", ""))
     total = after.get("total", "")
-    inv_id = params.get("invoice_id", "") or params.get("bill_id", "")
+    # Whichever doc-ID key the tool wrapper used (mutually
+    # exclusive in practice).
+    inv_id = (
+        params.get("invoice_id", "")
+        or params.get("bill_id", "")
+        or params.get("voucher_id", "")
+        or params.get("credit_note_id", "")
+    )
     return [
         f"{time_part}  CREATE ENTRY",
         f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
@@ -891,6 +1533,30 @@ def _fmt_entry_create(entry: dict) -> list[str]:
 
 
 # ── Budget handlers ────────────────────────────────────────────────
+
+
+def _fmt_budget_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    lines = [f'{time_part}  CREATE BUDGET  "{name}"']
+    info_parts = []
+    num_periods = params.get("num_periods")
+    if num_periods is not None:
+        info_parts.append(f"periods: {num_periods}")
+    period_type = params.get("period_type")
+    if period_type:
+        info_parts.append(f"type: {period_type}")
+    year = params.get("year")
+    if year is not None:
+        info_parts.append(f"year: {year}")
+    if info_parts:
+        lines.append(f"{_INDENT}{'  '.join(info_parts)}")
+    desc = params.get("description", "")
+    if desc:
+        lines.append(f'{_INDENT}description: "{desc}"')
+    return lines
 
 
 def _fmt_budget_update(entry: dict) -> list[str]:
@@ -910,9 +1576,7 @@ def _fmt_budget_update(entry: dict) -> list[str]:
     ]
     prior = before.get("prior_amounts") or {}
     if prior:
-        # Show before/after per period. ``prior_amounts`` is keyed by
-        # period number; sort numerically so the human reader sees
-        # period 0, 1, 2, … in order.
+        # Per-period before/after, sorted numerically.
         for p in sorted(prior, key=lambda k: int(k) if str(k).isdigit() else 0):
             old = prior[p]
             old_str = old if old is not None else "(unset)"
@@ -941,6 +1605,30 @@ def _fmt_budget_delete(entry: dict) -> list[str]:
 
 
 # ── Scheduled-transaction handlers ─────────────────────────────────
+
+
+def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    name = after.get("name", params.get("name", ""))
+    lines = [f'{time_part}  CREATE SCHEDULED  "{name}"']
+    freq = after.get("frequency", params.get("frequency", ""))
+    start = params.get("start_date", "")
+    end = params.get("end_date", "")
+    parts = []
+    if freq:
+        parts.append(f"frequency: {freq}")
+    if start:
+        parts.append(f"start: {start}")
+    if end:
+        parts.append(f"end: {end}")
+    if parts:
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    next_occ = after.get("next_occurrence")
+    if next_occ:
+        lines.append(f"{_INDENT}next: {next_occ}")
+    return lines
 
 
 def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
@@ -1014,7 +1702,13 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("employee", "CREATE"): _fmt_employee_create,
     ("employee", "UPDATE"): _fmt_employee_update,
     ("employee", "DELETE"): _fmt_employee_delete,
+    ("job", "CREATE"): _fmt_job_create,
+    ("job", "UPDATE"): _fmt_job_update,
+    ("job", "DELETE"): _fmt_job_delete,
     ("billterm", "CREATE"): _fmt_billterm_create,
+    ("taxtable", "CREATE"): _fmt_taxtable_create,
+    ("taxtable", "UPDATE"): _fmt_taxtable_update,
+    ("taxtable", "DELETE"): _fmt_taxtable_delete,
     ("invoice", "CREATE"): _fmt_invoice_create,
     ("invoice", "DELETE"): _fmt_invoice_delete,
     ("invoice", "POST"): _fmt_invoice_post,
@@ -1025,10 +1719,29 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("bill", "POST"): _fmt_bill_post,
     ("bill", "UNPOST"): _fmt_bill_unpost,
     ("bill", "PAY"): _fmt_bill_pay,
+    ("voucher", "CREATE"): _fmt_voucher_create,
+    ("voucher", "DELETE"): _fmt_voucher_delete,
+    ("voucher", "POST"): _fmt_voucher_post,
+    ("voucher", "UNPOST"): _fmt_voucher_unpost,
+    ("voucher", "PAY"): _fmt_voucher_pay,
+    # Credit-note POST/UNPOST/PAY arrive via the decorator's
+    # entity_type swap; APPLY is apply_credit_note's netting op.
+    ("credit_note", "CREATE"): _fmt_credit_note_create,
+    ("credit_note", "DELETE"): _fmt_credit_note_delete,
+    ("credit_note", "POST"): _fmt_credit_note_post,
+    ("credit_note", "UNPOST"): _fmt_credit_note_unpost,
+    ("credit_note", "PAY"): _fmt_credit_note_pay,
+    ("credit_note", "APPLY"): _fmt_credit_note_apply,
     ("entry", "CREATE"): _fmt_entry_create,
+    ("commodity", "CREATE"): _fmt_commodity_create,
+    ("price", "CREATE"): _fmt_price_create,
     ("price", "DELETE"): _fmt_price_delete,
+    ("lot", "CREATE"): _fmt_lot_create,
+    ("lot", "UPDATE"): _fmt_lot_update,
+    ("budget", "CREATE"): _fmt_budget_create,
     ("budget", "UPDATE"): _fmt_budget_update,
     ("budget", "DELETE"): _fmt_budget_delete,
+    ("scheduled_transaction", "CREATE"): _fmt_scheduled_transaction_create,
     ("scheduled_transaction", "UPDATE"): _fmt_scheduled_transaction_update,
     ("scheduled_transaction", "DELETE"): _fmt_scheduled_transaction_delete,
 }
@@ -1054,139 +1767,52 @@ _ACCOUNT_REF_KEYS_CONDITIONAL: dict[tuple[str, str], frozenset[str]] = {
 }
 
 
-def _looks_like_guid_ref(value) -> bool:
-    """True iff ``value`` is a string worth resolving — short GUID
-    (``%xxxxxxx``) or 32-char hex full GUID. Path strings are already
-    canonical and skipped."""
-    if not isinstance(value, str) or not value:
-        return False
-    if value.startswith("%"):
-        return True
-    if len(value) == 32:
-        try:
-            int(value, 16)
-            return True
-        except ValueError:
-            return False
-    return False
-
-
 def _normalize_account_refs_for_audit(
     params: dict, entity_type: str, operation: str
 ) -> dict:
-    """Resolve any short / full-GUID account refs in ``params`` to
-    canonical full paths for audit-log rendering.
+    """Audit-log-specific wrapper around
+    :meth:`BaseGnuCashBook._normalize_account_refs` — this side
+    knows WHICH param keys carry refs (always vs per-operation);
+    the book layer owns the resolve mechanics.
 
-    The audit log is the one human-facing surface in the app — the LLM
-    can read short GUIDs fine, but a human reviewing the log shouldn't
-    have to look up ``%2e78c86`` to know what got reconciled. This
-    function walks ``params`` once and rewrites every known account-ref
-    key (and split-list ``account`` values) to the matching
-    ``Account.fullname``.
-
-    One book open per entry, regardless of how many refs are resolved.
-    Resolution failures degrade gracefully — we leave the original
-    string in place rather than crashing log rendering.
+    Falls back to ``params`` unchanged when the book wrapper isn't
+    available — the log line still renders with raw refs.
     """
     if not params:
         return params
+    if _get_book_func is None:
+        return params
+    try:
+        book_wrapper = _get_book_func()
+    except Exception:
+        return params
+    if book_wrapper is None:
+        return params
+    # Test-fixture / lightweight wrappers may not subclass
+    # ``BaseGnuCashBook``; degrade gracefully rather than crash
+    # audit-log rendering.
+    if not hasattr(book_wrapper, "_normalize_account_refs"):
+        return params
 
-    keys_to_normalize = set(_ACCOUNT_REF_KEYS_ALWAYS) | (
-        _ACCOUNT_REF_KEYS_CONDITIONAL.get((entity_type, operation)) or set()
+    keys_to_normalize = _ACCOUNT_REF_KEYS_ALWAYS | (
+        _ACCOUNT_REF_KEYS_CONDITIONAL.get(
+            (entity_type, operation),
+        ) or frozenset()
     )
-
-    # Pass 1: collect every unique ref string that's worth a lookup.
-    refs: set[str] = set()
-    for key, value in params.items():
-        if key in keys_to_normalize and _looks_like_guid_ref(value):
-            refs.add(value)
-        elif key == "splits" and isinstance(value, list):
-            for split in value:
-                if isinstance(split, dict):
-                    acct_ref = split.get("account")
-                    if _looks_like_guid_ref(acct_ref):
-                        refs.add(acct_ref)
-
-    if not refs:
-        # All values are paths already (or nothing to normalize).
-        return params
-
-    # Pass 2: one book open, resolve everything.
-    resolved: dict[str, str] = {}
-    if _get_book_func is not None:
-        try:
-            book_wrapper = _get_book_func()
-            if book_wrapper is not None:
-                with book_wrapper.open(readonly=True) as book:
-                    for ref in refs:
-                        try:
-                            account = book_wrapper._resolve_account(book, ref)
-                            if account is not None:
-                                resolved[ref] = account.fullname
-                        except Exception as e:
-                            # Stale, ambiguous, malformed — leave the raw
-                            # ref in place; the log line is still useful.
-                            # Surface in debug log so a post-hoc audit-log
-                            # reader who notices a raw ``%xxxxxxx`` instead
-                            # of a fullname can find the underlying cause.
-                            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
-                            debug_logger.warning(
-                                f"Audit log: could not resolve account "
-                                f"ref {ref!r} for canonical rendering "
-                                f"({type(e).__name__}: {e})"
-                            )
-                            continue
-        except Exception as e:
-            # Book unavailable: fall back to raw refs everywhere.
-            debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
-            debug_logger.warning(
-                f"Audit log: book wrapper unavailable for ref "
-                f"normalization ({type(e).__name__}: {e})"
-            )
-
-    if not resolved:
-        return params
-
-    def _replace(s):
-        return resolved.get(s, s) if isinstance(s, str) else s
-
-    # Pass 3: rewrite. Non-destructive — return a new dict so the
-    # debug-log line that already captured the original params is
-    # unaffected.
-    out: dict = {}
-    for key, value in params.items():
-        if key in keys_to_normalize:
-            out[key] = _replace(value)
-        elif key == "splits" and isinstance(value, list):
-            new_splits = []
-            for split in value:
-                if isinstance(split, dict) and "account" in split:
-                    new_splits.append({**split, "account": _replace(split["account"])})
-                else:
-                    new_splits.append(split)
-            out[key] = new_splits
-        else:
-            out[key] = value
-    return out
+    return book_wrapper._normalize_account_refs(
+        params, keys_to_normalize,
+    )
 
 
 def _format_audit_entry_text(entry: dict) -> str:
     """Format an audit entry as human-readable text.
 
-    Only formats write operations (mutations). Reads and unmapped
-    (entity_type, operation) combos return the empty string so a new
-    classification added in book code but not yet wired to a handler
-    degrades silently rather than crashing log rendering.
-
-    The account ``MOVE`` operation is logged upstream as ``UPDATE``
-    with ``new_parent`` in params — we remap the key here before
-    lookup so the dedicated move handler fires instead of the update
-    one.
-
-    Account refs in ``params`` (``%shortguid`` or full 32-char GUIDs)
-    are resolved to canonical full paths before handlers see them.
-    Audit logs are read by humans; short GUIDs are convenient on the
-    wire but would force a manual lookup at review time.
+    Writes only; reads and unmapped (entity_type, operation) combos
+    return "" so an unwired classification degrades silently.
+    Account MOVE arrives as UPDATE-with-new_parent and is remapped
+    before dispatch. Account refs in params are resolved to
+    canonical fullnames first — the log is read by humans, and
+    short GUIDs would force a lookup at review time.
     """
     if entry.get("classification") != "write":
         return ""
@@ -1206,9 +1832,8 @@ def _format_audit_entry_text(entry: dict) -> str:
     if handler is None:
         return ""
 
-    # Substitute canonical fullnames in for any %short / full-GUID
-    # account refs the LLM passed. Non-destructive: the source entry
-    # (and the debug log already written from it) keeps the raw values.
+    # Non-destructive — the source entry (and the debug log already
+    # written from it) keeps the raw values.
     normalized_params = _normalize_account_refs_for_audit(
         entry.get("params") or {}, entity_type, operation
     )
@@ -1222,20 +1847,12 @@ def _format_audit_entry_text(entry: dict) -> str:
 def _normalize_for_audit(value):
     """Recursively convert pydantic models to plain dicts/primitives.
 
-    The audit decorator captures the tool's ``kwargs`` into
-    ``entry["params"]`` and also stringifies them into the debug log
-    via ``json.dumps``. When a tool declares a pydantic model in its
-    signature (e.g. ``splits: list[SplitInput]`` on
-    ``create_transaction``), FastMCP hands us live model instances —
-    not JSON-serializable, and the audit text formatters expect the
-    raw dict shape (``split.get("account")``, etc.).
-
-    This normalizer walks the kwargs once and produces an equivalent
-    value with every pydantic model replaced by ``model_dump
-    (exclude_none=True)``. Plain dicts, lists, and scalars pass
-    through untouched (``exclude_none`` preserves the
-    "key present iff value set" contract the book methods depend
-    on — ``"quantity" in split`` keeps working).
+    FastMCP hands tools live model instances (e.g.
+    ``list[SplitInput]``) — not JSON-serializable, and the audit
+    formatters expect raw dict shapes. Each model becomes
+    ``model_dump(exclude_none=True)``; ``exclude_none`` preserves
+    the "key present iff value set" contract (``"quantity" in
+    split`` keeps working). Plain values pass through.
     """
     if hasattr(value, "model_dump"):
         return value.model_dump(exclude_none=True)
@@ -1251,7 +1868,7 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
 
     Args:
         result: JSON string returned by tool
-        entity_type: "transaction", "account", or "split"
+        entity_type: Audit entity type (e.g. "transaction", "invoice")
 
     Returns:
         State dict with guid, or None.
@@ -1286,9 +1903,11 @@ def audit_log(
 
     Args:
         classification: "read" or "write"
-        operation: For writes: "create", "update", "delete", "void", "unvoid",
-                   "reconcile", "set_state"
-        entity_type: "transaction", "account", or "split"
+        operation: For writes: the operation verb ("create", "update",
+                   "delete", "void", "post", "pay", ...) — uppercased to
+                   match the (entity_type, operation) dispatch table.
+        entity_type: Entity-type key in the audit dispatch table
+                     ("transaction", "account", "invoice", "budget", ...).
     """
 
     def decorator(func: Callable) -> Callable:
@@ -1298,17 +1917,37 @@ def audit_log(
             debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
             timestamp = datetime.now().astimezone().isoformat()
 
-            # Defense-in-depth: clear any previously-staged audit
-            # before-state at the TOP of the wrapper. The post-call
-            # consume (success branch) and the exception-path clear
-            # below are the primary cleanup paths, but if either one
-            # itself errors out (e.g., the book wrapper transiently
-            # unavailable), threading-local state can carry the
-            # previous tool's before-state into this one — and that
-            # tool would render an unrelated diff in its audit entry.
-            # Pre-clearing here means every tool starts with a clean
-            # threading-local slot regardless of what the previous
-            # call did.
+            # Rate limit checked BEFORE the auto-backup trigger and
+            # the audit-state pre-clear: a rate-limited call never
+            # started, so it must not disturb either.
+            if classification == "write":
+                limiter = _get_write_rate_limiter()
+                if limiter is not None:
+                    allowed, retry = limiter.consume()
+                    if not allowed:
+                        debug_logger.warning(
+                            f"Write rate limit hit on "
+                            f"{func.__name__}; retry in "
+                            f"{retry:.1f}s."
+                        )
+                        return json.dumps({
+                            "error": (
+                                f"Write rate limit exceeded "
+                                f"(retry in {retry:.1f}s). "
+                                f"Configured via "
+                                f"GNUCASH_WRITE_RATE_LIMIT="
+                                f"{os.environ.get('GNUCASH_WRITE_RATE_LIMIT')} "
+                                f"tokens/sec."
+                            ),
+                            "error_type": "rate_limited",
+                            "retry_after_seconds": round(retry, 2),
+                        })
+
+            # Defense-in-depth pre-clear of staged audit state: if
+            # the primary cleanup paths themselves error, the
+            # previous tool's before-state would leak into this one
+            # and render an unrelated diff. Every tool starts with
+            # a clean threading-local slot.
             if _get_book_func is not None:
                 try:
                     pre_book = _get_book_func()
@@ -1317,10 +1956,8 @@ def audit_log(
                 except Exception:
                     pass
 
-            # Normalize up front so pydantic models (e.g. list[SplitInput]
-            # from the transaction-creating tools) become plain dicts before
-            # they hit json.dumps in the debug line or the text-audit
-            # formatters that read from entry["params"].
+            # Pydantic models → plain dicts before json.dumps and
+            # the text formatters see them.
             normalized_kwargs = _normalize_for_audit(kwargs)
 
             entry = {
@@ -1339,11 +1976,9 @@ def audit_log(
                 f"params={json.dumps(normalized_kwargs)}"
             )
 
-            # Before the first write of each process, give the backup
-            # system a chance to snapshot. BackupMixin's own flag makes
-            # subsequent calls no-op, so the cost is negligible after
-            # the first hit. Silent on failure — auto-backup must
-            # never break a user's write. Reads never trigger.
+            # First write of the process triggers the auto-backup
+            # check (BackupMixin's flag no-ops the rest). Silent on
+            # failure — must never break a user's write.
             if classification == "write" and _get_book_func is not None:
                 try:
                     book = _get_book_func()
@@ -1360,10 +1995,8 @@ def audit_log(
                 result = func(*args, **kwargs)
                 elapsed_ms = (time.time() - start_time) * 1000
 
-                # Consume any before-state the book method staged while
-                # its session was open. Always consume (even on read /
-                # create) to clear any stray value; helper returns None
-                # when nothing staged.
+                # Always consume staged before-state (even on reads)
+                # to clear strays; returns None when nothing staged.
                 before = None
                 if _get_book_func is not None:
                     try:
@@ -1385,19 +2018,19 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            # Invoice/bill polymorphism: post_invoice
-                            # / unpost_invoice / pay_invoice all carry
-                            # entity_type="invoice" on the decorator
-                            # but accept either kind. The response's
-                            # ``type`` field is the truth — swap
-                            # entity_type to ``bill`` when the call
-                            # operated on a vendor bill so the audit
-                            # log doesn't mis-categorize the entry.
+                            # The lifecycle tools register as
+                            # entity_type="invoice" but accept all
+                            # four document kinds — the response's
+                            # ``type`` field is the truth; swap so
+                            # the log doesn't mis-categorize.
                             if (
                                 entity_type == "invoice"
-                                and result_data.get("type") == "bill"
+                                and result_data.get("type")
+                                in {"bill", "voucher", "credit_note"}
                             ):
-                                entry["entity_type"] = "bill"
+                                entry["entity_type"] = (
+                                    result_data["type"]
+                                )
                             after = _extract_after_state(
                                 result, entry["entity_type"]
                             )

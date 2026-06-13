@@ -383,6 +383,40 @@ class TestPruneBackups:
         kept_ts = sorted(e["timestamp"] for e in remaining)
         assert kept_ts[0] > "2026-04-19T08:06"  # minutes 7/8/9
 
+    def test_prune_under_path_redaction_deletes_real_files(
+        self, test_book: Path, monkeypatch,
+    ):
+        """H2 regression: with GNUCASH_REDACT_PATHS=1, ``list_backups``
+        redacts each entry's ``path`` to a bare basename. Pre-fix the
+        pruners called ``Path(entry["path"]).unlink()`` on that
+        basename, which resolved against the process CWD — a silent
+        no-op, so retention never actually trimmed. The prune must
+        still delete the real files in the backups dir.
+        """
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        book = GnuCashBook(str(test_book))
+        self._make_n_session_backups(book, 10)
+
+        backups_dir = book._backups_dir()
+        assert len(list(backups_dir.iterdir())) == 10
+
+        # Redaction is actually active: listed paths are basenames.
+        listed = book.list_backups()
+        assert listed and all("/" not in e["path"] for e in listed)
+
+        result = book.prune_backups(
+            keep_last_n=3, stage="session", dry_run=False
+        )
+        assert len(result["deleted"]) == 7
+
+        # The real files are gone (pre-fix: all 10 would remain because
+        # unlink targeted a CWD basename that doesn't exist there).
+        remaining = sorted(p.name for p in backups_dir.iterdir())
+        assert len(remaining) == 3, (
+            f"prune under path redaction did not delete real files; "
+            f"backups dir still holds: {remaining}"
+        )
+
     def test_prune_never_touches_manual_unless_asked(
         self, test_book: Path
     ):
@@ -456,6 +490,62 @@ class TestPruneBackups:
         assert result["dry_run"] is True
         # Plan shows the 1 manual would be deleted.
         assert len(result["would_delete"]) == 1
+
+    def test_prune_refuses_to_wipe_all_auto_backups(self, test_book: Path):
+        """MP-3 symmetric guard: ``prune_backups(keep_last_n=0,
+        dry_run=False)`` without an explicit ``stage`` must raise
+        rather than wipe every auto backup across all auto stages.
+
+        Auto backups rebuild over time (sessions on next write,
+        weekly on next Monday, monthly on next 1st), but in the
+        interim the user has no way to recover backups they didn't
+        realize they were deleting. Mirrors the manual-stage guard
+        — same shape of footgun, different stage scope.
+        """
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto-1")
+        book.create_backup(stage="session", label="auto-2")
+
+        with pytest.raises(
+            ValueError,
+            match="Refusing to delete every auto backup at once",
+        ):
+            book.prune_backups(keep_last_n=0, dry_run=False)
+
+        # Auto backups still on disk after the refusal.
+        session_count = sum(
+            1 for e in book.list_backups() if e["stage"] == "session"
+        )
+        assert session_count == 2
+
+    def test_prune_dry_run_with_zero_auto_still_allowed(
+        self, test_book: Path,
+    ):
+        """``dry_run=True`` with implicit-auto + keep_last_n=0
+        must still produce a plan (matches the manual-stage
+        symmetric behavior — review-before-act is always
+        permitted)."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto")
+
+        result = book.prune_backups(keep_last_n=0, dry_run=True)
+        assert result["dry_run"] is True
+
+    def test_prune_explicit_auto_stage_with_zero_allowed(
+        self, test_book: Path,
+    ):
+        """An explicit ``stage='session'`` with ``keep_last_n=0``
+        is intentional and permitted — the user opted in to
+        zero-retention for that specific stage. The guard only
+        catches the implicit-all-auto-stages case."""
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="session", label="auto")
+
+        result = book.prune_backups(
+            keep_last_n=0, stage="session", dry_run=False,
+        )
+        # At least one auto-stage backup was deleted.
+        assert len(result["deleted"]) >= 1
 
     def test_prune_explicit_manual_stage_works(self, test_book: Path):
         """Explicit stage='manual' DOES prune manual backups."""
@@ -698,3 +788,53 @@ class TestAuditHookIntegration:
         # Flag never toggled; no backups exist
         assert book._backup_checked_in_process is False
         assert book.list_backups() == []
+
+
+class TestBackupPathRedaction:
+    """MP-4: backup tool responses must honor
+    ``GNUCASH_REDACT_PATHS=1`` so absolute paths can collapse to
+    basenames before the response leaves the server. Default off
+    (paths are useful debugging signal locally); opt-in via the
+    same env var the error-message redaction uses.
+    """
+
+    def test_create_backup_path_redacted_when_env_set(
+        self, test_book: Path, monkeypatch,
+    ):
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        book = GnuCashBook(str(test_book))
+        result = book.create_backup(stage="manual", label="test")
+        # path collapses to basename — no directory components.
+        assert "/" not in result["path"], result["path"]
+        # restore_hint should not embed any absolute paths
+        # either.
+        assert " /" not in result["restore_hint"], result["restore_hint"]
+        # The book filename is preserved (so the user knows what
+        # they're restoring).
+        assert test_book.name in result["restore_hint"]
+
+    def test_create_backup_path_intact_by_default(
+        self, test_book: Path, monkeypatch,
+    ):
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        book = GnuCashBook(str(test_book))
+        result = book.create_backup(stage="manual", label="test")
+        # Default behavior emits full absolute paths.
+        assert str(test_book.parent) in result["restore_hint"], (
+            "default behavior should embed full paths for actionable "
+            f"restore hint; got: {result['restore_hint']!r}"
+        )
+
+    def test_list_backups_paths_redacted_when_env_set(
+        self, test_book: Path, monkeypatch,
+    ):
+        # Create with redaction off so the file lands at a real
+        # absolute path, then re-list with redaction on.
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        book = GnuCashBook(str(test_book))
+        book.create_backup(stage="manual", label="redaction-test")
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
+        listed = book.list_backups()
+        assert listed, "fixture failed: backup not created"
+        for entry in listed:
+            assert "/" not in entry["path"], entry

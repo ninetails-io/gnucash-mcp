@@ -1,5 +1,530 @@
 # Changelog
 
+## v1.3.1 — Business module, role-aligned modules, multi-currency correctness
+
+v1.2.1 fixed everything the business module *should* have been at first
+ship. v1.3 finishes the headline features the bookkeeper had been
+asking for since v1.2 and reshapes the public module surface around
+how real users actually deploy the server.
+
+**Business module — the four big features.**
+
+- **Employee expense vouchers** (`create_voucher`, `add_voucher_entry`,
+  `post_invoice` / `pay_invoice` / `unpost_invoice` /
+  `delete_voucher` polymorphic). The third half of the invoice
+  lifecycle alongside customer invoices and vendor bills. Employees
+  submit reimbursable expenses; voucher posts to A/P, payment hits
+  the chosen cash account. Same `owner_type='employee'` dispatch the
+  other invoice tools already understood.
+- **Credit notes** (`create_credit_note`, `add_credit_note_entry`,
+  `apply_credit_note`, plus the shared `post_invoice` /
+  `unpost_invoice` / `delete_credit_note` path). Refund and return
+  documents for customers and vendors. Posts as a negative invoice;
+  applies against an outstanding invoice or bill to net the
+  payable/receivable down. Lifecycle tracks
+  `gnc-mcp/applies-to-invoice` so the link survives between sessions.
+- **Jobs** (`create_job`, `get_job`, `list_jobs`, `update_job`,
+  `get_job_report`, `delete_job`). Project-level grouping over
+  invoices and bills for a single customer or vendor. A jobs-level
+  P&L (`get_job_report`) shows revenue, costs, net by project — the
+  view a freelancer needs at year-end without manually slicing every
+  client's transactions. Invoices and bills accept an optional
+  `job_id` at creation; existing tools see job-attached documents
+  through the same surfaces.
+- **Tax tables** (`create_taxtable`, `add_taxtable_entry`,
+  `update_taxtable`, `list_taxtables`, `get_taxtable`,
+  `delete_taxtable`). Composite tax rates (e.g. state + local
+  sales tax stacked) attached to invoice/bill/voucher line items.
+  Posting builds the tax splits at post-time from each entry's
+  taxable amount × applicable rate, with residual-to-largest-rate
+  rounding so totals tie exactly. Tax-inclusive pricing (`price` is
+  gross, pretax extracted at post) handled symmetrically. Refcount
+  discipline blocks deletion of in-use taxtables.
+
+The Stage 3 surface adds 19 tools to the catalog (87 → 106), each
+exercised against the synthetic test books before release.
+
+**Module surface — role-aligned partition.**
+
+`--modules` previously partitioned by code organization
+(`core / admin / backup / investments / business`). The new partition
+matches how people actually use the server:
+
+- **`core`** (29 tools) — always-on ledger primitives:
+  accounts, transactions, slots, audit, backup, balance sheet,
+  summary, diagnostics, reconciliation. Now a group alias
+  expanding to nine independently-selectable sub-modules; you
+  can opt into the group or pick the sub-modules à la carte.
+  *Reconciliation joined core late in the v1.3 cycle —
+  bookkeeper-flagged that reconciliation touches money and
+  every configuration touches money, so excluding it from any
+  persona produced a server that couldn't reconcile statements.*
+- **`bookkeeper`** (17 tools) — personal-finance management:
+  reporting, budgets, scheduling. Group alias for the three
+  underlying modules.
+- **`investor`** (12 tools) — group alias for `portfolio`
+  (commodities + prices, the multi-currency primitive) plus
+  `tax_lots` (cost basis tracking).
+- **`freelancer`** (19 tools) — customer-facing invoicing: invoice
+  creation, posting, payment, outstanding-invoices, taxtables.
+- **`business`** (29 tools) — vendor management, employee
+  expenses, jobs, credit notes, customers, billing terms.
+
+`get_server_config` renders the loaded modules as
+`core[accounts, audit, ...], reporting, ...` so it's clear what's
+inside each group without reading source. Group expansion is single-
+pass; the partition is deliberately flat. See the README's "Choosing
+a module set" table for which modules to load for which use case.
+
+**Reconciliation — bulk mode for OFX-import workflows.**
+
+- **`reconcile_all=true`** reconciles every unreconciled split on
+  the account in one call. The common case for "I just imported a
+  bank statement — everything matches; reconcile it all." No
+  GUID round-trip; one call instead of ~100 if a month's worth of
+  transactions are involved.
+- **`except_guids=[...]`** carves exceptions out of the bulk set.
+  When the statement matches the book *except* for one pending
+  ACH or a manual split the bank doesn't know about yet, two
+  prefix tokens describe the exception instead of the 100+ a full
+  `split_guids` listing would cost.
+- **`through_date`** filters bulk mode to splits on or before a
+  date — useful when you're reconciling a mid-month statement.
+- **Account shortcuts** accepted everywhere the older
+  reconciliation tools wanted full paths. `%2e78c86` flows in and
+  out of `reconcile_account` the same way it does in every other
+  account-aware tool.
+
+**Token bloat trimmed on read tools and business responses.**
+
+Bookkeeper-found during PR #92 review. Two patterns wasted
+tokens with no callable benefit:
+
+- **`get_transaction` and `list_transactions(verbose=True)`** were
+  emitting full 32-char GUIDs for transaction, split, and lot
+  fields. The compact path of `list_transactions` already
+  emitted collision-safe 8-char prefixes via the cached
+  `_transaction_prefix_map`; verbose didn't. Every tool that
+  accepts a GUID accepts an 8+ char prefix via `_resolve_guid`,
+  so the extra 24 chars per GUID was dead weight. On a 50-
+  transaction verbose list with 2-3 splits each, that's ~6-8K
+  chars saved per call.
+- **Business-object `guid` fields** (customer, vendor, employee,
+  job, billterm, taxtable, invoice, entry) — bookkeeper-
+  validated as never used by any consumer. Every business
+  object is addressed by its human-readable handle (ID like
+  "000001" or name like "BC GST+PST 12%"). The 32-char GUID
+  on every read and write response was pure overhead.
+  Stripped entirely from response shapes.
+
+The `transaction_guid` field on business write responses
+(post_invoice, pay_invoice, apply_credit_note) is preserved —
+it's the one business-tool surface that emits a core-
+transaction GUID consumers actually use (passed to
+get_transaction to verify splits). It's now emitted as a short
+prefix too.
+
+Two new cached prefix maps in `BaseGnuCashBook`
+(`_split_prefix_map`, `_lot_prefix_map`) parallel the existing
+`_transaction_prefix_map` — same mtime-keyed invalidation,
+same collision-safety guarantees against `_resolve_guid`.
+
+**Early-payment discounts now actually honored.**
+
+`create_billterm` had been accepting `discount_days` and
+`discount_percent` since v1.3 launched. The fields stored
+correctly, `get_billterm` returned them correctly — and
+`pay_invoice` ignored them entirely. A freelancer with `2/10 Net
+30` terms whose customer paid $980 of $1,000 on day 5 got a
+partial-payment record with $20 still outstanding instead of
+the clean settlement they expected.
+
+The pay path now supports an explicit `apply_discount=True`
+mode that validates terms exist, the payment date is within the
+discount window, and the shortfall matches the expected discount
+on pre-tax principal (tax is collected on behalf of the
+government at the gross rate and is NOT reduced — discounting
+it would short the GST/PST remittance). Each failure mode
+rejects with a specific error; no silent downgrades to partial.
+
+The discount split routes via the same auto-resolver pattern as
+`fx_account`: explicit `discount_account=` parameter > leaf-name
+match on `INCOME`/`EXPENSE` accounts > canonical default
+(`Expenses:Sales Discounts` for customer payments,
+`Income:Purchase Discounts Taken` for vendor bill payments —
+auto-created on first use).
+
+`get_invoice` verbose mode now surfaces a `discount_available`
+block (or `discount_expired` once the window passes) with the
+eligible-until date and dollar amount, so the LLM can
+proactively offer "you can save $X by paying this by Y" without
+the freelancer having to ask.
+
+**`balance_sheet` now actually balances.**
+
+Two unrelated bugs were producing a silent A ≠ L + E identity
+failure on every multi-currency book and every book with
+outstanding invoices:
+
+- **RECEIVABLE and PAYABLE were excluded from balance_sheet's
+  asset/liability buckets.** Posted-but-unpaid invoices were
+  invisible — Alex's $16,200 of outstanding A/R didn't appear in
+  Assets at all. Both account types now sit in their natural
+  buckets across `balance_sheet`, `net_worth`, and the
+  `get_book_summary` trajectory anchor (cross-tool agreement on
+  net worth was the calibration the bookkeeper review pattern
+  catches).
+- **A synthetic "Unrealized Gain/Loss" equity row.** Assets
+  render at market value (factor × quantity for commodities and
+  foreign-currency cash) while equity rolls up at historical-
+  cost split values. The gap — investment market drift on
+  STOCK/MUTUAL plus FX translation adjustment on foreign-
+  currency holdings — now appears as a single signed line in the
+  equity section, computed as the balancing residual. Display-
+  only; no journal entry is booked, the ledger remains at cost
+  exactly the way GnuCash itself stores it. Positive = unrealized
+  gain; negative = unrealized loss. On Alex's book the line
+  reconciles a ~$13K gap; on Lin Wei's book the FX translation
+  effect is similarly absorbed.
+
+After both fixes, A = L + E holds by construction across the
+three tools that compute net worth.
+
+**Heads-up for users tracking trajectory month-over-month:** the
+net-worth number — and every historical anchor (12mo / 6mo / 3mo
+/ 1mo ago) — now includes outstanding A/R minus A/P. On books
+with active business activity this is a meaningful restatement
+of the trajectory. Alex's "now" anchor moves from ~$189K (pre-
+v1.3) to $204K because $15K of A/R that was previously
+excluded now sits in the total. Historical anchors shift by
+whatever A/R / A/P existed on those dates. This is the
+accounting-correct number; the pre-v1.3 view was "tangible net
+worth excluding outstanding business activity," which doesn't
+have a standard name and disagreed with the canonical balance-
+sheet identity.
+
+**Multi-currency aggregation sweep.**
+
+A class of bugs that v1.2.1's "FX correctness in
+spending_by_category / income_by_source" fix addressed for two
+reports, but left lurking in four other places that nobody
+flagged until the v1.3 pre-release audit:
+
+- **Monthly net** in `get_book_summary` was summing INCOME and
+  EXPENSE splits by `split.value` raw. The docstring called this
+  out as a known limitation "rare in practice for personal /
+  household books"; it isn't rare for the bookkeeper's
+  freelancer-with-foreign-clients case.
+- **Budget headline** actuals were summing `split.quantity` raw
+  across budgeted accounts. EUR-budgeted expense accounts
+  contributed raw EUR quantity to used_pct comparisons against
+  USD budget targets.
+- **Daily expense burn** (the runway divisor) summed EXPENSE
+  splits by raw value. On Lin Wei (CNY-default with USD
+  subscriptions) the burn was understated by the USD spot-rate
+  factor — overstating runway days.
+- **Vendor spending report** summed each bill's grand_total at
+  face value. A vendor list mixing USD and EUR bills produced
+  per-vendor and grand totals that were the sum of numbers in
+  unrelated units.
+
+All four now route through `_account_conversion_factors` and
+`_split_in_default_currency` (or latest-rate × bill total for
+vendor_spending), the same pattern `spending_by_category` and
+`income_by_source` already used. Three regression tests in
+TestMultiCurrencyDashboardHelpers cover the helpers; the
+vendor_spending fix is structurally verified.
+
+**Dashboard refinements.**
+
+- **Overdue counts** on the receivables and payables lines —
+  *"Receivables: USD 7,420 outstanding (3 invoices, 1 overdue ⚠)"*.
+  The headline number was already there; what was missing was
+  whether any of it was overdue.
+- **Active jobs** line when at least one job is open —
+  *"Jobs: 4 active"*. Surfaces the new entity in the same place
+  the LLM already looks for "what's open."
+- **Foreign-currency conversion in `spending_by_category` and
+  `income_by_source`.** Pre-fix, these reports summed raw split
+  quantities across commodities — a USD spend and a CNY spend
+  added together to a meaningless number. Now each split is
+  converted to the book's default currency via the latest market
+  rate (with cost-basis fallback for unpriced commodities), the
+  same pattern `balance_sheet` and `net_worth` already used.
+
+**Security — Stage 6 hardening.**
+
+- **Book directory path redacted from routine LLM-visible
+  responses.** `get_server_config` and `get_book_summary` used
+  to render the full absolute path to the loaded book — every
+  orientation call and every "what's loaded?" diagnostic was
+  leaking the username, home directory layout, and book filename
+  into the LLM transcript. Now shown as filename only. Always-on
+  for the book path specifically; backup-tool responses
+  (`create_backup` restore hint, `list_backups` path field) still
+  carry full paths because the restore use case functionally
+  needs them.
+- **Path-traversal hardening on `.mcp` sidecar directories.** Backup
+  and audit-log paths derive from `GNUCASH_BOOK_PATH`; the sidecar
+  resolution now checks symlink targets, ownership, and world-
+  writable bits before trusting an existing directory. Sticky-bit
+  dirs (the `/tmp` class) get no exemption — sticky-bit prevents
+  deletion, not symlink creation. The optional `GNUCASH_LOG_DIR`
+  override lets containerized deployments redirect logs without
+  defeating the resolution checks.
+- **Path leak redaction at the MCP error boundary.** Tool error
+  responses now route through `redact_paths()` so absolute paths
+  on the host filesystem don't leak into error strings sent to the
+  LLM. Internal logger calls keep the full paths for debugging;
+  the boundary is the wire.
+- **Write rate-limiting via token bucket.** Defends against a
+  runaway agent loop accidentally hammering the database with
+  thousands of writes per second. Disabled by default; opt-in via
+  `GNUCASH_WRITE_RATE_LIMIT` (tokens-per-second, positive float)
+  with `GNUCASH_WRITE_BURST` (max bucket size, default 10). Read
+  tools are unaffected.
+
+**Strict argument validation.**
+
+`extra="forbid"` is now the default on every tool's Pydantic
+argument model. Unknown kwargs — typos like `except=[...]` instead
+of `except_guids=[...]`, or stale-spec parameter names from older
+docs — fail loudly at the MCP boundary with `Extra inputs are not
+permitted` instead of silently no-opping. Bookkeeper-found bug:
+a `reconcile_account` call with the wrong exclusion parameter name
+ran with no exclusion at all and only surfaced as a downstream
+balance mismatch.
+
+**Parameter normalization.**
+
+`delete_invoice`, `delete_bill`, `delete_voucher`, and
+`delete_credit_note` now accept `id` (the standard name across
+`get_invoice` / `post_invoice` / `unpost_invoice` / `pay_invoice`)
+in addition to the legacy `<entity>_id`. Pass exactly one; back-
+compat preserved for existing callers.
+
+**Server instructions — 39% smaller.**
+
+The orientation block sent to MCP clients on connect went from
+~2,500 chars to 1,522 (24% under the 2K cap). Same coverage
+— double-entry sign convention, account ref formats, GUID
+conventions, investment workflow, safety rules — denser phrasing.
+Frees ~1KB of every client's context budget.
+
+**Internal refactors (no behavior change).**
+
+- **`CurrencyMixin` extraction.** The conversion-factor logic
+  (`_account_conversion_factors`, `_latest_market_rates`,
+  `_split_in_default_currency`) hoisted into a single mixin
+  composed unconditionally into `BaseGnuCashBook`. Four prior
+  copies of the `type='transaction'` price filter collapse to one
+  call site.
+- **`_compute_fx_gain_loss`** extracted from `pay_invoice`. The
+  tri-currency realized-FX delta calculation is now a standalone
+  helper, reusable across any future cross-currency payment path.
+- **`get_book_summary` decomposition.** The 460-line monolith
+  split into `_render_*` helpers per section, plus a single-pass
+  materialization of `book.accounts` and `book.transactions` that
+  shaves ~30% off the call's wall time on large books.
+- **`QueryMixin`** consolidates indexed `.filter_by(guid=...)`
+  finders that had previously been open-coded in each consumer.
+
+**Looking ahead.** Accrual A/R revaluation (mark-to-market open
+foreign-currency invoices at reporting dates) and future-dated
+transaction warnings are the next correctness items on the
+backlog. The bookkeeper's daily flow remains the production
+signal.
+
+**Multi-currency correctness sweep.** An adversarial multi-agent
+review of the whole v1.3 surface, plus the valuation work it leaned
+on — validated against the synthetic Alex (USD) and Lin Wei (CNY)
+books and the bookkeeper's real-book pass.
+
+- **`get_book_summary` FX-converts foreign-currency liabilities.**
+  The dashboard balance-sheet and net-worth trajectory summed credit
+  cards and loans at raw account-commodity quantity, while
+  `balance_sheet` / `net_worth` converted them — so a foreign-
+  denominated card or loan disagreed across surfaces. All three now
+  agree to the cent.
+- **`debt_payoff_plan`** values foreign-currency debt in the book
+  default currency instead of summing raw foreign units.
+- **`vendor_spending_report`** excludes bills it can't convert (no
+  rate on file) from the default-currency totals and emits a
+  per-currency warning, rather than silently mixing currencies.
+- **Intermediate-currency valuation.** A holding priced only through
+  a pivot currency (e.g. a fund quoted in USD inside a CNY book) now
+  values via the chain, with provenance noting the derived path
+  (`via USD`).
+- **FX staleness cap.** Market-rate lookups exclude quotes more than
+  a configurable window (`GNUCASH_FX_STALENESS_DAYS`, default 90)
+  from the report date; invoice/bill post & pay raise a clear
+  `StaleFXRateError` rather than posting on a stale rate (override
+  with `force`).
+- **Consistent future-price convention.** The rate chain pass
+  applies the same "include future-dated forecasts at now-anchors"
+  rule as the direct pass.
+- **`income_by_source` / `spending_by_category` net contra splits.**
+  Both reports dropped within-account negative splits per split (a
+  realized capital loss, an expense refund), reporting *gross*
+  instead of *net* — a Capital Gains source showed gains-only, a
+  refunded category overstated spend. They now net signed amounts per
+  account before presenting. (Account balances were always correct;
+  only these two reports misstated.)
+
+**Final adversarial pass (pre-release).** A second adversarial
+review of the release candidate probed the shapes the synthetic
+books can't produce — parents and placeholders with direct splits,
+overpayments, contra splits against budgets — and held the release
+for four fixes:
+
+- **Net-worth surfaces agree on which splits count.** The dashboard
+  skipped parent and placeholder accounts' own splits;
+  `balance_sheet` skipped placeholders'; `net_worth` skipped
+  neither. None of the three rolls children up, so a parent's or
+  placeholder's *direct* splits are real money no other row
+  represents — and the balancing-residual equity line hid the
+  deletion from the sheet's own A = L + E check. All three now share
+  one rule: every account contributes exactly its own splits.
+- **`pay_invoice` rejects overpayments.** Nothing compared the
+  payment to the remaining balance: an overpayment drove the lot
+  negative and downstream `abs()` calls inverted the sign — a
+  customer who overpaid by $1,000 showed as still *owing* $1,000 in
+  the collections list. Overpaying now rejects with guidance to book
+  the excess as a credit note; `remaining_balance`, `amount_due`,
+  and job-report `outstanding` are direction-normalized (a negative
+  reads as credit held by the counterparty, rendered `OVERPAID` in
+  compact rows); credit notes no longer carry an aging clock in the
+  verbose outstanding list.
+- **Budget actuals net contra splits.** `get_budget_report` and the
+  dashboard budget headline still used the per-split gross filter
+  the contra-netting fix above retired for the income/spending
+  reports — the budget surfaces contradicted those reports on the
+  same data. Both now accumulate signed amounts.
+- **FX direction label on credit-note refunds.** A cross-currency
+  credit-note refund's booked FX loss was labeled `"gain"` in the
+  pay response (the ledger split was always correct); the label now
+  follows the same effective direction the split was booked with.
+
+The remaining findings from the same review closed before release,
+locked by a new "pathological shapes" fixture book (parents and
+placeholders with direct splits, an overpaid invoice lot, a voided
+transaction, a desktop-created SX template, foreign-denominated A/R,
+a future-dated entry) that runs every report surface against the
+combination:
+
+- **Native SX templates filtered everywhere.** GnuCash desktop
+  persists scheduled-transaction recipes as real Transaction rows
+  under `root_template` plus a `template` pseudo-commodity.
+  `list_transactions`, `search_transactions`, the dashboard stats /
+  warnings, `list_commodities`, and the Commodities line now filter
+  both via a shared `_is_template_transaction` chokepoint, and
+  `delete_scheduled_transaction` removes desktop recipe rows instead
+  of orphaning their splits.
+- **Voided splits protected at every boundary.** `update_transaction`
+  and `replace_splits` refuse voided targets (unvoid first),
+  `reconcile_account` skips voided splits in bulk sweeps and refuses
+  explicitly-targeted ones, and auto-fill / duplicate detection no
+  longer source signals from voided history (the silent-$0-
+  transaction generator). Balance surfaces exclude voided splits by
+  state through a new `_own_splits_balance` chokepoint, so the
+  partial-void corruption shape can't move money invisibly.
+- **Future-dated transactions excluded from "now" surfaces.**
+  Runway, the low-cash warning, and `debt_payoff_plan` now cap at
+  today like every other "now" surface; null `post_date` rows (an
+  old-book artifact) render as `(no date)` instead of raising.
+- **Report totals are depth-invariant.** `spending_by_category` /
+  `income_by_source` totals are the signed sum over every group;
+  net-refunded categories and net-loss sources surface explicitly
+  (`net_negative_netted`) instead of silently vanishing at deeper
+  `depth` values. The `depth` parameter now matches its documented
+  contract (1 = top-level buckets like `Expenses:Food`); the old
+  off-by-one collapsed the default report to a single `Expenses
+  100%` row.
+- **Historical anchors never value via future rates.** The
+  intermediate-currency chain pass honors the same on-or-before
+  convention as the direct pass for past anchors; rate provenance
+  notes now name the path that actually produced the rate.
+- **Invoice settlements count as cash flow.** Lot-linked A/R / A/P
+  payments are real flow (the freelancer's revenue receipt), not
+  internal transfers — and the classification no longer depends on
+  whether FX drift happened to add a rescue split.
+- **Cross-commodity A/R relieved at the carried rate.** When the
+  receivable account's commodity differs from the invoice currency,
+  settlements relieve the lot at the post-date rate it was carried
+  at (pro-rata for partials), so a fully settled invoice leaves no
+  phantom A/R; the early-payment-discount leg's FX drift is booked
+  with the payment leg's, and the discount books at the actual
+  shortfall so the validator's 1-quantum tolerance can't produce an
+  unbalanceable transaction.
+- **Lot gains convert foreign cost basis.** `calculate_lot_gain`
+  converts foreign-denominated purchase legs at their historical
+  purchase rates before comparing against default-currency proceeds.
+- **Smaller corrections.** `update_taxtable`'s force gate spells out
+  the live-recompute blast radius; debt-plan `minimum_payment` /
+  `credit_limit` slots convert from the account's commodity;
+  invoice-family deletes clean their slot rows; `get_lot` marks
+  voided zombie rows and the dashboard reconciliation section
+  ignores them; stale docstrings corrected and a dead helper
+  removed.
+
+**Live-test signoff fixes.** The bookkeeper's post-pass validation
+run surfaced two more, both fixed before the release PR:
+
+- **Auto-fill no-match guard actually fires.** The description match
+  was bidirectional substring, so an empty-description transaction
+  matched *every* proposed description — a no-match auto-fill cloned
+  that unrelated transaction under the caller's description (a
+  phantom write) instead of raising "no match found". Blank
+  descriptions now carry no match signal on either side, which also
+  cleans the same false D-signal out of the stability, recent-match,
+  and duplicate buckets.
+- **Dashboard never ages credit notes.** The summary's warnings
+  listed an unapplied credit note as past due and counted it in the
+  overdue tally while `get_outstanding_invoices` correctly exempted
+  it. Credit notes stay in the open counts but carry no aging clock
+  anywhere.
+
+**Data safety.** Backup retention works again under
+`GNUCASH_REDACT_PATHS=1`: the pruners deleted via a redacted
+basename that resolved against the working directory — a silent
+no-op (unbounded backup growth) or a wrong-file delete. They now
+reconstruct the real path inside the backups directory.
+
+**Validation & hardening.**
+
+- `update_account`'s rename path enforces the same name validation as
+  `create_account` (rejects `:`, control characters, empty names) —
+  it was an unguarded parallel entry point.
+- Fuzzy FX / discount-account matching skips template accounts.
+- Business free-text input gates short-circuit at the MCP schema
+  boundary (reject before the audit log fires); transaction
+  write-verification handles two splits to the same account.
+
+**Retroactive budgets.** `create_budget` accepts a `start_date` so a
+budget can be anchored to a past period for back-comparison, not
+just the current year.
+
+Under the hood: cross-currency conversion consolidated into one path
+across invoice post/pay, and the deferred review items cleared.
+
+**Tests:** 1,584 passing (was 1,114 at v1.2.1). New regression
+classes cover the four Stage 3 features end-to-end, the strict-
+kwargs contract, the `id` alias mutex, the FX-correct
+breakdowns (now extended to monthly net, runway, budget
+headline, and vendor spending), the role-aligned module groups,
+the balance-sheet equation closure across simple, multi-
+currency, and A/R-bearing books, the synthetic Unrealized
+Gain/Loss line's presence/absence semantics, and the correctness
+sweep — cross-tool agreement on foreign-currency liabilities,
+vendor-report exclusion of unconvertible bills, backup pruning
+under path redaction, account-name rename validation,
+same-account split write-verification, and report contra-split
+netting (capital-loss in income, refund in expenses). The two
+synthetic test personas (Alex, Lin Wei) and the bookkeeper's
+real-book validation remain the verification harness.
+
+---
+
 ## v1.2.1 — Business module shipped, multi-currency hardened
 
 The long-tail completion of the v1.2 business-module promise. v1.2
@@ -60,9 +585,11 @@ books" into "what do I need to do next":
 - **Budget headline** — *"41% used / 33% elapsed (+8% over pace)"*
   for the current period.
 - **Reconciliation backlog with split counts** —
-  *"Checking: 47 splits unreconciled since 2025-12-30 (4 months
-  behind) ⚠"*. Scope, not just staleness. 12 splits is a single
-  sitting; 400 is "let's narrow by month."
+  *"Checking: 47 splits unreconciled (4 months behind, oldest:
+  2025-12-30) ⚠"*. Scope, not just staleness. 12 splits is a single
+  sitting; 400 is "let's narrow by month." The lag is computed from
+  the OLDEST unreconciled split so "behind" tells you the planning
+  number — not how long ago the last reconciliation closed.
 - **Upcoming scheduled** rolled into the Scheduled line —
   *"Scheduled: 13 recurring, 3 due in next 7 days (CNY 15,650)"*.
   No second tool call needed.

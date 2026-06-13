@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 
 import piecash
+from dateutil.relativedelta import relativedelta
 from piecash._common import Recurrence
 from piecash.budget import Budget, BudgetAmount
 
@@ -27,16 +28,12 @@ from gnucash_mcp.book._base import (
 def _collapse_period_runs(
     periods: dict[int, str], num_periods: int,
 ) -> str:
-    """Render an account's period amounts as a compact run-string.
+    """Render an account's period amounts as a compact run-string,
+    e.g. ``"250/mo (all periods)"`` or
+    ``"300/mo (P0-5,P8-11), 600/mo (P6-7)"``.
 
-    Example outputs:
-      ``"250/mo (all periods)"``
-      ``"300/mo (P0-5,P8-11), 600/mo (P6-7)"``
-      ``"100/mo (P0-10), 800/mo (P11)"``
-
-    Groups consecutive periods that share the same amount into runs.
-    Most monthly budgets are uniform across all periods, so the common
-    case is the simple "all periods" form.
+    Consecutive same-amount periods group into runs; most budgets
+    are uniform, so the common case is the "all periods" form.
     """
     if not periods:
         return "—"
@@ -86,20 +83,16 @@ def _collapse_period_runs(
 def _format_budget_report_compact(report: dict) -> str:
     """Render a budget-report dict as a compact text table.
 
-    Layout per Phase 5B::
+    Layout::
 
         2026 Annual Budget — Period 3 (Apr 2026)
-        Account                          Budget   Actual  Remaining  %Used
-        Auto:Fuel                           250   199.61      50.39  79.8%
-        Business:Contractor Payments      6,200 6,128.00      72.00  98.8%
-        Groceries                           450   608.57    -158.57  135.2% ⚠
-        Medical                             200 1,488.03  -1,288.03  744.0% ⚠
-        TOTAL                             7,971 9,022.90  -1,051.90  113.2% ⚠
+        Account        Budget   Actual  Remaining  %Used
+        Auto:Fuel         250   199.61      50.39  79.8%
+        TOTAL           7,971 9,022.90  -1,051.90  113.2% ⚠
 
-    ``⚠`` markers fire on rows where ``percent_used > 110%`` — same
-    threshold ``get_book_summary`` uses for the budget headline.
-    Strips a common ``Expenses:`` / ``Income:`` prefix from leaf
-    names to keep the column readable.
+    ``⚠`` fires above 110% used — same threshold as the
+    get_book_summary headline. A common ``Expenses:`` / ``Income:``
+    prefix is stripped.
     """
     accounts = report.get("accounts", [])
     totals = report.get("totals", {})
@@ -279,8 +272,6 @@ class BudgetsMixin:
         Raises:
             ValueError: If period_num is out of range.
         """
-        from dateutil.relativedelta import relativedelta
-
         if period_num < 0 or period_num >= budget.num_periods:
             raise ValueError(
                 f"Period {period_num} out of range "
@@ -471,22 +462,24 @@ class BudgetsMixin:
         num_periods: int = 12,
         period_type: str = "monthly",
         description: str = "",
+        start_date: str | None = None,
     ) -> dict:
         """Create a new budget.
 
         Args:
             name: Budget name (e.g., "2026 Budget").
-            year: Budget year. Defaults to current year.
-            num_periods: Number of periods. Default 12.
-            period_type: "monthly" (default), "quarterly", or "weekly".
-            description: Optional description.
-
-        Returns:
-            Dict with guid, name, and status.
+            year: Defaults to the current year; ignored when
+                ``start_date`` is provided.
+            num_periods: Default 12.
+            period_type: "monthly" (default), "quarterly", "weekly".
+            description: Optional.
+            start_date: ISO date of the first period; defaults to
+                Jan 1 of ``year``. Use for historical or mid-year
+                budgets.
 
         Raises:
-            ValueError: If budget with same name already exists,
-                       invalid period_type, or invalid num_periods.
+            ValueError: duplicate name, invalid period_type /
+                num_periods / start_date.
         """
         import uuid
 
@@ -499,8 +492,18 @@ class BudgetsMixin:
         if num_periods < 1:
             raise ValueError("num_periods must be at least 1")
 
-        if year is None:
-            year = date.today().year
+        if start_date is not None:
+            try:
+                period_start = date.fromisoformat(start_date)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid start_date {start_date!r}: must be "
+                    f"YYYY-MM-DD ISO format. {e}"
+                )
+        else:
+            if year is None:
+                year = date.today().year
+            period_start = date(year, 1, 1)
 
         recurrence_map = {
             "monthly": ("month", 1),
@@ -535,7 +538,7 @@ class BudgetsMixin:
                     obj_guid=budget_guid,
                     recurrence_mult=rec_mult,
                     recurrence_period_type=rec_period_type,
-                    recurrence_period_start=date(year, 1, 1),
+                    recurrence_period_start=period_start,
                     recurrence_weekend_adjust="none",
                 )
             )
@@ -556,6 +559,7 @@ class BudgetsMixin:
             return {
                 "guid": short_guid,
                 "name": name,
+                "start_date": period_start.isoformat(),
                 "status": "created",
             }
 
@@ -598,10 +602,8 @@ class BudgetsMixin:
 
             periods = self._resolve_periods(budget, period)
 
-            # Stage prior amounts (per period) so the audit log can
-            # render before/after diffs. Without this, the bookkeeper
-            # sees only the new amount and has no way to verify what
-            # changed.
+            # Prior per-period amounts for the audit log's
+            # before/after diff.
             prior_amounts: dict = {}
             for p in periods:
                 try:
@@ -617,13 +619,10 @@ class BudgetsMixin:
                 "prior_amounts": prior_amounts,
             })
 
-            # Quantize to the account commodity's smallest fraction:
-            # USD (fraction=100) → 2 decimals, JPY (fraction=1) → 0,
-            # BHD (fraction=1000) → 3. Banker's rounding avoids
-            # systematic bias on ties. We must apply the same
-            # quantization on both the insert AND update branches —
-            # piecash's hybrid ``existing.amount`` setter doesn't
-            # quantize, so without this the two paths would store
+            # Quantize to the commodity's smallest fraction (banker's
+            # rounding). Applied on BOTH the insert and update
+            # branches — piecash's ``existing.amount`` setter doesn't
+            # quantize, so the two paths would otherwise store
             # different values for the same input.
             amount_denom = acct.commodity.fraction
             quantum = Decimal(1) / Decimal(amount_denom)
@@ -661,9 +660,8 @@ class BudgetsMixin:
 
             book.save()
 
-            # periods_set is computed (e.g., "q1" → [0, 1, 2]) so we keep
-            # it. The echoed inputs (budget, account, amount) come from
-            # tool params in the audit log.
+            # periods_set is computed ("q1" → [0, 1, 2]); the echoed
+            # inputs come from tool params in the audit log.
             return {
                 "periods_set": periods,
                 "status": "updated",
@@ -681,22 +679,24 @@ class BudgetsMixin:
 
         Args:
             budget_name: Name of the budget.
-            period: Which period to report:
-                - None: Current period based on today's date (default)
-                - Integer 0-N: Specific period
-                - "ytd": Year to date (all periods up to current)
-                - "all": All periods
-            account: Optional filter to specific account or parent.
-            include_children: If True and account specified, include
-                            child accounts. Default True.
+            period: Which period(s) to report:
+                - ``None`` (default): the period covering today.
+                - Integer ``0..num_periods-1``: a specific period.
+                - ``"q1"``–``"q4"``: the quarter's three periods.
+                - ``"ytd"``: budget start through the period
+                  covering today (raises if today predates the
+                  budget).
+                - ``"all"``: every period.
+            account: Optional filter to an account or parent.
+            include_children: Include child accounts when filtering.
 
         Returns:
-            Dict with budget name, period info, account breakdown
-            (budgeted, actual, remaining, percent_used), and totals.
+            Dict with period info, per-account breakdown
+            (budgeted / actual / remaining / percent_used), totals.
 
         Raises:
-            ValueError: If budget not found, invalid period, or
-                       account not found.
+            ValueError: budget not found, invalid period, or
+                account not found.
         """
         with self.open(readonly=True) as book:
             budget = self._find_budget(book, budget_name)
@@ -752,7 +752,12 @@ class BudgetsMixin:
             else:
                 target_accounts = None
 
-            # Gather budgeted amounts
+            # One factors map, period-end-anchored, used for BOTH
+            # targets and actuals — converting only the actuals
+            # leaves targets in raw account commodities and makes
+            # used_pct meaningless on multi-currency budgets.
+            factors = self._account_conversion_factors(book, last_end)
+
             budgeted: dict[str, Decimal] = {}
             # Keep a handle to each budgeted account for descendant walking.
             budgeted_accounts: dict[str, object] = {}
@@ -762,17 +767,24 @@ class BudgetsMixin:
                 acct_name = ba.account.fullname
                 if target_accounts is not None and ba.account not in target_accounts:
                     continue
+                # None factor → no rate on file; the raw-amount
+                # fallback matches how actuals degrade via
+                # _split_in_default_currency.
+                factor = factors.get(ba.account.guid)
+                ba_amount = Decimal(str(ba.amount))
+                if factor is not None:
+                    target_in_default = ba_amount * factor
+                else:
+                    target_in_default = ba_amount
                 budgeted[acct_name] = budgeted.get(
                     acct_name, Decimal("0")
-                ) + ba.amount
+                ) + target_in_default
                 budgeted_accounts[acct_name] = ba.account
 
-            # Roll-up map: descendant-account-fullname → nearest-ancestor-
-            # fullname that is itself budgeted. Lets budgets set on a
-            # placeholder parent (e.g. Expenses:Utilities) sum the actuals
-            # from all its non-budgeted children (Electric, Gas, Water...).
-            # A child that is itself separately budgeted is NOT rolled up —
-            # its actuals stay on its own line to avoid double-counting.
+            # Roll-up map: descendant fullname → nearest budgeted
+            # ancestor, so a placeholder-parent budget sums its
+            # children's actuals. A separately-budgeted child is NOT
+            # rolled up (double-counting).
             rollup_map: dict[str, str] = {}
             for acct_name, budgeted_acct in budgeted_accounts.items():
                 rollup_map.setdefault(acct_name, acct_name)
@@ -781,56 +793,44 @@ class BudgetsMixin:
                 for desc in descendants:
                     if desc.fullname in budgeted:
                         continue  # separately budgeted — don't roll up
-                    # If multiple budgeted ancestors cover this descendant
-                    # (nested parents), keep the nearest one (the deepest
-                    # budgeted ancestor). A simple proxy: prefer the longer
-                    # ancestor path.
+                    # Nested budgeted ancestors: keep the deepest.
+                    # ``count(":")`` is the real depth — string
+                    # length as a proxy breaks under long leaf names.
                     existing = rollup_map.get(desc.fullname)
-                    if existing is None or len(acct_name) > len(existing):
+                    if (
+                        existing is None
+                        or acct_name.count(":") > existing.count(":")
+                    ):
                         rollup_map[desc.fullname] = acct_name
 
-            # Cross-currency conversion: when a budgeted account
-            # parent has children in non-default-currency commodities
-            # (e.g., USD-default book with a EUR ``Expenses:Travel``
-            # leaf), summing raw ``split.quantity`` would treat 100
-            # EUR + 100 USD as 200 in the parent's row. Use the same
-            # market-rate lookup as the reporting suite, gracefully
-            # falling back to raw quantity when reporting helpers
-            # aren't available (e.g., ``--modules budgets`` without
-            # ``reporting``).
-            factors_fn = getattr(
-                self, "_account_conversion_factors", None,
-            )
-            split_in_default = getattr(
-                self, "_split_in_default_currency", None,
-            )
-            factors = factors_fn(book) if factors_fn else None
-
-            # Calculate actuals from transactions
+            # Actuals: date filter pushed to SQL; the rollup check
+            # and sign discipline stay in Python (the rollup map
+            # isn't expressible as a WHERE clause).
             actuals: dict[str, Decimal] = {}
-            for transaction in book.transactions:
-                if not (first_start <= transaction.post_date <= last_end):
+            rows = self._query_filtered_splits(
+                book, start_date=first_start, end_date=last_end,
+            )
+            for split, _txn, account in rows:
+                rollup_target = rollup_map.get(account.fullname)
+                if rollup_target is None:
                     continue
-                for split in transaction.splits:
-                    acct_name = split.account.fullname
-                    rollup_target = rollup_map.get(acct_name)
-                    if rollup_target is None:
-                        continue
-                    if factors is not None and split_in_default is not None:
-                        amount = split_in_default(
-                            split, split.account,
-                            factors.get(split.account.guid),
-                        )
-                    else:
-                        amount = Decimal(str(split.quantity))
-                    if split.account.type == "EXPENSE" and amount > 0:
-                        actuals[rollup_target] = actuals.get(
-                            rollup_target, Decimal("0")
-                        ) + amount
-                    elif split.account.type == "INCOME" and amount < 0:
-                        actuals[rollup_target] = actuals.get(
-                            rollup_target, Decimal("0")
-                        ) + (-amount)
+                amount = self._split_in_default_currency(
+                    split, account,
+                    factors.get(account.guid),
+                )
+                # SIGNED accumulation so contra splits net — same
+                # convention as spending_by_category /
+                # income_by_source; a gross filter would contradict
+                # them on identical data (spend 200 + refund 120
+                # showing 200, not net 80).
+                if account.type == "EXPENSE":
+                    actuals[rollup_target] = actuals.get(
+                        rollup_target, Decimal("0")
+                    ) + amount
+                elif account.type == "INCOME":
+                    actuals[rollup_target] = actuals.get(
+                        rollup_target, Decimal("0")
+                    ) + (-amount)
 
             accounts_result = []
             total_budgeted = Decimal("0")
@@ -913,12 +913,8 @@ class BudgetsMixin:
                 raise ValueError(f"Budget not found: {name}")
 
 
-            # Stage budget snapshot for the audit log BEFORE delete.
-            # Without this, the audit log shows only "deleted budget X"
-            # — the bookkeeper can't tell what amounts/periods were
-            # lost. Capture the small set of facts that can't be
-            # recovered after the delete: name, num_periods, and how
-            # many account-amount rows existed.
+            # Snapshot BEFORE delete the facts that can't be
+            # recovered after: name, num_periods, amount-row count.
             self._stage_audit_before({
                 "name": budget.name,
                 "num_periods": budget.num_periods,

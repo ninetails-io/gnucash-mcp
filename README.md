@@ -49,7 +49,7 @@ Receivables: 3 accounts, USD 10246.46
   Accounts Receivable: USD 3500.00
   Accounts Receivable CAD: USD 1837.50
 Reconciliation:
-  Checking Account: 174 splits unreconciled since 2025-12-30 (4 months behind) ⚠
+  Checking Account: 174 splits unreconciled (4 months behind, oldest: 2025-12-30) ⚠
   7 accounts never reconciled ⚠
 Net worth trajectory:
   12mo ago: USD 187,925
@@ -140,19 +140,20 @@ for the full breakdown of what's in each.
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
-cd gnucash-mcp
+uv tool install --editable ./gnucash-mcp
 ```
 
-Then either:
-
-```bash
-uv sync                # if you have uv (recommended)
-# or
-pip install -e .       # if you have pip
-```
+That gives you a `gnucash-mcp` command on your PATH. `--editable`
+keeps it tracking the source, so a `git pull` shows up in the
+running server the next time it restarts. Skip `--editable` if
+you don't plan to update.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+> For developers working against multiple worktrees, plain
+> `uv sync` inside the project directory still works — see
+> [For developers](#for-developers) below.
 
 ### 2. Make a working copy of a sample book
 
@@ -162,7 +163,7 @@ repo, so copy the book somewhere outside the repo first:
 
 ```bash
 mkdir -p ~/gnucash-mcp-scratch
-cp samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
+cp gnucash-mcp/samples/alex-chen-morales.gnucash ~/gnucash-mcp-scratch/alex.gnucash
 ```
 
 ### 3. Tell Claude Desktop about the server
@@ -172,22 +173,15 @@ Find your Claude Desktop config:
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this (replace the two paths with your actual paths):
+Add this (replace the `GNUCASH_BOOK_PATH` value with your actual
+path):
 
 ```json
 {
   "mcpServers": {
     "gnucash": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/gnucash-mcp",
-        "python",
-        "-m",
-        "gnucash_mcp",
-        "--modules=all"
-      ],
+      "command": "gnucash-mcp",
+      "args": ["--modules=all"],
       "env": {
         "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
@@ -195,6 +189,10 @@ Add this (replace the two paths with your actual paths):
   }
 }
 ```
+
+`--modules=all` loads every tool (106 of them) so you can poke at
+anything. Once you know what you actually use, narrow it — see
+[choosing a module set](#choosing-a-module-set) below.
 
 Quit Claude Desktop completely (not just close the window —
 quit) and reopen it. Look for the hammer 🔨 icon next to the
@@ -251,11 +249,46 @@ This is an [MCP](https://modelcontextprotocol.io/) server, so
 it works with any client that speaks MCP. Notes for non–Claude
 Desktop clients:
 
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","python","-m","gnucash_mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
 - **Anything else**: set `GNUCASH_BOOK_PATH` and run
-  `uv run gnucash-mcp` (or `gnucash-mcp` if installed via pip).
+  `gnucash-mcp` directly. Any client that can spawn a command
+  and speak MCP over stdio will work.
+
+---
+
+## Choosing a module set
+
+`--modules=all` is the easy default — every tool, 106 of them.
+For day-to-day use you'll probably want less. Pick the role that
+matches how you'll talk to the server. Each role is a *group*
+that expands to the underlying tool modules; you can also pick
+the leaves individually for a finer cut.
+
+| Role | What it gives you | Tools |
+|---|---|---|
+| `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
+| `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
+| `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
+| `freelancer` | Customer invoicing + sales tax, plus billterms (payment terms), jobs (per-project P&L rollups), and credit notes (customer refunds). The full solo-consultant toolkit. | 31 |
+| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, vendor reports). | 48 |
+
+Pick one or more, comma-separated:
+
+```json
+"args": ["--modules=bookkeeper"]            // personal finance
+"args": ["--modules=investor"]              // self-directed investor
+"args": ["--modules=freelancer"]            // solo contractor
+"args": ["--modules=business"]              // small business (= freelancer + business_complete)
+"args": ["--modules=bookkeeper,investor,freelancer"]  // most things
+```
+
+`core` is force-added regardless; the explicit listing in the
+examples above is for clarity. The leaf modules behind each
+group (`reconciliation`, `reporting`, `budgets`, `scheduling`,
+`tax_lots`, `portfolio`, etc.) are individually selectable too —
+run `gnucash-mcp --help` for the full menu.
 
 ---
 
@@ -377,80 +410,92 @@ you which one it's doing.
 
 ## Limiting what the AI can see
 
-By default the server exposes its full toolset (87 tools as
-of v1.2.1). Each tool's description lives in the AI's system
-prompt, which costs context on every message. If you only use
-some features — say, no investments and no business module —
-you can tell the server to load only those modules:
+Each tool's description lives in the AI's system prompt, which
+costs context on every message. Narrowing the toolset to what
+you actually use makes every conversation cheaper. See
+[choosing a module set](#choosing-a-module-set) above for the
+five role-based options (`core`, `bookkeeper`, `investor`,
+`freelancer`, `business`).
 
-```json
-"args": [
-  "run", "--directory", "/path/to/gnucash-mcp",
-  "python", "-m", "gnucash_mcp",
-  "--modules=core,reporting,budgets,scheduling"
-]
-```
-
-| Module | What it gives you |
-|---|---|
-| `core` | Accounts, transactions, the dashboard. Always loaded. |
-| `reconciliation` | Bank reconciliation, void/unvoid |
-| `reporting` | Spending, income, balance sheet, net worth, cash flow, debt payoff |
-| `budgets` | Create budgets, set targets, track variance |
-| `scheduling` | Recurring transactions, upcoming bills |
-| `investments` | Stocks, mutual funds, lots, capital-gain tracking |
-| `business` | Customers, vendors, employees, invoices, bills, payments |
-| `admin` | Account-level metadata (APR, credit limit, etc.) |
-| `backup` | Manual snapshot tools |
-
-Use `--modules=all` to load everything (the default for the
-sample-book quickstart above), or list a subset to keep your
-context light. You can also set
-`GNUCASH_MCP_MODULES=core,reporting` as an environment
-variable instead.
+You can also set `GNUCASH_MCP_MODULES=core,bookkeeper` as an
+environment variable instead of `--modules=...` in the JSON
+args.
 
 ---
 
-## What's in v1.2.1
+## What's in v1.3.1
 
-This release is the long-tail completion of the v1.2 business-
-module promise — what v1.2 should have been at first ship,
-plus a generous correctness sweep on every non-USD-default
-path the test books surfaced.
+This release fills in the business-feature complement promised
+since v1.2 and lands a deep correctness pass on the surfaces
+that were left rough — backed by an adversarial review of the
+whole codebase before the release branch opened.
 
-**Major:**
+**Stage 3 business features:**
 
-- **Multi-currency, end-to-end.** Foreign-currency invoices
-  post and pay against the right exchange rates from your
-  price table; rate drift between post-date and pay-date is
-  recognized as realized FX gain/loss in a dedicated income
-  account (or one you specify).
-- **A complete first-call dashboard.** `get_book_summary` now
-  shows net-worth trajectory, runway, monthly net income,
-  budget pacing, reconciliation backlog with split counts,
-  upcoming bills, and warnings — turning the LLM's first call
-  from "what is the state of the books" into "what do I need
-  to do next."
-- **Customer / vendor / employee CRUD complete.** Create,
-  list, get, update (new in 1.2.1), and delete. No more
-  needing to open GnuCash itself just to fix a typo on an
-  address.
-- **Posting workflow lifecycle complete.** `post_invoice` and
-  `pay_invoice` joined by `unpost_invoice` (new) so a posted
-  invoice can be reversed cleanly without SQL surgery.
-  `delete_transaction` refuses to break the lifecycle by
-  removing posting records directly.
-- **Automatic backups.** First write of each session snapshots
-  the book; staged retention (7 session / 4 weekly / 6
-  monthly) keeps you covered without filling your disk.
+- **Taxtables** — per-line-item sales-tax templates that flow
+  through invoice, bill, voucher, and credit-note posting.
+- **Jobs** — multi-invoice project containers so a freelancer
+  can group all the invoices on one engagement under a single
+  client deliverable.
+- **Credit notes** — refund instruments with explicit
+  apply-to-invoice linkage, recognized as negative invoices
+  through the same posting machinery.
+- **Employee expense vouchers** — full lifecycle (`create_voucher`,
+  `add_voucher_entry`, `post_invoice`, `pay_invoice`) for
+  reimbursement workflows.
 
-**Plus a thousand smaller fixes** from intensive testing on
-two real-shape books — multi-currency reporting, debt-payoff
-amortization for mortgages, voided-payment handling, employee-
-expense-voucher hooks, and many more. See
-[specs/NEXT_STEPS_1_3.md](specs/NEXT_STEPS_1_3.md) for the 1.3
-roadmap (taxtables, jobs, credit notes, employee expense
-vouchers).
+**Role-aligned `--modules` partition:**
+
+- `--modules=core` always-on (the ledger primitives plus
+  reconciliation, backups, and slot-based metadata).
+- Add `bookkeeper`, `investor`, or `business` to pick the
+  persona you're serving. Each is a transparent group alias
+  over leaf modules so `--modules=freelancer` or `--modules=portfolio`
+  picks a finer cut when you want one. `get_server_config`
+  shows the exact expansion at startup.
+
+**Honesty pass on every report:**
+
+- Reconciliation backlog lag is computed from the OLDEST
+  unreconciled split, not the latest reconcile date — so
+  `'47 splits unreconciled (6 years behind, oldest: 2020-03-15) ⚠'`
+  tells you the real scope of the work. Pre-1.3 it would say
+  "4 months behind" on the same account.
+- `cash_flow` filters internal transfers by default — the
+  totals answer "where did money come from and where did it
+  go?" instead of "every debit and credit that touched a cash
+  account." Pass `include_transfers=true` for the gross flow
+  if you're reconciling against a bank statement.
+- Multi-currency budget targets render in the book's default
+  currency at period-end rates — no more apples-to-oranges
+  totals on books with EUR / CNY / mixed targets.
+- `balance_sheet` now closes the accounting identity — a
+  computed Unrealized gain/loss line absorbs the residual
+  between market-value assets and cost-basis equity (both
+  investment drift and FX translation under one heading).
+- Multi-currency FX bug-class swept across `spending_by_category`,
+  `income_by_source`, `cash_flow`, dashboard monthly net,
+  daily expense burn, and vendor spending. Aggregations now
+  convert quantities through the historical FX rate; pre-1.3
+  several sites summed raw quantities across currencies.
+
+**Hardening:**
+
+- Defense-in-depth input gates on `create_account`,
+  `create_commodity`, business-entity notes and addresses,
+  audit-log date queries, slot values, void reasons.
+- Symmetric footgun guards on `prune_backups` — neither manual
+  nor auto stages can be wiped in a single call without
+  explicit opt-in.
+- Backup tool with staged retention (7 session / 4 weekly / 6
+  monthly), automatic snapshot on first write of each day, and
+  catastrophic-loss-safe defaults.
+
+**Plus a meaningful test-coverage step** — every chokepoint
+the release-prep arc introduced is locked with a regression
+test, including the structural `_is_unreconciled` /
+`_is_voided` predicates and the audit-dispatcher coverage
+contract.
 
 A condensed changelog of major releases lives in
 [CHANGELOG.md](CHANGELOG.md).
@@ -512,10 +557,16 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,044 tests as of v1.2.1
+uv run pytest                       # 1,584 tests as of v1.3.1
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
+
+For dev work the `uv run --directory PATH ...` form is the
+escape hatch — it lets you point Claude Desktop at a specific
+worktree without installing. The `uv tool install --editable`
+path from the Quick Start is generally cleaner for everyday
+use because the `gnucash-mcp` binary tracks your source.
 
 The server is built on
 [piecash](https://github.com/sdementen/piecash) (Python

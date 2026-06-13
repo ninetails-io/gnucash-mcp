@@ -4,7 +4,7 @@ import pytest
 from decimal import Decimal
 from pathlib import Path
 
-from gnucash_mcp.book import GnuCashBook
+from gnucash_mcp.book import GnuCashBook, build_book_class
 
 
 # ============== TestCreateBudget ==============
@@ -96,6 +96,57 @@ class TestCreateBudget:
                 name="Bad Budget",
                 year=2026,
                 num_periods=0,
+            )
+
+    def test_create_with_start_date(self, budget_book: Path):
+        """Explicit ``start_date`` anchors the first period exactly
+        — bookkeeper-flagged feature gap (PR #98 signoff). The
+        argument enables historical budget creation for
+        comparison against past actuals.
+        """
+        book = GnuCashBook(str(budget_book))
+        result = book.create_budget(
+            name="2024 Retroactive",
+            start_date="2024-01-01",
+            num_periods=12,
+            period_type="monthly",
+        )
+        assert result["start_date"] == "2024-01-01"
+
+        budget = book.get_budget(
+            compact=False, name="2024 Retroactive",
+        )
+        assert budget["start_date"] == "2024-01-01"
+
+    def test_start_date_wins_over_year(self, budget_book: Path):
+        """When both ``year`` and ``start_date`` are supplied, the
+        start_date is the more specific signal and takes precedence.
+        """
+        book = GnuCashBook(str(budget_book))
+        result = book.create_budget(
+            name="Mid-Year",
+            year=2026,  # ignored
+            start_date="2025-07-01",
+            num_periods=6,
+            period_type="monthly",
+        )
+        assert result["start_date"] == "2025-07-01"
+
+        budget = book.get_budget(compact=False, name="Mid-Year")
+        # start_date wins; year is ignored.
+        assert budget["start_date"] == "2025-07-01"
+
+    def test_create_invalid_start_date_raises(self, budget_book: Path):
+        """Malformed ``start_date`` raises with a clear message —
+        the ISO parse error is wrapped to surface the field name."""
+        book = GnuCashBook(str(budget_book))
+        with pytest.raises(
+            ValueError,
+            match=r"Invalid start_date '2025/01/01'",
+        ):
+            book.create_budget(
+                name="Bad Date Budget",
+                start_date="2025/01/01",
             )
 
 
@@ -735,12 +786,226 @@ class TestGetBudgetReport:
         # Pre-fix, raw quantity sum produced 200.
         assert Decimal(by_acct["Expenses:Travel"]["actual"]) == Decimal("210")
 
+    def test_cross_currency_rollup_without_reporting_module(
+        self, budget_book: Path,
+    ):
+        """Cross-currency budget rollup must work on a ``--modules
+        core,budgets`` build with no reporting mixin loaded.
+
+        Pre-fix, the conversion helpers
+        (``_account_conversion_factors`` / ``_split_in_default_currency``)
+        lived on ReportingMixin; budgets reached them via
+        ``getattr(self, ..., None)`` and silently degraded to raw
+        ``split.quantity`` sums when reporting was disabled — the
+        same bug class v1.2.1 fixed for the reports themselves, now
+        hiding behind a feature flag.
+
+        After the v1.3 Stage 1 work, currency helpers live on
+        :class:`CurrencyMixin` composed into :class:`BaseGnuCashBook`
+        unconditionally. This test exercises the
+        ``{"core","budgets"}`` build path explicitly to confirm a
+        100 EUR + 100 USD spend rolls up as 210 USD on a budgeted
+        USD parent (not 200).
+        """
+        import piecash
+        from datetime import date as _date
+        from piecash._common import GnucashException
+        from piecash import factories
+
+        # Use the default-build GnuCashBook to seed the data — write
+        # path needs the full toolkit. The currency-mixin assertion
+        # is on the *read* path (`get_budget_report`) using the
+        # restricted-module build below.
+        gc = GnuCashBook(str(budget_book))
+        with gc.open(readonly=False) as b:
+            usd = b.default_currency
+            try:
+                eur = factories.create_currency_from_ISO("EUR")
+                b.session.add(eur)
+                b.flush()
+            except (GnucashException, Exception):
+                eur = next(
+                    (c for c in b.commodities if c.mnemonic == "EUR"), None,
+                )
+                if eur is None:
+                    raise
+
+            expenses = next(
+                a for a in b.accounts if a.fullname == "Expenses"
+            )
+            checking = next(
+                a for a in b.accounts if a.fullname == "Assets:Checking"
+            )
+            travel = piecash.Account(
+                name="Travel", type="EXPENSE", parent=expenses,
+                commodity=usd, placeholder=True,
+            )
+            europe = piecash.Account(
+                name="Europe", type="EXPENSE", parent=travel,
+                commodity=eur,
+            )
+            us = piecash.Account(
+                name="US", type="EXPENSE", parent=travel, commodity=usd,
+            )
+            piecash.Price(
+                commodity=eur, currency=usd,
+                date=_date(2026, 1, 1),
+                value=Decimal("1.10"),
+                source="user:price", type="last",
+            )
+            piecash.Transaction(
+                currency=usd, description="Hotel in Berlin",
+                post_date=_date(2026, 1, 10),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-110"),
+                        quantity=Decimal("-110"),
+                    ),
+                    piecash.Split(
+                        account=europe, value=Decimal("110"),
+                        quantity=Decimal("100"),
+                    ),
+                ],
+            )
+            piecash.Transaction(
+                currency=usd, description="Hotel in Boston",
+                post_date=_date(2026, 1, 15),
+                splits=[
+                    piecash.Split(
+                        account=checking, value=Decimal("-100"),
+                    ),
+                    piecash.Split(
+                        account=us, value=Decimal("100"),
+                    ),
+                ],
+            )
+            b.save()
+        gc.create_budget(name="Travel Budget", year=2026, num_periods=12)
+        gc.set_budget_amount(
+            budget_name="Travel Budget",
+            account="Expenses:Travel", amount="500", period=0,
+        )
+
+        # ── The actual assertion: query via the restricted build ──
+        BookClass = build_book_class({"core", "budgets"})
+        # Sanity: this build must NOT carry ReportingMixin's namespace.
+        assert "ReportingMixin" not in {
+            base.__name__ for base in BookClass.__mro__
+        }, "Test setup: build_book_class leaked ReportingMixin"
+
+        restricted = BookClass(str(budget_book))
+        report = restricted.get_budget_report(
+            compact=False,
+            budget_name="Travel Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        # 100 USD + (100 EUR × 1.10) = 210 USD. Raw quantity sum = 200.
+        assert Decimal(by_acct["Expenses:Travel"]["actual"]) == Decimal("210")
+
     def test_report_nonexistent_budget_raises(self, budget_book: Path):
         """Reporting on nonexistent budget raises ValueError."""
         book = GnuCashBook(str(budget_book))
 
         with pytest.raises(ValueError, match="Budget not found"):
             book.get_budget_report(compact=False,budget_name="Nonexistent", period=0)
+
+
+# ============== TestBudgetContraNetting ==============
+
+
+class TestBudgetContraNetting:
+    """C3 regression (adversarial pass 2): budget actuals must
+    accumulate SIGNED amounts so contra splits (expense refunds,
+    income clawbacks) net — the same a34867c fix that
+    income_by_source / spending_by_category received. Pre-fix the
+    per-split gross filter (``amount > 0`` / ``amount < 0``) made
+    the budget surfaces contradict those reports on the same data:
+    spend 200 + refund 120 showed actual 200 instead of net 80.
+    """
+
+    def test_report_nets_expense_refunds(self, budget_book: Path):
+        """get_budget_report: Jan Groceries spend is $500; a $120
+        refund must net the actual to $380, not stay at gross $500."""
+        from datetime import date as date_cls
+
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(name="2026 Budget", year=2026, num_periods=12)
+        book.set_budget_amount(
+            budget_name="2026 Budget",
+            account="Expenses:Groceries",
+            amount="600.00",
+        )
+        book.create_transaction(
+            description="Grocery return",
+            trans_date=date_cls(2026, 1, 20),
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "-120.00"},
+                {"account": "Assets:Checking", "amount": "120.00"},
+            ],
+        )
+
+        report = book.get_budget_report(
+            compact=False, budget_name="2026 Budget", period=0,
+        )
+        by_acct = {a["account"]: a for a in report["accounts"]}
+        groceries = by_acct["Expenses:Groceries"]
+        assert Decimal(groceries["actual"]) == Decimal("380"), (
+            f"budget report kept gross actuals (refund dropped): "
+            f"{groceries}"
+        )
+        assert Decimal(groceries["remaining"]) == Decimal("220")
+
+    def test_dashboard_headline_nets_expense_refunds(
+        self, budget_book: Path,
+    ):
+        """_budget_headline (dashboard): spend 200 + refund 120 against
+        a 160 budget = 50% used (net 80), not 125% (gross 200).
+
+        Uses Entertainment — the fixture account with no other
+        transactions — because the headline accumulates actuals over
+        the budget's full period range, and Groceries carries Jan/Feb
+        fixture spend that would muddy the assertion.
+        """
+        from datetime import date as date_cls
+
+        today = date_cls.today()
+        month_start = date_cls(today.year, today.month, 1)
+
+        book = GnuCashBook(str(budget_book))
+        book.create_budget(
+            name="Headline", year=today.year, num_periods=12,
+        )
+        book.set_budget_amount(
+            budget_name="Headline",
+            account="Expenses:Entertainment",
+            amount="160.00", period=today.month - 1,
+        )
+        book.create_transaction(
+            description="Concert tickets",
+            trans_date=month_start,
+            splits=[
+                {"account": "Expenses:Entertainment", "amount": "200.00"},
+                {"account": "Assets:Checking", "amount": "-200.00"},
+            ],
+        )
+        book.create_transaction(
+            description="Concert refund",
+            trans_date=month_start,
+            splits=[
+                {"account": "Expenses:Entertainment", "amount": "-120.00"},
+                {"account": "Assets:Checking", "amount": "120.00"},
+            ],
+        )
+
+        with book.open(readonly=True) as b:
+            transactions = list(b.transactions)
+            headline = book._budget_headline(b, transactions)
+
+        assert headline is not None, "budget headline returned None"
+        assert headline["used_pct"] == Decimal("50"), (
+            f"dashboard headline kept gross actuals (refund dropped): "
+            f"{headline}"
+        )
 
 
 # ============== TestListAndGetBudget ==============

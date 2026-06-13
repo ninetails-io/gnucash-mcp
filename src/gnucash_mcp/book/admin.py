@@ -7,30 +7,30 @@ statement close day, etc. Values are stored as strings.
 
 import re
 
+from gnucash_mcp.book._base import _slot_value_str  # noqa: F401  (re-exported for callers)
+
 # Slot keys with embedded ``/`` create hierarchical sub-slots in
-# GnuCash's KVP store rather than flat keys. The MCP-facing tools
-# only manage flat keys (``apr``, ``credit_limit``, ``minimum_payment``,
-# etc.), so we restrict input to a safe alphabet up-front. Pre-fix
-# a key like ``credit/limit`` silently created a sub-slot under
-# ``credit`` — invisible to ``get_account_slots`` keyed lookups.
+# GnuCash's KVP store rather than flat keys. The MCP-facing
+# account-slot tools only manage flat keys (``apr``,
+# ``credit_limit``, ``minimum_payment``, etc.), so we restrict
+# user input to a safe alphabet up-front. A key like
+# ``credit/limit`` would silently create a sub-slot under ``credit`` —
+# invisible to ``get_account_slots`` keyed lookups.
+#
+# Note: internal slot keys (set by our own book methods, not
+# accepted from users) can and do use ``/`` for namespacing —
+# see the ``gnc-mcp/...`` convention in
+# ``BusinessMixin._APPLIES_TO_SLOT_KEY``. This regex gates
+# USER input only.
 _SLOT_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
-
-def _slot_value_str(value) -> str:
-    """Stringify a piecash slot value to a stable str.
-
-    piecash returns either a typed wrapper with a ``.value``
-    attribute or the raw value depending on slot type. The
-    single-key path and the all-keys path of ``get_account_slots``
-    used to handle these differently — single-key fell back to
-    ``str(value)`` when ``.value`` was missing, all-keys assumed
-    ``.value`` always present and would AttributeError on the
-    first row that didn't have it. Centralizing the access
-    makes both paths agree.
-    """
-    if hasattr(value, "value"):
-        return str(value.value)
-    return str(value)
+# Upper bound on slot value length. 64 KiB is generous for any
+# legitimate per-account metadata (APR strings, credit limits,
+# statement-close-day, structured JSON config blobs) — well past
+# what real bookkeeping needs but short enough that a malicious
+# or runaway caller can't exhaust the book file with a single
+# slot write.
+_SLOT_VALUE_MAX_BYTES = 64 * 1024
 
 
 class AdminMixin:
@@ -105,6 +105,20 @@ class AdminMixin:
                 f"Embedded '/' would create hierarchical sub-slots; "
                 f"use flat keys."
             )
+        # Length cap. Encode to UTF-8 to count bytes (so a
+        # multi-byte unicode payload can't sneak past a char-count
+        # check). 64 KiB is generous for any real per-account
+        # metadata. Compute the byte length once; reusing
+        # ``value.encode(...)`` would allocate a fresh copy of the
+        # already-large string.
+        value_bytes = len(value.encode("utf-8"))
+        if value_bytes > _SLOT_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"Slot value too long: "
+                f"{value_bytes} bytes exceeds the "
+                f"{_SLOT_VALUE_MAX_BYTES}-byte cap. Store large "
+                f"structured data outside the book."
+            )
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
             if not account:
@@ -134,8 +148,20 @@ class AdminMixin:
             log captures them from tool params.
 
         Raises:
-            ValueError: If account not found or key not found.
+            ValueError: If account not found, key contains disallowed
+                characters, or key not found.
         """
+        # Same regex gate as ``set_account_slot``. Without it,
+        # delete could target internal namespaced slots
+        # (``gnc-mcp/applies-to-invoice``, etc.) that the
+        # credit-note linkage and other internal features
+        # depend on.
+        if not _SLOT_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"Invalid slot key {key!r}: must match [A-Za-z0-9_.-]+. "
+                f"Embedded '/' would target hierarchical sub-slots "
+                f"(internal namespaced state); use flat keys."
+            )
         with self.open(readonly=False) as book:
             account = self._resolve_account(book, account_name)
             if not account:

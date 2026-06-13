@@ -1,0 +1,59 @@
+{
+  "anchor_historical": "2025-06-30",
+  "anchor_today": "2025-12-31",
+  "book_path": "/Users/stephen/Projects/gnucash-mcp/samples/lin-wei.gnucash",
+  "default_currency": "CNY",
+  "first_transaction": "2025-01-01",
+  "last_transaction": "2025-12-31",
+  "prices_by_commodity": {
+    "CURRENCY:CNY": {
+      "first_market": null,
+      "last_market": null,
+      "market_count": 0,
+      "transaction_count": 23
+    },
+    "CURRENCY:EUR": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 0
+    },
+    "CURRENCY:HKD": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 0
+    },
+    "CURRENCY:USD": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 0
+    },
+    "SSE:510300": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 1
+    },
+    "SSE:600519": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 2
+    },
+    "SZSE:159915": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 1
+    },
+    "SZSE:300750": {
+      "first_market": "2025-01-01",
+      "last_market": "2025-12-01",
+      "market_count": 12,
+      "transaction_count": 2
+    }
+  },
+  "transaction_count": 1961
+}

@@ -3,6 +3,7 @@
 Registered only when the 'admin' module is enabled via --modules.
 """
 
+import re
 from datetime import datetime
 
 from gnucash_mcp.logging_config import (
@@ -10,6 +11,15 @@ from gnucash_mcp.logging_config import (
     get_log_dir,
 )
 from gnucash_mcp.tools._helpers import _json, safe_tool
+
+
+# Audit log filenames are exactly ``YYYY-MM-DD.txt``. Validate
+# ``log_date`` against this shape before constructing the path —
+# unvalidated, ``Path(audit_dir) / f"{log_date}.txt"`` would happily
+# interpolate ``../../../../etc/passwd`` and read arbitrary
+# ``*.txt`` files. Prompt injection through any free-text field
+# that surfaces into the audit log is the attack vector.
+_LOG_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 def register(mcp, get_book) -> None:
@@ -110,18 +120,24 @@ def register(mcp, get_book) -> None:
 
         audit_dir = log_dir / "audit"
         target_date = log_date or datetime.now().astimezone().strftime("%Y-%m-%d")
+        # Path-traversal gate: target_date is interpolated into the
+        # log path, so anything that isn't a literal YYYY-MM-DD
+        # rejects before the join. Raise (rather than build the JSON
+        # envelope inline) so safe_tool applies its standard shape,
+        # logging, and path redaction.
+        if not _LOG_DATE_RE.fullmatch(target_date):
+            raise ValueError(
+                f"Invalid log_date {target_date!r}: must be "
+                f"YYYY-MM-DD (e.g. 2026-06-04)."
+            )
         log_file = audit_dir / f"{target_date}.txt"
 
         if not log_file.exists():
             return f"No audit log for {target_date}"
 
-        # Cap the size we'll read in one shot. A long-lived
-        # deployment with daily growth could produce multi-MB
-        # files; reading one in full to slice the last ``limit``
-        # blocks is wasteful (and on truly huge files would chew
-        # memory). 2 MB covers ~10k typical audit entries — well
-        # past any reasonable ``limit`` request. Files larger
-        # than the cap get tail-only treatment.
+        # Read cap: 2 MB covers ~10k audit entries — well past any
+        # reasonable limit request; larger files get tail-only
+        # treatment instead of a full in-memory read.
         _AUDIT_READ_CAP_BYTES = 2 * 1024 * 1024
         try:
             file_size = log_file.stat().st_size

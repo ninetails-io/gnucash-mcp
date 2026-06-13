@@ -1,0 +1,98 @@
+{
+  "commodities": {
+    "CRYPTO": [
+      {
+        "fraction": 1000000,
+        "fullname": "Ethereum",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "2328.28"
+        },
+        "mnemonic": "ETH"
+      }
+    ],
+    "CURRENCY": [
+      {
+        "fraction": 100,
+        "fullname": "Canadian Dollar",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-05-01",
+          "value": "0.735"
+        },
+        "mnemonic": "CAD"
+      },
+      {
+        "fraction": 100,
+        "fullname": "Euro",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "1.1688"
+        },
+        "mnemonic": "EUR"
+      },
+      {
+        "fraction": 100,
+        "fullname": "Pound Sterling",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2025-12-01",
+          "value": "1.275"
+        },
+        "mnemonic": "GBP"
+      },
+      {
+        "fraction": 100,
+        "fullname": "US Dollar",
+        "mnemonic": "USD"
+      }
+    ],
+    "FUND": [
+      {
+        "fraction": 10000,
+        "fullname": "Vanguard Total Bond Market Index Fund Admiral",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "9.71"
+        },
+        "mnemonic": "VBTLX"
+      },
+      {
+        "fraction": 10000,
+        "fullname": "Vanguard Total Stock Market Index Fund Admiral",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "170.99"
+        },
+        "mnemonic": "VTSAX"
+      }
+    ],
+    "NASDAQ": [
+      {
+        "fraction": 10000,
+        "fullname": "Apple Inc.",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "273.43"
+        },
+        "mnemonic": "AAPL"
+      },
+      {
+        "fraction": 10000,
+        "fullname": "Microsoft Corporation",
+        "latest_price": {
+          "currency": "USD",
+          "date": "2026-04-30",
+          "value": "415.75"
+        },
+        "mnemonic": "MSFT"
+      }
+    ]
+  },
+  "default_currency": "USD"
+}

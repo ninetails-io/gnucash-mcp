@@ -8,9 +8,9 @@ The module-level `GnuCashBook` symbol is the "all modules" variant,
 used by tests and by any caller that hasn't opted into module
 filtering (backward compatibility).
 
-Public exports match what the old book.py exposed so existing
-imports (`from gnucash_mcp.book import GnuCashBook, _verify_write`)
-continue to work.
+Public exports are a stable surface — existing imports
+(`from gnucash_mcp.book import GnuCashBook, _verify_write`)
+must continue to work.
 """
 
 import importlib
@@ -18,6 +18,7 @@ import importlib
 from gnucash_mcp.book._base import (
     BaseGnuCashBook,
     GnuCashLockError,
+    StaleFXRateError,
     _to_decimal,
     _verify_composite_write,
     _verify_delete,
@@ -25,7 +26,7 @@ from gnucash_mcp.book._base import (
 )
 
 # Map of module name → (relative import path, mixin class name).
-# Every module lives in its own file now; CoreMixin is always included
+# Every module lives in its own file; CoreMixin is always included
 # by _apply_module_filter (core is never truly "disabled"), but it goes
 # through the same registration path as every other module.
 _MIXIN_MAP: dict[str, tuple[str, str]] = {
@@ -53,8 +54,8 @@ def _load_mixin(module_name: str):
 def extracted_modules() -> set[str]:
     """Return the set of modules that have their own mixin file.
 
-    Now every module is extracted, so this equals the full TOOL_MODULES
-    keyset. Retained for API stability — `_apply_module_filter` still
+    Every module is extracted, so this equals the full TOOL_MODULES
+    keyset. `_apply_module_filter`
     consults it to decide which modules are lazy-loadable via
     gnucash_mcp.tools.<name>.register(mcp, get_book).
     """
@@ -109,6 +110,7 @@ __all__ = [
     "BaseGnuCashBook",
     "GnuCashBook",
     "GnuCashLockError",
+    "StaleFXRateError",
     "build_book_class",
     "extracted_modules",
     "_to_decimal",
