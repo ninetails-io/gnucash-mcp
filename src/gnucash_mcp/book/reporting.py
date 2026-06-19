@@ -12,14 +12,19 @@ per-boundary snapshots — O(splits + intervals), not
 O(intervals × splits).
 """
 
-import calendar
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import piecash
 
 from gnucash_mcp.book._base import _is_voided, _to_decimal
-from gnucash_mcp._format import _format_number
+from gnucash_mcp._format import (
+    _GROUP_BY_VALUES,
+    _enumerate_periods,
+    _format_grouped_tsv,
+    _format_number,
+    _period_label,
+)
 
 # Account-type groups shared by the reports' SQL IN() clauses — one
 # canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
@@ -31,9 +36,6 @@ _LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
 _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
-
-# Valid group_by sub-period granularities for the period breakdowns.
-_GROUP_BY_VALUES = ("month", "quarter", "year")
 
 
 def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> str:
@@ -76,123 +78,6 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
         f"{'TOTAL':<{name_width}}  {total:>{amount_width},.2f}"
     )
     return "\n".join(lines)
-
-
-def _period_label(d: date, group_by: str) -> str:
-    """Map a date to its sub-period column label.
-
-    ``month`` → ``YYYY-MM``; ``quarter`` → ``YYYY-Q#``; ``year`` →
-    ``YYYY``. Used both to enumerate columns and to bucket each
-    split by its ``post_date``, so the two always agree.
-    """
-    if group_by == "month":
-        return f"{d.year:04d}-{d.month:02d}"
-    if group_by == "quarter":
-        return f"{d.year:04d}-Q{(d.month - 1) // 3 + 1}"
-    return f"{d.year:04d}"
-
-
-def _enumerate_periods(
-    start_date: date, end_date: date, group_by: str
-) -> list[tuple[str, date]]:
-    """Ordered ``(label, anchor_date)`` pairs covering the range.
-
-    Every sub-period that overlaps ``[start_date, end_date]`` gets a
-    column, including empty ones (so a gap month still renders a
-    ``0.00`` column). The anchor date is the period's natural
-    calendar end clamped to ``end_date`` — FX/commodity rates value
-    each period at its own close, never at today's rates.
-    """
-    periods: list[tuple[str, date]] = []
-    if group_by == "month":
-        y, m = start_date.year, start_date.month
-        while (y, m) <= (end_date.year, end_date.month):
-            last = date(y, m, calendar.monthrange(y, m)[1])
-            periods.append((f"{y:04d}-{m:02d}", min(last, end_date)))
-            m += 1
-            if m > 12:
-                m, y = 1, y + 1
-    elif group_by == "quarter":
-        y = start_date.year
-        q = (start_date.month - 1) // 3 + 1
-        end_q = (end_date.month - 1) // 3 + 1
-        while (y, q) <= (end_date.year, end_q):
-            last_month = q * 3
-            last = date(y, last_month, calendar.monthrange(y, last_month)[1])
-            periods.append((f"{y:04d}-Q{q}", min(last, end_date)))
-            q += 1
-            if q > 4:
-                q, y = 1, y + 1
-    else:  # year
-        for y in range(start_date.year, end_date.year + 1):
-            periods.append((f"{y:04d}", min(date(y, 12, 31), end_date)))
-    return periods
-
-
-def _strip_common_prefix(names: list[str]) -> list[str]:
-    """Drop a shared top-level ``Expenses:`` / ``Income:`` prefix.
-
-    Mirrors :func:`_format_breakdown_tsv`'s single-period behaviour —
-    leaf labels stay readable when every row shares a prefix, full
-    paths survive a heterogeneous mix.
-    """
-    if names and ":" in names[0]:
-        candidate = names[0].split(":")[0] + ":"
-        if all(n.startswith(candidate) for n in names):
-            return [n[len(candidate):] for n in names]
-    return list(names)
-
-
-def _format_grouped_tsv(
-    *,
-    period_labels: list[str],
-    displayed_names: list[str],
-    totals: dict[str, dict[str, Decimal]],
-    cat_totals: dict[str, Decimal],
-    period_totals: dict[str, Decimal],
-    grand_total: Decimal,
-    excluded: list[tuple[str, Decimal]],
-    label: str,
-) -> str:
-    """Render the multi-period breakdown as a tab-separated table.
-
-    Columns: the leading label, one per sub-period, then ``Total``
-    (sum across periods) and ``Avg`` (Total / number of periods).
-    The trailing ``TOTAL`` row sums every category per period —
-    net-negative-overall categories are netted in here even though
-    they get no row of their own, keeping the column totals tied to
-    single-period mode and to income − spending = net income.
-    """
-    num_periods = len(period_labels)
-    leaves = _strip_common_prefix(displayed_names)
-    lines = ["\t".join([label, *period_labels, "Total", "Avg"])]
-    for name, leaf in zip(displayed_names, leaves):
-        per = totals.get(name, {})
-        cells = [leaf]
-        cells += [
-            f"{per.get(pl, Decimal('0')):.2f}" for pl in period_labels
-        ]
-        tot = cat_totals[name]
-        avg = tot / num_periods if num_periods else Decimal("0")
-        cells += [f"{tot:.2f}", f"{avg:.2f}"]
-        lines.append("\t".join(cells))
-
-    avg_total = grand_total / num_periods if num_periods else Decimal("0")
-    total_cells = ["TOTAL"]
-    total_cells += [f"{period_totals[pl]:.2f}" for pl in period_labels]
-    total_cells += [f"{grand_total:.2f}", f"{avg_total:.2f}"]
-    lines.append("\t".join(total_cells))
-
-    out = "\n".join(lines)
-    if excluded:
-        netted = ", ".join(
-            f"{n} {t:,.2f}"
-            for n, t in sorted(excluded, key=lambda x: x[1])
-        )
-        out += (
-            f"\n({len(excluded)} net-negative netted into TOTAL: {netted})"
-        )
-    return out
 
 
 def _format_grouped_cashflow_tsv(
@@ -428,7 +313,7 @@ class ReportingMixin:
             period_labels=period_labels,
             displayed_names=displayed_names,
             totals=totals,
-            cat_totals=cat_totals,
+            row_totals=cat_totals,
             period_totals=period_totals,
             grand_total=grand_total,
             excluded=excluded,

@@ -9881,6 +9881,93 @@ class TestVendorSpendingReport:
         assert result["vendors"][0]["vendor_name"] == "Office Depot"
 
 
+class TestVendorSpendingGroupBy:
+    """group_by sub-period columns for vendor_spending_report."""
+
+    @staticmethod
+    def _seed(gb) -> None:
+        """Office Depot billed Feb (50) + Mar (70); Staples Mar (30)."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_vendor(name="Staples")
+
+        def bill(bill_id, vendor_id, price, post_date):
+            gb.create_bill(vendor_id=vendor_id)
+            gb.add_bill_entry(
+                bill_id=bill_id,
+                account="Expenses:Office Supplies",
+                description="x", quantity="1", price=price,
+            )
+            gb.post_invoice(
+                invoice_id=bill_id,
+                post_account="Liabilities:Accounts Payable",
+                owner_type="vendor", post_date=post_date,
+            )
+
+        bill("000001", "000001", "50.00", "2026-02-15")
+        bill("000002", "000001", "70.00", "2026-03-10")
+        bill("000003", "000002", "30.00", "2026-03-20")
+
+    @staticmethod
+    def _parse(tsv: str) -> dict[str, list[str]]:
+        out = {}
+        for ln in tsv.splitlines():
+            if "\t" in ln:
+                cells = ln.split("\t")
+                out[cells[0]] = cells
+        return out
+
+    def test_month_columns(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        tsv = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-03-31",
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Vendor"] == [
+            "Vendor", "2026-01", "2026-02", "2026-03", "Total", "Avg",
+        ]
+        # Office Depot spikes in March; sorted first by total.
+        assert rows["Office Depot"] == [
+            "Office Depot", "0.00", "50.00", "70.00", "120.00", "40.00",
+        ]
+        assert rows["Staples"] == [
+            "Staples", "0.00", "0.00", "30.00", "30.00", "10.00",
+        ]
+        assert rows["TOTAL"] == [
+            "TOTAL", "0.00", "50.00", "100.00", "150.00", "50.00",
+        ]
+
+    def test_vendor_filter_with_group_by(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        tsv = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-03-31",
+            vendor_id="000001", group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert "Office Depot" in rows and "Staples" not in rows
+
+    def test_invalid_group_by(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid group_by"):
+            gb.vendor_spending_report(
+                start_date="2026-01-01", end_date="2026-03-31",
+                group_by="decade",
+            )
+
+    def test_no_group_by_unchanged(self, business_book):
+        """Regression guard: omitting group_by keeps the dict shape."""
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        result = gb.vendor_spending_report(
+            compact=False,
+            start_date="2026-01-01", end_date="2026-03-31",
+        )
+        assert "vendors" in result and "totals" in result
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("150")
+
+
 # ============== End-to-End Lifecycle Tests ==============
 
 
