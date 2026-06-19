@@ -151,3 +151,82 @@ def _apply_limit(
         return items, f"[Limit capped at {effective}]"
 
     return items, None
+
+
+# ── Pagination ─────────────────────────────────────────────────────
+
+
+def _paginate(
+    items: list[T],
+    offset: int = 0,
+    limit: int | None = None,
+    default: int = 50,
+    max_cap: int = 250,
+    entity_name: str = "items",
+    date_range: tuple[str | None, str | None] | None = None,
+) -> tuple[list[T], str]:
+    """Slice ``items`` to one page and build a ``Showing X-Y of Z`` line.
+
+    Unlike :func:`_apply_limit`, the indicator is **always** returned
+    (never None) and is meant to be the FIRST line of the response — the
+    LLM learns the view is partial *before* reading any rows. A silent
+    truncation is exactly the failure this prevents (a reconciliation
+    session once missed 16 of 109 transactions to a hidden cap).
+
+    Args:
+        items: The FULL filtered, sorted result set. Slicing happens
+            here; ``len(items)`` is the authoritative total — count
+            before paginating, never after.
+        offset: 0-indexed first row. Negative clamps to 0.
+        limit: Page size. Falsy/None falls back to ``default`` (50);
+            ``limit == 0`` is count-only mode (empty page, total still
+            reported); values above ``max_cap`` (250) clamp with a
+            ``limit capped at N`` note appended to the indicator.
+        entity_name: Plural noun for the indicator ("transactions",
+            "accounts", "splits").
+        date_range: ``(earliest, latest)`` ISO strings spanning the
+            FULL result set — not just this page — rendered in parens
+            so the LLM sees the time window without parsing rows. Omit
+            (or pass None/empty members) for undated entities.
+
+    Returns:
+        ``(page, indicator)``. ``page`` is the sliced rows; ``indicator``
+        is the always-present header line.
+    """
+    total = len(items)
+
+    suffix = ""
+    if date_range:
+        lo, hi = date_range
+        if lo and hi:
+            suffix = f" ({lo} to {hi})"
+
+    # Count-only mode — one cheap call to learn the size before paging.
+    if limit == 0:
+        return [], f"Showing 0 of {total} {entity_name}{suffix}"
+
+    if not limit or limit < 1:
+        limit = default
+    capped = limit > max_cap
+    effective = min(limit, max_cap)
+
+    if offset < 0:
+        offset = 0
+
+    if total == 0:
+        return [], f"Showing 0 of 0 {entity_name}"
+
+    # Overshot the end — surface the total so the LLM can correct.
+    if offset >= total:
+        return [], (
+            f"Showing 0 of {total} {entity_name} "
+            f"(offset {offset} exceeds result count){suffix}"
+        )
+
+    page = items[offset:offset + effective]
+    cap_note = f"; limit capped at {effective}" if capped else ""
+    indicator = (
+        f"Showing {offset + 1}-{offset + len(page)} of {total} "
+        f"{entity_name}{cap_note}{suffix}"
+    )
+    return page, indicator

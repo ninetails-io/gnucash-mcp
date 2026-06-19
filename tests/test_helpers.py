@@ -9,7 +9,12 @@ from decimal import Decimal
 
 import pytest
 
-from gnucash_mcp.tools._helpers import _apply_limit, _format_number, _resolve_id_alias
+from gnucash_mcp.tools._helpers import (
+    _apply_limit,
+    _format_number,
+    _paginate,
+    _resolve_id_alias,
+)
 
 
 class TestFormatNumber:
@@ -204,6 +209,167 @@ class TestApplyLimit:
         # Truncation preserves input order (just ``items[:n]``).
         items, _ = _apply_limit(list(range(20)), limit=3)
         assert items == [0, 1, 2]
+
+
+class TestPaginate:
+    """Tests for ``_paginate`` — the offset+limit chokepoint that emits
+    the always-present ``Showing X-Y of Z`` indicator. Mirrors the
+    test list in specs/PAGINATION.md."""
+
+    # ── First page / default ─────────────────────────────────────
+
+    def test_default_first_page(self):
+        # Spec test 1: default call shows ``1-50 of N`` when N > 50.
+        page, ind = _paginate(
+            list(range(109)), entity_name="transactions"
+        )
+        assert page == list(range(50))
+        assert ind == "Showing 1-50 of 109 transactions"
+
+    def test_second_page_offset(self):
+        # Spec test 2: offset=50 returns ``51-100 of N`` with the
+        # correct rows.
+        page, ind = _paginate(
+            list(range(109)), offset=50, entity_name="transactions"
+        )
+        assert page == list(range(50, 100))
+        assert ind == "Showing 51-100 of 109 transactions"
+
+    def test_last_partial_page(self):
+        # Spec test 3: last page shows a partial range.
+        page, ind = _paginate(
+            list(range(109)), offset=100, entity_name="transactions"
+        )
+        assert page == list(range(100, 109))
+        assert ind == "Showing 101-109 of 109 transactions"
+
+    def test_full_set_fits_one_page(self):
+        # Spec test 4: N <= limit shows ``1-N of N``.
+        page, ind = _paginate(
+            list(range(23)), entity_name="transactions"
+        )
+        assert page == list(range(23))
+        assert ind == "Showing 1-23 of 23 transactions"
+
+    # ── Edge cases ───────────────────────────────────────────────
+
+    def test_zero_results(self):
+        # Spec test 5.
+        page, ind = _paginate([], entity_name="transactions")
+        assert page == []
+        assert ind == "Showing 0 of 0 transactions"
+
+    def test_offset_beyond_total(self):
+        # Spec test 6.
+        page, ind = _paginate(
+            list(range(109)), offset=200, entity_name="transactions"
+        )
+        assert page == []
+        assert "of 109 transactions" in ind
+        assert "offset 200 exceeds result count" in ind
+
+    def test_count_only_mode(self):
+        # Spec test 7: limit=0 returns the count-only indicator.
+        page, ind = _paginate(
+            list(range(245)), limit=0, entity_name="transactions"
+        )
+        assert page == []
+        assert ind == "Showing 0 of 245 transactions"
+
+    def test_count_only_includes_date_range(self):
+        page, ind = _paginate(
+            list(range(245)),
+            limit=0,
+            entity_name="transactions",
+            date_range=("2026-01-01", "2026-06-18"),
+        )
+        assert page == []
+        assert ind == (
+            "Showing 0 of 245 transactions "
+            "(2026-01-01 to 2026-06-18)"
+        )
+
+    # ── Date range ───────────────────────────────────────────────
+
+    def test_date_range_appended(self):
+        # Spec test 9: date range reflects the full result set.
+        _, ind = _paginate(
+            list(range(109)),
+            entity_name="transactions",
+            date_range=("2026-05-01", "2026-06-12"),
+        )
+        assert ind == (
+            "Showing 1-50 of 109 transactions "
+            "(2026-05-01 to 2026-06-12)"
+        )
+
+    def test_date_range_omitted_when_undated(self):
+        _, ind = _paginate(
+            list(range(5)), entity_name="accounts", date_range=None
+        )
+        assert ind == "Showing 1-5 of 5 accounts"
+
+    def test_date_range_skipped_when_member_missing(self):
+        _, ind = _paginate(
+            list(range(5)),
+            entity_name="prices",
+            date_range=(None, None),
+        )
+        assert ind == "Showing 1-5 of 5 prices"
+
+    # ── Server-side cap ──────────────────────────────────────────
+
+    def test_limit_above_cap_clamps_with_note(self):
+        page, ind = _paginate(
+            list(range(500)), limit=999, max_cap=250,
+            entity_name="transactions",
+        )
+        assert len(page) == 250
+        assert ind == (
+            "Showing 1-250 of 500 transactions; limit capped at 250"
+        )
+
+    def test_cap_note_present_even_when_results_fit(self):
+        # Like ``_apply_limit``'s "[Limit capped at N]" heads-up: a
+        # requested limit above the ceiling is flagged so the LLM knows
+        # the server cap exists, even when the page held everything.
+        _, ind = _paginate(
+            list(range(100)), limit=999, max_cap=250,
+            entity_name="transactions",
+        )
+        assert ind == (
+            "Showing 1-100 of 100 transactions; limit capped at 250"
+        )
+
+    def test_no_cap_note_when_limit_within_cap(self):
+        _, ind = _paginate(
+            list(range(100)), limit=200, max_cap=250,
+            entity_name="transactions",
+        )
+        assert "capped" not in ind
+        assert ind == "Showing 1-100 of 100 transactions"
+
+    # ── Defaults / clamping ──────────────────────────────────────
+
+    def test_falsy_limit_uses_default(self):
+        page, _ = _paginate(
+            list(range(100)), limit=None, default=10,
+            entity_name="x",
+        )
+        assert len(page) == 10
+
+    def test_negative_offset_clamps_to_zero(self):
+        page, ind = _paginate(
+            list(range(10)), offset=-5, entity_name="x"
+        )
+        assert page == list(range(10))
+        assert ind == "Showing 1-10 of 10 x"
+
+    def test_indicator_always_returned(self):
+        # The contract: indicator is never None, for any input.
+        for args in [([],), (list(range(3)),), (list(range(300)),)]:
+            _, ind = _paginate(*args, entity_name="x")
+            assert isinstance(ind, str) and ind
 
 
 class TestSafeToolWriteVerificationRouting:
