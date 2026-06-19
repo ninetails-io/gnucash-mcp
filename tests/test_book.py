@@ -8474,6 +8474,91 @@ class TestGroupByBreakdown:
         ]
 
 
+class TestGroupByCashFlow:
+    """group_by sub-period columns for cash_flow (Inflows/Outflows/Net)."""
+
+    def test_month_trend(self, tmp_path: Path):
+        """3-month range → Inflows / Outflows / Net rows, one column
+        per month plus Total and Avg."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        tsv = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = TestGroupByBreakdown._parse(tsv)
+        assert rows["Cash flow"] == [
+            "Cash flow", "2026-03", "2026-04", "2026-05", "Total", "Avg",
+        ]
+        # Inflows: salary 4000/mo, + April consulting 1000 + April
+        # refunds (travel 200 + shopping 300).
+        assert rows["Inflows"] == [
+            "Inflows", "4000.00", "5500.00", "4000.00", "13500.00", "4500.00",
+        ]
+        assert rows["Outflows"] == [
+            "Outflows", "2100.00", "1300.00", "950.00", "4350.00", "1450.00",
+        ]
+        # Net is the build-vs-burn signal — every month positive here.
+        assert rows["Net"] == [
+            "Net", "1900.00", "4200.00", "3050.00", "9150.00", "3050.00",
+        ]
+        # The account-scope title line leads the table.
+        assert tsv.splitlines()[0] == "All cash/bank accounts"
+
+    def test_grouped_totals_match_single_period(self, tmp_path: Path):
+        """The grouped column totals reconcile with the single-period
+        cash_flow over the same range."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        single = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+        )
+        rows = TestGroupByBreakdown._parse(gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        ))
+        assert rows["Inflows"][-2] == f"{Decimal(single['inflows']):.2f}"
+        assert rows["Outflows"][-2] == f"{Decimal(single['outflows']):.2f}"
+
+    def test_quarter_columns(self, tmp_path: Path):
+        """6-month range → 2 quarter columns."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        rows = TestGroupByBreakdown._parse(gc.cash_flow(
+            start_date=date(2026, 1, 1), end_date=date(2026, 6, 30),
+            group_by="quarter",
+        ))
+        assert rows["Cash flow"] == [
+            "Cash flow", "2026-Q1", "2026-Q2", "Total", "Avg",
+        ]
+
+    def test_account_filter_with_group_by(self, tmp_path: Path):
+        """An explicit account scopes the trend and names it in the
+        title line."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        tsv = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            account="Assets:Checking", group_by="month",
+        )
+        assert tsv.splitlines()[0] == "Assets:Checking"
+
+    def test_invalid_group_by(self, tmp_path: Path):
+        """Unknown granularity → clear ValueError."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        with pytest.raises(ValueError, match="Invalid group_by"):
+            gc.cash_flow(
+                start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+                group_by="fortnight",
+            )
+
+    def test_no_group_by_unchanged(self, tmp_path: Path):
+        """Regression guard: omitting group_by keeps the single-period
+        dict shape."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        result = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+        )
+        assert "inflows" in result and "outflows" in result
+        assert result["account"] == "All cash/bank accounts"
+
+
 class TestBalanceSheet:
     """Tests for balance_sheet method."""
 

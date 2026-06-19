@@ -151,6 +151,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         account: str | None = None,
         include_transfers: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Calculate cash flow (inflows and outflows) for a period.
 
@@ -175,6 +176,9 @@ def register(mcp, get_book) -> None:
             include_transfers: When False (default), filter internal
                 transfers. When True, include every cash/bank
                 movement regardless of category.
+            group_by: Optional "month", "quarter", or "year" — split
+                the range into sub-period columns and return an
+                Inflows / Outflows / Net trend table (TSV).
         """
         book = get_book()
         result = book.cash_flow(
@@ -182,7 +186,10 @@ def register(mcp, get_book) -> None:
             end_date=date.fromisoformat(end_date),
             account=account,
             include_transfers=include_transfers,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         return _json(result)
 
     @mcp.tool()
