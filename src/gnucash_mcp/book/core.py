@@ -2121,17 +2121,23 @@ class CoreMixin:
         self,
         root: str | None = None,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all accounts in the chart of accounts.
 
-        Compact output emits one ``%shortguid<TAB>fullname [ANNOTATION]``
-        line per account; the short GUID is the cheap handle for
-        subsequent calls (tools resolve ``%xxxxxxx``, full GUIDs, and
-        paths interchangeably via ``_resolve_account``).
+        Leads with a ``Showing X-Y of Z accounts`` indicator (accounts
+        are undated, so no date range). Compact output then emits one
+        ``%shortguid<TAB>fullname [ANNOTATION]`` line per account; the
+        short GUID is the cheap handle for subsequent calls (tools
+        resolve ``%xxxxxxx``, full GUIDs, and paths interchangeably via
+        ``_resolve_account``).
 
         Args:
             root: Optional subtree filter (path, ``%short``, or GUID).
-            compact: If False, return full account dicts instead.
+            compact: If False, return a verbose envelope instead.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         with self.open(readonly=True) as book:
             # Template accounts are GnuCash internals, not part of
@@ -2160,17 +2166,32 @@ class CoreMixin:
 
             filtered.sort(key=lambda a: a.fullname)
 
+            page, indicator = _paginate(
+                filtered,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="accounts",
+            )
+
             if compact:
                 # Short-guid map spans the whole book so prefixes
                 # stay unambiguous against every resolvable account.
                 short_map = self._account_short_guid_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     f"{short_map[a.guid]}\t{_account_to_compact_line(a)}"
-                    for a in filtered
+                    for a in page
                 ]
                 return "\n".join(lines)
             else:
-                return [_account_to_dict(a) for a in filtered]
+                return {
+                    "showing": indicator,
+                    "total": len(filtered),
+                    "offset": offset,
+                    "count": len(page),
+                    "accounts": [_account_to_dict(a) for a in page],
+                }
 
     def get_account(self, name: str) -> dict | None:
         """Get details for a specific account by full name.

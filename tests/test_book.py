@@ -3367,7 +3367,8 @@ class TestListAccounts:
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts()
 
-        lines = result.strip().split("\n")
+        # Line 0 is the "Showing X-Y of Z accounts" indicator.
+        lines = result.strip().split("\n")[1:]
         # Extract fullname (before any annotation bracket); skip past
         # the '%shortguid<TAB>' prefix introduced by short GUIDs.
         names = [
@@ -3379,7 +3380,7 @@ class TestListAccounts:
     def test_list_accounts_structure_verbose(self, test_book: Path):
         """compact=False should return proper account dict structure."""
         gc_book = GnuCashBook(str(test_book))
-        accounts = gc_book.list_accounts(compact=False)
+        accounts = gc_book.list_accounts(compact=False)["accounts"]
 
         assert isinstance(accounts, list)
         account = accounts[0]
@@ -3426,7 +3427,7 @@ class TestListAccounts:
     def test_verbose_mode(self, test_book: Path):
         """compact=False should return list of dicts (old behavior)."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_accounts(compact=False)
+        result = gc_book.list_accounts(compact=False)["accounts"]
 
         assert isinstance(result, list)
         assert all(isinstance(a, dict) for a in result)
@@ -3438,7 +3439,8 @@ class TestListAccounts:
         """root parameter should filter to a subtree."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts(root="Expenses")
-        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")]
+        # Skip the leading "Showing X-Y of Z accounts" indicator.
+        paths = [_path_from_compact_line(l) for l in result.strip().split("\n")[1:]]
 
         for path in paths:
             assert path.startswith("Expenses")
@@ -3447,7 +3449,7 @@ class TestListAccounts:
     def test_root_filter_verbose(self, test_book: Path):
         """root + compact=False should return filtered dicts."""
         gc_book = GnuCashBook(str(test_book))
-        result = gc_book.list_accounts(root="Assets", compact=False)
+        result = gc_book.list_accounts(root="Assets", compact=False)["accounts"]
 
         assert isinstance(result, list)
         for a in result:
@@ -3457,13 +3459,13 @@ class TestListAccounts:
         """root filter should not partially match account names."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts(root="Exp")
-        assert result == ""
+        assert result == "Showing 0 of 0 accounts"
 
     def test_root_nonexistent(self, test_book: Path):
         """root filter for nonexistent account returns empty."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts(root="Nonexistent")
-        assert result == ""
+        assert result == "Showing 0 of 0 accounts"
 
     def test_root_includes_self(self, test_book: Path):
         """root account itself should be included in results."""
@@ -3617,7 +3619,7 @@ class TestResolveAccount:
         import re
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts()
-        for line in result.strip().split("\n"):
+        for line in result.strip().split("\n")[1:]:  # skip indicator
             # '%' + 7+ hex + TAB + non-empty path
             assert re.match(r"^%[0-9a-f]{7,32}\t\S", line), (
                 f"unexpected line shape: {line!r}"
@@ -3632,7 +3634,7 @@ class TestResolveAccount:
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.list_accounts()
         with gc_book.open(readonly=True) as book:
-            for line in result.strip().split("\n"):
+            for line in result.strip().split("\n")[1:]:  # skip indicator
                 short, rest = line.split("\t", 1)
                 # Path is everything before the optional " [ANN]" suffix.
                 path = rest.split(" [", 1)[0]
@@ -3836,7 +3838,7 @@ class TestTemplateAccountsHidden:
         compact = gc.list_accounts()
         assert "MonthlyRentTemplate" not in compact
 
-        verbose = gc.list_accounts(compact=False)
+        verbose = gc.list_accounts(compact=False)["accounts"]
         names = {a["fullname"] for a in verbose}
         assert not any("MonthlyRentTemplate" in n for n in names)
         # User's chart of accounts still appears normally.
@@ -6721,7 +6723,7 @@ class TestReplaceSplits:
         # emits and the LLM passes back. ``list_accounts`` returns
         # the full 32-char GUID; the shortcut is "%" + the first 7
         # chars (the bookkeeper's exact failing input format).
-        accounts_list = gc_book.list_accounts(compact=False)
+        accounts_list = gc_book.list_accounts(compact=False)["accounts"]
         groceries_full = next(
             a["guid"] for a in accounts_list
             if a["fullname"] == "Expenses:Groceries"
@@ -6767,7 +6769,7 @@ class TestReplaceSplits:
         )["transactions"]
         guid = transactions[0]["guid"]
 
-        accounts_list = gc_book.list_accounts(compact=False)
+        accounts_list = gc_book.list_accounts(compact=False)["accounts"]
         groceries_full = next(
             a["guid"] for a in accounts_list
             if a["fullname"] == "Expenses:Groceries"
@@ -10866,8 +10868,9 @@ class TestShortGuidRoundTripClosure:
     def test_account_short_guid_round_trip(self, test_book: Path):
         gc_book = GnuCashBook(str(test_book))
         # list_accounts compact emits "%shortguid<TAB>fullname [ANN]".
+        # Line 0 is the pagination indicator; first account is line 1.
         compact = gc_book.list_accounts()
-        line = compact.strip().split("\n")[0]
+        line = compact.strip().split("\n")[1]
         short_acct, _rest = line.split("\t", 1)
         assert short_acct.startswith("%")
         # Feed it back into get_account — accepts %short, full path,

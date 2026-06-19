@@ -82,20 +82,23 @@ class TestListAccountsTool:
         assert "\n" in result
 
     def test_list_accounts_verbose(self, setup_book_env):
-        """verbose=True should return full JSON."""
+        """verbose=True should return the paginated envelope."""
         result = server_module.list_accounts(verbose=True)
 
         data = json.loads(result)
-        assert isinstance(data, list)
-        assert len(data) > 0
-        fullnames = {a["fullname"] for a in data}
+        assert isinstance(data, dict)
+        assert data["showing"].startswith("Showing 1-")
+        accounts = data["accounts"]
+        assert len(accounts) > 0
+        fullnames = {a["fullname"] for a in accounts}
         assert "Assets" in fullnames
         assert "Assets:Checking" in fullnames
 
     def test_list_accounts_root_filter(self, setup_book_env):
         """root parameter should filter accounts."""
         result = server_module.list_accounts(root="Expenses")
-        lines = result.strip().split("\n")
+        # Skip the leading "Showing X-Y of Z accounts" indicator.
+        lines = result.strip().split("\n")[1:]
         for line in lines:
             # Compact line format: '%shortguid<TAB>fullname [ANNOTATION]'.
             # Pull the path portion off before checking the prefix.
@@ -106,8 +109,7 @@ class TestListAccountsTool:
         """root + verbose should return filtered JSON."""
         result = server_module.list_accounts(root="Assets", verbose=True)
         data = json.loads(result)
-        assert isinstance(data, list)
-        for a in data:
+        for a in data["accounts"]:
             assert a["fullname"].startswith("Assets")
 
 

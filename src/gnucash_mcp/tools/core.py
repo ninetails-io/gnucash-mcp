@@ -84,18 +84,26 @@ def register(mcp, get_book) -> None:
     def list_accounts(
         root: str | None = None,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all accounts in the GnuCash chart of accounts.
 
-        Returns a compact one-line-per-account format by default.
-        Use verbose=true for full JSON with guid, type, commodity, etc.
+        Leads with a ``Showing X-Y of Z accounts`` line, then a compact
+        one-line-per-account format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, type, commodity, etc.
 
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
             verbose: If true, return full JSON details for each account.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_accounts(root=root, compact=not verbose)
+        result = book.list_accounts(
+            root=root, compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result
