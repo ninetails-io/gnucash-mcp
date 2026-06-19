@@ -144,6 +144,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "list_transactions",
         "get_transaction",
         "create_transaction",
+        "create_transactions",
         "update_transaction",
         "delete_transaction",
         "replace_splits",
@@ -651,13 +652,13 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (29 tools, always-on). Use "all"
-                       for every module (106 tools).
+                       Default: core (30 tools, always-on). Use "all"
+                       for every module (107 tools).
 
                        Role-based selections (group aliases that
                        expand to underlying modules — start here):
                          core         Ledger primitives + reconciliation.
-                                      Always on regardless. 29 tools.
+                                      Always on regardless. 30 tools.
                          bookkeeper   Reporting + budgets + scheduling.
                                       17 tools.
                          investor     tax_lots + portfolio (cost basis

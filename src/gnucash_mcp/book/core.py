@@ -3032,6 +3032,188 @@ class CoreMixin:
                 result["auto_filled_from"] = auto_filled_from
             return result
 
+    def create_transactions(
+        self,
+        transactions: list[dict],
+        force: bool = False,
+        dry_run: bool = False,
+        on_error: str = "abort",
+    ) -> dict:
+        """Create multiple transactions in one atomic save.
+
+        Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
+        ``{ref, date (date), description, splits: [{account, amount}]}``.
+
+        Three phases under one book-open: validate all structurally,
+        screen each against existing-book duplicates, then build every
+        accepted transaction and ``save()`` once. ``on_error="abort"``
+        (default) sinks the whole batch on any structural failure;
+        ``"skip"`` keeps the good rows. A HIGH duplicate rejects only
+        its own row (``force=True`` overrides).
+
+        Returns a thin envelope: ``results`` TSV (always) and
+        ``duplicates`` TSV (only when a match exists; otherwise empty,
+        which ``_strip_noise`` drops). v1 is same-currency (book
+        default), no per-split memo, no intra-batch dedup — exotic cases
+        use ``create_transaction``.
+        """
+        if on_error not in ("abort", "skip"):
+            raise ValueError("on_error must be 'abort' or 'skip'")
+        refs = [t["ref"] for t in transactions]
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                "duplicate ref in batch — each ref must be unique"
+            )
+        readonly = dry_run
+        by_ref: dict = {}        # ref -> final result row
+        dup_rows: list = []      # (ref, candidate-dict) for the FK table
+
+        with self.open(readonly=readonly) as book:
+            default_currency = self._require_default_currency(book)
+
+            # --- Phase 1: structural validation (every row) ---
+            prepared = []
+            for txn in transactions:
+                ref = txn["ref"]
+                try:
+                    splits = txn["splits"]
+                    if len(splits) < 2:
+                        raise ValueError("at least 2 splits required")
+                    validated = self._validate_transaction_splits(
+                        book, splits, default_currency,
+                    )
+                    for v in validated:
+                        if v["account"].placeholder:
+                            raise ValueError(
+                                f"account '{v['account'].fullname}' is a "
+                                f"placeholder and cannot receive splits"
+                            )
+                    prepared.append({
+                        "ref": ref,
+                        "description": txn["description"],
+                        "trans_date": txn["date"],
+                        "validated": validated,
+                        "proposed_amounts": [
+                            abs(_to_decimal(s["amount"])) for s in splits
+                        ],
+                    })
+                except (ValueError, KeyError) as e:
+                    by_ref[ref] = {
+                        "ref": ref, "status": "rejected", "reason": str(e),
+                    }
+
+            # abort: any structural failure sinks the batch — the valid
+            # rows report batch_aborted, nothing is written.
+            if by_ref and on_error == "abort":
+                for p in prepared:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "rejected",
+                        "reason": "batch_aborted",
+                    }
+                return self._batch_envelope(transactions, by_ref, [])
+
+            # --- Phase 2: duplicate screen (against existing book) ---
+            accepted = []
+            for p in prepared:
+                signals = self._collect_create_signals(
+                    book, p["description"], p["trans_date"],
+                    p["proposed_amounts"],
+                    want_auto_fill=False, want_stability=False,
+                    want_duplicates=True, want_recent=False,
+                )
+                dups = signals.duplicates
+                for d in dups:
+                    dup_rows.append((p["ref"], d))
+                if signals.has_high_duplicate and not force:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "rejected",
+                        "reason": "duplicate_detected", "dup_count": len(dups),
+                    }
+                else:
+                    accepted.append((p, len(dups)))
+
+            # --- Phase 3: build all accepted rows, one save ---
+            if dry_run:
+                for p, dup_count in accepted:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "would_create",
+                        "dup_count": dup_count,
+                    }
+                return self._batch_envelope(transactions, by_ref, dup_rows)
+
+            built = []
+            for p, dup_count in accepted:
+                piecash_splits = [
+                    piecash.Split(
+                        account=v["account"], value=v["value"],
+                        quantity=v["quantity"], memo=v["memo"] or "",
+                    )
+                    for v in p["validated"]
+                ]
+                txn_obj = piecash.Transaction(
+                    currency=default_currency,
+                    description=p["description"],
+                    post_date=p["trans_date"],
+                    splits=piecash_splits,
+                )
+                built.append((p["ref"], txn_obj, dup_count))
+
+            # Single flush for the whole batch — per the "don't flush
+            # mid-build" rule, every Transaction is fully constructed
+            # before the one save.
+            book.save()
+
+            all_guids = [t.guid for t in book.transactions]
+            for ref, txn_obj, dup_count in built:
+                by_ref[ref] = {
+                    "ref": ref, "status": "created",
+                    "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
+                    "dup_count": dup_count,
+                }
+
+            return self._batch_envelope(transactions, by_ref, dup_rows)
+
+    def _batch_envelope(
+        self, transactions: list[dict], by_ref: dict, dup_rows: list,
+    ) -> dict:
+        """Assemble the {results, duplicates} TSV envelope in input
+        order. Empty ``duplicates`` renders as "" so _strip_noise drops
+        it — absence of the key means no duplicates anywhere."""
+        rows = [by_ref[t["ref"]] for t in transactions]
+        return {
+            "results": self._batch_results_to_tsv(rows),
+            "duplicates": self._batch_duplicates_to_tsv(dup_rows),
+        }
+
+    @staticmethod
+    def _batch_results_to_tsv(rows: list[dict]) -> str:
+        """RESULTS table: header + one row per input transaction.
+        Blank cells for fields a given status doesn't carry; ``dup_count``
+        of 0 renders as "0", absent renders blank."""
+        header = "ref\tstatus\ttxn_guid\tdup_count\treason"
+        lines = [header]
+        for r in rows:
+            dup = r["dup_count"] if "dup_count" in r else ""
+            lines.append(
+                f"{r['ref']}\t{r['status']}\t{r.get('txn_guid', '')}\t"
+                f"{dup}\t{r.get('reason', '')}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _batch_duplicates_to_tsv(dup_rows: list) -> str:
+        """DUPLICATES table: single-entry's column order with ``ref``
+        prepended as the FK. Empty string when no row has a match."""
+        if not dup_rows:
+            return ""
+        lines = ["ref\tconfidence\tguid\tdate\tamount\tdescription\tsignals"]
+        for ref, d in dup_rows:
+            lines.append(
+                f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
+                f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            )
+        return "\n".join(lines)
+
     def search_transactions(
         self,
         query: str,

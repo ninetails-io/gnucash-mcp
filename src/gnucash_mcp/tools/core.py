@@ -19,6 +19,49 @@ from gnucash_mcp.tools._helpers import (
 )
 
 
+def _parse_transactions_tsv(tsv: str) -> list[dict]:
+    """Parse the batch-entry TSV into structured transactions.
+
+    Header row + one row per transaction; positional parse so rows may
+    be ragged. First three fields are ref / date / description; the rest
+    are ``(amount, account)`` pairs. Raises ValueError on a missing
+    header, too-few columns, or an odd trailing count.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "transactions TSV needs a header row and at least one data row"
+        )
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        fields = ln.split("\t")
+        if len(fields) < 5:
+            raise ValueError(
+                f"row {i}: expected ref, date, description, and at least "
+                f"one (amount, account) pair"
+            )
+        ref, dt, desc = fields[0].strip(), fields[1].strip(), fields[2]
+        if not ref:
+            raise ValueError(f"row {i}: empty ref (each row needs a key)")
+        rest = fields[3:]
+        if len(rest) % 2 != 0:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): trailing fields must be "
+                f"(amount, account) pairs — got an odd count"
+            )
+        splits = [
+            {"account": rest[j + 1], "amount": rest[j]}
+            for j in range(0, len(rest), 2)
+        ]
+        out.append({
+            "ref": ref,
+            "date": _parse_iso_date(dt) or date.today(),
+            "description": desc,
+            "splits": splits,
+        })
+    return out
+
+
 def register(mcp, get_book) -> None:
     """Attach core tools to the FastMCP server."""
 
@@ -217,6 +260,69 @@ def register(mcp, get_book) -> None:
             check_duplicates=check_duplicates,
             force_create=force_create,
             dry_run=dry_run,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="create_batch",
+        entity_type="transaction",
+    )
+    def create_transactions(
+        transactions: str,
+        force: bool = False,
+        dry_run: bool = False,
+        on_error: str = "abort",
+    ) -> str:
+        """Create MANY transactions in one atomic command (bulk entry).
+
+        INPUT — ``transactions`` is a TSV block: a header row, then one
+        row per transaction. Splits are ``(amount, account)`` column
+        PAIRS, repeated as wide as a transaction needs::
+
+            ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
+            1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+        - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
+          within the batch. It is echoed back so you can match results
+          to what you sent; the server never reuses or interprets it.
+        - ``date``: ISO YYYY-MM-DD. ``amount``: decimal STRING (never a
+          raw JSON number). Each transaction needs >=2 splits balancing
+          to zero. Rows may differ in width (2 splits vs 3).
+        - v1 is same-currency (book default) with no per-split memo —
+          use ``create_transaction`` for cross-currency, investment, or
+          memo-bearing entries.
+
+        BEHAVIOR — one book-open, one atomic save:
+        - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
+          aborts the WHOLE batch by default; nothing is written. Pass
+          ``on_error="skip"`` to write the good rows and reject only the
+          bad ones.
+        - A duplicate rejects ONLY its row; ``force=True`` overrides all
+          blocking duplicates (as in ``create_transaction``).
+          ``dry_run=True`` validates + screens without writing.
+
+        OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
+        - ``results`` (always): ``ref, status, txn_guid, dup_count,
+          reason``. status is ``created`` | ``rejected`` |
+          ``would_create`` (dry_run); reason is a code like
+          ``duplicate_detected`` or the validation message.
+        - ``duplicates`` (only when matches exist): ``ref, confidence,
+          guid, date, amount, description, signals`` — the columns
+          ``create_transaction`` emits, keyed back to the offending
+          ``ref``. Σ(dup_count) equals the duplicates row count.
+
+        Args:
+            transactions: The TSV block described above.
+            force: Override ALL blocking (HIGH) duplicates this batch.
+            dry_run: Validate + screen, write nothing.
+            on_error: "abort" (default) or "skip" for structural errors.
+        """
+        book = get_book()
+        parsed = _parse_transactions_tsv(transactions)
+        result = book.create_transactions(
+            parsed, force=force, dry_run=dry_run, on_error=on_error,
         )
         return _json(result)
 
