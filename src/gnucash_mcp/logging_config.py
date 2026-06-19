@@ -509,6 +509,69 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     return lines
 
 
+def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
+    """Header-bearing TSV string -> row dicts (display-only)."""
+    if not tsv:
+        return []
+    rows = tsv.split("\n")
+    header = rows[0].split("\t")
+    return [dict(zip(header, r.split("\t"))) for r in rows[1:] if r]
+
+
+def _parse_batch_submission(tsv: str) -> dict:
+    """ref -> {description, date, splits} from the submitted batch TSV.
+    Positional parse mirroring the tool layer; tolerant of ragged rows
+    since this is display-only."""
+    out: dict = {}
+    for ln in (tsv.split("\n")[1:] if tsv else []):
+        if not ln.strip():
+            continue
+        f = ln.split("\t")
+        if len(f) < 3:
+            continue
+        rest = f[3:]
+        splits = [
+            {"account": rest[j + 1], "amount": rest[j]}
+            for j in range(0, len(rest) - 1, 2)
+        ]
+        out[f[0].strip()] = {
+            "description": f[2], "date": f[1].strip(), "splits": splits,
+        }
+    return out
+
+
+def _fmt_transaction_create_batch(entry: dict) -> list[str]:
+    """Batch create audits as N individual create blocks — one per
+    committed transaction, each rendered like a single-entry create.
+    Joins the submitted TSV (params) with the results TSV (after_state)
+    by ref. Account refs render as the caller supplied them (the TSV
+    isn't run through the audit ref-normalizer)."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    submitted = _parse_batch_submission(params.get("transactions") or "")
+    results = _parse_audit_tsv_rows(after.get("results") or "")
+    created = [r for r in results if r.get("status") == "created"]
+    rejected = [r for r in results if r.get("status") == "rejected"]
+
+    lines = [
+        f"{time_part}  CREATE TRANSACTIONS (batch)  "
+        f"{len(created)} created, {len(rejected)} rejected"
+    ]
+    for r in created:
+        src = submitted.get(r.get("ref", ""), {})
+        guid = r.get("txn_guid", "")
+        desc = src.get("description", "")
+        date_str = src.get("date", "")
+        lines.append(
+            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({date_str})'
+        )
+        splits = src.get("splits") or []
+        if splits:
+            lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    return lines
+
+
 def _fmt_transaction_update(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
@@ -1680,6 +1743,7 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
 
 _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
     ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,
     ("transaction", "UNVOID"): _fmt_transaction_unvoid,
