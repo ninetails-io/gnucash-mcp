@@ -23,6 +23,7 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
+from gnucash_mcp._format import _paginate
 
 
 def _collapse_period_runs(
@@ -378,31 +379,49 @@ class BudgetsMixin:
 
     # ── CRUD ──────────────────────────────────────────────────────
 
-    def list_budgets(self, compact: bool = True) -> list[dict] | str:
+    def list_budgets(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all budgets in the book.
 
+        Leads with a ``Showing X-Y of Z budgets`` indicator; page with
+        ``offset``.
+
         Args:
-            compact: If True (default), return a compact one-line-per-
-                     budget string. Verbose mode returns the structured
-                     dict list.
+            compact: If True (default), return the indicator + a compact
+                     one-line-per-budget string. Verbose mode returns the
+                     envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            If compact: newline-separated lines of the form
+            If compact: indicator + newline-separated lines of the form
                 ``"<name>  <num_periods> periods (<period_type>)  starts:<YYYY-MM-DD>"``.
-            If not compact: list of budget dicts.
+            If not compact: envelope ``{showing, total, offset, count,
+            budgets}``.
         """
 
         with self.open(readonly=True) as book:
             budgets = book.session.query(Budget).all()
             dicts = [self._budget_to_dict(b) for b in budgets]
-            if not compact:
-                return dicts
 
-            if not dicts:
-                return ""
-            name_width = max(len(d["name"]) for d in dicts)
-            lines = []
-            for d in dicts:
+            page, indicator = _paginate(
+                dicts, offset=offset, limit=limit, entity_name="budgets",
+            )
+            if not compact:
+                return {
+                    "showing": indicator,
+                    "total": len(dicts),
+                    "offset": offset,
+                    "count": len(page),
+                    "budgets": page,
+                }
+
+            if not page:
+                return indicator
+            name_width = max(len(d["name"]) for d in page)
+            lines = [indicator]
+            for d in page:
                 periods = d.get("num_periods", "?")
                 ptype = d.get("period_type", "")
                 start = d.get("start_date", "?")

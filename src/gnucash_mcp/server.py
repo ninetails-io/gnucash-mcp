@@ -586,10 +586,14 @@ if _book_path and (_audit_mode or _debug_mode):
 
 @mcp.resource("gnucash://accounts")
 def accounts_resource() -> str:
-    """Full chart of accounts from the GnuCash book."""
+    """Full chart of accounts from the GnuCash book.
+
+    Resources are whole-snapshot reads, so this unwraps the paginated
+    envelope and returns the bare account list (up to the server cap).
+    """
     book = get_book()
-    accounts = book.list_accounts(compact=False)
-    return _json(accounts)
+    envelope = book.list_accounts(compact=False, limit=book.MAX_LIST_LIMIT)
+    return _json(envelope["accounts"])
 
 
 # ============== Server Diagnostic Tool ==============

@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
+from gnucash_mcp._format import _paginate
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
@@ -2119,17 +2120,23 @@ class CoreMixin:
         self,
         root: str | None = None,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all accounts in the chart of accounts.
 
-        Compact output emits one ``%shortguid<TAB>fullname [ANNOTATION]``
-        line per account; the short GUID is the cheap handle for
-        subsequent calls (tools resolve ``%xxxxxxx``, full GUIDs, and
-        paths interchangeably via ``_resolve_account``).
+        Leads with a ``Showing X-Y of Z accounts`` indicator (accounts
+        are undated, so no date range). Compact output then emits one
+        ``%shortguid<TAB>fullname [ANNOTATION]`` line per account; the
+        short GUID is the cheap handle for subsequent calls (tools
+        resolve ``%xxxxxxx``, full GUIDs, and paths interchangeably via
+        ``_resolve_account``).
 
         Args:
             root: Optional subtree filter (path, ``%short``, or GUID).
-            compact: If False, return full account dicts instead.
+            compact: If False, return a verbose envelope instead.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         with self.open(readonly=True) as book:
             # Template accounts are GnuCash internals, not part of
@@ -2158,17 +2165,32 @@ class CoreMixin:
 
             filtered.sort(key=lambda a: a.fullname)
 
+            page, indicator = _paginate(
+                filtered,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="accounts",
+            )
+
             if compact:
                 # Short-guid map spans the whole book so prefixes
                 # stay unambiguous against every resolvable account.
                 short_map = self._account_short_guid_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     f"{short_map[a.guid]}\t{_account_to_compact_line(a)}"
-                    for a in filtered
+                    for a in page
                 ]
                 return "\n".join(lines)
             else:
-                return [_account_to_dict(a) for a in filtered]
+                return {
+                    "showing": indicator,
+                    "total": len(filtered),
+                    "offset": offset,
+                    "count": len(page),
+                    "accounts": [_account_to_dict(a) for a in page],
+                }
 
     def get_account(self, name: str) -> dict | None:
         """Get details for a specific account by full name.
@@ -2225,28 +2247,27 @@ class CoreMixin:
         start_date: date | None = None,
         end_date: date | None = None,
         limit: int = 50,
+        offset: int = 0,
         compact: bool = True,
-    ) -> list[dict] | str:
+    ) -> dict | str:
         """List transactions with optional filters.
 
-        Compact output appends a ``[Showing N of M ...]`` truncation
-        notice when the result set exceeds ``limit``; limits above
-        ``MAX_LIST_LIMIT`` (250) are clamped server-side and flagged.
-        Verbose mode truncates silently (callers have the length).
+        Both modes lead with a ``Showing X-Y of Z transactions`` line
+        spanning the full filtered set's date range, so a partial view
+        is never silent. ``offset`` pages through; limits above
+        ``MAX_LIST_LIMIT`` (250) clamp server-side and flag it.
 
         Args:
             account: Filter by account ref.
             start_date / end_date: Inclusive date bounds.
-            limit: Maximum to return. Capped at 250.
-            compact: One line per transaction (default) or dicts,
-                most recent first.
+            limit: Page size. Capped at 250. ``0`` = count only.
+            offset: 0-indexed first row to return.
+            compact: One line per transaction (default) or a verbose
+                envelope, most recent first.
 
         Raises:
             ValueError: If specified account not found.
         """
-        capped = limit > self.MAX_LIST_LIMIT
-        effective_limit = min(limit, self.MAX_LIST_LIMIT)
-
         with self.open(readonly=True) as book:
             # If filtering by account, get transactions through that account's splits
             focus_fullname: str | None = None
@@ -2294,30 +2315,27 @@ class CoreMixin:
                 key=lambda t: t.post_date or date.min, reverse=True
             )
 
-            total_matched = len(filtered)
-            # Apply limit
-            filtered = filtered[:effective_limit]
+            page, indicator = _paginate(
+                filtered,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="transactions",
+                date_key=lambda t: t.post_date,
+            )
 
             if compact:
                 # Prefix map spans ALL transactions so emitted
                 # prefixes stay valid _resolve_guid keys; cached by
                 # book mtime.
                 prefixes = self._transaction_prefix_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _transaction_to_compact_line(
                         t, focus_account=focus_fullname, prefixes=prefixes
                     )
-                    for t in filtered
+                    for t in page
                 ]
-                notice = self._truncation_notice(
-                    total=total_matched,
-                    shown=len(filtered),
-                    effective_limit=effective_limit,
-                    capped=capped,
-                    suggest_narrow=True,
-                )
-                if notice:
-                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 # Verbose also emits short prefixes — every
@@ -2325,51 +2343,21 @@ class CoreMixin:
                 txn_prefixes = self._transaction_prefix_map(book)
                 split_prefixes = self._split_prefix_map(book)
                 lot_prefixes = self._lot_prefix_map(book)
-                return [
-                    _transaction_to_dict(
-                        t,
-                        txn_prefixes=txn_prefixes,
-                        split_prefixes=split_prefixes,
-                        lot_prefixes=lot_prefixes,
-                    )
-                    for t in filtered
-                ]
-
-    @staticmethod
-    def _truncation_notice(
-        total: int,
-        shown: int,
-        effective_limit: int,
-        capped: bool,
-        suggest_narrow: bool = True,
-    ) -> str | None:
-        """Build a truncation-notice line, or return None if no notice needed.
-
-        Emits one of:
-          - "[Limit capped at 250 — narrow your criteria for larger datasets]"
-            when the caller's limit exceeded MAX_LIST_LIMIT AND results fit.
-          - "[Showing N of M transactions — use start_date/end_date to narrow,
-             or set limit= higher]" when results were truncated (capped or not).
-          - None when total <= shown (everything fit).
-        """
-        if total <= shown:
-            if capped:
-                return (
-                    f"[Limit capped at {effective_limit} — results fit under "
-                    f"the cap]"
-                )
-            return None
-        if capped:
-            return (
-                f"[Showing {shown} of {total} transactions — limit was capped "
-                f"at {effective_limit}; narrow your criteria for complete "
-                f"results]"
-            )
-        hint = (
-            "use start_date/end_date to narrow, or set limit= higher"
-            if suggest_narrow else "set limit= higher"
-        )
-        return f"[Showing {shown} of {total} transactions — {hint}]"
+                return {
+                    "showing": indicator,
+                    "total": len(filtered),
+                    "offset": offset,
+                    "count": len(page),
+                    "transactions": [
+                        _transaction_to_dict(
+                            t,
+                            txn_prefixes=txn_prefixes,
+                            split_prefixes=split_prefixes,
+                            lot_prefixes=lot_prefixes,
+                        )
+                        for t in page
+                    ],
+                }
 
     def get_transaction(self, guid: str) -> dict | None:
         """Get details for a specific transaction by GUID.
@@ -3219,27 +3207,28 @@ class CoreMixin:
         query: str,
         field: str = "description",
         limit: int = 50,
+        offset: int = 0,
         compact: bool = True,
-    ) -> list[dict] | str:
+    ) -> dict | str:
         """Search transactions by field.
 
-        Truncation mirrors ``list_transactions`` (notice + 250 cap).
+        Pagination mirrors ``list_transactions`` (``Showing X-Y of Z``
+        indicator + offset + 250 cap).
 
         Args:
             query: Search string. For 'amount': exact ("100.00"),
                 ">100", "<100", or range "100-200".
             field: 'description', 'memo', 'notes', or 'amount'.
-            limit: Maximum to return. Capped at 250.
-            compact: One line per transaction (default) or dicts.
+            limit: Page size. Capped at 250. ``0`` = count only.
+            offset: 0-indexed first row to return.
+            compact: One line per transaction (default) or a verbose
+                envelope.
 
         Raises:
             ValueError: If field is not valid.
         """
         if field not in ("description", "memo", "notes", "amount"):
             raise ValueError(f"Invalid search field: {field}")
-
-        capped = limit > self.MAX_LIST_LIMIT
-        effective_limit = min(limit, self.MAX_LIST_LIMIT)
 
         with self.open(readonly=True) as book:
             matched = []
@@ -3277,28 +3266,34 @@ class CoreMixin:
                 key=lambda t: t.post_date or date.min, reverse=True
             )
 
-            total_matched = len(matched)
-            matched = matched[:effective_limit]
+            page, indicator = _paginate(
+                matched,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="transactions",
+                date_key=lambda t: t.post_date,
+            )
 
             if compact:
                 # Prefix map cached by book mtime.
                 prefixes = self._transaction_prefix_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _transaction_to_compact_line(t, prefixes=prefixes)
-                    for t in matched
+                    for t in page
                 ]
-                notice = self._truncation_notice(
-                    total=total_matched,
-                    shown=len(matched),
-                    effective_limit=effective_limit,
-                    capped=capped,
-                    suggest_narrow=False,  # no date-range hint on search
-                )
-                if notice:
-                    lines.append(notice)
                 return "\n".join(lines)
             else:
-                return [_transaction_to_dict(t) for t in matched]
+                return {
+                    "showing": indicator,
+                    "total": len(matched),
+                    "offset": offset,
+                    "count": len(page),
+                    "transactions": [
+                        _transaction_to_dict(t) for t in page
+                    ],
+                }
 
     def _match_amount(self, transaction: piecash.Transaction, query: str) -> bool:
         """Check if any split amount matches the query.

@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Generator, Iterable

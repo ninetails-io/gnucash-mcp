@@ -26,7 +26,7 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
-from gnucash_mcp._format import _apply_limit
+from gnucash_mcp._format import _paginate
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -2086,26 +2086,44 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all customers.
+
+        Leads with a ``Showing X-Y of Z customers`` indicator; page
+        with ``offset``.
 
         Args:
             active_only: If True, only return active customers.
             compact: If True, return compact one-line-per-customer string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             customers = sorted(book.customers, key=lambda c: c.name)
             if active_only:
                 customers = [c for c in customers if c.active]
 
+            page, indicator = _paginate(
+                customers, offset=offset, limit=limit,
+                entity_name="customers",
+            )
             if compact:
-                lines = [self._customer_to_compact_line(c) for c in customers]
+                lines = [indicator]
+                lines += [self._customer_to_compact_line(c) for c in page]
                 return "\n".join(lines)
             else:
-                return [self._customer_to_dict(c) for c in customers]
+                return {
+                    "showing": indicator,
+                    "total": len(customers),
+                    "offset": offset,
+                    "count": len(page),
+                    "customers": [self._customer_to_dict(c) for c in page],
+                }
 
     def get_customer(self, customer_id: str) -> dict:
         """Get customer details by ID.
@@ -2156,26 +2174,43 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all vendors.
+
+        Leads with a ``Showing X-Y of Z vendors`` indicator; page with
+        ``offset``.
 
         Args:
             active_only: If True, only return active vendors.
             compact: If True, return compact one-line-per-vendor string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             vendors = sorted(book.vendors, key=lambda v: v.name)
             if active_only:
                 vendors = [v for v in vendors if v.active]
 
+            page, indicator = _paginate(
+                vendors, offset=offset, limit=limit, entity_name="vendors",
+            )
             if compact:
-                lines = [self._vendor_to_compact_line(v) for v in vendors]
+                lines = [indicator]
+                lines += [self._vendor_to_compact_line(v) for v in page]
                 return "\n".join(lines)
             else:
-                return [self._vendor_to_dict(v) for v in vendors]
+                return {
+                    "showing": indicator,
+                    "total": len(vendors),
+                    "offset": offset,
+                    "count": len(page),
+                    "vendors": [self._vendor_to_dict(v) for v in page],
+                }
 
     def get_vendor(self, vendor_id: str) -> dict:
         """Get vendor details by ID.
@@ -2227,26 +2262,44 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all employees.
+
+        Leads with a ``Showing X-Y of Z employees`` indicator; page
+        with ``offset``.
 
         Args:
             active_only: If True, only return active employees.
             compact: If True, return compact one-line-per-employee string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             employees = sorted(book.employees, key=lambda e: e.name)
             if active_only:
                 employees = [e for e in employees if e.active]
 
+            page, indicator = _paginate(
+                employees, offset=offset, limit=limit,
+                entity_name="employees",
+            )
             if compact:
-                lines = [self._employee_to_compact_line(e) for e in employees]
+                lines = [indicator]
+                lines += [self._employee_to_compact_line(e) for e in page]
                 return "\n".join(lines)
             else:
-                return [self._employee_to_dict(e) for e in employees]
+                return {
+                    "showing": indicator,
+                    "total": len(employees),
+                    "offset": offset,
+                    "count": len(page),
+                    "employees": [self._employee_to_dict(e) for e in page],
+                }
 
     def get_employee(self, employee_id: str) -> dict:
         """Get employee details by ID.
@@ -2405,14 +2458,21 @@ class BusinessMixin:
                 "status": "created",
             }
 
-    def list_billterms(self, compact: bool = True) -> list[dict] | str:
+    def list_billterms(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all billing terms.
+
+        Leads with a ``Showing X-Y of Z billterms`` indicator; page
+        with ``offset``.
 
         Args:
             compact: If True, return compact one-line-per-term string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         from piecash.business.invoice import Billterm
 
@@ -2421,13 +2481,21 @@ class BusinessMixin:
                 Billterm.invisible == 0
             ).order_by(Billterm.name).all()
 
+            page, indicator = _paginate(
+                terms, offset=offset, limit=limit, entity_name="billterms",
+            )
             if compact:
-                lines = []
-                for t in terms:
-                    lines.append(f"{t.name}\t{t.duedays} days")
+                lines = [indicator]
+                lines += [f"{t.name}\t{t.duedays} days" for t in page]
                 return "\n".join(lines)
             else:
-                return [self._billterm_to_dict(t) for t in terms]
+                return {
+                    "showing": indicator,
+                    "total": len(terms),
+                    "offset": offset,
+                    "count": len(page),
+                    "billterms": [self._billterm_to_dict(t) for t in page],
+                }
 
     # ── Taxtable CRUD ─────────────────────────────────────────────
     #
@@ -2812,14 +2880,15 @@ class BusinessMixin:
             }
 
     def list_taxtables(
-        self, compact: bool = True,
-    ) -> list[dict] | str:
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all tax tables.
 
-        Compact (default): one line per taxtable,
+        Leads with a ``Showing X-Y of Z taxtables`` indicator; page
+        with ``offset``. Compact (default): one line per taxtable,
         ``name<TAB>N entries: 5%→GST Payable, 7%→PST Payable``.
-        Verbose: list of full dicts with resolved account paths and
-        computed refcount. Empty book → empty string / empty list.
+        Verbose: envelope of full dicts with resolved account paths
+        and computed refcount.
         """
         from piecash.business.tax import Taxtable
 
@@ -2828,9 +2897,13 @@ class BusinessMixin:
                 Taxtable.name,
             ).all()
 
+            page, indicator = _paginate(
+                tables, offset=offset, limit=limit,
+                entity_name="taxtables",
+            )
             if compact:
-                lines = []
-                for tt in tables:
+                lines = [indicator]
+                for tt in page:
                     summary = ", ".join(
                         self._taxtable_entry_summary(e)
                         for e in tt.entries
@@ -2842,19 +2915,25 @@ class BusinessMixin:
                     )
                 return "\n".join(lines)
 
-            return [
-                self._taxtable_to_dict(
-                    tt,
-                    account_paths={
-                        e.account_guid: e.account.fullname
-                        for e in tt.entries
-                    },
-                    refcount=self._compute_taxtable_refcount(
-                        book, tt.guid,
-                    ),
-                )
-                for tt in tables
-            ]
+            return {
+                "showing": indicator,
+                "total": len(tables),
+                "offset": offset,
+                "count": len(page),
+                "taxtables": [
+                    self._taxtable_to_dict(
+                        tt,
+                        account_paths={
+                            e.account_guid: e.account.fullname
+                            for e in tt.entries
+                        },
+                        refcount=self._compute_taxtable_refcount(
+                            book, tt.guid,
+                        ),
+                    )
+                    for tt in page
+                ],
+            }
 
     def get_taxtable(self, name: str) -> dict:
         """Full details for a tax table.
@@ -4271,19 +4350,24 @@ class BusinessMixin:
         compact: bool = True,
         limit: int | None = None,
         job_id: str | None = None,
-    ) -> list[dict] | str:
+        offset: int = 0,
+    ) -> dict | str:
         """List invoices and/or bills.
+
+        Leads with a ``Showing X-Y of Z invoices (date range)``
+        indicator over the full filter set; page with ``offset``.
 
         Args:
             owner_type: 'customer', 'vendor', or None for all.
             status: 'posted', 'open', or None for all.
             compact: If True, one line per invoice.
-            limit: Defaults to 50, capped at 250 server-side.
+            limit: Page size (default 50, max 250). 0 = count only.
             job_id: Filter to invoices grouped under a specific job.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string (with optional truncation notice) or the
-            verbose envelope ``{invoices, count, total, notice}``.
+            Compact string (indicator + rows) or the verbose envelope
+            ``{invoices, showing, total, offset, count}``.
         """
         from piecash.business.invoice import Invoice
 
@@ -4324,17 +4408,18 @@ class BusinessMixin:
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
             total = len(invoices)
-            invoices, notice = _apply_limit(
+            page, indicator = _paginate(
                 invoices,
+                offset=offset,
                 limit=limit,
                 entity_name="invoices",
-                suggest_narrow=True,
+                date_key=lambda i: i.date_opened,
             )
+            invoices = page
 
             if compact:
-                lines = [self._invoice_to_compact_line(book, i) for i in invoices]
-                if notice:
-                    lines.append(notice)
+                lines = [indicator]
+                lines += [self._invoice_to_compact_line(book, i) for i in invoices]
                 return "\n".join(lines)
             else:
                 # Verbose path resolves owner names per invoice.
@@ -4369,15 +4454,15 @@ class BusinessMixin:
                             job=j_dict,
                         )
                     )
-                # Envelope matches get_unreconciled_splits /
-                # get_prices: ``count`` = truncated length,
-                # ``total`` = full filter-set size, ``notice`` = the
-                # same string compact appends (or None).
+                # Envelope matches the other list tools: ``count`` =
+                # page length, ``total`` = full filter-set size,
+                # ``showing`` = the indicator compact leads with.
                 return {
-                    "invoices": results,
-                    "count": len(results),
+                    "showing": indicator,
                     "total": total,
-                    "notice": notice,
+                    "offset": offset,
+                    "count": len(results),
+                    "invoices": results,
                 }
 
     def get_invoice(self, invoice_id: str, owner_type: str | None = None) -> dict:
@@ -6377,16 +6462,23 @@ class BusinessMixin:
         owner_id: str | None = None,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List jobs, optionally filtered by owner_type and/or
         owner_id.
+
+        Leads with a ``Showing X-Y of Z jobs`` indicator; page with
+        ``offset``.
 
         Args:
             owner_type: 'customer' or 'vendor'; omit for all.
             owner_id: Requires owner_type (customer and vendor IDs
                 share a sequence space).
             active_only: If True (default), exclude inactive jobs.
-            compact: One line per job (default) or list of dicts.
+            compact: One line per job (default) or verbose envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         from piecash.business.invoice import Job
 
@@ -6433,9 +6525,12 @@ class BusinessMixin:
 
             jobs = sorted(query.all(), key=lambda j: j.id)
 
+            page, indicator = _paginate(
+                jobs, offset=offset, limit=limit, entity_name="jobs",
+            )
             if compact:
-                lines = []
-                for job in jobs:
+                lines = [indicator]
+                for job in page:
                     owner = self._find_invoice_owner_by_guid(
                         book, job.owner_type, job.owner_guid,
                     )
@@ -6449,7 +6544,7 @@ class BusinessMixin:
                 return "\n".join(lines)
 
             results = []
-            for job in jobs:
+            for job in page:
                 owner = self._find_invoice_owner_by_guid(
                     book, job.owner_type, job.owner_guid,
                 )
@@ -6459,7 +6554,13 @@ class BusinessMixin:
                         owner_name=owner.name if owner else None,
                     )
                 )
-            return results
+            return {
+                "showing": indicator,
+                "total": len(jobs),
+                "offset": offset,
+                "count": len(page),
+                "jobs": results,
+            }
 
     def get_job(self, job_id: str) -> dict:
         """Get a job's details by ID.
@@ -6623,8 +6724,13 @@ class BusinessMixin:
         customer_id: str | None = None,
         vendor_id: str | None = None,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """Get all posted invoices/bills with outstanding balances.
+
+        Leads with a ``Showing X-Y of Z invoices (date range)``
+        indicator, most-overdue first; page with ``offset``.
 
         Args:
             owner_type: 'customer' or 'vendor'; omit for all.
@@ -6632,10 +6738,11 @@ class BusinessMixin:
             vendor_id: Filter by specific vendor ID.
             compact: One line per doc with action columns (due
                 date, days past due, (BILL)/(CN) tags),
-                most-overdue first; empty string when nothing is
-                outstanding. Verbose returns dicts with the full
-                original_amount / amount_paid / amount_due
-                breakdown.
+                most-overdue first. Verbose returns the envelope
+                with the full original_amount / amount_paid /
+                amount_due breakdown per doc.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         from piecash.business.invoice import Invoice
 
@@ -6785,9 +6892,23 @@ class BusinessMixin:
                 key=lambda r: -(r["days_past_due"] or 0),
             )
 
+            page, indicator = _paginate(
+                results,
+                offset=offset,
+                limit=limit,
+                entity_name="invoices",
+                date_key=lambda r: r["date_posted"],
+            )
             if compact:
-                return _format_outstanding_invoices_compact(results)
-            return results
+                body = _format_outstanding_invoices_compact(page)
+                return f"{indicator}\n{body}" if body else indicator
+            return {
+                "showing": indicator,
+                "total": len(results),
+                "offset": offset,
+                "count": len(page),
+                "invoices": page,
+            }
 
     def get_job_report(self, job_id: str) -> dict:
         """Per-job summary: billed / paid / outstanding totals

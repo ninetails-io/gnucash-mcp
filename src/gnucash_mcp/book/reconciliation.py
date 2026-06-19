@@ -23,7 +23,7 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
     _unreconciled_split_to_compact_line,
 )
-from gnucash_mcp._format import _apply_limit
+from gnucash_mcp._format import _paginate
 
 
 def _split_state_dict(split) -> dict:
@@ -133,13 +133,14 @@ class ReconciliationMixin:
         as_of_date: date | None = None,
         compact: bool = True,
         limit: int | None = None,
+        offset: int = 0,
     ) -> dict | str:
         """Get unreconciled splits for an account.
 
-        Returns up to ``limit`` splits (default 50, capped 250),
-        post-date ascending. The cleared/uncleared totals always
-        reflect the **full** unreconciled set, not the truncated
-        slice.
+        Leads with a ``Showing X-Y of Z splits`` indicator, post-date
+        ascending; page with ``offset``. The cleared/uncleared totals
+        always reflect the **full** unreconciled set, not the page —
+        truncation hides line items, never the headline summary.
 
         **Currency unit:** the totals are in the **account's
         commodity** (sum of ``split.quantity``, not ``split.value``)
@@ -149,9 +150,11 @@ class ReconciliationMixin:
         Args:
             account_name: Account ref.
             as_of_date: Only include splits on or before this date.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
             compact: One line per split + summary footer (default),
                 or the dict envelope {account, splits, totals,
-                count, total, notice}.
+                count, total, showing}.
 
         Raises:
             ValueError: If account not found.
@@ -194,25 +197,27 @@ class ReconciliationMixin:
                 else:
                     uncleared_total += split.quantity
 
-            unreconciled, notice = _apply_limit(
+            unreconciled, indicator = _paginate(
                 all_unreconciled,
+                offset=offset,
                 limit=limit,
                 entity_name="splits",
-                suggest_narrow=True,
+                date_key=lambda s: s["date"],
             )
             total_count = len(all_unreconciled)
 
             result = {
                 "account": account.fullname,
                 "as_of_date": as_of_date.isoformat() if as_of_date else None,
+                "showing": indicator,
                 "splits": unreconciled,
                 # Totals always reflect the full unreconciled set —
                 # truncation hides line items, never the headline summary.
                 "cleared_total": str(cleared_total),
                 "uncleared_total": str(uncleared_total),
+                "offset": offset,
                 "count": len(unreconciled),
                 "total": total_count,
-                "notice": notice,
             }
 
             if compact:
@@ -222,7 +227,8 @@ class ReconciliationMixin:
                     s.guid for txn in book.transactions for s in txn.splits
                 )
                 prefixes = _guid_prefix_map(all_split_guids)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _unreconciled_split_to_compact_line(s, prefixes=prefixes)
                     for s in unreconciled
                 ]
@@ -231,8 +237,6 @@ class ReconciliationMixin:
                     f"uncleared:{uncleared_total}"
                 )
                 lines.append(footer)
-                if notice:
-                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 return result

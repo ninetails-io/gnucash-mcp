@@ -34,6 +34,7 @@ from gnucash_mcp.book._base import (
     _verify_delete,
     _verify_write,
 )
+from gnucash_mcp._format import _paginate
 
 
 class SchedulingMixin:
@@ -393,17 +394,25 @@ class SchedulingMixin:
         self,
         enabled_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all scheduled transactions.
+
+        Leads with a ``Showing X-Y of Z scheduled transactions``
+        indicator; page with ``offset``.
 
         Args:
             enabled_only: If True, only show enabled schedules. Default True.
-            compact: If True (default), return a compact newline-separated
-                     string with one line per scheduled transaction.
+            compact: If True (default), return the indicator + a compact
+                     newline-separated string with one line per schedule.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            If compact: newline-separated string of scheduled transaction lines.
-            If not compact: list of scheduled transaction dicts.
+            If compact: indicator + newline-separated lines.
+            If not compact: envelope ``{showing, total, offset, count,
+            scheduled_transactions}``.
         """
 
         with self.open(readonly=True) as book:
@@ -420,15 +429,26 @@ class SchedulingMixin:
                     d["splits"] = self._get_sx_splits(book, sx)
                 results.append(d)
 
+            page, indicator = _paginate(
+                results, offset=offset, limit=limit,
+                entity_name="scheduled transactions",
+            )
             if compact:
                 # Prefix uniqueness across all scheduled transactions
                 prefixes = _guid_prefix_map(sx.guid for sx in all_sx)
-                lines = [
-                    _sx_to_compact_line(d, prefixes=prefixes) for d in results
+                lines = [indicator]
+                lines += [
+                    _sx_to_compact_line(d, prefixes=prefixes) for d in page
                 ]
                 return "\n".join(lines)
             else:
-                return results
+                return {
+                    "showing": indicator,
+                    "total": len(results),
+                    "offset": offset,
+                    "count": len(page),
+                    "scheduled_transactions": page,
+                }
 
     def _upcoming_within_days(
         self, book, days: int = 7,
@@ -494,12 +514,20 @@ class SchedulingMixin:
         self,
         days: int = 14,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """Get scheduled transactions due within a time window.
+
+        Leads with a ``Showing X-Y of Z upcoming transactions (date
+        range)`` indicator, soonest first; page with ``offset``.
 
         Args:
             days: Look ahead window in days. Default 14.
-            compact: If True, return compact one-line format.
+            compact: If True, return the indicator + compact one-line
+                format; otherwise the verbose envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
 
         today = date.today()
@@ -569,16 +597,28 @@ class SchedulingMixin:
 
             upcoming.sort(key=lambda x: x["occurrence_date"])
 
+            page, indicator = _paginate(
+                upcoming, offset=offset, limit=limit,
+                entity_name="upcoming transactions",
+                date_key=lambda e: e["occurrence_date"],
+            )
             if compact:
                 # Prefix uniqueness across all scheduled transactions
                 prefixes = _guid_prefix_map(sx.guid for sx in all_sx)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _upcoming_to_compact_line(e, prefixes=prefixes)
-                    for e in upcoming
+                    for e in page
                 ]
                 return "\n".join(lines)
             else:
-                return upcoming
+                return {
+                    "showing": indicator,
+                    "total": len(upcoming),
+                    "offset": offset,
+                    "count": len(page),
+                    "upcoming_transactions": page,
+                }
 
     def create_transaction_from_scheduled(
         self,

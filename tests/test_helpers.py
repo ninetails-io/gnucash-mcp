@@ -9,7 +9,12 @@ from decimal import Decimal
 
 import pytest
 
-from gnucash_mcp.tools._helpers import _apply_limit, _format_number, _resolve_id_alias
+from gnucash_mcp.tools._helpers import (
+    _apply_limit,
+    _format_number,
+    _paginate,
+    _resolve_id_alias,
+)
 
 
 class TestFormatNumber:
@@ -204,6 +209,219 @@ class TestApplyLimit:
         # Truncation preserves input order (just ``items[:n]``).
         items, _ = _apply_limit(list(range(20)), limit=3)
         assert items == [0, 1, 2]
+
+
+class TestPaginate:
+    """Tests for ``_paginate`` — the offset+limit chokepoint that emits
+    the always-present ``Showing X-Y of Z`` indicator. Mirrors the
+    test list in specs/PAGINATION.md."""
+
+    # ── First page / default ─────────────────────────────────────
+
+    def test_default_first_page(self):
+        # Spec test 1: default call shows ``1-50 of N`` when N > 50.
+        page, ind = _paginate(
+            list(range(109)), entity_name="transactions"
+        )
+        assert page == list(range(50))
+        assert ind == "Showing 1-50 of 109 transactions"
+
+    def test_second_page_offset(self):
+        # Spec test 2: offset=50 returns ``51-100 of N`` with the
+        # correct rows.
+        page, ind = _paginate(
+            list(range(109)), offset=50, entity_name="transactions"
+        )
+        assert page == list(range(50, 100))
+        assert ind == "Showing 51-100 of 109 transactions"
+
+    def test_last_partial_page(self):
+        # Spec test 3: last page shows a partial range.
+        page, ind = _paginate(
+            list(range(109)), offset=100, entity_name="transactions"
+        )
+        assert page == list(range(100, 109))
+        assert ind == "Showing 101-109 of 109 transactions"
+
+    def test_full_set_fits_one_page(self):
+        # Spec test 4: N <= limit shows ``1-N of N``.
+        page, ind = _paginate(
+            list(range(23)), entity_name="transactions"
+        )
+        assert page == list(range(23))
+        assert ind == "Showing 1-23 of 23 transactions"
+
+    # ── Edge cases ───────────────────────────────────────────────
+
+    def test_zero_results(self):
+        # Spec test 5.
+        page, ind = _paginate([], entity_name="transactions")
+        assert page == []
+        assert ind == "Showing 0 of 0 transactions"
+
+    def test_offset_beyond_total(self):
+        # Spec test 6.
+        page, ind = _paginate(
+            list(range(109)), offset=200, entity_name="transactions"
+        )
+        assert page == []
+        assert "of 109 transactions" in ind
+        assert "offset 200 exceeds result count" in ind
+
+    def test_count_only_mode(self):
+        # Spec test 7: limit=0 returns the count-only indicator.
+        page, ind = _paginate(
+            list(range(245)), limit=0, entity_name="transactions"
+        )
+        assert page == []
+        assert ind == "Showing 0 of 245 transactions"
+
+    def test_count_only_spans_full_set(self):
+        # Count-only has no page, so the range is the full set's scope.
+        rows = [{"d": f"2026-01-{i:02d}"} for i in range(1, 11)]
+        page, ind = _paginate(
+            rows, limit=0, entity_name="transactions",
+            date_key=lambda r: r["d"],
+        )
+        assert page == []
+        assert ind == (
+            "Showing 0 of 10 transactions (2026-01-01 to 2026-01-10)"
+        )
+
+    # ── Date range — spans the current PAGE ──────────────────────
+
+    def _dated_rows(self):
+        # 10 rows, one per day 2026-01-01 .. 2026-01-10.
+        return [{"d": f"2026-01-{i:02d}"} for i in range(1, 11)]
+
+    def test_page_range_is_current_page_not_full_set(self):
+        rows = self._dated_rows()
+        _, ind = _paginate(
+            rows, offset=3, limit=3, entity_name="transactions",
+            date_key=lambda r: r["d"],
+        )
+        # Rows 4-6 carry dates 04/05/06 — the page's window, not the
+        # full 01..10 span. This is the actionable navigation signal.
+        assert ind == (
+            "Showing 4-6 of 10 transactions (2026-01-04 to 2026-01-06)"
+        )
+
+    def test_page_range_moves_with_offset(self):
+        rows = self._dated_rows()
+        _, first = _paginate(
+            rows, offset=0, limit=3, date_key=lambda r: r["d"],
+            entity_name="transactions",
+        )
+        _, second = _paginate(
+            rows, offset=3, limit=3, date_key=lambda r: r["d"],
+            entity_name="transactions",
+        )
+        assert "(2026-01-01 to 2026-01-03)" in first
+        assert "(2026-01-04 to 2026-01-06)" in second
+
+    def test_full_page_spans_whole_set(self):
+        # When everything fits, page range == full range.
+        rows = self._dated_rows()
+        _, ind = _paginate(
+            rows, entity_name="transactions", date_key=lambda r: r["d"],
+        )
+        assert ind == (
+            "Showing 1-10 of 10 transactions (2026-01-01 to 2026-01-10)"
+        )
+
+    def test_date_key_handles_date_and_datetime(self):
+        from datetime import date, datetime
+        rows = [
+            {"d": date(2026, 3, 1)},
+            {"d": datetime(2026, 3, 15, 10, 59)},
+        ]
+        _, ind = _paginate(
+            rows, entity_name="transactions", date_key=lambda r: r["d"],
+        )
+        assert ind.endswith("(2026-03-01 to 2026-03-15)")
+
+    def test_date_key_trims_iso_timestamp_to_day(self):
+        rows = [{"d": "2026-04-30T10:59:00+00:00"}]
+        _, ind = _paginate(
+            rows, entity_name="backups", date_key=lambda r: r["d"],
+        )
+        assert ind == "Showing 1-1 of 1 backups (2026-04-30 to 2026-04-30)"
+
+    def test_date_omitted_when_no_date_key(self):
+        _, ind = _paginate(list(range(5)), entity_name="accounts")
+        assert ind == "Showing 1-5 of 5 accounts"
+
+    def test_date_skipped_when_all_rows_undated(self):
+        rows = [{"d": None}, {"d": None}]
+        _, ind = _paginate(
+            rows, entity_name="prices", date_key=lambda r: r["d"],
+        )
+        assert ind == "Showing 1-2 of 2 prices"
+
+    def test_offset_beyond_total_shows_full_scope(self):
+        rows = self._dated_rows()
+        page, ind = _paginate(
+            rows, offset=50, entity_name="transactions",
+            date_key=lambda r: r["d"],
+        )
+        assert page == []
+        assert "offset 50 exceeds result count" in ind
+        # No page to span, so fall back to the full set's window.
+        assert "(2026-01-01 to 2026-01-10)" in ind
+
+    # ── Server-side cap ──────────────────────────────────────────
+
+    def test_limit_above_cap_clamps_with_note(self):
+        page, ind = _paginate(
+            list(range(500)), limit=999, max_cap=250,
+            entity_name="transactions",
+        )
+        assert len(page) == 250
+        assert ind == (
+            "Showing 1-250 of 500 transactions; limit capped at 250"
+        )
+
+    def test_cap_note_present_even_when_results_fit(self):
+        # Like ``_apply_limit``'s "[Limit capped at N]" heads-up: a
+        # requested limit above the ceiling is flagged so the LLM knows
+        # the server cap exists, even when the page held everything.
+        _, ind = _paginate(
+            list(range(100)), limit=999, max_cap=250,
+            entity_name="transactions",
+        )
+        assert ind == (
+            "Showing 1-100 of 100 transactions; limit capped at 250"
+        )
+
+    def test_no_cap_note_when_limit_within_cap(self):
+        _, ind = _paginate(
+            list(range(100)), limit=200, max_cap=250,
+            entity_name="transactions",
+        )
+        assert "capped" not in ind
+        assert ind == "Showing 1-100 of 100 transactions"
+
+    # ── Defaults / clamping ──────────────────────────────────────
+
+    def test_falsy_limit_uses_default(self):
+        page, _ = _paginate(
+            list(range(100)), limit=None, default=10,
+            entity_name="x",
+        )
+        assert len(page) == 10
+
+    def test_negative_offset_clamps_to_zero(self):
+        page, ind = _paginate(
+            list(range(10)), offset=-5, entity_name="x"
+        )
+        assert page == list(range(10))
+        assert ind == "Showing 1-10 of 10 x"
+
+    def test_indicator_always_returned(self):
+        # The contract: indicator is never None, for any input.
+        for args in [([],), (list(range(3)),), (list(range(300)),)]:
+            _, ind = _paginate(*args, entity_name="x")
+            assert isinstance(ind, str) and ind
 
 
 class TestSafeToolWriteVerificationRouting:

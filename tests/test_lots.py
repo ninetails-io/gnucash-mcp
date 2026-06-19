@@ -91,7 +91,7 @@ class TestCreateLot:
 class TestListLots:
     def test_list_lots_empty(self, investment_book: Path):
         book = GnuCashBook(str(investment_book))
-        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
+        result = book.list_lots(account="Assets:Investments:VTSAX", compact=False)["lots"]
         assert result == []
 
     def test_list_lots_with_lots(self, investment_book: Path):
@@ -107,7 +107,7 @@ class TestListLots:
         result = book.list_lots(
             account="Assets:Investments:VTSAX",
             include_closed=True, compact=False,
-        )
+        )["lots"]
         assert len(result) == 2
         titles = {r["title"] for r in result}
         assert titles == {"Lot A", "Lot B"}
@@ -128,14 +128,14 @@ class TestListLots:
         # Default view: zero empty lots show up.
         result = book.list_lots(
             account="Assets:Investments:VTSAX", compact=False,
-        )
+        )["lots"]
         assert result == []
 
         # Audit view: both surface.
         result = book.list_lots(
             account="Assets:Investments:VTSAX",
             include_closed=True, compact=False,
-        )
+        )["lots"]
         assert len(result) == 2
 
     def test_list_lots_exclude_closed(self, investment_book: Path):
@@ -161,7 +161,7 @@ class TestListLots:
         # Default: exclude closed AND empty.
         result = book.list_lots(
             account="Assets:Investments:VTSAX", compact=False,
-        )
+        )["lots"]
         assert len(result) == 1
         assert result[0]["title"] == "Open Lot"
 
@@ -169,7 +169,7 @@ class TestListLots:
         result = book.list_lots(
             account="Assets:Investments:VTSAX",
             include_closed=True, compact=False,
-        )
+        )["lots"]
         assert len(result) == 2
 
 
@@ -528,11 +528,11 @@ class TestFullLotWorkflow:
         assert len(lot_detail["splits"]) == 2
 
         # Verify excluded from default list
-        lots = book.list_lots(account="Assets:Investments:VTSAX", compact=False)
+        lots = book.list_lots(account="Assets:Investments:VTSAX", compact=False)["lots"]
         assert len(lots) == 0
 
         # Verify included when include_closed=True
-        lots = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True, compact=False)
+        lots = book.list_lots(account="Assets:Investments:VTSAX", include_closed=True, compact=False)["lots"]
         assert len(lots) == 1
         assert lots[0]["is_closed"] is True
 
@@ -571,7 +571,7 @@ class TestSplitToDictLotGuid:
         txn_desc = lot_detail["splits"][0]["description"]
 
         # Search for the transaction
-        txns = book.search_transactions(query=txn_desc, field="description", compact=False)
+        txns = book.search_transactions(query=txn_desc, field="description", compact=False)["transactions"]
         assert len(txns) > 0
         txn = book.get_transaction(txns[0]["guid"])
 
