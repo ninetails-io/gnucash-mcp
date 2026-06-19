@@ -12,6 +12,7 @@ per-boundary snapshots — O(splits + intervals), not
 O(intervals × splits).
 """
 
+import calendar
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -30,6 +31,9 @@ _LIABILITY_TYPES = frozenset({"LIABILITY", "CREDIT", "PAYABLE"})
 _EQUITY_TYPES = frozenset({"EQUITY"})
 _NET_INCOME_TYPES = frozenset({"INCOME", "EXPENSE"})
 _CASH_TYPES = frozenset({"BANK", "CASH"})
+
+# Valid group_by sub-period granularities for the period breakdowns.
+_GROUP_BY_VALUES = ("month", "quarter", "year")
 
 
 def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> str:
@@ -72,6 +76,123 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
         f"{'TOTAL':<{name_width}}  {total:>{amount_width},.2f}"
     )
     return "\n".join(lines)
+
+
+def _period_label(d: date, group_by: str) -> str:
+    """Map a date to its sub-period column label.
+
+    ``month`` → ``YYYY-MM``; ``quarter`` → ``YYYY-Q#``; ``year`` →
+    ``YYYY``. Used both to enumerate columns and to bucket each
+    split by its ``post_date``, so the two always agree.
+    """
+    if group_by == "month":
+        return f"{d.year:04d}-{d.month:02d}"
+    if group_by == "quarter":
+        return f"{d.year:04d}-Q{(d.month - 1) // 3 + 1}"
+    return f"{d.year:04d}"
+
+
+def _enumerate_periods(
+    start_date: date, end_date: date, group_by: str
+) -> list[tuple[str, date]]:
+    """Ordered ``(label, anchor_date)`` pairs covering the range.
+
+    Every sub-period that overlaps ``[start_date, end_date]`` gets a
+    column, including empty ones (so a gap month still renders a
+    ``0.00`` column). The anchor date is the period's natural
+    calendar end clamped to ``end_date`` — FX/commodity rates value
+    each period at its own close, never at today's rates.
+    """
+    periods: list[tuple[str, date]] = []
+    if group_by == "month":
+        y, m = start_date.year, start_date.month
+        while (y, m) <= (end_date.year, end_date.month):
+            last = date(y, m, calendar.monthrange(y, m)[1])
+            periods.append((f"{y:04d}-{m:02d}", min(last, end_date)))
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+    elif group_by == "quarter":
+        y = start_date.year
+        q = (start_date.month - 1) // 3 + 1
+        end_q = (end_date.month - 1) // 3 + 1
+        while (y, q) <= (end_date.year, end_q):
+            last_month = q * 3
+            last = date(y, last_month, calendar.monthrange(y, last_month)[1])
+            periods.append((f"{y:04d}-Q{q}", min(last, end_date)))
+            q += 1
+            if q > 4:
+                q, y = 1, y + 1
+    else:  # year
+        for y in range(start_date.year, end_date.year + 1):
+            periods.append((f"{y:04d}", min(date(y, 12, 31), end_date)))
+    return periods
+
+
+def _strip_common_prefix(names: list[str]) -> list[str]:
+    """Drop a shared top-level ``Expenses:`` / ``Income:`` prefix.
+
+    Mirrors :func:`_format_breakdown_tsv`'s single-period behaviour —
+    leaf labels stay readable when every row shares a prefix, full
+    paths survive a heterogeneous mix.
+    """
+    if names and ":" in names[0]:
+        candidate = names[0].split(":")[0] + ":"
+        if all(n.startswith(candidate) for n in names):
+            return [n[len(candidate):] for n in names]
+    return list(names)
+
+
+def _format_grouped_tsv(
+    *,
+    period_labels: list[str],
+    displayed_names: list[str],
+    totals: dict[str, dict[str, Decimal]],
+    cat_totals: dict[str, Decimal],
+    period_totals: dict[str, Decimal],
+    grand_total: Decimal,
+    excluded: list[tuple[str, Decimal]],
+    label: str,
+) -> str:
+    """Render the multi-period breakdown as a tab-separated table.
+
+    Columns: the leading label, one per sub-period, then ``Total``
+    (sum across periods) and ``Avg`` (Total / number of periods).
+    The trailing ``TOTAL`` row sums every category per period —
+    net-negative-overall categories are netted in here even though
+    they get no row of their own, keeping the column totals tied to
+    single-period mode and to income − spending = net income.
+    """
+    num_periods = len(period_labels)
+    leaves = _strip_common_prefix(displayed_names)
+    lines = ["\t".join([label, *period_labels, "Total", "Avg"])]
+    for name, leaf in zip(displayed_names, leaves):
+        per = totals.get(name, {})
+        cells = [leaf]
+        cells += [
+            f"{per.get(pl, Decimal('0')):.2f}" for pl in period_labels
+        ]
+        tot = cat_totals[name]
+        avg = tot / num_periods if num_periods else Decimal("0")
+        cells += [f"{tot:.2f}", f"{avg:.2f}"]
+        lines.append("\t".join(cells))
+
+    avg_total = grand_total / num_periods if num_periods else Decimal("0")
+    total_cells = ["TOTAL"]
+    total_cells += [f"{period_totals[pl]:.2f}" for pl in period_labels]
+    total_cells += [f"{grand_total:.2f}", f"{avg_total:.2f}"]
+    lines.append("\t".join(total_cells))
+
+    out = "\n".join(lines)
+    if excluded:
+        netted = ", ".join(
+            f"{n} {t:,.2f}"
+            for n, t in sorted(excluded, key=lambda x: x[1])
+        )
+        out += (
+            f"\n({len(excluded)} net-negative netted into TOTAL: {netted})"
+        )
+    return out
 
 
 def _money_compact(value: Decimal, currency: str = "USD") -> str:
@@ -190,12 +311,94 @@ class ReportingMixin:
 
     # ── Period breakdowns ─────────────────────────────────────────────
 
+    def _grouped_breakdown(
+        self,
+        book: piecash.Book,
+        *,
+        start_date: date,
+        end_date: date,
+        depth: int,
+        account_type: str,
+        sign: Decimal,
+        group_by: str,
+        label: str,
+    ) -> str:
+        """Multi-period breakdown shared by spending/income.
+
+        One indexed pass over the range's splits, bucketed by
+        ``(group_account, sub-period)``. ``sign`` flips income's
+        stored-negative convention (``-1``) vs spending (``1``); the
+        rest is identical to the single-period path — same ``depth``
+        grouping, same net-after-aggregation rule (a category whose
+        total across ALL periods is ≤ 0 is dropped from the rows but
+        still netted into the column totals).
+        """
+        periods = _enumerate_periods(start_date, end_date, group_by)
+        period_labels = [pl for pl, _ in periods]
+        # Each period values at its own close — never today's rates
+        # against a historical period's quantities.
+        factors_by_period = {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in periods
+        }
+
+        rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=frozenset({account_type}),
+        )
+
+        # category fullname → {period_label: signed Decimal}
+        totals: dict[str, dict[str, Decimal]] = {}
+        for split, txn, account in rows:
+            plabel = _period_label(txn.post_date, group_by)
+            factor = factors_by_period.get(plabel, {}).get(account.guid)
+            amount = sign * self._split_in_default_currency(
+                split, account, factor,
+            )
+            group_account = self._get_account_at_depth(account, depth)
+            bucket = totals.setdefault(group_account.fullname, {})
+            bucket[plabel] = bucket.get(plabel, Decimal("0")) + amount
+
+        cat_totals = {
+            name: sum(per.values(), Decimal("0"))
+            for name, per in totals.items()
+        }
+        displayed_names = sorted(
+            (n for n, t in cat_totals.items() if t > 0),
+            key=lambda n: cat_totals[n],
+            reverse=True,
+        )
+        excluded = [(n, t) for n, t in cat_totals.items() if t < 0]
+
+        # Column totals sum every category — net-negative ones netted
+        # in even though they have no row, so the totals match
+        # single-period mode.
+        period_totals = {pl: Decimal("0") for pl in period_labels}
+        for per in totals.values():
+            for pl, v in per.items():
+                period_totals[pl] += v
+        grand_total = sum(cat_totals.values(), Decimal("0"))
+
+        return _format_grouped_tsv(
+            period_labels=period_labels,
+            displayed_names=displayed_names,
+            totals=totals,
+            cat_totals=cat_totals,
+            period_totals=period_totals,
+            grand_total=grand_total,
+            excluded=excluded,
+            label=label,
+        )
+
     def spending_by_category(
         self,
         start_date: date,
         end_date: date,
         depth: int = 1,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
@@ -210,7 +413,30 @@ class ReportingMixin:
                 leaf.
             compact: Aligned text table (default) or the structured
                 dict.
+            group_by: ``None`` (default) for the single-period
+                aggregation above; ``"month"`` / ``"quarter"`` /
+                ``"year"`` to split the range into sub-period columns
+                and return a multi-period TSV table (always a string;
+                ``compact`` is ignored — the table is the output).
         """
+        if group_by is not None:
+            if group_by not in _GROUP_BY_VALUES:
+                raise ValueError(
+                    f"Invalid group_by '{group_by}'. Must be one of: "
+                    f"{', '.join(_GROUP_BY_VALUES)}."
+                )
+            with self.open(readonly=True) as book:
+                return self._grouped_breakdown(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    depth=depth,
+                    account_type="EXPENSE",
+                    sign=Decimal("1"),
+                    group_by=group_by,
+                    label="Category",
+                )
+
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
                 book,
@@ -297,6 +523,7 @@ class ReportingMixin:
         end_date: date,
         depth: int = 1,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get income breakdown by source.
 
@@ -307,7 +534,28 @@ class ReportingMixin:
             start_date / end_date: Period bounds (inclusive).
             depth: Grouping depth (1 = top-level).
             compact: Aligned text table (default) or structured dict.
+            group_by: ``None`` (default) for single-period; ``"month"``
+                / ``"quarter"`` / ``"year"`` for a multi-period TSV
+                table — see ``spending_by_category``.
         """
+        if group_by is not None:
+            if group_by not in _GROUP_BY_VALUES:
+                raise ValueError(
+                    f"Invalid group_by '{group_by}'. Must be one of: "
+                    f"{', '.join(_GROUP_BY_VALUES)}."
+                )
+            with self.open(readonly=True) as book:
+                return self._grouped_breakdown(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    depth=depth,
+                    account_type="INCOME",
+                    sign=Decimal("-1"),
+                    group_by=group_by,
+                    label="Source",
+                )
+
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
                 book,
