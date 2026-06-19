@@ -571,7 +571,7 @@ class TestSplitToDictLotGuid:
         txn_desc = lot_detail["splits"][0]["description"]
 
         # Search for the transaction
-        txns = book.search_transactions(query=txn_desc, field="description", compact=False)
+        txns = book.search_transactions(query=txn_desc, field="description", compact=False)["transactions"]
         assert len(txns) > 0
         txn = book.get_transaction(txns[0]["guid"])
 

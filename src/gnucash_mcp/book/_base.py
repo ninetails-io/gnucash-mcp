@@ -62,6 +62,34 @@ def _slot_value_str(value) -> str:
     return str(value)
 
 
+def _iso_date(value) -> str | None:
+    """Render a ``date`` / ``datetime`` as a bare ``YYYY-MM-DD`` string.
+
+    The pagination indicator's date-range needs day precision only,
+    and piecash hands back ``datetime`` for some columns (``post_date``)
+    and ``date`` for others. ``None`` passes through so callers can
+    skip absent dates when computing a range.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return value.isoformat()
+
+
+def _date_range(values) -> tuple[str | None, str | None] | None:
+    """Min/max ISO date over an iterable of ``date``/``datetime``/None.
+
+    Returns ``(earliest, latest)`` for the pagination indicator, or
+    ``None`` when nothing dated is present — passing that straight to
+    :func:`gnucash_mcp._format._paginate` omits the parenthetical.
+    """
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    return _iso_date(min(present)), _iso_date(max(present))
+
+
 def _is_voided(split) -> bool:
     """True iff ``split`` carries GnuCash's voided marker.
 

@@ -156,7 +156,7 @@ class TestCrossSurfaceAgreement:
         without raising, in compact and verbose modes."""
         gb = GnuCashBook(str(pathological_book.path))
 
-        verbose = gb.list_transactions(compact=False, limit=250)
+        verbose = gb.list_transactions(compact=False, limit=250)["transactions"]
         descriptions = {t["description"] for t in verbose}
         assert "Opening balance" in descriptions
         assert "Transfer to savings" in descriptions
@@ -167,7 +167,7 @@ class TestCrossSurfaceAgreement:
 
         hits = gb.search_transactions(
             "Manual overpayment", compact=False,
-        )
+        )["transactions"]
         assert len(hits) == 1
         assert isinstance(
             gb.search_transactions("150", field="amount"), str
@@ -189,7 +189,7 @@ class TestNativeSxTemplateLeak:
         self, pathological_book,
     ):
         gb = GnuCashBook(str(pathological_book.path))
-        verbose = gb.list_transactions(compact=False, limit=250)
+        verbose = gb.list_transactions(compact=False, limit=250)["transactions"]
         descriptions = {t["description"] for t in verbose}
         assert "Mortgage Payment" not in descriptions, (
             "SX template recipe rendered as a real transaction"
@@ -199,11 +199,11 @@ class TestNativeSxTemplateLeak:
         self, pathological_book,
     ):
         gb = GnuCashBook(str(pathological_book.path))
-        assert gb.search_transactions("Mortgage", compact=False) == []
+        assert gb.search_transactions("Mortgage", compact=False)["transactions"] == []
         # Amount search must not surface the template's 2,485 either.
         assert gb.search_transactions(
             "2485", field="amount", compact=False,
-        ) == []
+        )["transactions"] == []
 
     def test_template_does_not_stretch_dashboard_dates(
         self, pathological_book,
@@ -460,7 +460,7 @@ class TestFutureDatedNowSurfaces:
         assert Decimal(nw["net_worth"]) == EXPECTED_NET_WORTH
         # ...but the register still shows it — it's a real entry,
         # just not a "now" event.
-        verbose = gb.list_transactions(compact=False, limit=250)
+        verbose = gb.list_transactions(compact=False, limit=250)["transactions"]
         assert "Scheduled rent (future)" in {
             t["description"] for t in verbose
         }
@@ -487,14 +487,14 @@ class TestNullPostDateRows:
         self._null_grocery_date(gc)
 
         # Unbounded listing renders it (sorted oldest, date=None).
-        listed = gc.list_transactions(compact=False, limit=50)
+        listed = gc.list_transactions(compact=False, limit=50)["transactions"]
         by_desc = {t["description"]: t for t in listed}
         assert "Weekly Groceries" in by_desc
         assert by_desc["Weekly Groceries"]["date"] is None
         # A start_date bound excludes what can't be dated.
         bounded = gc.list_transactions(
             start_date=date(2024, 1, 1), compact=False,
-        )
+        )["transactions"]
         assert "Weekly Groceries" not in {
             t["description"] for t in bounded
         }
@@ -502,7 +502,7 @@ class TestNullPostDateRows:
         assert "(no date)" in gc.list_transactions(compact=True)
         assert len(gc.search_transactions(
             "Weekly Groceries", compact=False,
-        )) == 1
+        )["transactions"]) == 1
         gc.get_book_summary()
 
     def test_duplicate_detection_skips_undated_rows(

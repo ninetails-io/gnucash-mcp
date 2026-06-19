@@ -45,7 +45,7 @@ def _seed_rent(gc):
 
 
 def _descriptions(gc):
-    return {t["description"] for t in gc.list_transactions(compact=False)}
+    return {t["description"] for t in gc.list_transactions(compact=False)["transactions"]}
 
 
 class TestBatchCreate:

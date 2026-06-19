@@ -157,9 +157,14 @@ def register(mcp, get_book) -> None:
         start_date: str | None = None,
         end_date: str | None = None,
         limit: int = 50,
+        offset: int = 0,
         verbose: bool = False,
     ) -> str:
         """List transactions with optional filters.
+
+        Leads with a ``Showing X-Y of Z transactions (date range)``
+        line so a truncated view is never mistaken for the whole set.
+        Page with ``offset``; ``limit=0`` returns the count only.
 
         Compact format (default):
         - Unfiltered: ``DATE<TAB>guid<TAB>Description<TAB>splits``
@@ -176,13 +181,16 @@ def register(mcp, get_book) -> None:
             account: Filter by account name (switches output to register form)
             start_date: Start date in ISO format (YYYY-MM-DD)
             end_date: End date in ISO format (YYYY-MM-DD)
-            limit: Maximum number of transactions to return (default 50)
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
         start = _parse_iso_date(start_date)
         end = _parse_iso_date(end_date)
-        result = book.list_transactions(account, start, end, limit, compact=not verbose)
+        result = book.list_transactions(
+            account, start, end, limit, offset, compact=not verbose
+        )
         if verbose:
             return _json(result)
         return result
@@ -333,6 +341,7 @@ def register(mcp, get_book) -> None:
         query: str,
         field: str = "description",
         limit: int = 50,
+        offset: int = 0,
         verbose: bool = False,
     ) -> str:
         """Search transactions by description, memo, notes, or amount.
@@ -341,17 +350,20 @@ def register(mcp, get_book) -> None:
         ``DATE<TAB>guid<TAB>Description<TAB>splits``
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
-        full breakdown. When matches exceed ``limit``, a
-        ``[Showing N of M ...]`` notice is appended.
+        full breakdown. Leads with a ``Showing X-Y of Z transactions``
+        line; page with ``offset``, or pass ``limit=0`` for the count.
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
-            limit: Maximum number of matches to return (default 50, server cap 250).
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
-        result = book.search_transactions(query, field, limit=limit, compact=not verbose)
+        result = book.search_transactions(
+            query, field, limit=limit, offset=offset, compact=not verbose
+        )
         if verbose:
             return _json(result)
         return result
