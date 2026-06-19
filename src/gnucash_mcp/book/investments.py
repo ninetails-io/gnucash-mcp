@@ -30,7 +30,6 @@ from gnucash_mcp.book._base import (
     _unique_prefix,
 )
 from gnucash_mcp._format import _format_number, _paginate
-from gnucash_mcp.book._base import _date_range
 
 
 class InvestmentsMixin:
@@ -468,15 +467,12 @@ class InvestmentsMixin:
 
             prices.sort(key=lambda x: x["date"], reverse=True)
             total = len(prices)
-            # ISO date strings; min/max is chronological.
-            all_dates = [p["date"] for p in prices]
-            dr = (min(all_dates), max(all_dates)) if all_dates else None
             page, indicator = _paginate(
                 prices,
                 offset=offset,
                 limit=limit,
                 entity_name="prices",
-                date_range=dr,
+                date_key=lambda p: p["date"],
             )
 
             if not compact:

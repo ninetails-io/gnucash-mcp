@@ -80,15 +80,9 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         entries = book.list_backups()
-        # Entries are newest-first; ISO timestamps, so the full set's
-        # window is its last and first rows (date portion only).
-        dr = (
-            (entries[-1]["timestamp"][:10], entries[0]["timestamp"][:10])
-            if entries else None
-        )
         page, indicator = _paginate(
             entries, offset=offset, limit=limit,
-            entity_name="backups", date_range=dr,
+            entity_name="backups", date_key=lambda e: e["timestamp"],
         )
         if not page:
             return indicator

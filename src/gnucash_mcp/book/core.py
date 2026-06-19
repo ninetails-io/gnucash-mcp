@@ -28,7 +28,6 @@ _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 from gnucash_mcp.book._base import (
     _account_to_compact_line,
     _account_to_dict,
-    _date_range,
     _guid_prefix_map,
     _is_market_price,
     _is_unreconciled,
@@ -2316,17 +2315,13 @@ class CoreMixin:
                 key=lambda t: t.post_date or date.min, reverse=True
             )
 
-            # Date range spans the FULL filtered set (real post_dates
-            # only — null-date artifacts contribute nothing to the
-            # window). Computed before slicing, per the indicator's
-            # full-set contract.
             page, indicator = _paginate(
                 filtered,
                 offset=offset,
                 limit=limit,
                 max_cap=self.MAX_LIST_LIMIT,
                 entity_name="transactions",
-                date_range=_date_range(t.post_date for t in filtered),
+                date_key=lambda t: t.post_date,
             )
 
             if compact:
@@ -3277,7 +3272,7 @@ class CoreMixin:
                 limit=limit,
                 max_cap=self.MAX_LIST_LIMIT,
                 entity_name="transactions",
-                date_range=_date_range(t.post_date for t in matched),
+                date_key=lambda t: t.post_date,
             )
 
             if compact:

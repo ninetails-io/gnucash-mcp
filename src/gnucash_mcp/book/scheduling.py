@@ -597,12 +597,10 @@ class SchedulingMixin:
 
             upcoming.sort(key=lambda x: x["occurrence_date"])
 
-            # Sorted ascending by occurrence_date (ISO strings).
-            dates = [e["occurrence_date"] for e in upcoming]
-            dr = (dates[0], dates[-1]) if dates else None
             page, indicator = _paginate(
                 upcoming, offset=offset, limit=limit,
-                entity_name="upcoming transactions", date_range=dr,
+                entity_name="upcoming transactions",
+                date_key=lambda e: e["occurrence_date"],
             )
             if compact:
                 # Prefix uniqueness across all scheduled transactions

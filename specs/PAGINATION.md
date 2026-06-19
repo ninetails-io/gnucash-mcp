@@ -4,10 +4,13 @@
 
 Implemented on `feat/pagination`. The chokepoint is
 `_paginate(items, offset, limit, default=50, max_cap=250,
-entity_name, date_range)` in `gnucash_mcp/_format.py`, which retired
+entity_name, date_key)` in `gnucash_mcp/_format.py`, which retired
 both prior truncation mechanisms (`_apply_limit` and the bespoke
-`_truncation_notice`). Date helpers `_iso_date` / `_date_range` live
-in `book/_base.py`.
+`_truncation_notice`). Dated callers pass a `date_key` callable
+(`row -> date/datetime/ISO-string`); `_paginate` computes the range
+itself — over the **current page** for paged calls, over the full set
+for count-only/overshoot. The `_iso_date` normalizer lives in
+`_format.py` (layer-neutral, so the book layer doesn't reach upward).
 
 Scope landed broader than the named subset below: **all 20
 list-returning tools** carry the indicator + `offset`, not just the
@@ -45,7 +48,13 @@ Components:
 - `1-50`: the row range in this response (1-indexed for readability)
 - `of 109`: total matching rows (the number the LLM needs to decide whether to paginate)
 - `transactions`: the entity type (transactions, splits, accounts, etc.)
-- `(2026-05-01 to 2026-06-12)`: date range of the FULL result set, not just this page — tells the LLM the time window without parsing rows
+- `(2026-05-01 to 2026-06-12)`: date range of **this page** — on a
+  chronological list it's the actionable navigation signal ("rows
+  251-500 cover Oct–Dec; I need May, jump ahead"). The exception is
+  count-only mode (`limit=0`), which has no page and so spans the FULL
+  result set — the "what's the scope?" query. (Design refined from
+  full-set-everywhere after the bookkeeper pointed out the page range
+  is what enables offset arithmetic.)
 
 When all results fit in one page:
 ```

@@ -276,46 +276,98 @@ class TestPaginate:
         assert page == []
         assert ind == "Showing 0 of 245 transactions"
 
-    def test_count_only_includes_date_range(self):
+    def test_count_only_spans_full_set(self):
+        # Count-only has no page, so the range is the full set's scope.
+        rows = [{"d": f"2026-01-{i:02d}"} for i in range(1, 11)]
         page, ind = _paginate(
-            list(range(245)),
-            limit=0,
-            entity_name="transactions",
-            date_range=("2026-01-01", "2026-06-18"),
+            rows, limit=0, entity_name="transactions",
+            date_key=lambda r: r["d"],
         )
         assert page == []
         assert ind == (
-            "Showing 0 of 245 transactions "
-            "(2026-01-01 to 2026-06-18)"
+            "Showing 0 of 10 transactions (2026-01-01 to 2026-01-10)"
         )
 
-    # ── Date range ───────────────────────────────────────────────
+    # ── Date range — spans the current PAGE ──────────────────────
 
-    def test_date_range_appended(self):
-        # Spec test 9: date range reflects the full result set.
+    def _dated_rows(self):
+        # 10 rows, one per day 2026-01-01 .. 2026-01-10.
+        return [{"d": f"2026-01-{i:02d}"} for i in range(1, 11)]
+
+    def test_page_range_is_current_page_not_full_set(self):
+        rows = self._dated_rows()
         _, ind = _paginate(
-            list(range(109)),
+            rows, offset=3, limit=3, entity_name="transactions",
+            date_key=lambda r: r["d"],
+        )
+        # Rows 4-6 carry dates 04/05/06 — the page's window, not the
+        # full 01..10 span. This is the actionable navigation signal.
+        assert ind == (
+            "Showing 4-6 of 10 transactions (2026-01-04 to 2026-01-06)"
+        )
+
+    def test_page_range_moves_with_offset(self):
+        rows = self._dated_rows()
+        _, first = _paginate(
+            rows, offset=0, limit=3, date_key=lambda r: r["d"],
             entity_name="transactions",
-            date_range=("2026-05-01", "2026-06-12"),
+        )
+        _, second = _paginate(
+            rows, offset=3, limit=3, date_key=lambda r: r["d"],
+            entity_name="transactions",
+        )
+        assert "(2026-01-01 to 2026-01-03)" in first
+        assert "(2026-01-04 to 2026-01-06)" in second
+
+    def test_full_page_spans_whole_set(self):
+        # When everything fits, page range == full range.
+        rows = self._dated_rows()
+        _, ind = _paginate(
+            rows, entity_name="transactions", date_key=lambda r: r["d"],
         )
         assert ind == (
-            "Showing 1-50 of 109 transactions "
-            "(2026-05-01 to 2026-06-12)"
+            "Showing 1-10 of 10 transactions (2026-01-01 to 2026-01-10)"
         )
 
-    def test_date_range_omitted_when_undated(self):
+    def test_date_key_handles_date_and_datetime(self):
+        from datetime import date, datetime
+        rows = [
+            {"d": date(2026, 3, 1)},
+            {"d": datetime(2026, 3, 15, 10, 59)},
+        ]
         _, ind = _paginate(
-            list(range(5)), entity_name="accounts", date_range=None
+            rows, entity_name="transactions", date_key=lambda r: r["d"],
         )
+        assert ind.endswith("(2026-03-01 to 2026-03-15)")
+
+    def test_date_key_trims_iso_timestamp_to_day(self):
+        rows = [{"d": "2026-04-30T10:59:00+00:00"}]
+        _, ind = _paginate(
+            rows, entity_name="backups", date_key=lambda r: r["d"],
+        )
+        assert ind == "Showing 1-1 of 1 backups (2026-04-30 to 2026-04-30)"
+
+    def test_date_omitted_when_no_date_key(self):
+        _, ind = _paginate(list(range(5)), entity_name="accounts")
         assert ind == "Showing 1-5 of 5 accounts"
 
-    def test_date_range_skipped_when_member_missing(self):
+    def test_date_skipped_when_all_rows_undated(self):
+        rows = [{"d": None}, {"d": None}]
         _, ind = _paginate(
-            list(range(5)),
-            entity_name="prices",
-            date_range=(None, None),
+            rows, entity_name="prices", date_key=lambda r: r["d"],
         )
-        assert ind == "Showing 1-5 of 5 prices"
+        assert ind == "Showing 1-2 of 2 prices"
+
+    def test_offset_beyond_total_shows_full_scope(self):
+        rows = self._dated_rows()
+        page, ind = _paginate(
+            rows, offset=50, entity_name="transactions",
+            date_key=lambda r: r["d"],
+        )
+        assert page == []
+        assert "offset 50 exceeds result count" in ind
+        # No page to span, so fall back to the full set's window.
+        assert "(2026-01-01 to 2026-01-10)" in ind
 
     # ── Server-side cap ──────────────────────────────────────────
 

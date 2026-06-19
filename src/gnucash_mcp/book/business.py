@@ -27,7 +27,6 @@ from gnucash_mcp.book._base import (
     _verify_write,
 )
 from gnucash_mcp._format import _paginate
-from gnucash_mcp.book._base import _date_range
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -4414,7 +4413,7 @@ class BusinessMixin:
                 offset=offset,
                 limit=limit,
                 entity_name="invoices",
-                date_range=_date_range(i.date_opened for i in invoices),
+                date_key=lambda i: i.date_opened,
             )
             invoices = page
 
@@ -6893,16 +6892,12 @@ class BusinessMixin:
                 key=lambda r: -(r["days_past_due"] or 0),
             )
 
-            # date_posted is already an ISO string; min/max of ISO
-            # dates is chronological order.
-            posted = [r["date_posted"] for r in results if r["date_posted"]]
-            dr = (min(posted), max(posted)) if posted else None
             page, indicator = _paginate(
                 results,
                 offset=offset,
                 limit=limit,
                 entity_name="invoices",
-                date_range=dr,
+                date_key=lambda r: r["date_posted"],
             )
             if compact:
                 body = _format_outstanding_invoices_compact(page)

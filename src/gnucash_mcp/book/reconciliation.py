@@ -197,16 +197,12 @@ class ReconciliationMixin:
                 else:
                     uncleared_total += split.quantity
 
-            # Splits are sorted post-date ascending, so the full set's
-            # date window is its first and last rows.
-            dates = [s["date"] for s in all_unreconciled]
-            date_range = (dates[0], dates[-1]) if dates else None
             unreconciled, indicator = _paginate(
                 all_unreconciled,
                 offset=offset,
                 limit=limit,
                 entity_name="splits",
-                date_range=date_range,
+                date_key=lambda s: s["date"],
             )
             total_count = len(all_unreconciled)
 

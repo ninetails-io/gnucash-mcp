@@ -17,6 +17,7 @@ Two pieces:
 """
 
 import os
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TypeVar
 
@@ -156,6 +157,41 @@ def _apply_limit(
 # ── Pagination ─────────────────────────────────────────────────────
 
 
+def _iso_date(value) -> str | None:
+    """Normalize a ``date`` / ``datetime`` / ISO-string to ``YYYY-MM-DD``.
+
+    The pagination indicator's date range needs day precision only.
+    piecash hands back ``datetime`` for some columns (``post_date``) and
+    ``date`` for others, and several callers already carry ISO strings
+    (split dicts, backup timestamps) — all normalize here. ``None``
+    passes through so absent dates drop out of a range.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Already ISO (possibly with a time component) — keep the date.
+        return value[:10]
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return value.isoformat()
+
+
+def _range_suffix(rows, date_key) -> str:
+    """Build the `` (earliest to latest)`` parenthetical over ``rows``.
+
+    Empty when ``date_key`` is None (undated entity) or no row carries a
+    date. The caller decides which rows to span — the current page (for
+    navigation) or the full set (for the count-only "scope" query).
+    """
+    if date_key is None:
+        return ""
+    isos = [_iso_date(date_key(r)) for r in rows]
+    isos = [d for d in isos if d]
+    if not isos:
+        return ""
+    return f" ({min(isos)} to {max(isos)})"
+
+
 def _paginate(
     items: list[T],
     offset: int = 0,
@@ -163,7 +199,7 @@ def _paginate(
     default: int = 50,
     max_cap: int = 250,
     entity_name: str = "items",
-    date_range: tuple[str | None, str | None] | None = None,
+    date_key=None,
 ) -> tuple[list[T], str]:
     """Slice ``items`` to one page and build a ``Showing X-Y of Z`` line.
 
@@ -172,6 +208,12 @@ def _paginate(
     LLM learns the view is partial *before* reading any rows. A silent
     truncation is exactly the failure this prevents (a reconciliation
     session once missed 16 of 109 transactions to a hidden cap).
+
+    The date range spans the **current page**, not the full set: on a
+    chronological list it's the actionable navigation signal ("rows
+    251-500 cover Nov–Dec; I need May, so jump ahead"). The exception is
+    count-only / overshoot mode, where there is no page and the range
+    spans the full set — the "what's the scope?" query.
 
     Args:
         items: The FULL filtered, sorted result set. Slicing happens
@@ -184,10 +226,10 @@ def _paginate(
             ``limit capped at N`` note appended to the indicator.
         entity_name: Plural noun for the indicator ("transactions",
             "accounts", "splits").
-        date_range: ``(earliest, latest)`` ISO strings spanning the
-            FULL result set — not just this page — rendered in parens
-            so the LLM sees the time window without parsing rows. Omit
-            (or pass None/empty members) for undated entities.
+        date_key: Optional ``row -> date/datetime/ISO-string`` callable.
+            Provided for dated entities so the indicator carries the
+            range; omit for undated ones (no parens). The range is
+            computed from the page (or the full set in count-only mode).
 
     Returns:
         ``(page, indicator)``. ``page`` is the sliced rows; ``indicator``
@@ -195,15 +237,13 @@ def _paginate(
     """
     total = len(items)
 
-    suffix = ""
-    if date_range:
-        lo, hi = date_range
-        if lo and hi:
-            suffix = f" ({lo} to {hi})"
-
     # Count-only mode — one cheap call to learn the size before paging.
+    # No page, so the range spans the full set (the scope question).
     if limit == 0:
-        return [], f"Showing 0 of {total} {entity_name}{suffix}"
+        return [], (
+            f"Showing 0 of {total} {entity_name}"
+            f"{_range_suffix(items, date_key)}"
+        )
 
     if not limit or limit < 1:
         limit = default
@@ -216,17 +256,19 @@ def _paginate(
     if total == 0:
         return [], f"Showing 0 of 0 {entity_name}"
 
-    # Overshot the end — surface the total so the LLM can correct.
+    # Overshot the end — surface the total (and full-set scope) so the
+    # LLM can correct.
     if offset >= total:
         return [], (
             f"Showing 0 of {total} {entity_name} "
-            f"(offset {offset} exceeds result count){suffix}"
+            f"(offset {offset} exceeds result count)"
+            f"{_range_suffix(items, date_key)}"
         )
 
     page = items[offset:offset + effective]
     cap_note = f"; limit capped at {effective}" if capped else ""
     indicator = (
         f"Showing {offset + 1}-{offset + len(page)} of {total} "
-        f"{entity_name}{cap_note}{suffix}"
+        f"{entity_name}{cap_note}{_range_suffix(page, date_key)}"
     )
     return page, indicator
