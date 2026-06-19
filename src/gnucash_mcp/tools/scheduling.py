@@ -57,20 +57,28 @@ def register(mcp, get_book) -> None:
     def list_scheduled_transactions(
         enabled_only: bool = True,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all scheduled transactions.
 
-        Returns a compact one-line-per-schedule format by default.
-        Use verbose=true for full JSON with GUIDs, splits, dates, etc.
+        Leads with a ``Showing X-Y of Z scheduled transactions`` line,
+        then a compact one-line-per-schedule format by default. Page with
+        ``offset``; ``limit=0`` returns the count only. Use verbose=true
+        for full JSON with GUIDs, splits, dates, etc.
 
         Args:
             enabled_only: If True, only show enabled schedules. Default True.
             verbose: If true, return full JSON details for each scheduled transaction.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
         result = book.list_scheduled_transactions(
             enabled_only=enabled_only,
             compact=not verbose,
+            limit=limit,
+            offset=offset,
         )
         if verbose:
             return _json(result)
@@ -82,17 +90,26 @@ def register(mcp, get_book) -> None:
     def get_upcoming_transactions(
         days: int = 14,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """Get scheduled transactions due within a time window.
 
-        This is the "what bills are coming up?" query.
+        This is the "what bills are coming up?" query. Leads with a
+        ``Showing X-Y of Z upcoming transactions (date range)`` line,
+        soonest first. Page with ``offset``; ``limit=0`` returns the
+        count only.
 
         Args:
             days: Look ahead window in days. Default 14.
             verbose: If true, return full JSON with splits. Default compact one-line format.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.get_upcoming_transactions(days=days, compact=not verbose)
+        result = book.get_upcoming_transactions(
+            days=days, compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result

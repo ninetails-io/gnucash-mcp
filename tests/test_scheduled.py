@@ -192,7 +192,7 @@ class TestListScheduled:
 
     def test_empty_list(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
-        result = gb.list_scheduled_transactions(compact=False)
+        result = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
         assert result == []
 
     def test_lists_created(self, scheduled_book):
@@ -207,7 +207,7 @@ class TestListScheduled:
             start_date="2026-01-01",
             frequency="monthly",
         )
-        result = gb.list_scheduled_transactions(compact=False)
+        result = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
         assert len(result) == 1
         assert result[0]["name"] == "Rent"
         assert result[0]["frequency"] == "monthly"
@@ -242,12 +242,12 @@ class TestListScheduled:
         gb.update_scheduled_transaction(r1["guid"], enabled=False)
 
         # Default: enabled_only=True
-        enabled = gb.list_scheduled_transactions(enabled_only=True, compact=False)
+        enabled = gb.list_scheduled_transactions(enabled_only=True, compact=False)["scheduled_transactions"]
         assert len(enabled) == 1
         assert enabled[0]["name"] == "Utils"
 
         # All
-        all_sx = gb.list_scheduled_transactions(enabled_only=False, compact=False)
+        all_sx = gb.list_scheduled_transactions(enabled_only=False, compact=False)["scheduled_transactions"]
         assert len(all_sx) == 2
 
 
@@ -271,7 +271,7 @@ class TestGetUpcoming:
             start_date=tomorrow.isoformat(),
             frequency="monthly",
         )
-        result = gb.get_upcoming_transactions(days=14, compact=False)
+        result = gb.get_upcoming_transactions(days=14, compact=False)["upcoming_transactions"]
         assert len(result) == 1
         assert result[0]["name"] == "Rent"
         assert result[0]["amount"] == "1850.00"
@@ -291,7 +291,7 @@ class TestGetUpcoming:
             start_date=future.isoformat(),
             frequency="monthly",
         )
-        result = gb.get_upcoming_transactions(days=14, compact=False)
+        result = gb.get_upcoming_transactions(days=14, compact=False)["upcoming_transactions"]
         assert len(result) == 0
 
     def test_disabled_excluded(self, scheduled_book):
@@ -308,7 +308,7 @@ class TestGetUpcoming:
             frequency="monthly",
         )
         gb.update_scheduled_transaction(r["guid"], enabled=False)
-        result = gb.get_upcoming_transactions(days=14, compact=False)
+        result = gb.get_upcoming_transactions(days=14, compact=False)["upcoming_transactions"]
         assert len(result) == 0
 
 
@@ -514,7 +514,7 @@ class TestDeleteScheduled:
         assert result["name"] == "Rent"
 
         # Verify gone
-        listed = gb.list_scheduled_transactions(enabled_only=False, compact=False)
+        listed = gb.list_scheduled_transactions(enabled_only=False, compact=False)["scheduled_transactions"]
         assert len(listed) == 0
 
     def test_delete_nonexistent_error(self, scheduled_book):
@@ -686,7 +686,7 @@ class TestScheduledIntegration:
         )
 
         # List
-        listed = gb.list_scheduled_transactions(compact=False)
+        listed = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
         assert len(listed) == 1
         assert listed[0]["name"] == "Monthly Rent"
         assert listed[0]["enabled"] is True
@@ -714,7 +714,7 @@ class TestScheduledIntegration:
 
         # Delete
         gb.delete_scheduled_transaction(sx["guid"])
-        listed = gb.list_scheduled_transactions(enabled_only=False, compact=False)
+        listed = gb.list_scheduled_transactions(enabled_only=False, compact=False)["scheduled_transactions"]
         assert len(listed) == 0
 
     def test_multiple_frequencies(self, scheduled_book):
@@ -733,7 +733,7 @@ class TestScheduledIntegration:
                 frequency=freq,
             )
 
-        listed = gb.list_scheduled_transactions(compact=False)
+        listed = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
         assert len(listed) == 5
         freqs = {sx["frequency"] for sx in listed}
         assert freqs == {"weekly", "biweekly", "monthly", "quarterly", "yearly"}
