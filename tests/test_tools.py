@@ -1,7 +1,9 @@
 """Tests for MCP server tools and resources."""
 
+import inspect
 import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1416,3 +1418,91 @@ class TestStrictToolKwargs:
             )
             with pytest.raises(ValidationError):
                 arg_model.model_validate({"this_is_not_a_real_kwarg": "x"})
+
+
+# Compact line-1 indicator: "Showing 1-50 of 109 …" or "Showing 0 of 0 …".
+_INDICATOR_RE = re.compile(r"^Showing (0|\d+-\d+) of \d+ [a-z]")
+
+# (tool, runnable kwargs against the standard test book, verbose entity
+# key). A None key marks a TSV-only tool with no verbose envelope.
+_PAGINATED_TOOLS = [
+    ("list_accounts", {}, "accounts"),
+    ("list_transactions", {}, "transactions"),
+    ("search_transactions", {"query": "a"}, "transactions"),
+    ("get_unreconciled_splits", {"account": "Assets:Checking"}, "splits"),
+    ("list_customers", {}, "customers"),
+    ("list_vendors", {}, "vendors"),
+    ("list_employees", {}, "employees"),
+    ("list_billterms", {}, "billterms"),
+    ("list_taxtables", {}, "taxtables"),
+    ("list_invoices", {}, "invoices"),
+    ("list_jobs", {}, "jobs"),
+    ("get_outstanding_invoices", {}, "invoices"),
+    ("list_scheduled_transactions", {}, "scheduled_transactions"),
+    ("get_upcoming_transactions", {}, "upcoming_transactions"),
+    ("list_commodities", {}, "commodities"),
+    ("get_prices", {"commodity": "USD", "namespace": "CURRENCY"}, "prices"),
+    ("list_lots", {"account": "Assets:Checking"}, "lots"),
+    ("list_budgets", {}, "budgets"),
+    ("list_backups", {}, None),
+    ("get_audit_log", {}, None),
+]
+
+
+class TestPaginationCoverage:
+    """Contract lock for the pagination rollout: every list-returning
+    tool leads with a ``Showing X-Y of Z`` indicator, accepts
+    ``offset``/``limit``, and (where it has a verbose mode) returns the
+    uniform envelope. Mirrors TestToolFileVsModulesMapping — adding a
+    list tool without pagination should fail loudly here."""
+
+    @pytest.mark.parametrize(
+        "tool_name", [t[0] for t in _PAGINATED_TOOLS]
+    )
+    def test_tool_accepts_offset_and_limit(self, tool_name):
+        fn = getattr(server_module, tool_name)
+        params = inspect.signature(fn).parameters
+        assert "offset" in params, f"{tool_name} missing offset param"
+        assert "limit" in params, f"{tool_name} missing limit param"
+
+    @pytest.mark.parametrize(
+        "tool_name,kwargs", [(t[0], t[1]) for t in _PAGINATED_TOOLS]
+    )
+    def test_compact_leads_with_indicator(
+        self, setup_book_env, tool_name, kwargs
+    ):
+        result = getattr(server_module, tool_name)(**kwargs)
+        line0 = result.split("\n")[0]
+        # get_audit_log can't reach its indicator in this fixture: no
+        # log dir is configured, so it returns the not-initialized /
+        # no-file sentinel. Its indicator format is locked by the book
+        # path that DOES have entries; here we only assert it doesn't
+        # masquerade as a row list.
+        if tool_name == "get_audit_log" and not line0.startswith("Showing"):
+            assert "audit log" in line0.lower() or "error" in line0.lower()
+            return
+        assert _INDICATOR_RE.match(line0), (
+            f"{tool_name} compact line 0 is not an indicator: {line0!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "tool_name,kwargs,key",
+        [(t[0], t[1], t[2]) for t in _PAGINATED_TOOLS if t[2]],
+    )
+    def test_verbose_returns_uniform_envelope(
+        self, setup_book_env, tool_name, kwargs, key
+    ):
+        result = getattr(server_module, tool_name)(verbose=True, **kwargs)
+        data = json.loads(result)
+        assert isinstance(data, dict), f"{tool_name} verbose is not a dict"
+        for field in ("showing", "total", "offset", "count"):
+            assert field in data, f"{tool_name} verbose missing {field!r}"
+        assert _INDICATOR_RE.match(data["showing"]), (
+            f"{tool_name} 'showing' is not an indicator: {data['showing']!r}"
+        )
+        assert key in data, f"{tool_name} verbose missing entity key {key!r}"
+
+    def test_count_only_mode(self, setup_book_env):
+        """limit=0 yields a zero-page indicator with the full total."""
+        result = server_module.list_transactions(limit=0)
+        assert result.startswith("Showing 0 of 3 transactions")
