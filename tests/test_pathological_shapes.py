@@ -133,7 +133,7 @@ class TestCrossSurfaceAgreement:
         gb = GnuCashBook(str(pathological_book.path))
         rows = {
             r["id"]: r
-            for r in gb.get_outstanding_invoices(compact=False)
+            for r in gb.get_outstanding_invoices(compact=False)["invoices"]
         }
 
         overpaid = rows[pathological_book.usd_invoice_id]
