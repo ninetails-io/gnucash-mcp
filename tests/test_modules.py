@@ -1,5 +1,6 @@
 """Tests for tool module filtering and server configuration."""
 
+import os
 import re
 from pathlib import Path
 
@@ -974,21 +975,30 @@ class TestMultiBook:
     def test_parse_multi_path_preserves_order(self, two_books):
         from gnucash_mcp.server import _parse_book_paths
         alex, beast = two_books
-        result = _parse_book_paths(f"{alex},{beast}")
+        result = _parse_book_paths(f"{alex}{os.pathsep}{beast}")
         assert result == [alex.resolve(), beast.resolve()]
 
     def test_parse_strips_whitespace_and_empties(self, two_books):
         from gnucash_mcp.server import _parse_book_paths
         alex, beast = two_books
-        result = _parse_book_paths(f" {alex} , , {beast} ")
+        sep = os.pathsep
+        result = _parse_book_paths(f" {alex} {sep} {sep} {beast} ")
         assert result == [alex.resolve(), beast.resolve()]
+
+    def test_parse_allows_comma_in_filename(self, tmp_path):
+        """Regression guard: a single book whose name contains a comma
+        (the rejected separator) must parse as ONE path."""
+        from gnucash_mcp.server import _parse_book_paths
+        name = "financials, invoicing, and metrics.gnucash"
+        book = _make_min_book(tmp_path / name)
+        assert _parse_book_paths(str(book)) == [book.resolve()]
 
     def test_parse_missing_path_fails_fast(self, two_books, tmp_path):
         from gnucash_mcp.server import _parse_book_paths, _BookPathError
         alex, _ = two_books
         missing = tmp_path / "nope.gnucash"
         with pytest.raises(_BookPathError, match="not found"):
-            _parse_book_paths(f"{alex},{missing}")
+            _parse_book_paths(f"{alex}{os.pathsep}{missing}")
 
     def test_book_path_error_is_file_not_found(self):
         """Missing-book errors must subclass FileNotFoundError so the
@@ -1005,7 +1015,7 @@ class TestMultiBook:
         b1 = _make_min_book(d1 / "dup.gnucash")
         b2 = _make_min_book(d2 / "dup.gnucash")
         with pytest.raises(_BookPathError, match="duplicate book filename"):
-            _parse_book_paths(f"{b1},{b2}")
+            _parse_book_paths(f"{b1}{os.pathsep}{b2}")
 
     def test_parse_unset_raises_valueerror(self):
         from gnucash_mcp.server import _parse_book_paths
@@ -1106,7 +1116,7 @@ class TestMultiBook:
     def test_get_book_selects_first_as_current(self, two_books, monkeypatch):
         import gnucash_mcp.server as srv
         alex, beast = two_books
-        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex},{beast}")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex}{os.pathsep}{beast}")
         srv._book = None
         srv._current_path = None
         srv._book_registry = {}
@@ -1152,7 +1162,7 @@ class TestMultiBook:
         import gnucash_mcp.server as srv
         import gnucash_mcp.logging_config as logcfg
         alex, beast = two_books
-        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex},{beast}")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex}{os.pathsep}{beast}")
         srv._book = None
         srv._current_path = None
         srv._book_registry = {}

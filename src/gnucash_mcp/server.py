@@ -557,7 +557,8 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
 _server_state: dict = {}
 
 # ── Multi-book registry ────────────────────────────────────────────
-# GNUCASH_BOOK_PATH may hold a single path OR a comma-separated list.
+# GNUCASH_BOOK_PATH may hold a single path OR an os.pathsep-separated
+# list (``:`` on POSIX, ``;`` on Windows — the PATH convention).
 # The server keeps one "current" book and switches between them
 # in-session via the switch_book tool (no restart, no re-registration —
 # every tool calls get_book() per operation, so repointing _book is
@@ -602,10 +603,19 @@ class _BookPathError(FileNotFoundError):
 
 
 def _parse_book_paths(value: str | None) -> list[Path]:
-    """Parse GNUCASH_BOOK_PATH (one path, or a comma-separated list).
+    """Parse GNUCASH_BOOK_PATH (one path, or an os.pathsep-separated list).
 
-    Splits on ``,``, strips, drops empties, and resolves each entry to
-    an absolute path that must exist and be a regular file.
+    The separator is ``os.pathsep`` — ``:`` on POSIX, ``;`` on Windows
+    — the same convention PATH/PYTHONPATH use. Comma was rejected as a
+    separator because it is a common filename character (a book named
+    ``financials, invoicing.gnucash`` would have mis-split, and no
+    shell escaping could prevent it — the shell can't signal "this
+    separator byte is literal" to a downstream parser). The one
+    residual limit, a literal ``os.pathsep`` inside a path, is rare and
+    identical to PATH's own constraint.
+
+    Splits on ``os.pathsep``, strips, drops empties, and resolves each
+    entry to an absolute path that must exist and be a regular file.
 
     Raises:
         ValueError: value unset or empty.
@@ -617,7 +627,7 @@ def _parse_book_paths(value: str | None) -> list[Path]:
         raise ValueError(
             "GNUCASH_BOOK_PATH environment variable not set"
         )
-    raw = [p.strip() for p in value.split(",") if p.strip()]
+    raw = [p.strip() for p in value.split(os.pathsep) if p.strip()]
     if not raw:
         raise ValueError(
             "GNUCASH_BOOK_PATH environment variable not set"
@@ -678,7 +688,7 @@ def multi_book_active() -> bool:
 def get_book():
     """Get or create the current GnuCashBook instance.
 
-    Honors a comma-separated GNUCASH_BOOK_PATH: when no book is
+    Honors an os.pathsep-separated GNUCASH_BOOK_PATH: when no book is
     selected yet, the first valid path becomes current. switch_book
     repoints the selection mid-session. Resetting ``_book`` to None
     forces re-initialization from the environment — the reset point
@@ -945,10 +955,12 @@ Options:
 
 Environment variables:
   GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required). May
-                             be a comma-separated list of books; the
-                             first is current at startup and switch_book
-                             changes the active one in-session. Filenames
-                             must be unique (switch_book matches by name).
+                             be an os.pathsep-separated list of books
+                             (":" on macOS/Linux, ";" on Windows — same
+                             as PATH); the first is current at startup
+                             and switch_book changes the active one
+                             in-session. Filenames must be unique
+                             (switch_book matches by name).
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
@@ -980,7 +992,7 @@ default, or at GNUCASH_LOG_DIR if set:
     global _book_paths, _current_path, _logging_debug, _logging_audit
     global _book_class
 
-    # GNUCASH_BOOK_PATH: one path or a comma-separated list. Fail fast
+    # GNUCASH_BOOK_PATH: one path or an os.pathsep-separated list. Fail fast
     # on any invalid/duplicate entry (unset is tolerated — tools error
     # at call time, matching the prior behavior). ``book_path`` below
     # is the CURRENT book, used for logging / health / display.
