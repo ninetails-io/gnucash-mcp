@@ -17,6 +17,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         depth: int = 1,
         verbose: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Get spending breakdown by expense category for a period.
 
@@ -28,6 +29,10 @@ def register(mcp, get_book) -> None:
             end_date: End of period (YYYY-MM-DD)
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
             verbose: If true, return the structured dict.
+            group_by: Optional "month", "quarter", or "year" — split the
+                range into sub-period columns and return a multi-period
+                TSV table (category rows, one column per period plus
+                Total and Avg). Overrides verbose.
         """
         book = get_book()
         result = book.spending_by_category(
@@ -35,7 +40,10 @@ def register(mcp, get_book) -> None:
             end_date=date.fromisoformat(end_date),
             depth=depth,
             compact=not verbose,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         if verbose:
             return _json(result)
         return result
@@ -48,6 +56,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         depth: int = 1,
         verbose: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Get income breakdown by source for a period.
 
@@ -59,6 +68,10 @@ def register(mcp, get_book) -> None:
             end_date: End of period (YYYY-MM-DD)
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
             verbose: If true, return the structured dict.
+            group_by: Optional "month", "quarter", or "year" — split the
+                range into sub-period columns and return a multi-period
+                TSV table (source rows, one column per period plus Total
+                and Avg). Overrides verbose.
         """
         book = get_book()
         result = book.income_by_source(
@@ -66,7 +79,10 @@ def register(mcp, get_book) -> None:
             end_date=date.fromisoformat(end_date),
             depth=depth,
             compact=not verbose,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         if verbose:
             return _json(result)
         return result
@@ -135,6 +151,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         account: str | None = None,
         include_transfers: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Calculate cash flow (inflows and outflows) for a period.
 
@@ -159,6 +176,9 @@ def register(mcp, get_book) -> None:
             include_transfers: When False (default), filter internal
                 transfers. When True, include every cash/bank
                 movement regardless of category.
+            group_by: Optional "month", "quarter", or "year" — split
+                the range into sub-period columns and return an
+                Inflows / Outflows / Net trend table (TSV).
         """
         book = get_book()
         result = book.cash_flow(
@@ -166,7 +186,10 @@ def register(mcp, get_book) -> None:
             end_date=date.fromisoformat(end_date),
             account=account,
             include_transfers=include_transfers,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         return _json(result)
 
     @mcp.tool()

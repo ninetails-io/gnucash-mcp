@@ -18,7 +18,13 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.book._base import _is_voided, _to_decimal
-from gnucash_mcp._format import _format_number
+from gnucash_mcp._format import (
+    _GROUP_BY_VALUES,
+    _enumerate_periods,
+    _format_grouped_tsv,
+    _format_number,
+    _period_label,
+)
 
 # Account-type groups shared by the reports' SQL IN() clauses — one
 # canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
@@ -72,6 +78,49 @@ def _format_breakdown_tsv(rows: list[dict], total: Decimal, label_key: str) -> s
         f"{'TOTAL':<{name_width}}  {total:>{amount_width},.2f}"
     )
     return "\n".join(lines)
+
+
+def _format_grouped_cashflow_tsv(
+    *,
+    period_labels: list[str],
+    inflows: dict[str, Decimal],
+    outflows: dict[str, Decimal],
+    account_label: str,
+    transfers_excluded: int,
+) -> str:
+    """Render a multi-period cash-flow trend as a TSV table.
+
+    Three fixed rows — Inflows, Outflows (positive magnitude, matching
+    single-period), and Net (Inflows − Outflows, the build-vs-burn
+    signal a trend view exists for). Columns are the sub-periods plus
+    Total and Avg. A leading title line names the account scope; a
+    trailing note surfaces the ``include_transfers`` escape hatch.
+    """
+    num_periods = len(period_labels)
+    net = {pl: inflows[pl] - outflows[pl] for pl in period_labels}
+
+    def _row(name: str, values: dict[str, Decimal]) -> str:
+        cells = [name]
+        cells += [f"{values[pl]:.2f}" for pl in period_labels]
+        tot = sum(values.values(), Decimal("0"))
+        avg = tot / num_periods if num_periods else Decimal("0")
+        cells += [f"{tot:.2f}", f"{avg:.2f}"]
+        return "\t".join(cells)
+
+    lines = [
+        account_label,
+        "\t".join(["Cash flow", *period_labels, "Total", "Avg"]),
+        _row("Inflows", inflows),
+        _row("Outflows", outflows),
+        _row("Net", net),
+    ]
+    out = "\n".join(lines)
+    if transfers_excluded:
+        out += (
+            f"\n({transfers_excluded} internal transfer txn(s) excluded; "
+            f"include_transfers=true to include)"
+        )
+    return out
 
 
 def _money_compact(value: Decimal, currency: str = "USD") -> str:
@@ -190,12 +239,94 @@ class ReportingMixin:
 
     # ── Period breakdowns ─────────────────────────────────────────────
 
+    def _grouped_breakdown(
+        self,
+        book: piecash.Book,
+        *,
+        start_date: date,
+        end_date: date,
+        depth: int,
+        account_type: str,
+        sign: Decimal,
+        group_by: str,
+        label: str,
+    ) -> str:
+        """Multi-period breakdown shared by spending/income.
+
+        One indexed pass over the range's splits, bucketed by
+        ``(group_account, sub-period)``. ``sign`` flips income's
+        stored-negative convention (``-1``) vs spending (``1``); the
+        rest is identical to the single-period path — same ``depth``
+        grouping, same net-after-aggregation rule (a category whose
+        total across ALL periods is ≤ 0 is dropped from the rows but
+        still netted into the column totals).
+        """
+        periods = _enumerate_periods(start_date, end_date, group_by)
+        period_labels = [pl for pl, _ in periods]
+        # Each period values at its own close — never today's rates
+        # against a historical period's quantities.
+        factors_by_period = {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in periods
+        }
+
+        rows = self._query_filtered_splits(
+            book,
+            start_date=start_date,
+            end_date=end_date,
+            account_types=frozenset({account_type}),
+        )
+
+        # category fullname → {period_label: signed Decimal}
+        totals: dict[str, dict[str, Decimal]] = {}
+        for split, txn, account in rows:
+            plabel = _period_label(txn.post_date, group_by)
+            factor = factors_by_period.get(plabel, {}).get(account.guid)
+            amount = sign * self._split_in_default_currency(
+                split, account, factor,
+            )
+            group_account = self._get_account_at_depth(account, depth)
+            bucket = totals.setdefault(group_account.fullname, {})
+            bucket[plabel] = bucket.get(plabel, Decimal("0")) + amount
+
+        cat_totals = {
+            name: sum(per.values(), Decimal("0"))
+            for name, per in totals.items()
+        }
+        displayed_names = sorted(
+            (n for n, t in cat_totals.items() if t > 0),
+            key=lambda n: cat_totals[n],
+            reverse=True,
+        )
+        excluded = [(n, t) for n, t in cat_totals.items() if t < 0]
+
+        # Column totals sum every category — net-negative ones netted
+        # in even though they have no row, so the totals match
+        # single-period mode.
+        period_totals = {pl: Decimal("0") for pl in period_labels}
+        for per in totals.values():
+            for pl, v in per.items():
+                period_totals[pl] += v
+        grand_total = sum(cat_totals.values(), Decimal("0"))
+
+        return _format_grouped_tsv(
+            period_labels=period_labels,
+            displayed_names=displayed_names,
+            totals=totals,
+            row_totals=cat_totals,
+            period_totals=period_totals,
+            grand_total=grand_total,
+            excluded=excluded,
+            label=label,
+        )
+
     def spending_by_category(
         self,
         start_date: date,
         end_date: date,
         depth: int = 1,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get spending breakdown by expense category.
 
@@ -210,7 +341,30 @@ class ReportingMixin:
                 leaf.
             compact: Aligned text table (default) or the structured
                 dict.
+            group_by: ``None`` (default) for the single-period
+                aggregation above; ``"month"`` / ``"quarter"`` /
+                ``"year"`` to split the range into sub-period columns
+                and return a multi-period TSV table (always a string;
+                ``compact`` is ignored — the table is the output).
         """
+        if group_by is not None:
+            if group_by not in _GROUP_BY_VALUES:
+                raise ValueError(
+                    f"Invalid group_by '{group_by}'. Must be one of: "
+                    f"{', '.join(_GROUP_BY_VALUES)}."
+                )
+            with self.open(readonly=True) as book:
+                return self._grouped_breakdown(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    depth=depth,
+                    account_type="EXPENSE",
+                    sign=Decimal("1"),
+                    group_by=group_by,
+                    label="Category",
+                )
+
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
                 book,
@@ -297,6 +451,7 @@ class ReportingMixin:
         end_date: date,
         depth: int = 1,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get income breakdown by source.
 
@@ -307,7 +462,28 @@ class ReportingMixin:
             start_date / end_date: Period bounds (inclusive).
             depth: Grouping depth (1 = top-level).
             compact: Aligned text table (default) or structured dict.
+            group_by: ``None`` (default) for single-period; ``"month"``
+                / ``"quarter"`` / ``"year"`` for a multi-period TSV
+                table — see ``spending_by_category``.
         """
+        if group_by is not None:
+            if group_by not in _GROUP_BY_VALUES:
+                raise ValueError(
+                    f"Invalid group_by '{group_by}'. Must be one of: "
+                    f"{', '.join(_GROUP_BY_VALUES)}."
+                )
+            with self.open(readonly=True) as book:
+                return self._grouped_breakdown(
+                    book,
+                    start_date=start_date,
+                    end_date=end_date,
+                    depth=depth,
+                    account_type="INCOME",
+                    sign=Decimal("-1"),
+                    group_by=group_by,
+                    label="Source",
+                )
+
         with self.open(readonly=True) as book:
             rows = self._query_filtered_splits(
                 book,
@@ -761,7 +937,8 @@ class ReportingMixin:
         end_date: date,
         account: str | None = None,
         include_transfers: bool = False,
-    ) -> dict:
+        group_by: str | None = None,
+    ) -> dict | str:
         """Calculate cash flow (inflows and outflows) for a period.
 
         Scope: BANK and CASH accounts only. Credit-card movements
@@ -782,14 +959,23 @@ class ReportingMixin:
             account: Optional single-account filter.
             include_transfers: True includes every cash movement —
                 useful for reconciling against a bank statement.
+            group_by: ``None`` (default) for the single-period dict;
+                ``"month"`` / ``"quarter"`` / ``"year"`` to split the
+                range into sub-period columns and return an
+                Inflows / Outflows / Net trend table (a TSV string).
 
         Returns:
             ``{account, inflows, outflows}`` plus, when transfers
             were filtered, ``transfers_excluded`` — the count of
             distinct cash-touching transactions skipped (surfaced so
             the LLM can mention the ``include_transfers`` escape
-            hatch).
+            hatch). With ``group_by``, a multi-period TSV table.
         """
+        if group_by is not None and group_by not in _GROUP_BY_VALUES:
+            raise ValueError(
+                f"Invalid group_by '{group_by}'. Must be one of: "
+                f"{', '.join(_GROUP_BY_VALUES)}."
+            )
         with self.open(readonly=True) as book:
             # Named-account or all-cash filter; both push to SQL.
             if account:
@@ -802,6 +988,7 @@ class ReportingMixin:
                     end_date=end_date,
                     account_guids=frozenset({target_account.guid}),
                 )
+                account_label = target_account.fullname
             else:
                 rows = self._query_filtered_splits(
                     book,
@@ -809,6 +996,7 @@ class ReportingMixin:
                     end_date=end_date,
                     account_types=_CASH_TYPES,
                 )
+                account_label = "All cash/bank accounts"
 
             # GUIDs of "real" cash-flow transactions; everything
             # else is a transfer unless include_transfers.
@@ -818,6 +1006,17 @@ class ReportingMixin:
                 )
             else:
                 cashflow_txn_guids = None  # don't filter
+
+            if group_by is not None:
+                return self._grouped_cash_flow(
+                    book,
+                    rows=rows,
+                    start_date=start_date,
+                    end_date=end_date,
+                    cashflow_txn_guids=cashflow_txn_guids,
+                    group_by=group_by,
+                    account_label=account_label,
+                )
 
             factors = self._account_conversion_factors(book, end_date)
             inflows = Decimal("0")
@@ -845,16 +1044,65 @@ class ReportingMixin:
             # The canonical fullname is echoed so %short/GUID input
             # still yields a readable name.
             result = {
-                "account": (
-                    target_account.fullname if account
-                    else "All cash/bank accounts"
-                ),
+                "account": account_label,
                 "inflows": str(inflows),
                 "outflows": str(outflows),
             }
             if transfers_excluded:
                 result["transfers_excluded"] = len(transfers_excluded)
             return result
+
+    def _grouped_cash_flow(
+        self,
+        book: piecash.Book,
+        *,
+        rows,
+        start_date: date,
+        end_date: date,
+        cashflow_txn_guids: set[str] | None,
+        group_by: str,
+        account_label: str,
+    ) -> str:
+        """Bucket the cash-flow splits into per-period inflows/outflows.
+
+        Same classification as the single-period path — voided splits
+        skipped, internal transfers excluded unless the caller passed
+        ``cashflow_txn_guids=None`` — but each split lands in its
+        post_date's sub-period and converts at that period's close.
+        """
+        periods = _enumerate_periods(start_date, end_date, group_by)
+        period_labels = [pl for pl, _ in periods]
+        factors_by_period = {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in periods
+        }
+
+        inflows = {pl: Decimal("0") for pl in period_labels}
+        outflows = {pl: Decimal("0") for pl in period_labels}
+        transfers_excluded: set[str] = set()
+        for split, txn, acct in rows:
+            if _is_voided(split):
+                continue
+            if cashflow_txn_guids is not None \
+                    and txn.guid not in cashflow_txn_guids:
+                transfers_excluded.add(txn.guid)
+                continue
+            plabel = _period_label(txn.post_date, group_by)
+            amt = self._split_in_default_currency(
+                split, acct, factors_by_period.get(plabel, {}).get(acct.guid)
+            )
+            if amt > 0:
+                inflows[plabel] += amt
+            elif amt < 0:
+                outflows[plabel] += -amt
+
+        return _format_grouped_cashflow_tsv(
+            period_labels=period_labels,
+            inflows=inflows,
+            outflows=outflows,
+            account_label=account_label,
+            transfers_excluded=len(transfers_excluded),
+        )
 
     def _cashflow_txn_guids(
         self,

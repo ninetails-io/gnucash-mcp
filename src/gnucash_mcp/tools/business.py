@@ -1571,6 +1571,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         vendor_id: str | None = None,
         verbose: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Get spending breakdown by vendor for a period.
 
@@ -1585,6 +1586,9 @@ def register(mcp, get_book) -> None:
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to a specific vendor.
             verbose: If true, return the structured dict.
+            group_by: Optional "month", "quarter", or "year" — split the
+                range into sub-period columns of total billed per vendor
+                and return a multi-period TSV table. Overrides verbose.
         """
         book = get_book()
         result = book.vendor_spending_report(
@@ -1592,7 +1596,10 @@ def register(mcp, get_book) -> None:
             end_date=end_date,
             vendor_id=vendor_id,
             compact=not verbose,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         if verbose:
             return _json(result)
         return result

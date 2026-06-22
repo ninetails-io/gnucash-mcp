@@ -8238,6 +8238,327 @@ class TestIncomeBySource:
         assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
 
 
+class TestGroupByBreakdown:
+    """group_by sub-period columns for spending/income breakdowns."""
+
+    @staticmethod
+    def _book(tmp_path: Path) -> Path:
+        """Three months (2026-03..05) of expenses + income.
+
+        Travel is positive overall (900) but negative in April (a
+        refund month). Shopping is net-negative overall (−200) — it
+        must drop from the rows but stay netted into the column
+        totals.
+        """
+        bp = tmp_path / "grouped.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        groceries = piecash.Account(name="Groceries", type="EXPENSE",
+                                    parent=exp, commodity=usd)
+        dining = piecash.Account(name="Dining", type="EXPENSE",
+                                 parent=exp, commodity=usd)
+        travel = piecash.Account(name="Travel", type="EXPENSE",
+                                 parent=exp, commodity=usd)
+        shopping = piecash.Account(name="Shopping", type="EXPENSE",
+                                   parent=exp, commodity=usd)
+        inc = piecash.Account(name="Income", type="INCOME", parent=root,
+                              commodity=usd, placeholder=True)
+        salary = piecash.Account(name="Salary", type="INCOME",
+                                 parent=inc, commodity=usd)
+        consulting = piecash.Account(name="Consulting", type="INCOME",
+                                     parent=inc, commodity=usd)
+        eq = piecash.Account(name="Equity", type="EQUITY", parent=root,
+                             commodity=usd, placeholder=True)
+        opening = piecash.Account(name="Opening", type="EQUITY",
+                                  parent=eq, commodity=usd)
+        book.save()
+
+        def tx(desc, d, acct, amt):
+            book.session.add(piecash.Transaction(
+                currency=usd, description=desc, post_date=d,
+                splits=[piecash.Split(account=acct, value=Decimal(amt)),
+                        piecash.Split(account=checking,
+                                      value=Decimal(amt) * -1)]))
+
+        tx("open", date(2026, 1, 1), opening, "-50000")
+        # Expenses (account gets a positive debit).
+        for d, amt in ((3, "500"), (4, "700"), (5, "500")):
+            tx("groceries", date(2026, d, 5), groceries, amt)
+        for d, amt in ((3, "500"), (4, "600"), (5, "350")):
+            tx("dining", date(2026, d, 6), dining, amt)
+        tx("flights", date(2026, 3, 7), travel, "1000")
+        tx("refund", date(2026, 4, 7), travel, "-200")
+        tx("taxi", date(2026, 5, 7), travel, "100")
+        tx("shop", date(2026, 3, 8), shopping, "100")
+        tx("shop-refund", date(2026, 4, 8), shopping, "-300")
+        # Income (income account gets a negative credit).
+        for d in (3, 4, 5):
+            tx("salary", date(2026, d, 1), salary, "-4000")
+        tx("consulting", date(2026, 4, 15), consulting, "-1000")
+        book.save()
+        return bp
+
+    @staticmethod
+    def _parse(tsv: str) -> dict[str, list[str]]:
+        """Header + each row keyed by its first cell → list of cells."""
+        lines = [ln for ln in tsv.splitlines()
+                 if "\t" in ln]  # drop any footnote line
+        out = {}
+        for ln in lines:
+            cells = ln.split("\t")
+            out[cells[0]] = cells
+        return out
+
+    def test_month_three_columns(self, tmp_path: Path):
+        """3-month range → 3 period columns + Total + Avg."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Category"] == [
+            "Category", "2026-03", "2026-04", "2026-05", "Total", "Avg",
+        ]
+        assert rows["Groceries"] == [
+            "Groceries", "500.00", "700.00", "500.00", "1700.00", "566.67",
+        ]
+        # Sorted by Total desc: Groceries > Dining > Travel.
+        order = [c[0] for c in rows.values()][1:]  # skip header
+        assert order == ["Groceries", "Dining", "Travel", "TOTAL"]
+
+    def test_quarter_two_columns(self, tmp_path: Path):
+        """6-month range → 2 quarter columns (Q1 partial, Q2)."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 1, 1), end_date=date(2026, 6, 30),
+            group_by="quarter",
+        )
+        rows = self._parse(tsv)
+        assert rows["Category"] == [
+            "Category", "2026-Q1", "2026-Q2", "Total", "Avg",
+        ]
+        # Q1 = March data only; Q2 = April + May.
+        assert rows["Groceries"][1:3] == ["500.00", "1200.00"]
+
+    def test_year_two_columns_partial_empty(self, tmp_path: Path):
+        """18-month range → 2 year columns; the empty 2025 column
+        still renders as 0.00."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2025, 1, 1), end_date=date(2026, 6, 30),
+            group_by="year",
+        )
+        rows = self._parse(tsv)
+        assert rows["Category"] == [
+            "Category", "2025", "2026", "Total", "Avg",
+        ]
+        assert rows["Groceries"][1:] == ["0.00", "1700.00", "1700.00", "850.00"]
+
+    def test_no_group_by_unchanged(self, tmp_path: Path):
+        """Regression guard: omitting group_by keeps the single-period
+        dict shape."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        result = gc.spending_by_category(
+            compact=False,
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+        )
+        assert "categories" in result and "total" in result
+        assert Decimal(result["total"]) == Decimal("3850")
+
+    def test_invalid_group_by(self, tmp_path: Path):
+        """Unknown granularity → clear ValueError."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        with pytest.raises(ValueError, match="Invalid group_by"):
+            gc.spending_by_category(
+                start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+                group_by="week",
+            )
+
+    def test_negative_month_positive_overall_shown(self, tmp_path: Path):
+        """Travel is −200 in April but +900 overall → shown, with the
+        negative month displayed as-is."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Travel"] == [
+            "Travel", "1000.00", "-200.00", "100.00", "900.00", "300.00",
+        ]
+
+    def test_net_negative_overall_omitted_but_netted(self, tmp_path: Path):
+        """Shopping (−200 overall) drops from the rows but its values
+        still land in the column totals."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert "Shopping" not in rows
+        # TOTAL nets Shopping in: Mar 2100, Apr 800, May 950, grand 3850.
+        assert rows["TOTAL"] == [
+            "TOTAL", "2100.00", "800.00", "950.00", "3850.00", "1283.33",
+        ]
+        assert "net-negative netted into TOTAL" in tsv
+
+    def test_depth_groups_children(self, tmp_path: Path):
+        """depth collapses children under their parent just like
+        single-period mode."""
+        bp = tmp_path / "depth.gnucash"
+        book = piecash.create_book(str(bp), currency="USD", overwrite=True)
+        usd = book.default_currency
+        root = book.root_account
+        assets = piecash.Account(name="Assets", type="ASSET", parent=root,
+                                 commodity=usd, placeholder=True)
+        checking = piecash.Account(name="Checking", type="BANK",
+                                   parent=assets, commodity=usd)
+        exp = piecash.Account(name="Expenses", type="EXPENSE", parent=root,
+                              commodity=usd, placeholder=True)
+        food = piecash.Account(name="Food", type="EXPENSE", parent=exp,
+                               commodity=usd, placeholder=True)
+        groceries = piecash.Account(name="Groceries", type="EXPENSE",
+                                    parent=food, commodity=usd)
+        dining = piecash.Account(name="Dining", type="EXPENSE",
+                                 parent=food, commodity=usd)
+        book.save()
+        for acct, amt in ((groceries, "300"), (dining, "200")):
+            book.session.add(piecash.Transaction(
+                currency=usd, description="x", post_date=date(2026, 3, 5),
+                splits=[piecash.Split(account=acct, value=Decimal(amt)),
+                        piecash.Split(account=checking,
+                                      value=Decimal(amt) * -1)]))
+        book.save()
+        gc = GnuCashBook(str(bp))
+        depth1 = self._parse(gc.spending_by_category(
+            start_date=date(2026, 3, 1), end_date=date(2026, 3, 31),
+            group_by="month", depth=1))
+        # depth 1 → one "Food" row at 500.
+        assert "Food" in depth1 and depth1["Food"][1] == "500.00"
+        assert "Groceries" not in depth1
+        depth2 = self._parse(gc.spending_by_category(
+            start_date=date(2026, 3, 1), end_date=date(2026, 3, 31),
+            group_by="month", depth=2))
+        # depth 2 → split into the two leaves (the shared "Expenses:"
+        # prefix is stripped, leaving "Food:Groceries" / "Food:Dining").
+        assert "Food:Groceries" in depth2 and "Food:Dining" in depth2
+        assert "Food" not in depth2
+
+    def test_income_by_source_same_shape(self, tmp_path: Path):
+        """income_by_source mirrors spending: Source label, per-period
+        columns, sign flipped to positive income."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.income_by_source(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Source"] == [
+            "Source", "2026-03", "2026-04", "2026-05", "Total", "Avg",
+        ]
+        assert rows["Salary"] == [
+            "Salary", "4000.00", "4000.00", "4000.00", "12000.00", "4000.00",
+        ]
+        assert rows["Consulting"][2] == "1000.00"  # April only
+        assert rows["TOTAL"] == [
+            "TOTAL", "4000.00", "5000.00", "4000.00", "13000.00", "4333.33",
+        ]
+
+
+class TestGroupByCashFlow:
+    """group_by sub-period columns for cash_flow (Inflows/Outflows/Net)."""
+
+    def test_month_trend(self, tmp_path: Path):
+        """3-month range → Inflows / Outflows / Net rows, one column
+        per month plus Total and Avg."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        tsv = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = TestGroupByBreakdown._parse(tsv)
+        assert rows["Cash flow"] == [
+            "Cash flow", "2026-03", "2026-04", "2026-05", "Total", "Avg",
+        ]
+        # Inflows: salary 4000/mo, + April consulting 1000 + April
+        # refunds (travel 200 + shopping 300).
+        assert rows["Inflows"] == [
+            "Inflows", "4000.00", "5500.00", "4000.00", "13500.00", "4500.00",
+        ]
+        assert rows["Outflows"] == [
+            "Outflows", "2100.00", "1300.00", "950.00", "4350.00", "1450.00",
+        ]
+        # Net is the build-vs-burn signal — every month positive here.
+        assert rows["Net"] == [
+            "Net", "1900.00", "4200.00", "3050.00", "9150.00", "3050.00",
+        ]
+        # The account-scope title line leads the table.
+        assert tsv.splitlines()[0] == "All cash/bank accounts"
+
+    def test_grouped_totals_match_single_period(self, tmp_path: Path):
+        """The grouped column totals reconcile with the single-period
+        cash_flow over the same range."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        single = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+        )
+        rows = TestGroupByBreakdown._parse(gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            group_by="month",
+        ))
+        assert rows["Inflows"][-2] == f"{Decimal(single['inflows']):.2f}"
+        assert rows["Outflows"][-2] == f"{Decimal(single['outflows']):.2f}"
+
+    def test_quarter_columns(self, tmp_path: Path):
+        """6-month range → 2 quarter columns."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        rows = TestGroupByBreakdown._parse(gc.cash_flow(
+            start_date=date(2026, 1, 1), end_date=date(2026, 6, 30),
+            group_by="quarter",
+        ))
+        assert rows["Cash flow"] == [
+            "Cash flow", "2026-Q1", "2026-Q2", "Total", "Avg",
+        ]
+
+    def test_account_filter_with_group_by(self, tmp_path: Path):
+        """An explicit account scopes the trend and names it in the
+        title line."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        tsv = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+            account="Assets:Checking", group_by="month",
+        )
+        assert tsv.splitlines()[0] == "Assets:Checking"
+
+    def test_invalid_group_by(self, tmp_path: Path):
+        """Unknown granularity → clear ValueError."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        with pytest.raises(ValueError, match="Invalid group_by"):
+            gc.cash_flow(
+                start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+                group_by="fortnight",
+            )
+
+    def test_no_group_by_unchanged(self, tmp_path: Path):
+        """Regression guard: omitting group_by keeps the single-period
+        dict shape."""
+        gc = GnuCashBook(str(TestGroupByBreakdown._book(tmp_path)))
+        result = gc.cash_flow(
+            start_date=date(2026, 3, 1), end_date=date(2026, 5, 31),
+        )
+        assert "inflows" in result and "outflows" in result
+        assert result["account"] == "All cash/bank accounts"
+
+
 class TestBalanceSheet:
     """Tests for balance_sheet method."""
 

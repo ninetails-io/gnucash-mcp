@@ -26,7 +26,13 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import (
+    _GROUP_BY_VALUES,
+    _enumerate_periods,
+    _format_grouped_tsv,
+    _paginate,
+    _period_label,
+)
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -7050,12 +7056,121 @@ class BusinessMixin:
                 "invoices": invoice_rows,
             }
 
+    def _bill_billed_total(self, book, bill) -> Decimal:
+        """Total billed on a bill, in the bill's own currency.
+
+        Mirrors the single-period path: the invoice-entries grand
+        total, falling back to the post-lot balance when entries are
+        empty or corrupted (substituting 0 would understate the
+        vendor's total by the whole bill).
+        """
+        try:
+            return self._get_invoice_entries_and_total(
+                book, bill,
+            )["grand_total"]
+        except ValueError:
+            post_acct = book.session.query(
+                piecash.Account
+            ).filter_by(guid=bill.post_acc_guid).first()
+            if post_acct:
+                for lot in post_acct.lots:
+                    if lot.guid == bill.post_lot_guid:
+                        return abs(self._calculate_lot_balance(lot))
+            return Decimal(0)
+
+    def _grouped_vendor_spending(
+        self,
+        book,
+        *,
+        bills,
+        start_date: date,
+        end_date: date,
+        group_by: str,
+        default_currency,
+    ) -> str:
+        """Bucket total-billed per vendor into sub-period columns.
+
+        Each bill lands in its ``date_posted`` sub-period and converts
+        at that period's close — never today's rates. Bills with no FX
+        rate on file are excluded from the converted totals and
+        surfaced in a trailing warning, exactly as the single-period
+        report handles them.
+        """
+        periods = _enumerate_periods(start_date, end_date, group_by)
+        period_labels = [pl for pl, _ in periods]
+        rates_by_period = {
+            pl: self._rates_as_of(book, anchor) for pl, anchor in periods
+        }
+        quantum = _commodity_quantum(default_currency)
+
+        totals: dict[str, dict[str, Decimal]] = {}
+        unconverted: dict[str, dict] = {}
+        for bill in bills:
+            posted = _safe_invoice_date(bill, "date_posted")
+            if posted is None:
+                continue
+            plabel = _period_label(posted.date(), group_by)
+            total = self._bill_billed_total(book, bill)
+
+            if bill.currency != default_currency:
+                rate = rates_by_period[plabel].get(bill.currency.guid)
+                if rate is None:
+                    u = unconverted.setdefault(
+                        bill.currency.mnemonic,
+                        {"total_billed": Decimal(0), "bill_count": 0},
+                    )
+                    u["total_billed"] += total
+                    u["bill_count"] += 1
+                    continue
+                total = (total * rate).quantize(quantum)
+
+            v = self._find_vendor_by_guid(book, bill.owner_guid)
+            v_name = v.name if v else "Unknown"
+            bucket = totals.setdefault(v_name, {})
+            bucket[plabel] = bucket.get(plabel, Decimal(0)) + total
+
+        row_totals = {
+            name: sum(per.values(), Decimal(0))
+            for name, per in totals.items()
+        }
+        # Billed totals are non-negative, so there is no net-negative
+        # exclusion here (unlike the category breakdowns).
+        displayed_names = sorted(
+            row_totals, key=lambda n: row_totals[n], reverse=True,
+        )
+        period_totals = {pl: Decimal(0) for pl in period_labels}
+        for per in totals.values():
+            for pl, v in per.items():
+                period_totals[pl] += v
+        grand_total = sum(row_totals.values(), Decimal(0))
+
+        out = _format_grouped_tsv(
+            period_labels=period_labels,
+            displayed_names=displayed_names,
+            totals=totals,
+            row_totals=row_totals,
+            period_totals=period_totals,
+            grand_total=grand_total,
+            excluded=[],
+            label="Vendor",
+        )
+        if unconverted:
+            mnem = default_currency.mnemonic
+            for ccy, d in unconverted.items():
+                out += (
+                    f"\n⚠ {d['bill_count']} bill(s) in {ccy} excluded from "
+                    f"{mnem} totals — no exchange rate on file "
+                    f"(raw {ccy}: billed {d['total_billed']})"
+                )
+        return out
+
     def vendor_spending_report(
         self,
         start_date: str,
         end_date: str,
         vendor_id: str | None = None,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get spending breakdown by vendor for a period.
 
@@ -7068,8 +7183,20 @@ class BusinessMixin:
             vendor_id: Optional filter to one vendor.
             compact: Aligned text table with TOTAL row (default),
                 or the structured dict.
+            group_by: ``None`` (default) for the single-period
+                billed/paid/outstanding view; ``"month"`` /
+                ``"quarter"`` / ``"year"`` to split the range into
+                sub-period columns of **total billed** per vendor and
+                return a multi-period TSV table — surfaces per-vendor
+                spend trends (a spike at one vendor in one month).
         """
         from piecash.business.invoice import Invoice
+
+        if group_by is not None and group_by not in _GROUP_BY_VALUES:
+            raise ValueError(
+                f"Invalid group_by '{group_by}'. Must be one of: "
+                f"{', '.join(_GROUP_BY_VALUES)}."
+            )
 
         parsed_start = date.fromisoformat(start_date)
         parsed_end = date.fromisoformat(end_date)
@@ -7111,6 +7238,16 @@ class BusinessMixin:
                 if parsed_start <= posted.date() <= parsed_end:
                     filtered_bills.append(b)
             bills = filtered_bills
+
+            if group_by is not None:
+                return self._grouped_vendor_spending(
+                    book,
+                    bills=bills,
+                    start_date=parsed_start,
+                    end_date=parsed_end,
+                    group_by=group_by,
+                    default_currency=default_currency,
+                )
 
             vendor_data: dict[str, dict] = {}
             # Bills with no rate on file are EXCLUDED from
