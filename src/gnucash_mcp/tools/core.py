@@ -76,7 +76,21 @@ def register(mcp, get_book) -> None:
         in a single text response. Use this first to orient yourself.
         """
         book = get_book()
-        return book.get_book_summary()
+        summary = book.get_book_summary()
+        # Multi-book sessions: name the current book up front so the
+        # client knows which book these numbers belong to. The book
+        # layer stays ignorant of server session state, so the marker
+        # is added here, not in get_book_summary itself.
+        from gnucash_mcp import server as _server
+        if _server.multi_book_active():
+            from gnucash_mcp._format import _book_display_name
+            name = _book_display_name(book.book_path)
+            count = len(_server._book_paths)
+            summary = (
+                f"Current book: {name} ({count} books available — "
+                f"switch_book to change)\n{summary}"
+            )
+        return summary
 
     @mcp.tool()
     @safe_tool
