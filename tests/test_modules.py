@@ -1078,14 +1078,44 @@ class TestMultiBook:
         import gnucash_mcp.server as srv
         self._select(srv, two_books)
         msg = srv._switch_book_impl("beast")
-        assert msg == "Switched to: beast-man.gnucash"
+        assert "Switched to: beast-man.gnucash" in msg
         assert srv._current_path.name == "beast-man.gnucash"
         assert srv.get_book().book_path.name == "beast-man.gnucash"
 
     def test_switch_is_case_insensitive(self, two_books):
         import gnucash_mcp.server as srv
         self._select(srv, two_books)
-        assert srv._switch_book_impl("BEAST").endswith("beast-man.gnucash")
+        assert "beast-man.gnucash" in srv._switch_book_impl("BEAST")
+
+    def test_switch_emits_context_reset_banner(self, two_books):
+        """The response must loudly invalidate the previous book's refs
+        (naming it) and reorient with a one-line snapshot — the
+        bookkeeper-flagged guard against silent cross-book collisions."""
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)  # current = alex
+        msg = srv._switch_book_impl("beast")
+        assert "CONTEXT RESET" in msg
+        assert "alex.gnucash" in msg          # names the PREVIOUS book
+        assert "invalid" in msg.lower()
+        assert "Switched to: beast-man.gnucash" in msg
+        assert "base currency" in msg          # orientation snapshot
+
+    def test_switch_noop_skips_reset_banner(self, two_books):
+        """Switching to the already-current book is a no-op — it must
+        NOT claim a context reset."""
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)  # current = alex
+        msg = srv._switch_book_impl("alex")
+        assert msg.startswith("Already on: alex.gnucash")
+        assert "CONTEXT RESET" not in msg
+
+    def test_orientation_reports_currency_and_count(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        snap = srv._book_orientation(srv._book_for(alex.resolve()))
+        # _make_min_book seeds one transaction in a USD book.
+        assert "1 transaction" in snap
+        assert "USD base currency" in snap
 
     def test_switch_no_match_lists_available(self, two_books):
         import gnucash_mcp.server as srv

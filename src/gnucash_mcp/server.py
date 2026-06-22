@@ -721,6 +721,42 @@ def _activate_logging(path: Path) -> None:
         )
 
 
+def _book_orientation(book_instance) -> str:
+    """One-line snapshot of a book for post-switch reorientation:
+    ``N transactions | N customers | N vendors | N employees | CUR
+    base currency``.
+
+    Transactions exclude scheduled-transaction template recipes (the
+    same filter get_book_summary uses, so the counts agree). Business
+    counts are omitted when zero so personal books stay uncluttered.
+    Best-effort — a locked or unreadable book yields a soft fallback
+    rather than failing the switch.
+    """
+    try:
+        with book_instance.open(readonly=True) as book:
+            template_guids = book_instance._template_account_guids(book)
+            txns = sum(
+                1 for t in book.transactions
+                if not book_instance._is_template_transaction(
+                    t, template_guids
+                )
+            )
+            parts = [f"{txns:,} transaction{'s' if txns != 1 else ''}"]
+            for label, coll in (
+                ("customer", book.customers),
+                ("vendor", book.vendors),
+                ("employee", book.employees),
+            ):
+                n = len(coll)
+                if n:
+                    parts.append(f"{n} {label}{'s' if n != 1 else ''}")
+            cur = book.default_currency
+            parts.append(f"{cur.mnemonic if cur else '?'} base currency")
+            return " | ".join(parts)
+    except Exception:
+        return "(book ready; orientation snapshot unavailable)"
+
+
 def _switch_book_impl(name: str) -> str:
     """Make the book whose filename uniquely prefix-matches ``name``
     the current book. See the switch_book tool docstring.
@@ -748,12 +784,35 @@ def _switch_book_impl(name: str) -> str:
         )
 
     target = matches[0]
+    previous = _current_path
+
+    # No-op switch — already on this book. Don't emit the reset
+    # banner (nothing changed); just reaffirm and reorient.
+    if previous is not None and target == previous:
+        return (
+            f"Already on: {target.name}\n"
+            f"{_book_orientation(_book_for(target))}"
+        )
+
     _current_path = target
     _book = _book_for(target)
     _activate_logging(target)  # logs follow the active book
     _server_state["book_path"] = str(target)
     _server_state["current_book"] = target.name
-    return f"Switched to: {target.name}"
+
+    # Loud context-reset banner: the LLM may be carrying account
+    # names, GUIDs, and entity refs from the previous book — all
+    # invalid here, and a stale GUID prefix could even mis-resolve to
+    # a DIFFERENT entity in this book. Naming the previous book makes
+    # the boundary explicit. Snapshot reorients in one line.
+    prev_name = previous.name if previous else "the previous book"
+    return (
+        f"⚠ CONTEXT RESET: All account names, GUIDs, and entity "
+        f"references from the previous book ({prev_name}) are now "
+        f"invalid. Do not reuse them.\n\n"
+        f"Switched to: {target.name}\n"
+        f"{_book_orientation(_book)}"
+    )
 
 
 # Initialize logging at module import time
