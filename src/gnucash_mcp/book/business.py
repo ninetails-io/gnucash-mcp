@@ -7074,7 +7074,7 @@ class BusinessMixin:
             }
 
     def _posting_split_in_default(
-        self, split, default_currency, rates,
+        self, book, split, default_currency,
     ) -> tuple[Decimal, bool]:
         """Value one posting/payment split in the book's default
         currency, trusting the ledger.
@@ -7083,27 +7083,34 @@ class BusinessMixin:
         ``value`` in its transaction's currency. Whichever of those
         is the book default IS the base-currency amount — the rate
         was applied when the row was written, so re-deriving it from
-        face value at a later period's rate is wrong (it drifts with
-        the rate). Only a split whose account AND transaction are
-        both non-default needs a live conversion; then ``value`` is
-        converted at the supplied rate, flagging when none is on file.
+        face value is unnecessary and re-deriving it at a *report-time*
+        rate is wrong (it drifts with the rate). Only a split whose
+        account AND transaction are both non-default has no stored
+        base-currency amount; there a live conversion is required, and
+        it uses the rate AS OF THE POSTING DATE (what was booked), not
+        a report-period rate.
 
         Returns ``(amount, converted_ok)``; ``converted_ok`` is False
-        only when a rate was required and missing.
+        only when a rate was required and none is on file.
         """
         if split.account.commodity == default_currency:
             return Decimal(str(split.quantity)), True
         txn_currency = split.transaction.currency
         if txn_currency == default_currency:
             return Decimal(str(split.value)), True
-        rate = rates.get(txn_currency.guid)
+        # Both-foreign: no base-currency amount is stored. Convert the
+        # transaction-currency value at the posting-date rate.
+        rate = self._cross_rate(
+            book, txn_currency, default_currency,
+            as_of=split.transaction.post_date,
+        )
         if rate is None:
             return Decimal(str(split.value)), False
         quantum = _commodity_quantum(default_currency)
         return (Decimal(str(split.value)) * rate).quantize(quantum), True
 
     def _bill_amounts_in_default(
-        self, book, bill, default_currency, rates,
+        self, book, bill, default_currency,
     ) -> tuple[Decimal, Decimal, Decimal, str | None]:
         """Billed / paid / outstanding for one bill, in the book's
         default currency, read from the posting ledger.
@@ -7137,7 +7144,7 @@ class BusinessMixin:
                 if s.account.guid == bill.post_acc_guid:
                     continue
                 amt, ok = self._posting_split_in_default(
-                    s, default_currency, rates,
+                    book, s, default_currency,
                 )
                 converted_ok = converted_ok and ok
                 billed += amt
@@ -7156,7 +7163,7 @@ class BusinessMixin:
                     if s.reconcile_state == "v":
                         continue
                     amt, ok = self._posting_split_in_default(
-                        s, default_currency, rates,
+                        book, s, default_currency,
                     )
                     converted_ok = converted_ok and ok
                     outstanding += amt
@@ -7188,9 +7195,6 @@ class BusinessMixin:
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
-        rates_by_period = {
-            pl: self._rates_as_of(book, anchor) for pl, anchor in periods
-        }
 
         totals: dict[str, dict[str, Decimal]] = {}
         unconverted: dict[str, dict] = {}
@@ -7200,7 +7204,7 @@ class BusinessMixin:
                 continue
             plabel = _period_label(posted.date(), group_by)
             total, _paid, _out, unconv = self._bill_amounts_in_default(
-                book, bill, default_currency, rates_by_period[plabel],
+                book, bill, default_currency,
             )
 
             if unconv is not None:
@@ -7295,10 +7299,6 @@ class BusinessMixin:
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            # Rates as of period end — historical periods must not
-            # be valued at today's rates.
-            latest_rates = self._rates_as_of(book, parsed_end)
-
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
                 Invoice.date_posted.isnot(None),
@@ -7367,7 +7367,7 @@ class BusinessMixin:
                 # rate-at-posting amount, never today's drifted rate.
                 total, paid, outstanding, unconv = (
                     self._bill_amounts_in_default(
-                        book, bill, default_currency, latest_rates,
+                        book, bill, default_currency,
                     )
                 )
 
