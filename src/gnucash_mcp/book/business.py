@@ -367,6 +367,8 @@ class BusinessMixin:
                 INCOME/EXPENSE; or no ``Income`` parent to create
                 under.
         """
+        default_currency = self._require_default_currency(book)
+
         # Layer 1: caller-supplied account wins.
         if fx_account is not None:
             acct = self._resolve_account(book, fx_account)
@@ -382,15 +384,31 @@ class BusinessMixin:
                     f"{acct.type}; must be INCOME or EXPENSE to "
                     f"receive realized FX gain/loss."
                 )
+            # Realized FX gain/loss is a reporting-currency figure;
+            # the gain is booked as a default-currency quantity. A
+            # non-default-commodity FX account would record it in the
+            # wrong commodity (a $42 gain becoming €42). Reject rather
+            # than silently corrupt.
+            if acct.commodity != default_currency:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is denominated in "
+                    f"{acct.commodity.mnemonic}; the realized FX "
+                    f"gain/loss account must be in the book default "
+                    f"currency ({default_currency.mnemonic})."
+                )
             return acct, None
 
-        # Layer 2: fuzzy match by leaf-name substring.
+        # Layer 2: fuzzy match by leaf-name substring. Only
+        # default-currency candidates qualify — see the commodity
+        # rationale on the explicit-account path above.
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
             if account.guid in template_guids:
                 continue
             if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            if account.commodity != default_currency:
                 continue
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
@@ -427,7 +445,6 @@ class BusinessMixin:
                 "Income (type=INCOME, placeholder) first."
             )
 
-        default_currency = self._require_default_currency(book)
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
         # the payment transaction, and orphan Split objects already in
