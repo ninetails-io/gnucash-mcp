@@ -578,7 +578,7 @@ class InvestmentsMixin:
             raise
         return book.session.query(Lot).filter_by(guid=full_guid).first()
 
-    def _lot_decimals(self, lot) -> dict:
+    def _lot_decimals(self, lot, book, default_ccy) -> dict:
         """Raw-Decimal source of truth for a lot's current state.
 
         Keeps full precision; ``_lot_summary`` formats the egress.
@@ -587,6 +587,15 @@ class InvestmentsMixin:
         computation. The classic precision-loss path: $100 / 3 shares
         formatted to 4 decimals as 33.3333, multiplied back by 3
         shares becomes $99.99 — but the actual cost was $100.
+
+        ``purchase_value`` (and the ``cost_per_share`` /
+        ``remaining_cost_basis`` derived from it) is in the book
+        DEFAULT currency. ``split.value`` is in the purchase
+        transaction's currency; a foreign-denominated buy is converted
+        at its posting-date rate (matching ``calculate_lot_gain``), so
+        a CNY-book holding bought in USD doesn't surface a bare USD
+        number that reads as CNY. Missing rate degrades to the raw
+        value.
 
         Returns:
             Dict of Decimals: purchase_quantity, purchase_value,
@@ -605,7 +614,16 @@ class InvestmentsMixin:
                 continue
             if split.quantity > 0:
                 purchase_quantity += Decimal(str(split.quantity))
-                purchase_value += Decimal(str(split.value))
+                value = Decimal(str(split.value))
+                txn_ccy = split.transaction.currency
+                if txn_ccy != default_ccy:
+                    rate = self._cross_rate(
+                        book, txn_ccy, default_ccy,
+                        as_of=split.transaction.post_date,
+                    )
+                    if rate is not None:
+                        value = value * rate
+                purchase_value += value
             else:
                 sale_quantity += abs(Decimal(str(split.quantity)))
 
@@ -634,7 +652,7 @@ class InvestmentsMixin:
             "remaining_cost_basis": remaining_cost_basis,
         }
 
-    def _lot_summary(self, lot) -> dict:
+    def _lot_summary(self, lot, book, default_ccy) -> dict:
         """Compute current state of a lot from its splits.
 
         Returns:
@@ -649,7 +667,7 @@ class InvestmentsMixin:
         as either the purchase cost or what's left of it. The
         ``cost_basis`` key keeps existing callers working.
         """
-        raw = self._lot_decimals(lot)
+        raw = self._lot_decimals(lot, book, default_ccy)
         remaining_cb = _format_number(
             raw["remaining_cost_basis"], decimals=2,
         )
@@ -756,11 +774,12 @@ class InvestmentsMixin:
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
+            default_ccy = self._require_default_currency(book)
             results = []
             for lot in acct.lots:
                 if not include_closed and lot.is_closed:
                     continue
-                summary = self._lot_summary(lot)
+                summary = self._lot_summary(lot, book, default_ccy)
                 # The open-positions view also skips zero-position
                 # lots (voided buys, never-assigned, round-tripped
                 # to zero) — noise rows in a holdings listing.
@@ -845,7 +864,8 @@ class InvestmentsMixin:
                     row["voided"] = True
                 splits.append(row)
 
-            summary = self._lot_summary(lot)
+            default_ccy = self._require_default_currency(book)
+            summary = self._lot_summary(lot, book, default_ccy)
             # ``is_closed`` already lives at the top level
             # of this response. Drop it from the nested ``summary``
             # so callers see the field once, not twice.
@@ -917,7 +937,8 @@ class InvestmentsMixin:
             split.lot = lot
             book.save()
 
-            summary = self._lot_summary(lot)
+            default_ccy = self._require_default_currency(book)
+            summary = self._lot_summary(lot, book, default_ccy)
 
             # Auto-close if quantity reaches zero; GnuCash uses -1 for boolean true
             auto_closed = False
@@ -964,7 +985,8 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
 
-            raw = self._lot_decimals(lot)
+            default_ccy = self._require_default_currency(book)
+            raw = self._lot_decimals(lot, book, default_ccy)
             remaining = raw["remaining"]
 
             if remaining <= 0:
@@ -993,8 +1015,6 @@ class InvestmentsMixin:
             else:
                 shares_to_sell = remaining
 
-            default_ccy = self._require_default_currency(book)
-
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
@@ -1014,25 +1034,10 @@ class InvestmentsMixin:
                     )
                 price = Decimal(str(recent[0].value))
 
-            # Cost basis must match the proceeds' currency.
-            # split.value is in TRANSACTION currency — a foreign-
-            # denominated buy converts at its historical purchase
-            # date or the tax-relevant gain is off by the full FX
-            # factor. Missing rate degrades to the raw value.
-            purchase_value_default = Decimal("0")
-            for split in lot.splits:
-                if _is_voided(split) or split.quantity <= 0:
-                    continue
-                value = Decimal(str(split.value))
-                txn_ccy = split.transaction.currency
-                if txn_ccy != default_ccy:
-                    rate = self._cross_rate(
-                        book, txn_ccy, default_ccy,
-                        as_of=split.transaction.post_date,
-                    )
-                    if rate is not None:
-                        value = value * rate
-                purchase_value_default += value
+            # Cost basis in the book default (proceeds' currency).
+            # _lot_decimals already converts each purchase split at its
+            # posting-date rate — same treatment, one chokepoint.
+            purchase_value_default = raw["purchase_value"]
 
             # Prorate on shares-to-sell, never cost_per_share ×
             # shares — divide-then-multiply loses precision ($100/3
