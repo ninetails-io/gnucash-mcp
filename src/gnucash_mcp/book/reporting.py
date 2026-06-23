@@ -1266,11 +1266,14 @@ class ReportingMixin:
             raise ValueError("additional_purchase must be a positive number")
 
         with self.open(readonly=True) as book:
-            default_currency_mnemonic = (
-                self._require_default_currency(book).mnemonic
-            )
+            default_currency = self._require_default_currency(book)
+            default_currency_mnemonic = default_currency.mnemonic
             debt_types = {"CREDIT", "LIABILITY"}
             debts = []
+            # Foreign-currency debts with no FX rate on file can't be
+            # valued in the book default; collected here and excluded
+            # from the schedule (see the loop guard below).
+            excluded_debts: list[str] = []
             # Counted so the no-debts error distinguishes "no debt
             # accounts at all" from "they exist but lack the apr
             # slot" — the user's next action differs.
@@ -1293,6 +1296,19 @@ class ReportingMixin:
                 if account.type not in debt_types:
                     continue
                 debt_typed_account_count += 1
+
+                # A foreign-currency debt with no FX rate on file can't
+                # be valued in the book default: its balance would fall
+                # back to raw transaction-currency value while its
+                # min_payment / credit_limit slots stay in account-
+                # commodity units — mixing units in the payoff math.
+                # Exclude it honestly rather than emit a skewed schedule.
+                if (
+                    account.commodity != default_currency
+                    and debt_factors.get(account.guid) is None
+                ):
+                    excluded_debts.append(account.fullname)
+                    continue
 
                 # Materialize slots once — three account[key]
                 # accesses each re-walk the slots collection.
@@ -1409,7 +1425,37 @@ class ReportingMixin:
                     "credit_limit": credit_limit,
                 })
 
+        # Warning shared by the all-excluded error and the normal-path
+        # output, so the reader always learns what was left out.
+        excluded_warning = None
+        if excluded_debts:
+            excluded_warning = (
+                f"{len(excluded_debts)} debt(s) excluded — no FX rate on "
+                f"file to value in {default_currency_mnemonic}: "
+                f"{', '.join(sorted(excluded_debts))}"
+            )
+
         if not debts:
+            # Nothing left to plan but some debts were excluded for lack
+            # of an FX rate — lead with that actionable cause (distinct
+            # from "no debts at all" or "no APR set").
+            if excluded_debts:
+                msg = (
+                    f"No debts could be valued for the payoff plan. "
+                    f"{len(excluded_debts)} debt(s) are in a non-default "
+                    f"currency with no FX rate on file to value in "
+                    f"{default_currency_mnemonic}: "
+                    f"{', '.join(sorted(excluded_debts))}. Add a market "
+                    f"price (create_price) for each currency"
+                )
+                if debt_typed_account_count > len(excluded_debts):
+                    msg += (
+                        ", and set an 'apr' slot on the remaining debt "
+                        "account(s)."
+                    )
+                else:
+                    msg += " and retry."
+                raise ValueError(msg)
             if debt_typed_account_count == 0:
                 raise ValueError(
                     "No CREDIT or LIABILITY accounts found in the "
@@ -1496,11 +1542,14 @@ class ReportingMixin:
                 ),
             },
         }
+        if excluded_warning:
+            full["excluded"] = sorted(excluded_debts)
+            full["warnings"] = [excluded_warning]
 
         if not compact:
             return full
 
-        return _format_debt_payoff_compact(
+        compact_out = _format_debt_payoff_compact(
             results=results,
             orig_balances=orig_balances,
             total_balance=total_balance,
@@ -1513,3 +1562,6 @@ class ReportingMixin:
             true_cost=true_cost,
             currency=default_currency_mnemonic,
         )
+        if excluded_warning:
+            compact_out += f"\n⚠ {excluded_warning}"
+        return compact_out
