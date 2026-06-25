@@ -2972,6 +2972,13 @@ class CoreMixin:
             warnings = self._generate_warnings(
                 trans_date, splits, resolved_accounts
             )
+            # Cross-commodity implied-rate sanity (decimal slips,
+            # inverted pairs) — non-blocking, caught at entry.
+            warnings.extend(
+                self._fx_sanity_warnings(
+                    book, validated, trans_currency, trans_date,
+                )
+            )
             proposed_pattern = self._extract_account_pattern(resolved_accounts)
             # Recent matches were gathered pre-write, so the new txn
             # is automatically absent.
@@ -3128,6 +3135,16 @@ class CoreMixin:
                 else:
                     accepted.append((p, len(dups)))
 
+            # Cross-commodity implied-rate sanity per accepted row
+            # (non-blocking) — surfaced as a side table keyed by ref,
+            # so a decimal slip in a bulk import is caught too.
+            warn_rows: list = []
+            for p, _dc in accepted:
+                for w in self._fx_sanity_warnings(
+                    book, p["validated"], default_currency, p["trans_date"],
+                ):
+                    warn_rows.append((p["ref"], w["message"]))
+
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
                 for p, dup_count in accepted:
@@ -3135,7 +3152,9 @@ class CoreMixin:
                         "ref": p["ref"], "status": "would_create",
                         "dup_count": dup_count,
                     }
-                return self._batch_envelope(transactions, by_ref, dup_rows)
+                return self._batch_envelope(
+                    transactions, by_ref, dup_rows, warn_rows,
+                )
 
             built = []
             for p, dup_count in accepted:
@@ -3167,19 +3186,34 @@ class CoreMixin:
                     "dup_count": dup_count,
                 }
 
-            return self._batch_envelope(transactions, by_ref, dup_rows)
+            return self._batch_envelope(
+                transactions, by_ref, dup_rows, warn_rows,
+            )
 
     def _batch_envelope(
         self, transactions: list[dict], by_ref: dict, dup_rows: list,
+        warn_rows: list | None = None,
     ) -> dict:
-        """Assemble the {results, duplicates} TSV envelope in input
-        order. Empty ``duplicates`` renders as "" so _strip_noise drops
-        it — absence of the key means no duplicates anywhere."""
+        """Assemble the {results, duplicates, warnings} TSV envelope in
+        input order. Empty ``duplicates`` / ``warnings`` render as "" so
+        _strip_noise drops them — absence of the key means none."""
         rows = [by_ref[t["ref"]] for t in transactions]
         return {
             "results": self._batch_results_to_tsv(rows),
             "duplicates": self._batch_duplicates_to_tsv(dup_rows),
+            "warnings": self._batch_warnings_to_tsv(warn_rows or []),
         }
+
+    @staticmethod
+    def _batch_warnings_to_tsv(warn_rows: list) -> str:
+        """WARNINGS table: ``ref<TAB>message`` per flagged row, FK to
+        results. Empty string when nothing was flagged."""
+        if not warn_rows:
+            return ""
+        lines = ["ref\tmessage"]
+        for ref, message in warn_rows:
+            lines.append(f"{ref}\t{message}")
+        return "\n".join(lines)
 
     @staticmethod
     def _batch_results_to_tsv(rows: list[dict]) -> str:
@@ -3956,6 +3990,8 @@ class CoreMixin:
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
+            fx_warnings: list[dict] = []
+
             # Update description if provided
             if description is not None:
                 transaction.description = description
@@ -3977,6 +4013,10 @@ class CoreMixin:
                 # (see _validate_transaction_splits).
                 validated = self._validate_transaction_splits(
                     book, splits, trans_currency,
+                )
+                fx_warnings = self._fx_sanity_warnings(
+                    book, validated, trans_currency,
+                    trans_date or transaction.post_date,
                 )
 
                 # Build a map keyed by resolved-account-fullname so we
@@ -4027,12 +4067,15 @@ class CoreMixin:
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
             )
-            return {
+            result = {
                 "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
                 "description": transaction.description,
                 "status": "updated",
             }
+            if fx_warnings:
+                result["warnings"] = fx_warnings
+            return result
 
     def replace_splits(
         self,
@@ -4147,6 +4190,7 @@ class CoreMixin:
 
             # 7. Create new splits
             trans_currency = transaction.currency
+            fx_check_splits: list[dict] = []
             for account, split_data in resolved_accounts:
                 amount = _to_decimal(split_data["amount"])
 
@@ -4169,6 +4213,9 @@ class CoreMixin:
                         f"transaction currency ({trans_currency.mnemonic})"
                     )
 
+                fx_check_splits.append({
+                    "account": account, "value": amount, "quantity": quantity,
+                })
                 piecash.Split(
                     account=account,
                     value=amount,
@@ -4176,6 +4223,15 @@ class CoreMixin:
                     memo=split_data.get("memo", ""),
                     transaction=transaction,
                 )
+
+            # Cross-commodity implied-rate sanity (non-blocking) — this
+            # path's warnings are plain strings, so emit messages.
+            warnings.extend(
+                w["message"] for w in self._fx_sanity_warnings(
+                    book, fx_check_splits, trans_currency,
+                    transaction.post_date,
+                )
+            )
 
             # 8. Save
             book.save()
