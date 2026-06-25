@@ -18,18 +18,14 @@ green, bookkeeper-validated on Alex + Lin Wei.
 - **S5** lot cost basis in book default currency
 - **S6** foreign debts with no FX rate excluded from debt_payoff_plan (warned)
 - budget targets: warn instead of silently folding un-converted foreign units
+- **`_market_value`** cost-basis fallback converts each purchase at its
+  posting-date rate (book threaded through the 6 core.py call sites) —
+  no more mixed-currency cost sums. (Initially mis-scoped as "too big";
+  it was 6 callers, all with book in scope.)
 - regression tests in `tests/test_multicurrency_audit.py`
 
 ## Tier 1 — Correctness (remaining)
 
-- **`_market_value` cost-basis fallback can mix currencies.** When a
-  foreign holding has NO market price AND its purchases were booked in
-  a non-default currency, the fallback sums `split.value` across
-  transaction currencies. Bounded to the no-rate path and already
-  carries a `"… — no price data"` note (not silent), so it was left as
-  documented-acceptable. A proper fix = per-split posting-date
-  conversion (same shape as S5), but it needs `book` threaded through
-  `_market_value`'s signature into all its callers. Low priority.
 - **S3 — `_monthly_net_income` re-prices history at today's rate**
   (`core.py`). Tagged **1.4.1** (display drift on a dashboard, not data
   corruption). Fix = per-month-end rate maps, like `_budget_headline`.
