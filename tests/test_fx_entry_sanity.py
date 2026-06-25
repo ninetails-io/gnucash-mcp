@@ -81,13 +81,21 @@ def test_create_transaction_quiet_on_in_band_rate(tmp_path):
     assert not _fx_warns(res)
 
 
-def test_no_warning_without_reference_price(tmp_path):
-    # Nothing to compare against -> silent (don't nag price-free books).
+def test_warns_when_no_reference_price(tmp_path):
+    # No quote at all = no safety net (a 100x slip would pass), so it
+    # warns with a distinct type rather than staying silent.
     gb = GnuCashBook(_usd_eur_book(tmp_path, with_price=False))
     res = gb.create_transaction(
-        description="slip", check_duplicates=False, splits=_SLIP,
+        description="cross-ccy, no price", check_duplicates=False,
+        splits=_SLIP,
     )
-    assert not _fx_warns(res)
+    no_ref = [
+        w for w in res.get("warnings", [])
+        if isinstance(w, dict) and w.get("type") == "fx_no_reference"
+    ]
+    assert no_ref and "no EUR/USD rate on file" in no_ref[0]["message"]
+    # Non-blocking: still created.
+    assert res["status"] == "created"
 
 
 def test_dry_run_surfaces_the_warning(tmp_path):

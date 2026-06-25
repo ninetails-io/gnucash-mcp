@@ -564,11 +564,15 @@ class CurrencyMixin:
         latest price on file — a decimal slip or inverted pair caught
         at entry, before it corrupts everything downstream.
 
-        Returns ``{"type": "fx_rate_sanity", "message": ...}`` dicts.
-        Never raises and never blocks: the user authored the rate, so
-        an unusual one may be a real off-market deal or a correction —
-        flag, don't refuse. Silent when no reference price exists
-        (nothing to compare against) so price-free books aren't nagged.
+        Returns warning dicts of two types — ``fx_rate_sanity`` (a
+        quote exists and the implied rate is grossly off it) and
+        ``fx_no_reference`` (no quote at all, so the rate can't be
+        checked). Never raises and never blocks: the user authored the
+        rate, so an unusual one may be a real off-market deal or a
+        correction — flag, don't refuse. The no-reference case is the
+        one with NO safety net (a 100x slip would pass unchecked), so it
+        earns a heads-up rather than silence, even though the entry
+        still saves (it may be the first transaction in that currency).
 
         ``validated_splits`` are the resolved dicts from
         :meth:`_validate_transaction_splits` (``account``, ``value``,
@@ -599,6 +603,18 @@ class CurrencyMixin:
                 respect_staleness_cap=False,
             )
             if aged is None:
+                # No quote at all — the worst case, since even a 100x
+                # slip would pass unchecked. Flag the absent guardrail.
+                out.append({
+                    "type": "fx_no_reference",
+                    "message": (
+                        f"Split for '{account.fullname}': no "
+                        f"{account.commodity.mnemonic}/"
+                        f"{trans_currency.mnemonic} rate on file — the "
+                        f"exchange rate can't be sanity-checked. Add one "
+                        f"with create_price to enable the guardrail."
+                    ),
+                })
                 continue
             reference, _age_days, price_date = aged
             if reference <= 0:
