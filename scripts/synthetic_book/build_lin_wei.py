@@ -313,6 +313,10 @@ def add_prices(out_path: Path) -> int:
        post & pay dates (FX). Laying a 0-day-old quote on each FX
        transaction date means post_invoice/pay_invoice find a *fresh*
        rate and never trip the StaleFXRateError freshness guard.
+    3. A closing point per commodity at its LAST AVAILABLE real quote
+       (capped at THROUGH), so a report at the present edge of the book
+       reflects the most recent real close rather than forward-filling
+       the 1st-of-month value to the end of the horizon.
     """
     book = piecash.open_book(str(out_path), readonly=False)
     count = 0
@@ -331,6 +335,12 @@ def add_prices(out_path: Path) -> int:
             wanted[sym].add(when)
         for sym, when in fx_price_dates():
             wanted[sym].add(when)
+        # Closing point: last available real quote per commodity, never past
+        # THROUGH. real_price() returns the actual most-recent close there.
+        for sym in FOREIGN_CURRENCIES:
+            wanted[sym].add(min(THROUGH, MD.latest_fx_date(sym, "CNY")))
+        for sym in SECURITY_MNEMONICS:
+            wanted[sym].add(min(THROUGH, MD.latest_security_date(sym)))
 
         for sym, dates in wanted.items():
             comm = comm_by_mnemonic[sym]

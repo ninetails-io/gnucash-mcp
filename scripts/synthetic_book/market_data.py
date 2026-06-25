@@ -160,6 +160,27 @@ class MarketData:
             )
         return _forward_fill(series, when, f"fx {key}")
 
+    def latest_security_date(self, mnemonic: str) -> date:
+        """Most recent date with a real quote for ``mnemonic`` in the cache."""
+        series = self._securities.get(mnemonic)
+        if not series:
+            raise KeyError(
+                f"Security {mnemonic!r} not in cache "
+                f"(have: {sorted(self._securities)})"
+            )
+        # ISO date strings sort lexicographically == chronologically.
+        return date.fromisoformat(max(series))
+
+    def latest_fx_date(self, foreign: str, base: str) -> date:
+        """Most recent date with a real quote for ``foreign/base`` in the cache."""
+        key = _fx_key(foreign, base)
+        series = self._fx.get(key)
+        if not series:
+            raise KeyError(
+                f"FX pair {key!r} not in cache (have: {sorted(self._fx)})"
+            )
+        return date.fromisoformat(max(series))
+
 
 # --- Refresh path (yfinance + frankfurter; network required) --------------
 

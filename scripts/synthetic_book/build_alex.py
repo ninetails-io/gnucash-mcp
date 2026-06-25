@@ -247,32 +247,52 @@ def create_book_file(out_path: Path) -> None:
 
 
 def add_prices(out_path: Path) -> int:
-    """Add monthly USD-base prices for securities + FX pairs (real data)."""
+    """Add USD-base prices for securities + FX pairs (real data).
+
+    Two layers: a 1st-of-month snapshot across the timeline, then a final
+    point per commodity at its LAST AVAILABLE real quote (capped at
+    THROUGH). The closing point means a report dated near the present
+    reflects the most recent real close instead of forward-filling the
+    1st-of-month value to the end of the horizon.
+    """
     book = piecash.open_book(str(out_path), readonly=False)
     count = 0
     try:
         usd = book.default_currency
         comm_by_mnemonic = {c.mnemonic: c for c in book.commodities}
+        seen: set[tuple[str, str]] = set()
+
+        def _add(mnemonic: str, pdate: date, value: Decimal) -> None:
+            nonlocal count
+            key = (mnemonic, pdate.isoformat())
+            if key in seen:  # piecash rejects duplicate commodity+date+currency
+                return
+            seen.add(key)
+            piecash.Price(
+                commodity=comm_by_mnemonic[mnemonic], currency=usd,
+                date=pdate, value=value, type="last", source="user:market_data",
+            )
+            count += 1
+
+        # Layer 1: 1st-of-month snapshots, real closes, forward-filled.
         for yr, mo in PRICE_MONTHS:
             pdate = date(yr, mo, 1)
-            # Securities: USD close, real, forward-filled.
             for sym, _full, _ns, _frac in SECURITIES:
-                comm = comm_by_mnemonic[sym]
-                value = MD.security(sym, pdate).quantize(_security_quant(sym))
-                piecash.Price(
-                    commodity=comm, currency=usd, date=pdate,
-                    value=value, type="last", source="user:market_data",
-                )
-                count += 1
-            # FX: USD per foreign unit, real, forward-filled.
+                _add(sym, pdate, MD.security(sym, pdate).quantize(_security_quant(sym)))
             for foreign in FOREIGN_CURRENCIES:
-                comm = comm_by_mnemonic[foreign]
-                value = MD.fx(foreign, "USD", pdate).quantize(D("0.0001"))
-                piecash.Price(
-                    commodity=comm, currency=usd, date=pdate,
-                    value=value, type="last", source="user:market_data",
-                )
-                count += 1
+                _add(foreign, pdate, MD.fx(foreign, "USD", pdate).quantize(D("0.0001")))
+
+        # Layer 2: closing point at the last available real quote per
+        # commodity (never past THROUGH). This is the price reports walk to
+        # at the present edge of the book — the actual most-recent close,
+        # not the 1st-of-month value carried over.
+        for sym, _full, _ns, _frac in SECURITIES:
+            asof = min(THROUGH, MD.latest_security_date(sym))
+            _add(sym, asof, MD.security(sym, asof).quantize(_security_quant(sym)))
+        for foreign in FOREIGN_CURRENCIES:
+            asof = min(THROUGH, MD.latest_fx_date(foreign, "USD"))
+            _add(foreign, asof, MD.fx(foreign, "USD", asof).quantize(D("0.0001")))
+
         book.save()
     finally:
         book.close()
