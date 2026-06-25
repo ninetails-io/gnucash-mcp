@@ -288,3 +288,40 @@ def test_debt_payoff_all_foreign_excluded_raises_clear_error(tmp_path):
     gb = _build_debt_book(tmp_path, with_usd_debt=False)
     with pytest.raises(ValueError, match="no FX rate on file"):
         gb.debt_payoff_plan(compact=False, monthly_budget="1000")
+
+
+# --------------------------------------------------------------------------
+# Budget no-rate fold — warn instead of folding foreign units silently
+# --------------------------------------------------------------------------
+
+def test_budget_report_warns_on_unconvertible_foreign_target(tmp_path):
+    """A budget target on a foreign account with no FX rate is still
+    counted (a caveated line beats a dropped one) but surfaces a warning
+    naming the currency, instead of folding raw foreign units silently."""
+    path = tmp_path / "budget.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    eur = factories.create_currency_from_ISO("EUR")
+    expenses = piecash.Account(
+        name="Expenses", type="EXPENSE", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    piecash.Account(
+        name="EU Travel", type="EXPENSE", commodity=eur, parent=expenses,
+    )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    gb.create_budget(name="2026", num_periods=12, period_type="monthly")
+    gb.set_budget_amount(
+        budget_name="2026", account="Expenses:EU Travel",
+        amount="500", period="all",
+    )
+    res = gb.get_budget_report(
+        budget_name="2026", period="all", compact=False,
+    )
+    assert res.get("warnings")
+    assert "EUR" in res["warnings"][0]
+    # The amount is still included (not dropped), just flagged.
+    assert Decimal(res["totals"]["budgeted"]) > 0
