@@ -24,6 +24,21 @@ green, bookkeeper-validated on Alex + Lin Wei.
   it was 6 callers, all with book in scope.)
 - regression tests in `tests/test_multicurrency_audit.py`
 
+## Tier 0b — DONE (branch `feat/fx-entry-sanity`)
+
+Preventive correctness — catch the bad rate at *entry* instead of
+valuing it correctly after the fact.
+
+- **Cross-commodity implied-rate sanity warning.** A user-supplied
+  cross-commodity split encodes its rate via `|value|/|quantity|`;
+  `_fx_sanity_warnings` flags (non-blocking) when that implied rate is
+  off the latest price on file by ≥ a configurable ratio (default 2×,
+  `GNUCASH_FX_SANITY_RATIO`). Catches decimal slips / inverted pairs —
+  the JetBrains-fossil class (implied 1.0 vs market 7.0). Wired into
+  `create_transaction`, `create_transactions` (per-row warnings side-
+  table), `update_transaction`, `replace_splits`. Warns, never blocks.
+- regression tests in `tests/test_fx_entry_sanity.py`
+
 ## Tier 1 — Correctness (remaining)
 
 - **S3 — `_monthly_net_income` re-prices history at today's rate**
