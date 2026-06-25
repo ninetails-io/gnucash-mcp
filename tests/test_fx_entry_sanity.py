@@ -7,7 +7,7 @@ file, catching decimal slips and inverted pairs at the source. The user
 authored the rate, so it warns rather than refuses.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 import piecash
 from piecash import factories
@@ -113,6 +113,39 @@ def test_batch_surfaces_slip_in_warnings_table(tmp_path):
     assert "r2" in table and "implied rate" in table
     # The in-band row isn't flagged.
     assert "\nr1\t" not in table
+
+
+def test_warning_fires_against_a_stale_reference_price(tmp_path):
+    """Regression for the bookkeeper find: the sanity anchor must ignore
+    the FX staleness cap — a months-old quote still catches a 10x slip.
+    (The post/pay path's 90-day cap does NOT apply to a sanity anchor.)
+    My original fixtures used same-day prices and missed this."""
+    path = tmp_path / "fxstale.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    eur = factories.create_currency_from_ISO("EUR")
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    piecash.Account(name="Checking", type="BANK", commodity=usd, parent=assets)
+    piecash.Account(
+        name="EUR Savings", type="BANK", commodity=eur, parent=assets,
+    )
+    # Reference price ~200 days old — well beyond the 90-day cap.
+    book.session.add(piecash.Price(
+        commodity=eur, currency=usd,
+        date=date.today() - timedelta(days=200), value="1.10", type="last",
+    ))
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    res = gb.create_transaction(
+        description="slip vs stale ref", check_duplicates=False, splits=_SLIP,
+    )
+    warns = _fx_warns(res)
+    assert warns and "10.0x" in warns[0]
 
 
 def test_replace_splits_flags_slip(tmp_path):

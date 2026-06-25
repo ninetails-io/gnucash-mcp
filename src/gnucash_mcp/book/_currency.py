@@ -588,10 +588,20 @@ class CurrencyMixin:
             # implied rate is trans_currency per unit of the account's
             # commodity — same orientation as the reference below.
             implied = value / quantity
-            reference = self._find_exchange_rate(
-                book, account.commodity, trans_currency, as_of=as_of,
+            # ANY prior quote is a valid sanity anchor — a 6-month-old
+            # rate still catches a 10x slip — so bypass the staleness
+            # cap that the post/pay path enforces (there a stale rate
+            # would be etched into a booked amount; here it only
+            # answers "is this grossly off?"). The aged variant also
+            # hands back the quote's date for the message.
+            aged = self._find_exchange_rate_aged(
+                book, account.commodity, trans_currency, as_of,
+                respect_staleness_cap=False,
             )
-            if reference is None or reference <= 0:
+            if aged is None:
+                continue
+            reference, _age_days, price_date = aged
+            if reference <= 0:
                 continue
             hi = max(implied, reference)
             lo = min(implied, reference)
@@ -601,10 +611,10 @@ class CurrencyMixin:
                     "message": (
                         f"Split for '{account.fullname}': implied rate "
                         f"{implied:.4f} {trans_currency.mnemonic}/"
-                        f"{account.commodity.mnemonic} differs from the "
-                        f"latest price on file ({reference:.4f}) by "
-                        f"{hi / lo:.1f}x — check the amount/quantity for "
-                        f"a misplaced decimal or inverted rate."
+                        f"{account.commodity.mnemonic} is {hi / lo:.1f}x the "
+                        f"stored rate {reference:.4f} ({price_date}) — "
+                        f"verify the amount and quantity (possible misplaced "
+                        f"decimal or inverted rate)."
                     ),
                 })
         return out
