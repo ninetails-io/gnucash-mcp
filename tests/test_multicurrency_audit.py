@@ -325,3 +325,63 @@ def test_budget_report_warns_on_unconvertible_foreign_target(tmp_path):
     assert "EUR" in res["warnings"][0]
     # The amount is still included (not dropped), just flagged.
     assert Decimal(res["totals"]["budgeted"]) > 0
+
+
+# --------------------------------------------------------------------------
+# _market_value cost-basis fallback — converts foreign purchases, no mix
+# --------------------------------------------------------------------------
+
+def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
+    """When a holding has no market price, the cost-basis fallback
+    values each purchase at its posting-date rate (book default), not a
+    raw sum of foreign transaction-currency values."""
+    path = tmp_path / "mv.gnucash"
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    eur = factories.create_currency_from_ISO("EUR")
+    # A security with NO price on file -> forces the cost-basis fallback.
+    fund = piecash.Commodity(
+        namespace="FUND", mnemonic="NOPRICE",
+        fullname="Unpriced Fund", fraction=10000,
+    )
+    book.session.add(fund)
+    assets = piecash.Account(
+        name="Assets", type="ASSET", commodity=usd,
+        parent=book.root_account, placeholder=True,
+    )
+    inv = piecash.Account(
+        name="FundX", type="MUTUAL", commodity=fund, parent=assets,
+    )
+    cash_eur = piecash.Account(
+        name="EUR Cash", type="BANK", commodity=eur, parent=assets,
+    )
+    # Only a EUR->USD price exists (1.20); the fund itself is unpriced.
+    book.session.add(piecash.Price(
+        commodity=eur, currency=usd,
+        date=date(2025, 3, 1), value="1.20", type="last",
+    ))
+    piecash.Transaction(
+        currency=eur, post_date=date(2025, 3, 1), description="Buy",
+        splits=[
+            piecash.Split(account=inv, value=Decimal("1000"),
+                          quantity=Decimal("10")),
+            piecash.Split(account=cash_eur, value=Decimal("-1000"),
+                          quantity=Decimal("-1000")),
+        ],
+    )
+    book.save()
+    book.close()
+
+    gb = GnuCashBook(str(path))
+    with gb.open(readonly=True) as book:
+        inv_acct = gb._find_account(book, "Assets:FundX")
+        usd = book.default_currency
+        rates = gb._rates_as_of(book, date(2025, 3, 1))
+        value, note = gb._market_value(
+            inv_acct, Decimal("10"),
+            book=book, rates=rates, default_currency=usd,
+            today=date(2025, 3, 1),
+        )
+        assert "no price data" in note
+        # 1000 EUR x 1.20 = 1200 USD, not a raw 1000.
+        assert value == Decimal("1200.00")
