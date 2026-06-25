@@ -530,6 +530,7 @@ class CurrencyMixin:
         account,
         quantity: Decimal,
         *,
+        book: piecash.Book,
         rates: dict[str, Decimal],
         default_currency: piecash.Commodity,
         today: date | None = None,
@@ -542,6 +543,8 @@ class CurrencyMixin:
         account-level aggregation.
 
         Args:
+            book: Needed to value the cost-basis fallback in the book
+                default currency (see below).
             rates: Map from :meth:`_rates_as_of`, passed in so the
                 price-map builds once per report.
             today: Cost-basis fallback ignores splits dated after
@@ -566,10 +569,26 @@ class CurrencyMixin:
             return quantity * rate, note
         if not with_cost_fallback:
             return Decimal("0"), f"{quantity} {sym} — no price data"
+        # No market price for the holding: fall back to cost basis in
+        # the book default. ``split.value`` is in each purchase's
+        # transaction currency; convert each at its posting-date rate
+        # (mirroring calculate_lot_gain / _lot_decimals) so a holding
+        # bought across foreign currencies isn't summed as raw mixed
+        # units. Missing per-leg rate degrades to the raw value.
         cost_basis = Decimal("0")
         for s in account.splits:
-            if today is None or s.transaction.post_date <= today:
-                cost_basis += Decimal(str(s.value))
+            if today is not None and s.transaction.post_date > today:
+                continue
+            value = Decimal(str(s.value))
+            txn_ccy = s.transaction.currency
+            if txn_ccy != default_currency:
+                leg_rate = self._cross_rate(
+                    book, txn_ccy, default_currency,
+                    as_of=s.transaction.post_date,
+                )
+                if leg_rate is not None:
+                    value = value * leg_rate
+            cost_basis += value
         return cost_basis, f"{quantity} {sym} — no price data"
 
     @staticmethod

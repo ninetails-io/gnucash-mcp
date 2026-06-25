@@ -449,6 +449,7 @@ class CoreMixin:
             # liabilities; liabilities negate to a positive magnitude.
             converted, _ = self._market_value(
                 account, balance,
+                book=book,
                 rates=rates,
                 default_currency=default_currency,
                 today=as_of,
@@ -1511,6 +1512,7 @@ class CoreMixin:
         latest_prices: dict,
         default_currency,
         today: date,
+        book: piecash.Book,
         rate_via: dict[str, str] | None = None,
     ) -> _SummaryData:
         """Single-pass account walker for ``get_book_summary``.
@@ -1548,6 +1550,7 @@ class CoreMixin:
                 if balance != 0:
                     usd_value, note = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1561,6 +1564,7 @@ class CoreMixin:
                     # diverge from balance_sheet on foreign debt.
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1570,6 +1574,7 @@ class CoreMixin:
                 if balance != 0:
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1586,6 +1591,7 @@ class CoreMixin:
                     # A/R is debit-natural: positive balance = owed to us.
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1596,6 +1602,7 @@ class CoreMixin:
                     # A/P is credit-natural: negate for "what we owe".
                     usd_value, _ = self._market_value(
                         account, -balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1991,6 +1998,7 @@ class CoreMixin:
                 latest_prices=latest_prices,
                 default_currency=default_currency,
                 today=today,
+                book=book,
                 rate_via=rate_via,
             )
 

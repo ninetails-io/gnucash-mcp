@@ -367,6 +367,8 @@ class BusinessMixin:
                 INCOME/EXPENSE; or no ``Income`` parent to create
                 under.
         """
+        default_currency = self._require_default_currency(book)
+
         # Layer 1: caller-supplied account wins.
         if fx_account is not None:
             acct = self._resolve_account(book, fx_account)
@@ -382,15 +384,31 @@ class BusinessMixin:
                     f"{acct.type}; must be INCOME or EXPENSE to "
                     f"receive realized FX gain/loss."
                 )
+            # Realized FX gain/loss is a reporting-currency figure;
+            # the gain is booked as a default-currency quantity. A
+            # non-default-commodity FX account would record it in the
+            # wrong commodity (a $42 gain becoming €42). Reject rather
+            # than silently corrupt.
+            if acct.commodity != default_currency:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is denominated in "
+                    f"{acct.commodity.mnemonic}; the realized FX "
+                    f"gain/loss account must be in the book default "
+                    f"currency ({default_currency.mnemonic})."
+                )
             return acct, None
 
-        # Layer 2: fuzzy match by leaf-name substring.
+        # Layer 2: fuzzy match by leaf-name substring. Only
+        # default-currency candidates qualify — see the commodity
+        # rationale on the explicit-account path above.
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
             if account.guid in template_guids:
                 continue
             if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            if account.commodity != default_currency:
                 continue
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
@@ -427,7 +445,6 @@ class BusinessMixin:
                 "Income (type=INCOME, placeholder) first."
             )
 
-        default_currency = self._require_default_currency(book)
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
         # the payment transaction, and orphan Split objects already in
@@ -7056,27 +7073,106 @@ class BusinessMixin:
                 "invoices": invoice_rows,
             }
 
-    def _bill_billed_total(self, book, bill) -> Decimal:
-        """Total billed on a bill, in the bill's own currency.
+    def _posting_split_in_default(
+        self, book, split, default_currency,
+    ) -> tuple[Decimal, bool]:
+        """Value one posting/payment split in the book's default
+        currency, trusting the ledger.
 
-        Mirrors the single-period path: the invoice-entries grand
-        total, falling back to the post-lot balance when entries are
-        empty or corrupted (substituting 0 would understate the
-        vendor's total by the whole bill).
+        A split stores ``quantity`` in its account's commodity and
+        ``value`` in its transaction's currency. Whichever of those
+        is the book default IS the base-currency amount — the rate
+        was applied when the row was written, so re-deriving it from
+        face value is unnecessary and re-deriving it at a *report-time*
+        rate is wrong (it drifts with the rate). Only a split whose
+        account AND transaction are both non-default has no stored
+        base-currency amount; there a live conversion is required, and
+        it uses the rate AS OF THE POSTING DATE (what was booked), not
+        a report-period rate.
+
+        Returns ``(amount, converted_ok)``; ``converted_ok`` is False
+        only when a rate was required and none is on file.
         """
-        try:
-            return self._get_invoice_entries_and_total(
-                book, bill,
-            )["grand_total"]
-        except ValueError:
-            post_acct = book.session.query(
-                piecash.Account
-            ).filter_by(guid=bill.post_acc_guid).first()
-            if post_acct:
-                for lot in post_acct.lots:
-                    if lot.guid == bill.post_lot_guid:
-                        return abs(self._calculate_lot_balance(lot))
-            return Decimal(0)
+        if split.account.commodity == default_currency:
+            return Decimal(str(split.quantity)), True
+        txn_currency = split.transaction.currency
+        if txn_currency == default_currency:
+            return Decimal(str(split.value)), True
+        # Both-foreign: no base-currency amount is stored. Convert the
+        # transaction-currency value at the posting-date rate.
+        rate = self._cross_rate(
+            book, txn_currency, default_currency,
+            as_of=split.transaction.post_date,
+        )
+        if rate is None:
+            return Decimal(str(split.value)), False
+        quantum = _commodity_quantum(default_currency)
+        return (Decimal(str(split.value)) * rate).quantize(quantum), True
+
+    def _bill_amounts_in_default(
+        self, book, bill, default_currency,
+    ) -> tuple[Decimal, Decimal, Decimal, str | None]:
+        """Billed / paid / outstanding for one bill, in the book's
+        default currency, read from the posting ledger.
+
+        Sums the posting transaction's contra (non-A/P) splits for
+        the billed total and the post-lot balance for outstanding —
+        both valued via :meth:`_posting_split_in_default`, so a
+        foreign-currency bill posted against a default-currency A/P
+        account needs no rate at all: the CNY amounts computed at
+        posting time are read straight off the ledger. ``paid`` is
+        the difference. This is the same principle as the contra-split
+        fix: report what the book contains, not a re-derivation of
+        what it should contain.
+
+        Returns ``(billed, paid, outstanding, unconverted_ccy)``.
+        ``unconverted_ccy`` is the bill currency's mnemonic when a
+        split could not be valued (no rate on file) — None on
+        success; the amounts are then in that raw foreign currency
+        and the caller routes them to the per-currency bucket.
+        """
+        converted_ok = True
+
+        # Total billed = magnitude of the contra (non-A/P) side of
+        # the posting transaction.
+        billed = Decimal(0)
+        txn = bill.post_txn
+        if txn is not None:
+            for s in txn.splits:
+                if s.reconcile_state == "v":
+                    continue
+                if s.account.guid == bill.post_acc_guid:
+                    continue
+                amt, ok = self._posting_split_in_default(
+                    book, s, default_currency,
+                )
+                converted_ok = converted_ok and ok
+                billed += amt
+        billed = abs(billed)
+
+        # Outstanding = magnitude of the post-lot balance.
+        outstanding = Decimal(0)
+        post_acct = book.session.query(
+            piecash.Account
+        ).filter_by(guid=bill.post_acc_guid).first()
+        if post_acct:
+            for lot in post_acct.lots:
+                if lot.guid != bill.post_lot_guid:
+                    continue
+                for s in lot.splits:
+                    if s.reconcile_state == "v":
+                        continue
+                    amt, ok = self._posting_split_in_default(
+                        book, s, default_currency,
+                    )
+                    converted_ok = converted_ok and ok
+                    outstanding += amt
+                break
+        outstanding = abs(outstanding)
+
+        paid = billed - outstanding
+        unconverted = None if converted_ok else bill.currency.mnemonic
+        return billed, paid, outstanding, unconverted
 
     def _grouped_vendor_spending(
         self,
@@ -7090,18 +7186,15 @@ class BusinessMixin:
     ) -> str:
         """Bucket total-billed per vendor into sub-period columns.
 
-        Each bill lands in its ``date_posted`` sub-period and converts
-        at that period's close — never today's rates. Bills with no FX
-        rate on file are excluded from the converted totals and
-        surfaced in a trailing warning, exactly as the single-period
-        report handles them.
+        Each bill lands in its ``date_posted`` sub-period, billed in
+        the book default read off the posting ledger (see
+        :meth:`_bill_amounts_in_default`). Bills that can't be valued
+        (foreign A/P account, no FX rate on file) are excluded from
+        the converted totals and surfaced in a trailing warning,
+        exactly as the single-period report handles them.
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
-        rates_by_period = {
-            pl: self._rates_as_of(book, anchor) for pl, anchor in periods
-        }
-        quantum = _commodity_quantum(default_currency)
 
         totals: dict[str, dict[str, Decimal]] = {}
         unconverted: dict[str, dict] = {}
@@ -7110,19 +7203,18 @@ class BusinessMixin:
             if posted is None:
                 continue
             plabel = _period_label(posted.date(), group_by)
-            total = self._bill_billed_total(book, bill)
+            total, _paid, _out, unconv = self._bill_amounts_in_default(
+                book, bill, default_currency,
+            )
 
-            if bill.currency != default_currency:
-                rate = rates_by_period[plabel].get(bill.currency.guid)
-                if rate is None:
-                    u = unconverted.setdefault(
-                        bill.currency.mnemonic,
-                        {"total_billed": Decimal(0), "bill_count": 0},
-                    )
-                    u["total_billed"] += total
-                    u["bill_count"] += 1
-                    continue
-                total = (total * rate).quantize(quantum)
+            if unconv is not None:
+                u = unconverted.setdefault(
+                    unconv,
+                    {"total_billed": Decimal(0), "bill_count": 0},
+                )
+                u["total_billed"] += total
+                u["bill_count"] += 1
+                continue
 
             v = self._find_vendor_by_guid(book, bill.owner_guid)
             v_name = v.name if v else "Unknown"
@@ -7207,10 +7299,6 @@ class BusinessMixin:
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
 
-            # Rates as of period end — historical periods must not
-            # be valued at today's rates.
-            latest_rates = self._rates_as_of(book, parsed_end)
-
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
                 Invoice.date_posted.isnot(None),
@@ -7250,7 +7338,8 @@ class BusinessMixin:
                 )
 
             vendor_data: dict[str, dict] = {}
-            # Bills with no rate on file are EXCLUDED from
+            # Bills that can't be valued in the book default (foreign
+            # A/P account with no FX rate on file) are EXCLUDED from
             # default-currency totals (folding raw foreign units
             # corrupts the sum); tracked per currency and surfaced
             # as a warning.
@@ -7272,64 +7361,31 @@ class BusinessMixin:
                         "bill_count": 0,
                     }
 
-                balance = Decimal(0)
-                post_acct = book.session.query(
-                    piecash.Account
-                ).filter_by(guid=bill.post_acc_guid).first()
-                if post_acct:
-                    for lot in post_acct.lots:
-                        if lot.guid == bill.post_lot_guid:
-                            balance = self._calculate_lot_balance(
-                                lot
-                            )
-                            break
+                # Billed/paid/outstanding read off the posting ledger
+                # in the book default — for a foreign-currency bill
+                # against a default-currency A/P account this is the
+                # rate-at-posting amount, never today's drifted rate.
+                total, paid, outstanding, unconv = (
+                    self._bill_amounts_in_default(
+                        book, bill, default_currency,
+                    )
+                )
 
-                try:
-                    total = self._get_invoice_entries_and_total(
-                        book, bill,
-                    )["grand_total"]
-                except ValueError:
-                    # Empty/corrupted entries: fall back to the lot
-                    # balance. Substituting 0 would understate
-                    # total_billed by the bill's full amount.
-                    total = abs(balance)
-
-                outstanding = abs(balance)
-                paid = total - outstanding
-
-                # Convert per-bill totals to the book default before
-                # summing — unconverted, a €2,500 bill and a $3,000
-                # bill sum to "5,500" of nothing in particular.
-                converted_ok = True
-                if bill.currency != default_currency:
-                    rate = latest_rates.get(bill.currency.guid)
-                    if rate is not None:
-                        # Quantize FX products to default-currency
-                        # precision: verbose emits via str(), which
-                        # would expose a long fractional tail.
-                        q = _commodity_quantum(default_currency)
-                        total = (total * rate).quantize(q)
-                        paid = (paid * rate).quantize(q)
-                        outstanding = (outstanding * rate).quantize(q)
-                    else:
-                        # No rate: exclude and accumulate per
-                        # currency for explicit reporting.
-                        converted_ok = False
-                        u = unconverted.setdefault(
-                            bill.currency.mnemonic,
-                            {
-                                "total_billed": Decimal(0),
-                                "total_paid": Decimal(0),
-                                "outstanding": Decimal(0),
-                                "bill_count": 0,
-                            },
-                        )
-                        u["total_billed"] += total
-                        u["total_paid"] += paid
-                        u["outstanding"] += outstanding
-                        u["bill_count"] += 1
-
-                if converted_ok:
+                if unconv is not None:
+                    u = unconverted.setdefault(
+                        unconv,
+                        {
+                            "total_billed": Decimal(0),
+                            "total_paid": Decimal(0),
+                            "outstanding": Decimal(0),
+                            "bill_count": 0,
+                        },
+                    )
+                    u["total_billed"] += total
+                    u["total_paid"] += paid
+                    u["outstanding"] += outstanding
+                    u["bill_count"] += 1
+                else:
                     vendor_data[v_name]["total_billed"] += total
                     vendor_data[v_name]["total_paid"] += paid
                     vendor_data[v_name]["outstanding"] += outstanding

@@ -776,6 +776,12 @@ class BudgetsMixin:
             # leaves targets in raw account commodities and makes
             # used_pct meaningless on multi-currency budgets.
             factors = self._account_conversion_factors(book, last_end)
+            default_currency = self._require_default_currency(book)
+            # Currencies of budgeted accounts folded in raw for lack of
+            # an FX rate — surfaced as a warning so the converted totals
+            # don't read as exact (the math stays internally consistent
+            # because actuals degrade the same way).
+            unconverted_currencies: set[str] = set()
 
             budgeted: dict[str, Decimal] = {}
             # Keep a handle to each budgeted account for descendant walking.
@@ -788,13 +794,19 @@ class BudgetsMixin:
                     continue
                 # None factor → no rate on file; the raw-amount
                 # fallback matches how actuals degrade via
-                # _split_in_default_currency.
+                # _split_in_default_currency. Record the currency so a
+                # foreign fold isn't silent (it stays in the totals —
+                # a caveated budget line beats a dropped one).
                 factor = factors.get(ba.account.guid)
                 ba_amount = Decimal(str(ba.amount))
                 if factor is not None:
                     target_in_default = ba_amount * factor
                 else:
                     target_in_default = ba_amount
+                    if ba.account.commodity != default_currency:
+                        unconverted_currencies.add(
+                            ba.account.commodity.mnemonic
+                        )
                 budgeted[acct_name] = budgeted.get(
                     acct_name, Decimal("0")
                 ) + target_in_default
@@ -910,9 +922,24 @@ class BudgetsMixin:
                     "percent_used": str(total_pct),
                 },
             }
+            warning = None
+            if unconverted_currencies:
+                warning = (
+                    f"Budgeted amounts in "
+                    f"{', '.join(sorted(unconverted_currencies))} have no FX "
+                    f"rate on file and are folded in un-converted; "
+                    f"{default_currency.mnemonic} totals are approximate "
+                    f"(percent_used stays consistent — actuals degrade the "
+                    f"same way)."
+                )
+                full["warnings"] = [warning]
+
             if not compact:
                 return full
-            return _format_budget_report_compact(full)
+            out = _format_budget_report_compact(full)
+            if warning:
+                out += f"\n⚠ {warning}"
+            return out
 
     def delete_budget(self, name: str) -> dict:
         """Delete a budget.
