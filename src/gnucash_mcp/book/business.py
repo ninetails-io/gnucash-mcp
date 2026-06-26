@@ -358,14 +358,17 @@ class BusinessMixin:
            caller to pass ``fx_account``. Don't guess between
            user-created accounts.
         3. **Canonical default**: existing ``Income:Foreign Exchange
-           Gain/Loss``, else auto-create it under ``Income`` — so
-           books without foreign-currency activity never accumulate
-           an unused account.
+           Gain/Loss``, else auto-create it under the top-level INCOME
+           account resolved *by type* — locale-robust, so it works on
+           a book whose income root is "Erträge"/"Ingresos"/… (and
+           survives a user rename), instead of throwing on a missing
+           English "Income". Falls back to creating a top-level INCOME
+           account only if the book has none at all.
 
         Raises:
-            ValueError: ``fx_account`` supplied but missing or not
-                INCOME/EXPENSE; or no ``Income`` parent to create
-                under.
+            ValueError: ``fx_account`` supplied but missing, not
+                INCOME/EXPENSE, or denominated in a non-default
+                currency.
         """
         default_currency = self._require_default_currency(book)
 
@@ -437,13 +440,25 @@ class BusinessMixin:
         if fx_acct is not None:
             return fx_acct, notice
 
-        income = self._find_account(book, "Income")
+        # Resolve the parent by TYPE, not the English name "Income".
+        # On a localized book the income root is "Erträge"/"Ingresos"/…,
+        # so _find_account(book, "Income") returns None and the old
+        # code threw here — the first cross-currency payment failing.
+        # Fall back to creating a top-level INCOME account only if the
+        # book genuinely has none.
+        income, parent_notice = self._top_level_account_of_type(
+            book, "INCOME"
+        )
         if income is None:
-            raise ValueError(
-                "Realized FX gain/loss on cross-currency payment needs "
-                "an Income parent account, but none exists. Create "
-                "Income (type=INCOME, placeholder) first."
+            income = piecash.Account(
+                name="Income",
+                type="INCOME",
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
             )
+        if notice is None:
+            notice = parent_notice
 
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
@@ -544,16 +559,25 @@ class BusinessMixin:
         if disc_acct is not None:
             return disc_acct, notice
 
-        parent = self._find_account(book, canonical_parent_path)
-        if parent is None:
-            raise ValueError(
-                f"Early-payment discount on this payment needs an "
-                f"{canonical_parent_path} parent account, but none "
-                f"exists. Create {canonical_parent_path} (type="
-                f"{canonical_type}, placeholder) first."
-            )
-
+        # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
+        # name "Income"/"Expenses" — locale-robust and rename-proof.
+        # Fall back to creating the top-level account only if the book
+        # has none of that type.
+        parent, parent_notice = self._top_level_account_of_type(
+            book, canonical_type
+        )
         default_currency = self._require_default_currency(book)
+        if parent is None:
+            parent = piecash.Account(
+                name=canonical_parent_path,
+                type=canonical_type,
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
+            )
+        if notice is None:
+            notice = parent_notice
+
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
         leaf_name = canonical_path.split(":")[-1]

@@ -79,3 +79,53 @@ class TestTopLevelAccountOfType:
             assert notice["account_type"] == "INCOME"
             assert set(notice["candidates"]) == {"Andere Erträge", "Erträge"}
             assert notice["chosen"] == "Andere Erträge"
+
+
+class TestLocalizedHelperAccounts:
+    """The Tier-A blocker: the FX and discount helper-account
+    resolvers used to call ``_find_account(book, "Income")`` and
+    **throw** on a localized book (no account named "Income"). They now
+    resolve the parent by type and create under the German roots.
+    """
+
+    def test_fx_account_autocreates_under_localized_income(
+        self, localized_book
+    ):
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            # This call raised ValueError before the fix.
+            acct, _ = gb._get_or_create_fx_account(b)
+            assert acct is not None
+            assert acct.type == "INCOME"
+            assert acct.commodity == b.default_currency
+            # Parent resolved by TYPE → the German income root.
+            assert acct.parent.fullname == "Erträge"
+            assert acct.fullname == "Erträge:Foreign Exchange Gain/Loss"
+            b.save()
+
+        # Idempotent: a second call resolves the same account (the
+        # English leaf self-matches the fuzzy layer) rather than
+        # creating a duplicate.
+        with gb.open(readonly=False) as b:
+            acct2, _ = gb._get_or_create_fx_account(b)
+            assert acct2.fullname == "Erträge:Foreign Exchange Gain/Loss"
+
+    def test_discount_accounts_autocreate_under_localized_parents(
+        self, localized_book
+    ):
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            # Sales discount → EXPENSE side → German expense root.
+            sales, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=False
+            )
+            assert sales.type == "EXPENSE"
+            assert sales.parent.fullname == "Aufwand"
+
+            # Purchase discount → INCOME side → German income root.
+            purchase, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=True
+            )
+            assert purchase.type == "INCOME"
+            assert purchase.parent.fullname == "Erträge"
+            b.save()
