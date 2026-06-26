@@ -924,6 +924,62 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 return account
         return None
 
+    def _top_level_account_of_type(
+        self, book: piecash.Book, acct_type: str
+    ) -> "tuple[piecash.Account | None, dict | None]":
+        """Find the top-level account of a given ``GNCAccountType``.
+
+        "Top-level" = a direct child of the real root account. This is
+        the locale-invariant replacement for English-name parent
+        lookups such as ``_find_account(book, "Income")``: it keys off
+        ``type`` and ``parent is root``, never a name, so it works on a
+        localized book (German "Erträge", etc.) **and** survives a user
+        renaming the account. Account *types* are never localized;
+        names always are.
+
+        Returns ``(account, notice)``:
+
+        - exactly one match → ``(account, None)``
+        - several → the lowest-``fullname`` pick plus an
+          ``ambiguous_top_level_account`` notice (mirrors the
+          ``ambiguous_fx_account`` convention so callers can surface it)
+        - none → ``(None, None)``
+
+        The scheduled-transaction template subtree is excluded, as
+        everywhere else accounts are surfaced.
+        """
+        root = book.root_account
+        template_guids = self._template_account_guids(book)
+        candidates = sorted(
+            (
+                a
+                for a in book.accounts
+                if a.guid not in template_guids
+                and a.type == acct_type
+                and a.parent is not None
+                and a.parent.guid == root.guid
+            ),
+            key=lambda a: a.fullname,
+        )
+        if not candidates:
+            return None, None
+        if len(candidates) == 1:
+            return candidates[0], None
+        chosen = candidates[0]
+        names = ", ".join(a.fullname for a in candidates)
+        notice = {
+            "type": "ambiguous_top_level_account",
+            "account_type": acct_type,
+            "candidates": [a.fullname for a in candidates],
+            "chosen": chosen.fullname,
+            "message": (
+                f"Found {len(candidates)} top-level {acct_type} "
+                f"accounts ({names}); using {chosen.fullname!r}. Pass "
+                f"an explicit account to override."
+            ),
+        }
+        return chosen, notice
+
     # ── Short account GUIDs ───────────────────────────────────────────
     #
     # Format "%XXXXXXX" (literal "%" + ≥7 hex chars) — cheap on the

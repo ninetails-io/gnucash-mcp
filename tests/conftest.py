@@ -1006,6 +1006,95 @@ def debt_book(tmp_path: Path) -> Path:
     return book_path
 
 
+@pytest.fixture
+def localized_book(tmp_path: Path) -> Path:
+    """A book with a German (`de_DE`-style) account hierarchy.
+
+    EUR default. Account *names* are German; account *types* are the
+    locale-invariant enum, exactly as a real localized GnuCash book is
+    laid out. Crucially there is **no account literally named "Income"
+    or "Expenses"** — so any code that resolves a helper-account parent
+    by English name throws here, while type-based resolution succeeds.
+
+    Chart:
+    - Aktiva (ASSET) → Girokonto (BANK), Forderungen (RECEIVABLE)
+    - Fremdkapital (LIABILITY) → Verbindlichkeiten (PAYABLE)
+    - Erträge (INCOME) → Umsatzerlöse (INCOME)
+    - Aufwand (EXPENSE) → Bürobedarf (EXPENSE)
+    - Eigenkapital (EQUITY) → Anfangsbestand (EQUITY)
+    - Opening balance: €10,000 in Girokonto.
+    """
+    book_path = tmp_path / "localized.gnucash"
+
+    book = piecash.create_book(
+        str(book_path), currency="EUR", overwrite=True,
+    )
+    root = book.root_account
+    eur = book.default_currency
+
+    aktiva = piecash.Account(
+        name="Aktiva", type="ASSET", parent=root,
+        commodity=eur, placeholder=True,
+    )
+    girokonto = piecash.Account(
+        name="Girokonto", type="BANK", parent=aktiva, commodity=eur,
+    )
+    piecash.Account(
+        name="Forderungen", type="RECEIVABLE", parent=aktiva, commodity=eur,
+    )
+
+    fremdkapital = piecash.Account(
+        name="Fremdkapital", type="LIABILITY", parent=root,
+        commodity=eur, placeholder=True,
+    )
+    piecash.Account(
+        name="Verbindlichkeiten", type="PAYABLE", parent=fremdkapital,
+        commodity=eur,
+    )
+
+    ertraege = piecash.Account(
+        name="Erträge", type="INCOME", parent=root,
+        commodity=eur, placeholder=True,
+    )
+    piecash.Account(
+        name="Umsatzerlöse", type="INCOME", parent=ertraege, commodity=eur,
+    )
+
+    aufwand = piecash.Account(
+        name="Aufwand", type="EXPENSE", parent=root,
+        commodity=eur, placeholder=True,
+    )
+    piecash.Account(
+        name="Bürobedarf", type="EXPENSE", parent=aufwand, commodity=eur,
+    )
+
+    eigenkapital = piecash.Account(
+        name="Eigenkapital", type="EQUITY", parent=root,
+        commodity=eur, placeholder=True,
+    )
+    anfangsbestand = piecash.Account(
+        name="Anfangsbestand", type="EQUITY", parent=eigenkapital,
+        commodity=eur,
+    )
+
+    book.save()
+
+    book.session.add(piecash.Transaction(
+        currency=eur,
+        description="Anfangsbestand",
+        post_date=date(2025, 12, 31),
+        splits=[
+            piecash.Split(account=girokonto, value=Decimal("10000")),
+            piecash.Split(account=anfangsbestand, value=Decimal("-10000")),
+        ],
+    ))
+
+    book.save()
+    book.close()
+
+    return book_path
+
+
 class PathologicalBook(typing.NamedTuple):
     """Handle returned by the ``pathological_book`` fixture.
 
