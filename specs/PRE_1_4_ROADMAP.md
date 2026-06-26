@@ -63,6 +63,19 @@ the absence of a positional assumption encoded without one (those
 were spot-checked — depth/root detection is data-driven and safe).
 High confidence the *behavioral* set below is complete.
 
+**Implementation status (branch `fix/i18n-account-resolution`):**
+Tiers **A, B, C are DONE** — `_top_level_account_of_type` chokepoint
+(`_base.py`), type-based FX/discount parent resolution (`business.py`),
+`loan_term_months` slot + 30y default (`reporting.py`), single
+"Loans & other" liability bucket (`core.py`), and
+`_is_auto_balancing_account` Imbalance/Orphan detection across 13
+locales (`_base.py`/`core.py`). End-to-end proven: a cross-currency
+invoice payment on a German book settles and books FX under "Erträge"
+(`tests/test_i18n_account_resolution.py`, 12 tests). **Remaining:**
+Tier D — localized *created* leaf names (flagship polish; the
+slot + locale-inference design in the spec §6.2-6.3) — and the full
+"Greta" synthetic persona.
+
 **A — Throws (hard failure):**
 - **LEAD ITEM (correctness-grade): resolve helper-account parents by
   TYPE, not English name.** `_get_or_create_fx_account`
