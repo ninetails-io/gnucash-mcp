@@ -1383,11 +1383,31 @@ class ReportingMixin:
                     else:
                         # LIABILITY: amortization formula
                         # PMT = P × r(1+r)^n / ((1+r)^n − 1).
-                        # Term: 30y when "mortgage" appears in the
-                        # path, else 5y; non-standard terms should
-                        # set the minimum_payment slot.
-                        is_mortgage = "mortgage" in account.fullname.lower()
-                        term_months = 360 if is_mortgage else 60
+                        # Term from the optional `loan_term_months`
+                        # slot, else default to 30y. We deliberately do
+                        # NOT guess "mortgage vs. other" from the
+                        # account name: that was English-only (it missed
+                        # "Hypothek"/"Darlehen" and any rename). A 30y
+                        # default under-states a short loan's payment
+                        # mildly rather than over-stating a mortgage's
+                        # — over-statement is what trips the budget gate
+                        # (the failure the 2%-rule comment above guards
+                        # against). Set `loan_term_months` or
+                        # `minimum_payment` for an exact figure.
+                        term_months = 360
+                        lt_val = slot_by_name.get("loan_term_months")
+                        if lt_val is not None:
+                            try:
+                                lt_str = (
+                                    str(lt_val.value)
+                                    if hasattr(lt_val, "value")
+                                    else str(lt_val)
+                                )
+                                parsed = int(Decimal(lt_str))
+                                if parsed > 0:
+                                    term_months = parsed
+                            except (InvalidOperation, ValueError):
+                                pass
                         monthly_rate = (
                             apr / Decimal("100") / Decimal("12")
                         )

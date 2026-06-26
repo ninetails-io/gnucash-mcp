@@ -455,6 +455,12 @@ class TestDebtPayoffAmortizingLoans:
 
         mortgage["apr"] = "3.85"
         auto["apr"] = "4.90"
+        # The amortization term is data, not inferred from the account
+        # name (the old English "mortgage" substring was locale-
+        # fragile — it missed "Hypothek"/"Darlehen"). The Auto Loan
+        # declares its 5-year term via the loan_term_months slot; the
+        # Mortgage omits it and exercises the 30-year default.
+        auto["loan_term_months"] = "60"
         cc["apr"] = "18.25"
         book.save()
 
@@ -505,7 +511,7 @@ class TestDebtPayoffAmortizingLoans:
             pytest.fail("Mortgage not found in results")
 
     def test_auto_loan_uses_amortization_not_two_percent(self, tmp_path: Path):
-        """Auto loan should use 5-year amortization default."""
+        """Auto loan uses its loan_term_months slot (5-year term)."""
         book_path = self._liability_book(tmp_path)
         gc_book = GnuCashBook(str(book_path))
 
@@ -521,13 +527,12 @@ class TestDebtPayoffAmortizingLoans:
                 assert Decimal("1700") < mp < Decimal("2000"), (
                     f"Auto loan minimum {mp} outside expected range"
                 )
-                # Nowhere near the broken 2% answer (¥1,936) — actually
-                # those are close here, so use the term as the
-                # discriminator instead. Auto with 5y term: ~¥1,824.
-                # Auto with 30y term (mortgage default): ~¥514.
+                # Discriminate by term: 5y (slot) → ~¥1,824; the 30y
+                # default would give ~¥514. Proves the loan_term_months
+                # slot drives the amortization, not the account name.
                 assert mp > Decimal("1500"), (
-                    "Auto loan got mortgage's 30-year term — name "
-                    "heuristic should require 'mortgage' in path"
+                    "Auto loan got the 30-year default — the "
+                    "loan_term_months slot was not honored"
                 )
                 break
         else:

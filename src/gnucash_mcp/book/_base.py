@@ -980,6 +980,56 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         }
         return chosen, notice
 
+    # GnuCash names its auto-created balancing accounts via gettext —
+    # ``_("Imbalance")-<CUR>`` and ``_("Orphan")-<CUR>`` (Scrub.cpp) —
+    # so the leading word is localized. An English-only prefix check
+    # misses them on a localized book and the data-integrity warning
+    # goes dark. These are the catalog translations of "Imbalance" and
+    # "Orphan" across the shipped GnuCash locales, lowercased; a leaf
+    # name that STARTS WITH any of them is a balancing account (the
+    # "-<CUR>" suffix, when present, follows the word). Source:
+    # specs/gnucash-account-naming-i18n.md.
+    _BALANCING_ACCOUNT_NAME_PREFIXES = frozenset(
+        s.lower()
+        for s in (
+            # "Imbalance"
+            "Imbalance", "Ausgleichskonto", "Non soldé", "Descuadre",
+            "Sbilancio", "Desequilíbrio", "Niet in balans", "Дисбаланс",
+            "貸借不一致", "不平衡的", "대차 불일치", "Niezrównoważenie",
+            "Obalans",
+            # "Orphan"
+            "Orphan", "Ausbuchungskonto", "Orphelin", "Huérfano",
+            "Orfano", "Órfão", "Verweesd", "Упущенный", "不明",
+            "孤立的", "고아", "Osierocone", "Föräldralös",
+        )
+    )
+
+    def _is_auto_balancing_account(
+        self, account: piecash.Account, root: piecash.Account
+    ) -> bool:
+        """True iff ``account`` is a GnuCash auto-created Imbalance or
+        Orphan balancing account.
+
+        A non-zero balance on one of these is a structural defect the
+        dashboard surfaces. Locale-robust: match by **structure** —
+        type ``BANK``, a direct child of root (both invariants of how
+        GnuCash hangs these accounts) — plus a leading word from the
+        known Imbalance/Orphan catalog translations. Unknown locales
+        degrade to the English forms; the structural gate keeps false
+        positives off ordinary user accounts. (``Orphaned Gains`` is
+        deliberately excluded — it is type ``INCOME``, a legitimate
+        account, not a defect.)
+        """
+        if account.type != "BANK":
+            return False
+        if account.parent is None or account.parent.guid != root.guid:
+            return False
+        leaf = account.name.lower()
+        return any(
+            leaf.startswith(p)
+            for p in self._BALANCING_ACCOUNT_NAME_PREFIXES
+        )
+
     # ── Short account GUIDs ───────────────────────────────────────────
     #
     # Format "%XXXXXXX" (literal "%" + ≥7 hex chars) — cheap on the
