@@ -434,13 +434,27 @@ Lin Wei (CNY) are both English-named, which is exactly why this bug
 class was invisible. A third persona with a **native-localized account
 hierarchy** converts the whole class from invisible to a failing test.
 
-- **New persona (Abe owns final design):** a `de_DE`-hierarchy book —
-  EUR default, German account names (`Aktiva`, `Fremdkapital`,
-  `Erträge`, `Aufwand`, …), a USD-paying client to force cross-currency
-  invoicing, a `Hypothek` for the debt-payoff path, and a localized
-  Imbalance account to exercise Tier C. Built via a
-  `scripts/synthetic_book/` generator like the others, deterministic
-  seed, per-phase backups. Working name: *"Greta"* (placeholder).
+- **New persona — Sabine Brenner** (Abe owns the final build): a
+  Munich freelance Grafikdesignerin / Einzelunternehmerin running the
+  **SKR03 Standardkontenrahmen** — the chart a real German sole
+  proprietor actually uses, not a tidied-up English-shaped hierarchy.
+  EUR default; GnuCash's shipped `acctchrt_skr03` names (top-level
+  INCOME "Erlöse u. Erträge 2/8", EXPENSE "Aufwendungen 2/4", numbered
+  leaves like "8400 Erlöse USt. 19%", A/R "1400 Ford. a. Lieferungen
+  und Leistungen"); a USD-paying client to force cross-currency
+  invoicing; a `Hypothek` for the debt-payoff path; and a localized
+  Imbalance account for Tier C. Built via a `scripts/synthetic_book/`
+  generator like Alex/Lin Wei, deterministic seed, per-phase backups.
+
+  **Verified (2026-06-26):** SKR03 ships with GnuCash and — despite
+  being numbered and Kontenklasse-organized — maps to a clean **single
+  top-level account per fundamental type**, so
+  `_top_level_account_of_type` resolves it correctly: the FX account
+  lands under "Erlöse u. Erträge 2/8" and self-heals on repeat via the
+  English leaf. A minimal SKR03 slice with the real names is locked in
+  `test_i18n_account_resolution.py::TestSKR03Chart`. (An SKR03 purist
+  might want FX in a specific numbered account; auto-creation under the
+  income-class placeholder is correct-by-type and acceptable.)
 - **The acceptance test:** post and pay a cross-currency invoice on the
   German book with rate drift. Pre-fix this **throws**; post-fix it
   settles, recognizes FX into a (German-named) top-level-INCOME child,

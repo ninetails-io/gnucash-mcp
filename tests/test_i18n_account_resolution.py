@@ -367,3 +367,75 @@ class TestCrossCurrencyPaymentOnLocalizedBook:
             assert fx is not None
             assert fx.type == "INCOME"
             assert fx.commodity == b.default_currency  # EUR
+
+
+class TestSKR03Chart:
+    """Sabine Brenner's chart: the SKR03 Standardkontenrahmen that a
+    real German Einzelunternehmerin uses. It's numbered and organized
+    by Kontenklasse, not by the five fundamental types — but GnuCash's
+    shipped `acctchrt_skr03` template still wraps each class in a single
+    top-level account of the right TYPE. These tests use the actual
+    SKR03 top-level names (verified against GnuCash `stable`) to prove
+    the resolver handles the real chart, not just a tidy German one.
+    """
+
+    @staticmethod
+    def _skr03_book(path):
+        # Minimal slice of acctchrt_skr03: real top-level names, real
+        # nesting (income leaves live two levels deep under the
+        # top-level INCOME placeholder).
+        book = piecash.create_book(str(path), currency="EUR", overwrite=True)
+        root = book.root_account
+        eur = book.default_currency
+        aktiva = piecash.Account(
+            name="Aktiva", type="ASSET", parent=root,
+            commodity=eur, placeholder=True,
+        )
+        piecash.Account(
+            name="1200 Bank", type="BANK", parent=aktiva, commodity=eur,
+        )
+        ertraege = piecash.Account(
+            name="Erlöse u. Erträge 2/8", type="INCOME", parent=root,
+            commodity=eur, placeholder=True,
+        )
+        erloeskonten = piecash.Account(
+            name="Erlöskonten 8", type="INCOME", parent=ertraege,
+            commodity=eur, placeholder=True,
+        )
+        piecash.Account(
+            name="8400 Erlöse USt. 19%", type="INCOME",
+            parent=erloeskonten, commodity=eur,
+        )
+        piecash.Account(
+            name="Aufwendungen 2/4", type="EXPENSE", parent=root,
+            commodity=eur, placeholder=True,
+        )
+        book.save()
+        book.close()
+
+    def test_top_level_income_is_the_class_placeholder(self, tmp_path):
+        path = tmp_path / "skr03.gnucash"
+        self._skr03_book(path)
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            acct, notice = gb._top_level_account_of_type(b, "INCOME")
+            # The root-child placeholder, NOT the nested "Erlöskonten 8"
+            # or the leaf "8400 …".
+            assert acct.fullname == "Erlöse u. Erträge 2/8"
+            assert notice is None
+            exp, _ = gb._top_level_account_of_type(b, "EXPENSE")
+            assert exp.fullname == "Aufwendungen 2/4"
+
+    def test_fx_account_lands_under_skr03_income_root(self, tmp_path):
+        path = tmp_path / "skr03fx.gnucash"
+        self._skr03_book(path)
+        gb = GnuCashBook(str(path))
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            assert acct.type == "INCOME"
+            assert acct.parent.fullname == "Erlöse u. Erträge 2/8"
+            assert (
+                acct.fullname
+                == "Erlöse u. Erträge 2/8:Foreign Exchange Gain/Loss"
+            )
+            b.save()
