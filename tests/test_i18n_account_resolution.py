@@ -282,3 +282,88 @@ class TestLoanTermLocaleRobust:
         gb = GnuCashBook(str(path))
         with pytest.raises(ValueError, match="less than the sum of minimum"):
             gb.debt_payoff_plan(monthly_budget="2000", compact=True)
+
+
+class TestCrossCurrencyPaymentOnLocalizedBook:
+    """End-to-end acceptance test. Paying a cross-currency invoice on a
+    localized (German) book used to raise ValueError inside
+    _get_or_create_fx_account — there is no account named "Income", so
+    the realized-FX recognition threw on the FIRST such payment. It now
+    settles and books the FX under the German income root "Erträge".
+    """
+
+    @staticmethod
+    def _add_usd_ar_and_price(gb, rate_date, rate_value):
+        # Mirror of the EUR helper in test_business, inverted: this book
+        # is EUR-default, so the foreign side is USD. Adds a USD A/R and
+        # a USD→EUR price.
+        with gb.open(readonly=False) as book:
+            eur = book.default_currency
+            usd = next(
+                (c for c in book.commodities if c.mnemonic == "USD"), None
+            )
+            if usd is None:
+                usd = piecash.factories.create_currency_from_ISO("USD")
+                book.session.add(usd)
+            if not any(
+                a.fullname == "Aktiva:Forderungen USD"
+                for a in book.accounts
+            ):
+                aktiva = next(
+                    a for a in book.accounts if a.fullname == "Aktiva"
+                )
+                book.session.add(piecash.Account(
+                    name="Forderungen USD", type="RECEIVABLE",
+                    parent=aktiva, commodity=usd,
+                ))
+            book.session.add(piecash.Price(
+                commodity=usd, currency=eur,
+                date=date.fromisoformat(rate_date),
+                value=str(rate_value), source="user:test", type="nav",
+            ))
+            book.save()
+
+    def test_pay_books_fx_under_localized_income_root(self, localized_book):
+        gb = GnuCashBook(str(localized_book))
+        # USD 1 = 0.90 EUR at post, 0.95 EUR at pay → rate drift → FX.
+        self._add_usd_ar_and_price(gb, "2026-03-10", "0.90")
+        self._add_usd_ar_and_price(gb, "2026-03-20", "0.95")
+
+        gb.create_customer(name="Acme USA", currency="USD")
+        gb.create_invoice(
+            customer_id="000001", currency="USD",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Erträge:Umsatzerlöse",
+            description="Beratung", quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Aktiva:Forderungen USD",
+            post_date="2026-03-10",
+        )
+
+        # The line that raised ValueError before the fix.
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Aktiva:Girokonto",
+            amount="1000.00",
+            payment_date="2026-03-20",
+        )
+
+        # Realized FX booked under the German income root, by TYPE.
+        assert "fx_realized" in result
+        assert (
+            result["fx_realized"]["account"]
+            == "Erträge:Foreign Exchange Gain/Loss"
+        )
+        with gb.open() as b:
+            fx = next(
+                (a for a in b.accounts
+                 if a.fullname == "Erträge:Foreign Exchange Gain/Loss"),
+                None,
+            )
+            assert fx is not None
+            assert fx.type == "INCOME"
+            assert fx.commodity == b.default_currency  # EUR
