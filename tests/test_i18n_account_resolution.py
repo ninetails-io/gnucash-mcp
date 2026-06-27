@@ -102,9 +102,11 @@ class TestLocalizedHelperAccounts:
             assert acct is not None
             assert acct.type == "INCOME"
             assert acct.commodity == b.default_currency
-            # Parent resolved by TYPE → the German income root.
+            # Parent resolved by TYPE → the German income root. The leaf
+            # is localized (§6.3): the tidy German chart infers "de", so
+            # the auto-created account reads naturally in German.
             assert acct.parent.fullname == "Erträge"
-            assert acct.fullname == "Erträge:Foreign Exchange Gain/Loss"
+            assert acct.fullname == "Erträge:Realisierter Gewinn/Verlust"
             b.save()
 
         # Idempotent: the first create stored the account's GUID in the
@@ -112,7 +114,7 @@ class TestLocalizedHelperAccounts:
         # Layer 0 rather than creating a duplicate.
         with gb.open(readonly=False) as b:
             acct2, _ = gb._get_or_create_fx_account(b)
-            assert acct2.fullname == "Erträge:Foreign Exchange Gain/Loss"
+            assert acct2.fullname == "Erträge:Realisierter Gewinn/Verlust"
 
     def test_discount_accounts_autocreate_under_localized_parents(
         self, localized_book
@@ -153,8 +155,9 @@ class TestDesignatedAccountSlotLayer0:
 
         # Rename the account to a word matching NO fuzzy keyword and not
         # the canonical path — only the GUID slot (Layer 0) can find it.
+        # (Leaf is the localized German name per §6.3.)
         gb.update_account(
-            "Erträge:Foreign Exchange Gain/Loss",
+            "Erträge:Realisierter Gewinn/Verlust",
             new_name="Wechselkursergebnis",
         )
 
@@ -213,7 +216,7 @@ class TestDesignatedAccountSlotLayer0:
                 b, gb._FX_ACCOUNT_SLOT_KEY
             )
             assert resolved is not None
-            assert resolved.fullname == "Erträge:Foreign Exchange Gain/Loss"
+            assert resolved.fullname == "Erträge:Realisierter Gewinn/Verlust"
 
     def test_discount_sides_use_independent_slots(self, localized_book):
         # Sales (EXPENSE) and purchase (INCOME) designations are stored
@@ -241,6 +244,95 @@ class TestDesignatedAccountSlotLayer0:
             assert via_purchase.guid == purchase_guid
             assert via_purchase.type == "INCOME"
             assert via_sales.guid != via_purchase.guid
+
+
+class TestBookLocaleInference:
+    """§6.3: infer the book locale from its own top-level accounts
+    (with a GNUCASH_LOCALE override), and localize auto-created leaf
+    names — falling back to English when no locale or translation
+    applies. Resolution stays GUID-based, so the leaf is cosmetic.
+    """
+
+    @staticmethod
+    def _english_book(path):
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        for name, atype in (
+            ("Assets", "ASSET"), ("Liabilities", "LIABILITY"),
+            ("Income", "INCOME"), ("Expenses", "EXPENSE"),
+            ("Equity", "EQUITY"),
+        ):
+            piecash.Account(name=name, type=atype, parent=root,
+                            commodity=usd, placeholder=True)
+        book.save()
+        book.close()
+
+    @staticmethod
+    def _numbered_german_book(path):
+        # SKR03-shaped: one structural word ("Aktiva") matches, the rest
+        # are numbered/non-standard — too few to trigger inference.
+        book = piecash.create_book(str(path), currency="EUR", overwrite=True)
+        root = book.root_account
+        eur = book.default_currency
+        piecash.Account(name="Aktiva", type="ASSET", parent=root,
+                        commodity=eur, placeholder=True)
+        piecash.Account(name="Erlöse u. Erträge 2/8", type="INCOME",
+                        parent=root, commodity=eur, placeholder=True)
+        piecash.Account(name="Aufwendungen 2/4", type="EXPENSE",
+                        parent=root, commodity=eur, placeholder=True)
+        book.save()
+        book.close()
+
+    def test_infers_german_from_tidy_chart(self, localized_book):
+        gb = GnuCashBook(str(localized_book))
+        with gb.open() as b:
+            # Aktiva/Fremdkapital/Aufwand/Eigenkapital match "de"; the
+            # template "Erträge" ≠ gettext "Ertrag" but voting carries it.
+            assert gb._infer_book_locale(b) == "de"
+
+    def test_returns_none_for_english_book(self, tmp_path):
+        path = tmp_path / "en.gnucash"
+        self._english_book(path)
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            assert gb._infer_book_locale(b) is None
+
+    def test_numbered_chart_below_threshold_returns_none(self, tmp_path):
+        path = tmp_path / "numbered.gnucash"
+        self._numbered_german_book(path)
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            # Only "Aktiva" matches (1 < 2) → None → English leaf.
+            assert gb._infer_book_locale(b) is None
+
+    def test_env_override_wins(self, localized_book, monkeypatch):
+        monkeypatch.setenv("GNUCASH_LOCALE", "fr_FR.UTF-8")
+        gb = GnuCashBook(str(localized_book))
+        with gb.open() as b:
+            # Override beats inference (which would say "de"); reduced
+            # to the bare language code.
+            assert gb._infer_book_locale(b) == "fr"
+
+    def test_locale_account_name_lookup_and_fallbacks(self, tmp_path):
+        path = tmp_path / "x.gnucash"
+        self._english_book(path)
+        gb = GnuCashBook(str(path))
+        en = "Foreign Exchange Gain/Loss"
+        # Hit.
+        assert (
+            gb._locale_account_name("fx_gain_loss", en, "de")
+            == "Realisierter Gewinn/Verlust"
+        )
+        # No locale → English default.
+        assert gb._locale_account_name("fx_gain_loss", en, None) == en
+        # Unknown locale → English default.
+        assert gb._locale_account_name("fx_gain_loss", en, "xx") == en
+        # Concept with no translation table → English default.
+        assert (
+            gb._locale_account_name("sales_discount", "Sales Discounts", "de")
+            == "Sales Discounts"
+        )
 
 
 class TestAutoBalancingAccountDetection:
@@ -465,16 +557,17 @@ class TestCrossCurrencyPaymentOnLocalizedBook:
             payment_date="2026-03-20",
         )
 
-        # Realized FX booked under the German income root, by TYPE.
+        # Realized FX booked under the German income root, by TYPE, with
+        # a localized leaf (§6.3 — the book infers "de").
         assert "fx_realized" in result
         assert (
             result["fx_realized"]["account"]
-            == "Erträge:Foreign Exchange Gain/Loss"
+            == "Erträge:Realisierter Gewinn/Verlust"
         )
         with gb.open() as b:
             fx = next(
                 (a for a in b.accounts
-                 if a.fullname == "Erträge:Foreign Exchange Gain/Loss"),
+                 if a.fullname == "Erträge:Realisierter Gewinn/Verlust"),
                 None,
             )
             assert fx is not None

@@ -556,8 +556,15 @@ class BusinessMixin:
         # the session would trip a NOT NULL on splits.tx_guid. The
         # final book.save() at the end of pay_invoice flushes everything
         # together with their now-set tx_guids.
+        # Localize the leaf on a non-English book (§6.3). Cosmetic only:
+        # the slot write below makes the next resolve GUID-based, so the
+        # localized name never has to be matched again.
+        fx_leaf = self._locale_account_name(
+            "fx_gain_loss", "Foreign Exchange Gain/Loss",
+            self._infer_book_locale(book),
+        )
         fx_acct = piecash.Account(
-            name="Foreign Exchange Gain/Loss",
+            name=fx_leaf,
             type="INCOME",
             parent=income,
             commodity=default_currency,
@@ -597,6 +604,7 @@ class BusinessMixin:
             keywords = self._PURCHASE_DISCOUNT_NAME_KEYWORDS
             side_label = "purchase discounts taken"
             slot_key = self._PURCHASE_DISCOUNT_SLOT_KEY
+            concept = "purchase_discount"
         else:
             canonical_path = self.SALES_DISCOUNTS_PATH
             canonical_type = "EXPENSE"
@@ -604,6 +612,7 @@ class BusinessMixin:
             keywords = self._SALES_DISCOUNT_NAME_KEYWORDS
             side_label = "sales discounts"
             slot_key = self._SALES_DISCOUNT_SLOT_KEY
+            concept = "sales_discount"
 
         # Layer 1: caller-supplied account wins.
         if discount_account is not None:
@@ -684,7 +693,13 @@ class BusinessMixin:
 
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
-        leaf_name = canonical_path.split(":")[-1]
+        # Localized leaf on a non-English book (§6.3); falls back to the
+        # English canonical leaf when no translation exists for the
+        # concept (the discount concepts have none shipped yet).
+        leaf_name = self._locale_account_name(
+            concept, canonical_path.split(":")[-1],
+            self._infer_book_locale(book),
+        )
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,

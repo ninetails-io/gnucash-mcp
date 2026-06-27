@@ -362,15 +362,24 @@ the env override covers ambiguity. (Settled — formerly the §10 open
 question.)
 
 - `_infer_book_locale(book)`: (1) honor an explicit `GNUCASH_LOCALE`
-  env/config override; else (2) reverse-match the book's top-level
-  type accounts against the bundled catalog table (if the top-level
-  INCOME account is "Erträge", infer `de`); else (3) `None`.
-- `_locale_account_name(concept, locale)`: look up a concept
-  ("Realized Gain/Loss", "Sales Discounts", …) in a bundled catalog
-  table seeded from the cousin doc's translation table (12 languages
-  for the core terms; extend by parsing `po/<lang>.po` later). Fall
-  back to the English name when locale is `None` or the concept is
-  missing.
+  env/config override, reduced to its language code; else (2) **vote**
+  — match the book's top-level type accounts against the bundled
+  gettext structural-word catalog and take the language with the most
+  matches (≥ 2, so a lone coincidental hit doesn't drive inference);
+  else (3) `None`. Voting (not a single-account lookup) is required by
+  the two-translation-sources trap (§3): a German book's top-level
+  income is the *template* word "Erträge", which does **not** equal
+  the *gettext* "Ertrag" — but Assets/Expenses/Equity
+  ("Aktiva"/"Aufwand"/"Eigenkapital") match exactly and carry the
+  vote. A numbered chart (SKR03) matches too few and correctly falls
+  back to English.
+- `_locale_account_name(concept, english_default, locale)`: look up a
+  concept ("Realized Gain/Loss", "Sales Discounts", …) in a bundled
+  catalog seeded from the cousin doc's translation table (12 languages
+  for the core terms; extend by parsing `po/<lang>.po` later). Returns
+  `english_default` when `locale` is `None`/unknown or the concept has
+  no translation. (Only the FX concept ships translations today; the
+  discount concepts have none in GnuCash and stay English.)
 - An English fallback leaf is **harmless** — the slot still resolves
   it. So this degrades gracefully and never blocks.
 
