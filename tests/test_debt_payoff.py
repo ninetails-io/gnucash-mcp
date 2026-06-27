@@ -457,9 +457,12 @@ class TestDebtPayoffAmortizingLoans:
         auto["apr"] = "4.90"
         # The amortization term is data, not inferred from the account
         # name (the old English "mortgage" substring was locale-
-        # fragile — it missed "Hypothek"/"Darlehen"). The Auto Loan
-        # declares its 5-year term via the loan_term_months slot; the
-        # Mortgage omits it and exercises the 30-year default.
+        # fragile — it missed "Hypothek"/"Darlehen"). Each loan
+        # declares its term via the loan_term_months slot: the Mortgage
+        # 30y, the Auto Loan 5y. There is no default term — a loan
+        # without this slot (and without minimum_payment) is omitted
+        # from the plan (see test_liability_without_term_is_omitted).
+        mortgage["loan_term_months"] = "360"
         auto["loan_term_months"] = "60"
         cc["apr"] = "18.25"
         book.save()
@@ -485,8 +488,8 @@ class TestDebtPayoffAmortizingLoans:
         return book_path
 
     def test_mortgage_uses_amortization_not_two_percent(self, tmp_path: Path):
-        """The mortgage minimum should be ~¥12-13K (amortization on a
-        30-year term), not ¥54K (2% of balance)."""
+        """The mortgage minimum should be ~¥12-13K (amortization on its
+        slot-declared 30-year term), not ¥54K (2% of balance)."""
         book_path = self._liability_book(tmp_path)
         gc_book = GnuCashBook(str(book_path))
 
@@ -498,9 +501,9 @@ class TestDebtPayoffAmortizingLoans:
             if d["account"] == "Liabilities:Loans:Mortgage":
                 mp = Decimal(d["minimum_payment"])
                 # 30-year amortization on ¥2,729,518 at 3.85% =
-                # ~¥12,789. Allow a generous ±¥500 band — the formula
-                # is exact; the band protects against future
-                # refactors choosing nearby term defaults.
+                # ~¥12,789, from the loan_term_months=360 slot. Allow a
+                # generous ±¥500 band — the formula is exact; the band
+                # absorbs rounding only.
                 assert Decimal("12200") < mp < Decimal("13400"), (
                     f"Mortgage minimum {mp} outside expected range"
                 )
@@ -527,12 +530,13 @@ class TestDebtPayoffAmortizingLoans:
                 assert Decimal("1700") < mp < Decimal("2000"), (
                     f"Auto loan minimum {mp} outside expected range"
                 )
-                # Discriminate by term: 5y (slot) → ~¥1,824; the 30y
-                # default would give ~¥514. Proves the loan_term_months
-                # slot drives the amortization, not the account name.
+                # Discriminate by term: the 5y slot → ~¥1,824, whereas
+                # the mortgage's 30y slot on the same balance would give
+                # far less. Proves the loan_term_months slot drives the
+                # amortization, not the account name (and not a default).
                 assert mp > Decimal("1500"), (
-                    "Auto loan got the 30-year default — the "
-                    "loan_term_months slot was not honored"
+                    "Auto loan minimum too low — the loan_term_months "
+                    "slot (60) was not honored"
                 )
                 break
         else:
@@ -601,6 +605,84 @@ class TestDebtPayoffAmortizingLoans:
                 break
         else:
             pytest.fail("Mortgage not found in results")
+
+    def test_liability_without_term_is_omitted(self, tmp_path: Path):
+        """A LIABILITY with an APR and balance but no loan_term_months
+        and no minimum_payment is omitted from the plan rather than
+        amortized from a guessed term — a wrong estimate (30y vs 5y
+        differ by an order of magnitude) is worse than none."""
+        book_path = self._liability_book(tmp_path)
+        gc_book = GnuCashBook(str(book_path))
+        # Strip the Mortgage's term slot so it has no payment source.
+        gc_book.delete_account_slot(
+            "Liabilities:Loans:Mortgage", "loan_term_months",
+        )
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="30000",
+        )
+
+        # Omitted from the actionable plan...
+        names = [d["account"] for d in result["debts"]]
+        assert "Liabilities:Loans:Mortgage" not in names
+        # ...and surfaced as unestimable with an actionable message,
+        # rather than silently dropped or guessed.
+        assert "Liabilities:Loans:Mortgage" in result["unestimable"]
+        assert any(
+            "loan_term_months" in w for w in result["warnings"]
+        ), "expected a warning naming loan_term_months"
+        # The estimable debts (Auto Loan term=60, Credit Card 2%) still plan.
+        assert "Liabilities:Loans:Auto Loan" in names
+
+    def test_all_liabilities_unestimable_raises_actionably(
+        self, tmp_path: Path,
+    ):
+        """If every qualifying debt is unestimable, the error names the
+        fix (set loan_term_months / minimum_payment), not the wrong
+        'no apr slot' cause."""
+        import piecash
+
+        book_path = tmp_path / "unestimable_only.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        usd = book.default_currency
+        root = book.root_account
+        liabilities = piecash.Account(
+            name="Liabilities", type="LIABILITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        loan = piecash.Account(
+            name="Personal Loan", type="LIABILITY", parent=liabilities,
+            commodity=usd,
+        )
+        equity = piecash.Account(
+            name="Equity", type="EQUITY", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        opening = piecash.Account(
+            name="Opening Balance", type="EQUITY", parent=equity,
+            commodity=usd,
+        )
+        book.save()
+        loan["apr"] = "6.5"  # APR set, but no term and no minimum_payment.
+        book.save()
+        tx = piecash.Transaction(
+            currency=usd, description="Opening: Personal Loan",
+            post_date=date(2026, 1, 1),
+            splits=[
+                piecash.Split(account=loan, value=Decimal("-12000")),
+                piecash.Split(account=opening, value=Decimal("12000")),
+            ],
+        )
+        book.session.add(tx)
+        book.save()
+
+        gc_book = GnuCashBook(str(book_path))
+        with pytest.raises(ValueError, match="loan_term_months"):
+            gc_book.debt_payoff_plan(
+                compact=False, monthly_budget="5000",
+            )
 
 
 class TestDebtPayoffTemplateAccountFiltering:

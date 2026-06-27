@@ -355,6 +355,12 @@ Because Layer 0 makes resolution GUID-based, the created leaf name is
 purely cosmetic and can be localized freely without risking later
 resolution.
 
+**Locale source of truth (decided).** Infer the locale from the book's
+own account names, with `GNUCASH_LOCALE` as an optional override.
+Inference is zero-config and matches the book the user actually has;
+the env override covers ambiguity. (Settled — formerly the §10 open
+question.)
+
 - `_infer_book_locale(book)`: (1) honor an explicit `GNUCASH_LOCALE`
   env/config override; else (2) reverse-match the book's top-level
   type accounts against the bundled catalog table (if the top-level
@@ -380,21 +386,31 @@ interoperable choice.
 - **Mortgage term (B).** Remove the `"mortgage"` substring heuristic.
   There is no "mortgage" account type, so the locale-correct source of
   truth is explicit data: honor the existing `minimum_payment` slot and
-  add an optional `loan_term_months` slot. When neither is set, use a
-  single conservative default term and **surface a warning** that the
-  estimate is rough — rather than guessing 30y-vs-5y from an English
-  word. (Removes the assumption entirely; also fixes English books that
-  named the account "Home Loan".)
+  add an optional `loan_term_months` slot. **No default term.** When
+  neither slot is set, *omit the minimum-payment estimate entirely* and
+  surface `"set loan_term_months for payment estimates"` rather than
+  guessing — a 30y-vs-5y guess differs by an order of magnitude, and a
+  wrong estimate on camera is worse than no estimate. (Removes the
+  assumption entirely; also fixes English books that named the account
+  "Home Loan".)
 - **Loan bucketing (B).** Replace the `"loan"` substring with a type
   split: `CREDIT` → "Credit cards", other `LIABILITY` → "Loans & other
   liabilities". Locale-correct; minor, intentional relabeling.
 - **Imbalance/Orphan detection (C).** Replace the English-prefix check
-  with a structural predicate, e.g.
-  `_is_auto_imbalance_account(account, root)` =
-  `account.parent is root` **and** `account.type == "BANK"` **and**
-  `re.search(r"-[A-Z]{3}$", account.name)` (or account currency ≠
-  default → unsuffixed form also handled). Optional tiebreaker: the
-  locale `.po` word for Imbalance/Orphan. No English string-compare.
+  with a structural-plus-catalog predicate,
+  `_is_auto_balancing_account(account, root)`: `account.type == "BANK"`
+  **and** `account.parent is root` **and** `account.name.lower()`
+  starts with any "Imbalance"/"Orphan" entry in the bundled locale
+  catalog (`_BALANCING_ACCOUNT_NAME_PREFIXES`, §6.3). The catalog
+  **prefix** match is what makes the currency suffix irrelevant: one
+  rule accepts both the suffixed form (`Ungleichgewicht-EUR`, when the
+  account currency ≠ book default) and the unsuffixed form
+  (`Ungleichgewicht`, when it equals the default). `type == BANK` +
+  `parent is root` are the structural invariants that keep the prefix
+  match off ordinary user accounts; unknown locales degrade to the
+  English words. `Orphaned Gains` is deliberately **not** matched — it
+  is type `INCOME`, a legitimate account, not a defect. No English
+  string-compare.
 
 ---
 
@@ -506,14 +522,10 @@ future body of work and explicitly not promised by v1.4.
 
 ## 10. Open questions
 
-1. **Locale source of truth.** Is inferring locale from the book's own
-   account names (§6.3) acceptable, or should `GNUCASH_LOCALE` be
-   required for localized names? (Inference is zero-config and matches
-   the book the user actually has; the env override covers ambiguity.)
-2. **Trading-Accounts books** (§4.5) — confirm via a live test that a
+1. **Trading-Accounts books** (§4.5) — confirm via a live test that a
    post-commit scrub doesn't interact with our FX split. Low
    probability; cheap to check on the German persona.
-3. **Catalog coverage.** Seed from the cousin doc's 12-language table
+2. **Catalog coverage.** Seed from the cousin doc's 12-language table
    now; decide later whether to parse all 61 `po/` locales at build
    time. Not a blocker — English fallback is safe.
 

@@ -211,10 +211,12 @@ class TestAutoBalancingAccountDetection:
 
 class TestLoanTermLocaleRobust:
     """Tier B: ``debt_payoff_plan`` must not guess a loan's
-    amortization term from an English "mortgage" substring. A German
-    "Hypothek" now gets the 30y default term (not the old 5y), and the
-    ``loan_term_months`` slot overrides it — both proven via the
-    budget gate (budget < sum-of-minimums raises).
+    amortization term from an English "mortgage" substring, and must
+    not fall back to a fabricated default term. A German "Hypothek"
+    with no ``loan_term_months`` (and no ``minimum_payment``) is
+    omitted from the plan with an actionable message rather than
+    amortized from a guessed term; setting ``loan_term_months`` makes
+    it estimable — both proven via the omit error / the budget gate.
     """
 
     @staticmethod
@@ -261,17 +263,20 @@ class TestLoanTermLocaleRobust:
         book.save()
         book.close()
 
-    def test_german_mortgage_gets_30y_default_not_5y(self, tmp_path):
-        # €200k @ 4%: ~€955/mo over 30y, ~€3,683/mo over 5y. A €2,000
-        # budget covers the 30y default but NOT the old 5y keyword
-        # term — so a clean run proves the English "mortgage" guess is
-        # gone (a "Hypothek" never matched it, so it used to amortize
-        # over 5y and blow the budget gate).
+    def test_german_mortgage_without_term_is_omitted_not_guessed(self, tmp_path):
+        # €200k @ 4% Hypothek with no loan_term_months and no
+        # minimum_payment. There is no "mortgage" account type and no
+        # default term to fall back on, so its payment can't be
+        # estimated — and it's the only debt, so the plan raises an
+        # actionable error naming loan_term_months rather than guessing
+        # a 30y (or 5y) term. Proves both: the English-keyword guess is
+        # gone (a "Hypothek" never matched it) AND there is no silent
+        # default standing in for the missing data.
         path = tmp_path / "hyp.gnucash"
         self._hypothek_book(path)
         gb = GnuCashBook(str(path))
-        result = gb.debt_payoff_plan(monthly_budget="2000", compact=True)
-        assert result  # no ValueError
+        with pytest.raises(ValueError, match="loan_term_months"):
+            gb.debt_payoff_plan(monthly_budget="2000", compact=True)
 
     def test_loan_term_months_slot_is_honored(self, tmp_path):
         # Force a 5y term via the slot → ~€3,683/mo minimum, which
