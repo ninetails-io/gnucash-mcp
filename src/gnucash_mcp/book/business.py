@@ -340,6 +340,74 @@ class BusinessMixin:
         "vendor discounts",
     )
 
+    # ── Designated-account KVP slots (Layer 0 of the resolvers) ──────
+    #
+    # Once the FX / discount account is first resolved or created, its
+    # GUID is stored in a book-global slot on the root account. Every
+    # later resolution reads that GUID directly (Layer 0) — immune to
+    # both account renames and the book's locale, because the name no
+    # longer participates once the slot is populated. A stale or missing
+    # slot falls through to the lower layers, which re-populate it on the
+    # next create, so the designation self-heals.
+    #
+    # Path-style ``gnc-mcp/<role>`` keys (hierarchical sub-slots in the
+    # KVP store) per the slot-naming convention. One account per role,
+    # each denominated in the book default currency, so a single slot on
+    # the root account suffices — no per-source-account/per-commodity
+    # path is needed.
+    _FX_ACCOUNT_SLOT_KEY = "gnc-mcp/fx-gain-loss-acct"
+    _SALES_DISCOUNT_SLOT_KEY = "gnc-mcp/sales-discount-acct"
+    _PURCHASE_DISCOUNT_SLOT_KEY = "gnc-mcp/purchase-discount-acct"
+
+    def _resolve_designated_account(self, book, slot_key):
+        """Layer 0: resolve a designated FX/discount account from its
+        root-account KVP slot.
+
+        Returns the Account iff the slot holds a GUID that still
+        resolves to an INCOME/EXPENSE account in the book default
+        currency. A missing, empty, or stale slot (the account was
+        deleted, retyped, or re-denominated) returns ``None`` — the
+        caller falls through to the lower layers and re-writes the slot
+        on the next create, so the designation self-heals.
+
+        GUID-based, hence locale- and rename-proof: the account can be
+        renamed or re-parented freely after first use and still resolve.
+        """
+        try:
+            raw = book.root_account[slot_key]
+        except KeyError:
+            return None
+        guid = _slot_value_str(raw)
+        if not guid:
+            return None
+        acct = self._resolve_account(book, guid)
+        if acct is None:
+            return None
+        if acct.type not in {"INCOME", "EXPENSE"}:
+            return None
+        if acct.commodity != self._require_default_currency(book):
+            return None
+        return acct
+
+    def _store_designated_account(self, book, slot_key, account) -> None:
+        """Persist ``account``'s GUID to a root-account KVP slot so
+        future resolutions hit Layer 0 (a direct, locale-/rename-proof
+        GUID lookup) instead of re-deriving the account by name.
+
+        Called once the FX/discount account is definitively resolved
+        (found at its canonical path or freshly created). piecash
+        assigns ``guid`` at flush, not construction, and we cannot
+        flush mid-payment-build (orphan splits would trip a NOT NULL on
+        ``splits.tx_guid``); so a freshly created account is still
+        guid-less here. Assign the canonical guid now — piecash uses it
+        at INSERT — and the slot persists with the caller's final
+        ``book.save()``.
+        """
+        if account.guid is None:
+            import uuid
+            account.guid = uuid.uuid4().hex
+        book.root_account[slot_key] = account.guid
+
     def _get_or_create_fx_account(self, book, fx_account: str | None = None):
         """Find or lazily create the FX-gain/loss account.
 
@@ -349,8 +417,16 @@ class BusinessMixin:
 
         Resolution order:
 
+        0. **Stored designation** — a GUID written to the
+           ``gnc-mcp/fx-gain-loss-acct`` root slot on a prior resolve/
+           create. Consulted only when no explicit ``fx_account`` is
+           given; GUID-based, so it is immune to a rename of the FX
+           account and to the book's locale. The primary path after
+           first use.
         1. **Explicit ``fx_account``** (path, ``%short``, or full
            GUID) — validated for existence and INCOME/EXPENSE type.
+           A per-call override; wins over the stored designation and
+           is not itself persisted.
         2. **Fuzzy match**, leaf-name substring against
            ``_FX_NAME_KEYWORDS`` over INCOME/EXPENSE accounts:
            exactly one match → use it; zero → fall through; more
@@ -358,14 +434,17 @@ class BusinessMixin:
            caller to pass ``fx_account``. Don't guess between
            user-created accounts.
         3. **Canonical default**: existing ``Income:Foreign Exchange
-           Gain/Loss``, else auto-create it under ``Income`` — so
-           books without foreign-currency activity never accumulate
-           an unused account.
+           Gain/Loss``, else auto-create it under the top-level INCOME
+           account resolved *by type* — locale-robust, so it works on
+           a book whose income root is "Erträge"/"Ingresos"/… (and
+           survives a user rename), instead of throwing on a missing
+           English "Income". Falls back to creating a top-level INCOME
+           account only if the book has none at all.
 
         Raises:
-            ValueError: ``fx_account`` supplied but missing or not
-                INCOME/EXPENSE; or no ``Income`` parent to create
-                under.
+            ValueError: ``fx_account`` supplied but missing, not
+                INCOME/EXPENSE, or denominated in a non-default
+                currency.
         """
         default_currency = self._require_default_currency(book)
 
@@ -397,6 +476,15 @@ class BusinessMixin:
                     f"currency ({default_currency.mnemonic})."
                 )
             return acct, None
+
+        # Layer 0: a stored designation wins for the no-explicit-arg
+        # case (the usual pay_invoice path). GUID-based, so it survives
+        # a rename of the FX account and works on any locale.
+        slotted = self._resolve_designated_account(
+            book, self._FX_ACCOUNT_SLOT_KEY
+        )
+        if slotted is not None:
+            return slotted, None
 
         # Layer 2: fuzzy match by leaf-name substring. Only
         # default-currency candidates qualify — see the commodity
@@ -435,15 +523,32 @@ class BusinessMixin:
         # Layer 3: canonical default (existing or auto-create).
         fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
         if fx_acct is not None:
+            # Lock in the designation so the next call hits Layer 0
+            # directly — even on a book that already had this account.
+            self._store_designated_account(
+                book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
+            )
             return fx_acct, notice
 
-        income = self._find_account(book, "Income")
+        # Resolve the parent by TYPE, not the English name "Income".
+        # On a localized book the income root is "Erträge"/"Ingresos"/…,
+        # so _find_account(book, "Income") returns None and the old
+        # code threw here — the first cross-currency payment failing.
+        # Fall back to creating a top-level INCOME account only if the
+        # book genuinely has none.
+        income, parent_notice = self._top_level_account_of_type(
+            book, "INCOME"
+        )
         if income is None:
-            raise ValueError(
-                "Realized FX gain/loss on cross-currency payment needs "
-                "an Income parent account, but none exists. Create "
-                "Income (type=INCOME, placeholder) first."
+            income = piecash.Account(
+                name="Income",
+                type="INCOME",
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
             )
+        if notice is None:
+            notice = parent_notice
 
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
@@ -451,8 +556,15 @@ class BusinessMixin:
         # the session would trip a NOT NULL on splits.tx_guid. The
         # final book.save() at the end of pay_invoice flushes everything
         # together with their now-set tx_guids.
+        # Localize the leaf on a non-English book (§6.3). Cosmetic only:
+        # the slot write below makes the next resolve GUID-based, so the
+        # localized name never has to be matched again.
+        fx_leaf = self._locale_account_name(
+            "fx_gain_loss", "Foreign Exchange Gain/Loss",
+            self._infer_book_locale(book),
+        )
         fx_acct = piecash.Account(
-            name="Foreign Exchange Gain/Loss",
+            name=fx_leaf,
             type="INCOME",
             parent=income,
             commodity=default_currency,
@@ -461,6 +573,9 @@ class BusinessMixin:
                 "invoice settlements (rate drift between post-date "
                 "and pay-date). Auto-created on first use."
             ),
+        )
+        self._store_designated_account(
+            book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
         )
         return fx_acct, notice
 
@@ -471,9 +586,11 @@ class BusinessMixin:
         """Find or lazily create the early-payment-discount account.
 
         Direct parallel to ``_get_or_create_fx_account`` — same
-        three-layer resolution (explicit > fuzzy match > canonical
-        default with auto-create) and the same ``(account, notice)``
-        return shape.
+        four-layer resolution (stored designation > explicit > fuzzy
+        match > canonical default with auto-create) and the same
+        ``(account, notice)`` return shape. The Layer-0 slot is
+        per-side, so the sales and purchase designations are
+        independent.
 
         ``owner_type_is_bill`` selects the side: True → vendor-bill
         payment (or customer credit-note refund), discount is INCOME
@@ -486,12 +603,16 @@ class BusinessMixin:
             canonical_parent_path = "Income"
             keywords = self._PURCHASE_DISCOUNT_NAME_KEYWORDS
             side_label = "purchase discounts taken"
+            slot_key = self._PURCHASE_DISCOUNT_SLOT_KEY
+            concept = "purchase_discount"
         else:
             canonical_path = self.SALES_DISCOUNTS_PATH
             canonical_type = "EXPENSE"
             canonical_parent_path = "Expenses"
             keywords = self._SALES_DISCOUNT_NAME_KEYWORDS
             side_label = "sales discounts"
+            slot_key = self._SALES_DISCOUNT_SLOT_KEY
+            concept = "sales_discount"
 
         # Layer 1: caller-supplied account wins.
         if discount_account is not None:
@@ -509,6 +630,12 @@ class BusinessMixin:
                     f"receive an early-payment-discount split."
                 )
             return acct, None
+
+        # Layer 0: a stored designation wins for the no-explicit-arg
+        # case. Per-side slot, GUID-based — rename- and locale-proof.
+        slotted = self._resolve_designated_account(book, slot_key)
+        if slotted is not None:
+            return slotted, None
 
         # Layer 2: fuzzy match by leaf-name substring.
         template_guids = self._template_account_guids(book)
@@ -542,21 +669,37 @@ class BusinessMixin:
         # Layer 3: canonical default (existing or auto-create).
         disc_acct = self._find_account(book, canonical_path)
         if disc_acct is not None:
+            self._store_designated_account(book, slot_key, disc_acct)
             return disc_acct, notice
 
-        parent = self._find_account(book, canonical_parent_path)
-        if parent is None:
-            raise ValueError(
-                f"Early-payment discount on this payment needs an "
-                f"{canonical_parent_path} parent account, but none "
-                f"exists. Create {canonical_parent_path} (type="
-                f"{canonical_type}, placeholder) first."
-            )
-
+        # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
+        # name "Income"/"Expenses" — locale-robust and rename-proof.
+        # Fall back to creating the top-level account only if the book
+        # has none of that type.
+        parent, parent_notice = self._top_level_account_of_type(
+            book, canonical_type
+        )
         default_currency = self._require_default_currency(book)
+        if parent is None:
+            parent = piecash.Account(
+                name=canonical_parent_path,
+                type=canonical_type,
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
+            )
+        if notice is None:
+            notice = parent_notice
+
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
-        leaf_name = canonical_path.split(":")[-1]
+        # Localized leaf on a non-English book (§6.3); falls back to the
+        # English canonical leaf when no translation exists for the
+        # concept (the discount concepts have none shipped yet).
+        leaf_name = self._locale_account_name(
+            concept, canonical_path.split(":")[-1],
+            self._infer_book_locale(book),
+        )
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,
@@ -569,6 +712,7 @@ class BusinessMixin:
                 f"validation passes. Auto-created on first use."
             ),
         )
+        self._store_designated_account(book, slot_key, disc_acct)
         return disc_acct, notice
 
     def _get_invoice_billterm(self, book, inv):
@@ -1621,6 +1765,20 @@ class BusinessMixin:
         if row and row[0]:
             gdate_val = row[0]
             if isinstance(gdate_val, str):
+                # GnuCash GDATE columns return a compact ``YYYYMMDD``
+                # string; other paths yield ISO ``YYYY-MM-DD``. Python
+                # 3.11+ ``date.fromisoformat`` accepts both, but 3.10
+                # (a supported target) rejects the compact form and
+                # raises — which the warnings collector's broad
+                # ``except`` then swallows, silently dropping the
+                # overdue warning. Normalize to digits first.
+                digits = gdate_val.strip().replace("-", "")[:8]
+                if len(digits) == 8 and digits.isdigit():
+                    return (
+                        date(int(digits[:4]), int(digits[4:6]),
+                             int(digits[6:8])),
+                        False,
+                    )
                 return date.fromisoformat(gdate_val[:10]), False
             if isinstance(gdate_val, datetime):
                 return gdate_val.date(), False

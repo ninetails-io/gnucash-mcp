@@ -924,6 +924,251 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
                 return account
         return None
 
+    def _top_level_account_of_type(
+        self, book: piecash.Book, acct_type: str
+    ) -> "tuple[piecash.Account | None, dict | None]":
+        """Find the top-level account of a given ``GNCAccountType``.
+
+        "Top-level" = a direct child of the real root account. This is
+        the locale-invariant replacement for English-name parent
+        lookups such as ``_find_account(book, "Income")``: it keys off
+        ``type`` and ``parent is root``, never a name, so it works on a
+        localized book (German "Erträge", etc.) **and** survives a user
+        renaming the account. Account *types* are never localized;
+        names always are.
+
+        Returns ``(account, notice)``:
+
+        - exactly one match → ``(account, None)``
+        - several → the lowest-``fullname`` pick plus an
+          ``ambiguous_top_level_account`` notice (mirrors the
+          ``ambiguous_fx_account`` convention so callers can surface it)
+        - none → ``(None, None)``
+
+        The scheduled-transaction template subtree is excluded, as
+        everywhere else accounts are surfaced.
+        """
+        root = book.root_account
+        template_guids = self._template_account_guids(book)
+        candidates = sorted(
+            (
+                a
+                for a in book.accounts
+                if a.guid not in template_guids
+                and a.type == acct_type
+                and a.parent is not None
+                and a.parent.guid == root.guid
+            ),
+            key=lambda a: a.fullname,
+        )
+        if not candidates:
+            return None, None
+        if len(candidates) == 1:
+            return candidates[0], None
+        chosen = candidates[0]
+        names = ", ".join(a.fullname for a in candidates)
+        notice = {
+            "type": "ambiguous_top_level_account",
+            "account_type": acct_type,
+            "candidates": [a.fullname for a in candidates],
+            "chosen": chosen.fullname,
+            "message": (
+                f"Found {len(candidates)} top-level {acct_type} "
+                f"accounts ({names}); using {chosen.fullname!r}. Pass "
+                f"an explicit account to override."
+            ),
+        }
+        return chosen, notice
+
+    # GnuCash names its auto-created balancing accounts via gettext —
+    # ``_("Imbalance")-<CUR>`` and ``_("Orphan")-<CUR>`` (Scrub.cpp) —
+    # so the leading word is localized. An English-only prefix check
+    # misses them on a localized book and the data-integrity warning
+    # goes dark. These are the catalog translations of "Imbalance" and
+    # "Orphan" across the shipped GnuCash locales, lowercased; a leaf
+    # name that STARTS WITH any of them is a balancing account (the
+    # "-<CUR>" suffix, when present, follows the word). Source:
+    # specs/gnucash-account-naming-i18n.md.
+    _BALANCING_ACCOUNT_NAME_PREFIXES = frozenset(
+        s.lower()
+        for s in (
+            # "Imbalance"
+            "Imbalance", "Ausgleichskonto", "Non soldé", "Descuadre",
+            "Sbilancio", "Desequilíbrio", "Niet in balans", "Дисбаланс",
+            "貸借不一致", "不平衡的", "대차 불일치", "Niezrównoważenie",
+            "Obalans",
+            # "Orphan"
+            "Orphan", "Ausbuchungskonto", "Orphelin", "Huérfano",
+            "Orfano", "Órfão", "Verweesd", "Упущенный", "不明",
+            "孤立的", "고아", "Osierocone", "Föräldralös",
+        )
+    )
+
+    def _is_auto_balancing_account(
+        self, account: piecash.Account, root: piecash.Account
+    ) -> bool:
+        """True iff ``account`` is a GnuCash auto-created Imbalance or
+        Orphan balancing account.
+
+        A non-zero balance on one of these is a structural defect the
+        dashboard surfaces. Locale-robust: match by **structure** —
+        type ``BANK``, a direct child of root (both invariants of how
+        GnuCash hangs these accounts) — plus a leading word from the
+        known Imbalance/Orphan catalog translations. Unknown locales
+        degrade to the English forms; the structural gate keeps false
+        positives off ordinary user accounts. (``Orphaned Gains`` is
+        deliberately excluded — it is type ``INCOME``, a legitimate
+        account, not a defect.)
+        """
+        if account.type != "BANK":
+            return False
+        if account.parent is None or account.parent.guid != root.guid:
+            return False
+        leaf = account.name.lower()
+        return any(
+            leaf.startswith(p)
+            for p in self._BALANCING_ACCOUNT_NAME_PREFIXES
+        )
+
+    # ── Book-locale inference + localized account names (§6.3) ────────
+    #
+    # When we auto-create an FX/discount account on a localized book we
+    # give it a localized leaf name so it reads naturally in the user's
+    # language. This is purely cosmetic: resolution after first use is
+    # GUID-based (the Layer-0 designated-account slot), so the leaf name
+    # never participates in finding the account again — an English
+    # fallback is always safe and never blocks.
+    #
+    # gettext (po/<lang>.po) translations of the five structural type
+    # words, keyed by GNCAccountType, used ONLY to infer the book locale
+    # from its top-level accounts. Source: gnucash-account-naming-i18n.md.
+    # Locale keys are normalized 2-letter codes (pt_BR→pt, zh_CN→zh).
+    _STRUCTURAL_TYPE_NAMES = {
+        "de": {"ASSET": "Aktiva", "LIABILITY": "Fremdkapital",
+               "INCOME": "Ertrag", "EXPENSE": "Aufwand",
+               "EQUITY": "Eigenkapital"},
+        "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)",
+               "INCOME": "Revenus", "EXPENSE": "Dépenses",
+               "EQUITY": "Capitaux propres"},
+        "es": {"ASSET": "Activos", "LIABILITY": "Pasivos",
+               "INCOME": "Ingreso", "EXPENSE": "Gastos",
+               "EQUITY": "Patrimonio"},
+        "it": {"ASSET": "Attività", "LIABILITY": "Passività",
+               "INCOME": "Entrate", "EXPENSE": "Uscite",
+               "EQUITY": "Patrimonio netto"},
+        "pt": {"ASSET": "Ativos", "LIABILITY": "Passivos",
+               "INCOME": "Receita", "EXPENSE": "Despesas",
+               "EQUITY": "Patrimônio líquido"},
+        "nl": {"ASSET": "Activa", "LIABILITY": "Vreemd vermogen",
+               "INCOME": "Opbrengsten", "EXPENSE": "Kosten",
+               "EQUITY": "Eigen vermogen"},
+        "ru": {"ASSET": "Активы", "LIABILITY": "Обязательства",
+               "INCOME": "Приход", "EXPENSE": "Расходы",
+               "EQUITY": "Собственные средства"},
+        "ja": {"ASSET": "資産", "LIABILITY": "負債", "INCOME": "収益",
+               "EXPENSE": "費用", "EQUITY": "純資産"},
+        "zh": {"ASSET": "资产", "LIABILITY": "负债", "INCOME": "收入",
+               "EXPENSE": "支出", "EQUITY": "所有者权益"},
+        "ko": {"ASSET": "자산", "LIABILITY": "부채", "INCOME": "수입",
+               "EXPENSE": "비용", "EQUITY": "자기자본"},
+        "pl": {"ASSET": "Aktywa", "LIABILITY": "Pasywa",
+               "INCOME": "Przychody", "EXPENSE": "Wydatki",
+               "EQUITY": "Kapitał własny"},
+        "sv": {"ASSET": "Tillgångar", "LIABILITY": "Skulder",
+               "INCOME": "Inkomst", "EXPENSE": "Utgifter",
+               "EQUITY": "Eget kapital"},
+    }
+
+    # Localized leaf names for the accounts we auto-create, keyed by an
+    # internal concept slug then normalized locale code. Only concepts
+    # with a translation table appear here; a missing concept or locale
+    # degrades to the caller's English default. Seeded from the
+    # "Realized Gain/Loss" row of gnucash-account-naming-i18n.md;
+    # extend by parsing po/<lang>.po later (the discount concepts have
+    # no shipped GnuCash translation, so they stay English for now).
+    _LOCALIZED_ACCOUNT_NAMES = {
+        "fx_gain_loss": {
+            "de": "Realisierter Gewinn/Verlust",
+            "fr": "Gains/pertes réalisés",
+            "es": "Ganancias/Pérdidas Ocurridas",
+            "it": "Profitti e perdite realizzati",
+            "pt": "Ganhos e perdas realizados",
+            "nl": "Gerealiseerde winst/verlies",
+            "ru": "Реализованная прибыль/убыток",
+            "ja": "実現損益",
+            "zh": "已实现获利(亏损)",
+            "ko": "실제 이익/손실",
+            "pl": "Zyski/straty zrealizowane",
+            "sv": "Reavinst/-förlust",
+        },
+    }
+
+    def _infer_book_locale(self, book: piecash.Book) -> str | None:
+        """Infer the book's locale (a normalized 2-letter language
+        code) for naming auto-created accounts. Decided source of
+        truth (§6.3):
+
+        1. ``GNUCASH_LOCALE`` env override, reduced to its language
+           code (``de_DE.UTF-8`` → ``de``).
+        2. else **vote**: match the book's top-level type accounts
+           against the gettext structural-word catalog; the language
+           with the most matches wins (>= 2, so a single coincidental
+           hit doesn't drive inference).
+        3. else ``None`` → English leaf names.
+
+        Voting (not a single-account lookup) sidesteps the two-
+        translation-sources trap: a German book's top-level income is
+        the template word "Erträge", which does NOT equal the gettext
+        "Ertrag" — but Assets/Expenses/Equity ("Aktiva"/"Aufwand"/
+        "Eigenkapital") match exactly, so German still resolves. A
+        numbered chart like SKR03 matches too few to trigger and
+        correctly falls back to English.
+        """
+        import os
+        override = os.environ.get("GNUCASH_LOCALE")
+        if override:
+            code = override.strip().split(".")[0].split("_")[0].lower()
+            return code or None
+
+        root = book.root_account
+        template_guids = self._template_account_guids(book)
+        names_by_type: dict[str, list[str]] = {}
+        for acct in book.accounts:
+            if acct.guid in template_guids:
+                continue
+            if acct.parent is None or acct.parent.guid != root.guid:
+                continue
+            names_by_type.setdefault(acct.type, []).append(
+                acct.name.strip().lower()
+            )
+        if not names_by_type:
+            return None
+
+        best_lang, best_score = None, 0
+        for lang, type_words in self._STRUCTURAL_TYPE_NAMES.items():
+            score = sum(
+                1
+                for atype, word in type_words.items()
+                if any(n == word.lower() for n in names_by_type.get(atype, ()))
+            )
+            if score > best_score:
+                best_lang, best_score = lang, score
+        return best_lang if best_score >= 2 else None
+
+    def _locale_account_name(
+        self, concept: str, english_default: str, locale: str | None,
+    ) -> str:
+        """Localized leaf name for an auto-created-account ``concept``,
+        or ``english_default`` when no localization applies (``locale``
+        is None/unknown, or the concept has no translation). Cosmetic
+        only — resolution is GUID-based, so the fallback never blocks.
+        """
+        if locale is None:
+            return english_default
+        return self._LOCALIZED_ACCOUNT_NAMES.get(concept, {}).get(
+            locale, english_default
+        )
+
     # ── Short account GUIDs ───────────────────────────────────────────
     #
     # Format "%XXXXXXX" (literal "%" + ≥7 hex chars) — cheap on the

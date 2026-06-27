@@ -1274,6 +1274,11 @@ class ReportingMixin:
             # valued in the book default; collected here and excluded
             # from the schedule (see the loop guard below).
             excluded_debts: list[str] = []
+            # LIABILITY accounts with an APR and balance but no way to
+            # estimate a payment (neither minimum_payment nor
+            # loan_term_months slot). Omitted from the plan rather than
+            # estimated from a guessed term — see the LIABILITY branch.
+            unestimable_debts: list[str] = []
             # Counted so the no-debts error distinguishes "no debt
             # accounts at all" from "they exist but lack the apr
             # slot" — the user's next action differs.
@@ -1383,11 +1388,33 @@ class ReportingMixin:
                     else:
                         # LIABILITY: amortization formula
                         # PMT = P × r(1+r)^n / ((1+r)^n − 1).
-                        # Term: 30y when "mortgage" appears in the
-                        # path, else 5y; non-standard terms should
-                        # set the minimum_payment slot.
-                        is_mortgage = "mortgage" in account.fullname.lower()
-                        term_months = 360 if is_mortgage else 60
+                        # Term comes ONLY from the `loan_term_months`
+                        # slot. There is no "mortgage" account type to
+                        # key off, and no safe default term: a 30y-vs-5y
+                        # guess differs by an order of magnitude, so a
+                        # guessed estimate is wrong enough to be worse
+                        # than none (a low guess understates the payment;
+                        # a high one trips the budget gate). Without the
+                        # slot — or an explicit `minimum_payment` above —
+                        # omit this debt from the plan and tell the user
+                        # what to set, rather than fabricate a figure.
+                        term_months = None
+                        lt_val = slot_by_name.get("loan_term_months")
+                        if lt_val is not None:
+                            try:
+                                lt_str = (
+                                    str(lt_val.value)
+                                    if hasattr(lt_val, "value")
+                                    else str(lt_val)
+                                )
+                                parsed = int(Decimal(lt_str))
+                                if parsed > 0:
+                                    term_months = parsed
+                            except (InvalidOperation, ValueError):
+                                pass
+                        if term_months is None:
+                            unestimable_debts.append(account.fullname)
+                            continue
                         monthly_rate = (
                             apr / Decimal("100") / Decimal("12")
                         )
@@ -1435,6 +1462,20 @@ class ReportingMixin:
                 f"{', '.join(sorted(excluded_debts))}"
             )
 
+        # Debts omitted because their payment can't be estimated without
+        # guessing the amortization term — surfaced so the reader knows
+        # the plan is partial and exactly what to set to complete it.
+        unestimable_warning = None
+        if unestimable_debts:
+            unestimable_warning = (
+                f"{len(unestimable_debts)} debt(s) omitted — no "
+                f"'loan_term_months' or 'minimum_payment' slot, so the "
+                f"payment can't be estimated without guessing the loan "
+                f"term: {', '.join(sorted(unestimable_debts))}. Set "
+                f"loan_term_months (or minimum_payment) via "
+                f"set_account_slot for payment estimates."
+            )
+
         if not debts:
             # Nothing left to plan but some debts were excluded for lack
             # of an FX rate — lead with that actionable cause (distinct
@@ -1462,6 +1503,18 @@ class ReportingMixin:
                     "chart of accounts. Create the debt account(s) "
                     "first via create_account, then set their APR "
                     "via set_account_slot."
+                )
+            # Distinct from the apr-missing case below: these debts have
+            # an APR and balance but no term/payment to estimate from.
+            if unestimable_debts:
+                raise ValueError(
+                    f"{len(unestimable_debts)} loan/liability account(s) "
+                    f"have an APR and balance but no way to estimate a "
+                    f"minimum payment: "
+                    f"{', '.join(sorted(unestimable_debts))}. Set a "
+                    f"'loan_term_months' (amortization term) or "
+                    f"'minimum_payment' slot on each via "
+                    f"set_account_slot."
                 )
             raise ValueError(
                 f"Found {debt_typed_account_count} CREDIT/LIABILITY "
@@ -1542,9 +1595,15 @@ class ReportingMixin:
                 ),
             },
         }
+        warnings: list[str] = []
         if excluded_warning:
             full["excluded"] = sorted(excluded_debts)
-            full["warnings"] = [excluded_warning]
+            warnings.append(excluded_warning)
+        if unestimable_warning:
+            full["unestimable"] = sorted(unestimable_debts)
+            warnings.append(unestimable_warning)
+        if warnings:
+            full["warnings"] = warnings
 
         if not compact:
             return full
@@ -1564,4 +1623,6 @@ class ReportingMixin:
         )
         if excluded_warning:
             compact_out += f"\n⚠ {excluded_warning}"
+        if unestimable_warning:
+            compact_out += f"\n⚠ {unestimable_warning}"
         return compact_out

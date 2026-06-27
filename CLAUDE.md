@@ -156,6 +156,29 @@ module contributes zero tools to the MCP surface.
   `_parse_owner_type(value)`, which returns the piecash int code or
   raises with a message naming the valid options. A new owner-typed
   tool should follow the same path.
+- **Identify accounts by `GNCAccountType`, never by an English name.**
+  GnuCash localizes account *names* per locale but never *types*. Code
+  that keys off an English literal (`_find_account(book, "Income")`,
+  `"mortgage" in fullname`, `name.startswith("Imbalance-")`) is wrong
+  the moment the book is `de_DE`/`es_MX`/`zh_CN`/… Resolve top-level
+  accounts by type via `_top_level_account_of_type`; where a name
+  *must* be used, resolve it from the book's own data, not a hard-coded
+  word. Two traps make this stricter than it looks:
+  - **Two independent translation sources that disagree.** Wizard chart
+    templates (`data/accounts/<locale>/*.gnucash-xea`) and the runtime
+    gettext catalog (`po/<lang>.po`) don't always match — a German
+    book's top-level income is the template's **"Erträge"** while the
+    catalog translation of "Income" is **"Ertrag"**. So a "look up the
+    localized word and match it" fix is unsafe for template-created
+    accounts. `_infer_book_locale` therefore *votes* across several
+    top-level type accounts rather than trusting any one.
+  - **Designated accounts self-heal via a KVP slot.** The FX and
+    discount resolvers store the resolved account's GUID on the root
+    account (`gnc-mcp/fx-gain-loss-acct`, etc.) on first use, then
+    resolve by GUID forever after (`_resolve_designated_account`). This
+    is locale- AND rename-proof; the leaf name becomes purely cosmetic,
+    which is what makes localized created-account names (§6.3) safe. A
+    stale slot falls through to the lower layers and is rewritten.
 
 ### Data model conventions
 
@@ -248,6 +271,15 @@ existed.
   for audit-trail purposes. Code that asks "does this lot/account
   have any payment activity" must filter on `s.value != 0` or
   `s.reconcile_state != 'v'`, not on split presence alone.
+- **GDATE columns are compact `YYYYMMDD` strings — don't feed them to
+  `date.fromisoformat` raw.** Date slots/columns stored as GnuCash
+  GDATE (e.g. `slots.gdate_val`, an invoice's `trans-date-due`) come
+  back as `"20260528"`, no dashes. Python 3.11+ `date.fromisoformat`
+  accepts that; **3.10 (a supported target) rejects it and raises.**
+  Normalize to digits and build the date explicitly. The bite is
+  worse when the caller wraps the parse in a broad `except` — a 3.10
+  `ValueError` then silently drops the feature (this is exactly how
+  overdue-invoice/bill warnings went dark until found).
 
 ---
 

@@ -89,7 +89,6 @@ class _SummaryData:
     # Account categorization (per-leaf rows the section renderers iterate).
     asset_leaves: list[tuple[str, Decimal, str | None]] = field(default_factory=list)
     credit_cards: list[tuple[str, Decimal]] = field(default_factory=list)
-    loan_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     other_liab_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     receivable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     payable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
@@ -100,7 +99,6 @@ class _SummaryData:
     receivables_total: Decimal = Decimal("0")
     payables_total: Decimal = Decimal("0")
     credit_total: Decimal = Decimal("0")
-    loan_total: Decimal = Decimal("0")
     other_liab_total: Decimal = Decimal("0")
 
     # Counts.
@@ -598,13 +596,16 @@ class CoreMixin:
         rates_for_sort = self._rates_as_of(
             book, today, default_currency,
         )
+        root = book.root_account
         integrity: list[tuple[Decimal, str]] = []
         for account in accounts:
-            if account.type == "ROOT":
+            # Locale-robust: GnuCash localizes the "Imbalance"/"Orphan"
+            # leading word, so a structural+catalog match replaces the
+            # old English-only prefix check (which never fired on a
+            # localized book — the warning silently went dark).
+            if not self._is_auto_balancing_account(account, root):
                 continue
             name = account.name
-            if not (name.startswith("Imbalance-") or name.startswith("Orphan-")):
-                continue
             balance = self._own_splits_balance(account)
             if balance != 0:
                 acct_commodity = (
@@ -1580,12 +1581,12 @@ class CoreMixin:
                         today=today,
                     )
                     pos_value = -usd_value
-                    if "loan" in account.fullname.lower():
-                        data.loan_accts.append((leaf, pos_value))
-                    else:
-                        data.other_liab_accts.append(
-                            (leaf, pos_value)
-                        )
+                    # Loans and other liabilities are the same TYPE —
+                    # GnuCash has no "loan" account type — so we don't
+                    # sub-classify by name. The old "loan" substring
+                    # was English-only (missed "Darlehen"/"Kredit" and
+                    # any rename); one bucket is locale-correct.
+                    data.other_liab_accts.append((leaf, pos_value))
             elif account.type == "RECEIVABLE":
                 if balance != 0:
                     # A/R is debit-natural: positive balance = owed to us.
@@ -1635,17 +1636,13 @@ class CoreMixin:
             sum(b for _, b in data.credit_cards)
             if data.credit_cards else Decimal(0)
         )
-        data.loan_total = _r2(
-            sum(b for _, b in data.loan_accts)
-            if data.loan_accts else Decimal(0)
-        )
         data.other_liab_total = _r2(
             sum(b for _, b in data.other_liab_accts)
             if data.other_liab_accts else Decimal(0)
         )
         data.liabilities_total = _r2(
-            data.credit_total + data.loan_total
-            + data.other_liab_total + data.payables_total
+            data.credit_total + data.other_liab_total
+            + data.payables_total
         )
         return data
 
@@ -1749,8 +1746,8 @@ class CoreMixin:
         lives in ``_render_receivables_payables``.
         """
         liab_count = (
-            len(data.credit_cards) + len(data.loan_accts)
-            + len(data.other_liab_accts) + len(data.payable_accts)
+            len(data.credit_cards) + len(data.other_liab_accts)
+            + len(data.payable_accts)
         )
         lines = [
             f"Liabilities: {liab_count} accounts, "
@@ -1761,18 +1758,13 @@ class CoreMixin:
                 f"  Credit cards ({len(data.credit_cards)}): "
                 f"{currency} {data.credit_total}"
             )
-        if data.loan_accts:
-            lines.append(
-                f"  Loans ({len(data.loan_accts)}): "
-                f"{currency} {data.loan_total}"
-            )
         if data.other_liab_accts:
             lines.append(
-                f"  Other ({len(data.other_liab_accts)}): "
+                f"  Loans & other ({len(data.other_liab_accts)}): "
                 f"{currency} {data.other_liab_total}"
             )
         all_liab_leaves = (
-            data.credit_cards + data.loan_accts + data.other_liab_accts
+            data.credit_cards + data.other_liab_accts
         )
         if len(all_liab_leaves) > 1:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
