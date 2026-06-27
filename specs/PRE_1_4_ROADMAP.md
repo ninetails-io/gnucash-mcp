@@ -63,18 +63,35 @@ the absence of a positional assumption encoded without one (those
 were spot-checked — depth/root detection is data-driven and safe).
 High confidence the *behavioral* set below is complete.
 
-**Implementation status (branch `fix/i18n-account-resolution`):**
-Tiers **A, B, C are DONE** — `_top_level_account_of_type` chokepoint
-(`_base.py`), type-based FX/discount parent resolution (`business.py`),
-`loan_term_months` slot + 30y default (`reporting.py`), single
-"Loans & other" liability bucket (`core.py`), and
-`_is_auto_balancing_account` Imbalance/Orphan detection across 13
-locales (`_base.py`/`core.py`). End-to-end proven: a cross-currency
-invoice payment on a German book settles and books FX under "Erträge"
-(`tests/test_i18n_account_resolution.py`, 12 tests). **Remaining:**
-Tier D — localized *created* leaf names (flagship polish; the
-slot + locale-inference design in the spec §6.2-6.3) — and the full
-"Greta" synthetic persona.
+**Implementation status (branch `fix/i18n-account-resolution`):
+COMPLETE.** Tiers A, B, C, D all done.
+- **A** — `_top_level_account_of_type` chokepoint (`_base.py`) +
+  type-based FX/discount parent resolution, plus a **self-healing
+  KVP-slot designated-account resolver** (Layer 0: stores the resolved
+  GUID on the root account, so resolution after first use is rename-
+  and locale-proof; spec §6.2) (`business.py`).
+- **B** — `loan_term_months` slot with **no default**: a loan with no
+  explicit term (and no `minimum_payment`) is omitted from the payoff
+  plan with an actionable message rather than amortized from a guessed
+  term (`reporting.py`); single "Loans & other" liability bucket
+  (`core.py`).
+- **C** — `_is_auto_balancing_account` Imbalance/Orphan detection
+  across the shipped locales (`_base.py`/`core.py`).
+- **D** — **localized created-account leaf names**: `_infer_book_locale`
+  (votes top-level type accounts against the gettext catalog, ≥2 wins)
+  + `_locale_account_name` (spec §6.3). A tidy German book auto-creates
+  `Erträge:Realisierter Gewinn/Verlust`; English and numbered (SKR03)
+  charts fall back to the English leaf.
+
+End-to-end proven on a German book (cross-currency invoice payment
+settles and books FX under the localized income root) and
+**bookkeeper-validated to the penny** with a German-named FX account.
+The SKR03 (Sabine Brenner) chart slice is locked in
+`tests/test_i18n_account_resolution.py::TestSKR03Chart` (23 i18n tests
+total). Also fixed in passing: a Python-3.10 GDATE due-date parse bug
+that silently dropped overdue invoice/bill warnings. **Remaining
+(optional):** the full `scripts/synthetic_book/` Sabine persona
+generator (Abe's build), and the §7 housekeeping (CLAUDE.md gotchas).
 
 **A — Throws (hard failure):**
 - **LEAD ITEM (correctness-grade): resolve helper-account parents by
