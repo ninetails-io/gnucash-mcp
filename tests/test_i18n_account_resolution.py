@@ -107,9 +107,9 @@ class TestLocalizedHelperAccounts:
             assert acct.fullname == "Erträge:Foreign Exchange Gain/Loss"
             b.save()
 
-        # Idempotent: a second call resolves the same account (the
-        # English leaf self-matches the fuzzy layer) rather than
-        # creating a duplicate.
+        # Idempotent: the first create stored the account's GUID in the
+        # root slot, so the second call resolves the same account via
+        # Layer 0 rather than creating a duplicate.
         with gb.open(readonly=False) as b:
             acct2, _ = gb._get_or_create_fx_account(b)
             assert acct2.fullname == "Erträge:Foreign Exchange Gain/Loss"
@@ -133,6 +133,114 @@ class TestLocalizedHelperAccounts:
             assert purchase.type == "INCOME"
             assert purchase.parent.fullname == "Erträge"
             b.save()
+
+
+class TestDesignatedAccountSlotLayer0:
+    """§6.2 Layer 0: once resolved, the FX/discount account's GUID is
+    stored in a root-account slot and every later resolution reads that
+    GUID directly — making resolution self-healing, rename-proof, and
+    locale-proof. A stale slot falls through and is rewritten.
+    """
+
+    def test_fx_designation_survives_account_rename(self, localized_book):
+        # First resolve creates the account and writes its GUID to the
+        # gnc-mcp/fx-gain-loss-acct slot.
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            b.save()
+            original_guid = acct.guid
+
+        # Rename the account to a word matching NO fuzzy keyword and not
+        # the canonical path — only the GUID slot (Layer 0) can find it.
+        gb.update_account(
+            "Erträge:Foreign Exchange Gain/Loss",
+            new_name="Wechselkursergebnis",
+        )
+
+        with gb.open(readonly=False) as b:
+            acct2, notice = gb._get_or_create_fx_account(b)
+            # Same account by GUID, despite the rename — no duplicate.
+            assert acct2.guid == original_guid
+            assert acct2.name == "Wechselkursergebnis"
+            assert notice is None
+
+    def test_explicit_arg_overrides_stored_designation(self, localized_book):
+        # An explicit fx_account wins over the slot and is NOT persisted
+        # as the new designation (it is a per-call override).
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            designated, _ = gb._get_or_create_fx_account(b)
+            b.save()
+            designated_guid = designated.guid
+        # Create a second, distinct INCOME account to pass explicitly.
+        gb.create_account(
+            "Sonstige Kursdifferenzen", "INCOME",
+            parent="Erträge", commodity="EUR",
+        )
+        with gb.open(readonly=False) as b:
+            override, _ = gb._get_or_create_fx_account(
+                b, fx_account="Erträge:Sonstige Kursdifferenzen"
+            )
+            assert override.fullname == "Erträge:Sonstige Kursdifferenzen"
+            # The slot still points at the original designation.
+            slotted = gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY
+            )
+            assert slotted.guid == designated_guid
+
+    def test_stale_slot_falls_through_and_rewrites(self, localized_book):
+        gb = GnuCashBook(str(localized_book))
+        # Point the slot at a well-formed GUID that resolves to nothing.
+        with gb.open(readonly=False) as b:
+            b.root_account[gb._FX_ACCOUNT_SLOT_KEY] = "deadbeef" * 4
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            # Layer 0 returns None on the dangling GUID; resolution
+            # falls through and lands a real account.
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY
+            ) is None
+            acct, _ = gb._get_or_create_fx_account(b)
+            assert acct is not None
+            assert acct.type == "INCOME"
+            b.save()
+
+        # The slot self-healed: Layer 0 now resolves the real account.
+        with gb.open() as b:
+            resolved = gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY
+            )
+            assert resolved is not None
+            assert resolved.fullname == "Erträge:Foreign Exchange Gain/Loss"
+
+    def test_discount_sides_use_independent_slots(self, localized_book):
+        # Sales (EXPENSE) and purchase (INCOME) designations are stored
+        # under separate slot keys and resolve independently.
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            sales, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=False
+            )
+            purchase, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=True
+            )
+            b.save()
+            sales_guid, purchase_guid = sales.guid, purchase.guid
+
+        with gb.open() as b:
+            via_sales = gb._resolve_designated_account(
+                b, gb._SALES_DISCOUNT_SLOT_KEY
+            )
+            via_purchase = gb._resolve_designated_account(
+                b, gb._PURCHASE_DISCOUNT_SLOT_KEY
+            )
+            assert via_sales.guid == sales_guid
+            assert via_sales.type == "EXPENSE"
+            assert via_purchase.guid == purchase_guid
+            assert via_purchase.type == "INCOME"
+            assert via_sales.guid != via_purchase.guid
 
 
 class TestAutoBalancingAccountDetection:
