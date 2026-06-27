@@ -1750,6 +1750,20 @@ class BusinessMixin:
         if row and row[0]:
             gdate_val = row[0]
             if isinstance(gdate_val, str):
+                # GnuCash GDATE columns return a compact ``YYYYMMDD``
+                # string; other paths yield ISO ``YYYY-MM-DD``. Python
+                # 3.11+ ``date.fromisoformat`` accepts both, but 3.10
+                # (a supported target) rejects the compact form and
+                # raises — which the warnings collector's broad
+                # ``except`` then swallows, silently dropping the
+                # overdue warning. Normalize to digits first.
+                digits = gdate_val.strip().replace("-", "")[:8]
+                if len(digits) == 8 and digits.isdigit():
+                    return (
+                        date(int(digits[:4]), int(digits[4:6]),
+                             int(digits[6:8])),
+                        False,
+                    )
                 return date.fromisoformat(gdate_val[:10]), False
             if isinstance(gdate_val, datetime):
                 return gdate_val.date(), False
