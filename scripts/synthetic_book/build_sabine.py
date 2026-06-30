@@ -73,6 +73,14 @@ VERSICHERUNG = "Aufwendungen 2/4:Versicherungsbeiträge:4360 Versicherungen"
 BANKGEBUEHR = "Aufwendungen 2/4:verschiedene Kosten:4970 Nebenkosten des Geldverkehrs"
 ZINS_HYP = "Aufwendungen 2/4:Zinsaufwendungen:2110 Zinsaufwendungen für kurzfristige Verbindlichkeiten"
 ZINS_KFZ = "Aufwendungen 2/4:Zinsaufwendungen:2121 Zinsaufwendungen für KFZ Finanzierung"
+STROM = "Aufwendungen 2/4:Raumkosten:4240 Gas, Wasser, Strom (Verwaltung, Vertrieb)"
+WERKZEUG = "Aufwendungen 2/4:verschiedene Kosten:4985 Werkzeuge und Kleingeräte"
+AUFMERK = "Aufwendungen 2/4:Werbe-/Reisekosten:4653 Aufmerksamkeiten"
+BUECHER = "Aufwendungen 2/4:verschiedene Kosten:4940 Zeitschriften, Bücher"
+KFZ_BETRIEB = "Aufwendungen 2/4:Kfz-Kosten:4530 laufende Kfz-Betriebskosten"
+KFZ_STEUER = "Aufwendungen 2/4:Kfz-Kosten:4510 Kfz-Steuer"
+KFZ_VERS = "Aufwendungen 2/4:Kfz-Kosten:4520 Kfz-Versicherungen"
+PRIV_EINLAGE = "Privatkonten 1:Privatentnahmen/-einlagen:1890 Privateinlagen"
 # Additions (under authentic German parents)
 HYPOTHEK = "Passiva:Verbindlichkeiten:0630 Verbindlichkeiten ggü. Kreditinstituten"
 KFZ_FIN = "Passiva:Verbindlichkeiten:0640 Kfz-Finanzierung"
@@ -369,83 +377,150 @@ def iter_months():
         y, m = (y + 1, 1) if m == 12 else (y, m + 1)
 
 
+def _vat_expense(day, desc, account, gross, acct_from=BANKKONTO):
+    """A business expense with 19% reclaimable input VAT (3-split)."""
+    net, vat = _vat_split(gross, D("19"))
+    return {"date": day, "description": desc,
+            "splits": [(acct_from, -gross), (account, net), (VST19, vat)]}
+
+
+# Fixed monthly SaaS / tooling subscriptions a designer actually pays
+# (gross EUR incl. 19% VAT), routed to authentic SKR03 accounts.
+SUBSCRIPTIONS = [
+    (WERKZEUG, "65.43", "Adobe Creative Cloud"),
+    (WERKZEUG, "17.85", "Figma Professional"),
+    (WERKZEUG, "29.74", "Adobe Stock"),
+    (WERKZEUG, "11.89", "Monotype Fonts"),
+    (BUEROBEDARF, "11.99", "Dropbox Business"),
+    (INTERNET, "14.28", "Webhosting + Domain (All-Inkl)"),
+    (BUEROBEDARF, "16.66", "sevDesk Buchhaltung"),
+    (WERKZEUG, "10.71", "Backblaze Backup"),
+]
+
+
 def gen_recurring() -> list[dict]:
+    """Fixed monthly business obligations + loans + monthly USt-VA."""
     txns = []
     hyp = _amort(D("395000"), D("3.65"), 300)
     kfz = _amort(D("16500"), D("4.49"), 60)
     for first in iter_months():
         ym = first.strftime("%m/%Y")
-        # Miete (Studio, VAT-free residential-style lease)
+        # Studio rent (VAT-free residential-style lease) + utilities (19%).
         txns.append({"date": first.replace(day=1), "description": f"Miete Studio {ym}",
                      "splits": [(BANKKONTO, D("-1150")), (MIETE, D("1150"))]})
-        # Internet + Mobilfunk with 19% input VAT (reclaimable -> 1576 asset)
+        txns.append(_vat_expense(first.replace(day=4), f"Stadtwerke Strom/Gas {ym}",
+                                 STROM, D("128.00")))
+        # Telecom trio.
         for path, gross, desc in [(INTERNET, D("49.99"), "Internet"),
-                                  (MOBILFUNK, D("39.99"), "Mobilfunk D2")]:
-            net, vat = _vat_split(gross, D("19"))
-            txns.append({"date": first.replace(day=3),
-                         "description": f"{desc} {ym}",
-                         "splits": [(BANKKONTO, -gross), (path, net), (VST19, vat)]})
-        # Privatentnahme (owner draw)
-        txns.append({"date": first.replace(day=28),
-                     "description": f"Privatentnahme {ym}",
+                                  (MOBILFUNK, D("39.99"), "Mobilfunk D2"),
+                                  (TELEKOM, D("24.99"), "Festnetz")]:
+            txns.append(_vat_expense(first.replace(day=3), f"{desc} {ym}", path, gross))
+        # Monthly software/tooling subscriptions.
+        for path, gross, name in SUBSCRIPTIONS:
+            txns.append(_vat_expense(first.replace(day=2), f"{name} {ym}", path, D(gross)))
+        # Steuerberater (monthly retainer) + monthly bank fee.
+        txns.append(_vat_expense(first.replace(day=8), f"Steuerberater {ym}",
+                                 STEUERBERATER, D("89.25")))
+        txns.append({"date": first.replace(day=2), "description": f"Kontoführung {ym}",
+                     "splits": [(BANKKONTO, D("-8.90")), (BANKGEBUEHR, D("8.90"))]})
+        # Regular monthly owner draw.
+        txns.append({"date": first.replace(day=28), "description": f"Privatentnahme {ym}",
                      "splits": [(BANKKONTO, D("-3200")), (PRIV_DRAW, D("3200"))]})
-        # Hypothek amortization
-        try:
-            pmt, interest, principal = next(hyp)
-            txns.append({"date": first.replace(day=30) if first.month != 2 else first.replace(day=28),
-                         "description": f"Hypothek Rate {ym}",
-                         "splits": [(BANKKONTO, -pmt), (HYPOTHEK, principal),
-                                    (ZINS_HYP, interest)]})
-        except StopIteration:
-            pass
-        try:
-            pmt, interest, principal = next(kfz)
-            txns.append({"date": first.replace(day=15),
-                         "description": f"Kfz-Finanzierung Rate {ym}",
-                         "splits": [(BANKKONTO, -pmt), (KFZ_FIN, principal),
-                                    (ZINS_KFZ, interest)]})
-        except StopIteration:
-            pass
-    # Quarterly Steuerberater (19% input VAT) + USt-Vorauszahlung
-    for q_first in [d for d in iter_months() if d.month in (1, 4, 7, 10)]:
-        ym = q_first.strftime("%m/%Y")
-        gross = D("178.50")
-        net, vat = _vat_split(gross, D("19"))
-        txns.append({"date": q_first.replace(day=10),
-                     "description": f"Steuerberater {ym}",
-                     "splits": [(BANKKONTO, -gross), (STEUERBERATER, net), (VST19, vat)]})
-        # USt-Vorauszahlung: clear accumulated 19% output VAT to Finanzamt.
-        txns.append({"date": q_first.replace(day=10),
-                     "description": f"USt-Vorauszahlung {ym}",
-                     "splits": [(UST19, D("1366.50")), (BANKKONTO, D("-1366.50"))]})
+        # Loan amortization.
+        for gen, liab, zins, label, day in [
+                (hyp, HYPOTHEK, ZINS_HYP, "Hypothek", 30),
+                (kfz, KFZ_FIN, ZINS_KFZ, "Kfz-Finanzierung", 15)]:
+            try:
+                pmt, interest, principal = next(gen)
+                d = first.replace(day=min(day, 28)) if first.month == 2 else first.replace(day=day)
+                txns.append({"date": d, "description": f"{label} Rate {ym}",
+                             "splits": [(BANKKONTO, -pmt), (liab, principal), (zins, interest)]})
+            except StopIteration:
+                pass
+        # Monthly USt-Voranmeldung: reduce the accumulated 19% output-VAT
+        # liability toward the Finanzamt (sized to the month's invoiced +
+        # direct revenue; keeps 1776 near zero over time).
+        txns.append({"date": first.replace(day=10), "description": f"USt-Voranmeldung {ym}",
+                     "splits": [(UST19, D("1650.00")), (BANKKONTO, D("-1650.00"))]})
+    # Yearly Kfz-Steuer / Kfz-Versicherung / Berufshaftpflicht.
+    for first in iter_months():
+        if first.month == 1:
+            txns.append({"date": first.replace(day=20), "description": f"Kfz-Steuer {first.year}",
+                         "splits": [(BANKKONTO, D("-184.00")), (KFZ_STEUER, D("184.00"))]})
+            txns.append(_vat_expense(first.replace(day=22), f"Kfz-Versicherung {first.year}",
+                                     KFZ_VERS, D("612.00")))
+            txns.append(_vat_expense(first.replace(day=24), f"Berufshaftpflicht {first.year}",
+                                     VERSICHERUNG, D("428.00")))
     return txns
 
 
-# ── Phase 6: daily/weekly seeded business spend (with input VAT) ───
-DAILY = [
-    (BUEROBEDARF, 18, 120, "Bürobedarf"),
-    (WERBUNG, 30, 250, "Werbung/Portfolio"),
-    (REISE, 25, 180, "Reisekosten (DB)"),
-    (GWG, 90, 600, "GWG (Geräte)"),
-    (FORTBILDUNG, 40, 300, "Fortbildung"),
-    (PORTO, 4, 25, "Porto"),
+# Variable business spend — (account, lo, hi, label, monthly-count).
+VARIABLE = [
+    (BUEROBEDARF, 8, 90, "Bürobedarf", 6),
+    (WERKZEUG, 25, 350, "Werkzeug/GWG", 3),
+    (REISE, 15, 220, "Reisekosten (DB/Taxi)", 6),
+    (AUFMERK, 18, 95, "Aufmerksamkeit/Bewirtung", 4),
+    (WERBUNG, 30, 400, "Werbung/Anzeigen", 2),
+    (PORTO, 3, 30, "Porto/Versand", 5),
+    (BUECHER, 12, 65, "Fachbücher/Zeitschriften", 2),
+    (KFZ_BETRIEB, 35, 110, "Tanken/Parken", 6),
+    (FORTBILDUNG, 60, 480, "Fortbildung/Workshop", 2),
+    (GWG, 120, 780, "Geräteanschaffung GWG", 1),
 ]
 
 
-def gen_daily() -> list[dict]:
+def gen_variable() -> list[dict]:
+    """Dense seeded business spend (all 19% input VAT)."""
     rng = random.Random(SEED + 6)
     txns = []
     for first in iter_months():
-        for path, lo, hi, desc in DAILY:
-            if rng.random() < 0.7:
-                gross = D(str(rng.randint(lo, hi))) + D("0.99")
-                net, vat = _vat_split(gross, D("19"))
-                day = rng.randint(2, 26)
-                acct = BANKKONTO if rng.random() < 0.6 else POSTBANK
-                txns.append({"date": first.replace(day=day),
-                             "description": f"{desc} {first.strftime('%m/%Y')}",
-                             "splits": [(acct, -gross), (path, net), (VST19, vat)]})
+        ym = first.strftime("%m/%Y")
+        for path, lo, hi, label, count in VARIABLE:
+            for _ in range(count):
+                if rng.random() < 0.8:
+                    gross = D(str(rng.randint(lo, hi))) + D("0.") + D(str(rng.randint(0, 99)))
+                    gross = gross.quantize(D("0.01"))
+                    day = rng.randint(2, 27)
+                    acct = BANKKONTO if rng.random() < 0.7 else POSTBANK
+                    txns.append(_vat_expense(day_in(first, day), f"{label} {ym}", path, gross, acct))
+        # Irregular extra owner draws + occasional capital injection.
+        for _ in range(rng.randint(1, 3)):
+            amt = D(str(rng.randint(150, 900)))
+            txns.append({"date": day_in(first, rng.randint(2, 27)),
+                         "description": f"Privatentnahme (Bar/Karte) {ym}",
+                         "splits": [(BANKKONTO, -amt), (PRIV_DRAW, amt)]})
+        if rng.random() < 0.15:
+            amt = D(str(rng.randint(500, 2500)))
+            txns.append({"date": day_in(first, rng.randint(2, 27)),
+                         "description": f"Privateinlage {ym}",
+                         "splits": [(BANKKONTO, amt), (PRIV_EINLAGE, -amt)]})
     return txns
+
+
+def gen_honorar() -> list[dict]:
+    """Direct (non-invoiced) Honorar deposits — the bulk of revenue, paid
+    straight to the bank with output VAT (19%, plus occasional 7%)."""
+    rng = random.Random(SEED + 9)
+    txns = []
+    for first in iter_months():
+        ym = first.strftime("%m/%Y")
+        for _ in range(rng.randint(4, 8)):
+            net = D(str(rng.randint(400, 2600)))
+            rate, rev, ust = ((D("7"), REV7, UST7) if rng.random() < 0.2
+                              else (D("19"), REV19, UST19))
+            vat = (net * rate / D("100")).quantize(D("0.01"))
+            gross = net + vat
+            acct = BANKKONTO if rng.random() < 0.8 else POSTBANK
+            txns.append({"date": day_in(first, rng.randint(2, 27)),
+                         "description": f"Honorar Direktauftrag {ym}",
+                         "splits": [(acct, gross), (rev, -net), (ust, -vat)]})
+    return txns
+
+
+def day_in(first: date, day: int) -> date:
+    import calendar
+    last = calendar.monthrange(first.year, first.month)[1]
+    return first.replace(day=min(day, last))
 
 
 # ── Phase 7: business — VAT invoicing + USD cross-currency + bill ──
@@ -624,10 +699,12 @@ def build(out_path: Path) -> None:
     print("  loan slots set")
     print("\nPhase 3: opening balances + ETF lot")
     opening_balances(out_path)
-    print("\nPhase 4: recurring")
+    print("\nPhase 4: recurring (rent, utilities, subs, loans, USt-VA)")
     print(f"  {write_bulk(out_path, gen_recurring())} recurring txns")
-    print("\nPhase 6: daily/weekly business spend")
-    print(f"  {write_bulk(out_path, gen_daily())} daily txns")
+    print("\nPhase 5: variable business spend")
+    print(f"  {write_bulk(out_path, gen_variable())} variable txns")
+    print("\nPhase 6: direct Honorar deposits")
+    print(f"  {write_bulk(out_path, gen_honorar())} Honorar deposits")
     print("\nPhase 7: business (VAT invoicing + USD cross-currency)")
     print(f"  {run_business(book)}")
     print("\nPhase 8: edge — localized Ausgleichskonto")
