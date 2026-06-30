@@ -651,6 +651,15 @@ class CoreMixin:
                 for account in accounts:
                     if account.type not in ("BANK", "CASH"):
                         continue
+                    if self._is_auto_balancing_account(
+                        account, book.root_account
+                    ):
+                        # A suspense/Imbalance balance isn't spendable
+                        # cash — it's surfaced by the integrity section
+                        # above. Counting it here fires a bogus
+                        # "critically low cash" on a few euros parked
+                        # for clarification.
+                        continue
                     if account.placeholder:
                         continue
                     if account.guid in template_guids:
@@ -1199,6 +1208,10 @@ class CoreMixin:
             if account.placeholder:
                 continue
             if account.type not in self._RUNWAY_LIQUID_TYPES:
+                continue
+            if self._is_auto_balancing_account(account, book.root_account):
+                # Suspense/Imbalance balances aren't runway liquidity —
+                # they're unresolved bookkeeping, not money to live on.
                 continue
             if self._is_in_retirement_subtree(account):
                 # Penalty-locked money isn't runway — see the helper.
