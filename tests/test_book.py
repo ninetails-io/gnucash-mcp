@@ -2090,7 +2090,7 @@ class TestGetBookSummaryWarnings:
         warnings_block = result.split("Warnings:")[1].split("\n")
         joined = "\n".join(warnings_block)
         assert "Imbalance-USD" in joined
-        assert "data integrity issue" in joined
+        assert "uncleared suspense balance" in joined
         assert "⚠" in joined
 
     def test_orphan_account_with_balance_warns(self, test_book: Path):
@@ -2125,7 +2125,7 @@ class TestGetBookSummaryWarnings:
         warnings_block = result.split("Warnings:")[1].split("\n")
         joined = "\n".join(warnings_block)
         assert "Orphan-USD" in joined
-        assert "data integrity issue" in joined
+        assert "uncleared suspense balance" in joined
 
     def test_zero_balance_imbalance_does_not_warn(
         self, test_book: Path,
