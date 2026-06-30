@@ -409,6 +409,35 @@ class TestAutoBalancingAccountDetection:
             )
 
 
+    def test_detects_newly_covered_locales(self, tmp_path):
+        """Locks the full-catalog expansion (every shipped GnuCash
+        locale). A regression to a smaller prefix table fails here.
+        """
+        path = tmp_path / "bal3.gnucash"
+        self._make_book(path, [
+            ("Açık-TRY", "BANK", None),        # tr imbalance/orphan
+            ("貸借不一致", "BANK", None),  # ja imbalance, unsuffixed
+            ("عدم تناسب-PKR", "BANK", None),  # ur imbalance
+            ("Osierocone-PLN", "BANK", None),             # pl orphan
+            ("Tagesgeld", "BANK", None),                  # ordinary root bank
+        ])
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            root = b.root_account
+            by_name = {a.name: a for a in b.accounts}
+            for nm in (
+                "Açık-TRY",
+                "貸借不一致",
+                "عدم تناسب-PKR",
+                "Osierocone-PLN",
+            ):
+                assert gb._is_auto_balancing_account(by_name[nm], root), nm
+            assert not gb._is_auto_balancing_account(
+                by_name["Tagesgeld"], root
+            )
+
+
+
 class TestLoanTermLocaleRobust:
     """Tier B: ``debt_payoff_plan`` must not guess a loan's
     amortization term from an English "mortgage" substring, and must

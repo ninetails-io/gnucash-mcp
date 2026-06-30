@@ -985,22 +985,43 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     # so the leading word is localized. An English-only prefix check
     # misses them on a localized book and the data-integrity warning
     # goes dark. These are the catalog translations of "Imbalance" and
-    # "Orphan" across the shipped GnuCash locales, lowercased; a leaf
-    # name that STARTS WITH any of them is a balancing account (the
-    # "-<CUR>" suffix, when present, follows the word). Source:
-    # specs/gnucash-account-naming-i18n.md.
+    # "Orphan" for every shipped GnuCash locale, extracted from
+    # po/<lang>.po (stable branch); fuzzy and untranslated entries are
+    # excluded — GnuCash's runtime ignores fuzzy, and an untranslated
+    # locale falls back to the English forms, which are listed. Lower-
+    # cased; a leaf name that STARTS WITH any of them is a balancing
+    # account (the "-<CUR>" suffix, when present, follows the word).
+    # Regenerate via the recipe in specs/gnucash-account-naming-i18n.md.
     _BALANCING_ACCOUNT_NAME_PREFIXES = frozenset(
         s.lower()
         for s in (
-            # "Imbalance"
-            "Imbalance", "Ausgleichskonto", "Non soldé", "Descuadre",
-            "Sbilancio", "Desequilíbrio", "Niet in balans", "Дисбаланс",
-            "貸借不一致", "不平衡的", "대차 불일치", "Niezrównoważenie",
-            "Obalans",
-            # "Orphan"
-            "Orphan", "Ausbuchungskonto", "Orphelin", "Huérfano",
-            "Orfano", "Órfão", "Verweesd", "Упущенный", "不明",
-            "孤立的", "고아", "Osierocone", "Föräldralös",
+            # "Imbalance" — every shipped GnuCash locale
+            'Ausgleichskonto', 'Açık', 'Chưa cân bằng', 'Debalans',
+            'Descuadre', 'Desequilibri', 'Desequilibrio',
+            'Desequilíbrio', 'Deskoadratzea', 'Dezechilibru',
+            'Disbalansas', 'Epätasapaino', 'Imbalance',
+            'Kiegyenlítés', 'Nerovnováha', 'Nevyváženost',
+            'Niet in balans', 'Niezrównoważenie', 'Non soldé',
+            'Obalans', 'Sbilancio', 'Starpība', 'Tak-seimbang',
+            'Ubalance', 'Ubalanse', 'osomotolon', 'Χωρίς ισοζύγιο',
+            'Дебаланс', 'Дисбаланс', 'Невідповідність', 'Неравнена',
+            'חוסר איזון', 'حساب عدم التوازن', 'عدم تناسب', 'ناتراز',
+            'असंतुलन', 'असंतुलित', 'असन्तुलित', 'गॊर मसावात',
+            'समानथायगैयै', 'অসমতা', 'ইমবেলেন্স', 'અસંતુલિત',
+            'சமநிலையில்லாத', 'అసమతుల్యం', 'ಅಸಮತೋಲನ', '不平衡的', '失調',
+            '貸借不一致', 'ꯏꯝꯕꯦꯂꯦꯟꯁ', '대차 불일치',
+            # "Orphan" — every shipped GnuCash locale
+            'Apleistas', 'Ausbuchungskonto', 'Açık', 'Egyedülálló',
+            'Foreldreløs', 'Föräldralös', 'Hittebarn', 'Huérfano',
+            'Nepovezano', 'Nesaistīts', 'Orfan', 'Orfano', 'Orfe',
+            'Orphan', 'Orphelin', 'Orpo', 'Osierocone', 'Sirota',
+            'Sirotek', 'Terlantar', 'Thừa', 'Umezurtza', 'Verweesd',
+            'onath', 'Órfã', 'Órfão', 'Ορφανό', 'Занедбаний',
+            'Изоставена', 'Напуштено', 'Упущенный', 'יתומים',
+            'حساب الأيتام', 'یتیم', 'अनाथ', 'आरफन', 'बेवारिसी',
+            'मावरिया', 'लावारस', 'लावारिस', 'অনাথ', 'ওর্ফান',
+            'આધાર વિનાનું', 'கைவிடப்பட்டது', 'అనాథ', 'ಆರ್ಫನ್', '不明',
+            '孤立的', '無主的', 'ꯑꯣꯔꯐꯥꯟ', '고아',
         )
     )
 
