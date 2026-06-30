@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import os
 import random
 from datetime import date
 from decimal import Decimal as D, ROUND_HALF_UP
@@ -419,9 +420,10 @@ def day_in(first: date, day: int) -> date:
 
 
 def _pick(rng, names: list[str]) -> str:
-    """A merchant string, sometimes with a pseudo bank-statement reference."""
+    """A merchant string, sometimes with a German-style branch reference
+    (Fil. = Filiale), as a real card-payment line reads."""
     name = rng.choice(names)
-    return f"{name} {rng.randint(1000, 99999)}" if rng.random() < 0.4 else name
+    return f"{name} Fil. {rng.randint(1, 999):04d}" if rng.random() < 0.45 else name
 
 
 def _cents(rng, lo: int, hi: int) -> D:
@@ -551,8 +553,10 @@ def gen_personal() -> list[dict]:
     rng = random.Random(SEED + 12)
     txns = []
     for first in iter_months():
+        # Krankenkasse premium rises each January (Zusatzbeitrag/Beitragssatz).
+        kk = D("781.53") if first.year == 2025 else D("812.40")
         txns.append({"date": day_in(first, 1), "description": "Techniker Krankenkasse Beitrag",
-                     "splits": [(BANKKONTO, D("-781.53")), (KRANKENKASSE, D("781.53"))]})
+                     "splits": [(BANKKONTO, -kk), (KRANKENKASSE, kk)]})
         for name, amt in P_SUBS:
             txns.append({"date": day_in(first, 5), "description": name,
                          "splits": [(BANKKONTO, -D(amt)), (PRIV_DRAW, D(amt))]})
@@ -693,9 +697,13 @@ def run_business(book: GnuCashBook) -> dict:
 
 # ── Phase 8: edge — localized Ausgleichskonto (Tier C) ─────────────
 def run_edge(out_path: Path) -> None:
+    # A recent, not-yet-cleared item parked in the localized Ausgleichskonto
+    # (Tier-C fixture: trips the dashboard's German-Imbalance warning). Dated
+    # near THROUGH so it reads as a fresh "to clarify", not a year-old defect.
+    edge_date = day_in(date(THROUGH.year, THROUGH.month, 1), 17)
     write_bulk(out_path, [{
-        "date": date(YEAR, 6, 17),
-        "description": "Unklarer Zahlungseingang (zu klären)",
+        "date": edge_date,
+        "description": "Unklare Lastschrift (noch zu klären)",
         "splits": [(BANKKONTO, D("-48.50")), (AUSGLEICH, D("48.50"))],
     }])
 
@@ -738,11 +746,12 @@ def verify(out_path: Path) -> None:
     print(f"✓ A=L+E and net worth agree to the cent: "
           f"€{assets} = €{liab} + €{equity}")
 
-    # 3. FX recognized under the type-resolved German income root (English
-    #    leaf — locale inference correctly declines on a numbered chart).
+    # 3. FX recognized under the type-resolved German income root, with a
+    #    German leaf (Tier-D naming under GNUCASH_LOCALE=de).
     with book.open() as b:
         fx = [a.fullname for a in b.accounts
-              if "Foreign Exchange Gain/Loss" in a.name]
+              if "Realisierter Gewinn/Verlust" in a.name
+              or "Foreign Exchange Gain/Loss" in a.name]
         assert any("Erlöse u. Erträge 2/8" in f for f in fx), \
             f"FX account not under the German income root: {fx}"
     print(f"✓ FX recognized under German INCOME (by type): {fx[0]}")
@@ -763,6 +772,11 @@ def verify(out_path: Path) -> None:
 
 # ── Orchestration ──────────────────────────────────────────────────
 def build(out_path: Path) -> None:
+    # Sabine runs a German-locale system, so the server names auto-created
+    # accounts in German (Tier-D): the FX gain/loss leaf becomes
+    # "Realisierter Gewinn/Verlust", not the English fallback that a
+    # locale-less run would pick on a numbered SKR03 chart.
+    os.environ["GNUCASH_LOCALE"] = "de_DE.UTF-8"
     print(f"Building Sabine book at: {out_path}  (THROUGH={THROUGH})")
     print("\nPhase 1: book + commodities + prices")
     create_book_file(out_path)

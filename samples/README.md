@@ -107,9 +107,10 @@ What's in here:
   and reclaimable input VAT (Vorsteuer) to `1576`.
 - **A USD-paying export client** (Lumen Labs Inc.) — invoiced in USD,
   posted and paid at different EUR/USD rates, so realized FX gain/loss
-  is recognized into a top-level-INCOME child **resolved by type**
-  (`Erlöse u. Erträge 2/8:Foreign Exchange Gain/Loss` — English leaf,
-  because locale inference correctly declines on a numbered chart).
+  is recognized into a top-level-INCOME child **resolved by type** and
+  named in German (`Erlöse u. Erträge 2/8:Realisierter Gewinn/Verlust`)
+  — the book is built under `GNUCASH_LOCALE=de_DE`, as a German user's
+  system would be.
 - **Sole-proprietor equity flows:** monthly Privatentnahme instead of
   salary; opening balances via the SKR03 `Anfangsbestand`.
 - **A Hypothek and a Kfz-Finanzierung** with `apr` + `loan_term_months`

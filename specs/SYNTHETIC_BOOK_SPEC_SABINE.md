@@ -197,13 +197,15 @@ A volume batch to stress paging.
 - **Native non-English chart.** Type-based resolution
   (`_top_level_account_of_type`), Imbalance/Orphan detection, and
   debt-term resolution must all work with zero English account names.
-- **Type-based resolution on a numbered chart.** Auto-created FX
-  gain/loss lands under the German income root resolved *by type*. On
-  the numbered SKR03 chart locale inference correctly **declines** (only
-  "Aktiva" matches the structural words, below the ≥2 vote threshold),
-  so the leaf is the English fallback (`Foreign Exchange Gain/Loss`) —
-  exactly as `TestSKR03Chart` documents. German *leaf naming* is
-  exercised by the tidy `localized_book` fixture, not SKR03.
+- **Type-based resolution + localized leaf naming.** Auto-created FX
+  gain/loss lands under the German income root resolved *by type*, and
+  gets a German leaf — `Realisierter Gewinn/Verlust`. The book is built
+  with `GNUCASH_LOCALE=de_DE` (Sabine runs a German system), which is
+  how the leaf is localized: on the numbered SKR03 chart, *inference*
+  alone would correctly **decline** (only "Aktiva" matches the
+  structural words, below the ≥2 vote threshold) and fall back to
+  English — so the explicit locale is what supplies the German name.
+  Both paths are documented in `TestSKR03Chart`.
 - **German VAT (USt).** Two rates (19%/7%), input vs output VAT,
   USt-Vorauszahlung — exercised through taxtables and the business
   module.
