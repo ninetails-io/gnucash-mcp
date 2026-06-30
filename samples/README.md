@@ -96,7 +96,7 @@ where that assumption fails.
 - **Accounts:** 110 (the shipped `acctchrt_skr03` verbatim + a few
   German-named additions: Hypothek, Kfz-Finanzierung, fixed assets,
   an ETF depot, a localized Ausgleichskonto)
-- **Transactions:** ~1,020
+- **Transactions:** ~1,320
 - **Period covered:** 2025 → 2026
 
 What's in here:
@@ -118,6 +118,16 @@ What's in here:
 - **A localized Ausgleichskonto-EUR** carrying a small balance, so the
   dashboard's data-integrity warning fires on a *German* Imbalance
   name (the structural Tier-C detector).
+- **A real bank statement, not category labels.** Spending carries
+  actual merchant names (REWE, SHELL München, DHL, Deutsche Bahn,
+  Netflix) with lumpy month-to-month cadence — busy months and quiet
+  ones, not a flat recurring pattern.
+- **Personal life, itemized.** Groceries, dining, the Krankenkasse,
+  streaming, and household spend post to `1800 Privatentnahme` /
+  `1830 Sonderausgaben` — the Girokonto reads like a real freelancer's
+  while the book stays strictly business-only.
+- **A monthly MSCI World ETF Sparplan** (IWDA.AS — what German
+  investors actually buy under MiFID II) building cost-basis lots.
 
 Built to convert the i18n bug class from invisible to a failing test:
 net worth agrees to the cent across `get_book_summary` /

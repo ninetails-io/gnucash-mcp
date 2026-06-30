@@ -20,6 +20,7 @@ NEVER writes to the protected sample (samples/sabine-brenner.gnucash).
 from __future__ import annotations
 
 import argparse
+import calendar
 import random
 from datetime import date
 from decimal import Decimal as D, ROUND_HALF_UP
@@ -324,6 +325,34 @@ OPENING_BALANCES = [
 ETF_UNITS = D("95")
 
 
+def run_investments(out_path: Path) -> int:
+    """Monthly MSCI World ETF Sparplan — invests the freelancer's surplus
+    (soaks idle cash) and exercises the investment/lot path. Each buy is
+    its own lot for cost-basis tracking."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    n = 0
+    try:
+        eur = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        etf, bank = acct[ETF], acct[BANKKONTO]
+        cost = D("1200.00")
+        for first in iter_months():
+            price = etf_price(first)
+            units = (cost / price).quantize(D("0.0001"), ROUND_HALF_UP)
+            lot = piecash.Lot(title=f"Sparplan {first.isoformat()}", account=etf,
+                              notes="MSCI World Sparplan", is_closed=0)
+            isp = piecash.Split(account=etf, value=cost, quantity=units)
+            bsp = piecash.Split(account=bank, value=-cost)
+            piecash.Transaction(currency=eur, description="MSCI World ETF Sparplan (comdirect)",
+                                post_date=day_in(first, 6), splits=[isp, bsp])
+            isp.lot = lot
+            n += 1
+        book.save()
+    finally:
+        book.close()
+    return n
+
+
 def opening_balances(out_path: Path) -> None:
     book = piecash.open_book(str(out_path), readonly=False)
     try:
@@ -384,143 +413,189 @@ def _vat_expense(day, desc, account, gross, acct_from=BANKKONTO):
             "splits": [(acct_from, -gross), (account, net), (VST19, vat)]}
 
 
-# Fixed monthly SaaS / tooling subscriptions a designer actually pays
-# (gross EUR incl. 19% VAT), routed to authentic SKR03 accounts.
+def day_in(first: date, day: int) -> date:
+    last = calendar.monthrange(first.year, first.month)[1]
+    return first.replace(day=min(day, last))
+
+
+def _pick(rng, names: list[str]) -> str:
+    """A merchant string, sometimes with a pseudo bank-statement reference."""
+    name = rng.choice(names)
+    return f"{name} {rng.randint(1000, 99999)}" if rng.random() < 0.4 else name
+
+
+def _cents(rng, lo: int, hi: int) -> D:
+    return (D(rng.randint(lo, hi)) + D(rng.randint(0, 99)) / D(100)).quantize(D("0.01"))
+
+
+def _lumpy(rng, avg: int) -> int:
+    """Lumpy monthly count: 0 in quiet months, spikes in busy ones."""
+    return rng.randint(0, 2 * avg)
+
+
+# 1830 Sonderausgaben — private health insurance is a Privatentnahme, not
+# a business expense (Vorsorgeaufwendungen).
+KRANKENKASSE = "Privatkonten 1:Privatentnahmen/-einlagen:1830 Sonderausgaben unbeschränkt abzugsfähig"
+
+# Monthly SaaS/tooling — real product names, routed to authentic SKR03.
 SUBSCRIPTIONS = [
     (WERKZEUG, "65.43", "Adobe Creative Cloud"),
     (WERKZEUG, "17.85", "Figma Professional"),
     (WERKZEUG, "29.74", "Adobe Stock"),
     (WERKZEUG, "11.89", "Monotype Fonts"),
     (BUEROBEDARF, "11.99", "Dropbox Business"),
-    (INTERNET, "14.28", "Webhosting + Domain (All-Inkl)"),
-    (BUEROBEDARF, "16.66", "sevDesk Buchhaltung"),
-    (WERKZEUG, "10.71", "Backblaze Backup"),
+    (INTERNET, "14.28", "All-Inkl Webhosting"),
+    (BUEROBEDARF, "16.66", "sevDesk"),
+    (WERKZEUG, "10.71", "Backblaze"),
 ]
 
 
 def gen_recurring() -> list[dict]:
-    """Fixed monthly business obligations + loans + monthly USt-VA."""
+    """Fixed monthly business obligations + loans + USt-VA. Real
+    Dauerauftrag-style descriptions, rent rising annually, utilities
+    seasonal."""
     txns = []
     hyp = _amort(D("395000"), D("3.65"), 300)
     kfz = _amort(D("16500"), D("4.49"), 60)
     for first in iter_months():
-        ym = first.strftime("%m/%Y")
-        # Studio rent (VAT-free residential-style lease) + utilities (19%).
-        txns.append({"date": first.replace(day=1), "description": f"Miete Studio {ym}",
-                     "splits": [(BANKKONTO, D("-1150")), (MIETE, D("1150"))]})
-        txns.append(_vat_expense(first.replace(day=4), f"Stadtwerke Strom/Gas {ym}",
-                                 STROM, D("128.00")))
-        # Telecom trio.
-        for path, gross, desc in [(INTERNET, D("49.99"), "Internet"),
-                                  (MOBILFUNK, D("39.99"), "Mobilfunk D2"),
-                                  (TELEKOM, D("24.99"), "Festnetz")]:
-            txns.append(_vat_expense(first.replace(day=3), f"{desc} {ym}", path, gross))
-        # Monthly software/tooling subscriptions.
+        rent = D("1150") if first.year == 2025 else D("1190")  # Mieterhöhung
+        txns.append({"date": first.replace(day=1), "description": "Dauerauftrag Miete Studio Schwabing",
+                     "splits": [(BANKKONTO, -rent), (MIETE, rent)]})
+        # Utilities: higher in winter (heating), lower in summer.
+        winter = first.month in (11, 12, 1, 2, 3)
+        strom = D("168.00") if winter else D("94.00")
+        txns.append(_vat_expense(first.replace(day=4), "Stadtwerke München", STROM, strom))
+        for path, gross, name in [(INTERNET, D("49.99"), "Telekom Deutschland"),
+                                  (MOBILFUNK, D("39.99"), "Vodafone Mobilfunk"),
+                                  (TELEKOM, D("24.99"), "1&1 Festnetz")]:
+            txns.append(_vat_expense(first.replace(day=3), name, path, gross))
         for path, gross, name in SUBSCRIPTIONS:
-            txns.append(_vat_expense(first.replace(day=2), f"{name} {ym}", path, D(gross)))
-        # Steuerberater (monthly retainer) + monthly bank fee.
-        txns.append(_vat_expense(first.replace(day=8), f"Steuerberater {ym}",
-                                 STEUERBERATER, D("89.25")))
-        txns.append({"date": first.replace(day=2), "description": f"Kontoführung {ym}",
+            txns.append(_vat_expense(first.replace(day=2), name, path, D(gross)))
+        txns.append(_vat_expense(first.replace(day=8), "Steuerkanzlei Hoffmann", STEUERBERATER, D("89.25")))
+        txns.append({"date": first.replace(day=2), "description": "Kontoführungsgebühr",
                      "splits": [(BANKKONTO, D("-8.90")), (BANKGEBUEHR, D("8.90"))]})
-        # Regular monthly owner draw.
-        txns.append({"date": first.replace(day=28), "description": f"Privatentnahme {ym}",
-                     "splits": [(BANKKONTO, D("-3200")), (PRIV_DRAW, D("3200"))]})
-        # Loan amortization.
-        for gen, liab, zins, label, day in [
-                (hyp, HYPOTHEK, ZINS_HYP, "Hypothek", 30),
-                (kfz, KFZ_FIN, ZINS_KFZ, "Kfz-Finanzierung", 15)]:
+        for gen, liab, zins, name, day in [
+                (hyp, HYPOTHEK, ZINS_HYP, "Dauerauftrag Hypothek Sparkasse", 30),
+                (kfz, KFZ_FIN, ZINS_KFZ, "VW Bank Kfz-Finanzierung", 15)]:
             try:
                 pmt, interest, principal = next(gen)
-                d = first.replace(day=min(day, 28)) if first.month == 2 else first.replace(day=day)
-                txns.append({"date": d, "description": f"{label} Rate {ym}",
+                txns.append({"date": day_in(first, day), "description": name,
                              "splits": [(BANKKONTO, -pmt), (liab, principal), (zins, interest)]})
             except StopIteration:
                 pass
-        # Monthly USt-Voranmeldung: reduce the accumulated 19% output-VAT
-        # liability toward the Finanzamt (sized to the month's invoiced +
-        # direct revenue; keeps 1776 near zero over time).
-        txns.append({"date": first.replace(day=10), "description": f"USt-Voranmeldung {ym}",
-                     "splits": [(UST19, D("1650.00")), (BANKKONTO, D("-1650.00"))]})
-    # Yearly Kfz-Steuer / Kfz-Versicherung / Berufshaftpflicht.
+        txns.append({"date": first.replace(day=10), "description": "Finanzamt München USt-Voranmeldung",
+                     "splits": [(UST19, D("1850.00")), (BANKKONTO, D("-1850.00"))]})
     for first in iter_months():
         if first.month == 1:
-            txns.append({"date": first.replace(day=20), "description": f"Kfz-Steuer {first.year}",
+            txns.append({"date": first.replace(day=20), "description": "Hauptzollamt Kfz-Steuer",
                          "splits": [(BANKKONTO, D("-184.00")), (KFZ_STEUER, D("184.00"))]})
-            txns.append(_vat_expense(first.replace(day=22), f"Kfz-Versicherung {first.year}",
-                                     KFZ_VERS, D("612.00")))
-            txns.append(_vat_expense(first.replace(day=24), f"Berufshaftpflicht {first.year}",
-                                     VERSICHERUNG, D("428.00")))
+            txns.append(_vat_expense(first.replace(day=22), "HUK-Coburg Kfz-Versicherung", KFZ_VERS, D("612.00")))
+            txns.append(_vat_expense(first.replace(day=24), "VGH Berufshaftpflicht", VERSICHERUNG, D("428.00")))
     return txns
 
 
-# Variable business spend — (account, lo, hi, label, monthly-count).
-VARIABLE = [
-    (BUEROBEDARF, 8, 90, "Bürobedarf", 6),
-    (WERKZEUG, 25, 350, "Werkzeug/GWG", 3),
-    (REISE, 15, 220, "Reisekosten (DB/Taxi)", 6),
-    (AUFMERK, 18, 95, "Aufmerksamkeit/Bewirtung", 4),
-    (WERBUNG, 30, 400, "Werbung/Anzeigen", 2),
-    (PORTO, 3, 30, "Porto/Versand", 5),
-    (BUECHER, 12, 65, "Fachbücher/Zeitschriften", 2),
-    (KFZ_BETRIEB, 35, 110, "Tanken/Parken", 6),
-    (FORTBILDUNG, 60, 480, "Fortbildung/Workshop", 2),
-    (GWG, 120, 780, "Geräteanschaffung GWG", 1),
+# Business spend: (account, lo, hi, avg-count/mo, merchant-key)
+B_MERCHANTS = {
+    "buero": ["Amazon.de", "Staples", "Office Discount", "McPaper München"],
+    "werkzeug": ["MediaMarkt München", "Cyberport", "Apple Store München", "Gravis", "Amazon.de"],
+    "reise": ["Deutsche Bahn", "DB Navigator", "MVG München", "Lufthansa", "Sixt", "FREENOW"],
+    "aufmerk": ["L'Osteria", "Café Frischhut", "Vinzenzmurr", "Hofbräuhaus", "dean&david"],
+    "werbung": ["Google Ads", "Meta Platforms", "LinkedIn Ads", "Flyeralarm"],
+    "porto": ["Deutsche Post", "DHL Paket", "Hermes Versand", "DPD"],
+    "buecher": ["Hugendubel", "Amazon.de", "PAGE Magazin", "Rheinwerk Verlag"],
+    "tanken": ["SHELL München", "ARAL", "EnBW Ladestation", "Parkhaus Stachus", "ADAC"],
+    "fortbildung": ["Domestika", "Skillshare", "TYPO Berlin", "Adobe MAX"],
+    "gwg": ["MediaMarkt München", "Cyberport", "Apple Store München", "Gravis"],
+}
+BUSINESS = [
+    (BUEROBEDARF, 8, 90, 4, "buero"),
+    (WERKZEUG, 25, 350, 2, "werkzeug"),
+    (REISE, 12, 220, 4, "reise"),
+    (AUFMERK, 14, 95, 3, "aufmerk"),
+    (WERBUNG, 30, 420, 1, "werbung"),
+    (PORTO, 3, 30, 3, "porto"),
+    (BUECHER, 10, 65, 1, "buecher"),
+    (KFZ_BETRIEB, 30, 110, 4, "tanken"),
+    (FORTBILDUNG, 60, 480, 1, "fortbildung"),
+    (GWG, 120, 780, 1, "gwg"),
 ]
 
 
 def gen_variable() -> list[dict]:
-    """Dense seeded business spend (all 19% input VAT)."""
+    """Lumpy seeded business spend with real merchant names (19% VSt)."""
     rng = random.Random(SEED + 6)
     txns = []
     for first in iter_months():
-        ym = first.strftime("%m/%Y")
-        for path, lo, hi, label, count in VARIABLE:
-            for _ in range(count):
-                if rng.random() < 0.8:
-                    gross = D(str(rng.randint(lo, hi))) + D("0.") + D(str(rng.randint(0, 99)))
-                    gross = gross.quantize(D("0.01"))
-                    day = rng.randint(2, 27)
-                    acct = BANKKONTO if rng.random() < 0.7 else POSTBANK
-                    txns.append(_vat_expense(day_in(first, day), f"{label} {ym}", path, gross, acct))
-        # Irregular extra owner draws + occasional capital injection.
-        for _ in range(rng.randint(1, 3)):
-            amt = D(str(rng.randint(150, 900)))
+        for path, lo, hi, avg, key in BUSINESS:
+            for _ in range(_lumpy(rng, avg)):
+                acct = BANKKONTO if rng.random() < 0.7 else POSTBANK
+                txns.append(_vat_expense(day_in(first, rng.randint(2, 27)),
+                                         _pick(rng, B_MERCHANTS[key]), path,
+                                         _cents(rng, lo, hi), acct))
+    return txns
+
+
+# Personal living — itemized Privatentnahme (1800) with real merchants, so
+# the Girokonto reads like a real statement while the book stays strictly
+# business-only (personal -> equity draw).
+P_GROCERIES = ["REWE", "EDEKA", "LIDL", "ALDI Süd", "Vollcorner Bio", "dm-drogerie", "Rossmann"]
+P_DINING = ["Hofbräuhaus", "L'Osteria", "Vapiano", "Döner Imbiss Schwabing", "Starbucks", "Café Glockenspiel"]
+P_HOUSE = ["IKEA Brunnthal", "Höffner", "MediaMarkt", "Amazon.de", "OBI Baumarkt"]
+P_TRANSPORT = ["MVG München", "Deutsche Bahn", "FREENOW", "ARAL"]
+P_MISC = ["Apotheke am Markt", "Friseur Schnittstelle", "Body & Soul Fitness", "Cinemaxx", "Müller Drogerie"]
+P_SUBS = [("Netflix", "12.99"), ("Spotify", "10.99"), ("Amazon Prime", "8.99")]
+
+
+def gen_personal() -> list[dict]:
+    """Personal living + Krankenkasse, itemized as Privatentnahme draws."""
+    rng = random.Random(SEED + 12)
+    txns = []
+    for first in iter_months():
+        txns.append({"date": day_in(first, 1), "description": "Techniker Krankenkasse Beitrag",
+                     "splits": [(BANKKONTO, D("-781.53")), (KRANKENKASSE, D("781.53"))]})
+        for name, amt in P_SUBS:
+            txns.append({"date": day_in(first, 5), "description": name,
+                         "splits": [(BANKKONTO, -D(amt)), (PRIV_DRAW, D(amt))]})
+        for names, lo, hi, avg in [
+                (P_GROCERIES, 12, 95, 8), (P_DINING, 8, 70, 6), (P_HOUSE, 25, 600, 1),
+                (P_TRANSPORT, 3, 60, 3), (P_MISC, 12, 140, 2)]:
+            for _ in range(_lumpy(rng, avg)):
+                amt = _cents(rng, lo, hi)
+                acct = BANKKONTO if rng.random() < 0.85 else POSTBANK
+                txns.append({"date": day_in(first, rng.randint(2, 27)),
+                             "description": _pick(rng, names),
+                             "splits": [(acct, -amt), (PRIV_DRAW, amt)]})
+        if rng.random() < 0.12:
+            amt = _cents(rng, 600, 2500)
             txns.append({"date": day_in(first, rng.randint(2, 27)),
-                         "description": f"Privatentnahme (Bar/Karte) {ym}",
-                         "splits": [(BANKKONTO, -amt), (PRIV_DRAW, amt)]})
-        if rng.random() < 0.15:
-            amt = D(str(rng.randint(500, 2500)))
-            txns.append({"date": day_in(first, rng.randint(2, 27)),
-                         "description": f"Privateinlage {ym}",
+                         "description": "Privateinlage (Übertrag privat)",
                          "splits": [(BANKKONTO, amt), (PRIV_EINLAGE, -amt)]})
     return txns
 
 
+CLIENTS = ["Verlag Bergblick", "Atelier Donau", "Stadtmarketing München", "BioBackhaus GmbH",
+           "Praxis Dr. Vogel", "Architekturbüro Lindner", "Festival Tollwood", "Café Kosmos",
+           "Brauerei Aukofer", "Modehaus Lindberg"]
+
+
 def gen_honorar() -> list[dict]:
     """Direct (non-invoiced) Honorar deposits — the bulk of revenue, paid
-    straight to the bank with output VAT (19%, plus occasional 7%)."""
+    straight to the bank with output VAT (19%, occasionally 7% licensing).
+    Lifted to a Munich senior-designer level so the Bankkonto stays solvent."""
     rng = random.Random(SEED + 9)
     txns = []
     for first in iter_months():
-        ym = first.strftime("%m/%Y")
-        for _ in range(rng.randint(4, 8)):
-            net = D(str(rng.randint(400, 2600)))
-            rate, rev, ust = ((D("7"), REV7, UST7) if rng.random() < 0.2
-                              else (D("19"), REV19, UST19))
+        for _ in range(rng.randint(4, 6)):
+            net = D(rng.randint(800, 2800))
+            seven = rng.random() < 0.2
+            rate, rev, ust = (D("7"), REV7, UST7) if seven else (D("19"), REV19, UST19)
             vat = (net * rate / D("100")).quantize(D("0.01"))
-            gross = net + vat
-            acct = BANKKONTO if rng.random() < 0.8 else POSTBANK
+            acct = BANKKONTO if rng.random() < 0.85 else POSTBANK
+            kind = "Nutzungsrechte" if seven else "Honorar"
             txns.append({"date": day_in(first, rng.randint(2, 27)),
-                         "description": f"Honorar Direktauftrag {ym}",
-                         "splits": [(acct, gross), (rev, -net), (ust, -vat)]})
+                         "description": f"{kind} {rng.choice(CLIENTS)}",
+                         "splits": [(acct, net + vat), (rev, -net), (ust, -vat)]})
     return txns
-
-
-def day_in(first: date, day: int) -> date:
-    import calendar
-    last = calendar.monthrange(first.year, first.month)[1]
-    return first.replace(day=min(day, last))
 
 
 # ── Phase 7: business — VAT invoicing + USD cross-currency + bill ──
@@ -703,8 +778,12 @@ def build(out_path: Path) -> None:
     print(f"  {write_bulk(out_path, gen_recurring())} recurring txns")
     print("\nPhase 5: variable business spend")
     print(f"  {write_bulk(out_path, gen_variable())} variable txns")
-    print("\nPhase 6: direct Honorar deposits")
+    print("\nPhase 6: personal living + Krankenkasse (Privatentnahme)")
+    print(f"  {write_bulk(out_path, gen_personal())} personal txns")
+    print("\nPhase 7: direct Honorar deposits")
     print(f"  {write_bulk(out_path, gen_honorar())} Honorar deposits")
+    print("\nPhase 7b: monthly ETF Sparplan")
+    print(f"  {run_investments(out_path)} Sparplan buys")
     print("\nPhase 7: business (VAT invoicing + USD cross-currency)")
     print(f"  {run_business(book)}")
     print("\nPhase 8: edge — localized Ausgleichskonto")
