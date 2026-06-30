@@ -83,6 +83,49 @@ verification harness.
 
 ---
 
+## sabine-brenner.gnucash
+
+Munich freelance Grafikdesignerin (Einzelunternehmerin) running the
+authentic DATEV **SKR03** chart. Tests the **natively localized
+account hierarchy** path: German, numbered account names with **no
+English account named "Income"/"Imbalance"/"mortgage"** anywhere, so
+every tool that keys off an English name is exercised against a book
+where that assumption fails.
+
+- **Default currency:** EUR (with USD in the book for a US client)
+- **Accounts:** 110 (the shipped `acctchrt_skr03` verbatim + a few
+  German-named additions: Hypothek, Kfz-Finanzierung, fixed assets,
+  an ETF depot, a localized Ausgleichskonto)
+- **Transactions:** ~220
+- **Period covered:** 2025 → 2026
+
+What's in here:
+
+- **German VAT (USt) invoicing** through taxtables — 19% on design
+  services (`8400 Erlöse USt. 19%`) and the reduced 7% rate on
+  licensing/Nutzungsrechte (`8300`), with output VAT to `1776`/`1771`
+  and reclaimable input VAT (Vorsteuer) to `1576`.
+- **A USD-paying export client** (Lumen Labs Inc.) — invoiced in USD,
+  posted and paid at different EUR/USD rates, so realized FX gain/loss
+  is recognized into a top-level-INCOME child **resolved by type**
+  (`Erlöse u. Erträge 2/8:Foreign Exchange Gain/Loss` — English leaf,
+  because locale inference correctly declines on a numbered chart).
+- **Sole-proprietor equity flows:** monthly Privatentnahme instead of
+  salary; opening balances via the SKR03 `Anfangsbestand`.
+- **A Hypothek and a Kfz-Finanzierung** with `apr` + `loan_term_months`
+  slots — exercises `debt_payoff_plan` with no English "mortgage"
+  keyword in sight.
+- **A localized Ausgleichskonto-EUR** carrying a small balance, so the
+  dashboard's data-integrity warning fires on a *German* Imbalance
+  name (the structural Tier-C detector).
+
+Built to convert the i18n bug class from invisible to a failing test:
+net worth agrees to the cent across `get_book_summary` /
+`balance_sheet` / `net_worth`, all classification is by account type,
+and the cross-currency FX path settles instead of throwing.
+
+---
+
 ## How to point the server at a sample book
 
 ```bash
