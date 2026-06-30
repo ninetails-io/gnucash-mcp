@@ -2507,6 +2507,51 @@ class TestGetBookSummaryWarnings:
             )[0]
             assert "Roth IRA" not in warnings_block
 
+    def test_low_cash_imbalance_account_excluded(self, test_book: Path):
+        """A root-level Imbalance/suspense BANK account is surfaced by the
+        integrity check, NOT the low-cash check (and not counted in
+        runway). A few units parked for clarification aren't a cash-flow
+        emergency."""
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=False) as book:
+            opening = gc._find_account(book, "Equity:Opening Balance")
+            imb = piecash.Account(
+                name="Imbalance-USD", type="BANK",
+                parent=book.root_account,
+                commodity=book.default_currency,
+            )
+            book.session.add(imb)
+            book.session.add(piecash.Transaction(
+                currency=book.default_currency,
+                description="Unbalanced remainder",
+                post_date=date.today() - timedelta(days=10),
+                splits=[
+                    piecash.Split(account=imb, value=Decimal("3")),
+                    piecash.Split(account=opening, value=Decimal("-3")),
+                ],
+            ))
+            book.save()
+        # Burn high enough that the low-cash threshold sits above $3.
+        gc.create_transaction(
+            description="Burn",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "36000"},
+                {"account": "Assets:Checking", "amount": "-36000"},
+            ],
+            trans_date=date.today() - timedelta(days=30),
+            check_duplicates=False,
+        )
+        result = gc.get_book_summary()
+        if "Warnings:" in result:
+            warnings_block = result.split("Warnings:")[1].split(
+                "Accounts:"
+            )[0]
+            # Not a cash-flow alarm...
+            assert "Critically low cash: Imbalance-USD" not in warnings_block
+            # ...but the integrity section DOES surface it.
+            assert "Imbalance-USD" in warnings_block
+            assert "uncleared suspense balance" in warnings_block
+
     def test_low_cash_skipped_when_no_burn(self, test_book: Path):
         """When the book has no expense activity in the burn
         window, there's no daily-burn benchmark. Skip the
