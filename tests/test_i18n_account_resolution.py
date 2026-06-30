@@ -335,6 +335,38 @@ class TestBookLocaleInference:
         )
 
 
+    def test_infers_and_names_newly_added_locale(self, tmp_path):
+        # A locale added by the catalog-completion expansion (Turkish).
+        # Build the book from the table's own structural words (no
+        # transcription drift), then prove inference detects it AND the
+        # naming table returns a localized FX leaf — i.e. inference and
+        # naming moved together past the original 12. A revert to the
+        # smaller tables fails here.
+        words = GnuCashBook._STRUCTURAL_TYPE_NAMES["tr"]
+        path = tmp_path / "tr.gnucash"
+        book = piecash.create_book(str(path), currency="EUR", overwrite=True)
+        root = book.root_account
+        cur = book.default_currency
+        for atype, name in words.items():
+            piecash.Account(name=name, type=atype, parent=root,
+                            commodity=cur, placeholder=True)
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            assert gb._infer_book_locale(b) == "tr"
+        expected = GnuCashBook._LOCALIZED_ACCOUNT_NAMES["fx_gain_loss"]["tr"]
+        assert (
+            gb._locale_account_name(
+                "fx_gain_loss", "Foreign Exchange Gain/Loss", "tr"
+            )
+            == expected
+        )
+        assert expected != "Foreign Exchange Gain/Loss"  # genuinely localized
+
+
+
 class TestAutoBalancingAccountDetection:
     """Tier C: GnuCash localizes the "Imbalance"/"Orphan" leading word,
     so the old English-prefix check went dark on localized books. The

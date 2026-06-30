@@ -1062,65 +1062,120 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     #
     # gettext (po/<lang>.po) translations of the five structural type
     # words, keyed by GNCAccountType, used ONLY to infer the book locale
-    # from its top-level accounts. Source: gnucash-account-naming-i18n.md.
-    # Locale keys are normalized 2-letter codes (pt_BR→pt, zh_CN→zh).
+    # from its top-level accounts (voting; >=2 matches win). Extracted
+    # from every shipped GnuCash po catalog that has all five words AND a
+    # Realized Gain/Loss name (47 locales); inference and naming move
+    # together, so a detected locale always has a leaf name. Locale keys
+    # are normalized codes (pt_BR→pt, zh_CN→zh); variant files that would
+    # collide on a key are skipped. Regenerate per gnucash-account-
+    # naming-i18n.md.
     _STRUCTURAL_TYPE_NAMES = {
-        "de": {"ASSET": "Aktiva", "LIABILITY": "Fremdkapital",
-               "INCOME": "Ertrag", "EXPENSE": "Aufwand",
-               "EQUITY": "Eigenkapital"},
-        "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)",
-               "INCOME": "Revenus", "EXPENSE": "Dépenses",
-               "EQUITY": "Capitaux propres"},
-        "es": {"ASSET": "Activos", "LIABILITY": "Pasivos",
-               "INCOME": "Ingreso", "EXPENSE": "Gastos",
-               "EQUITY": "Patrimonio"},
-        "it": {"ASSET": "Attività", "LIABILITY": "Passività",
-               "INCOME": "Entrate", "EXPENSE": "Uscite",
-               "EQUITY": "Patrimonio netto"},
-        "pt": {"ASSET": "Ativos", "LIABILITY": "Passivos",
-               "INCOME": "Receita", "EXPENSE": "Despesas",
-               "EQUITY": "Patrimônio líquido"},
-        "nl": {"ASSET": "Activa", "LIABILITY": "Vreemd vermogen",
-               "INCOME": "Opbrengsten", "EXPENSE": "Kosten",
-               "EQUITY": "Eigen vermogen"},
-        "ru": {"ASSET": "Активы", "LIABILITY": "Обязательства",
-               "INCOME": "Приход", "EXPENSE": "Расходы",
-               "EQUITY": "Собственные средства"},
-        "ja": {"ASSET": "資産", "LIABILITY": "負債", "INCOME": "収益",
-               "EXPENSE": "費用", "EQUITY": "純資産"},
-        "zh": {"ASSET": "资产", "LIABILITY": "负债", "INCOME": "收入",
-               "EXPENSE": "支出", "EQUITY": "所有者权益"},
-        "ko": {"ASSET": "자산", "LIABILITY": "부채", "INCOME": "수입",
-               "EXPENSE": "비용", "EQUITY": "자기자본"},
-        "pl": {"ASSET": "Aktywa", "LIABILITY": "Pasywa",
-               "INCOME": "Przychody", "EXPENSE": "Wydatki",
-               "EQUITY": "Kapitał własny"},
-        "sv": {"ASSET": "Tillgångar", "LIABILITY": "Skulder",
-               "INCOME": "Inkomst", "EXPENSE": "Utgifter",
-               "EQUITY": "Eget kapital"},
+        "ar": {"ASSET": "الأصول", "LIABILITY": "الالتزامات", "INCOME": "الدخل", "EXPENSE": "المصروفات", "EQUITY": "حقوق الملكية"},
+        "as": {"ASSET": "সম্পত্তিবোৰ", "LIABILITY": "বিশ্বাসযোগ্যতাবোৰ", "INCOME": "উপাৰ্জন", "EXPENSE": "ব্যয়বোৰ", "EQUITY": "সাধাৰণ অংশ"},
+        "bg": {"ASSET": "Активи:", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
+        "brx": {"ASSET": "सम्पति", "LIABILITY": "दाहार", "INCOME": "आय", "EXPENSE": "खरसा", "EQUITY": "बन्दक"},
+        "ca": {"ASSET": "Actiu", "LIABILITY": "Passiu", "INCOME": "Ingressos", "EXPENSE": "Despeses", "EQUITY": "Patrimoni"},
+        "cs": {"ASSET": "Aktiva", "LIABILITY": "Pasiva", "INCOME": "Příjmy", "EXPENSE": "Náklady", "EQUITY": "Vlastní jmění"},
+        "da": {"ASSET": "Aktiver", "LIABILITY": "Passiver", "INCOME": "Indtægt", "EXPENSE": "Udgifter", "EQUITY": "Egenkapital"},
+        "de": {"ASSET": "Aktiva", "LIABILITY": "Fremdkapital", "INCOME": "Ertrag", "EXPENSE": "Aufwand", "EQUITY": "Eigenkapital"},
+        "doi": {"ASSET": "जैदाद", "LIABILITY": "देनदारियां", "INCOME": "आमदन", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "el": {"ASSET": "Ενεργητικό", "LIABILITY": "Παθητικό", "INCOME": "Έσοδα", "EXPENSE": "Έξοδα", "EQUITY": "Καθαρή θέση"},
+        "es": {"ASSET": "Activos", "LIABILITY": "Pasivos", "INCOME": "Ingreso", "EXPENSE": "Gastos", "EQUITY": "Patrimonio"},
+        "fi": {"ASSET": "Vastaavaa", "LIABILITY": "Vieras pääoma", "INCOME": "Tulo", "EXPENSE": "Menot", "EQUITY": "Oma pääoma"},
+        "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)", "INCOME": "Revenus", "EXPENSE": "Dépenses", "EQUITY": "Capitaux propres"},
+        "gu": {"ASSET": "સંપત્તિઓ", "LIABILITY": "જવાબદારી", "INCOME": "આવક", "EXPENSE": "ખર્ચ", "EQUITY": "હિસ્સો"},
+        "he": {"ASSET": "נכסים", "LIABILITY": "התחייבויות", "INCOME": "הכנסות", "EXPENSE": "הוצאות", "EQUITY": "הון"},
+        "hi": {"ASSET": "संपत्तियां ", "LIABILITY": "देयताएं ", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "hr": {"ASSET": "Imovina", "LIABILITY": "Obveze", "INCOME": "Prihod", "EXPENSE": "Rashod", "EQUITY": "Kapital"},
+        "hu": {"ASSET": "Eszközök", "LIABILITY": "Kötelezettségek", "INCOME": "Bevétel", "EXPENSE": "Kiadások", "EQUITY": "Saját tőke"},
+        "id": {"ASSET": "Aset", "LIABILITY": "Liabilitas", "INCOME": "Pendapatan", "EXPENSE": "Pengeluaran", "EQUITY": "Ekuitas"},
+        "it": {"ASSET": "Attività", "LIABILITY": "Passività", "INCOME": "Entrate", "EXPENSE": "Uscite", "EQUITY": "Patrimonio netto"},
+        "ja": {"ASSET": "資産", "LIABILITY": "負債", "INCOME": "収益", "EXPENSE": "費用", "EQUITY": "純資産"},
+        "kn": {"ASSET": "ಆಸ್ತಿಗಳು", "LIABILITY": "ಹೊಣೆಗಾರಿಕೆಗಳು", "INCOME": "ಆದಾಯ", "EXPENSE": "ಖರ್ಚುಗಳು", "EQUITY": "ಈಕ್ವಿಟಿ"},
+        "ko": {"ASSET": "자산", "LIABILITY": "부채", "INCOME": "수입", "EXPENSE": "비용", "EQUITY": "자기자본"},
+        "kok": {"ASSET": "एसेट्स", "LIABILITY": "देणी", "INCOME": "उत्पन्न", "EXPENSE": "खर्च", "EQUITY": "समभाग"},
+        "ks": {"ASSET": "एिसीट", "LIABILITY": "लायबोलटी", "INCOME": "ईनकम", "EXPENSE": "खरचो", "EQUITY": "बराबरी"},
+        "lt": {"ASSET": "Turtas", "LIABILITY": "Įsipareigojimai", "INCOME": "Pajamos", "EXPENSE": "Sąnaudos", "EQUITY": "Nuosavybė"},
+        "lv": {"ASSET": "Aktīvi", "LIABILITY": "Pasīvi", "INCOME": "Ieņēmumi", "EXPENSE": "izdevumi", "EQUITY": "Pašu kapitāls"},
+        "mai": {"ASSET": "संपत्ति", "LIABILITY": "देयता", "INCOME": "आय", "EXPENSE": "खर्च", "EQUITY": "इक्विटी"},
+        "mni": {"ASSET": "ꯂꯟ-ꯊꯨꯝ", "LIABILITY": "ꯂꯥꯏꯌꯕꯤꯂꯤꯇꯤꯁ", "INCOME": "ꯏꯟꯀꯝ", "EXPENSE": "ꯆꯥꯗꯤꯡ", "EQUITY": "ꯏꯀꯨꯏꯇꯤ"},
+        "mr": {"ASSET": "मालमत्ता", "LIABILITY": "दायित्व", "INCOME": "मिळकत", "EXPENSE": "खर्च", "EQUITY": "इक्विटी"},
+        "nb": {"ASSET": "Eiendeler", "LIABILITY": "Gjeld", "INCOME": "Inntekt", "EXPENSE": "Kostnader", "EQUITY": "Egenkapital"},
+        "ne": {"ASSET": "सम्पत्ति", "LIABILITY": "दायित्व", "INCOME": "आम्दानी", "EXPENSE": "खर्चहरु", "EQUITY": "इक्युटी"},
+        "nl": {"ASSET": "Activa", "LIABILITY": "Vreemd vermogen", "INCOME": "Opbrengsten", "EXPENSE": "Kosten", "EQUITY": "Eigen vermogen"},
+        "pl": {"ASSET": "Aktywa", "LIABILITY": "Pasywa", "INCOME": "Przychody", "EXPENSE": "Wydatki", "EQUITY": "Kapitał własny"},
+        "pt": {"ASSET": "Ativos", "LIABILITY": "Passivos", "INCOME": "Receita", "EXPENSE": "Despesas", "EQUITY": "Patrimônio líquido"},
+        "ro": {"ASSET": "Active", "LIABILITY": "Pasive", "INCOME": "Venituri", "EXPENSE": "Cheltuieli", "EQUITY": "Capital propriu"},
+        "ru": {"ASSET": "Активы", "LIABILITY": "Обязательства", "INCOME": "Приход", "EXPENSE": "Расходы", "EQUITY": "Собственные средства"},
+        "sk": {"ASSET": "Aktíva", "LIABILITY": "Pasíva", "INCOME": "Príjem", "EXPENSE": "Výdavky", "EQUITY": "Vlastné imanie"},
+        "sr": {"ASSET": "Добра", "LIABILITY": "Дуговања", "INCOME": "Приход", "EXPENSE": "Расходи", "EQUITY": "Акција"},
+        "sv": {"ASSET": "Tillgångar", "LIABILITY": "Skulder", "INCOME": "Inkomst", "EXPENSE": "Utgifter", "EQUITY": "Eget kapital"},
+        "ta": {"ASSET": "சொத்துக்கள்", "LIABILITY": "பொறுப்பீடுகள்", "INCOME": "ஊதியம்", "EXPENSE": "செலவுகள்", "EQUITY": "உறுப்பு"},
+        "te": {"ASSET": "ఆస్తులు", "LIABILITY": "అప్పులు", "INCOME": "ఆదాయం", "EXPENSE": "వ్యయాలు", "EQUITY": "ఈక్విటీ"},
+        "tr": {"ASSET": "Varlıklar", "LIABILITY": "Y.Kaynaklar", "INCOME": "Gelir", "EXPENSE": "Gider", "EQUITY": "Özkaynak"},
+        "uk": {"ASSET": "Активи", "LIABILITY": "Зобов'язання", "INCOME": "Надходження", "EXPENSE": "Видатки", "EQUITY": "Маржа"},
+        "ur": {"ASSET": "مالیات", "LIABILITY": "ادائیگی", "INCOME": "آمدنی", "EXPENSE": "خرچ", "EQUITY": "اكویٹی"},
+        "vi": {"ASSET": "Tài sản", "LIABILITY": "Tài sản nợ", "INCOME": "Thu nhập", "EXPENSE": "Phí tổn", "EQUITY": "Cổ phần"},
+        "zh": {"ASSET": "资产", "LIABILITY": "负债", "INCOME": "收入", "EXPENSE": "支出", "EQUITY": "所有者权益"},
     }
 
     # Localized leaf names for the accounts we auto-create, keyed by an
-    # internal concept slug then normalized locale code. Only concepts
-    # with a translation table appear here; a missing concept or locale
-    # degrades to the caller's English default. Seeded from the
-    # "Realized Gain/Loss" row of gnucash-account-naming-i18n.md;
-    # extend by parsing po/<lang>.po later (the discount concepts have
-    # no shipped GnuCash translation, so they stay English for now).
+    # internal concept slug then normalized locale code. A missing
+    # concept or locale degrades to the caller's English default. The
+    # fx_gain_loss row is the "Realized Gain/Loss" translation for every
+    # shipped locale that also has a complete structural-word set (47,
+    # from po/<lang>.po), kept in lockstep with _STRUCTURAL_TYPE_NAMES.
+    # The discount concepts have no shipped GnuCash translation, so they
+    # stay English.
     _LOCALIZED_ACCOUNT_NAMES = {
         "fx_gain_loss": {
+            "ar": "مكسب/خسارة محقَّقة",
+            "as": "লাভ/লোচকান বুজি লোৱা হল",
+            "bg": "Реализирана печалба/загуба",
+            "brx": "आदाय खालामनाय मुलाम्फा/खहा",
+            "ca": "Guanys/pèrdues realitzats",
+            "cs": "Realizovaný zisk/ztráta",
+            "da": "Realiseret overskud/tab",
             "de": "Realisierter Gewinn/Verlust",
-            "fr": "Gains/pertes réalisés",
+            "doi": "स्वीकृत नऱफा/ नुक्सान",
+            "el": "Πραγματοποιηθέντα Κέρδη/Ζημιές",
             "es": "Ganancias/Pérdidas Ocurridas",
+            "fi": "Toteutuneet tulot/menot",
+            "fr": "Gains/pertes réalisés",
+            "gu": "વાસ્તવિક લાભ/નુક્શાન",
+            "he": "רוח/הפסד ממומש",
+            "hi": "वास्तविक लाभ/हानि",
+            "hr": "Ostvarena dobit/gubitak",
+            "hu": "Realizált nyereség/veszteség",
+            "id": "Keuntungan/Kerugian Direalisasikan",
             "it": "Profitti e perdite realizzati",
-            "pt": "Ganhos e perdas realizados",
-            "nl": "Gerealiseerde winst/verlies",
-            "ru": "Реализованная прибыль/убыток",
             "ja": "実現損益",
-            "zh": "已实现获利(亏损)",
+            "kn": "ನಗದುಗೊಳಿಸಲಾದ ಗಳಿಕೆ/ನಷ್ಟ",
             "ko": "실제 이익/손실",
+            "kok": "मेळिल्लो नफो / तोटो",
+            "ks": "रीयालायज़ीड फॊयदी /नुकसान",
+            "lt": "Patirtas pelnas/nuostolis",
+            "lv": "Realizētie ieņēmumi/zaudējumi",
+            "mai": "वास्तविक लाभ/हानि",
+            "mni": "ꯐꯪꯂꯕ ꯑꯇꯣꯡꯕ/ꯑꯃꯥꯡꯕ",
+            "mr": "विक्री करून आलेला नफा/तोटा",
+            "nb": "Realisert over-/underskudd",
+            "ne": "असूल गरिएको नाफा/नोक्सान",
+            "nl": "Gerealiseerde winst/verlies",
             "pl": "Zyski/straty zrealizowane",
+            "pt": "Ganhos e perdas realizados",
+            "ro": "Câștiguri/pierderi realizate",
+            "ru": "Реализованная прибыль/убыток",
+            "sk": "Realizované Zisky/Straty",
+            "sr": "Остварени добитак/губитак",
             "sv": "Reavinst/-förlust",
+            "ta": "விவரிக்கப்பட்ட இலாபம்/இழப்பு",
+            "te": "గ్రహించిన లాభం/నష్టం",
+            "tr": "Gerçekleşmiş Kazanç/Kayıp",
+            "uk": "Отримані прибутки/втрати",
+            "ur": "حقیقی نفع/ نقصان",
+            "vi": "Gia tăng/giảm thực xảy ra",
+            "zh": "已实现获利(亏损)",
         },
     }
 
