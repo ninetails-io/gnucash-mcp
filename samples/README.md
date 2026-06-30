@@ -96,7 +96,7 @@ where that assumption fails.
 - **Accounts:** 110 (the shipped `acctchrt_skr03` verbatim + a few
   German-named additions: Hypothek, Kfz-Finanzierung, fixed assets,
   an ETF depot, a localized Ausgleichskonto)
-- **Transactions:** ~1,320
+- **Transactions:** ~1,450
 - **Period covered:** 2025 → 2026
 
 What's in here:

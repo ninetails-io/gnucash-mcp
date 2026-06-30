@@ -541,7 +541,8 @@ def gen_variable() -> list[dict]:
 # the Girokonto reads like a real statement while the book stays strictly
 # business-only (personal -> equity draw).
 P_GROCERIES = ["REWE", "EDEKA", "LIDL", "ALDI Süd", "Vollcorner Bio", "dm-drogerie", "Rossmann"]
-P_DINING = ["Hofbräuhaus", "L'Osteria", "Vapiano", "Döner Imbiss Schwabing", "Starbucks", "Café Glockenspiel"]
+P_DINING = ["Hofbräuhaus", "L'Osteria", "Vapiano", "Wirtshaus zur Brez'n", "dean&david"]
+P_COFFEE = ["Starbucks", "Café Glockenspiel", "Man Versus Machine", "Bäckerei Rischart", "Döner Imbiss Schwabing"]
 P_HOUSE = ["IKEA Brunnthal", "Höffner", "MediaMarkt", "Amazon.de", "OBI Baumarkt"]
 P_TRANSPORT = ["MVG München", "Deutsche Bahn", "FREENOW", "ARAL"]
 P_MISC = ["Apotheke am Markt", "Friseur Schnittstelle", "Body & Soul Fitness", "Cinemaxx", "Müller Drogerie"]
@@ -561,7 +562,8 @@ def gen_personal() -> list[dict]:
             txns.append({"date": day_in(first, 5), "description": name,
                          "splits": [(BANKKONTO, -D(amt)), (PRIV_DRAW, D(amt))]})
         for names, lo, hi, avg in [
-                (P_GROCERIES, 12, 95, 8), (P_DINING, 8, 70, 6), (P_HOUSE, 25, 600, 1),
+                (P_GROCERIES, 12, 95, 8), (P_DINING, 14, 65, 4),
+                (P_COFFEE, 3, 14, 7), (P_HOUSE, 25, 600, 1),
                 (P_TRANSPORT, 3, 60, 3), (P_MISC, 12, 140, 2)]:
             for _ in range(_lumpy(rng, avg)):
                 amt = _cents(rng, lo, hi)
