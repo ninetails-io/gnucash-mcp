@@ -624,7 +624,13 @@ class CoreMixin:
                         sort_magnitude = abs(balance * rate)
                 integrity.append((
                     sort_magnitude,
-                    f"{name}: {balance} (data integrity issue)",
+                    # An auto-balancing (Imbalance/Orphan) account with a
+                    # non-zero balance is ambiguous: GnuCash may have parked
+                    # an unbalanced remainder, or the user may be holding an
+                    # unclassified item on purpose. Flag it for attention
+                    # without implying the book is corrupted.
+                    f"{name}: {balance} "
+                    f"(uncleared suspense balance — review or reclassify)",
                 ))
         integrity.sort(key=lambda pair: pair[0], reverse=True)
         integrity = [msg for _, msg in integrity]
