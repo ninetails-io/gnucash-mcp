@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.4.0 - Internationalization, batch entry, and multi-book
+
+The first widely-promoted release. v1.3 finished the business
+module; v1.4 makes the server locale-robust, adds bulk and
+multi-book workflows, and closes a second multi-currency
+correctness pass.
+
+**Internationalization - locale-robust account resolution.**
+
+GnuCash localizes account *names* per locale but never account
+*types*. Every place the server keyed off an English literal
+("Income", "Imbalance", "mortgage") was wrong the moment a book
+was `de_DE` / `es_MX` / `zh_CN`. v1.4 resolves top-level accounts
+by `GNCAccountType`, votes across several type accounts to infer a
+book's locale, and self-heals designated accounts (FX gain/loss,
+discounts) via a KVP slot that becomes rename- and locale-proof
+after first use.
+
+- Locale-robust resolution across balancing detection, Imbalance /
+  Orphan handling, and cross-currency FX account naming.
+- Suspense / Imbalance accounts excluded from runway and low-cash
+  signals so a lopsided book doesn't distort the dashboard.
+- **Sabine Brenner** - a German DATEV SKR03 synthetic persona (EUR
+  default, numbered German account names) that makes the i18n bug
+  class visible; ships alongside Alex (USD) and Lin Wei (CNY, now
+  localized to a zh_CN chart of accounts).
+
+**Bulk and multi-book workflows.**
+
+- **Batch transaction entry** (`create_transactions`) - submit
+  many transactions in one atomic call, with a per-transaction
+  result correlated back by a caller-supplied `ref` and a
+  duplicates table keyed to it. One book open, one save for the
+  whole batch.
+- **Multi-book** - `GNUCASH_BOOK_PATH` takes an `os.pathsep`-
+  separated list; `switch_book` flips the active book in-session
+  (matched by unique filename prefix) with a context-reset banner
+  so cross-book references don't leak.
+
+**Reporting.**
+
+- **Pagination** - `offset` plus a `Showing X-Y of Z` indicator
+  across all list-returning tools; dated tools also render the
+  covered date range.
+- **group_by** - sub-period columns on the aggregation reports.
+
+**Multi-currency correctness (second pass).**
+
+- FX gain/loss booked in the book's default currency; both-foreign
+  posting splits valued at the posting-date rate; lot cost basis
+  in the default currency; foreign debts with no FX rate excluded
+  from `debt_payoff_plan` (with a warning).
+- FX entry-sanity warning when a cross-currency transaction's
+  implied rate diverges sharply from the latest price on file.
+
+**Tests:** 1,714 passing.
+
+---
+
 ## v1.3.1 — Business module, role-aligned modules, multi-currency correctness
 
 v1.2.1 fixed everything the business module *should* have been at first
