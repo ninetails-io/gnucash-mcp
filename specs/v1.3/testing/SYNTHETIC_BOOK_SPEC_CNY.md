@@ -76,102 +76,122 @@ assumes rates are near 1.0.
 
 ## Phase 2: Chart of Accounts
 
-Use English account names (GnuCash standard) but Chinese vendor/description
-names in transactions. The account structure tests the server; the transaction
-descriptions test character encoding.
+**Native zh_CN chart.** Lin Wei's book is a genuine Chinese-locale book:
+the entire chart of accounts is in Chinese, the way a real Shenzhen
+household's GnuCash book looks. This is deliberate — an English-named chart
+on a CNY/Shenzhen persona was unrealistic, *and* it left the server's i18n
+paths untested. A Chinese chart exercises them for real.
 
-### Assets
-```
-Assets:Current Assets:Checking Account [BANK] — 中国工商银行 (ICBC) primary
-Assets:Current Assets:Savings Account [BANK] — 招商银行 (CMB) savings
-Assets:Current Assets:Cash [CASH]
-Assets:Current Assets:WeChat Pay [BANK] — 微信支付 balance
-Assets:Current Assets:Alipay [BANK] — 支付宝 balance
-Assets:Receivables:Accounts Receivable [RECEIVABLE] — CNY invoices
-Assets:Receivables:Accounts Receivable USD [RECEIVABLE] commodity=USD — US client invoices
-Assets:Receivables:Accounts Receivable EUR [RECEIVABLE] commodity=EUR — German client invoices
-Assets:Investments:Brokerage [PLACEHOLDER]
-  Assets:Investments:Brokerage:Moutai [STOCK] commodity=600519, namespace=SSE
-  Assets:Investments:Brokerage:CATL [STOCK] commodity=300750, namespace=SZSE
-  Assets:Investments:Brokerage:CSI300 [MUTUAL] commodity=510300, namespace=SSE
-  Assets:Investments:Brokerage:ChiNext [MUTUAL] commodity=159915, namespace=SZSE
-Assets:Investments:Housing Fund [BANK] — 住房公积金 (mandatory employer contribution)
-Assets:Fixed Assets:Apartment [ASSET] — 南山区 apartment
-Assets:Fixed Assets:Vehicle [ASSET] — BYD Han EV
-```
+The five top-level roots are the exact `zh` structural words in the server's
+`_STRUCTURAL_TYPE_NAMES` catalog (`资产 / 负债 / 收入 / 支出 / 所有者权益`), so
+`_infer_book_locale` votes the book to `"zh"`. Account *types* are
+locale-invariant (GnuCash never localizes the type enum), so every
+type-based server code path keeps working unchanged; only the *names* and
+paths are localized. Transaction descriptions and vendor/customer names are
+Chinese as before (character-encoding coverage).
 
-### Liabilities
+### 资产 (Assets)
 ```
-Liabilities:Credit Card:ICBC Credit Card [CREDIT] — 工商银行信用卡
-Liabilities:Credit Card:CMB Credit Card [CREDIT] — 招商银行信用卡
-Liabilities:Credit Card:HSBC HKD Card [CREDIT] commodity=HKD — 汇丰 HK$ card for cross-border Hong Kong shopping (FOREIGN-currency liability)
-Liabilities:Loans:Mortgage [LIABILITY] — 30-year mortgage on Nanshan apartment
-Liabilities:Loans:Auto Loan [LIABILITY] — BYD Han EV loan
-Liabilities:Accounts Payable [PAYABLE] — vendor bills (CNY and foreign-currency)
-```
-
-Set account slots:
-- ICBC Credit Card: apr=18.25, credit_limit=50000, statement_close_day=20
-- CMB Credit Card: apr=18.25, credit_limit=80000, statement_close_day=25
-- HSBC HKD Card: foreign-currency (HKD) card — apr / credit_limit set in HKD terms
-- Mortgage: apr=3.85 (China's LPR-based mortgage rate, much lower than US)
-- Auto Loan: apr=4.90
-
-### Income
-```
-Income:Salary [INCOME] — Chen Yu's hospital salary
-Income:Contractor Income [INCOME] — direct CNY contracts
-Income:LLC Revenue [INCOME] — invoiced through sole proprietorship
-Income:Investment Income:Dividends [INCOME]
-Income:Investment Income:Capital Gains [INCOME]
-Income:Housing Fund Income [INCOME] — employer housing fund match
-Income:Reimbursements [INCOME]
-Income:Foreign Exchange Gain/Loss [INCOME] — realized FX gain/loss on cross-currency invoice/bill settlement (auto-created on first cross-currency payment)
+资产:流动资产:支票账户 [BANK] — 中国工商银行 (ICBC) primary
+资产:流动资产:储蓄账户 [BANK] — 招商银行 (CMB) savings
+资产:流动资产:现金 [CASH]
+资产:流动资产:微信支付 [BANK] — 微信支付 balance
+资产:流动资产:支付宝 [BANK] — 支付宝 balance
+资产:应收款项:应收账款 [RECEIVABLE] — CNY invoices
+资产:应收款项:应收账款（美元） [RECEIVABLE] commodity=USD — US client invoices
+资产:应收款项:应收账款（欧元） [RECEIVABLE] commodity=EUR — German client invoices
+资产:投资:证券账户 [PLACEHOLDER]
+  资产:投资:证券账户:贵州茅台 [STOCK] commodity=600519, namespace=SSE
+  资产:投资:证券账户:宁德时代 [STOCK] commodity=300750, namespace=SZSE
+  资产:投资:证券账户:沪深300ETF [MUTUAL] commodity=510300, namespace=SSE
+  资产:投资:证券账户:创业板ETF [MUTUAL] commodity=159915, namespace=SZSE
+资产:投资:住房公积金 [BANK] — 住房公积金 (mandatory employer contribution)
+资产:固定资产:公寓 [ASSET] — 南山区 apartment
+资产:固定资产:车辆 [ASSET] — BYD Han EV
 ```
 
-### Expenses
+### 负债 (Liabilities)
 ```
-Expenses:Housing:Mortgage Interest [EXPENSE]
-Expenses:Housing:Property Management [EXPENSE] — 物业管理费 (replaces HOA)
-Expenses:Housing:Maintenance [EXPENSE]
-Expenses:Auto:Charging [EXPENSE] — EV charging, not fuel
-Expenses:Auto:Insurance [EXPENSE]
-Expenses:Auto:Maintenance [EXPENSE]
-Expenses:Auto:Parking [EXPENSE] — significant cost in Shenzhen
-Expenses:Groceries [EXPENSE]
-Expenses:Dining [EXPENSE]
-Expenses:Utilities:Electric [EXPENSE]
-Expenses:Utilities:Water [EXPENSE]
-Expenses:Utilities:Gas [EXPENSE] — 天然气 (natural gas for cooking)
-Expenses:Utilities:Internet [EXPENSE]
-Expenses:Utilities:Phone [EXPENSE]
-Expenses:Insurance:Health [EXPENSE] — 医疗保险
-Expenses:Insurance:Life [EXPENSE]
-Expenses:Taxes:Income Tax [EXPENSE] — 个人所得税
-Expenses:Taxes:Social Insurance [EXPENSE] — 五险一金 (Five Insurances + Housing Fund)
-Expenses:Taxes:Business Tax [EXPENSE] — sole proprietorship taxes
-Expenses:Subscriptions [EXPENSE]
-Expenses:Streaming [EXPENSE] — 爱奇艺, Bilibili Premium
-Expenses:Clothing [EXPENSE]
-Expenses:Pet:Food [EXPENSE]
-Expenses:Pet:Vet [EXPENSE]
-Expenses:Travel [EXPENSE]
-Expenses:Education [EXPENSE]
-Expenses:Gifts [EXPENSE] — 红包 (red envelopes) are significant
-Expenses:Charity [EXPENSE]
-Expenses:Business:Cloud Hosting [EXPENSE] — Alibaba Cloud (阿里云)
-Expenses:Business:Software [EXPENSE]
-Expenses:Business:Coworking [EXPENSE]
-Expenses:Interest:Credit Card Interest [EXPENSE]
-Expenses:Interest:Mortgage Interest [EXPENSE]
-Expenses:Interest:Auto Loan Interest [EXPENSE]
-Expenses:Medical [EXPENSE]
-Expenses:Miscellaneous [EXPENSE]
+负债:信用卡:工商银行信用卡 [CREDIT]
+负债:信用卡:招商银行信用卡 [CREDIT]
+负债:信用卡:汇丰港币信用卡 [CREDIT] commodity=HKD — 汇丰 HK$ card for cross-border Hong Kong shopping (FOREIGN-currency liability)
+负债:贷款:房屋贷款 [LIABILITY] — 30-year mortgage on Nanshan apartment
+负债:贷款:汽车贷款 [LIABILITY] — BYD Han EV loan
+负债:应付账款 [PAYABLE] — vendor bills (CNY and foreign-currency)
 ```
 
-### Equity
+Set account slots (keyed off the localized paths; slot keys are
+locale-invariant):
+- 工商银行信用卡: apr=18.25, credit_limit=50000, statement_close_day=20
+- 招商银行信用卡: apr=18.25, credit_limit=80000, statement_close_day=25
+- 汇丰港币信用卡: foreign-currency (HKD) card — apr / credit_limit set in HKD terms
+- 房屋贷款: apr=3.85 (China's LPR-based mortgage rate, much lower than US)
+- 汽车贷款: apr=4.90
+
+### 收入 (Income)
 ```
-Equity:Opening Balances [EQUITY]
+收入:工资 [INCOME] — Chen Yu's hospital salary
+收入:承包收入 [INCOME] — direct CNY contracts
+收入:个体经营收入 [INCOME] — invoiced through sole proprietorship
+收入:投资收益:股息 [INCOME]
+收入:投资收益:资本利得 [INCOME]
+收入:住房公积金收入 [INCOME] — employer housing fund match
+收入:报销收入 [INCOME]
+```
+
+The realized FX gain/loss account is intentionally **not** pre-created:
+`pay_invoice` auto-creates it on the first cross-currency settlement, under
+the top-level INCOME account resolved *by type*, with a localized leaf name.
+On this `zh` book that yields `收入:已实现获利(亏损)`, and its GUID is stored on
+the root KVP slot so subsequent resolves are locale- and rename-proof. This
+is the whole point of a natively-localized persona — it exercises the i18n
+auto-creation + self-healing path that Alex (English) never touches.
+
+### 支出 (Expenses)
+```
+支出:住房:房贷利息 [EXPENSE]
+支出:住房:物业管理费 [EXPENSE] — 物业管理费 (replaces HOA)
+支出:住房:房屋维修 [EXPENSE]
+支出:汽车:充电费 [EXPENSE] — EV charging, not fuel
+支出:汽车:汽车保险 [EXPENSE]
+支出:汽车:汽车保养 [EXPENSE]
+支出:汽车:停车费 [EXPENSE] — significant cost in Shenzhen
+支出:食品杂货 [EXPENSE]
+支出:餐饮 [EXPENSE]
+支出:公用事业:电费 [EXPENSE]
+支出:公用事业:水费 [EXPENSE]
+支出:公用事业:燃气费 [EXPENSE] — 天然气 (natural gas for cooking)
+支出:公用事业:网络费 [EXPENSE]
+支出:公用事业:电话费 [EXPENSE]
+支出:保险:医疗保险 [EXPENSE] — 医疗保险
+支出:保险:人寿保险 [EXPENSE]
+支出:税费:个人所得税 [EXPENSE] — 个人所得税
+支出:税费:社会保险 [EXPENSE] — 五险一金 (Five Insurances + Housing Fund)
+支出:税费:营业税 [EXPENSE] — sole proprietorship taxes
+支出:订阅 [EXPENSE]
+支出:视频会员 [EXPENSE] — 爱奇艺, Bilibili Premium
+支出:服装 [EXPENSE]
+支出:宠物:宠物食品 [EXPENSE]
+支出:宠物:宠物医疗 [EXPENSE]
+支出:旅行 [EXPENSE]
+支出:教育 [EXPENSE]
+支出:礼金 [EXPENSE] — 红包 (red envelopes) are significant
+支出:慈善捐款 [EXPENSE]
+支出:经营支出:云服务器 [EXPENSE] — Alibaba Cloud (阿里云)
+支出:经营支出:软件 [EXPENSE]
+支出:经营支出:联合办公 [EXPENSE]
+支出:利息:信用卡利息 [EXPENSE]
+支出:利息:房贷利息 [EXPENSE]
+支出:利息:车贷利息 [EXPENSE]
+支出:医疗 [EXPENSE]
+支出:娱乐 [EXPENSE]
+支出:个人护理 [EXPENSE]
+支出:杂项 [EXPENSE]
+```
+
+### 所有者权益 (Equity)
+```
+所有者权益:期初余额 [EQUITY]
 ```
 
 ---

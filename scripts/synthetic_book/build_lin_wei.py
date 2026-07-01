@@ -85,74 +85,85 @@ def md_fx_cny(foreign: str, when: date) -> Decimal:
 
 
 # ── Account path constants ──────────────────────────────────────
+#
+# Lin Wei runs a native zh_CN book: the entire chart of accounts is in
+# Chinese, the way a real Shenzhen household's GnuCash book looks. The
+# ASCII identifiers below are kept for code readability; only their VALUES
+# (the account paths) are localized. The five top-level roots are the exact
+# zh structural words the server's _STRUCTURAL_TYPE_NAMES catalog carries
+# (资产/负债/收入/支出/所有者权益), so _infer_book_locale votes this book to
+# "zh" and the localized-created-account paths (e.g. the FX gain/loss
+# account) get Chinese leaf names automatically.
 
-CHECKING = "Assets:Current Assets:Checking Account"
-SAVINGS = "Assets:Current Assets:Savings Account"
-CASH = "Assets:Current Assets:Cash"
-WECHAT = "Assets:Current Assets:WeChat Pay"
-ALIPAY = "Assets:Current Assets:Alipay"
-AR_CNY = "Assets:Receivables:Accounts Receivable"
-AR_USD = "Assets:Receivables:Accounts Receivable USD"
-AR_EUR = "Assets:Receivables:Accounts Receivable EUR"
-HOUSING_FUND = "Assets:Investments:Housing Fund"
-APARTMENT = "Assets:Fixed Assets:Apartment"
-VEHICLE = "Assets:Fixed Assets:Vehicle"
+CHECKING = "资产:流动资产:支票账户"
+SAVINGS = "资产:流动资产:储蓄账户"
+CASH = "资产:流动资产:现金"
+WECHAT = "资产:流动资产:微信支付"
+ALIPAY = "资产:流动资产:支付宝"
+AR_CNY = "资产:应收款项:应收账款"
+AR_USD = "资产:应收款项:应收账款（美元）"
+AR_EUR = "资产:应收款项:应收账款（欧元）"
+HOUSING_FUND = "资产:投资:住房公积金"
+APARTMENT = "资产:固定资产:公寓"
+VEHICLE = "资产:固定资产:车辆"
 
-MOUTAI = "Assets:Investments:Brokerage:Moutai"
-CATL = "Assets:Investments:Brokerage:CATL"
-CSI300 = "Assets:Investments:Brokerage:CSI300"
-CHINEXT = "Assets:Investments:Brokerage:ChiNext"
+MOUTAI = "资产:投资:证券账户:贵州茅台"
+CATL = "资产:投资:证券账户:宁德时代"
+CSI300 = "资产:投资:证券账户:沪深300ETF"
+CHINEXT = "资产:投资:证券账户:创业板ETF"
 
-ICBC_CARD = "Liabilities:Credit Card:ICBC Credit Card"
-CMB_CARD = "Liabilities:Credit Card:CMB Credit Card"
-HSBC_CARD = "Liabilities:Credit Card:HSBC HKD Card"
-MORTGAGE = "Liabilities:Loans:Mortgage"
-AUTO_LOAN = "Liabilities:Loans:Auto Loan"
-AP = "Liabilities:Accounts Payable"
+ICBC_CARD = "负债:信用卡:工商银行信用卡"
+CMB_CARD = "负债:信用卡:招商银行信用卡"
+HSBC_CARD = "负债:信用卡:汇丰港币信用卡"
+MORTGAGE = "负债:贷款:房屋贷款"
+AUTO_LOAN = "负债:贷款:汽车贷款"
+AP = "负债:应付账款"
 
-OPENING = "Equity:Opening Balances"
+OPENING = "所有者权益:期初余额"
 
-SALARY = "Income:Salary"
-CONTRACTOR = "Income:Contractor Income"
-LLC_REVENUE = "Income:LLC Revenue"
-DIVIDENDS = "Income:Investment Income:Dividends"
-CAPITAL_GAINS = "Income:Investment Income:Capital Gains"
-HOUSING_FUND_INCOME = "Income:Housing Fund Income"
-REIMBURSEMENTS = "Income:Reimbursements"
+SALARY = "收入:工资"
+CONTRACTOR = "收入:承包收入"
+LLC_REVENUE = "收入:个体经营收入"
+DIVIDENDS = "收入:投资收益:股息"
+CAPITAL_GAINS = "收入:投资收益:资本利得"
+HOUSING_FUND_INCOME = "收入:住房公积金收入"
+REIMBURSEMENTS = "收入:报销收入"
 
-EXP_PROP_MGMT = "Expenses:Housing:Property Management"
-EXP_MORTGAGE_INT = "Expenses:Interest:Mortgage Interest"
-EXP_AUTO_INT = "Expenses:Interest:Auto Loan Interest"
-EXP_CC_INT = "Expenses:Interest:Credit Card Interest"
-EXP_CHARGING = "Expenses:Auto:Charging"
-EXP_AUTO_INS = "Expenses:Auto:Insurance"
-EXP_PARKING = "Expenses:Auto:Parking"
-EXP_GROCERIES = "Expenses:Groceries"
-EXP_DINING = "Expenses:Dining"
-EXP_ELECTRIC = "Expenses:Utilities:Electric"
-EXP_WATER = "Expenses:Utilities:Water"
-EXP_GAS = "Expenses:Utilities:Gas"
-EXP_INTERNET = "Expenses:Utilities:Internet"
-EXP_PHONE = "Expenses:Utilities:Phone"
-EXP_INCOME_TAX = "Expenses:Taxes:Income Tax"
-EXP_SOCIAL = "Expenses:Taxes:Social Insurance"
-EXP_BUSINESS_TAX = "Expenses:Taxes:Business Tax"
-EXP_STREAMING = "Expenses:Streaming"
-EXP_SUBSCRIPTIONS = "Expenses:Subscriptions"
-EXP_EDUCATION = "Expenses:Education"
-EXP_CLOTHING = "Expenses:Clothing"
-EXP_PET_FOOD = "Expenses:Pet:Food"
-EXP_PET_VET = "Expenses:Pet:Vet"
-EXP_TRAVEL = "Expenses:Travel"
-EXP_GIFTS = "Expenses:Gifts"
-EXP_CHARITY = "Expenses:Charity"
-EXP_CLOUD = "Expenses:Business:Cloud Hosting"
-EXP_SOFTWARE = "Expenses:Business:Software"
-EXP_COWORKING = "Expenses:Business:Coworking"
-EXP_MISC = "Expenses:Miscellaneous"
-EXP_MEDICAL = "Expenses:Medical"
-EXP_ENTERTAINMENT = "Expenses:Entertainment"
-EXP_PERSONAL_CARE = "Expenses:Personal Care"
+EXP_PROP_MGMT = "支出:住房:物业管理费"
+EXP_MORTGAGE_INT = "支出:利息:房贷利息"
+EXP_AUTO_INT = "支出:利息:车贷利息"
+EXP_CC_INT = "支出:利息:信用卡利息"
+EXP_CHARGING = "支出:汽车:充电费"
+EXP_AUTO_INS = "支出:汽车:汽车保险"
+EXP_PARKING = "支出:汽车:停车费"
+EXP_GROCERIES = "支出:食品杂货"
+EXP_DINING = "支出:餐饮"
+EXP_UTILITIES = "支出:公用事业"
+EXP_ELECTRIC = "支出:公用事业:电费"
+EXP_WATER = "支出:公用事业:水费"
+EXP_GAS = "支出:公用事业:燃气费"
+EXP_INTERNET = "支出:公用事业:网络费"
+EXP_PHONE = "支出:公用事业:电话费"
+EXP_INCOME_TAX = "支出:税费:个人所得税"
+EXP_SOCIAL = "支出:税费:社会保险"
+EXP_BUSINESS_TAX = "支出:税费:营业税"
+EXP_STREAMING = "支出:视频会员"
+EXP_SUBSCRIPTIONS = "支出:订阅"
+EXP_EDUCATION = "支出:教育"
+EXP_CLOTHING = "支出:服装"
+EXP_PET = "支出:宠物"
+EXP_PET_FOOD = "支出:宠物:宠物食品"
+EXP_PET_VET = "支出:宠物:宠物医疗"
+EXP_TRAVEL = "支出:旅行"
+EXP_GIFTS = "支出:礼金"
+EXP_CHARITY = "支出:慈善捐款"
+EXP_CLOUD = "支出:经营支出:云服务器"
+EXP_SOFTWARE = "支出:经营支出:软件"
+EXP_COWORKING = "支出:经营支出:联合办公"
+EXP_MISC = "支出:杂项"
+EXP_MEDICAL = "支出:医疗"
+EXP_ENTERTAINMENT = "支出:娱乐"
+EXP_PERSONAL_CARE = "支出:个人护理"
 
 
 # ── Phase 1: Commodities & prices ───────────────────────────────
@@ -385,103 +396,113 @@ def fx_price_dates() -> list[tuple[str, date]]:
 # ── Phase 2: Chart of accounts ──────────────────────────────────
 
 # (name, type, parent, commodity, namespace, placeholder)
+#
+# A native zh_CN chart. The five top-level roots are the exact zh
+# structural words in the server's _STRUCTURAL_TYPE_NAMES catalog
+# (资产/负债/收入/支出/所有者权益) so _infer_book_locale resolves this book
+# to "zh". Parent paths are the localized paths, matching the constants
+# above. Types are locale-invariant (GnuCash never localizes the type enum),
+# so every type-based server code path keeps working unchanged.
 ACCOUNTS = [
-    # Assets
-    ("Assets", "ASSET", None, "CNY", "CURRENCY", True),
-    ("Current Assets", "ASSET", "Assets", "CNY", "CURRENCY", True),
-    ("Checking Account", "BANK", "Assets:Current Assets", "CNY", "CURRENCY", False),
-    ("Savings Account", "BANK", "Assets:Current Assets", "CNY", "CURRENCY", False),
-    ("Cash", "CASH", "Assets:Current Assets", "CNY", "CURRENCY", False),
-    ("WeChat Pay", "BANK", "Assets:Current Assets", "CNY", "CURRENCY", False),
-    ("Alipay", "BANK", "Assets:Current Assets", "CNY", "CURRENCY", False),
-    ("Receivables", "ASSET", "Assets", "CNY", "CURRENCY", True),
-    ("Accounts Receivable", "RECEIVABLE", "Assets:Receivables", "CNY", "CURRENCY", False),
-    ("Accounts Receivable USD", "RECEIVABLE", "Assets:Receivables", "USD", "CURRENCY", False),
-    ("Accounts Receivable EUR", "RECEIVABLE", "Assets:Receivables", "EUR", "CURRENCY", False),
-    ("Investments", "ASSET", "Assets", "CNY", "CURRENCY", True),
-    ("Brokerage", "ASSET", "Assets:Investments", "CNY", "CURRENCY", True),
-    ("Moutai", "STOCK", "Assets:Investments:Brokerage", "600519", "SSE", False),
-    ("CATL", "STOCK", "Assets:Investments:Brokerage", "300750", "SZSE", False),
-    ("CSI300", "MUTUAL", "Assets:Investments:Brokerage", "510300", "SSE", False),
-    ("ChiNext", "MUTUAL", "Assets:Investments:Brokerage", "159915", "SZSE", False),
-    ("Housing Fund", "BANK", "Assets:Investments", "CNY", "CURRENCY", False),
-    ("Fixed Assets", "ASSET", "Assets", "CNY", "CURRENCY", True),
-    ("Apartment", "ASSET", "Assets:Fixed Assets", "CNY", "CURRENCY", False),
-    ("Vehicle", "ASSET", "Assets:Fixed Assets", "CNY", "CURRENCY", False),
-    # Liabilities
-    ("Liabilities", "LIABILITY", None, "CNY", "CURRENCY", True),
-    ("Credit Card", "LIABILITY", "Liabilities", "CNY", "CURRENCY", True),
-    ("ICBC Credit Card", "CREDIT", "Liabilities:Credit Card", "CNY", "CURRENCY", False),
-    ("CMB Credit Card", "CREDIT", "Liabilities:Credit Card", "CNY", "CURRENCY", False),
-    ("HSBC HKD Card", "CREDIT", "Liabilities:Credit Card", "HKD", "CURRENCY", False),
-    ("Loans", "LIABILITY", "Liabilities", "CNY", "CURRENCY", True),
-    ("Mortgage", "LIABILITY", "Liabilities:Loans", "CNY", "CURRENCY", False),
-    ("Auto Loan", "LIABILITY", "Liabilities:Loans", "CNY", "CURRENCY", False),
-    ("Accounts Payable", "PAYABLE", "Liabilities", "CNY", "CURRENCY", False),
-    # Income
-    ("Income", "INCOME", None, "CNY", "CURRENCY", True),
-    ("Salary", "INCOME", "Income", "CNY", "CURRENCY", False),
-    ("Contractor Income", "INCOME", "Income", "CNY", "CURRENCY", False),
-    ("LLC Revenue", "INCOME", "Income", "CNY", "CURRENCY", False),
-    ("Investment Income", "INCOME", "Income", "CNY", "CURRENCY", True),
-    ("Dividends", "INCOME", "Income:Investment Income", "CNY", "CURRENCY", False),
-    ("Capital Gains", "INCOME", "Income:Investment Income", "CNY", "CURRENCY", False),
-    ("Housing Fund Income", "INCOME", "Income", "CNY", "CURRENCY", False),
-    ("Reimbursements", "INCOME", "Income", "CNY", "CURRENCY", False),
-    # Income:Foreign Exchange Gain/Loss is auto-created by pay_invoice; create
-    # it up front so it always exists for direct FX transactions too.
-    ("Foreign Exchange Gain/Loss", "INCOME", "Income", "CNY", "CURRENCY", False),
-    # Expenses
-    ("Expenses", "EXPENSE", None, "CNY", "CURRENCY", True),
-    ("Housing", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Mortgage Interest", "EXPENSE", "Expenses:Housing", "CNY", "CURRENCY", False),
-    ("Property Management", "EXPENSE", "Expenses:Housing", "CNY", "CURRENCY", False),
-    ("Maintenance", "EXPENSE", "Expenses:Housing", "CNY", "CURRENCY", False),
-    ("Auto", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Charging", "EXPENSE", "Expenses:Auto", "CNY", "CURRENCY", False),
-    ("Insurance", "EXPENSE", "Expenses:Auto", "CNY", "CURRENCY", False),
-    ("Maintenance", "EXPENSE", "Expenses:Auto", "CNY", "CURRENCY", False),
-    ("Parking", "EXPENSE", "Expenses:Auto", "CNY", "CURRENCY", False),
-    ("Groceries", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Dining", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Utilities", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Electric", "EXPENSE", "Expenses:Utilities", "CNY", "CURRENCY", False),
-    ("Water", "EXPENSE", "Expenses:Utilities", "CNY", "CURRENCY", False),
-    ("Gas", "EXPENSE", "Expenses:Utilities", "CNY", "CURRENCY", False),
-    ("Internet", "EXPENSE", "Expenses:Utilities", "CNY", "CURRENCY", False),
-    ("Phone", "EXPENSE", "Expenses:Utilities", "CNY", "CURRENCY", False),
-    ("Insurance", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Health", "EXPENSE", "Expenses:Insurance", "CNY", "CURRENCY", False),
-    ("Life", "EXPENSE", "Expenses:Insurance", "CNY", "CURRENCY", False),
-    ("Taxes", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Income Tax", "EXPENSE", "Expenses:Taxes", "CNY", "CURRENCY", False),
-    ("Social Insurance", "EXPENSE", "Expenses:Taxes", "CNY", "CURRENCY", False),
-    ("Business Tax", "EXPENSE", "Expenses:Taxes", "CNY", "CURRENCY", False),
-    ("Subscriptions", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Streaming", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Clothing", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Pet", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Food", "EXPENSE", "Expenses:Pet", "CNY", "CURRENCY", False),
-    ("Vet", "EXPENSE", "Expenses:Pet", "CNY", "CURRENCY", False),
-    ("Travel", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Education", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Gifts", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Charity", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Entertainment", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Personal Care", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Business", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Cloud Hosting", "EXPENSE", "Expenses:Business", "CNY", "CURRENCY", False),
-    ("Software", "EXPENSE", "Expenses:Business", "CNY", "CURRENCY", False),
-    ("Coworking", "EXPENSE", "Expenses:Business", "CNY", "CURRENCY", False),
-    ("Interest", "EXPENSE", "Expenses", "CNY", "CURRENCY", True),
-    ("Credit Card Interest", "EXPENSE", "Expenses:Interest", "CNY", "CURRENCY", False),
-    ("Mortgage Interest", "EXPENSE", "Expenses:Interest", "CNY", "CURRENCY", False),
-    ("Auto Loan Interest", "EXPENSE", "Expenses:Interest", "CNY", "CURRENCY", False),
-    ("Medical", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    ("Miscellaneous", "EXPENSE", "Expenses", "CNY", "CURRENCY", False),
-    # Equity
-    ("Equity", "EQUITY", None, "CNY", "CURRENCY", True),
-    ("Opening Balances", "EQUITY", "Equity", "CNY", "CURRENCY", False),
+    # 资产 (Assets)
+    ("资产", "ASSET", None, "CNY", "CURRENCY", True),
+    ("流动资产", "ASSET", "资产", "CNY", "CURRENCY", True),
+    ("支票账户", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("储蓄账户", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("现金", "CASH", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("微信支付", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("支付宝", "BANK", "资产:流动资产", "CNY", "CURRENCY", False),
+    ("应收款项", "ASSET", "资产", "CNY", "CURRENCY", True),
+    ("应收账款", "RECEIVABLE", "资产:应收款项", "CNY", "CURRENCY", False),
+    ("应收账款（美元）", "RECEIVABLE", "资产:应收款项", "USD", "CURRENCY", False),
+    ("应收账款（欧元）", "RECEIVABLE", "资产:应收款项", "EUR", "CURRENCY", False),
+    ("投资", "ASSET", "资产", "CNY", "CURRENCY", True),
+    ("证券账户", "ASSET", "资产:投资", "CNY", "CURRENCY", True),
+    ("贵州茅台", "STOCK", "资产:投资:证券账户", "600519", "SSE", False),
+    ("宁德时代", "STOCK", "资产:投资:证券账户", "300750", "SZSE", False),
+    ("沪深300ETF", "MUTUAL", "资产:投资:证券账户", "510300", "SSE", False),
+    ("创业板ETF", "MUTUAL", "资产:投资:证券账户", "159915", "SZSE", False),
+    ("住房公积金", "BANK", "资产:投资", "CNY", "CURRENCY", False),
+    ("固定资产", "ASSET", "资产", "CNY", "CURRENCY", True),
+    ("公寓", "ASSET", "资产:固定资产", "CNY", "CURRENCY", False),
+    ("车辆", "ASSET", "资产:固定资产", "CNY", "CURRENCY", False),
+    # 负债 (Liabilities)
+    ("负债", "LIABILITY", None, "CNY", "CURRENCY", True),
+    ("信用卡", "LIABILITY", "负债", "CNY", "CURRENCY", True),
+    ("工商银行信用卡", "CREDIT", "负债:信用卡", "CNY", "CURRENCY", False),
+    ("招商银行信用卡", "CREDIT", "负债:信用卡", "CNY", "CURRENCY", False),
+    ("汇丰港币信用卡", "CREDIT", "负债:信用卡", "HKD", "CURRENCY", False),
+    ("贷款", "LIABILITY", "负债", "CNY", "CURRENCY", True),
+    ("房屋贷款", "LIABILITY", "负债:贷款", "CNY", "CURRENCY", False),
+    ("汽车贷款", "LIABILITY", "负债:贷款", "CNY", "CURRENCY", False),
+    ("应付账款", "PAYABLE", "负债", "CNY", "CURRENCY", False),
+    # 收入 (Income)
+    ("收入", "INCOME", None, "CNY", "CURRENCY", True),
+    ("工资", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("承包收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("个体经营收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("投资收益", "INCOME", "收入", "CNY", "CURRENCY", True),
+    ("股息", "INCOME", "收入:投资收益", "CNY", "CURRENCY", False),
+    ("资本利得", "INCOME", "收入:投资收益", "CNY", "CURRENCY", False),
+    ("住房公积金收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    ("报销收入", "INCOME", "收入", "CNY", "CURRENCY", False),
+    # The realized FX gain/loss account is intentionally NOT pre-created:
+    # pay_invoice auto-creates it on the first cross-currency settlement,
+    # under the top-level INCOME account resolved by TYPE, with a localized
+    # leaf name (已实现获利(亏损) on a zh book). That exercises the server's
+    # i18n auto-creation + KVP self-healing path — the whole point of a
+    # natively-localized persona.
+    # 支出 (Expenses)
+    ("支出", "EXPENSE", None, "CNY", "CURRENCY", True),
+    ("住房", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("房贷利息", "EXPENSE", "支出:住房", "CNY", "CURRENCY", False),
+    ("物业管理费", "EXPENSE", "支出:住房", "CNY", "CURRENCY", False),
+    ("房屋维修", "EXPENSE", "支出:住房", "CNY", "CURRENCY", False),
+    ("汽车", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("充电费", "EXPENSE", "支出:汽车", "CNY", "CURRENCY", False),
+    ("汽车保险", "EXPENSE", "支出:汽车", "CNY", "CURRENCY", False),
+    ("汽车保养", "EXPENSE", "支出:汽车", "CNY", "CURRENCY", False),
+    ("停车费", "EXPENSE", "支出:汽车", "CNY", "CURRENCY", False),
+    ("食品杂货", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("餐饮", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("公用事业", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("电费", "EXPENSE", "支出:公用事业", "CNY", "CURRENCY", False),
+    ("水费", "EXPENSE", "支出:公用事业", "CNY", "CURRENCY", False),
+    ("燃气费", "EXPENSE", "支出:公用事业", "CNY", "CURRENCY", False),
+    ("网络费", "EXPENSE", "支出:公用事业", "CNY", "CURRENCY", False),
+    ("电话费", "EXPENSE", "支出:公用事业", "CNY", "CURRENCY", False),
+    ("保险", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("医疗保险", "EXPENSE", "支出:保险", "CNY", "CURRENCY", False),
+    ("人寿保险", "EXPENSE", "支出:保险", "CNY", "CURRENCY", False),
+    ("税费", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("个人所得税", "EXPENSE", "支出:税费", "CNY", "CURRENCY", False),
+    ("社会保险", "EXPENSE", "支出:税费", "CNY", "CURRENCY", False),
+    ("营业税", "EXPENSE", "支出:税费", "CNY", "CURRENCY", False),
+    ("订阅", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("视频会员", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("服装", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("宠物", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("宠物食品", "EXPENSE", "支出:宠物", "CNY", "CURRENCY", False),
+    ("宠物医疗", "EXPENSE", "支出:宠物", "CNY", "CURRENCY", False),
+    ("旅行", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("教育", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("礼金", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("慈善捐款", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("娱乐", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("个人护理", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("经营支出", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("云服务器", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("软件", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("联合办公", "EXPENSE", "支出:经营支出", "CNY", "CURRENCY", False),
+    ("利息", "EXPENSE", "支出", "CNY", "CURRENCY", True),
+    ("信用卡利息", "EXPENSE", "支出:利息", "CNY", "CURRENCY", False),
+    ("房贷利息", "EXPENSE", "支出:利息", "CNY", "CURRENCY", False),
+    ("车贷利息", "EXPENSE", "支出:利息", "CNY", "CURRENCY", False),
+    ("医疗", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    ("杂项", "EXPENSE", "支出", "CNY", "CURRENCY", False),
+    # 所有者权益 (Equity)
+    ("所有者权益", "EQUITY", None, "CNY", "CURRENCY", True),
+    ("期初余额", "EQUITY", "所有者权益", "CNY", "CURRENCY", False),
 ]
 
 
@@ -804,7 +825,7 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
         count += 1
 
     # Monthly salary (Chinese pattern — monthly, paid on the 15th).
-    sx("Chen Yu Salary", "深圳市人民医院 工资", [
+    sx("陈宇工资", "深圳市人民医院 工资", [
         {"account": SALARY, "amount": "-15000"},
         {"account": CHECKING, "amount": "11800"},
         {"account": EXP_INCOME_TAX, "amount": "450"},
@@ -812,31 +833,31 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
         {"account": HOUSING_FUND, "amount": "1100"},
     ], "monthly")
 
-    sx("Mortgage Payment", "房贷还款", [
+    sx("房贷还款", "房贷还款", [
         {"account": CHECKING, "amount": "-14800"},
         {"account": EXP_MORTGAGE_INT, "amount": "8983"},
         {"account": MORTGAGE, "amount": "5817"},
     ], "monthly")
 
-    sx("Auto Loan Payment", "车贷还款", [
+    sx("车贷还款", "车贷还款", [
         {"account": CHECKING, "amount": "-2400"},
         {"account": EXP_AUTO_INT, "amount": "490"},
         {"account": AUTO_LOAN, "amount": "1910"},
     ], "monthly")
 
     simple_monthly = [
-        ("Property Management", "物业管理费", CHECKING, EXP_PROP_MGMT, "850"),
-        ("Electric", "电费", WECHAT, EXP_ELECTRIC, "200"),
-        ("Water", "水费", WECHAT, EXP_WATER, "80"),
-        ("Gas", "天然气", WECHAT, EXP_GAS, "60"),
-        ("Internet", "中国电信宽带", WECHAT, EXP_INTERNET, "199"),
-        ("Phone", "中国移动话费", WECHAT, EXP_PHONE, "128"),
-        ("Streaming", "爱奇艺 + Bilibili", WECHAT, EXP_STREAMING, "45"),
-        ("Alibaba Cloud", "阿里云", CMB_CARD, EXP_CLOUD, "350"),
-        ("Coworking", "优客工场", CMB_CARD, EXP_COWORKING, "1500"),
-        ("Pet Food", "字节口粮", ALIPAY, EXP_PET_FOOD, "280"),
-        ("Auto Insurance", "车险", CHECKING, EXP_AUTO_INS, "450"),
-        ("Parking", "停车月卡", WECHAT, EXP_PARKING, "800"),
+        ("物业管理费", "物业管理费", CHECKING, EXP_PROP_MGMT, "850"),
+        ("电费", "电费", WECHAT, EXP_ELECTRIC, "200"),
+        ("水费", "水费", WECHAT, EXP_WATER, "80"),
+        ("天然气", "天然气", WECHAT, EXP_GAS, "60"),
+        ("宽带费", "中国电信宽带", WECHAT, EXP_INTERNET, "199"),
+        ("话费", "中国移动话费", WECHAT, EXP_PHONE, "128"),
+        ("视频会员", "爱奇艺 + Bilibili", WECHAT, EXP_STREAMING, "45"),
+        ("阿里云", "阿里云", CMB_CARD, EXP_CLOUD, "350"),
+        ("联合办公", "优客工场", CMB_CARD, EXP_COWORKING, "1500"),
+        ("宠物口粮", "字节口粮", ALIPAY, EXP_PET_FOOD, "280"),
+        ("车险", "车险", CHECKING, EXP_AUTO_INS, "450"),
+        ("停车月卡", "停车月卡", WECHAT, EXP_PARKING, "800"),
     ]
     for name, desc, src, dst, amt in simple_monthly:
         sx(name, desc, [
@@ -845,21 +866,21 @@ def create_scheduled_templates(book: GnuCashBook) -> int:
         ], "monthly")
 
     # Quarterly
-    sx("Estimated Tax", "个体工商户季度预缴税", [
+    sx("季度预缴税", "个体工商户季度预缴税", [
         {"account": CHECKING, "amount": "-8000"},
         {"account": EXP_BUSINESS_TAX, "amount": "8000"},
     ], "quarterly")
-    sx("Pet Vet", "字节季度体检", [
+    sx("宠物体检", "字节季度体检", [
         {"account": ALIPAY, "amount": "-500"},
         {"account": EXP_PET_VET, "amount": "500"},
     ], "quarterly")
 
     # Yearly
-    sx("Spring Festival Red Envelopes", "春节红包", [
+    sx("春节红包", "春节红包", [
         {"account": CHECKING, "amount": "-6000"},
         {"account": EXP_GIFTS, "amount": "6000"},
     ], "yearly", start_date="2025-02-01")
-    sx("Vehicle Inspection", "年检", [
+    sx("车辆年检", "年检", [
         {"account": CHECKING, "amount": "-300"},
         {"account": EXP_AUTO_INS, "amount": "300"},
     ], "yearly", start_date="2025-03-01")
@@ -2147,10 +2168,10 @@ def run_budget(book: GnuCashBook) -> None:
                                period="all")
     # Utilities (parent rollup): set on the placeholder parent.
     book.set_budget_amount(budget_name=name,
-                           account="Expenses:Utilities", amount="700",
+                           account=EXP_UTILITIES, amount="700",
                            period="all")
     # Pet (parent rollup).
-    book.set_budget_amount(budget_name=name, account="Expenses:Pet",
+    book.set_budget_amount(budget_name=name, account=EXP_PET,
                            amount="400", period="all")
 
     # Seasonal overrides (period is 0-indexed: Feb=1, Jun=5, Sep=8, Oct=9, Nov=10).
@@ -2332,6 +2353,17 @@ def set_schedule_state(out_path: Path) -> None:
         m = (d.month - 1 + n) % 12 + 1
         return _clamp_day(y, m, d.day)
 
+    # Exactly two schedules are left OVERDUE (they drive the dashboard's
+    # overdue-schedule warning and the create_transaction_from_scheduled
+    # workflow); every other schedule is CURRENT with its next occurrence in
+    # the future. Both chosen indices are monthly schedules (salary, property
+    # management), so shifting last_occur back one month reliably pushes the
+    # next monthly occurrence into the past. The prior logic anchored
+    # last_occur to a fixed month offset on the schedule's start-day, which —
+    # for the common day-15 monthly schedules — left the next occurrence in
+    # the past too, flooding the summary with ~16 overdue warnings.
+    OVERDUE_IDX = {0, 3}
+
     book = piecash.open_book(str(out_path), readonly=False)
     try:
         sxs = list(book.session.query(ScheduledTransaction).all())
@@ -2340,18 +2372,25 @@ def set_schedule_state(out_path: Path) -> None:
             start = sx.start_date
             if hasattr(start, "date"):
                 start = start.date()
-            # Make ~2 of them OVERDUE (last_occur ~2 months before today, so
-            # the next monthly occurrence is already in the past), the rest
-            # UPCOMING (last_occur ~last month, next occurrence near now).
-            offset = -2 if i % 6 == 0 else -1
-            candidate = _shift_months(
-                date(today.year, today.month, start.day if start else 15),
-                offset,
+            day = start.day if start else 15
+            # Most recent monthly-cadence occurrence on/before today. For a
+            # monthly schedule this is the true last occurrence, so the next
+            # occurrence is in the future (CURRENT, not overdue). For a
+            # quarterly/yearly schedule it's a conservative anchor ≤ today, so
+            # the real next occurrence (computed from the actual recurrence)
+            # still lands well in the future.
+            this_month = _clamp_day(today.year, today.month, day)
+            last_occ = (
+                this_month if this_month <= today
+                else _shift_months(this_month, -1)
             )
+            if i in OVERDUE_IDX:
+                # Push the next monthly occurrence into the past → OVERDUE.
+                last_occ = _shift_months(last_occ, -1)
             # Never set last_occur before the schedule's own start.
-            if start and candidate < start:
-                candidate = start
-            sx.last_occur = candidate
+            if start and last_occ < start:
+                last_occ = start
+            sx.last_occur = last_occ
         book.save()
     finally:
         book.close()
@@ -2416,10 +2455,10 @@ def _verify_realism(out_path: Path) -> None:
                     if s.account.fullname.endswith(path_end):
                         return s.value
                 return None
-            gross = -_split("Income:Salary")
-            it = _split("Taxes:Income Tax")
-            soc = _split("Taxes:Social Insurance")
-            hf = _split("Housing Fund")
+            gross = -_split("收入:工资")
+            it = _split("税费:个人所得税")
+            soc = _split("税费:社会保险")
+            hf = _split("住房公积金")
             ot = "OT" if "加班" in t.description else "  "
             print(f"    {str(t.post_date)[:7]} {ot} gross ¥{gross:>8}  "
                   f"income_tax ¥{it:>8}  social ¥{soc:>6}  housing ¥{hf:>6}")
@@ -2431,7 +2470,7 @@ def _verify_realism(out_path: Path) -> None:
         for t in txns:
             # The expense split is the one whose account is under Expenses.
             exp = [s for s in t.splits
-                   if s.account.fullname.startswith("Expenses:")]
+                   if s.account.fullname.startswith("支出:")]
             for s in exp:
                 for key in ("瑞幸", "美团外卖", "饿了么", "盒马", "便利蜂",
                             "滴滴出行", "共享单车", "自动贩卖机", "山姆",
@@ -2441,10 +2480,10 @@ def _verify_realism(out_path: Path) -> None:
         for key in sorted(m2c):
             cats = sorted(m2c[key])
             flag = "OK (single)" if len(cats) == 1 else "⚠ MULTIPLE"
-            short = [c.replace("Expenses:", "") for c in cats]
+            short = [c.replace("支出:", "") for c in cats]
             print(f"    {key:10s} → {short}  {flag}")
         print("  deliberate sticky miscategorization: "
-              "自动贩卖机 → Miscellaneous (always)")
+              "自动贩卖机 → 杂项 (always)")
 
         # 4. Meta-notes stripped from persisted customer/vendor data.
         print("\n-- Realism #4: meta-notes in persisted data --")
