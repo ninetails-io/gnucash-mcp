@@ -1017,7 +1017,7 @@ class TestListAndGetBudget:
     def test_list_empty(self, budget_book: Path):
         """Listing budgets on a book with no budgets returns empty list."""
         book = GnuCashBook(str(budget_book))
-        result = book.list_budgets(compact=False)
+        result = book.list_budgets(compact=False)["budgets"]
         assert result == []
 
     def test_list_single_budget(self, budget_book: Path):
@@ -1025,7 +1025,7 @@ class TestListAndGetBudget:
         book = GnuCashBook(str(budget_book))
         book.create_budget(name="2026 Budget", year=2026, num_periods=12)
 
-        result = book.list_budgets(compact=False)
+        result = book.list_budgets(compact=False)["budgets"]
         assert len(result) == 1
         assert result[0]["name"] == "2026 Budget"
         assert result[0]["num_periods"] == 12
@@ -1078,7 +1078,7 @@ class TestDeleteBudget:
 
         # Verify it's gone
         assert book.get_budget(compact=False, name="2026 Budget") is None
-        assert book.list_budgets(compact=False) == []
+        assert book.list_budgets(compact=False)["budgets"] == []
 
     def test_delete_with_amounts(self, budget_book: Path):
         """Delete a budget with amounts (cascade delete)."""
@@ -1092,7 +1092,7 @@ class TestDeleteBudget:
 
         result = book.delete_budget("2026 Budget")
         assert result["status"] == "deleted"
-        assert book.list_budgets(compact=False) == []
+        assert book.list_budgets(compact=False)["budgets"] == []
 
     def test_delete_nonexistent_raises(self, budget_book: Path):
         """Deleting a nonexistent budget raises ValueError."""
@@ -1139,7 +1139,7 @@ class TestBudgetIntegration:
         )
 
         # Verify listing
-        budgets = book.list_budgets(compact=False)
+        budgets = book.list_budgets(compact=False)["budgets"]
         assert len(budgets) == 1
         assert budgets[0]["name"] == "2026 Budget"
 

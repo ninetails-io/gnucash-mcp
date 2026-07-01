@@ -51,18 +51,27 @@ def register(mcp, get_book) -> None:
     def list_customers(
         active_only: bool = True,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all customers.
 
-        Returns a compact one-line-per-customer format by default.
-        Use verbose=true for full JSON with guid, address, notes, etc.
+        Leads with a ``Showing X-Y of Z customers`` line, then a compact
+        one-line-per-customer format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, address, notes, etc.
 
         Args:
             active_only: If True, only show active customers. Default True.
             verbose: If true, return full JSON details for each customer.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_customers(active_only=active_only, compact=not verbose)
+        result = book.list_customers(
+            active_only=active_only, compact=not verbose,
+            limit=limit, offset=offset,
+        )
         if verbose:
             return _json(result)
         return result
@@ -116,18 +125,27 @@ def register(mcp, get_book) -> None:
     def list_vendors(
         active_only: bool = True,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all vendors.
 
-        Returns a compact one-line-per-vendor format by default.
-        Use verbose=true for full JSON with guid, address, notes, etc.
+        Leads with a ``Showing X-Y of Z vendors`` line, then a compact
+        one-line-per-vendor format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, address, notes, etc.
 
         Args:
             active_only: If True, only show active vendors. Default True.
             verbose: If true, return full JSON details for each vendor.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_vendors(active_only=active_only, compact=not verbose)
+        result = book.list_vendors(
+            active_only=active_only, compact=not verbose,
+            limit=limit, offset=offset,
+        )
         if verbose:
             return _json(result)
         return result
@@ -182,18 +200,27 @@ def register(mcp, get_book) -> None:
     def list_employees(
         active_only: bool = True,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all employees.
 
-        Returns a compact one-line-per-employee format by default.
-        Use verbose=true for full JSON with guid, address, etc.
+        Leads with a ``Showing X-Y of Z employees`` line, then a compact
+        one-line-per-employee format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, address, etc.
 
         Args:
             active_only: If True, only show active employees. Default True.
             verbose: If true, return full JSON details for each employee.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_employees(active_only=active_only, compact=not verbose)
+        result = book.list_employees(
+            active_only=active_only, compact=not verbose,
+            limit=limit, offset=offset,
+        )
         if verbose:
             return _json(result)
         return result
@@ -345,17 +372,25 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def list_billterms(
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all billing terms.
 
-        Returns a compact one-line-per-term format by default.
-        Use verbose=true for full JSON with guid, discount details, etc.
+        Leads with a ``Showing X-Y of Z billterms`` line, then a compact
+        one-line-per-term format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, discount details, etc.
 
         Args:
             verbose: If true, return full JSON details for each billing term.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_billterms(compact=not verbose)
+        result = book.list_billterms(
+            compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result
@@ -408,18 +443,26 @@ def register(mcp, get_book) -> None:
     @audit_log(classification="read")
     def list_taxtables(
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all sales-tax tables.
 
-        Compact format (default): one line per taxtable with name,
-        entry count, and per-entry rate→account routing. Verbose:
-        full JSON with resolved account paths and refcount.
+        Leads with a ``Showing X-Y of Z taxtables`` line. Compact format
+        (default): one line per taxtable with name, entry count, and
+        per-entry rate→account routing. Page with ``offset``; ``limit=0``
+        returns the count only. Verbose: full JSON with resolved account
+        paths and refcount.
 
         Args:
             verbose: If true, return full JSON for each taxtable.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_taxtables(compact=not verbose)
+        result = book.list_taxtables(
+            compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result
@@ -954,23 +997,25 @@ def register(mcp, get_book) -> None:
         verbose: bool = False,
         limit: int = 50,
         job_id: str | None = None,
+        offset: int = 0,
     ) -> str:
         """List invoices and/or vendor bills.
 
-        Returns a compact one-line-per-invoice format by default.
-        Use verbose=true for full JSON with GUIDs, dates, notes, etc.
+        Leads with a ``Showing X-Y of Z invoices (date range)`` line,
+        then a compact one-line-per-invoice format by default. Page with
+        ``offset``; ``limit=0`` returns the count only. Use verbose=true
+        for full JSON with GUIDs, dates, notes, etc.
 
         Args:
             owner_type: Filter by type: "customer" for invoices,
                         "vendor" for bills, or omit for all.
             status: Filter by status: "posted" or "open", or omit for all.
             verbose: If true, return full JSON details.
-            limit: Maximum invoices to return. Defaults to 50, capped
-                   at 250. Compact output appends a truncation notice
-                   when results are clipped.
+            limit: Page size (default 50, max 250). 0 = count only.
             job_id: Filter to invoices grouped under a specific
                 job — useful for the "what's part of this
                 engagement?" listing pattern.
+            offset: 0-indexed first row to return (default 0).
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -980,6 +1025,7 @@ def register(mcp, get_book) -> None:
             compact=not verbose,
             limit=limit,
             job_id=job_id,
+            offset=offset,
         )
         if verbose:
             return _json(result)
@@ -1324,8 +1370,13 @@ def register(mcp, get_book) -> None:
         owner_id: str | None = None,
         active_only: bool = True,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List jobs, optionally filtered.
+
+        Leads with a ``Showing X-Y of Z jobs`` line; page with
+        ``offset``, or pass ``limit=0`` for the count only.
 
         Args:
             owner_type: Filter by "customer" or "vendor". Omit
@@ -1335,6 +1386,8 @@ def register(mcp, get_book) -> None:
             active_only: If True (default), exclude inactive jobs.
             verbose: If True, return full JSON dicts; otherwise
                 compact tab-separated rows.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1343,6 +1396,8 @@ def register(mcp, get_book) -> None:
             owner_id=owner_id,
             active_only=active_only,
             compact=not verbose,
+            limit=limit,
+            offset=offset,
         )
         # Match the other list_* tools' verbose pattern: all
         # list_* verbose returns route through
@@ -1453,13 +1508,17 @@ def register(mcp, get_book) -> None:
         customer_id: str | None = None,
         vendor_id: str | None = None,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """Get all posted invoices/bills with outstanding balances.
 
-        Returns a compact one-line-per-doc format by default with action
+        Leads with a ``Showing X-Y of Z invoices (date range)`` line,
+        then a compact one-line-per-doc format by default with action
         columns (due date, days past due, currency, BILL tag, owner).
         Sorted most-overdue-first so the bookkeeper sees the urgent
-        items at the top.
+        items at the top. Page with ``offset``; ``limit=0`` returns the
+        count only.
 
         Use verbose=true for full JSON with ``original_amount`` /
         ``amount_paid`` / ``amount_due`` breakdown — the shape
@@ -1470,6 +1529,8 @@ def register(mcp, get_book) -> None:
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
             verbose: If true, return full JSON details.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         owner_type = _gate_owner_type(owner_type)
         # When Business isn't loaded, vendor_id is also a vendor-only
@@ -1495,6 +1556,8 @@ def register(mcp, get_book) -> None:
             customer_id=customer_id,
             vendor_id=vendor_id,
             compact=not verbose,
+            limit=limit,
+            offset=offset,
         )
         if verbose:
             return _json(result)
@@ -1508,6 +1571,7 @@ def register(mcp, get_book) -> None:
         end_date: str,
         vendor_id: str | None = None,
         verbose: bool = False,
+        group_by: str | None = None,
     ) -> str:
         """Get spending breakdown by vendor for a period.
 
@@ -1522,6 +1586,9 @@ def register(mcp, get_book) -> None:
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to a specific vendor.
             verbose: If true, return the structured dict.
+            group_by: Optional "month", "quarter", or "year" — split the
+                range into sub-period columns of total billed per vendor
+                and return a multi-period TSV table. Overrides verbose.
         """
         book = get_book()
         result = book.vendor_spending_report(
@@ -1529,7 +1596,10 @@ def register(mcp, get_book) -> None:
             end_date=end_date,
             vendor_id=vendor_id,
             compact=not verbose,
+            group_by=group_by,
         )
+        if group_by:
+            return result
         if verbose:
             return _json(result)
         return result

@@ -103,16 +103,24 @@ def register(mcp, get_book) -> None:
     def get_audit_log(
         log_date: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """Read audit log entries for a date.
 
-        Returns the human-readable text audit log. Each write operation
-        (CREATE, UPDATE, DELETE, VOID, RECONCILE, etc.) is one entry
-        separated by a blank line. Reads are not logged.
+        Returns the human-readable text audit log, led by a
+        ``Showing X-Y of Z audit entries (date)`` indicator. Each write
+        operation (CREATE, UPDATE, DELETE, VOID, RECONCILE, etc.) is one
+        entry separated by a blank line. Reads are not logged.
+
+        Unlike the row-list tools, the window is anchored to the most
+        recent entry: ``offset`` pages *backward* into history (offset=0
+        is the newest page), since "what happened lately" is the usual
+        question. ``limit=0`` returns the count only.
 
         Args:
             log_date: Date to read (YYYY-MM-DD). Defaults to today.
-            limit: Maximum entries to return (default 50). Most recent last.
+            limit: Page size (default 50). 0 = count only.
+            offset: Entries to skip back from the most recent (default 0).
         """
         log_dir = get_log_dir()
         if not log_dir:
@@ -163,14 +171,37 @@ def register(mcp, get_book) -> None:
 
         # Entries are separated by blank lines. The first block is the
         # day's header (box-drawing banner) — preserve it regardless of
-        # limit so the reader knows date/timezone/book context.
+        # paging so the reader knows date/timezone/book context.
         blocks = content.split("\n\n")
         header = None
         if blocks and "═" in blocks[0]:
             header, blocks = blocks[0], blocks[1:]
 
-        if len(blocks) > limit:
-            blocks = blocks[-limit:]
+        total = len(blocks)
+        # Recency-anchored window: offset counts back from the newest
+        # entry, so offset=0 is the most recent page. This inverts the
+        # row-list tools' offset-from-start, matching how an audit log
+        # is actually read. Indicator positions are 1-indexed in
+        # chronological (oldest-first) order so they stay monotonic.
+        if offset < 0:
+            offset = 0
+        if limit == 0:
+            page = []
+            indicator = f"Showing 0 of {total} audit entries ({target_date})"
+        else:
+            page_limit = limit if limit > 0 else 50
+            end_idx = max(0, total - offset)
+            start_idx = max(0, end_idx - page_limit)
+            page = blocks[start_idx:end_idx]
+            if page:
+                indicator = (
+                    f"Showing {start_idx + 1}-{end_idx} of {total} "
+                    f"audit entries ({target_date})"
+                )
+            else:
+                indicator = (
+                    f"Showing 0 of {total} audit entries ({target_date})"
+                )
 
-        parts = ([header] if header else []) + blocks
+        parts = [indicator] + ([header] if header else []) + page
         return "\n\n".join(parts)

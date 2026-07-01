@@ -1,5 +1,6 @@
 """Tests for tool module filtering and server configuration."""
 
+import os
 import re
 from pathlib import Path
 
@@ -50,7 +51,12 @@ class TestToolModulesMapping:
         all_mapped = set()
         for tools in TOOL_MODULES.values():
             all_mapped.update(tools)
+        # switch_book is an inline meta-tool deliberately outside the
+        # partition (registered at import, kept only in multi-book
+        # sessions); exclude it like the server validator does.
+        from gnucash_mcp.server import _INLINE_UNMAPPED_TOOLS
         registered = set(mcp._tool_manager._tools.keys())
+        registered -= _INLINE_UNMAPPED_TOOLS
         assert registered.issubset(all_mapped)
 
     def test_every_tool_module_backs_onto_extracted_files(self):
@@ -78,22 +84,22 @@ class TestToolModulesMapping:
                 seen.add(tool)
 
     def test_core_group_resolves_to_29_tools(self):
-        """The ``core`` group expands to 29 tools across its nine
+        """The ``core`` group expands to 30 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 9 + slots
         3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
         reconciliation 3). Reconciliation joined core in v1.3.1
         per the bookkeeper-driven principle that any configuration
         which handles money must include reconciliation.
         """
-        assert len(_core_tool_names()) == 29
+        assert len(_core_tool_names()) == 30
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 106 —
+        """Total tools across all sub-modules should be 107 —
         88 post-module-restructure + 3 voucher tools +
         4 credit-note tools + 5 job CRUD tools +
         1 get_job_report + 5 taxtable CRUD tools added in v1.3."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 106
+        assert total == 107
 
     def test_expected_modules_exist(self):
         """All expected leaf-module names should be present.
@@ -157,7 +163,7 @@ class TestToolFileVsModulesMapping:
 
     Pre-restructure this was a per-module 1:1 check (each
     ``tools/<X>.py`` matched ``TOOL_MODULES[X]`` exactly). The Core
-    restructure broke that bijection — Core's 29 tools span
+    restructure broke that bijection — Core's 30 tools span
     ``tools/core.py`` + ``tools/reconciliation.py`` +
     ``tools/admin.py`` + ``tools/backup.py``. The contract is now
     bidirectional-totality: every decorated tool maps to some
@@ -257,9 +263,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 106 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report + 5 taxtables)."""
+        """--modules=all should keep all 107 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report + 5 taxtables)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 106
+        assert len(self._tool_names()) == 107
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -291,12 +297,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 106
+        assert len(self._tool_names()) == 107
 
     def test_all_in_list_keeps_everything(self):
-        """'all' mixed with other modules should keep all 106 tools."""
+        """'all' mixed with other modules should keep all 107 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 106
+        assert len(self._tool_names()) == 107
 
     def test_unknown_module_fails_fast(self, capsys):
         """Unknown module names fail-fast at startup with SystemExit.
@@ -870,3 +876,359 @@ class TestModuleGroupsValidation:
                 _validate_module_groups()
         finally:
             srv.MODULE_GROUPS = original
+
+
+# ── Multi-book accounting ──────────────────────────────────────────
+
+
+def _make_min_book(path: Path) -> Path:
+    """Create a minimal valid USD book with one funded account."""
+    import piecash
+    from datetime import date
+    from decimal import Decimal
+
+    book = piecash.create_book(str(path), currency="USD", overwrite=True)
+    usd = book.default_currency
+    root = book.root_account
+    assets = piecash.Account(
+        name="Assets", type="ASSET", parent=root, commodity=usd,
+        placeholder=True,
+    )
+    checking = piecash.Account(
+        name="Checking", type="BANK", parent=assets, commodity=usd,
+    )
+    equity = piecash.Account(
+        name="Equity", type="EQUITY", parent=root, commodity=usd,
+        placeholder=True,
+    )
+    opening = piecash.Account(
+        name="Opening Balance", type="EQUITY", parent=equity,
+        commodity=usd,
+    )
+    book.save()
+    book.session.add(piecash.Transaction(
+        currency=usd, description="Opening Balance",
+        post_date=date(2026, 1, 1),
+        splits=[
+            piecash.Split(account=checking, value=Decimal("1000")),
+            piecash.Split(account=opening, value=Decimal("-1000")),
+        ],
+    ))
+    book.save()
+    book.close()
+    return path
+
+
+class TestMultiBook:
+    """Comma-separated GNUCASH_BOOK_PATH, the switch_book tool, and the
+    current-book surfacing in get_server_config / get_book_summary."""
+
+    @pytest.fixture
+    def two_books(self, tmp_path: Path):
+        """Two distinct-named books: alex.gnucash and beast-man.gnucash."""
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        beast = _make_min_book(tmp_path / "beast-man.gnucash")
+        return alex, beast
+
+    @pytest.fixture(autouse=True)
+    def restore_state(self):
+        """Snapshot and restore every global the multi-book paths touch."""
+        import gnucash_mcp.server as srv
+        import gnucash_mcp.logging_config as logcfg
+
+        saved = {
+            "_book": srv._book,
+            "_book_paths": list(srv._book_paths),
+            "_current_path": srv._current_path,
+            "_book_registry": dict(srv._book_registry),
+            "_logging_debug": srv._logging_debug,
+            "_logging_audit": srv._logging_audit,
+        }
+        server_state_copy = dict(_server_state)
+        tools_copy = dict(mcp._tool_manager._tools)
+        loaded_copy = set(_loaded_tool_files)
+        log_saved = (
+            logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
+        )
+        yield
+        srv._book = saved["_book"]
+        srv._book_paths = saved["_book_paths"]
+        srv._current_path = saved["_current_path"]
+        srv._book_registry = saved["_book_registry"]
+        srv._logging_debug = saved["_logging_debug"]
+        srv._logging_audit = saved["_logging_audit"]
+        _server_state.clear()
+        _server_state.update(server_state_copy)
+        mcp._tool_manager._tools.clear()
+        mcp._tool_manager._tools.update(tools_copy)
+        _reset_lazy_load_state()
+        _loaded_tool_files.update(loaded_copy)
+        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
+
+    # ── _parse_book_paths ──────────────────────────────────────────
+
+    def test_parse_single_path(self, two_books):
+        from gnucash_mcp.server import _parse_book_paths
+        alex, _ = two_books
+        assert _parse_book_paths(str(alex)) == [alex.resolve()]
+
+    def test_parse_multi_path_preserves_order(self, two_books):
+        from gnucash_mcp.server import _parse_book_paths
+        alex, beast = two_books
+        result = _parse_book_paths(f"{alex}{os.pathsep}{beast}")
+        assert result == [alex.resolve(), beast.resolve()]
+
+    def test_parse_strips_whitespace_and_empties(self, two_books):
+        from gnucash_mcp.server import _parse_book_paths
+        alex, beast = two_books
+        sep = os.pathsep
+        result = _parse_book_paths(f" {alex} {sep} {sep} {beast} ")
+        assert result == [alex.resolve(), beast.resolve()]
+
+    def test_parse_allows_comma_in_filename(self, tmp_path):
+        """Regression guard: a single book whose name contains a comma
+        (the rejected separator) must parse as ONE path."""
+        from gnucash_mcp.server import _parse_book_paths
+        name = "financials, invoicing, and metrics.gnucash"
+        book = _make_min_book(tmp_path / name)
+        assert _parse_book_paths(str(book)) == [book.resolve()]
+
+    def test_parse_missing_path_fails_fast(self, two_books, tmp_path):
+        from gnucash_mcp.server import _parse_book_paths, _BookPathError
+        alex, _ = two_books
+        missing = tmp_path / "nope.gnucash"
+        with pytest.raises(_BookPathError, match="not found"):
+            _parse_book_paths(f"{alex}{os.pathsep}{missing}")
+
+    def test_book_path_error_is_file_not_found(self):
+        """Missing-book errors must subclass FileNotFoundError so the
+        runtime error_type stays ``file_not_found``."""
+        from gnucash_mcp.server import _BookPathError
+        assert issubclass(_BookPathError, FileNotFoundError)
+
+    def test_parse_duplicate_basename_fails_fast(self, tmp_path):
+        from gnucash_mcp.server import _parse_book_paths, _BookPathError
+        d1 = tmp_path / "a"
+        d2 = tmp_path / "b"
+        d1.mkdir()
+        d2.mkdir()
+        b1 = _make_min_book(d1 / "dup.gnucash")
+        b2 = _make_min_book(d2 / "dup.gnucash")
+        with pytest.raises(_BookPathError, match="duplicate book filename"):
+            _parse_book_paths(f"{b1}{os.pathsep}{b2}")
+
+    def test_parse_unset_raises_valueerror(self):
+        from gnucash_mcp.server import _parse_book_paths
+        with pytest.raises(ValueError, match="GNUCASH_BOOK_PATH"):
+            _parse_book_paths(None)
+        with pytest.raises(ValueError, match="GNUCASH_BOOK_PATH"):
+            _parse_book_paths("   ")
+
+    # ── switch_book visibility ─────────────────────────────────────
+
+    def test_switch_book_present_with_two_books(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        srv._book_paths = [alex.resolve(), beast.resolve()]
+        _apply_module_filter("all")
+        assert "switch_book" in mcp._tool_manager._tools
+
+    def test_switch_book_absent_with_one_book(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        srv._book_paths = [alex.resolve()]
+        _apply_module_filter("all")
+        assert "switch_book" not in mcp._tool_manager._tools
+
+    def test_switch_book_absent_when_unconfigured(self):
+        import gnucash_mcp.server as srv
+        srv._book_paths = []
+        _apply_module_filter("all")
+        assert "switch_book" not in mcp._tool_manager._tools
+
+    def test_tool_count_single_book(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        srv._book_paths = [alex.resolve()]
+        _apply_module_filter("all")
+        assert len(mcp._tool_manager._tools) == 107
+
+    def test_tool_count_multi_book(self, two_books):
+        """The lone runtime delta from single-book: switch_book (108).
+        Each filter call relies on switch_book being registered at
+        import; the production flow filters once at startup."""
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        srv._book_paths = [alex.resolve(), beast.resolve()]
+        _apply_module_filter("all")
+        assert len(mcp._tool_manager._tools) == 108
+
+    # ── switch_book matching ───────────────────────────────────────
+
+    def _select(self, srv, two_books):
+        alex, beast = two_books
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = [alex.resolve(), beast.resolve()]
+        srv._current_path = alex.resolve()
+        srv._book = srv._book_for(alex.resolve())
+
+    def test_switch_by_unique_prefix(self, two_books):
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)
+        msg = srv._switch_book_impl("beast")
+        assert "Switched to: beast-man.gnucash" in msg
+        assert srv._current_path.name == "beast-man.gnucash"
+        assert srv.get_book().book_path.name == "beast-man.gnucash"
+
+    def test_switch_is_case_insensitive(self, two_books):
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)
+        assert "beast-man.gnucash" in srv._switch_book_impl("BEAST")
+
+    def test_switch_emits_context_reset_banner(self, two_books):
+        """The response must loudly invalidate the previous book's refs
+        (naming it) and reorient with a one-line snapshot — the
+        bookkeeper-flagged guard against silent cross-book collisions."""
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)  # current = alex
+        msg = srv._switch_book_impl("beast")
+        assert "CONTEXT RESET" in msg
+        assert "alex.gnucash" in msg          # names the PREVIOUS book
+        assert "invalid" in msg.lower()
+        assert "Switched to: beast-man.gnucash" in msg
+        assert "base currency" in msg          # orientation snapshot
+
+    def test_switch_noop_skips_reset_banner(self, two_books):
+        """Switching to the already-current book is a no-op — it must
+        NOT claim a context reset."""
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)  # current = alex
+        msg = srv._switch_book_impl("alex")
+        assert msg.startswith("Already on: alex.gnucash")
+        assert "CONTEXT RESET" not in msg
+
+    def test_orientation_reports_currency_and_count(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        snap = srv._book_orientation(srv._book_for(alex.resolve()))
+        # _make_min_book seeds one transaction in a USD book.
+        assert "1 transaction" in snap
+        assert "USD base currency" in snap
+
+    def test_switch_no_match_lists_available(self, two_books):
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)
+        with pytest.raises(ValueError, match="No book matches"):
+            srv._switch_book_impl("zzz")
+
+    def test_switch_ambiguous_prefix_raises(self, tmp_path):
+        import gnucash_mcp.server as srv
+        a = _make_min_book(tmp_path / "report-q1.gnucash")
+        b = _make_min_book(tmp_path / "report-q2.gnucash")
+        srv._book = None
+        srv._book_registry = {}
+        srv._book_paths = [a.resolve(), b.resolve()]
+        srv._current_path = a.resolve()
+        srv._book = srv._book_for(a.resolve())
+        with pytest.raises(ValueError, match="ambiguous"):
+            srv._switch_book_impl("report")
+
+    def test_switch_empty_name_raises(self, two_books):
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)
+        with pytest.raises(ValueError, match="requires a book name"):
+            srv._switch_book_impl("   ")
+
+    # ── get_book cold-start selection ──────────────────────────────
+
+    def test_get_book_selects_first_as_current(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex}{os.pathsep}{beast}")
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = []
+        book = srv.get_book()
+        assert book.book_path.name == "alex.gnucash"
+        assert srv._current_path.name == "alex.gnucash"
+        assert srv.multi_book_active() is True
+
+    # ── get_server_config ──────────────────────────────────────────
+
+    def test_server_config_lists_books_when_multi(self):
+        _server_state.clear()
+        _server_state.update({
+            "modules": "core", "tool_count": 108,
+            "book_path": "/secret/dir/alex.gnucash",
+            "book_paths": ["alex.gnucash", "beast-man.gnucash"],
+            "current_book": "alex.gnucash",
+            "debug": False,
+        })
+        out = _get_server_config_impl()
+        assert "Current book: alex.gnucash" in out
+        assert "Available books: alex.gnucash, beast-man.gnucash" in out
+        assert "/secret/dir" not in out  # no directory leakage
+
+    def test_server_config_no_book_list_when_single(self):
+        _server_state.clear()
+        _server_state.update({
+            "modules": "core", "tool_count": 107,
+            "book_path": "/dir/alex.gnucash",
+            "book_paths": ["alex.gnucash"],
+            "current_book": "alex.gnucash",
+            "debug": False,
+        })
+        out = _get_server_config_impl()
+        assert "Available books:" not in out
+        assert "Current book:" not in out
+        assert "Book: alex.gnucash" in out
+
+    # ── logging follows the active book ────────────────────────────
+
+    def test_logging_follows_switch(self, two_books, monkeypatch):
+        import gnucash_mcp.server as srv
+        import gnucash_mcp.logging_config as logcfg
+        alex, beast = two_books
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", f"{alex}{os.pathsep}{beast}")
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = []
+        srv._logging_audit = True
+        srv._logging_debug = False
+        srv.get_book()  # cold-start: current = alex
+        srv._switch_book_impl("beast")
+        assert logcfg._book_path_str.endswith("beast-man.gnucash")
+
+    # ── get_book_summary current-book marker ───────────────────────
+
+    def test_summary_marks_current_book_when_multi(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = [alex.resolve(), beast.resolve()]
+        srv._current_path = alex.resolve()
+        srv._book = srv._book_for(alex.resolve())
+        _apply_module_filter("all")
+        summary = mcp._tool_manager._tools["get_book_summary"].fn()
+        first = summary.split("\n", 1)[0]
+        assert first.startswith("Current book: alex.gnucash")
+        assert "2 books available" in first
+
+    def test_summary_unmarked_when_single(self, two_books):
+        import gnucash_mcp.server as srv
+        alex, _ = two_books
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = [alex.resolve()]
+        srv._current_path = alex.resolve()
+        srv._book = srv._book_for(alex.resolve())
+        _apply_module_filter("all")
+        summary = mcp._tool_manager._tools["get_book_summary"].fn()
+        assert summary.split("\n", 1)[0].startswith("Book: alex.gnucash")

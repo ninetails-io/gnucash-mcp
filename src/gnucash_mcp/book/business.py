@@ -26,7 +26,13 @@ from gnucash_mcp.book._base import (
     _verify_composite_write,
     _verify_write,
 )
-from gnucash_mcp._format import _apply_limit
+from gnucash_mcp._format import (
+    _GROUP_BY_VALUES,
+    _enumerate_periods,
+    _format_grouped_tsv,
+    _paginate,
+    _period_label,
+)
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -334,6 +340,74 @@ class BusinessMixin:
         "vendor discounts",
     )
 
+    # ── Designated-account KVP slots (Layer 0 of the resolvers) ──────
+    #
+    # Once the FX / discount account is first resolved or created, its
+    # GUID is stored in a book-global slot on the root account. Every
+    # later resolution reads that GUID directly (Layer 0) — immune to
+    # both account renames and the book's locale, because the name no
+    # longer participates once the slot is populated. A stale or missing
+    # slot falls through to the lower layers, which re-populate it on the
+    # next create, so the designation self-heals.
+    #
+    # Path-style ``gnc-mcp/<role>`` keys (hierarchical sub-slots in the
+    # KVP store) per the slot-naming convention. One account per role,
+    # each denominated in the book default currency, so a single slot on
+    # the root account suffices — no per-source-account/per-commodity
+    # path is needed.
+    _FX_ACCOUNT_SLOT_KEY = "gnc-mcp/fx-gain-loss-acct"
+    _SALES_DISCOUNT_SLOT_KEY = "gnc-mcp/sales-discount-acct"
+    _PURCHASE_DISCOUNT_SLOT_KEY = "gnc-mcp/purchase-discount-acct"
+
+    def _resolve_designated_account(self, book, slot_key):
+        """Layer 0: resolve a designated FX/discount account from its
+        root-account KVP slot.
+
+        Returns the Account iff the slot holds a GUID that still
+        resolves to an INCOME/EXPENSE account in the book default
+        currency. A missing, empty, or stale slot (the account was
+        deleted, retyped, or re-denominated) returns ``None`` — the
+        caller falls through to the lower layers and re-writes the slot
+        on the next create, so the designation self-heals.
+
+        GUID-based, hence locale- and rename-proof: the account can be
+        renamed or re-parented freely after first use and still resolve.
+        """
+        try:
+            raw = book.root_account[slot_key]
+        except KeyError:
+            return None
+        guid = _slot_value_str(raw)
+        if not guid:
+            return None
+        acct = self._resolve_account(book, guid)
+        if acct is None:
+            return None
+        if acct.type not in {"INCOME", "EXPENSE"}:
+            return None
+        if acct.commodity != self._require_default_currency(book):
+            return None
+        return acct
+
+    def _store_designated_account(self, book, slot_key, account) -> None:
+        """Persist ``account``'s GUID to a root-account KVP slot so
+        future resolutions hit Layer 0 (a direct, locale-/rename-proof
+        GUID lookup) instead of re-deriving the account by name.
+
+        Called once the FX/discount account is definitively resolved
+        (found at its canonical path or freshly created). piecash
+        assigns ``guid`` at flush, not construction, and we cannot
+        flush mid-payment-build (orphan splits would trip a NOT NULL on
+        ``splits.tx_guid``); so a freshly created account is still
+        guid-less here. Assign the canonical guid now — piecash uses it
+        at INSERT — and the slot persists with the caller's final
+        ``book.save()``.
+        """
+        if account.guid is None:
+            import uuid
+            account.guid = uuid.uuid4().hex
+        book.root_account[slot_key] = account.guid
+
     def _get_or_create_fx_account(self, book, fx_account: str | None = None):
         """Find or lazily create the FX-gain/loss account.
 
@@ -343,8 +417,16 @@ class BusinessMixin:
 
         Resolution order:
 
+        0. **Stored designation** — a GUID written to the
+           ``gnc-mcp/fx-gain-loss-acct`` root slot on a prior resolve/
+           create. Consulted only when no explicit ``fx_account`` is
+           given; GUID-based, so it is immune to a rename of the FX
+           account and to the book's locale. The primary path after
+           first use.
         1. **Explicit ``fx_account``** (path, ``%short``, or full
            GUID) — validated for existence and INCOME/EXPENSE type.
+           A per-call override; wins over the stored designation and
+           is not itself persisted.
         2. **Fuzzy match**, leaf-name substring against
            ``_FX_NAME_KEYWORDS`` over INCOME/EXPENSE accounts:
            exactly one match → use it; zero → fall through; more
@@ -352,15 +434,20 @@ class BusinessMixin:
            caller to pass ``fx_account``. Don't guess between
            user-created accounts.
         3. **Canonical default**: existing ``Income:Foreign Exchange
-           Gain/Loss``, else auto-create it under ``Income`` — so
-           books without foreign-currency activity never accumulate
-           an unused account.
+           Gain/Loss``, else auto-create it under the top-level INCOME
+           account resolved *by type* — locale-robust, so it works on
+           a book whose income root is "Erträge"/"Ingresos"/… (and
+           survives a user rename), instead of throwing on a missing
+           English "Income". Falls back to creating a top-level INCOME
+           account only if the book has none at all.
 
         Raises:
-            ValueError: ``fx_account`` supplied but missing or not
-                INCOME/EXPENSE; or no ``Income`` parent to create
-                under.
+            ValueError: ``fx_account`` supplied but missing, not
+                INCOME/EXPENSE, or denominated in a non-default
+                currency.
         """
+        default_currency = self._require_default_currency(book)
+
         # Layer 1: caller-supplied account wins.
         if fx_account is not None:
             acct = self._resolve_account(book, fx_account)
@@ -376,15 +463,40 @@ class BusinessMixin:
                     f"{acct.type}; must be INCOME or EXPENSE to "
                     f"receive realized FX gain/loss."
                 )
+            # Realized FX gain/loss is a reporting-currency figure;
+            # the gain is booked as a default-currency quantity. A
+            # non-default-commodity FX account would record it in the
+            # wrong commodity (a $42 gain becoming €42). Reject rather
+            # than silently corrupt.
+            if acct.commodity != default_currency:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is denominated in "
+                    f"{acct.commodity.mnemonic}; the realized FX "
+                    f"gain/loss account must be in the book default "
+                    f"currency ({default_currency.mnemonic})."
+                )
             return acct, None
 
-        # Layer 2: fuzzy match by leaf-name substring.
+        # Layer 0: a stored designation wins for the no-explicit-arg
+        # case (the usual pay_invoice path). GUID-based, so it survives
+        # a rename of the FX account and works on any locale.
+        slotted = self._resolve_designated_account(
+            book, self._FX_ACCOUNT_SLOT_KEY
+        )
+        if slotted is not None:
+            return slotted, None
+
+        # Layer 2: fuzzy match by leaf-name substring. Only
+        # default-currency candidates qualify — see the commodity
+        # rationale on the explicit-account path above.
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
             if account.guid in template_guids:
                 continue
             if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            if account.commodity != default_currency:
                 continue
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
@@ -411,25 +523,48 @@ class BusinessMixin:
         # Layer 3: canonical default (existing or auto-create).
         fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
         if fx_acct is not None:
+            # Lock in the designation so the next call hits Layer 0
+            # directly — even on a book that already had this account.
+            self._store_designated_account(
+                book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
+            )
             return fx_acct, notice
 
-        income = self._find_account(book, "Income")
+        # Resolve the parent by TYPE, not the English name "Income".
+        # On a localized book the income root is "Erträge"/"Ingresos"/…,
+        # so _find_account(book, "Income") returns None and the old
+        # code threw here — the first cross-currency payment failing.
+        # Fall back to creating a top-level INCOME account only if the
+        # book genuinely has none.
+        income, parent_notice = self._top_level_account_of_type(
+            book, "INCOME"
+        )
         if income is None:
-            raise ValueError(
-                "Realized FX gain/loss on cross-currency payment needs "
-                "an Income parent account, but none exists. Create "
-                "Income (type=INCOME, placeholder) first."
+            income = piecash.Account(
+                name="Income",
+                type="INCOME",
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
             )
+        if notice is None:
+            notice = parent_notice
 
-        default_currency = self._require_default_currency(book)
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
         # the payment transaction, and orphan Split objects already in
         # the session would trip a NOT NULL on splits.tx_guid. The
         # final book.save() at the end of pay_invoice flushes everything
         # together with their now-set tx_guids.
+        # Localize the leaf on a non-English book (§6.3). Cosmetic only:
+        # the slot write below makes the next resolve GUID-based, so the
+        # localized name never has to be matched again.
+        fx_leaf = self._locale_account_name(
+            "fx_gain_loss", "Foreign Exchange Gain/Loss",
+            self._infer_book_locale(book),
+        )
         fx_acct = piecash.Account(
-            name="Foreign Exchange Gain/Loss",
+            name=fx_leaf,
             type="INCOME",
             parent=income,
             commodity=default_currency,
@@ -438,6 +573,9 @@ class BusinessMixin:
                 "invoice settlements (rate drift between post-date "
                 "and pay-date). Auto-created on first use."
             ),
+        )
+        self._store_designated_account(
+            book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
         )
         return fx_acct, notice
 
@@ -448,9 +586,11 @@ class BusinessMixin:
         """Find or lazily create the early-payment-discount account.
 
         Direct parallel to ``_get_or_create_fx_account`` — same
-        three-layer resolution (explicit > fuzzy match > canonical
-        default with auto-create) and the same ``(account, notice)``
-        return shape.
+        four-layer resolution (stored designation > explicit > fuzzy
+        match > canonical default with auto-create) and the same
+        ``(account, notice)`` return shape. The Layer-0 slot is
+        per-side, so the sales and purchase designations are
+        independent.
 
         ``owner_type_is_bill`` selects the side: True → vendor-bill
         payment (or customer credit-note refund), discount is INCOME
@@ -463,12 +603,16 @@ class BusinessMixin:
             canonical_parent_path = "Income"
             keywords = self._PURCHASE_DISCOUNT_NAME_KEYWORDS
             side_label = "purchase discounts taken"
+            slot_key = self._PURCHASE_DISCOUNT_SLOT_KEY
+            concept = "purchase_discount"
         else:
             canonical_path = self.SALES_DISCOUNTS_PATH
             canonical_type = "EXPENSE"
             canonical_parent_path = "Expenses"
             keywords = self._SALES_DISCOUNT_NAME_KEYWORDS
             side_label = "sales discounts"
+            slot_key = self._SALES_DISCOUNT_SLOT_KEY
+            concept = "sales_discount"
 
         # Layer 1: caller-supplied account wins.
         if discount_account is not None:
@@ -486,6 +630,12 @@ class BusinessMixin:
                     f"receive an early-payment-discount split."
                 )
             return acct, None
+
+        # Layer 0: a stored designation wins for the no-explicit-arg
+        # case. Per-side slot, GUID-based — rename- and locale-proof.
+        slotted = self._resolve_designated_account(book, slot_key)
+        if slotted is not None:
+            return slotted, None
 
         # Layer 2: fuzzy match by leaf-name substring.
         template_guids = self._template_account_guids(book)
@@ -519,21 +669,37 @@ class BusinessMixin:
         # Layer 3: canonical default (existing or auto-create).
         disc_acct = self._find_account(book, canonical_path)
         if disc_acct is not None:
+            self._store_designated_account(book, slot_key, disc_acct)
             return disc_acct, notice
 
-        parent = self._find_account(book, canonical_parent_path)
-        if parent is None:
-            raise ValueError(
-                f"Early-payment discount on this payment needs an "
-                f"{canonical_parent_path} parent account, but none "
-                f"exists. Create {canonical_parent_path} (type="
-                f"{canonical_type}, placeholder) first."
-            )
-
+        # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
+        # name "Income"/"Expenses" — locale-robust and rename-proof.
+        # Fall back to creating the top-level account only if the book
+        # has none of that type.
+        parent, parent_notice = self._top_level_account_of_type(
+            book, canonical_type
+        )
         default_currency = self._require_default_currency(book)
+        if parent is None:
+            parent = piecash.Account(
+                name=canonical_parent_path,
+                type=canonical_type,
+                parent=book.root_account,
+                commodity=default_currency,
+                placeholder=1,
+            )
+        if notice is None:
+            notice = parent_notice
+
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
-        leaf_name = canonical_path.split(":")[-1]
+        # Localized leaf on a non-English book (§6.3); falls back to the
+        # English canonical leaf when no translation exists for the
+        # concept (the discount concepts have none shipped yet).
+        leaf_name = self._locale_account_name(
+            concept, canonical_path.split(":")[-1],
+            self._infer_book_locale(book),
+        )
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,
@@ -546,6 +712,7 @@ class BusinessMixin:
                 f"validation passes. Auto-created on first use."
             ),
         )
+        self._store_designated_account(book, slot_key, disc_acct)
         return disc_acct, notice
 
     def _get_invoice_billterm(self, book, inv):
@@ -1598,6 +1765,20 @@ class BusinessMixin:
         if row and row[0]:
             gdate_val = row[0]
             if isinstance(gdate_val, str):
+                # GnuCash GDATE columns return a compact ``YYYYMMDD``
+                # string; other paths yield ISO ``YYYY-MM-DD``. Python
+                # 3.11+ ``date.fromisoformat`` accepts both, but 3.10
+                # (a supported target) rejects the compact form and
+                # raises — which the warnings collector's broad
+                # ``except`` then swallows, silently dropping the
+                # overdue warning. Normalize to digits first.
+                digits = gdate_val.strip().replace("-", "")[:8]
+                if len(digits) == 8 and digits.isdigit():
+                    return (
+                        date(int(digits[:4]), int(digits[4:6]),
+                             int(digits[6:8])),
+                        False,
+                    )
                 return date.fromisoformat(gdate_val[:10]), False
             if isinstance(gdate_val, datetime):
                 return gdate_val.date(), False
@@ -2086,26 +2267,44 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all customers.
+
+        Leads with a ``Showing X-Y of Z customers`` indicator; page
+        with ``offset``.
 
         Args:
             active_only: If True, only return active customers.
             compact: If True, return compact one-line-per-customer string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             customers = sorted(book.customers, key=lambda c: c.name)
             if active_only:
                 customers = [c for c in customers if c.active]
 
+            page, indicator = _paginate(
+                customers, offset=offset, limit=limit,
+                entity_name="customers",
+            )
             if compact:
-                lines = [self._customer_to_compact_line(c) for c in customers]
+                lines = [indicator]
+                lines += [self._customer_to_compact_line(c) for c in page]
                 return "\n".join(lines)
             else:
-                return [self._customer_to_dict(c) for c in customers]
+                return {
+                    "showing": indicator,
+                    "total": len(customers),
+                    "offset": offset,
+                    "count": len(page),
+                    "customers": [self._customer_to_dict(c) for c in page],
+                }
 
     def get_customer(self, customer_id: str) -> dict:
         """Get customer details by ID.
@@ -2156,26 +2355,43 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all vendors.
+
+        Leads with a ``Showing X-Y of Z vendors`` indicator; page with
+        ``offset``.
 
         Args:
             active_only: If True, only return active vendors.
             compact: If True, return compact one-line-per-vendor string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             vendors = sorted(book.vendors, key=lambda v: v.name)
             if active_only:
                 vendors = [v for v in vendors if v.active]
 
+            page, indicator = _paginate(
+                vendors, offset=offset, limit=limit, entity_name="vendors",
+            )
             if compact:
-                lines = [self._vendor_to_compact_line(v) for v in vendors]
+                lines = [indicator]
+                lines += [self._vendor_to_compact_line(v) for v in page]
                 return "\n".join(lines)
             else:
-                return [self._vendor_to_dict(v) for v in vendors]
+                return {
+                    "showing": indicator,
+                    "total": len(vendors),
+                    "offset": offset,
+                    "count": len(page),
+                    "vendors": [self._vendor_to_dict(v) for v in page],
+                }
 
     def get_vendor(self, vendor_id: str) -> dict:
         """Get vendor details by ID.
@@ -2227,26 +2443,44 @@ class BusinessMixin:
         self,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all employees.
+
+        Leads with a ``Showing X-Y of Z employees`` indicator; page
+        with ``offset``.
 
         Args:
             active_only: If True, only return active employees.
             compact: If True, return compact one-line-per-employee string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         with self.open() as book:
             employees = sorted(book.employees, key=lambda e: e.name)
             if active_only:
                 employees = [e for e in employees if e.active]
 
+            page, indicator = _paginate(
+                employees, offset=offset, limit=limit,
+                entity_name="employees",
+            )
             if compact:
-                lines = [self._employee_to_compact_line(e) for e in employees]
+                lines = [indicator]
+                lines += [self._employee_to_compact_line(e) for e in page]
                 return "\n".join(lines)
             else:
-                return [self._employee_to_dict(e) for e in employees]
+                return {
+                    "showing": indicator,
+                    "total": len(employees),
+                    "offset": offset,
+                    "count": len(page),
+                    "employees": [self._employee_to_dict(e) for e in page],
+                }
 
     def get_employee(self, employee_id: str) -> dict:
         """Get employee details by ID.
@@ -2405,14 +2639,21 @@ class BusinessMixin:
                 "status": "created",
             }
 
-    def list_billterms(self, compact: bool = True) -> list[dict] | str:
+    def list_billterms(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all billing terms.
+
+        Leads with a ``Showing X-Y of Z billterms`` indicator; page
+        with ``offset``.
 
         Args:
             compact: If True, return compact one-line-per-term string.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string or list of dicts.
+            Compact string or verbose envelope.
         """
         from piecash.business.invoice import Billterm
 
@@ -2421,13 +2662,21 @@ class BusinessMixin:
                 Billterm.invisible == 0
             ).order_by(Billterm.name).all()
 
+            page, indicator = _paginate(
+                terms, offset=offset, limit=limit, entity_name="billterms",
+            )
             if compact:
-                lines = []
-                for t in terms:
-                    lines.append(f"{t.name}\t{t.duedays} days")
+                lines = [indicator]
+                lines += [f"{t.name}\t{t.duedays} days" for t in page]
                 return "\n".join(lines)
             else:
-                return [self._billterm_to_dict(t) for t in terms]
+                return {
+                    "showing": indicator,
+                    "total": len(terms),
+                    "offset": offset,
+                    "count": len(page),
+                    "billterms": [self._billterm_to_dict(t) for t in page],
+                }
 
     # ── Taxtable CRUD ─────────────────────────────────────────────
     #
@@ -2812,14 +3061,15 @@ class BusinessMixin:
             }
 
     def list_taxtables(
-        self, compact: bool = True,
-    ) -> list[dict] | str:
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all tax tables.
 
-        Compact (default): one line per taxtable,
+        Leads with a ``Showing X-Y of Z taxtables`` indicator; page
+        with ``offset``. Compact (default): one line per taxtable,
         ``name<TAB>N entries: 5%→GST Payable, 7%→PST Payable``.
-        Verbose: list of full dicts with resolved account paths and
-        computed refcount. Empty book → empty string / empty list.
+        Verbose: envelope of full dicts with resolved account paths
+        and computed refcount.
         """
         from piecash.business.tax import Taxtable
 
@@ -2828,9 +3078,13 @@ class BusinessMixin:
                 Taxtable.name,
             ).all()
 
+            page, indicator = _paginate(
+                tables, offset=offset, limit=limit,
+                entity_name="taxtables",
+            )
             if compact:
-                lines = []
-                for tt in tables:
+                lines = [indicator]
+                for tt in page:
                     summary = ", ".join(
                         self._taxtable_entry_summary(e)
                         for e in tt.entries
@@ -2842,19 +3096,25 @@ class BusinessMixin:
                     )
                 return "\n".join(lines)
 
-            return [
-                self._taxtable_to_dict(
-                    tt,
-                    account_paths={
-                        e.account_guid: e.account.fullname
-                        for e in tt.entries
-                    },
-                    refcount=self._compute_taxtable_refcount(
-                        book, tt.guid,
-                    ),
-                )
-                for tt in tables
-            ]
+            return {
+                "showing": indicator,
+                "total": len(tables),
+                "offset": offset,
+                "count": len(page),
+                "taxtables": [
+                    self._taxtable_to_dict(
+                        tt,
+                        account_paths={
+                            e.account_guid: e.account.fullname
+                            for e in tt.entries
+                        },
+                        refcount=self._compute_taxtable_refcount(
+                            book, tt.guid,
+                        ),
+                    )
+                    for tt in page
+                ],
+            }
 
     def get_taxtable(self, name: str) -> dict:
         """Full details for a tax table.
@@ -4271,19 +4531,24 @@ class BusinessMixin:
         compact: bool = True,
         limit: int | None = None,
         job_id: str | None = None,
-    ) -> list[dict] | str:
+        offset: int = 0,
+    ) -> dict | str:
         """List invoices and/or bills.
+
+        Leads with a ``Showing X-Y of Z invoices (date range)``
+        indicator over the full filter set; page with ``offset``.
 
         Args:
             owner_type: 'customer', 'vendor', or None for all.
             status: 'posted', 'open', or None for all.
             compact: If True, one line per invoice.
-            limit: Defaults to 50, capped at 250 server-side.
+            limit: Page size (default 50, max 250). 0 = count only.
             job_id: Filter to invoices grouped under a specific job.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Compact string (with optional truncation notice) or the
-            verbose envelope ``{invoices, count, total, notice}``.
+            Compact string (indicator + rows) or the verbose envelope
+            ``{invoices, showing, total, offset, count}``.
         """
         from piecash.business.invoice import Invoice
 
@@ -4324,17 +4589,18 @@ class BusinessMixin:
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
             total = len(invoices)
-            invoices, notice = _apply_limit(
+            page, indicator = _paginate(
                 invoices,
+                offset=offset,
                 limit=limit,
                 entity_name="invoices",
-                suggest_narrow=True,
+                date_key=lambda i: i.date_opened,
             )
+            invoices = page
 
             if compact:
-                lines = [self._invoice_to_compact_line(book, i) for i in invoices]
-                if notice:
-                    lines.append(notice)
+                lines = [indicator]
+                lines += [self._invoice_to_compact_line(book, i) for i in invoices]
                 return "\n".join(lines)
             else:
                 # Verbose path resolves owner names per invoice.
@@ -4369,15 +4635,15 @@ class BusinessMixin:
                             job=j_dict,
                         )
                     )
-                # Envelope matches get_unreconciled_splits /
-                # get_prices: ``count`` = truncated length,
-                # ``total`` = full filter-set size, ``notice`` = the
-                # same string compact appends (or None).
+                # Envelope matches the other list tools: ``count`` =
+                # page length, ``total`` = full filter-set size,
+                # ``showing`` = the indicator compact leads with.
                 return {
-                    "invoices": results,
-                    "count": len(results),
+                    "showing": indicator,
                     "total": total,
-                    "notice": notice,
+                    "offset": offset,
+                    "count": len(results),
+                    "invoices": results,
                 }
 
     def get_invoice(self, invoice_id: str, owner_type: str | None = None) -> dict:
@@ -6377,16 +6643,23 @@ class BusinessMixin:
         owner_id: str | None = None,
         active_only: bool = True,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List jobs, optionally filtered by owner_type and/or
         owner_id.
+
+        Leads with a ``Showing X-Y of Z jobs`` indicator; page with
+        ``offset``.
 
         Args:
             owner_type: 'customer' or 'vendor'; omit for all.
             owner_id: Requires owner_type (customer and vendor IDs
                 share a sequence space).
             active_only: If True (default), exclude inactive jobs.
-            compact: One line per job (default) or list of dicts.
+            compact: One line per job (default) or verbose envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         from piecash.business.invoice import Job
 
@@ -6433,9 +6706,12 @@ class BusinessMixin:
 
             jobs = sorted(query.all(), key=lambda j: j.id)
 
+            page, indicator = _paginate(
+                jobs, offset=offset, limit=limit, entity_name="jobs",
+            )
             if compact:
-                lines = []
-                for job in jobs:
+                lines = [indicator]
+                for job in page:
                     owner = self._find_invoice_owner_by_guid(
                         book, job.owner_type, job.owner_guid,
                     )
@@ -6449,7 +6725,7 @@ class BusinessMixin:
                 return "\n".join(lines)
 
             results = []
-            for job in jobs:
+            for job in page:
                 owner = self._find_invoice_owner_by_guid(
                     book, job.owner_type, job.owner_guid,
                 )
@@ -6459,7 +6735,13 @@ class BusinessMixin:
                         owner_name=owner.name if owner else None,
                     )
                 )
-            return results
+            return {
+                "showing": indicator,
+                "total": len(jobs),
+                "offset": offset,
+                "count": len(page),
+                "jobs": results,
+            }
 
     def get_job(self, job_id: str) -> dict:
         """Get a job's details by ID.
@@ -6623,8 +6905,13 @@ class BusinessMixin:
         customer_id: str | None = None,
         vendor_id: str | None = None,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """Get all posted invoices/bills with outstanding balances.
+
+        Leads with a ``Showing X-Y of Z invoices (date range)``
+        indicator, most-overdue first; page with ``offset``.
 
         Args:
             owner_type: 'customer' or 'vendor'; omit for all.
@@ -6632,10 +6919,11 @@ class BusinessMixin:
             vendor_id: Filter by specific vendor ID.
             compact: One line per doc with action columns (due
                 date, days past due, (BILL)/(CN) tags),
-                most-overdue first; empty string when nothing is
-                outstanding. Verbose returns dicts with the full
-                original_amount / amount_paid / amount_due
-                breakdown.
+                most-overdue first. Verbose returns the envelope
+                with the full original_amount / amount_paid /
+                amount_due breakdown per doc.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         from piecash.business.invoice import Invoice
 
@@ -6785,9 +7073,23 @@ class BusinessMixin:
                 key=lambda r: -(r["days_past_due"] or 0),
             )
 
+            page, indicator = _paginate(
+                results,
+                offset=offset,
+                limit=limit,
+                entity_name="invoices",
+                date_key=lambda r: r["date_posted"],
+            )
             if compact:
-                return _format_outstanding_invoices_compact(results)
-            return results
+                body = _format_outstanding_invoices_compact(page)
+                return f"{indicator}\n{body}" if body else indicator
+            return {
+                "showing": indicator,
+                "total": len(results),
+                "offset": offset,
+                "count": len(page),
+                "invoices": page,
+            }
 
     def get_job_report(self, job_id: str) -> dict:
         """Per-job summary: billed / paid / outstanding totals
@@ -6929,12 +7231,196 @@ class BusinessMixin:
                 "invoices": invoice_rows,
             }
 
+    def _posting_split_in_default(
+        self, book, split, default_currency,
+    ) -> tuple[Decimal, bool]:
+        """Value one posting/payment split in the book's default
+        currency, trusting the ledger.
+
+        A split stores ``quantity`` in its account's commodity and
+        ``value`` in its transaction's currency. Whichever of those
+        is the book default IS the base-currency amount — the rate
+        was applied when the row was written, so re-deriving it from
+        face value is unnecessary and re-deriving it at a *report-time*
+        rate is wrong (it drifts with the rate). Only a split whose
+        account AND transaction are both non-default has no stored
+        base-currency amount; there a live conversion is required, and
+        it uses the rate AS OF THE POSTING DATE (what was booked), not
+        a report-period rate.
+
+        Returns ``(amount, converted_ok)``; ``converted_ok`` is False
+        only when a rate was required and none is on file.
+        """
+        if split.account.commodity == default_currency:
+            return Decimal(str(split.quantity)), True
+        txn_currency = split.transaction.currency
+        if txn_currency == default_currency:
+            return Decimal(str(split.value)), True
+        # Both-foreign: no base-currency amount is stored. Convert the
+        # transaction-currency value at the posting-date rate.
+        rate = self._cross_rate(
+            book, txn_currency, default_currency,
+            as_of=split.transaction.post_date,
+        )
+        if rate is None:
+            return Decimal(str(split.value)), False
+        quantum = _commodity_quantum(default_currency)
+        return (Decimal(str(split.value)) * rate).quantize(quantum), True
+
+    def _bill_amounts_in_default(
+        self, book, bill, default_currency,
+    ) -> tuple[Decimal, Decimal, Decimal, str | None]:
+        """Billed / paid / outstanding for one bill, in the book's
+        default currency, read from the posting ledger.
+
+        Sums the posting transaction's contra (non-A/P) splits for
+        the billed total and the post-lot balance for outstanding —
+        both valued via :meth:`_posting_split_in_default`, so a
+        foreign-currency bill posted against a default-currency A/P
+        account needs no rate at all: the CNY amounts computed at
+        posting time are read straight off the ledger. ``paid`` is
+        the difference. This is the same principle as the contra-split
+        fix: report what the book contains, not a re-derivation of
+        what it should contain.
+
+        Returns ``(billed, paid, outstanding, unconverted_ccy)``.
+        ``unconverted_ccy`` is the bill currency's mnemonic when a
+        split could not be valued (no rate on file) — None on
+        success; the amounts are then in that raw foreign currency
+        and the caller routes them to the per-currency bucket.
+        """
+        converted_ok = True
+
+        # Total billed = magnitude of the contra (non-A/P) side of
+        # the posting transaction.
+        billed = Decimal(0)
+        txn = bill.post_txn
+        if txn is not None:
+            for s in txn.splits:
+                if s.reconcile_state == "v":
+                    continue
+                if s.account.guid == bill.post_acc_guid:
+                    continue
+                amt, ok = self._posting_split_in_default(
+                    book, s, default_currency,
+                )
+                converted_ok = converted_ok and ok
+                billed += amt
+        billed = abs(billed)
+
+        # Outstanding = magnitude of the post-lot balance.
+        outstanding = Decimal(0)
+        post_acct = book.session.query(
+            piecash.Account
+        ).filter_by(guid=bill.post_acc_guid).first()
+        if post_acct:
+            for lot in post_acct.lots:
+                if lot.guid != bill.post_lot_guid:
+                    continue
+                for s in lot.splits:
+                    if s.reconcile_state == "v":
+                        continue
+                    amt, ok = self._posting_split_in_default(
+                        book, s, default_currency,
+                    )
+                    converted_ok = converted_ok and ok
+                    outstanding += amt
+                break
+        outstanding = abs(outstanding)
+
+        paid = billed - outstanding
+        unconverted = None if converted_ok else bill.currency.mnemonic
+        return billed, paid, outstanding, unconverted
+
+    def _grouped_vendor_spending(
+        self,
+        book,
+        *,
+        bills,
+        start_date: date,
+        end_date: date,
+        group_by: str,
+        default_currency,
+    ) -> str:
+        """Bucket total-billed per vendor into sub-period columns.
+
+        Each bill lands in its ``date_posted`` sub-period, billed in
+        the book default read off the posting ledger (see
+        :meth:`_bill_amounts_in_default`). Bills that can't be valued
+        (foreign A/P account, no FX rate on file) are excluded from
+        the converted totals and surfaced in a trailing warning,
+        exactly as the single-period report handles them.
+        """
+        periods = _enumerate_periods(start_date, end_date, group_by)
+        period_labels = [pl for pl, _ in periods]
+
+        totals: dict[str, dict[str, Decimal]] = {}
+        unconverted: dict[str, dict] = {}
+        for bill in bills:
+            posted = _safe_invoice_date(bill, "date_posted")
+            if posted is None:
+                continue
+            plabel = _period_label(posted.date(), group_by)
+            total, _paid, _out, unconv = self._bill_amounts_in_default(
+                book, bill, default_currency,
+            )
+
+            if unconv is not None:
+                u = unconverted.setdefault(
+                    unconv,
+                    {"total_billed": Decimal(0), "bill_count": 0},
+                )
+                u["total_billed"] += total
+                u["bill_count"] += 1
+                continue
+
+            v = self._find_vendor_by_guid(book, bill.owner_guid)
+            v_name = v.name if v else "Unknown"
+            bucket = totals.setdefault(v_name, {})
+            bucket[plabel] = bucket.get(plabel, Decimal(0)) + total
+
+        row_totals = {
+            name: sum(per.values(), Decimal(0))
+            for name, per in totals.items()
+        }
+        # Billed totals are non-negative, so there is no net-negative
+        # exclusion here (unlike the category breakdowns).
+        displayed_names = sorted(
+            row_totals, key=lambda n: row_totals[n], reverse=True,
+        )
+        period_totals = {pl: Decimal(0) for pl in period_labels}
+        for per in totals.values():
+            for pl, v in per.items():
+                period_totals[pl] += v
+        grand_total = sum(row_totals.values(), Decimal(0))
+
+        out = _format_grouped_tsv(
+            period_labels=period_labels,
+            displayed_names=displayed_names,
+            totals=totals,
+            row_totals=row_totals,
+            period_totals=period_totals,
+            grand_total=grand_total,
+            excluded=[],
+            label="Vendor",
+        )
+        if unconverted:
+            mnem = default_currency.mnemonic
+            for ccy, d in unconverted.items():
+                out += (
+                    f"\n⚠ {d['bill_count']} bill(s) in {ccy} excluded from "
+                    f"{mnem} totals — no exchange rate on file "
+                    f"(raw {ccy}: billed {d['total_billed']})"
+                )
+        return out
+
     def vendor_spending_report(
         self,
         start_date: str,
         end_date: str,
         vendor_id: str | None = None,
         compact: bool = True,
+        group_by: str | None = None,
     ) -> dict | str:
         """Get spending breakdown by vendor for a period.
 
@@ -6947,8 +7433,20 @@ class BusinessMixin:
             vendor_id: Optional filter to one vendor.
             compact: Aligned text table with TOTAL row (default),
                 or the structured dict.
+            group_by: ``None`` (default) for the single-period
+                billed/paid/outstanding view; ``"month"`` /
+                ``"quarter"`` / ``"year"`` to split the range into
+                sub-period columns of **total billed** per vendor and
+                return a multi-period TSV table — surfaces per-vendor
+                spend trends (a spike at one vendor in one month).
         """
         from piecash.business.invoice import Invoice
+
+        if group_by is not None and group_by not in _GROUP_BY_VALUES:
+            raise ValueError(
+                f"Invalid group_by '{group_by}'. Must be one of: "
+                f"{', '.join(_GROUP_BY_VALUES)}."
+            )
 
         parsed_start = date.fromisoformat(start_date)
         parsed_end = date.fromisoformat(end_date)
@@ -6958,10 +7456,6 @@ class BusinessMixin:
             # a hardcoded ``$`` breaks on non-USD books.
             default_currency = self._require_default_currency(book)
             default_currency_mnemonic = default_currency.mnemonic
-
-            # Rates as of period end — historical periods must not
-            # be valued at today's rates.
-            latest_rates = self._rates_as_of(book, parsed_end)
 
             query = book.session.query(Invoice).filter(
                 Invoice.owner_type == 4,
@@ -6991,8 +7485,19 @@ class BusinessMixin:
                     filtered_bills.append(b)
             bills = filtered_bills
 
+            if group_by is not None:
+                return self._grouped_vendor_spending(
+                    book,
+                    bills=bills,
+                    start_date=parsed_start,
+                    end_date=parsed_end,
+                    group_by=group_by,
+                    default_currency=default_currency,
+                )
+
             vendor_data: dict[str, dict] = {}
-            # Bills with no rate on file are EXCLUDED from
+            # Bills that can't be valued in the book default (foreign
+            # A/P account with no FX rate on file) are EXCLUDED from
             # default-currency totals (folding raw foreign units
             # corrupts the sum); tracked per currency and surfaced
             # as a warning.
@@ -7014,64 +7519,31 @@ class BusinessMixin:
                         "bill_count": 0,
                     }
 
-                balance = Decimal(0)
-                post_acct = book.session.query(
-                    piecash.Account
-                ).filter_by(guid=bill.post_acc_guid).first()
-                if post_acct:
-                    for lot in post_acct.lots:
-                        if lot.guid == bill.post_lot_guid:
-                            balance = self._calculate_lot_balance(
-                                lot
-                            )
-                            break
+                # Billed/paid/outstanding read off the posting ledger
+                # in the book default — for a foreign-currency bill
+                # against a default-currency A/P account this is the
+                # rate-at-posting amount, never today's drifted rate.
+                total, paid, outstanding, unconv = (
+                    self._bill_amounts_in_default(
+                        book, bill, default_currency,
+                    )
+                )
 
-                try:
-                    total = self._get_invoice_entries_and_total(
-                        book, bill,
-                    )["grand_total"]
-                except ValueError:
-                    # Empty/corrupted entries: fall back to the lot
-                    # balance. Substituting 0 would understate
-                    # total_billed by the bill's full amount.
-                    total = abs(balance)
-
-                outstanding = abs(balance)
-                paid = total - outstanding
-
-                # Convert per-bill totals to the book default before
-                # summing — unconverted, a €2,500 bill and a $3,000
-                # bill sum to "5,500" of nothing in particular.
-                converted_ok = True
-                if bill.currency != default_currency:
-                    rate = latest_rates.get(bill.currency.guid)
-                    if rate is not None:
-                        # Quantize FX products to default-currency
-                        # precision: verbose emits via str(), which
-                        # would expose a long fractional tail.
-                        q = _commodity_quantum(default_currency)
-                        total = (total * rate).quantize(q)
-                        paid = (paid * rate).quantize(q)
-                        outstanding = (outstanding * rate).quantize(q)
-                    else:
-                        # No rate: exclude and accumulate per
-                        # currency for explicit reporting.
-                        converted_ok = False
-                        u = unconverted.setdefault(
-                            bill.currency.mnemonic,
-                            {
-                                "total_billed": Decimal(0),
-                                "total_paid": Decimal(0),
-                                "outstanding": Decimal(0),
-                                "bill_count": 0,
-                            },
-                        )
-                        u["total_billed"] += total
-                        u["total_paid"] += paid
-                        u["outstanding"] += outstanding
-                        u["bill_count"] += 1
-
-                if converted_ok:
+                if unconv is not None:
+                    u = unconverted.setdefault(
+                        unconv,
+                        {
+                            "total_billed": Decimal(0),
+                            "total_paid": Decimal(0),
+                            "outstanding": Decimal(0),
+                            "bill_count": 0,
+                        },
+                    )
+                    u["total_billed"] += total
+                    u["total_paid"] += paid
+                    u["outstanding"] += outstanding
+                    u["bill_count"] += 1
+                else:
                     vendor_data[v_name]["total_billed"] += total
                     vendor_data[v_name]["total_paid"] += paid
                     vendor_data[v_name]["outstanding"] += outstanding

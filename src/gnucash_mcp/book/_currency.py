@@ -88,6 +88,37 @@ def _fx_guard_days() -> int:
         return 7
 
 
+# ── FX entry-time implied-rate sanity ratio ───────────────────────
+#
+# A user-supplied cross-commodity split encodes its own rate via
+# ``|value| / |quantity|``. When that implied rate differs from the
+# latest price on file by this factor or more, the ledger-entry paths
+# emit a NON-BLOCKING warning — catching decimal slips and inverted
+# pairs at the source. Unlike the post/pay guard this never blocks:
+# the user authored the rate, so an off-market value may be a genuine
+# deal or a correction — flag it, let them decide. Default 2.0 (off by
+# 2x+, comfortably catching 10x slips and inversions without nagging
+# on normal rate variation). A ratio must exceed 1 to be meaningful;
+# raise it high via ``GNUCASH_FX_SANITY_RATIO`` to quiet the check.
+
+
+def _fx_sanity_ratio() -> Decimal:
+    """Read the implied-rate sanity ratio from the environment.
+
+    Resolved per-call (tests monkey-patch it). Malformed or <= 1
+    falls back to the 2.0 default.
+    """
+    raw = os.environ.get("GNUCASH_FX_SANITY_RATIO")
+    if raw is not None:
+        try:
+            val = Decimal(raw)
+            if val > 1:
+                return val
+        except (ValueError, ArithmeticError):
+            pass
+    return Decimal("2")
+
+
 def _to_date(dt: date | datetime) -> date:
     """Convert a datetime or date to a date object.
 
@@ -525,11 +556,91 @@ class CurrencyMixin:
             return Decimal(str(split.quantity)) * factor
         return Decimal(str(split.value))
 
+    def _fx_sanity_warnings(
+        self, book, validated_splits, trans_currency, as_of,
+    ) -> list[dict]:
+        """Non-blocking warnings for cross-commodity splits whose
+        implied rate (``|value| / |quantity|``) is grossly off the
+        latest price on file — a decimal slip or inverted pair caught
+        at entry, before it corrupts everything downstream.
+
+        Returns warning dicts of two types — ``fx_rate_sanity`` (a
+        quote exists and the implied rate is grossly off it) and
+        ``fx_no_reference`` (no quote at all, so the rate can't be
+        checked). Never raises and never blocks: the user authored the
+        rate, so an unusual one may be a real off-market deal or a
+        correction — flag, don't refuse. The no-reference case is the
+        one with NO safety net (a 100x slip would pass unchecked), so it
+        earns a heads-up rather than silence, even though the entry
+        still saves (it may be the first transaction in that currency).
+
+        ``validated_splits`` are the resolved dicts from
+        :meth:`_validate_transaction_splits` (``account``, ``value``,
+        ``quantity``). ``as_of`` is the transaction date.
+        """
+        as_of = as_of or date.today()
+        ratio_cap = _fx_sanity_ratio()
+        out: list[dict] = []
+        for v in validated_splits:
+            account = v["account"]
+            if account.commodity == trans_currency:
+                continue
+            value = abs(Decimal(str(v["value"])))
+            quantity = abs(Decimal(str(v["quantity"])))
+            if value == 0 or quantity == 0:
+                continue
+            # implied rate is trans_currency per unit of the account's
+            # commodity — same orientation as the reference below.
+            implied = value / quantity
+            # ANY prior quote is a valid sanity anchor — a 6-month-old
+            # rate still catches a 10x slip — so bypass the staleness
+            # cap that the post/pay path enforces (there a stale rate
+            # would be etched into a booked amount; here it only
+            # answers "is this grossly off?"). The aged variant also
+            # hands back the quote's date for the message.
+            aged = self._find_exchange_rate_aged(
+                book, account.commodity, trans_currency, as_of,
+                respect_staleness_cap=False,
+            )
+            if aged is None:
+                # No quote at all — the worst case, since even a 100x
+                # slip would pass unchecked. Flag the absent guardrail.
+                out.append({
+                    "type": "fx_no_reference",
+                    "message": (
+                        f"Split for '{account.fullname}': no "
+                        f"{account.commodity.mnemonic}/"
+                        f"{trans_currency.mnemonic} rate on file — the "
+                        f"exchange rate can't be sanity-checked. Add one "
+                        f"with create_price to enable the guardrail."
+                    ),
+                })
+                continue
+            reference, _age_days, price_date = aged
+            if reference <= 0:
+                continue
+            hi = max(implied, reference)
+            lo = min(implied, reference)
+            if lo > 0 and hi / lo >= ratio_cap:
+                out.append({
+                    "type": "fx_rate_sanity",
+                    "message": (
+                        f"Split for '{account.fullname}': implied rate "
+                        f"{implied:.4f} {trans_currency.mnemonic}/"
+                        f"{account.commodity.mnemonic} is {hi / lo:.1f}x the "
+                        f"stored rate {reference:.4f} ({price_date}) — "
+                        f"verify the amount and quantity (possible misplaced "
+                        f"decimal or inverted rate)."
+                    ),
+                })
+        return out
+
     def _market_value(
         self,
         account,
         quantity: Decimal,
         *,
+        book: piecash.Book,
         rates: dict[str, Decimal],
         default_currency: piecash.Commodity,
         today: date | None = None,
@@ -542,6 +653,8 @@ class CurrencyMixin:
         account-level aggregation.
 
         Args:
+            book: Needed to value the cost-basis fallback in the book
+                default currency (see below).
             rates: Map from :meth:`_rates_as_of`, passed in so the
                 price-map builds once per report.
             today: Cost-basis fallback ignores splits dated after
@@ -566,10 +679,26 @@ class CurrencyMixin:
             return quantity * rate, note
         if not with_cost_fallback:
             return Decimal("0"), f"{quantity} {sym} — no price data"
+        # No market price for the holding: fall back to cost basis in
+        # the book default. ``split.value`` is in each purchase's
+        # transaction currency; convert each at its posting-date rate
+        # (mirroring calculate_lot_gain / _lot_decimals) so a holding
+        # bought across foreign currencies isn't summed as raw mixed
+        # units. Missing per-leg rate degrades to the raw value.
         cost_basis = Decimal("0")
         for s in account.splits:
-            if today is None or s.transaction.post_date <= today:
-                cost_basis += Decimal(str(s.value))
+            if today is not None and s.transaction.post_date > today:
+                continue
+            value = Decimal(str(s.value))
+            txn_ccy = s.transaction.currency
+            if txn_ccy != default_currency:
+                leg_rate = self._cross_rate(
+                    book, txn_ccy, default_currency,
+                    as_of=s.transaction.post_date,
+                )
+                if leg_rate is not None:
+                    value = value * leg_rate
+            cost_basis += value
         return cost_basis, f"{quantity} {sym} — no price data"
 
     @staticmethod

@@ -10,17 +10,27 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def list_budgets(verbose: bool = False) -> str:
+    def list_budgets(
+        verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
         """List all budgets in the book.
 
-        Returns a compact one-line-per-budget format by default. Use
-        verbose=true for the full JSON list.
+        Leads with a ``Showing X-Y of Z budgets`` line, then a compact
+        one-line-per-budget format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for the full
+        JSON envelope.
 
         Args:
-            verbose: If true, return the full JSON list.
+            verbose: If true, return the full JSON envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_budgets(compact=not verbose)
+        result = book.list_budgets(
+            compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result

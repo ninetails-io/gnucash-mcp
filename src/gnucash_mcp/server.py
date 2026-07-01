@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from datetime import date
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field
@@ -144,6 +145,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "list_transactions",
         "get_transaction",
         "create_transaction",
+        "create_transactions",
         "update_transaction",
         "delete_transaction",
         "replace_splits",
@@ -291,6 +293,15 @@ TOOL_MODULES: dict[str, list[str]] = {
 }
 
 
+# Inline tools registered at import that are deliberately NOT part of
+# the TOOL_MODULES partition. ``switch_book`` is a conditional
+# meta-tool: registered inline like get_server_config, but kept only
+# when 2+ books are configured (added to the keep set in
+# _apply_module_filter), so it can't live in a static module list. The
+# validators and the contract tests exclude it.
+_INLINE_UNMAPPED_TOOLS: set[str] = {"switch_book"}
+
+
 def _validate_module_groups() -> None:
     """Every member of a MODULE_GROUPS expansion must exist in
     TOOL_MODULES — a typo'd member would otherwise silently drop
@@ -332,7 +343,7 @@ def _validate_tool_modules() -> None:
         all_mapped.update(tools)
 
     registered = set(mcp._tool_manager._tools.keys())
-    unmapped = registered - all_mapped
+    unmapped = registered - all_mapped - _INLINE_UNMAPPED_TOOLS
     if unmapped:
         raise RuntimeError(
             f"Tools registered but not in TOOL_MODULES: {sorted(unmapped)}. "
@@ -518,6 +529,13 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
     for mod_name in sorted(enabled_modules):
         keep.update(TOOL_MODULES[mod_name])
 
+    # switch_book is an inline meta-tool outside the module partition;
+    # keep it only when there are 2+ books to switch between. Otherwise
+    # the removal pass below drops it (single-book sessions have
+    # nothing to switch to).
+    if multi_book_active():
+        keep.add("switch_book")
+
     # Remove tools not in the keep set (covers server.py-registered tools
     # that belong to non-enabled modules, and any stale entries)
     for tool_name in list(mcp._tool_manager._tools.keys()):
@@ -538,23 +556,263 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
 # Runtime server state — populated by main(), read by get_server_config tool
 _server_state: dict = {}
 
-# Global book instance - initialized on first use
+# ── Multi-book registry ────────────────────────────────────────────
+# GNUCASH_BOOK_PATH may hold a single path OR an os.pathsep-separated
+# list (``:`` on POSIX, ``;`` on Windows — the PATH convention).
+# The server keeps one "current" book and switches between them
+# in-session via the switch_book tool (no restart, no re-registration —
+# every tool calls get_book() per operation, so repointing _book is
+# transparent to all of them).
+#
+# - _book_paths:    resolved, validated paths in declared order.
+# - _current_path:  the active book's resolved path.
+# - _book_registry: lazy instance cache keyed by resolved-path str, so
+#                   re-selecting a book reuses its instance (and its
+#                   GUID-prefix caches).
+# - _book:          the CURRENT instance. Resetting it to None is the
+#                   re-init point tests rely on.
+_book_paths: list[Path] = []
+_current_path: Path | None = None
+_book_registry: dict[str, GnuCashBook] = {}
 _book = None
+
+# Effective logging mode. Seeded from env at import; main() may widen
+# it via the --debug / --noaudit CLI flags. switch_book reads these to
+# re-point logging at the newly-active book.
+_logging_debug: bool = False
+_logging_audit: bool = True
 
 # Class used to construct the book — set by main() to match enabled modules.
 # Defaults to the "all modules" class so tests and direct imports still work.
 _book_class: type = GnuCashBook
 
 
+class _BookPathError(FileNotFoundError):
+    """Invalid GNUCASH_BOOK_PATH entry (missing file / not a file /
+    duplicate filename).
+
+    Subclasses FileNotFoundError so a missing book surfaces at runtime
+    with the same ``file_not_found`` error_type the single-book path
+    always produced (the book constructor raised FileNotFoundError).
+    main() catches the specific type to fail fast with SystemExit at
+    startup. The *unset/empty* env case is a plain ValueError instead
+    — that path's "GNUCASH_BOOK_PATH ... not set" contract predates
+    multi-book and is never reached from main() (which guards on a
+    non-empty value first).
+    """
+
+
+def _parse_book_paths(value: str | None) -> list[Path]:
+    """Parse GNUCASH_BOOK_PATH (one path, or an os.pathsep-separated list).
+
+    The separator is ``os.pathsep`` — ``:`` on POSIX, ``;`` on Windows
+    — the same convention PATH/PYTHONPATH use. Comma was rejected as a
+    separator because it is a common filename character (a book named
+    ``financials, invoicing.gnucash`` would have mis-split, and no
+    shell escaping could prevent it — the shell can't signal "this
+    separator byte is literal" to a downstream parser). The one
+    residual limit, a literal ``os.pathsep`` inside a path, is rare and
+    identical to PATH's own constraint.
+
+    Splits on ``os.pathsep``, strips, drops empties, and resolves each
+    entry to an absolute path that must exist and be a regular file.
+
+    Raises:
+        ValueError: value unset or empty.
+        _BookPathError: any entry missing or not a regular file; or two
+            entries sharing a filename (basename collisions make
+            switch_book's prefix matching ambiguous).
+    """
+    if not value or not value.strip():
+        raise ValueError(
+            "GNUCASH_BOOK_PATH environment variable not set"
+        )
+    raw = [p.strip() for p in value.split(os.pathsep) if p.strip()]
+    if not raw:
+        raise ValueError(
+            "GNUCASH_BOOK_PATH environment variable not set"
+        )
+
+    paths: list[Path] = []
+    errors: list[str] = []
+    for p in raw:
+        try:
+            resolved = Path(p).resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            errors.append(f"  - {p!r}: not found")
+            continue
+        if not resolved.is_file():
+            errors.append(f"  - {p!r}: not a regular file")
+            continue
+        paths.append(resolved)
+
+    # Filenames must be unique — switch_book matches on them.
+    seen: dict[str, Path] = {}
+    for path in paths:
+        if path.name in seen:
+            errors.append(
+                f"  - duplicate book filename {path.name!r}: "
+                f"{seen[path.name]} and {path} (filenames must be "
+                f"unique so switch_book can match by name)"
+            )
+        else:
+            seen[path.name] = path
+
+    if errors:
+        raise _BookPathError(
+            "Invalid GNUCASH_BOOK_PATH:\n" + "\n".join(errors)
+        )
+    return paths
+
+
+def _book_for(path: Path) -> GnuCashBook:
+    """Get-or-create the cached book instance for a resolved path."""
+    key = str(path)
+    inst = _book_registry.get(key)
+    if inst is None:
+        inst = _book_class(key)
+        _book_registry[key] = inst
+    return inst
+
+
+def multi_book_active() -> bool:
+    """True when more than one valid book path is configured.
+
+    Read by tool wrappers (e.g. get_book_summary) to decide whether to
+    surface the current-book marker, and by _apply_module_filter to
+    gate switch_book's visibility.
+    """
+    return len(_book_paths) > 1
+
+
 def get_book():
-    """Get or create the GnuCashBook instance."""
-    global _book
+    """Get or create the current GnuCashBook instance.
+
+    Honors an os.pathsep-separated GNUCASH_BOOK_PATH: when no book is
+    selected yet, the first valid path becomes current. switch_book
+    repoints the selection mid-session. Resetting ``_book`` to None
+    forces re-initialization from the environment — the reset point
+    tests rely on.
+    """
+    global _book, _current_path, _book_paths
     if _book is None:
-        path = os.environ.get("GNUCASH_BOOK_PATH")
-        if not path:
-            raise ValueError("GNUCASH_BOOK_PATH environment variable not set")
-        _book = _book_class(path)
+        # Re-read the env so a test that swapped GNUCASH_BOOK_PATH and
+        # reset _book picks up the new value.
+        _book_paths = _parse_book_paths(os.environ.get("GNUCASH_BOOK_PATH"))
+        if _current_path not in _book_paths:
+            _current_path = _book_paths[0]
+        _book = _book_for(_current_path)
     return _book
+
+
+def _activate_logging(path: Path) -> None:
+    """(Re-)point audit/debug logging at ``path``.
+
+    Used on book switch so each book's writes land in its own
+    .mcp/audit trail. setup_logging clears its handlers on every call,
+    so repeated invocations don't stack handlers.
+    """
+    if _logging_audit or _logging_debug:
+        setup_logging(
+            book_path=str(path),
+            debug=_logging_debug,
+            audit=_logging_audit,
+            get_book=get_book,
+        )
+
+
+def _book_orientation(book_instance) -> str:
+    """One-line snapshot of a book for post-switch reorientation:
+    ``N transactions | N customers | N vendors | N employees | CUR
+    base currency``.
+
+    Transactions exclude scheduled-transaction template recipes (the
+    same filter get_book_summary uses, so the counts agree). Business
+    counts are omitted when zero so personal books stay uncluttered.
+    Best-effort — a locked or unreadable book yields a soft fallback
+    rather than failing the switch.
+    """
+    try:
+        with book_instance.open(readonly=True) as book:
+            template_guids = book_instance._template_account_guids(book)
+            txns = sum(
+                1 for t in book.transactions
+                if not book_instance._is_template_transaction(
+                    t, template_guids
+                )
+            )
+            parts = [f"{txns:,} transaction{'s' if txns != 1 else ''}"]
+            for label, coll in (
+                ("customer", book.customers),
+                ("vendor", book.vendors),
+                ("employee", book.employees),
+            ):
+                n = len(coll)
+                if n:
+                    parts.append(f"{n} {label}{'s' if n != 1 else ''}")
+            cur = book.default_currency
+            parts.append(f"{cur.mnemonic if cur else '?'} base currency")
+            return " | ".join(parts)
+    except Exception:
+        return "(book ready; orientation snapshot unavailable)"
+
+
+def _switch_book_impl(name: str) -> str:
+    """Make the book whose filename uniquely prefix-matches ``name``
+    the current book. See the switch_book tool docstring.
+    """
+    global _book, _current_path
+    if not _book_paths:
+        # Cold start (direct single-call use): populate the registry.
+        get_book()
+
+    needle = name.strip().lower()
+    if not needle:
+        raise ValueError("switch_book requires a book name")
+
+    matches = [p for p in _book_paths if p.name.lower().startswith(needle)]
+    available = ", ".join(p.name for p in _book_paths)
+    if not matches:
+        raise ValueError(
+            f"No book matches {name!r}. Available books: {available}"
+        )
+    if len(matches) > 1:
+        ambiguous = ", ".join(p.name for p in matches)
+        raise ValueError(
+            f"Book name {name!r} is ambiguous — matches: {ambiguous}. "
+            f"Use a longer prefix."
+        )
+
+    target = matches[0]
+    previous = _current_path
+
+    # No-op switch — already on this book. Don't emit the reset
+    # banner (nothing changed); just reaffirm and reorient.
+    if previous is not None and target == previous:
+        return (
+            f"Already on: {target.name}\n"
+            f"{_book_orientation(_book_for(target))}"
+        )
+
+    _current_path = target
+    _book = _book_for(target)
+    _activate_logging(target)  # logs follow the active book
+    _server_state["book_path"] = str(target)
+    _server_state["current_book"] = target.name
+
+    # Loud context-reset banner: the LLM may be carrying account
+    # names, GUIDs, and entity refs from the previous book — all
+    # invalid here, and a stale GUID prefix could even mis-resolve to
+    # a DIFFERENT entity in this book. Naming the previous book makes
+    # the boundary explicit. Snapshot reorients in one line.
+    prev_name = previous.name if previous else "the previous book"
+    return (
+        f"⚠ CONTEXT RESET: All account names, GUIDs, and entity "
+        f"references from the previous book ({prev_name}) are now "
+        f"invalid. Do not reuse them.\n\n"
+        f"Switched to: {target.name}\n"
+        f"{_book_orientation(_book)}"
+    )
 
 
 # Initialize logging at module import time
@@ -563,7 +821,18 @@ def get_book():
 # Logs are stored alongside the book file: {book_path}.mcp/audit/ and {book_path}.mcp/debug/
 _debug_mode = os.environ.get("GNUCASH_MCP_DEBUG") == "1"
 _audit_mode = os.environ.get("GNUCASH_MCP_NOAUDIT") != "1"
-_book_path = os.environ.get("GNUCASH_BOOK_PATH")
+_logging_debug = _debug_mode
+_logging_audit = _audit_mode
+# Initial logging points at the first valid book. Best-effort at
+# import (a bad path is left for main() to fail-fast on); switch_book
+# repoints it per active book later.
+_book_path = None
+_raw_book_path = os.environ.get("GNUCASH_BOOK_PATH")
+if _raw_book_path:
+    try:
+        _book_path = str(_parse_book_paths(_raw_book_path)[0])
+    except _BookPathError:
+        _book_path = None
 if _book_path and (_audit_mode or _debug_mode):
     setup_logging(
         book_path=_book_path,
@@ -585,10 +854,14 @@ if _book_path and (_audit_mode or _debug_mode):
 
 @mcp.resource("gnucash://accounts")
 def accounts_resource() -> str:
-    """Full chart of accounts from the GnuCash book."""
+    """Full chart of accounts from the GnuCash book.
+
+    Resources are whole-snapshot reads, so this unwraps the paginated
+    envelope and returns the bare account list (up to the server cap).
+    """
     book = get_book()
-    accounts = book.list_accounts(compact=False)
-    return _json(accounts)
+    envelope = book.list_accounts(compact=False, limit=book.MAX_LIST_LIMIT)
+    return _json(envelope["accounts"])
 
 
 # ============== Server Diagnostic Tool ==============
@@ -611,6 +884,15 @@ def _get_server_config_impl() -> str:
         f"Debug mode: {str(_server_state.get('debug', False)).lower()}",
         f"Version: {__version__}",
     ]
+    # Multi-book sessions: name the current book and list the rest so
+    # the client knows what switch_book can target. Single-book runs
+    # keep the bare ``Book:`` line above and add nothing.
+    book_paths = _server_state.get("book_paths") or []
+    if len(book_paths) > 1:
+        lines.append(
+            f"Current book: {_server_state.get('current_book', 'unknown')}"
+        )
+        lines.append(f"Available books: {', '.join(book_paths)}")
     dc_ok = _server_state.get("default_currency_ok")
     if dc_ok is False:
         lines.append("Warning: Book has no default currency set")
@@ -638,6 +920,36 @@ def get_server_config() -> str:
     return _get_server_config_impl()
 
 
+# Registered inline at import, but OUTSIDE the TOOL_MODULES partition
+# (see _INLINE_UNMAPPED_TOOLS). _apply_module_filter adds it to the
+# keep set only when 2+ books are configured; single-book sessions
+# have nothing to switch to, so the keep pass drops it.
+#
+# No @audit_log — the switch is session config, not a book write. And
+# because logging follows the active book, every subsequent write is
+# attributed to the correct book's trail without a marker here.
+@mcp.tool()
+@safe_tool
+def switch_book(
+    name: Annotated[
+        str,
+        Field(
+            description="Book to activate, matched as a "
+            "case-insensitive prefix of its filename. Must uniquely "
+            "identify one configured book (see get_server_config for "
+            "the list)."
+        ),
+    ],
+) -> str:
+    """Switch the active GnuCash book (multi-book sessions only).
+
+    All subsequent tool calls — and the audit/debug logs — operate on
+    the newly-selected book until the next switch. Only present when
+    GNUCASH_BOOK_PATH lists 2+ books.
+    """
+    return _switch_book_impl(name)
+
+
 # ============== Main ==============
 
 
@@ -651,13 +963,13 @@ Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (29 tools, always-on). Use "all"
-                       for every module (106 tools).
+                       Default: core (30 tools, always-on). Use "all"
+                       for every module (107 tools).
 
                        Role-based selections (group aliases that
                        expand to underlying modules — start here):
                          core         Ledger primitives + reconciliation.
-                                      Always on regardless. 29 tools.
+                                      Always on regardless. 30 tools.
                          bookkeeper   Reporting + budgets + scheduling.
                                       17 tools.
                          investor     tax_lots + portfolio (cost basis
@@ -701,7 +1013,13 @@ Options:
   -h, --help           Show this help message
 
 Environment variables:
-  GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required)
+  GNUCASH_BOOK_PATH          Path to GnuCash SQLite book (required). May
+                             be an os.pathsep-separated list of books
+                             (":" on macOS/Linux, ";" on Windows — same
+                             as PATH); the first is current at startup
+                             and switch_book changes the active one
+                             in-session. Filenames must be unique
+                             (switch_book matches by name).
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
@@ -730,7 +1048,24 @@ default, or at GNUCASH_LOG_DIR if set:
 """)
         sys.exit(0)
 
-    book_path = os.environ.get("GNUCASH_BOOK_PATH")
+    global _book_paths, _current_path, _logging_debug, _logging_audit
+    global _book_class
+
+    # GNUCASH_BOOK_PATH: one path or an os.pathsep-separated list. Fail fast
+    # on any invalid/duplicate entry (unset is tolerated — tools error
+    # at call time, matching the prior behavior). ``book_path`` below
+    # is the CURRENT book, used for logging / health / display.
+    raw_book_path = os.environ.get("GNUCASH_BOOK_PATH")
+    if raw_book_path and raw_book_path.strip():
+        try:
+            _book_paths = _parse_book_paths(raw_book_path)
+        except _BookPathError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2)
+        _current_path = _book_paths[0]
+        book_path = str(_current_path)
+    else:
+        book_path = None
 
     # Parse CLI flags
     debug_flag = "--debug" in sys.argv
@@ -752,19 +1087,23 @@ default, or at GNUCASH_LOG_DIR if set:
     if modules_value is None:
         modules_value = os.environ.get("GNUCASH_MCP_MODULES")
 
-    # Re-init logging if CLI flags override env vars
+    # Re-init logging if CLI flags override env vars. Update the
+    # effective-mode globals so switch_book repoints with the same
+    # debug/audit settings.
     if debug_flag or noaudit_flag:
         audit_enabled = not noaudit_flag
-        if book_path and (audit_enabled or debug_flag):
+        _logging_debug = debug_flag or _debug_mode
+        _logging_audit = audit_enabled and _audit_mode
+        if book_path and (_logging_audit or _logging_debug):
             setup_logging(
                 book_path=book_path,
-                debug=debug_flag,
-                audit=audit_enabled,
+                debug=_logging_debug,
+                audit=_logging_audit,
                 get_book=get_book,
             )
-            if debug_flag:
+            if _logging_debug:
                 debug_log(f"Server starting via CLI. Book: {book_path}")
-                debug_log(f"Debug logging enabled, audit={'enabled' if audit_enabled else 'disabled'}")
+                debug_log(f"Debug logging enabled, audit={'enabled' if _logging_audit else 'disabled'}")
 
     # Validate and apply module filter (also lazy-loads extracted modules)
     _validate_module_groups()
@@ -775,7 +1114,6 @@ default, or at GNUCASH_LOG_DIR if set:
     # modules. If get_book() has already been called (tests / module
     # import), leave the existing instance alone; otherwise subsequent
     # get_book() calls will use this class.
-    global _book_class
     # Expand each loaded module to its backing mixin set via
     # MODULE_BACKED_BY (default 1:1).
     backing_mixins: set[str] = set()
@@ -816,6 +1154,8 @@ default, or at GNUCASH_LOG_DIR if set:
         "modules": modules_display,
         "tool_count": tool_count,
         "book_path": book_path or "not set",
+        "book_paths": [p.name for p in _book_paths],
+        "current_book": _current_path.name if _current_path else None,
         "debug": debug_flag,
         "default_currency_ok": currency_ok,
     })

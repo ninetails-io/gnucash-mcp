@@ -29,7 +29,7 @@ from gnucash_mcp.book._base import (
     _to_decimal,
     _unique_prefix,
 )
-from gnucash_mcp._format import _apply_limit, _format_number
+from gnucash_mcp._format import _format_number, _paginate
 
 
 class InvestmentsMixin:
@@ -37,16 +37,26 @@ class InvestmentsMixin:
 
     # ── Commodities and prices ────────────────────────────────────
 
-    def list_commodities(self, compact: bool = True) -> dict | str:
+    def list_commodities(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
         """List all commodities in the book with latest prices.
+
+        Leads with a ``Showing X-Y of Z commodities`` indicator; page
+        with ``offset``.
 
         Args:
             compact: If True (default), return compact one-line-per-commodity
-                     string. If False, return full dict grouped by namespace.
+                     string. If False, return the verbose envelope with
+                     commodities grouped by namespace.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            If compact: newline-separated string of commodity lines.
-            If not compact: dict with commodities grouped by namespace.
+            If compact: indicator + newline-separated commodity lines.
+            If not compact: envelope ``{showing, total, offset, count,
+            default_currency, commodities}`` (commodities grouped by
+            namespace, limited to the page).
         """
         with self.open(readonly=True) as book:
             by_namespace: dict[str, list[dict]] = {}
@@ -92,19 +102,40 @@ class InvestmentsMixin:
             for ns in by_namespace:
                 by_namespace[ns].sort(key=lambda c: c["mnemonic"])
 
-            result = {
-                "default_currency": self._require_default_currency(book).mnemonic,
-                "commodities": by_namespace,
-            }
+            default_currency = self._require_default_currency(book).mnemonic
+
+            # Flatten to one ordered list (namespace, then mnemonic —
+            # the compact render order) so pagination has a flat
+            # sequence to slice; the verbose path re-groups the page.
+            flat = [
+                (ns, entry)
+                for ns, entries in sorted(by_namespace.items())
+                for entry in entries
+            ]
+            page, indicator = _paginate(
+                flat, offset=offset, limit=limit,
+                entity_name="commodities",
+            )
 
             if compact:
-                lines = []
-                for ns, entries in sorted(by_namespace.items()):
-                    for entry in entries:
-                        lines.append(_commodity_to_compact_line(ns, entry))
+                lines = [indicator]
+                lines += [
+                    _commodity_to_compact_line(ns, entry)
+                    for ns, entry in page
+                ]
                 return "\n".join(lines)
             else:
-                return result
+                paged_by_ns: dict[str, list[dict]] = {}
+                for ns, entry in page:
+                    paged_by_ns.setdefault(ns, []).append(entry)
+                return {
+                    "showing": indicator,
+                    "total": len(flat),
+                    "offset": offset,
+                    "count": len(page),
+                    "default_currency": default_currency,
+                    "commodities": paged_by_ns,
+                }
 
     def create_commodity(
         self,
@@ -380,8 +411,13 @@ class InvestmentsMixin:
         currency: str | None = None,
         limit: int | None = None,
         compact: bool = True,
+        offset: int = 0,
     ) -> dict | str:
         """Get price history for a commodity.
+
+        Leads with a ``Showing X-Y of Z prices (date range)`` indicator;
+        page with ``offset``. Sorted by date descending — most recent
+        first, so a small ``limit`` still surfaces the freshest data.
 
         Args:
             commodity: Symbol of the commodity (e.g., "VTSAX").
@@ -389,15 +425,12 @@ class InvestmentsMixin:
             start_date: Optional start date filter.
             end_date: Optional end date filter.
             currency: Optional currency filter (e.g., "USD").
-            limit: Maximum prices to return. Defaults to 50, capped at
-                   250 server-side.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            Dict with ``prices`` (list, possibly truncated), ``count``
-            (truncated length), ``total`` (untruncated), and ``notice``
-            (truncation message or None). Sorted by date descending —
-            most recent first, so a small ``limit`` still surfaces the
-            freshest data.
+            Verbose envelope ``{prices, showing, total, offset, count}``;
+            compact leads with the indicator.
 
         Raises:
             ValueError: If commodity not found.
@@ -434,31 +467,32 @@ class InvestmentsMixin:
 
             prices.sort(key=lambda x: x["date"], reverse=True)
             total = len(prices)
-            prices, notice = _apply_limit(
+            page, indicator = _paginate(
                 prices,
+                offset=offset,
                 limit=limit,
                 entity_name="prices",
-                suggest_narrow=True,
+                date_key=lambda p: p["date"],
             )
 
-            full = {
-                "prices": prices,
-                "count": len(prices),
-                "total": total,
-                "notice": notice,
-            }
             if not compact:
-                return full
+                return {
+                    "showing": indicator,
+                    "total": total,
+                    "offset": offset,
+                    "count": len(page),
+                    "prices": page,
+                }
 
             # Compact: "2026-04-30  273.43  USD  last  yfinance",
-            # columns aligned.
-            if not prices:
-                return notice or "No prices found."
-            value_w = max(len(p["value"]) for p in prices)
-            type_w = max(len(p.get("type") or "") for p in prices)
-            ccy_w = max(len(p["currency"]) for p in prices)
-            lines = []
-            for p in prices:
+            # columns aligned, under the indicator.
+            if not page:
+                return indicator
+            value_w = max(len(p["value"]) for p in page)
+            type_w = max(len(p.get("type") or "") for p in page)
+            ccy_w = max(len(p["currency"]) for p in page)
+            lines = [indicator]
+            for p in page:
                 lines.append(
                     f"{p['date']}  "
                     f"{p['value']:>{value_w}}  "
@@ -466,8 +500,6 @@ class InvestmentsMixin:
                     f"{(p.get('type') or ''):<{type_w}}  "
                     f"{p.get('source') or ''}"
                 )
-            if notice:
-                lines.append(notice)
             return "\n".join(lines)
 
     def get_latest_price(
@@ -546,7 +578,7 @@ class InvestmentsMixin:
             raise
         return book.session.query(Lot).filter_by(guid=full_guid).first()
 
-    def _lot_decimals(self, lot) -> dict:
+    def _lot_decimals(self, lot, book, default_ccy) -> dict:
         """Raw-Decimal source of truth for a lot's current state.
 
         Keeps full precision; ``_lot_summary`` formats the egress.
@@ -555,6 +587,15 @@ class InvestmentsMixin:
         computation. The classic precision-loss path: $100 / 3 shares
         formatted to 4 decimals as 33.3333, multiplied back by 3
         shares becomes $99.99 — but the actual cost was $100.
+
+        ``purchase_value`` (and the ``cost_per_share`` /
+        ``remaining_cost_basis`` derived from it) is in the book
+        DEFAULT currency. ``split.value`` is in the purchase
+        transaction's currency; a foreign-denominated buy is converted
+        at its posting-date rate (matching ``calculate_lot_gain``), so
+        a CNY-book holding bought in USD doesn't surface a bare USD
+        number that reads as CNY. Missing rate degrades to the raw
+        value.
 
         Returns:
             Dict of Decimals: purchase_quantity, purchase_value,
@@ -573,7 +614,16 @@ class InvestmentsMixin:
                 continue
             if split.quantity > 0:
                 purchase_quantity += Decimal(str(split.quantity))
-                purchase_value += Decimal(str(split.value))
+                value = Decimal(str(split.value))
+                txn_ccy = split.transaction.currency
+                if txn_ccy != default_ccy:
+                    rate = self._cross_rate(
+                        book, txn_ccy, default_ccy,
+                        as_of=split.transaction.post_date,
+                    )
+                    if rate is not None:
+                        value = value * rate
+                purchase_value += value
             else:
                 sale_quantity += abs(Decimal(str(split.quantity)))
 
@@ -602,7 +652,7 @@ class InvestmentsMixin:
             "remaining_cost_basis": remaining_cost_basis,
         }
 
-    def _lot_summary(self, lot) -> dict:
+    def _lot_summary(self, lot, book, default_ccy) -> dict:
         """Compute current state of a lot from its splits.
 
         Returns:
@@ -617,7 +667,7 @@ class InvestmentsMixin:
         as either the purchase cost or what's left of it. The
         ``cost_basis`` key keeps existing callers working.
         """
-        raw = self._lot_decimals(lot)
+        raw = self._lot_decimals(lot, book, default_ccy)
         remaining_cb = _format_number(
             raw["remaining_cost_basis"], decimals=2,
         )
@@ -695,18 +745,26 @@ class InvestmentsMixin:
         account: str,
         include_closed: bool = False,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all lots for an investment account.
+
+        Leads with a ``Showing X-Y of Z lots`` indicator; page with
+        ``offset``.
 
         Args:
             account: Full path of investment account.
             include_closed: If True, include fully-sold lots. Default False.
-            compact: If True (default), return a compact newline-separated
-                     string with one line per lot.
+            compact: If True (default), return the indicator + a compact
+                     newline-separated string with one line per lot.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
 
         Returns:
-            If compact: newline-separated string of lot lines.
-            If not compact: list of lot dicts.
+            If compact: indicator + newline-separated lot lines.
+            If not compact: envelope ``{showing, total, offset, count,
+            lots}``.
 
         Raises:
             ValueError: If account not found.
@@ -716,11 +774,12 @@ class InvestmentsMixin:
             if not acct:
                 raise ValueError(f"Account not found: {account}")
 
+            default_ccy = self._require_default_currency(book)
             results = []
             for lot in acct.lots:
                 if not include_closed and lot.is_closed:
                     continue
-                summary = self._lot_summary(lot)
+                summary = self._lot_summary(lot, book, default_ccy)
                 # The open-positions view also skips zero-position
                 # lots (voided buys, never-assigned, round-tripped
                 # to zero) — noise rows in a holdings listing.
@@ -737,6 +796,9 @@ class InvestmentsMixin:
                     **summary,
                 })
 
+            page, indicator = _paginate(
+                results, offset=offset, limit=limit, entity_name="lots",
+            )
             if compact:
                 # Prefix map spans every lot in the book —
                 # _resolve_guid searches table-wide.
@@ -745,12 +807,19 @@ class InvestmentsMixin:
                     for row in book.session.query(Lot.guid).all()
                 ]
                 prefixes = _guid_prefix_map(all_lot_guids)
-                lines = [
-                    _lot_to_compact_line(d, prefixes=prefixes) for d in results
+                lines = [indicator]
+                lines += [
+                    _lot_to_compact_line(d, prefixes=prefixes) for d in page
                 ]
                 return "\n".join(lines)
             else:
-                return results
+                return {
+                    "showing": indicator,
+                    "total": len(results),
+                    "offset": offset,
+                    "count": len(page),
+                    "lots": page,
+                }
 
     def get_lot(self, guid: str) -> dict:
         """Get detailed information about a lot.
@@ -795,7 +864,8 @@ class InvestmentsMixin:
                     row["voided"] = True
                 splits.append(row)
 
-            summary = self._lot_summary(lot)
+            default_ccy = self._require_default_currency(book)
+            summary = self._lot_summary(lot, book, default_ccy)
             # ``is_closed`` already lives at the top level
             # of this response. Drop it from the nested ``summary``
             # so callers see the field once, not twice.
@@ -867,7 +937,8 @@ class InvestmentsMixin:
             split.lot = lot
             book.save()
 
-            summary = self._lot_summary(lot)
+            default_ccy = self._require_default_currency(book)
+            summary = self._lot_summary(lot, book, default_ccy)
 
             # Auto-close if quantity reaches zero; GnuCash uses -1 for boolean true
             auto_closed = False
@@ -914,7 +985,8 @@ class InvestmentsMixin:
             if not lot:
                 raise ValueError(f"Lot not found: {lot_guid}")
 
-            raw = self._lot_decimals(lot)
+            default_ccy = self._require_default_currency(book)
+            raw = self._lot_decimals(lot, book, default_ccy)
             remaining = raw["remaining"]
 
             if remaining <= 0:
@@ -943,8 +1015,6 @@ class InvestmentsMixin:
             else:
                 shares_to_sell = remaining
 
-            default_ccy = self._require_default_currency(book)
-
             if sale_price is not None:
                 price = _to_decimal(sale_price)
             else:
@@ -964,25 +1034,10 @@ class InvestmentsMixin:
                     )
                 price = Decimal(str(recent[0].value))
 
-            # Cost basis must match the proceeds' currency.
-            # split.value is in TRANSACTION currency — a foreign-
-            # denominated buy converts at its historical purchase
-            # date or the tax-relevant gain is off by the full FX
-            # factor. Missing rate degrades to the raw value.
-            purchase_value_default = Decimal("0")
-            for split in lot.splits:
-                if _is_voided(split) or split.quantity <= 0:
-                    continue
-                value = Decimal(str(split.value))
-                txn_ccy = split.transaction.currency
-                if txn_ccy != default_ccy:
-                    rate = self._cross_rate(
-                        book, txn_ccy, default_ccy,
-                        as_of=split.transaction.post_date,
-                    )
-                    if rate is not None:
-                        value = value * rate
-                purchase_value_default += value
+            # Cost basis in the book default (proceeds' currency).
+            # _lot_decimals already converts each purchase split at its
+            # posting-date rate — same treatment, one chokepoint.
+            purchase_value_default = raw["purchase_value"]
 
             # Prorate on shares-to-sell, never cost_per_share ×
             # shares — divide-then-multiply loses precision ($100/3

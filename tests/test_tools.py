@@ -1,7 +1,9 @@
 """Tests for MCP server tools and resources."""
 
+import inspect
 import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -82,20 +84,23 @@ class TestListAccountsTool:
         assert "\n" in result
 
     def test_list_accounts_verbose(self, setup_book_env):
-        """verbose=True should return full JSON."""
+        """verbose=True should return the paginated envelope."""
         result = server_module.list_accounts(verbose=True)
 
         data = json.loads(result)
-        assert isinstance(data, list)
-        assert len(data) > 0
-        fullnames = {a["fullname"] for a in data}
+        assert isinstance(data, dict)
+        assert data["showing"].startswith("Showing 1-")
+        accounts = data["accounts"]
+        assert len(accounts) > 0
+        fullnames = {a["fullname"] for a in accounts}
         assert "Assets" in fullnames
         assert "Assets:Checking" in fullnames
 
     def test_list_accounts_root_filter(self, setup_book_env):
         """root parameter should filter accounts."""
         result = server_module.list_accounts(root="Expenses")
-        lines = result.strip().split("\n")
+        # Skip the leading "Showing X-Y of Z accounts" indicator.
+        lines = result.strip().split("\n")[1:]
         for line in lines:
             # Compact line format: '%shortguid<TAB>fullname [ANNOTATION]'.
             # Pull the path portion off before checking the prefix.
@@ -106,8 +111,7 @@ class TestListAccountsTool:
         """root + verbose should return filtered JSON."""
         result = server_module.list_accounts(root="Assets", verbose=True)
         data = json.loads(result)
-        assert isinstance(data, list)
-        for a in data:
+        for a in data["accounts"]:
             assert a["fullname"].startswith("Assets")
 
 
@@ -187,20 +191,26 @@ class TestListTransactionsTool:
     """Tests for list_transactions tool."""
 
     def test_list_all_transactions(self, setup_book_env):
-        """Should return all transactions."""
+        """Should return all transactions in a paginated envelope."""
         result = server_module.list_transactions(verbose=True)
 
         data = json.loads(result)
-        assert isinstance(data, list)
-        assert len(data) == 3
+        assert isinstance(data, dict)
+        assert len(data["transactions"]) == 3
+        assert data["total"] == 3
+        assert data["offset"] == 0
+        assert data["showing"] == (
+            "Showing 1-3 of 3 transactions (2024-01-01 to 2024-01-20)"
+        )
 
     def test_list_transactions_by_account(self, setup_book_env):
         """Should filter by account."""
         result = server_module.list_transactions(account="Expenses:Groceries", verbose=True)
 
         data = json.loads(result)
-        assert len(data) == 1
-        assert data[0]["description"] == "Weekly Groceries"
+        assert data["total"] == 1
+        assert len(data["transactions"]) == 1
+        assert data["transactions"][0]["description"] == "Weekly Groceries"
 
     def test_list_transactions_date_range(self, setup_book_env):
         """Should filter by date range."""
@@ -209,8 +219,25 @@ class TestListTransactionsTool:
         )
 
         data = json.loads(result)
-        assert len(data) == 1
-        assert data[0]["description"] == "Salary Deposit"
+        assert data["total"] == 1
+        assert data["transactions"][0]["description"] == "Salary Deposit"
+
+    def test_list_transactions_offset_pages(self, setup_book_env):
+        """offset should page through the result set."""
+        page2 = json.loads(
+            server_module.list_transactions(limit=2, offset=2, verbose=True)
+        )
+        assert page2["offset"] == 2
+        assert page2["total"] == 3
+        assert len(page2["transactions"]) == 1
+        assert page2["showing"].startswith("Showing 3-3 of 3 transactions")
+
+    def test_list_transactions_count_only(self, setup_book_env):
+        """limit=0 returns the count without rows."""
+        data = json.loads(server_module.list_transactions(limit=0, verbose=True))
+        assert data["transactions"] == []
+        assert data["total"] == 3
+        assert data["showing"].startswith("Showing 0 of 3 transactions")
 
 
 class TestGetTransactionTool:
@@ -345,15 +372,17 @@ class TestSearchTransactionsTool:
         result = server_module.search_transactions("Salary", verbose=True)
 
         data = json.loads(result)
-        assert len(data) == 1
-        assert data[0]["description"] == "Salary Deposit"
+        assert data["total"] == 1
+        assert data["transactions"][0]["description"] == "Salary Deposit"
 
     def test_search_by_amount(self, setup_book_env):
         """Should find transactions by amount range."""
         result = server_module.search_transactions(">500", field="amount", verbose=True)
 
         data = json.loads(result)
-        assert len(data) == 2  # Opening Balance (1000) and Salary (2000)
+        # Opening Balance (1000) and Salary (2000)
+        assert data["total"] == 2
+        assert len(data["transactions"]) == 2
 
 
 class TestCreateAccountTool:
@@ -475,7 +504,7 @@ class TestDeleteTransactionTool:
     def test_delete_transaction(self, setup_book_env):
         """Should delete a transaction and return result."""
         # First get a transaction to delete
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.delete_transaction(guid)
@@ -491,7 +520,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_reconciled_rejected(self, setup_book_env):
         """Should reject deleting a transaction with reconciled splits."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         split_guid = transactions[0]["splits"][0]["guid"]
         server_module.set_reconcile_state(split_guid, "y")
         guid = transactions[0]["guid"]
@@ -504,7 +533,7 @@ class TestDeleteTransactionTool:
 
     def test_delete_reconciled_force(self, setup_book_env):
         """Should allow deleting reconciled transaction with force=True."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         split_guid = transactions[0]["splits"][0]["guid"]
         server_module.set_reconcile_state(split_guid, "y")
         guid = transactions[0]["guid"]
@@ -529,7 +558,7 @@ class TestUpdateTransactionTool:
 
     def test_update_description(self, setup_book_env):
         """Should update transaction description."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -543,7 +572,7 @@ class TestUpdateTransactionTool:
 
     def test_update_date(self, setup_book_env):
         """Should update transaction date."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -558,7 +587,7 @@ class TestUpdateTransactionTool:
     def test_update_splits(self, setup_book_env):
         """Should update transaction split amounts."""
         # Find the groceries transaction which has known accounts
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -588,7 +617,7 @@ class TestUpdateTransactionTool:
 
     def test_update_unbalanced_splits(self, setup_book_env):
         """Should return error for unbalanced splits."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.update_transaction(
@@ -605,7 +634,7 @@ class TestUpdateTransactionTool:
 
     def test_update_reconciled_splits_rejected(self, setup_book_env):
         """Should reject updating splits on a reconciled transaction."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -627,7 +656,7 @@ class TestUpdateTransactionTool:
 
     def test_update_reconciled_force(self, setup_book_env):
         """Should allow updating reconciled splits with force=True."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         groceries_trans = next(
             t for t in transactions if t["description"] == "Weekly Groceries"
         )
@@ -661,7 +690,7 @@ class TestReplaceSplitsTool:
         )
 
         # Find a transaction to replace splits on
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         grocery_txn = next(
             t for t in transactions if "Groceries" in t["description"]
         )
@@ -686,7 +715,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_returns_previous_splits(self, setup_book_env):
         """Should include previous_splits for audit trail."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         grocery_txn = next(
             t for t in transactions if "Groceries" in t["description"]
         )
@@ -706,7 +735,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_unbalanced_error(self, setup_book_env):
         """Should return error for unbalanced splits."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.replace_splits(
@@ -723,7 +752,7 @@ class TestReplaceSplitsTool:
 
     def test_replace_splits_placeholder_error(self, setup_book_env):
         """Should return error for placeholder account."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.replace_splits(
@@ -744,7 +773,7 @@ class TestSetReconcileStateTool:
 
     def test_set_reconcile_state(self, setup_book_env):
         """Should set reconcile state on a split."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = server_module.set_reconcile_state(split_guid, "c")
@@ -752,7 +781,7 @@ class TestSetReconcileStateTool:
         data = json.loads(result)
         # `reconcile_state` echo dropped — verified through read-back.
         assert data["status"] == "updated"
-        refreshed = json.loads(server_module.list_transactions(verbose=True))
+        refreshed = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         updated_split = next(
             s for t in refreshed for s in t["splits"] if s["guid"] == split_guid
         )
@@ -760,7 +789,7 @@ class TestSetReconcileStateTool:
 
     def test_set_reconcile_state_invalid(self, setup_book_env):
         """Should return error for invalid state."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         split_guid = transactions[0]["splits"][0]["guid"]
 
         result = server_module.set_reconcile_state(split_guid, "x")
@@ -842,7 +871,7 @@ class TestVoidTransactionTool:
 
     def test_void_transaction(self, setup_book_env):
         """Should void a transaction."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.void_transaction(guid, "Test void reason")
@@ -853,7 +882,7 @@ class TestVoidTransactionTool:
 
     def test_void_transaction_no_reason(self, setup_book_env):
         """Should return error if no reason provided."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.void_transaction(guid, "")
@@ -867,7 +896,7 @@ class TestUnvoidTransactionTool:
 
     def test_unvoid_transaction(self, setup_book_env):
         """Should restore a voided transaction."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         # Void first
@@ -881,7 +910,7 @@ class TestUnvoidTransactionTool:
 
     def test_unvoid_not_voided(self, setup_book_env):
         """Should return error if transaction not voided."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))
+        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
         guid = transactions[0]["guid"]
 
         result = server_module.unvoid_transaction(guid)
@@ -1389,3 +1418,91 @@ class TestStrictToolKwargs:
             )
             with pytest.raises(ValidationError):
                 arg_model.model_validate({"this_is_not_a_real_kwarg": "x"})
+
+
+# Compact line-1 indicator: "Showing 1-50 of 109 …" or "Showing 0 of 0 …".
+_INDICATOR_RE = re.compile(r"^Showing (0|\d+-\d+) of \d+ [a-z]")
+
+# (tool, runnable kwargs against the standard test book, verbose entity
+# key). A None key marks a TSV-only tool with no verbose envelope.
+_PAGINATED_TOOLS = [
+    ("list_accounts", {}, "accounts"),
+    ("list_transactions", {}, "transactions"),
+    ("search_transactions", {"query": "a"}, "transactions"),
+    ("get_unreconciled_splits", {"account": "Assets:Checking"}, "splits"),
+    ("list_customers", {}, "customers"),
+    ("list_vendors", {}, "vendors"),
+    ("list_employees", {}, "employees"),
+    ("list_billterms", {}, "billterms"),
+    ("list_taxtables", {}, "taxtables"),
+    ("list_invoices", {}, "invoices"),
+    ("list_jobs", {}, "jobs"),
+    ("get_outstanding_invoices", {}, "invoices"),
+    ("list_scheduled_transactions", {}, "scheduled_transactions"),
+    ("get_upcoming_transactions", {}, "upcoming_transactions"),
+    ("list_commodities", {}, "commodities"),
+    ("get_prices", {"commodity": "USD", "namespace": "CURRENCY"}, "prices"),
+    ("list_lots", {"account": "Assets:Checking"}, "lots"),
+    ("list_budgets", {}, "budgets"),
+    ("list_backups", {}, None),
+    ("get_audit_log", {}, None),
+]
+
+
+class TestPaginationCoverage:
+    """Contract lock for the pagination rollout: every list-returning
+    tool leads with a ``Showing X-Y of Z`` indicator, accepts
+    ``offset``/``limit``, and (where it has a verbose mode) returns the
+    uniform envelope. Mirrors TestToolFileVsModulesMapping — adding a
+    list tool without pagination should fail loudly here."""
+
+    @pytest.mark.parametrize(
+        "tool_name", [t[0] for t in _PAGINATED_TOOLS]
+    )
+    def test_tool_accepts_offset_and_limit(self, tool_name):
+        fn = getattr(server_module, tool_name)
+        params = inspect.signature(fn).parameters
+        assert "offset" in params, f"{tool_name} missing offset param"
+        assert "limit" in params, f"{tool_name} missing limit param"
+
+    @pytest.mark.parametrize(
+        "tool_name,kwargs", [(t[0], t[1]) for t in _PAGINATED_TOOLS]
+    )
+    def test_compact_leads_with_indicator(
+        self, setup_book_env, tool_name, kwargs
+    ):
+        result = getattr(server_module, tool_name)(**kwargs)
+        line0 = result.split("\n")[0]
+        # get_audit_log can't reach its indicator in this fixture: no
+        # log dir is configured, so it returns the not-initialized /
+        # no-file sentinel. Its indicator format is locked by the book
+        # path that DOES have entries; here we only assert it doesn't
+        # masquerade as a row list.
+        if tool_name == "get_audit_log" and not line0.startswith("Showing"):
+            assert "audit log" in line0.lower() or "error" in line0.lower()
+            return
+        assert _INDICATOR_RE.match(line0), (
+            f"{tool_name} compact line 0 is not an indicator: {line0!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "tool_name,kwargs,key",
+        [(t[0], t[1], t[2]) for t in _PAGINATED_TOOLS if t[2]],
+    )
+    def test_verbose_returns_uniform_envelope(
+        self, setup_book_env, tool_name, kwargs, key
+    ):
+        result = getattr(server_module, tool_name)(verbose=True, **kwargs)
+        data = json.loads(result)
+        assert isinstance(data, dict), f"{tool_name} verbose is not a dict"
+        for field in ("showing", "total", "offset", "count"):
+            assert field in data, f"{tool_name} verbose missing {field!r}"
+        assert _INDICATOR_RE.match(data["showing"]), (
+            f"{tool_name} 'showing' is not an indicator: {data['showing']!r}"
+        )
+        assert key in data, f"{tool_name} verbose missing entity key {key!r}"
+
+    def test_count_only_mode(self, setup_book_env):
+        """limit=0 yields a zero-page indicator with the full total."""
+        result = server_module.list_transactions(limit=0)
+        assert result.startswith("Showing 0 of 3 transactions")

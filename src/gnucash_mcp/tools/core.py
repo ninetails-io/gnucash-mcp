@@ -19,6 +19,49 @@ from gnucash_mcp.tools._helpers import (
 )
 
 
+def _parse_transactions_tsv(tsv: str) -> list[dict]:
+    """Parse the batch-entry TSV into structured transactions.
+
+    Header row + one row per transaction; positional parse so rows may
+    be ragged. First three fields are ref / date / description; the rest
+    are ``(amount, account)`` pairs. Raises ValueError on a missing
+    header, too-few columns, or an odd trailing count.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "transactions TSV needs a header row and at least one data row"
+        )
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        fields = ln.split("\t")
+        if len(fields) < 5:
+            raise ValueError(
+                f"row {i}: expected ref, date, description, and at least "
+                f"one (amount, account) pair"
+            )
+        ref, dt, desc = fields[0].strip(), fields[1].strip(), fields[2]
+        if not ref:
+            raise ValueError(f"row {i}: empty ref (each row needs a key)")
+        rest = fields[3:]
+        if len(rest) % 2 != 0:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): trailing fields must be "
+                f"(amount, account) pairs — got an odd count"
+            )
+        splits = [
+            {"account": rest[j + 1], "amount": rest[j]}
+            for j in range(0, len(rest), 2)
+        ]
+        out.append({
+            "ref": ref,
+            "date": _parse_iso_date(dt) or date.today(),
+            "description": desc,
+            "splits": splits,
+        })
+    return out
+
+
 def register(mcp, get_book) -> None:
     """Attach core tools to the FastMCP server."""
 
@@ -33,7 +76,21 @@ def register(mcp, get_book) -> None:
         in a single text response. Use this first to orient yourself.
         """
         book = get_book()
-        return book.get_book_summary()
+        summary = book.get_book_summary()
+        # Multi-book sessions: name the current book up front so the
+        # client knows which book these numbers belong to. The book
+        # layer stays ignorant of server session state, so the marker
+        # is added here, not in get_book_summary itself.
+        from gnucash_mcp import server as _server
+        if _server.multi_book_active():
+            from gnucash_mcp._format import _book_display_name
+            name = _book_display_name(book.book_path)
+            count = len(_server._book_paths)
+            summary = (
+                f"Current book: {name} ({count} books available — "
+                f"switch_book to change)\n{summary}"
+            )
+        return summary
 
     @mcp.tool()
     @safe_tool
@@ -41,18 +98,26 @@ def register(mcp, get_book) -> None:
     def list_accounts(
         root: str | None = None,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all accounts in the GnuCash chart of accounts.
 
-        Returns a compact one-line-per-account format by default.
-        Use verbose=true for full JSON with guid, type, commodity, etc.
+        Leads with a ``Showing X-Y of Z accounts`` line, then a compact
+        one-line-per-account format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, type, commodity, etc.
 
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
             verbose: If true, return full JSON details for each account.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_accounts(root=root, compact=not verbose)
+        result = book.list_accounts(
+            root=root, compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result
@@ -114,9 +179,14 @@ def register(mcp, get_book) -> None:
         start_date: str | None = None,
         end_date: str | None = None,
         limit: int = 50,
+        offset: int = 0,
         verbose: bool = False,
     ) -> str:
         """List transactions with optional filters.
+
+        Leads with a ``Showing X-Y of Z transactions (date range)``
+        line so a truncated view is never mistaken for the whole set.
+        Page with ``offset``; ``limit=0`` returns the count only.
 
         Compact format (default):
         - Unfiltered: ``DATE<TAB>guid<TAB>Description<TAB>splits``
@@ -133,13 +203,16 @@ def register(mcp, get_book) -> None:
             account: Filter by account name (switches output to register form)
             start_date: Start date in ISO format (YYYY-MM-DD)
             end_date: End date in ISO format (YYYY-MM-DD)
-            limit: Maximum number of transactions to return (default 50)
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
         start = _parse_iso_date(start_date)
         end = _parse_iso_date(end_date)
-        result = book.list_transactions(account, start, end, limit, compact=not verbose)
+        result = book.list_transactions(
+            account, start, end, limit, offset, compact=not verbose
+        )
         if verbose:
             return _json(result)
         return result
@@ -222,11 +295,75 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
+    @audit_log(
+        classification="write", operation="create_batch",
+        entity_type="transaction",
+    )
+    def create_transactions(
+        transactions: str,
+        force: bool = False,
+        dry_run: bool = False,
+        on_error: str = "abort",
+    ) -> str:
+        """Create MANY transactions in one atomic command (bulk entry).
+
+        INPUT — ``transactions`` is a TSV block: a header row, then one
+        row per transaction. Splits are ``(amount, account)`` column
+        PAIRS, repeated as wide as a transaction needs::
+
+            ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
+            1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+        - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
+          within the batch. It is echoed back so you can match results
+          to what you sent; the server never reuses or interprets it.
+        - ``date``: ISO YYYY-MM-DD. ``amount``: decimal STRING (never a
+          raw JSON number). Each transaction needs >=2 splits balancing
+          to zero. Rows may differ in width (2 splits vs 3).
+        - v1 is same-currency (book default) with no per-split memo —
+          use ``create_transaction`` for cross-currency, investment, or
+          memo-bearing entries.
+
+        BEHAVIOR — one book-open, one atomic save:
+        - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
+          aborts the WHOLE batch by default; nothing is written. Pass
+          ``on_error="skip"`` to write the good rows and reject only the
+          bad ones.
+        - A duplicate rejects ONLY its row; ``force=True`` overrides all
+          blocking duplicates (as in ``create_transaction``).
+          ``dry_run=True`` validates + screens without writing.
+
+        OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
+        - ``results`` (always): ``ref, status, txn_guid, dup_count,
+          reason``. status is ``created`` | ``rejected`` |
+          ``would_create`` (dry_run); reason is a code like
+          ``duplicate_detected`` or the validation message.
+        - ``duplicates`` (only when matches exist): ``ref, confidence,
+          guid, date, amount, description, signals`` — the columns
+          ``create_transaction`` emits, keyed back to the offending
+          ``ref``. Σ(dup_count) equals the duplicates row count.
+
+        Args:
+            transactions: The TSV block described above.
+            force: Override ALL blocking (HIGH) duplicates this batch.
+            dry_run: Validate + screen, write nothing.
+            on_error: "abort" (default) or "skip" for structural errors.
+        """
+        book = get_book()
+        parsed = _parse_transactions_tsv(transactions)
+        result = book.create_transactions(
+            parsed, force=force, dry_run=dry_run, on_error=on_error,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
     @audit_log(classification="read")
     def search_transactions(
         query: str,
         field: str = "description",
         limit: int = 50,
+        offset: int = 0,
         verbose: bool = False,
     ) -> str:
         """Search transactions by description, memo, notes, or amount.
@@ -235,17 +372,20 @@ def register(mcp, get_book) -> None:
         ``DATE<TAB>guid<TAB>Description<TAB>splits``
         Transactions with more than 4 splits collapse to the top 3 by
         |value| plus ``+N more`` — call ``get_transaction`` for the
-        full breakdown. When matches exceed ``limit``, a
-        ``[Showing N of M ...]`` notice is appended.
+        full breakdown. Leads with a ``Showing X-Y of Z transactions``
+        line; page with ``offset``, or pass ``limit=0`` for the count.
 
         Args:
             query: Search query string. For amount, supports: exact ("100"), greater (">100"), less ("<100"), range ("100-200")
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
-            limit: Maximum number of matches to return (default 50, server cap 250).
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
             verbose: If true, return full JSON details for each transaction.
         """
         book = get_book()
-        result = book.search_transactions(query, field, limit=limit, compact=not verbose)
+        result = book.search_transactions(
+            query, field, limit=limit, offset=offset, compact=not verbose
+        )
         if verbose:
             return _json(result)
         return result

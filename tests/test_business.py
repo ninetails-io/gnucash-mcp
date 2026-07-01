@@ -85,14 +85,15 @@ class TestListCustomers:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_customers()
-        assert result == ""
+        assert result == "Showing 0 of 0 customers"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Beta Corp")
         gb.create_customer(name="Alpha Inc")
         result = gb.list_customers()
-        lines = result.strip().split("\n")
+        # Skip the leading "Showing X-Y of Z customers" indicator.
+        lines = result.strip().split("\n")[1:]
         assert len(lines) == 2
         # Sorted by name
         assert "Alpha Inc" in lines[0]
@@ -101,7 +102,7 @@ class TestListCustomers:
     def test_verbose_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_customer(name="Acme Corp")
-        result = gb.list_customers(compact=False)
+        result = gb.list_customers(compact=False)["customers"]
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Acme Corp"
@@ -170,14 +171,14 @@ class TestListVendors:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_vendors()
-        assert result == ""
+        assert result == "Showing 0 of 0 vendors"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_vendor(name="Zeta Supply")
         gb.create_vendor(name="Alpha Parts")
         result = gb.list_vendors()
-        lines = result.strip().split("\n")
+        lines = result.strip().split("\n")[1:]  # skip indicator
         assert len(lines) == 2
         assert "Alpha Parts" in lines[0]
         assert "Zeta Supply" in lines[1]
@@ -185,7 +186,7 @@ class TestListVendors:
     def test_verbose_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_vendor(name="Office Depot")
-        result = gb.list_vendors(compact=False)
+        result = gb.list_vendors(compact=False)["vendors"]
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Office Depot"
@@ -279,14 +280,14 @@ class TestListEmployees:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_employees()
-        assert result == ""
+        assert result == "Showing 0 of 0 employees"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_employee(name="Beta Hire")
         gb.create_employee(name="Alpha Hire")
         result = gb.list_employees()
-        lines = result.strip().split("\n")
+        lines = result.strip().split("\n")[1:]  # skip indicator
         assert len(lines) == 2
         # Sorted by name
         assert "Alpha Hire" in lines[0]
@@ -295,7 +296,7 @@ class TestListEmployees:
     def test_verbose_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_employee(name="Jane Smith")
-        result = gb.list_employees(compact=False)
+        result = gb.list_employees(compact=False)["employees"]
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Jane Smith"
@@ -448,7 +449,7 @@ class TestListJobs:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_jobs()
-        assert result == ""
+        assert result == "Showing 0 of 0 jobs"
 
     def test_compact_default(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -468,7 +469,7 @@ class TestListJobs:
         gb.create_job(
             owner_id="000001", owner_type="customer", name="X",
         )
-        result = gb.list_jobs(compact=False)
+        result = gb.list_jobs(compact=False)["jobs"]
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "X"
@@ -485,10 +486,10 @@ class TestListJobs:
         gb.create_job(
             owner_id="000001", owner_type="vendor", name="Vend",
         )
-        cust = gb.list_jobs(owner_type="customer", compact=False)
+        cust = gb.list_jobs(owner_type="customer", compact=False)["jobs"]
         assert len(cust) == 1
         assert cust[0]["name"] == "Cust"
-        vend = gb.list_jobs(owner_type="vendor", compact=False)
+        vend = gb.list_jobs(owner_type="vendor", compact=False)["jobs"]
         assert len(vend) == 1
         assert vend[0]["name"] == "Vend"
 
@@ -516,11 +517,11 @@ class TestListJobs:
         # Deactivate the second
         gb.update_job(job_id=inactive["id"], active=False)
         # Default lists only active
-        result = gb.list_jobs(compact=False)
+        result = gb.list_jobs(compact=False)["jobs"]
         assert len(result) == 1
         assert result[0]["id"] == active["id"]
         # include_inactive surfaces both
-        result_all = gb.list_jobs(active_only=False, compact=False)
+        result_all = gb.list_jobs(active_only=False, compact=False)["jobs"]
         assert len(result_all) == 2
 
 
@@ -1047,7 +1048,7 @@ class TestJobPr88ReviewFollowups:
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
         )
-        outstanding = gb.get_outstanding_invoices(compact=False)
+        outstanding = gb.get_outstanding_invoices(compact=False)["invoices"]
         row = next(r for r in outstanding if r["id"] == inv["id"])
         # The bug: pre-fix, owner_name was None on job-attached
         # posted invoices.
@@ -1072,7 +1073,7 @@ class TestJobPr88ReviewFollowups:
             name="X", reference="",  # empty ref to test strip behavior
         )
         # Direct book method returns the list shape unchanged.
-        rows = gb.list_jobs(compact=False)
+        rows = gb.list_jobs(compact=False)["jobs"]
         assert len(rows) == 1
         # Empty reference SHOULD survive the verbose JSON path
         # — the bug was that _json stripped it. We verify the
@@ -1376,11 +1377,11 @@ class TestUpdateCustomer:
         gb.create_customer(name="Old Customer")
         gb.update_customer(customer_id="000001", active=False)
 
-        active_only = gb.list_customers(active_only=True, compact=False)
+        active_only = gb.list_customers(active_only=True, compact=False)["customers"]
         assert all(c["id"] != "000001" for c in active_only)
         all_customers = gb.list_customers(
             active_only=False, compact=False,
-        )
+        )["customers"]
         assert any(c["id"] == "000001" for c in all_customers)
 
     def test_update_address_creates_when_missing(self, business_book):
@@ -1569,7 +1570,7 @@ class TestUpdateEmployee:
 
         active_only = gb.list_employees(
             active_only=True, compact=False,
-        )
+        )["employees"]
         assert all(e["id"] != "000001" for e in active_only)
 
 
@@ -1681,7 +1682,7 @@ class TestCreateBillterm:
         gb = GnuCashBook(str(business_book))
         gb.create_billterm(name="Net 30")
         gb.create_billterm(name="Net 60", due_days=60)
-        result = gb.list_billterms(compact=False)
+        result = gb.list_billterms(compact=False)["billterms"]
         assert len(result) == 2
         names = {bt["name"] for bt in result}
         assert names == {"Net 30", "Net 60"}
@@ -1693,7 +1694,7 @@ class TestListBillterms:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_billterms()
-        assert result == ""
+        assert result == "Showing 0 of 0 billterms"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1705,7 +1706,7 @@ class TestListBillterms:
     def test_verbose_format(self, business_book):
         gb = GnuCashBook(str(business_book))
         gb.create_billterm(name="Net 30", due_days=30, description="Standard terms")
-        result = gb.list_billterms(compact=False)
+        result = gb.list_billterms(compact=False)["billterms"]
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0]["name"] == "Net 30"
@@ -1942,8 +1943,8 @@ class TestListTaxtables:
 
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
-        assert gb.list_taxtables() == ""
-        assert gb.list_taxtables(compact=False) == []
+        assert gb.list_taxtables() == "Showing 0 of 0 taxtables"
+        assert gb.list_taxtables(compact=False)["taxtables"] == []
 
     def test_compact_single_entry(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -1984,7 +1985,7 @@ class TestListTaxtables:
             entries=[{"type": "percentage", "amount": "5",
                       "account": gst}],
         )
-        result = gb.list_taxtables(compact=False)
+        result = gb.list_taxtables(compact=False)["taxtables"]
         assert len(result) == 1
         assert result[0]["name"] == "GST 5%"
         assert result[0]["refcount"] == 0
@@ -1999,7 +2000,7 @@ class TestListTaxtables:
                 entries=[{"type": "percentage", "amount": "5",
                           "account": gst}],
             )
-        result = gb.list_taxtables(compact=False)
+        result = gb.list_taxtables(compact=False)["taxtables"]
         assert [t["name"] for t in result] == ["Alpha", "Mu", "Zeta"]
 
 
@@ -5805,7 +5806,7 @@ class TestCreditNoteDisplayPolish:
             post_account="Assets:Accounts Receivable",
             owner_type="customer",
         )
-        rows = gb.get_outstanding_invoices(compact=False)
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         cn_row = next(r for r in rows if r["id"] == cn["id"])
         assert cn_row["is_credit_note"] is True
 
@@ -6035,7 +6036,7 @@ class TestListInvoices:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_invoices()
-        assert result == ""
+        assert result == "Showing 0 of 0 invoices"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -6051,19 +6052,18 @@ class TestListInvoices:
         gb.create_customer(name="Acme Corp")
         gb.create_invoice(customer_id="000001")
         result = gb.list_invoices(compact=False)
-        # Verbose mode returns the envelope shape that matches
-        # get_unreconciled_splits / get_prices: invoices list +
-        # count + total + notice.
+        # Verbose mode returns the uniform pagination envelope:
+        # invoices list + showing + total + offset + count.
         assert isinstance(result, dict)
         assert "invoices" in result
         assert "count" in result
         assert "total" in result
-        assert "notice" in result
+        assert "showing" in result
         invoices = result["invoices"]
         assert len(invoices) == 1
         assert invoices[0]["type"] == "invoice"
         assert result["total"] == 1
-        assert result["notice"] is None  # nothing truncated
+        assert result["showing"].startswith("Showing 1-1 of 1 invoices")
 
     def test_filter_by_customer_type(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -8598,7 +8598,7 @@ class TestOverpaymentGuard:
                 amount="4500.00",
             )
         # Lot untouched by the rejected payment.
-        rows = gb.get_outstanding_invoices(compact=False)
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert Decimal(rows[0]["amount_due"]) == Decimal("3500.00")
 
     def test_overpay_after_partial_rejected_exact_ok(self, business_book):
@@ -8706,7 +8706,7 @@ class TestOverpaymentGuard:
             ar_split.lot = lot_obj
             book.save()
 
-        rows = gb.get_outstanding_invoices(compact=False)
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(rows) == 1
         row = rows[0]
         assert Decimal(row["amount_due"]) == Decimal("-200.00")
@@ -8740,7 +8740,7 @@ class TestOverpaymentGuard:
             post_date="2025-10-01",  # long past — clock would tick
         )
 
-        rows = gb.get_outstanding_invoices(compact=False)
+        rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(rows) == 1
         row = rows[0]
         assert row["is_credit_note"] is True
@@ -9438,7 +9438,7 @@ class TestGetOutstandingInvoices:
 
     def test_empty_when_none_posted(self, business_book):
         gb = GnuCashBook(str(business_book))
-        result = gb.get_outstanding_invoices(compact=False)
+        result = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert result == []
 
     def test_shows_posted_unpaid(self, business_book):
@@ -9456,7 +9456,7 @@ class TestGetOutstandingInvoices:
             invoice_id="000001",
             post_account="Assets:Accounts Receivable",
         )
-        result = gb.get_outstanding_invoices(compact=False)
+        result = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(result) == 1
         assert result[0]["id"] == "000001"
         assert Decimal(result[0]["amount_due"]) == Decimal("500")
@@ -9481,7 +9481,7 @@ class TestGetOutstandingInvoices:
             payment_account="Assets:Checking",
             amount="500",
         )
-        result = gb.get_outstanding_invoices(compact=False)
+        result = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(result) == 0
 
     def test_partially_paid_shows_correct_amounts(self, business_book):
@@ -9504,7 +9504,7 @@ class TestGetOutstandingInvoices:
             payment_account="Assets:Checking",
             amount="200",
         )
-        result = gb.get_outstanding_invoices(compact=False)
+        result = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(result) == 1
         assert Decimal(result[0]["amount_due"]) == Decimal("300")
         assert Decimal(result[0]["amount_paid"]) == Decimal("200")
@@ -9537,7 +9537,7 @@ class TestGetOutstandingInvoices:
             invoice_id="000002",
             post_account="Assets:Accounts Receivable",
         )
-        result = gb.get_outstanding_invoices(customer_id="000001", compact=False)
+        result = gb.get_outstanding_invoices(customer_id="000001", compact=False)["invoices"]
         assert len(result) == 1
         assert result[0]["owner_name"] == "Acme Corp"
 
@@ -9557,7 +9557,7 @@ class TestGetOutstandingInvoices:
             post_account="Liabilities:Accounts Payable",
             owner_type="vendor",
         )
-        result = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
+        result = gb.get_outstanding_invoices(owner_type="vendor", compact=False)["invoices"]
         assert len(result) == 1
         assert result[0]["type"] == "bill"
 
@@ -9651,7 +9651,7 @@ class TestPhase3CommsContracts:
             post_account="Assets:Accounts Receivable",
             post_date="2026-01-01",
         )
-        result = gb.get_outstanding_invoices(compact=False)
+        result = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert isinstance(result, list)
         assert result[0]["due_date"] is not None
         assert result[0]["days_past_due"] is not None
@@ -9724,11 +9724,10 @@ class TestPhase3CommsContracts:
     def test_list_invoices_verbose_envelope_with_truncation(
         self, business_book,
     ):
-        """Bookkeeper-flagged inconsistency: compact mode appended a
-        ``[Showing N of M]`` notice when truncated, but verbose mode
-        returned just a bare list with no truncation signal.
-        Now both modes carry ``count`` / ``total`` / ``notice`` so a
-        verbose-mode caller knows the result is incomplete.
+        """Both modes carry the pagination indicator so a verbose-mode
+        caller knows the result is incomplete: compact leads with the
+        ``Showing X-Y of Z`` line, verbose carries it in ``showing``
+        alongside ``count`` / ``total`` / ``offset``.
         """
         gb = GnuCashBook(str(business_book))
         # 5 invoices, ask for 3.
@@ -9740,9 +9739,8 @@ class TestPhase3CommsContracts:
         assert len(result["invoices"]) == 3
         assert result["count"] == 3
         assert result["total"] == 5
-        assert result["notice"] is not None
-        assert "Showing 3 of 5" in result["notice"]
-        assert "invoices" in result["notice"]
+        assert result["offset"] == 0
+        assert "Showing 1-3 of 5 invoices" in result["showing"]
 
 
 # ============== Vendor Spending Report Tests ==============
@@ -9883,6 +9881,93 @@ class TestVendorSpendingReport:
         assert result["vendors"][0]["vendor_name"] == "Office Depot"
 
 
+class TestVendorSpendingGroupBy:
+    """group_by sub-period columns for vendor_spending_report."""
+
+    @staticmethod
+    def _seed(gb) -> None:
+        """Office Depot billed Feb (50) + Mar (70); Staples Mar (30)."""
+        gb.create_vendor(name="Office Depot")
+        gb.create_vendor(name="Staples")
+
+        def bill(bill_id, vendor_id, price, post_date):
+            gb.create_bill(vendor_id=vendor_id)
+            gb.add_bill_entry(
+                bill_id=bill_id,
+                account="Expenses:Office Supplies",
+                description="x", quantity="1", price=price,
+            )
+            gb.post_invoice(
+                invoice_id=bill_id,
+                post_account="Liabilities:Accounts Payable",
+                owner_type="vendor", post_date=post_date,
+            )
+
+        bill("000001", "000001", "50.00", "2026-02-15")
+        bill("000002", "000001", "70.00", "2026-03-10")
+        bill("000003", "000002", "30.00", "2026-03-20")
+
+    @staticmethod
+    def _parse(tsv: str) -> dict[str, list[str]]:
+        out = {}
+        for ln in tsv.splitlines():
+            if "\t" in ln:
+                cells = ln.split("\t")
+                out[cells[0]] = cells
+        return out
+
+    def test_month_columns(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        tsv = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-03-31",
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Vendor"] == [
+            "Vendor", "2026-01", "2026-02", "2026-03", "Total", "Avg",
+        ]
+        # Office Depot spikes in March; sorted first by total.
+        assert rows["Office Depot"] == [
+            "Office Depot", "0.00", "50.00", "70.00", "120.00", "40.00",
+        ]
+        assert rows["Staples"] == [
+            "Staples", "0.00", "0.00", "30.00", "30.00", "10.00",
+        ]
+        assert rows["TOTAL"] == [
+            "TOTAL", "0.00", "50.00", "100.00", "150.00", "50.00",
+        ]
+
+    def test_vendor_filter_with_group_by(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        tsv = gb.vendor_spending_report(
+            start_date="2026-01-01", end_date="2026-03-31",
+            vendor_id="000001", group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert "Office Depot" in rows and "Staples" not in rows
+
+    def test_invalid_group_by(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        with pytest.raises(ValueError, match="Invalid group_by"):
+            gb.vendor_spending_report(
+                start_date="2026-01-01", end_date="2026-03-31",
+                group_by="decade",
+            )
+
+    def test_no_group_by_unchanged(self, business_book):
+        """Regression guard: omitting group_by keeps the dict shape."""
+        gb = GnuCashBook(str(business_book))
+        self._seed(gb)
+        result = gb.vendor_spending_report(
+            compact=False,
+            start_date="2026-01-01", end_date="2026-03-31",
+        )
+        assert "vendors" in result and "totals" in result
+        assert Decimal(result["totals"]["total_billed"]) == Decimal("150")
+
+
 # ============== End-to-End Lifecycle Tests ==============
 
 
@@ -9915,7 +10000,7 @@ class TestInvoiceLifecycle:
         assert Decimal(post_result["total"]) == Decimal("1000")
 
         # Verify outstanding
-        outstanding = gb.get_outstanding_invoices(compact=False)
+        outstanding = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(outstanding) == 1
         assert Decimal(outstanding[0]["amount_due"]) == Decimal("1000")
 
@@ -9928,7 +10013,7 @@ class TestInvoiceLifecycle:
         assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
 
         # Verify no longer outstanding
-        outstanding = gb.get_outstanding_invoices(compact=False)
+        outstanding = gb.get_outstanding_invoices(compact=False)["invoices"]
         assert len(outstanding) == 0
 
     def test_full_bill_lifecycle(self, business_book):
@@ -9958,7 +10043,7 @@ class TestInvoiceLifecycle:
         assert Decimal(post_result["total"]) == Decimal("100")
 
         # Verify outstanding
-        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)["invoices"]
         assert len(outstanding) == 1
 
         # Pay
@@ -9971,7 +10056,7 @@ class TestInvoiceLifecycle:
         assert Decimal(pay_result["remaining_balance"]) == Decimal("0")
 
         # Verify cleared
-        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)
+        outstanding = gb.get_outstanding_invoices(owner_type="vendor", compact=False)["invoices"]
         assert len(outstanding) == 0
 
 
@@ -10725,7 +10810,7 @@ class TestCrossCommodityArRelief:
         assert gb.get_balance(
             account_name="Assets:Accounts Receivable"
         ) == Decimal("0"), "phantom A/R residue after full settlement"
-        assert gb.get_outstanding_invoices(compact=False) == []
+        assert gb.get_outstanding_invoices(compact=False)["invoices"] == []
 
     def test_partial_payment_relieves_pro_rata(self, business_book):
         """A 40% payment relieves 40% of the carried quantity, so

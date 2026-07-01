@@ -12,7 +12,7 @@ procedure performed with the server stopped. See
 """
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, safe_tool
+from gnucash_mcp.tools._helpers import _json, _paginate, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -63,24 +63,34 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def list_backups() -> str:
+    def list_backups(limit: int = 50, offset: int = 0) -> str:
         """List all available backups, newest first.
 
-        Returns a compact tab-separated table with one row per backup:
+        Leads with a ``Showing X-Y of Z backups (date range)`` line,
+        then a compact tab-separated table with one row per backup:
         ``stage``, ``timestamp`` (ISO UTC), ``age``, ``size`` (MB),
         and ``label`` (if any). Stages are ``session`` / ``weekly`` /
         ``monthly`` (automatic retention tiers) and ``manual`` (user-
-        invoked, unlimited retention).
+        invoked, unlimited retention). Page with ``offset``; ``limit=0``
+        returns the count only.
+
+        Args:
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
         entries = book.list_backups()
-        if not entries:
-            return "No backups found."
+        page, indicator = _paginate(
+            entries, offset=offset, limit=limit,
+            entity_name="backups", date_key=lambda e: e["timestamp"],
+        )
+        if not page:
+            return indicator
 
-        # Header + rows. TSV is compact and the LLM can parse it
-        # without a schema reminder.
-        lines = ["stage\ttimestamp\tage\tsize_mb\tlabel"]
-        for e in entries:
+        # Indicator + header + rows. TSV is compact and the LLM can
+        # parse it without a schema reminder.
+        lines = [indicator, "stage\ttimestamp\tage\tsize_mb\tlabel"]
+        for e in page:
             size_mb = f"{e['size_bytes'] / (1024 * 1024):.1f}"
             label = e.get("label") or ""
             lines.append(

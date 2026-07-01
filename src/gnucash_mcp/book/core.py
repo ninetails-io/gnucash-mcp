@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
+from gnucash_mcp._format import _paginate
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
@@ -88,7 +89,6 @@ class _SummaryData:
     # Account categorization (per-leaf rows the section renderers iterate).
     asset_leaves: list[tuple[str, Decimal, str | None]] = field(default_factory=list)
     credit_cards: list[tuple[str, Decimal]] = field(default_factory=list)
-    loan_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     other_liab_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     receivable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
     payable_accts: list[tuple[str, Decimal]] = field(default_factory=list)
@@ -99,7 +99,6 @@ class _SummaryData:
     receivables_total: Decimal = Decimal("0")
     payables_total: Decimal = Decimal("0")
     credit_total: Decimal = Decimal("0")
-    loan_total: Decimal = Decimal("0")
     other_liab_total: Decimal = Decimal("0")
 
     # Counts.
@@ -448,6 +447,7 @@ class CoreMixin:
             # liabilities; liabilities negate to a positive magnitude.
             converted, _ = self._market_value(
                 account, balance,
+                book=book,
                 rates=rates,
                 default_currency=default_currency,
                 today=as_of,
@@ -596,13 +596,16 @@ class CoreMixin:
         rates_for_sort = self._rates_as_of(
             book, today, default_currency,
         )
+        root = book.root_account
         integrity: list[tuple[Decimal, str]] = []
         for account in accounts:
-            if account.type == "ROOT":
+            # Locale-robust: GnuCash localizes the "Imbalance"/"Orphan"
+            # leading word, so a structural+catalog match replaces the
+            # old English-only prefix check (which never fired on a
+            # localized book — the warning silently went dark).
+            if not self._is_auto_balancing_account(account, root):
                 continue
             name = account.name
-            if not (name.startswith("Imbalance-") or name.startswith("Orphan-")):
-                continue
             balance = self._own_splits_balance(account)
             if balance != 0:
                 acct_commodity = (
@@ -621,7 +624,13 @@ class CoreMixin:
                         sort_magnitude = abs(balance * rate)
                 integrity.append((
                     sort_magnitude,
-                    f"{name}: {balance} (data integrity issue)",
+                    # An auto-balancing (Imbalance/Orphan) account with a
+                    # non-zero balance is ambiguous: GnuCash may have parked
+                    # an unbalanced remainder, or the user may be holding an
+                    # unclassified item on purpose. Flag it for attention
+                    # without implying the book is corrupted.
+                    f"{name}: {balance} "
+                    f"(uncleared suspense balance — review or reclassify)",
                 ))
         integrity.sort(key=lambda pair: pair[0], reverse=True)
         integrity = [msg for _, msg in integrity]
@@ -641,6 +650,15 @@ class CoreMixin:
                 low_cash_entries: list[tuple[Decimal, str]] = []
                 for account in accounts:
                     if account.type not in ("BANK", "CASH"):
+                        continue
+                    if self._is_auto_balancing_account(
+                        account, book.root_account
+                    ):
+                        # A suspense/Imbalance balance isn't spendable
+                        # cash — it's surfaced by the integrity section
+                        # above. Counting it here fires a bogus
+                        # "critically low cash" on a few euros parked
+                        # for clarification.
                         continue
                     if account.placeholder:
                         continue
@@ -1191,6 +1209,10 @@ class CoreMixin:
                 continue
             if account.type not in self._RUNWAY_LIQUID_TYPES:
                 continue
+            if self._is_auto_balancing_account(account, book.root_account):
+                # Suspense/Imbalance balances aren't runway liquidity —
+                # they're unresolved bookkeeping, not money to live on.
+                continue
             if self._is_in_retirement_subtree(account):
                 # Penalty-locked money isn't runway — see the helper.
                 continue
@@ -1510,6 +1532,7 @@ class CoreMixin:
         latest_prices: dict,
         default_currency,
         today: date,
+        book: piecash.Book,
         rate_via: dict[str, str] | None = None,
     ) -> _SummaryData:
         """Single-pass account walker for ``get_book_summary``.
@@ -1547,6 +1570,7 @@ class CoreMixin:
                 if balance != 0:
                     usd_value, note = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1560,6 +1584,7 @@ class CoreMixin:
                     # diverge from balance_sheet on foreign debt.
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1569,22 +1594,24 @@ class CoreMixin:
                 if balance != 0:
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
                     )
                     pos_value = -usd_value
-                    if "loan" in account.fullname.lower():
-                        data.loan_accts.append((leaf, pos_value))
-                    else:
-                        data.other_liab_accts.append(
-                            (leaf, pos_value)
-                        )
+                    # Loans and other liabilities are the same TYPE —
+                    # GnuCash has no "loan" account type — so we don't
+                    # sub-classify by name. The old "loan" substring
+                    # was English-only (missed "Darlehen"/"Kredit" and
+                    # any rename); one bucket is locale-correct.
+                    data.other_liab_accts.append((leaf, pos_value))
             elif account.type == "RECEIVABLE":
                 if balance != 0:
                     # A/R is debit-natural: positive balance = owed to us.
                     usd_value, _ = self._market_value(
                         account, balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1595,6 +1622,7 @@ class CoreMixin:
                     # A/P is credit-natural: negate for "what we owe".
                     usd_value, _ = self._market_value(
                         account, -balance,
+                        book=book,
                         rates=latest_prices,
                         default_currency=default_currency,
                         today=today,
@@ -1627,17 +1655,13 @@ class CoreMixin:
             sum(b for _, b in data.credit_cards)
             if data.credit_cards else Decimal(0)
         )
-        data.loan_total = _r2(
-            sum(b for _, b in data.loan_accts)
-            if data.loan_accts else Decimal(0)
-        )
         data.other_liab_total = _r2(
             sum(b for _, b in data.other_liab_accts)
             if data.other_liab_accts else Decimal(0)
         )
         data.liabilities_total = _r2(
-            data.credit_total + data.loan_total
-            + data.other_liab_total + data.payables_total
+            data.credit_total + data.other_liab_total
+            + data.payables_total
         )
         return data
 
@@ -1741,8 +1765,8 @@ class CoreMixin:
         lives in ``_render_receivables_payables``.
         """
         liab_count = (
-            len(data.credit_cards) + len(data.loan_accts)
-            + len(data.other_liab_accts) + len(data.payable_accts)
+            len(data.credit_cards) + len(data.other_liab_accts)
+            + len(data.payable_accts)
         )
         lines = [
             f"Liabilities: {liab_count} accounts, "
@@ -1753,18 +1777,13 @@ class CoreMixin:
                 f"  Credit cards ({len(data.credit_cards)}): "
                 f"{currency} {data.credit_total}"
             )
-        if data.loan_accts:
-            lines.append(
-                f"  Loans ({len(data.loan_accts)}): "
-                f"{currency} {data.loan_total}"
-            )
         if data.other_liab_accts:
             lines.append(
-                f"  Other ({len(data.other_liab_accts)}): "
+                f"  Loans & other ({len(data.other_liab_accts)}): "
                 f"{currency} {data.other_liab_total}"
             )
         all_liab_leaves = (
-            data.credit_cards + data.loan_accts + data.other_liab_accts
+            data.credit_cards + data.other_liab_accts
         )
         if len(all_liab_leaves) > 1:
             all_liab_leaves.sort(key=lambda x: x[1], reverse=True)
@@ -1990,6 +2009,7 @@ class CoreMixin:
                 latest_prices=latest_prices,
                 default_currency=default_currency,
                 today=today,
+                book=book,
                 rate_via=rate_via,
             )
 
@@ -2119,17 +2139,23 @@ class CoreMixin:
         self,
         root: str | None = None,
         compact: bool = True,
-    ) -> list[dict] | str:
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict | str:
         """List all accounts in the chart of accounts.
 
-        Compact output emits one ``%shortguid<TAB>fullname [ANNOTATION]``
-        line per account; the short GUID is the cheap handle for
-        subsequent calls (tools resolve ``%xxxxxxx``, full GUIDs, and
-        paths interchangeably via ``_resolve_account``).
+        Leads with a ``Showing X-Y of Z accounts`` indicator (accounts
+        are undated, so no date range). Compact output then emits one
+        ``%shortguid<TAB>fullname [ANNOTATION]`` line per account; the
+        short GUID is the cheap handle for subsequent calls (tools
+        resolve ``%xxxxxxx``, full GUIDs, and paths interchangeably via
+        ``_resolve_account``).
 
         Args:
             root: Optional subtree filter (path, ``%short``, or GUID).
-            compact: If False, return full account dicts instead.
+            compact: If False, return a verbose envelope instead.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
         """
         with self.open(readonly=True) as book:
             # Template accounts are GnuCash internals, not part of
@@ -2158,17 +2184,32 @@ class CoreMixin:
 
             filtered.sort(key=lambda a: a.fullname)
 
+            page, indicator = _paginate(
+                filtered,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="accounts",
+            )
+
             if compact:
                 # Short-guid map spans the whole book so prefixes
                 # stay unambiguous against every resolvable account.
                 short_map = self._account_short_guid_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     f"{short_map[a.guid]}\t{_account_to_compact_line(a)}"
-                    for a in filtered
+                    for a in page
                 ]
                 return "\n".join(lines)
             else:
-                return [_account_to_dict(a) for a in filtered]
+                return {
+                    "showing": indicator,
+                    "total": len(filtered),
+                    "offset": offset,
+                    "count": len(page),
+                    "accounts": [_account_to_dict(a) for a in page],
+                }
 
     def get_account(self, name: str) -> dict | None:
         """Get details for a specific account by full name.
@@ -2225,28 +2266,27 @@ class CoreMixin:
         start_date: date | None = None,
         end_date: date | None = None,
         limit: int = 50,
+        offset: int = 0,
         compact: bool = True,
-    ) -> list[dict] | str:
+    ) -> dict | str:
         """List transactions with optional filters.
 
-        Compact output appends a ``[Showing N of M ...]`` truncation
-        notice when the result set exceeds ``limit``; limits above
-        ``MAX_LIST_LIMIT`` (250) are clamped server-side and flagged.
-        Verbose mode truncates silently (callers have the length).
+        Both modes lead with a ``Showing X-Y of Z transactions`` line
+        spanning the full filtered set's date range, so a partial view
+        is never silent. ``offset`` pages through; limits above
+        ``MAX_LIST_LIMIT`` (250) clamp server-side and flag it.
 
         Args:
             account: Filter by account ref.
             start_date / end_date: Inclusive date bounds.
-            limit: Maximum to return. Capped at 250.
-            compact: One line per transaction (default) or dicts,
-                most recent first.
+            limit: Page size. Capped at 250. ``0`` = count only.
+            offset: 0-indexed first row to return.
+            compact: One line per transaction (default) or a verbose
+                envelope, most recent first.
 
         Raises:
             ValueError: If specified account not found.
         """
-        capped = limit > self.MAX_LIST_LIMIT
-        effective_limit = min(limit, self.MAX_LIST_LIMIT)
-
         with self.open(readonly=True) as book:
             # If filtering by account, get transactions through that account's splits
             focus_fullname: str | None = None
@@ -2294,30 +2334,27 @@ class CoreMixin:
                 key=lambda t: t.post_date or date.min, reverse=True
             )
 
-            total_matched = len(filtered)
-            # Apply limit
-            filtered = filtered[:effective_limit]
+            page, indicator = _paginate(
+                filtered,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="transactions",
+                date_key=lambda t: t.post_date,
+            )
 
             if compact:
                 # Prefix map spans ALL transactions so emitted
                 # prefixes stay valid _resolve_guid keys; cached by
                 # book mtime.
                 prefixes = self._transaction_prefix_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _transaction_to_compact_line(
                         t, focus_account=focus_fullname, prefixes=prefixes
                     )
-                    for t in filtered
+                    for t in page
                 ]
-                notice = self._truncation_notice(
-                    total=total_matched,
-                    shown=len(filtered),
-                    effective_limit=effective_limit,
-                    capped=capped,
-                    suggest_narrow=True,
-                )
-                if notice:
-                    lines.append(notice)
                 return "\n".join(lines)
             else:
                 # Verbose also emits short prefixes — every
@@ -2325,51 +2362,21 @@ class CoreMixin:
                 txn_prefixes = self._transaction_prefix_map(book)
                 split_prefixes = self._split_prefix_map(book)
                 lot_prefixes = self._lot_prefix_map(book)
-                return [
-                    _transaction_to_dict(
-                        t,
-                        txn_prefixes=txn_prefixes,
-                        split_prefixes=split_prefixes,
-                        lot_prefixes=lot_prefixes,
-                    )
-                    for t in filtered
-                ]
-
-    @staticmethod
-    def _truncation_notice(
-        total: int,
-        shown: int,
-        effective_limit: int,
-        capped: bool,
-        suggest_narrow: bool = True,
-    ) -> str | None:
-        """Build a truncation-notice line, or return None if no notice needed.
-
-        Emits one of:
-          - "[Limit capped at 250 — narrow your criteria for larger datasets]"
-            when the caller's limit exceeded MAX_LIST_LIMIT AND results fit.
-          - "[Showing N of M transactions — use start_date/end_date to narrow,
-             or set limit= higher]" when results were truncated (capped or not).
-          - None when total <= shown (everything fit).
-        """
-        if total <= shown:
-            if capped:
-                return (
-                    f"[Limit capped at {effective_limit} — results fit under "
-                    f"the cap]"
-                )
-            return None
-        if capped:
-            return (
-                f"[Showing {shown} of {total} transactions — limit was capped "
-                f"at {effective_limit}; narrow your criteria for complete "
-                f"results]"
-            )
-        hint = (
-            "use start_date/end_date to narrow, or set limit= higher"
-            if suggest_narrow else "set limit= higher"
-        )
-        return f"[Showing {shown} of {total} transactions — {hint}]"
+                return {
+                    "showing": indicator,
+                    "total": len(filtered),
+                    "offset": offset,
+                    "count": len(page),
+                    "transactions": [
+                        _transaction_to_dict(
+                            t,
+                            txn_prefixes=txn_prefixes,
+                            split_prefixes=split_prefixes,
+                            lot_prefixes=lot_prefixes,
+                        )
+                        for t in page
+                    ],
+                }
 
     def get_transaction(self, guid: str) -> dict | None:
         """Get details for a specific transaction by GUID.
@@ -2976,6 +2983,13 @@ class CoreMixin:
             warnings = self._generate_warnings(
                 trans_date, splits, resolved_accounts
             )
+            # Cross-commodity implied-rate sanity (decimal slips,
+            # inverted pairs) — non-blocking, caught at entry.
+            warnings.extend(
+                self._fx_sanity_warnings(
+                    book, validated, trans_currency, trans_date,
+                )
+            )
             proposed_pattern = self._extract_account_pattern(resolved_accounts)
             # Recent matches were gathered pre-write, so the new txn
             # is automatically absent.
@@ -3032,32 +3046,242 @@ class CoreMixin:
                 result["auto_filled_from"] = auto_filled_from
             return result
 
+    def create_transactions(
+        self,
+        transactions: list[dict],
+        force: bool = False,
+        dry_run: bool = False,
+        on_error: str = "abort",
+    ) -> dict:
+        """Create multiple transactions in one atomic save.
+
+        Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
+        ``{ref, date (date), description, splits: [{account, amount}]}``.
+
+        Three phases under one book-open: validate all structurally,
+        screen each against existing-book duplicates, then build every
+        accepted transaction and ``save()`` once. ``on_error="abort"``
+        (default) sinks the whole batch on any structural failure;
+        ``"skip"`` keeps the good rows. A HIGH duplicate rejects only
+        its own row (``force=True`` overrides).
+
+        Returns a thin envelope: ``results`` TSV (always) and
+        ``duplicates`` TSV (only when a match exists; otherwise empty,
+        which ``_strip_noise`` drops). v1 is same-currency (book
+        default), no per-split memo, no intra-batch dedup — exotic cases
+        use ``create_transaction``.
+        """
+        if on_error not in ("abort", "skip"):
+            raise ValueError("on_error must be 'abort' or 'skip'")
+        refs = [t["ref"] for t in transactions]
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                "duplicate ref in batch — each ref must be unique"
+            )
+        readonly = dry_run
+        by_ref: dict = {}        # ref -> final result row
+        dup_rows: list = []      # (ref, candidate-dict) for the FK table
+
+        with self.open(readonly=readonly) as book:
+            default_currency = self._require_default_currency(book)
+
+            # --- Phase 1: structural validation (every row) ---
+            prepared = []
+            for txn in transactions:
+                ref = txn["ref"]
+                try:
+                    splits = txn["splits"]
+                    if len(splits) < 2:
+                        raise ValueError("at least 2 splits required")
+                    validated = self._validate_transaction_splits(
+                        book, splits, default_currency,
+                    )
+                    for v in validated:
+                        if v["account"].placeholder:
+                            raise ValueError(
+                                f"account '{v['account'].fullname}' is a "
+                                f"placeholder and cannot receive splits"
+                            )
+                    prepared.append({
+                        "ref": ref,
+                        "description": txn["description"],
+                        "trans_date": txn["date"],
+                        "validated": validated,
+                        "proposed_amounts": [
+                            abs(_to_decimal(s["amount"])) for s in splits
+                        ],
+                    })
+                except (ValueError, KeyError) as e:
+                    by_ref[ref] = {
+                        "ref": ref, "status": "rejected", "reason": str(e),
+                    }
+
+            # abort: any structural failure sinks the batch — the valid
+            # rows report batch_aborted, nothing is written.
+            if by_ref and on_error == "abort":
+                for p in prepared:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "rejected",
+                        "reason": "batch_aborted",
+                    }
+                return self._batch_envelope(transactions, by_ref, [])
+
+            # --- Phase 2: duplicate screen (against existing book) ---
+            accepted = []
+            for p in prepared:
+                signals = self._collect_create_signals(
+                    book, p["description"], p["trans_date"],
+                    p["proposed_amounts"],
+                    want_auto_fill=False, want_stability=False,
+                    want_duplicates=True, want_recent=False,
+                )
+                dups = signals.duplicates
+                for d in dups:
+                    dup_rows.append((p["ref"], d))
+                if signals.has_high_duplicate and not force:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "rejected",
+                        "reason": "duplicate_detected", "dup_count": len(dups),
+                    }
+                else:
+                    accepted.append((p, len(dups)))
+
+            # Cross-commodity implied-rate sanity per accepted row
+            # (non-blocking) — surfaced as a side table keyed by ref,
+            # so a decimal slip in a bulk import is caught too.
+            warn_rows: list = []
+            for p, _dc in accepted:
+                for w in self._fx_sanity_warnings(
+                    book, p["validated"], default_currency, p["trans_date"],
+                ):
+                    warn_rows.append((p["ref"], w["message"]))
+
+            # --- Phase 3: build all accepted rows, one save ---
+            if dry_run:
+                for p, dup_count in accepted:
+                    by_ref[p["ref"]] = {
+                        "ref": p["ref"], "status": "would_create",
+                        "dup_count": dup_count,
+                    }
+                return self._batch_envelope(
+                    transactions, by_ref, dup_rows, warn_rows,
+                )
+
+            built = []
+            for p, dup_count in accepted:
+                piecash_splits = [
+                    piecash.Split(
+                        account=v["account"], value=v["value"],
+                        quantity=v["quantity"], memo=v["memo"] or "",
+                    )
+                    for v in p["validated"]
+                ]
+                txn_obj = piecash.Transaction(
+                    currency=default_currency,
+                    description=p["description"],
+                    post_date=p["trans_date"],
+                    splits=piecash_splits,
+                )
+                built.append((p["ref"], txn_obj, dup_count))
+
+            # Single flush for the whole batch — per the "don't flush
+            # mid-build" rule, every Transaction is fully constructed
+            # before the one save.
+            book.save()
+
+            all_guids = [t.guid for t in book.transactions]
+            for ref, txn_obj, dup_count in built:
+                by_ref[ref] = {
+                    "ref": ref, "status": "created",
+                    "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
+                    "dup_count": dup_count,
+                }
+
+            return self._batch_envelope(
+                transactions, by_ref, dup_rows, warn_rows,
+            )
+
+    def _batch_envelope(
+        self, transactions: list[dict], by_ref: dict, dup_rows: list,
+        warn_rows: list | None = None,
+    ) -> dict:
+        """Assemble the {results, duplicates, warnings} TSV envelope in
+        input order. Empty ``duplicates`` / ``warnings`` render as "" so
+        _strip_noise drops them — absence of the key means none."""
+        rows = [by_ref[t["ref"]] for t in transactions]
+        return {
+            "results": self._batch_results_to_tsv(rows),
+            "duplicates": self._batch_duplicates_to_tsv(dup_rows),
+            "warnings": self._batch_warnings_to_tsv(warn_rows or []),
+        }
+
+    @staticmethod
+    def _batch_warnings_to_tsv(warn_rows: list) -> str:
+        """WARNINGS table: ``ref<TAB>message`` per flagged row, FK to
+        results. Empty string when nothing was flagged."""
+        if not warn_rows:
+            return ""
+        lines = ["ref\tmessage"]
+        for ref, message in warn_rows:
+            lines.append(f"{ref}\t{message}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _batch_results_to_tsv(rows: list[dict]) -> str:
+        """RESULTS table: header + one row per input transaction.
+        Blank cells for fields a given status doesn't carry; ``dup_count``
+        of 0 renders as "0", absent renders blank."""
+        header = "ref\tstatus\ttxn_guid\tdup_count\treason"
+        lines = [header]
+        for r in rows:
+            dup = r["dup_count"] if "dup_count" in r else ""
+            lines.append(
+                f"{r['ref']}\t{r['status']}\t{r.get('txn_guid', '')}\t"
+                f"{dup}\t{r.get('reason', '')}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _batch_duplicates_to_tsv(dup_rows: list) -> str:
+        """DUPLICATES table: single-entry's column order with ``ref``
+        prepended as the FK. Empty string when no row has a match."""
+        if not dup_rows:
+            return ""
+        lines = ["ref\tconfidence\tguid\tdate\tamount\tdescription\tsignals"]
+        for ref, d in dup_rows:
+            lines.append(
+                f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
+                f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            )
+        return "\n".join(lines)
+
     def search_transactions(
         self,
         query: str,
         field: str = "description",
         limit: int = 50,
+        offset: int = 0,
         compact: bool = True,
-    ) -> list[dict] | str:
+    ) -> dict | str:
         """Search transactions by field.
 
-        Truncation mirrors ``list_transactions`` (notice + 250 cap).
+        Pagination mirrors ``list_transactions`` (``Showing X-Y of Z``
+        indicator + offset + 250 cap).
 
         Args:
             query: Search string. For 'amount': exact ("100.00"),
                 ">100", "<100", or range "100-200".
             field: 'description', 'memo', 'notes', or 'amount'.
-            limit: Maximum to return. Capped at 250.
-            compact: One line per transaction (default) or dicts.
+            limit: Page size. Capped at 250. ``0`` = count only.
+            offset: 0-indexed first row to return.
+            compact: One line per transaction (default) or a verbose
+                envelope.
 
         Raises:
             ValueError: If field is not valid.
         """
         if field not in ("description", "memo", "notes", "amount"):
             raise ValueError(f"Invalid search field: {field}")
-
-        capped = limit > self.MAX_LIST_LIMIT
-        effective_limit = min(limit, self.MAX_LIST_LIMIT)
 
         with self.open(readonly=True) as book:
             matched = []
@@ -3095,28 +3319,34 @@ class CoreMixin:
                 key=lambda t: t.post_date or date.min, reverse=True
             )
 
-            total_matched = len(matched)
-            matched = matched[:effective_limit]
+            page, indicator = _paginate(
+                matched,
+                offset=offset,
+                limit=limit,
+                max_cap=self.MAX_LIST_LIMIT,
+                entity_name="transactions",
+                date_key=lambda t: t.post_date,
+            )
 
             if compact:
                 # Prefix map cached by book mtime.
                 prefixes = self._transaction_prefix_map(book)
-                lines = [
+                lines = [indicator]
+                lines += [
                     _transaction_to_compact_line(t, prefixes=prefixes)
-                    for t in matched
+                    for t in page
                 ]
-                notice = self._truncation_notice(
-                    total=total_matched,
-                    shown=len(matched),
-                    effective_limit=effective_limit,
-                    capped=capped,
-                    suggest_narrow=False,  # no date-range hint on search
-                )
-                if notice:
-                    lines.append(notice)
                 return "\n".join(lines)
             else:
-                return [_transaction_to_dict(t) for t in matched]
+                return {
+                    "showing": indicator,
+                    "total": len(matched),
+                    "offset": offset,
+                    "count": len(page),
+                    "transactions": [
+                        _transaction_to_dict(t) for t in page
+                    ],
+                }
 
     def _match_amount(self, transaction: piecash.Transaction, query: str) -> bool:
         """Check if any split amount matches the query.
@@ -3771,6 +4001,8 @@ class CoreMixin:
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
 
+            fx_warnings: list[dict] = []
+
             # Update description if provided
             if description is not None:
                 transaction.description = description
@@ -3792,6 +4024,10 @@ class CoreMixin:
                 # (see _validate_transaction_splits).
                 validated = self._validate_transaction_splits(
                     book, splits, trans_currency,
+                )
+                fx_warnings = self._fx_sanity_warnings(
+                    book, validated, trans_currency,
+                    trans_date or transaction.post_date,
                 )
 
                 # Build a map keyed by resolved-account-fullname so we
@@ -3842,12 +4078,15 @@ class CoreMixin:
             short_guid = _unique_prefix(
                 transaction.guid, (t.guid for t in book.transactions)
             )
-            return {
+            result = {
                 "guid": short_guid,
                 "date": transaction.post_date.isoformat(),
                 "description": transaction.description,
                 "status": "updated",
             }
+            if fx_warnings:
+                result["warnings"] = fx_warnings
+            return result
 
     def replace_splits(
         self,
@@ -3962,6 +4201,7 @@ class CoreMixin:
 
             # 7. Create new splits
             trans_currency = transaction.currency
+            fx_check_splits: list[dict] = []
             for account, split_data in resolved_accounts:
                 amount = _to_decimal(split_data["amount"])
 
@@ -3984,6 +4224,9 @@ class CoreMixin:
                         f"transaction currency ({trans_currency.mnemonic})"
                     )
 
+                fx_check_splits.append({
+                    "account": account, "value": amount, "quantity": quantity,
+                })
                 piecash.Split(
                     account=account,
                     value=amount,
@@ -3991,6 +4234,15 @@ class CoreMixin:
                     memo=split_data.get("memo", ""),
                     transaction=transaction,
                 )
+
+            # Cross-commodity implied-rate sanity (non-blocking) — this
+            # path's warnings are plain strings, so emit messages.
+            warnings.extend(
+                w["message"] for w in self._fx_sanity_warnings(
+                    book, fx_check_splits, trans_currency,
+                    transaction.post_date,
+                )
+            )
 
             # 8. Save
             book.save()

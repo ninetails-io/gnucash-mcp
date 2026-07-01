@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Generator, Iterable
@@ -923,6 +923,327 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             if account.fullname == fullname:
                 return account
         return None
+
+    def _top_level_account_of_type(
+        self, book: piecash.Book, acct_type: str
+    ) -> "tuple[piecash.Account | None, dict | None]":
+        """Find the top-level account of a given ``GNCAccountType``.
+
+        "Top-level" = a direct child of the real root account. This is
+        the locale-invariant replacement for English-name parent
+        lookups such as ``_find_account(book, "Income")``: it keys off
+        ``type`` and ``parent is root``, never a name, so it works on a
+        localized book (German "Erträge", etc.) **and** survives a user
+        renaming the account. Account *types* are never localized;
+        names always are.
+
+        Returns ``(account, notice)``:
+
+        - exactly one match → ``(account, None)``
+        - several → the lowest-``fullname`` pick plus an
+          ``ambiguous_top_level_account`` notice (mirrors the
+          ``ambiguous_fx_account`` convention so callers can surface it)
+        - none → ``(None, None)``
+
+        The scheduled-transaction template subtree is excluded, as
+        everywhere else accounts are surfaced.
+        """
+        root = book.root_account
+        template_guids = self._template_account_guids(book)
+        candidates = sorted(
+            (
+                a
+                for a in book.accounts
+                if a.guid not in template_guids
+                and a.type == acct_type
+                and a.parent is not None
+                and a.parent.guid == root.guid
+            ),
+            key=lambda a: a.fullname,
+        )
+        if not candidates:
+            return None, None
+        if len(candidates) == 1:
+            return candidates[0], None
+        chosen = candidates[0]
+        names = ", ".join(a.fullname for a in candidates)
+        notice = {
+            "type": "ambiguous_top_level_account",
+            "account_type": acct_type,
+            "candidates": [a.fullname for a in candidates],
+            "chosen": chosen.fullname,
+            "message": (
+                f"Found {len(candidates)} top-level {acct_type} "
+                f"accounts ({names}); using {chosen.fullname!r}. Pass "
+                f"an explicit account to override."
+            ),
+        }
+        return chosen, notice
+
+    # GnuCash names its auto-created balancing accounts via gettext —
+    # ``_("Imbalance")-<CUR>`` and ``_("Orphan")-<CUR>`` (Scrub.cpp) —
+    # so the leading word is localized. An English-only prefix check
+    # misses them on a localized book and the data-integrity warning
+    # goes dark. These are the catalog translations of "Imbalance" and
+    # "Orphan" for every shipped GnuCash locale, extracted from
+    # po/<lang>.po (stable branch); fuzzy and untranslated entries are
+    # excluded — GnuCash's runtime ignores fuzzy, and an untranslated
+    # locale falls back to the English forms, which are listed. Lower-
+    # cased; a leaf name that STARTS WITH any of them is a balancing
+    # account (the "-<CUR>" suffix, when present, follows the word).
+    # Regenerate via the recipe in specs/gnucash-account-naming-i18n.md.
+    _BALANCING_ACCOUNT_NAME_PREFIXES = frozenset(
+        s.lower()
+        for s in (
+            # "Imbalance" — every shipped GnuCash locale
+            'Ausgleichskonto', 'Açık', 'Chưa cân bằng', 'Debalans',
+            'Descuadre', 'Desequilibri', 'Desequilibrio',
+            'Desequilíbrio', 'Deskoadratzea', 'Dezechilibru',
+            'Disbalansas', 'Epätasapaino', 'Imbalance',
+            'Kiegyenlítés', 'Nerovnováha', 'Nevyváženost',
+            'Niet in balans', 'Niezrównoważenie', 'Non soldé',
+            'Obalans', 'Sbilancio', 'Starpība', 'Tak-seimbang',
+            'Ubalance', 'Ubalanse', 'osomotolon', 'Χωρίς ισοζύγιο',
+            'Дебаланс', 'Дисбаланс', 'Невідповідність', 'Неравнена',
+            'חוסר איזון', 'حساب عدم التوازن', 'عدم تناسب', 'ناتراز',
+            'असंतुलन', 'असंतुलित', 'असन्तुलित', 'गॊर मसावात',
+            'समानथायगैयै', 'অসমতা', 'ইমবেলেন্স', 'અસંતુલિત',
+            'சமநிலையில்லாத', 'అసమతుల్యం', 'ಅಸಮತೋಲನ', '不平衡的', '失調',
+            '貸借不一致', 'ꯏꯝꯕꯦꯂꯦꯟꯁ', '대차 불일치',
+            # "Orphan" — every shipped GnuCash locale
+            'Apleistas', 'Ausbuchungskonto', 'Açık', 'Egyedülálló',
+            'Foreldreløs', 'Föräldralös', 'Hittebarn', 'Huérfano',
+            'Nepovezano', 'Nesaistīts', 'Orfan', 'Orfano', 'Orfe',
+            'Orphan', 'Orphelin', 'Orpo', 'Osierocone', 'Sirota',
+            'Sirotek', 'Terlantar', 'Thừa', 'Umezurtza', 'Verweesd',
+            'onath', 'Órfã', 'Órfão', 'Ορφανό', 'Занедбаний',
+            'Изоставена', 'Напуштено', 'Упущенный', 'יתומים',
+            'حساب الأيتام', 'یتیم', 'अनाथ', 'आरफन', 'बेवारिसी',
+            'मावरिया', 'लावारस', 'लावारिस', 'অনাথ', 'ওর্ফান',
+            'આધાર વિનાનું', 'கைவிடப்பட்டது', 'అనాథ', 'ಆರ್ಫನ್', '不明',
+            '孤立的', '無主的', 'ꯑꯣꯔꯐꯥꯟ', '고아',
+        )
+    )
+
+    def _is_auto_balancing_account(
+        self, account: piecash.Account, root: piecash.Account
+    ) -> bool:
+        """True iff ``account`` is a GnuCash auto-created Imbalance or
+        Orphan balancing account.
+
+        A non-zero balance on one of these is a structural defect the
+        dashboard surfaces. Locale-robust: match by **structure** —
+        type ``BANK``, a direct child of root (both invariants of how
+        GnuCash hangs these accounts) — plus a leading word from the
+        known Imbalance/Orphan catalog translations. Unknown locales
+        degrade to the English forms; the structural gate keeps false
+        positives off ordinary user accounts. (``Orphaned Gains`` is
+        deliberately excluded — it is type ``INCOME``, a legitimate
+        account, not a defect.)
+        """
+        if account.type != "BANK":
+            return False
+        if account.parent is None or account.parent.guid != root.guid:
+            return False
+        leaf = account.name.lower()
+        return any(
+            leaf.startswith(p)
+            for p in self._BALANCING_ACCOUNT_NAME_PREFIXES
+        )
+
+    # ── Book-locale inference + localized account names (§6.3) ────────
+    #
+    # When we auto-create an FX/discount account on a localized book we
+    # give it a localized leaf name so it reads naturally in the user's
+    # language. This is purely cosmetic: resolution after first use is
+    # GUID-based (the Layer-0 designated-account slot), so the leaf name
+    # never participates in finding the account again — an English
+    # fallback is always safe and never blocks.
+    #
+    # gettext (po/<lang>.po) translations of the five structural type
+    # words, keyed by GNCAccountType, used ONLY to infer the book locale
+    # from its top-level accounts (voting; >=2 matches win). Extracted
+    # from every shipped GnuCash po catalog that has all five words AND a
+    # Realized Gain/Loss name (47 locales); inference and naming move
+    # together, so a detected locale always has a leaf name. Locale keys
+    # are normalized codes (pt_BR→pt, zh_CN→zh); variant files that would
+    # collide on a key are skipped. Regenerate per gnucash-account-
+    # naming-i18n.md.
+    _STRUCTURAL_TYPE_NAMES = {
+        "ar": {"ASSET": "الأصول", "LIABILITY": "الالتزامات", "INCOME": "الدخل", "EXPENSE": "المصروفات", "EQUITY": "حقوق الملكية"},
+        "as": {"ASSET": "সম্পত্তিবোৰ", "LIABILITY": "বিশ্বাসযোগ্যতাবোৰ", "INCOME": "উপাৰ্জন", "EXPENSE": "ব্যয়বোৰ", "EQUITY": "সাধাৰণ অংশ"},
+        "bg": {"ASSET": "Активи:", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
+        "brx": {"ASSET": "सम्पति", "LIABILITY": "दाहार", "INCOME": "आय", "EXPENSE": "खरसा", "EQUITY": "बन्दक"},
+        "ca": {"ASSET": "Actiu", "LIABILITY": "Passiu", "INCOME": "Ingressos", "EXPENSE": "Despeses", "EQUITY": "Patrimoni"},
+        "cs": {"ASSET": "Aktiva", "LIABILITY": "Pasiva", "INCOME": "Příjmy", "EXPENSE": "Náklady", "EQUITY": "Vlastní jmění"},
+        "da": {"ASSET": "Aktiver", "LIABILITY": "Passiver", "INCOME": "Indtægt", "EXPENSE": "Udgifter", "EQUITY": "Egenkapital"},
+        "de": {"ASSET": "Aktiva", "LIABILITY": "Fremdkapital", "INCOME": "Ertrag", "EXPENSE": "Aufwand", "EQUITY": "Eigenkapital"},
+        "doi": {"ASSET": "जैदाद", "LIABILITY": "देनदारियां", "INCOME": "आमदन", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "el": {"ASSET": "Ενεργητικό", "LIABILITY": "Παθητικό", "INCOME": "Έσοδα", "EXPENSE": "Έξοδα", "EQUITY": "Καθαρή θέση"},
+        "es": {"ASSET": "Activos", "LIABILITY": "Pasivos", "INCOME": "Ingreso", "EXPENSE": "Gastos", "EQUITY": "Patrimonio"},
+        "fi": {"ASSET": "Vastaavaa", "LIABILITY": "Vieras pääoma", "INCOME": "Tulo", "EXPENSE": "Menot", "EQUITY": "Oma pääoma"},
+        "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)", "INCOME": "Revenus", "EXPENSE": "Dépenses", "EQUITY": "Capitaux propres"},
+        "gu": {"ASSET": "સંપત્તિઓ", "LIABILITY": "જવાબદારી", "INCOME": "આવક", "EXPENSE": "ખર્ચ", "EQUITY": "હિસ્સો"},
+        "he": {"ASSET": "נכסים", "LIABILITY": "התחייבויות", "INCOME": "הכנסות", "EXPENSE": "הוצאות", "EQUITY": "הון"},
+        "hi": {"ASSET": "संपत्तियां ", "LIABILITY": "देयताएं ", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "hr": {"ASSET": "Imovina", "LIABILITY": "Obveze", "INCOME": "Prihod", "EXPENSE": "Rashod", "EQUITY": "Kapital"},
+        "hu": {"ASSET": "Eszközök", "LIABILITY": "Kötelezettségek", "INCOME": "Bevétel", "EXPENSE": "Kiadások", "EQUITY": "Saját tőke"},
+        "id": {"ASSET": "Aset", "LIABILITY": "Liabilitas", "INCOME": "Pendapatan", "EXPENSE": "Pengeluaran", "EQUITY": "Ekuitas"},
+        "it": {"ASSET": "Attività", "LIABILITY": "Passività", "INCOME": "Entrate", "EXPENSE": "Uscite", "EQUITY": "Patrimonio netto"},
+        "ja": {"ASSET": "資産", "LIABILITY": "負債", "INCOME": "収益", "EXPENSE": "費用", "EQUITY": "純資産"},
+        "kn": {"ASSET": "ಆಸ್ತಿಗಳು", "LIABILITY": "ಹೊಣೆಗಾರಿಕೆಗಳು", "INCOME": "ಆದಾಯ", "EXPENSE": "ಖರ್ಚುಗಳು", "EQUITY": "ಈಕ್ವಿಟಿ"},
+        "ko": {"ASSET": "자산", "LIABILITY": "부채", "INCOME": "수입", "EXPENSE": "비용", "EQUITY": "자기자본"},
+        "kok": {"ASSET": "एसेट्स", "LIABILITY": "देणी", "INCOME": "उत्पन्न", "EXPENSE": "खर्च", "EQUITY": "समभाग"},
+        "ks": {"ASSET": "एिसीट", "LIABILITY": "लायबोलटी", "INCOME": "ईनकम", "EXPENSE": "खरचो", "EQUITY": "बराबरी"},
+        "lt": {"ASSET": "Turtas", "LIABILITY": "Įsipareigojimai", "INCOME": "Pajamos", "EXPENSE": "Sąnaudos", "EQUITY": "Nuosavybė"},
+        "lv": {"ASSET": "Aktīvi", "LIABILITY": "Pasīvi", "INCOME": "Ieņēmumi", "EXPENSE": "izdevumi", "EQUITY": "Pašu kapitāls"},
+        "mai": {"ASSET": "संपत्ति", "LIABILITY": "देयता", "INCOME": "आय", "EXPENSE": "खर्च", "EQUITY": "इक्विटी"},
+        "mni": {"ASSET": "ꯂꯟ-ꯊꯨꯝ", "LIABILITY": "ꯂꯥꯏꯌꯕꯤꯂꯤꯇꯤꯁ", "INCOME": "ꯏꯟꯀꯝ", "EXPENSE": "ꯆꯥꯗꯤꯡ", "EQUITY": "ꯏꯀꯨꯏꯇꯤ"},
+        "mr": {"ASSET": "मालमत्ता", "LIABILITY": "दायित्व", "INCOME": "मिळकत", "EXPENSE": "खर्च", "EQUITY": "इक्विटी"},
+        "nb": {"ASSET": "Eiendeler", "LIABILITY": "Gjeld", "INCOME": "Inntekt", "EXPENSE": "Kostnader", "EQUITY": "Egenkapital"},
+        "ne": {"ASSET": "सम्पत्ति", "LIABILITY": "दायित्व", "INCOME": "आम्दानी", "EXPENSE": "खर्चहरु", "EQUITY": "इक्युटी"},
+        "nl": {"ASSET": "Activa", "LIABILITY": "Vreemd vermogen", "INCOME": "Opbrengsten", "EXPENSE": "Kosten", "EQUITY": "Eigen vermogen"},
+        "pl": {"ASSET": "Aktywa", "LIABILITY": "Pasywa", "INCOME": "Przychody", "EXPENSE": "Wydatki", "EQUITY": "Kapitał własny"},
+        "pt": {"ASSET": "Ativos", "LIABILITY": "Passivos", "INCOME": "Receita", "EXPENSE": "Despesas", "EQUITY": "Patrimônio líquido"},
+        "ro": {"ASSET": "Active", "LIABILITY": "Pasive", "INCOME": "Venituri", "EXPENSE": "Cheltuieli", "EQUITY": "Capital propriu"},
+        "ru": {"ASSET": "Активы", "LIABILITY": "Обязательства", "INCOME": "Приход", "EXPENSE": "Расходы", "EQUITY": "Собственные средства"},
+        "sk": {"ASSET": "Aktíva", "LIABILITY": "Pasíva", "INCOME": "Príjem", "EXPENSE": "Výdavky", "EQUITY": "Vlastné imanie"},
+        "sr": {"ASSET": "Добра", "LIABILITY": "Дуговања", "INCOME": "Приход", "EXPENSE": "Расходи", "EQUITY": "Акција"},
+        "sv": {"ASSET": "Tillgångar", "LIABILITY": "Skulder", "INCOME": "Inkomst", "EXPENSE": "Utgifter", "EQUITY": "Eget kapital"},
+        "ta": {"ASSET": "சொத்துக்கள்", "LIABILITY": "பொறுப்பீடுகள்", "INCOME": "ஊதியம்", "EXPENSE": "செலவுகள்", "EQUITY": "உறுப்பு"},
+        "te": {"ASSET": "ఆస్తులు", "LIABILITY": "అప్పులు", "INCOME": "ఆదాయం", "EXPENSE": "వ్యయాలు", "EQUITY": "ఈక్విటీ"},
+        "tr": {"ASSET": "Varlıklar", "LIABILITY": "Y.Kaynaklar", "INCOME": "Gelir", "EXPENSE": "Gider", "EQUITY": "Özkaynak"},
+        "uk": {"ASSET": "Активи", "LIABILITY": "Зобов'язання", "INCOME": "Надходження", "EXPENSE": "Видатки", "EQUITY": "Маржа"},
+        "ur": {"ASSET": "مالیات", "LIABILITY": "ادائیگی", "INCOME": "آمدنی", "EXPENSE": "خرچ", "EQUITY": "اكویٹی"},
+        "vi": {"ASSET": "Tài sản", "LIABILITY": "Tài sản nợ", "INCOME": "Thu nhập", "EXPENSE": "Phí tổn", "EQUITY": "Cổ phần"},
+        "zh": {"ASSET": "资产", "LIABILITY": "负债", "INCOME": "收入", "EXPENSE": "支出", "EQUITY": "所有者权益"},
+    }
+
+    # Localized leaf names for the accounts we auto-create, keyed by an
+    # internal concept slug then normalized locale code. A missing
+    # concept or locale degrades to the caller's English default. The
+    # fx_gain_loss row is the "Realized Gain/Loss" translation for every
+    # shipped locale that also has a complete structural-word set (47,
+    # from po/<lang>.po), kept in lockstep with _STRUCTURAL_TYPE_NAMES.
+    # The discount concepts have no shipped GnuCash translation, so they
+    # stay English.
+    _LOCALIZED_ACCOUNT_NAMES = {
+        "fx_gain_loss": {
+            "ar": "مكسب/خسارة محقَّقة",
+            "as": "লাভ/লোচকান বুজি লোৱা হল",
+            "bg": "Реализирана печалба/загуба",
+            "brx": "आदाय खालामनाय मुलाम्फा/खहा",
+            "ca": "Guanys/pèrdues realitzats",
+            "cs": "Realizovaný zisk/ztráta",
+            "da": "Realiseret overskud/tab",
+            "de": "Realisierter Gewinn/Verlust",
+            "doi": "स्वीकृत नऱफा/ नुक्सान",
+            "el": "Πραγματοποιηθέντα Κέρδη/Ζημιές",
+            "es": "Ganancias/Pérdidas Ocurridas",
+            "fi": "Toteutuneet tulot/menot",
+            "fr": "Gains/pertes réalisés",
+            "gu": "વાસ્તવિક લાભ/નુક્શાન",
+            "he": "רוח/הפסד ממומש",
+            "hi": "वास्तविक लाभ/हानि",
+            "hr": "Ostvarena dobit/gubitak",
+            "hu": "Realizált nyereség/veszteség",
+            "id": "Keuntungan/Kerugian Direalisasikan",
+            "it": "Profitti e perdite realizzati",
+            "ja": "実現損益",
+            "kn": "ನಗದುಗೊಳಿಸಲಾದ ಗಳಿಕೆ/ನಷ್ಟ",
+            "ko": "실제 이익/손실",
+            "kok": "मेळिल्लो नफो / तोटो",
+            "ks": "रीयालायज़ीड फॊयदी /नुकसान",
+            "lt": "Patirtas pelnas/nuostolis",
+            "lv": "Realizētie ieņēmumi/zaudējumi",
+            "mai": "वास्तविक लाभ/हानि",
+            "mni": "ꯐꯪꯂꯕ ꯑꯇꯣꯡꯕ/ꯑꯃꯥꯡꯕ",
+            "mr": "विक्री करून आलेला नफा/तोटा",
+            "nb": "Realisert over-/underskudd",
+            "ne": "असूल गरिएको नाफा/नोक्सान",
+            "nl": "Gerealiseerde winst/verlies",
+            "pl": "Zyski/straty zrealizowane",
+            "pt": "Ganhos e perdas realizados",
+            "ro": "Câștiguri/pierderi realizate",
+            "ru": "Реализованная прибыль/убыток",
+            "sk": "Realizované Zisky/Straty",
+            "sr": "Остварени добитак/губитак",
+            "sv": "Reavinst/-förlust",
+            "ta": "விவரிக்கப்பட்ட இலாபம்/இழப்பு",
+            "te": "గ్రహించిన లాభం/నష్టం",
+            "tr": "Gerçekleşmiş Kazanç/Kayıp",
+            "uk": "Отримані прибутки/втрати",
+            "ur": "حقیقی نفع/ نقصان",
+            "vi": "Gia tăng/giảm thực xảy ra",
+            "zh": "已实现获利(亏损)",
+        },
+    }
+
+    def _infer_book_locale(self, book: piecash.Book) -> str | None:
+        """Infer the book's locale (a normalized 2-letter language
+        code) for naming auto-created accounts. Decided source of
+        truth (§6.3):
+
+        1. ``GNUCASH_LOCALE`` env override, reduced to its language
+           code (``de_DE.UTF-8`` → ``de``).
+        2. else **vote**: match the book's top-level type accounts
+           against the gettext structural-word catalog; the language
+           with the most matches wins (>= 2, so a single coincidental
+           hit doesn't drive inference).
+        3. else ``None`` → English leaf names.
+
+        Voting (not a single-account lookup) sidesteps the two-
+        translation-sources trap: a German book's top-level income is
+        the template word "Erträge", which does NOT equal the gettext
+        "Ertrag" — but Assets/Expenses/Equity ("Aktiva"/"Aufwand"/
+        "Eigenkapital") match exactly, so German still resolves. A
+        numbered chart like SKR03 matches too few to trigger and
+        correctly falls back to English.
+        """
+        import os
+        override = os.environ.get("GNUCASH_LOCALE")
+        if override:
+            code = override.strip().split(".")[0].split("_")[0].lower()
+            return code or None
+
+        root = book.root_account
+        template_guids = self._template_account_guids(book)
+        names_by_type: dict[str, list[str]] = {}
+        for acct in book.accounts:
+            if acct.guid in template_guids:
+                continue
+            if acct.parent is None or acct.parent.guid != root.guid:
+                continue
+            names_by_type.setdefault(acct.type, []).append(
+                acct.name.strip().lower()
+            )
+        if not names_by_type:
+            return None
+
+        best_lang, best_score = None, 0
+        for lang, type_words in self._STRUCTURAL_TYPE_NAMES.items():
+            score = sum(
+                1
+                for atype, word in type_words.items()
+                if any(n == word.lower() for n in names_by_type.get(atype, ()))
+            )
+            if score > best_score:
+                best_lang, best_score = lang, score
+        return best_lang if best_score >= 2 else None
+
+    def _locale_account_name(
+        self, concept: str, english_default: str, locale: str | None,
+    ) -> str:
+        """Localized leaf name for an auto-created-account ``concept``,
+        or ``english_default`` when no localization applies (``locale``
+        is None/unknown, or the concept has no translation). Cosmetic
+        only — resolution is GUID-based, so the fallback never blocks.
+        """
+        if locale is None:
+            return english_default
+        return self._LOCALIZED_ACCOUNT_NAMES.get(concept, {}).get(
+            locale, english_default
+        )
 
     # ── Short account GUIDs ───────────────────────────────────────────
     #

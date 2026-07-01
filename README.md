@@ -136,24 +136,20 @@ for the full breakdown of what's in each.
 
 ## Quick Start (5 minutes)
 
-### 1. Install
+### 1. Download
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
-uv tool install --editable ./gnucash-mcp
 ```
 
-That gives you a `gnucash-mcp` command on your PATH. `--editable`
-keeps it tracking the source, so a `git pull` shows up in the
-running server the next time it restarts. Skip `--editable` if
-you don't plan to update.
+That's the whole install — there's no build or install step. The
+client launches the server with `uv run` (next step), which syncs
+dependencies from the lockfile automatically on every start. To
+update later, just `git pull` inside the repo; the next launch
+picks up new code *and* new dependencies with nothing else to do.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
-
-> For developers working against multiple worktrees, plain
-> `uv sync` inside the project directory still works — see
-> [For developers](#for-developers) below.
 
 ### 2. Make a working copy of a sample book
 
@@ -173,15 +169,21 @@ Find your Claude Desktop config:
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this (replace the `GNUCASH_BOOK_PATH` value with your actual
-path):
+Add this — replace `/path/to/gnucash-mcp` with the repo you just
+cloned, and `GNUCASH_BOOK_PATH` with your book's path:
 
 ```json
 {
   "mcpServers": {
     "gnucash": {
-      "command": "gnucash-mcp",
-      "args": ["--modules=all"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/gnucash-mcp",
+        "gnucash-mcp",
+        "--modules=all"
+      ],
       "env": {
         "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
@@ -190,9 +192,12 @@ path):
 }
 ```
 
-`--modules=all` loads every tool (106 of them) so you can poke at
-anything. Once you know what you actually use, narrow it — see
-[choosing a module set](#choosing-a-module-set) below.
+`uv run --directory` runs the server straight from the clone,
+resyncing dependencies each launch — so a `git pull` is all it
+takes to update. `--modules=all` loads every tool (107 of them)
+so you can poke at anything. Once you know what you actually use,
+narrow it — see [choosing a module set](#choosing-a-module-set)
+below.
 
 Quit Claude Desktop completely (not just close the window —
 quit) and reopen it. Look for the hammer 🔨 icon next to the
@@ -230,6 +235,15 @@ the older XML form. To convert:
 4. Save with a new filename (e.g. `mybook-sqlite.gnucash`)
 5. **Keep the XML original as a backup.**
 
+**On Linux (Debian/Ubuntu),** SQLite3 may be missing from the
+"Data Format" drop-down entirely — GnuCash needs a backend driver
+that isn't installed by default. Close GnuCash, install it, then
+reopen and the option appears:
+
+```bash
+sudo apt update && sudo apt install libdbd-sqlite3
+```
+
 You only do this once. From then on, GnuCash and the MCP server
 both work against the same SQLite file.
 
@@ -249,18 +263,23 @@ This is an [MCP](https://modelcontextprotocol.io/) server, so
 it works with any client that speaks MCP. Notes for non–Claude
 Desktop clients:
 
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","gnucash-mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
-- **Anything else**: set `GNUCASH_BOOK_PATH` and run
-  `gnucash-mcp` directly. Any client that can spawn a command
-  and speak MCP over stdio will work.
+- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash uv run --directory /path/to/gnucash-mcp gnucash-mcp --modules=all`
+  This writes a project `.gemini/settings.json` with the server
+  registered; run `/mcp list` inside Gemini to confirm it shows
+  `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
+  a SQLite3 export, see the `libdbd-sqlite3` note above.)
+- **Anything else**: set `GNUCASH_BOOK_PATH` and run `uv run
+  --directory /path/to/gnucash-mcp gnucash-mcp`. Any client that
+  can spawn a command and speak MCP over stdio will work.
 
 ---
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 106 of them.
+`--modules=all` is the easy default — every tool, 107 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
@@ -288,7 +307,7 @@ Pick one or more, comma-separated:
 examples above is for clarity. The leaf modules behind each
 group (`reconciliation`, `reporting`, `budgets`, `scheduling`,
 `tax_lots`, `portfolio`, etc.) are individually selectable too —
-run `gnucash-mcp --help` for the full menu.
+run `uv run gnucash-mcp --help` from the repo for the full menu.
 
 ---
 
@@ -423,79 +442,55 @@ args.
 
 ---
 
-## What's in v1.3.1
+## What's in v1.4.0
 
-This release fills in the business-feature complement promised
-since v1.2 and lands a deep correctness pass on the surfaces
-that were left rough — backed by an adversarial review of the
-whole codebase before the release branch opened.
+The first widely-promoted release. v1.3 finished the business
+module; v1.4 makes the server work correctly on non-English books,
+adds bulk and multi-book workflows, and lands a second
+multi-currency correctness pass.
 
-**Stage 3 business features:**
+**Internationalization:**
 
-- **Taxtables** — per-line-item sales-tax templates that flow
-  through invoice, bill, voucher, and credit-note posting.
-- **Jobs** — multi-invoice project containers so a freelancer
-  can group all the invoices on one engagement under a single
-  client deliverable.
-- **Credit notes** — refund instruments with explicit
-  apply-to-invoice linkage, recognized as negative invoices
-  through the same posting machinery.
-- **Employee expense vouchers** — full lifecycle (`create_voucher`,
-  `add_voucher_entry`, `post_invoice`, `pay_invoice`) for
-  reimbursement workflows.
+- Account resolution keys off `GNCAccountType`, never a localized
+  account *name* — so a `de_DE`, `es_MX`, or `zh_CN` book resolves
+  Income, Imbalance, and FX accounts correctly. Designated
+  accounts (FX gain/loss, discounts) self-heal via a KVP slot that
+  is locale- and rename-proof after first use.
+- Suspense / Imbalance accounts are excluded from runway and
+  low-cash signals so a lopsided book doesn't skew the dashboard.
+- Three synthetic personas ship in-repo: **Alex** (USD), **Lin
+  Wei** (CNY, zh_CN chart of accounts), and **Sabine Brenner**
+  (German DATEV SKR03, EUR) — the German book is what makes the
+  i18n bug class visible.
 
-**Role-aligned `--modules` partition:**
+**Batch and multi-book workflows:**
 
-- `--modules=core` always-on (the ledger primitives plus
-  reconciliation, backups, and slot-based metadata).
-- Add `bookkeeper`, `investor`, or `business` to pick the
-  persona you're serving. Each is a transparent group alias
-  over leaf modules so `--modules=freelancer` or `--modules=portfolio`
-  picks a finer cut when you want one. `get_server_config`
-  shows the exact expansion at startup.
+- `create_transactions` enters many transactions in one atomic
+  call and returns a per-transaction result you can correlate back
+  by a caller-supplied `ref`, plus a duplicates table keyed to it.
+- `GNUCASH_BOOK_PATH` accepts an `os.pathsep`-separated list of
+  books; `switch_book` flips the active book mid-session (matched
+  by unique filename prefix) with a context-reset banner so
+  cross-book references don't leak.
 
-**Honesty pass on every report:**
+**Reporting:**
 
-- Reconciliation backlog lag is computed from the OLDEST
-  unreconciled split, not the latest reconcile date — so
-  `'47 splits unreconciled (6 years behind, oldest: 2020-03-15) ⚠'`
-  tells you the real scope of the work. Pre-1.3 it would say
-  "4 months behind" on the same account.
-- `cash_flow` filters internal transfers by default — the
-  totals answer "where did money come from and where did it
-  go?" instead of "every debit and credit that touched a cash
-  account." Pass `include_transfers=true` for the gross flow
-  if you're reconciling against a bank statement.
-- Multi-currency budget targets render in the book's default
-  currency at period-end rates — no more apples-to-oranges
-  totals on books with EUR / CNY / mixed targets.
-- `balance_sheet` now closes the accounting identity — a
-  computed Unrealized gain/loss line absorbs the residual
-  between market-value assets and cost-basis equity (both
-  investment drift and FX translation under one heading).
-- Multi-currency FX bug-class swept across `spending_by_category`,
-  `income_by_source`, `cash_flow`, dashboard monthly net,
-  daily expense burn, and vendor spending. Aggregations now
-  convert quantities through the historical FX rate; pre-1.3
-  several sites summed raw quantities across currencies.
+- Every list-returning tool paginates with `offset` and a
+  `Showing X-Y of Z` indicator; dated tools also render the
+  covered date range.
+- The aggregation reports take `group_by` for sub-period columns.
 
-**Hardening:**
+**Multi-currency correctness (second pass):**
 
-- Defense-in-depth input gates on `create_account`,
-  `create_commodity`, business-entity notes and addresses,
-  audit-log date queries, slot values, void reasons.
-- Symmetric footgun guards on `prune_backups` — neither manual
-  nor auto stages can be wiped in a single call without
-  explicit opt-in.
-- Backup tool with staged retention (7 session / 4 weekly / 6
-  monthly), automatic snapshot on first write of each day, and
-  catastrophic-loss-safe defaults.
+- FX gain/loss booked in the book's default currency, both-foreign
+  posting splits valued at the posting-date rate, and lot cost
+  basis in the default currency. Foreign debts with no FX rate are
+  excluded from `debt_payoff_plan` with a warning.
+- An FX entry-sanity warning fires when a cross-currency
+  transaction's implied rate diverges sharply from the latest
+  price on file.
 
-**Plus a meaningful test-coverage step** — every chokepoint
-the release-prep arc introduced is locked with a regression
-test, including the structural `_is_unreconciled` /
-`_is_voided` predicates and the audit-dispatcher coverage
-contract.
+**Tests:** 1,714 passing.
 
 A condensed changelog of major releases lives in
 [CHANGELOG.md](CHANGELOG.md).
@@ -557,16 +552,16 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,584 tests as of v1.3.1
+uv run pytest                       # 1,714 tests as of v1.4.0
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
 
-For dev work the `uv run --directory PATH ...` form is the
-escape hatch — it lets you point Claude Desktop at a specific
-worktree without installing. The `uv tool install --editable`
-path from the Quick Start is generally cleaner for everyday
-use because the `gnucash-mcp` binary tracks your source.
+The `uv run --directory PATH ...` form the Quick Start uses is
+also how you point a client at a specific worktree — swap the
+directory and you're running that checkout, no reinstall. If you
+prefer a `gnucash-mcp` binary on your PATH instead, `uv tool
+install -e ./gnucash-mcp` still works and tracks your source.
 
 The server is built on
 [piecash](https://github.com/sdementen/piecash) (Python

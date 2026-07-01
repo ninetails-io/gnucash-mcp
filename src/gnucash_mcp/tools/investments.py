@@ -17,17 +17,27 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def list_commodities(verbose: bool = False) -> str:
+    def list_commodities(
+        verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
         """List all commodities (currencies, stocks, etc.) in the book.
 
-        Returns a compact one-line-per-commodity format by default.
-        Use verbose=true for full JSON with fraction, latest prices, etc.
+        Leads with a ``Showing X-Y of Z commodities`` line, then a
+        compact one-line-per-commodity format by default. Page with
+        ``offset``; ``limit=0`` returns the count only. Use verbose=true
+        for full JSON with fraction, latest prices, etc.
 
         Args:
             verbose: If true, return full JSON details for each commodity.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_commodities(compact=not verbose)
+        result = book.list_commodities(
+            compact=not verbose, limit=limit, offset=offset
+        )
         if verbose:
             return _json(result)
         return result
@@ -153,12 +163,15 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         limit: int = 50,
         verbose: bool = False,
+        offset: int = 0,
     ) -> str:
         """Get price history for a commodity.
 
-        Returns a compact aligned text table by default. Use
-        verbose=true for the full structured envelope (``prices`` list,
-        ``count``, ``total``, ``notice``).
+        Leads with a ``Showing X-Y of Z prices (date range)`` line, then
+        a compact aligned text table by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for the full
+        structured envelope (``prices`` list, ``showing``, ``total``,
+        ``offset``, ``count``).
 
         Args:
             commodity: Symbol of the commodity (e.g., "VTSAX").
@@ -166,8 +179,9 @@ def register(mcp, get_book) -> None:
             start_date: Optional start date filter (YYYY-MM-DD).
             end_date: Optional end date filter (YYYY-MM-DD).
             currency: Optional currency filter (e.g., "USD").
-            limit: Maximum prices to return. Defaults to 50, capped at 250.
+            limit: Page size (default 50, max 250). 0 = count only.
             verbose: If true, return the structured dict.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
         start = date_type.fromisoformat(start_date) if start_date else None
@@ -181,6 +195,7 @@ def register(mcp, get_book) -> None:
             currency=currency,
             limit=limit,
             compact=not verbose,
+            offset=offset,
         )
         if verbose:
             return _json(result)
@@ -244,19 +259,28 @@ def register(mcp, get_book) -> None:
         account: str,
         include_closed: bool = False,
         verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """List all lots for an investment account.
 
-        Returns a compact one-line-per-lot format by default.
-        Use verbose=true for full JSON with guid, title, notes, etc.
+        Leads with a ``Showing X-Y of Z lots`` line, then a compact
+        one-line-per-lot format by default. Page with ``offset``;
+        ``limit=0`` returns the count only. Use verbose=true for full
+        JSON with guid, title, notes, etc.
 
         Args:
             account: Account ref (full path, %short GUID, or full 32-char GUID).
             include_closed: If True, include fully-sold lots. Default False.
             verbose: If true, return full JSON details for each lot.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
-        result = book.list_lots(account=account, include_closed=include_closed, compact=not verbose)
+        result = book.list_lots(
+            account=account, include_closed=include_closed,
+            compact=not verbose, limit=limit, offset=offset,
+        )
         if verbose:
             return _json(result)
         return result
