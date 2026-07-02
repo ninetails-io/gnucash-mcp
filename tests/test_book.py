@@ -1803,6 +1803,69 @@ class TestGetBookSummaryRunway:
         assert "7,000" not in runway_line
         assert "2,670" in runway_line
 
+    def test_retirement_slot_marks_foreign_named_subtree(
+        self, test_book: Path,
+    ):
+        """The ``is_retirement`` slot is the locale-proof signal: a
+        subtree with no English "retirement" in any path component
+        (a zh_CN 退休金, a German Altersvorsorge) is excluded from
+        liquid once the flag is set on the parent — and the flag
+        inherits, so children need nothing."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Altersvorsorge",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="Riester-Rente",
+            account_type="BANK",
+            parent="Assets:Altersvorsorge",
+        )
+        gc.set_account_slot(
+            "Assets:Altersvorsorge", "is_retirement", "true",
+        )
+        with gc.open(readonly=False) as book:
+            acct = gc._find_account(
+                book, "Assets:Altersvorsorge:Riester-Rente",
+            )
+            assert gc._is_in_retirement_subtree(acct) is True
+            # The placeholder itself is flagged too.
+            parent = gc._find_account(book, "Assets:Altersvorsorge")
+            assert gc._is_in_retirement_subtree(parent) is True
+
+    def test_retirement_slot_false_overrides_name_fallback(
+        self, test_book: Path,
+    ):
+        """An explicit falsy slot un-marks an account the English
+        name heuristic would otherwise exclude — e.g. an HSA the
+        user keeps under their Retirement placeholder but treats
+        as spendable."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="HSA",
+            account_type="BANK",
+            parent="Assets:Retirement",
+        )
+        gc.set_account_slot(
+            "Assets:Retirement:HSA", "is_retirement", "false",
+        )
+        with gc.open(readonly=False) as book:
+            hsa = gc._find_account(book, "Assets:Retirement:HSA")
+            assert gc._is_in_retirement_subtree(hsa) is False
+            # Nearest-ancestor precedence: siblings without their own
+            # slot still fall back to the name heuristic and stay
+            # excluded.
+            parent = gc._find_account(book, "Assets:Retirement")
+            assert gc._is_in_retirement_subtree(parent) is True
+
     def test_stock_without_price_uses_cost_basis(
         self, test_book: Path,
     ):

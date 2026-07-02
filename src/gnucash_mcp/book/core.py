@@ -540,17 +540,50 @@ class CoreMixin:
     # the source of truth.
     _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
 
-    @staticmethod
-    def _is_in_retirement_subtree(account) -> bool:
-        """True if any path component of the account's fullname
-        contains "retirement" (case-insensitive).
+    # Bare slot key per the slot-naming convention (a universal
+    # financial concept another tool could plausibly converge on).
+    # Set via set_account_slot on the account or any ancestor:
+    # "1"/"true"/"yes" marks the subtree as retirement (excluded from
+    # runway/low-cash liquidity), "0"/"false"/"no" un-marks it —
+    # nearest ancestor wins, so one flag on the "Retirement"
+    # placeholder covers every account under it, and a child can
+    # opt back in.
+    _RETIREMENT_SLOT_KEY = "is_retirement"
 
-        Structural heuristic for excluding retirement accounts from
-        the runway liquid pool — users typically organize them under
-        a "Retirement" placeholder. A subtree named "Tax-advantaged"
-        slips through; the long-term answer is a slot-based
-        ``is_retirement`` flag.
+    _RETIREMENT_SLOT_TRUE = frozenset({"1", "true", "yes", "y"})
+    _RETIREMENT_SLOT_FALSE = frozenset({"0", "false", "no", "n"})
+
+    def _is_in_retirement_subtree(self, account) -> bool:
+        """True when the account is penalty-locked retirement money
+        that must not count as liquid for runway / low-cash.
+
+        Authoritative signal: the ``is_retirement`` slot on the
+        account or its nearest flagged ancestor (see the key comment
+        above) — locale- and naming-proof. Fallback when no slot is
+        set anywhere on the path: any fullname component containing
+        the English word "retirement" (case-insensitive). The
+        fallback is English-only by construction — a zh_CN
+        ``资产:投资:退休金`` or German ``Altersvorsorge`` is invisible
+        to it, which overstates runway on localized books; set the
+        slot there. A subtree named "Tax-advantaged" has the same
+        gap in any locale.
         """
+        from gnucash_mcp.book._base import _slot_value_str
+
+        node = account
+        while node is not None and node.type != "ROOT":
+            try:
+                raw = node[self._RETIREMENT_SLOT_KEY]
+            except KeyError:
+                raw = None
+            if raw is not None:
+                val = (_slot_value_str(raw) or "").strip().lower()
+                if val in self._RETIREMENT_SLOT_TRUE:
+                    return True
+                if val in self._RETIREMENT_SLOT_FALSE:
+                    return False
+                # Unrecognized value: keep walking rather than guess.
+            node = node.parent
         return any(
             "retirement" in part.lower()
             for part in account.fullname.split(":")
