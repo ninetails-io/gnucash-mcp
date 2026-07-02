@@ -338,6 +338,35 @@ item.
 
 ---
 
+## Status after the day-one fix pass (2026-07-01, same day)
+
+Five local branches off develop, **no PRs** — the bookkeeper loop
+runs when Stephen returns (July 6), PRs open after signoff. Every
+branch: full suite green; every regression test verified to fail on
+pre-fix code.
+
+| Branch | Fixes | Notes |
+|---|---|---|
+| `fix/multi-book-integrity` | MB-1, MB-4, MB-5, MB-6, MB-7 | Transactional switch_book; torn-state heal; fail-fast paths; sync-tool contract test |
+| `fix/multi-book-backup-scoping` | MB-2 | Per-book state/attempt files + stem-scoped list/prune. The **directory-layout design call** (per-book subdirs under GNUCASH_LOG_DIR, which would also retire MB-3) stays open — Stephen's call from the 2026-06-22 note |
+| `fix/i18n-fx-account-resolution` | I18N-1, I18N-2, I18N-6, I18N-4, I18N-7 | Both resolvers get the sibling-collision chokepoint; Layer-2 knows its own 47 localized leaves; gated Layer-3 adoption |
+| `fix/retirement-slot-classification` | I18N-3 | `is_retirement` slot, nearest-ancestor precedence, English keyword fallback. All three oracles byte-identical (no-slot books unchanged) |
+| `fix/groupby-partial-periods` | GB-2, GB-3 | `*` markers + footnote; bucketing guards. Labeling only, numbers unchanged |
+
+**Left for triage (deliberately not fixed without a decision):**
+- **GB-1** — the rate-anchor policy divergence between single-period
+  and group_by modes. Either direction shifts bookkeeper-validated
+  numbers; needs the design call, then a mode-agreement test.
+- **MB-3 / layout** — audit interleave under shared GNUCASH_LOG_DIR;
+  folds into the per-book-subdir design call above.
+- **I18N-5** — Imbalance-matcher false positives (all-locale prefix
+  union). The fix (require the `-<CUR>` suffix shape) changes matcher
+  behavior on real books; wants bookkeeper eyes.
+- **FX-1** — allow_after inconsistency on cost-basis fallback legs;
+  degradation-path-only, cheap, but it is a math-path change and the
+  standing rule routes those through explicit review.
+- **MB-8 / I18N-8** — info-only.
+
 *Review run 2026-07-01 by Claude (Fable 5), day one back. Two
 lenses ran as parallel deep-read agents (multi-book, i18n — both
 with live repro scripts); FX, group-by, and cross-cutting were
