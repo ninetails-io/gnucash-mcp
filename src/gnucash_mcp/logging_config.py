@@ -336,7 +336,12 @@ def setup_logging(
         # Write header if file is new
         write_header = not audit_file.exists()
 
-        audit_handler = logging.FileHandler(audit_file)
+        # Explicit UTF-8: under a C/POSIX locale (common for
+        # daemonized MCP servers) the platform default encoding is
+        # ASCII, and audit lines carrying localized account names
+        # ("已实现获利(亏损)", "Erträge:…") would hit UnicodeEncodeError
+        # inside the handler and be dropped to stderr.
+        audit_handler = logging.FileHandler(audit_file, encoding="utf-8")
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
@@ -370,7 +375,9 @@ def setup_logging(
         debug_logger.setLevel(logging.DEBUG)
         debug_logger.propagate = False
 
-        debug_handler = logging.FileHandler(debug_dir / f"{today}.log")
+        debug_handler = logging.FileHandler(
+            debug_dir / f"{today}.log", encoding="utf-8",
+        )
         debug_handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s",

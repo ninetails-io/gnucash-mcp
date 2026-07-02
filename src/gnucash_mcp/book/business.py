@@ -486,9 +486,19 @@ class BusinessMixin:
         if slotted is not None:
             return slotted, None
 
-        # Layer 2: fuzzy match by leaf-name substring. Only
+        # Layer 2: fuzzy match by leaf-name substring, plus exact
+        # match against every shipped localization of the FX leaf —
+        # the machinery must be able to re-find names it generates
+        # itself (a stale slot on a German book would otherwise miss
+        # "Realisierter Gewinn/Verlust" and collide at Layer 3). Only
         # default-currency candidates qualify — see the commodity
         # rationale on the explicit-account path above.
+        localized_fx_leaves = {
+            n.lower()
+            for n in self._LOCALIZED_ACCOUNT_NAMES.get(
+                "fx_gain_loss", {}
+            ).values()
+        }
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
@@ -499,36 +509,67 @@ class BusinessMixin:
             if account.commodity != default_currency:
                 continue
             name_lower = account.name.lower()
-            if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
+            if (
+                name_lower in localized_fx_leaves
+                or any(kw in name_lower for kw in self._FX_NAME_KEYWORDS)
+            ):
                 candidates.append(account)
 
-        notice = None
         if len(candidates) == 1:
-            return candidates[0], None
-        if len(candidates) > 1:
-            sorted_paths = sorted(c.fullname for c in candidates)
-            notice = {
+            only = candidates[0]
+            # A fuzzy keyword match stays per-call (don't permanently
+            # designate a guess), but an EXACT match on a leaf this
+            # machinery generates itself is the resolver re-finding
+            # its own account — designate it so the next call hits
+            # Layer 0 and the healed slot survives renames.
+            if only.name.lower() in localized_fx_leaves:
+                self._store_designated_account(
+                    book, self._FX_ACCOUNT_SLOT_KEY, only
+                )
+            return only, None
+
+        # Multi-candidate ambiguity: fall through to the canonical
+        # default and report where the split actually went. The
+        # message is built AFTER resolution — on a localized book the
+        # destination is the localized leaf under the type-resolved
+        # income root, not the English canonical path.
+        ambiguous_paths = (
+            sorted(c.fullname for c in candidates)
+            if len(candidates) > 1 else None
+        )
+
+        def _ambiguity_notice(destination: str) -> dict | None:
+            if ambiguous_paths is None:
+                return None
+            return {
                 "type": "ambiguous_fx_account",
-                "candidates": sorted_paths,
+                "candidates": ambiguous_paths,
                 "message": (
-                    f"Found {len(candidates)} candidate FX accounts "
-                    f"({', '.join(sorted_paths)}). Routed to "
-                    f"{self.FX_GAIN_LOSS_PATH} as the canonical "
-                    f"default; pass fx_account explicitly to "
-                    f"disambiguate."
+                    f"Found {len(ambiguous_paths)} candidate FX "
+                    f"accounts ({', '.join(ambiguous_paths)}). Routed "
+                    f"to {destination} as the default; pass fx_account "
+                    f"explicitly to disambiguate."
                 ),
             }
-            # Fall through to canonical default below.
 
-        # Layer 3: canonical default (existing or auto-create).
+        # Layer 3: canonical default (existing or auto-create). An
+        # existing canonical account is adopted only if it passes the
+        # same gates Layers 0 and 1 enforce — adopting (and slotting)
+        # e.g. a EUR-denominated account here would book a
+        # default-currency delta as EUR (silent corruption) and store
+        # a designation Layer 0 rejects on every later call.
         fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
-        if fx_acct is not None:
+        if (
+            fx_acct is not None
+            and fx_acct.type in {"INCOME", "EXPENSE"}
+            and fx_acct.commodity == default_currency
+        ):
             # Lock in the designation so the next call hits Layer 0
             # directly — even on a book that already had this account.
             self._store_designated_account(
                 book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
             )
-            return fx_acct, notice
+            return fx_acct, _ambiguity_notice(fx_acct.fullname)
 
         # Resolve the parent by TYPE, not the English name "Income".
         # On a localized book the income root is "Erträge"/"Ingresos"/…,
@@ -547,15 +588,7 @@ class BusinessMixin:
                 commodity=default_currency,
                 placeholder=1,
             )
-        if notice is None:
-            notice = parent_notice
 
-        # Construct — piecash.Account auto-adds to the session via the
-        # parent linkage. Don't flush here: the caller is still building
-        # the payment transaction, and orphan Split objects already in
-        # the session would trip a NOT NULL on splits.tx_guid. The
-        # final book.save() at the end of pay_invoice flushes everything
-        # together with their now-set tx_guids.
         # Localize the leaf on a non-English book (§6.3). Cosmetic only:
         # the slot write below makes the next resolve GUID-based, so the
         # localized name never has to be matched again.
@@ -563,6 +596,47 @@ class BusinessMixin:
             "fx_gain_loss", "Foreign Exchange Gain/Loss",
             self._infer_book_locale(book),
         )
+
+        # Sibling-collision check BEFORE constructing: if the intended
+        # leaf already exists under this parent, adopt it when it
+        # passes the gates — otherwise raise a clear error instead of
+        # letting book.save() fail with piecash's opaque "two children
+        # with the same name". That failure never persisted anything,
+        # so the slot never self-healed and every retry failed
+        # identically — a permanently wedged cross-currency pay path.
+        existing = next(
+            (c for c in income.children if c.name == fx_leaf), None
+        )
+        if existing is not None:
+            if (
+                existing.type in {"INCOME", "EXPENSE"}
+                and existing.commodity == default_currency
+                and existing.guid not in template_guids
+            ):
+                self._store_designated_account(
+                    book, self._FX_ACCOUNT_SLOT_KEY, existing
+                )
+                adopted_notice = _ambiguity_notice(existing.fullname)
+                return existing, (
+                    adopted_notice if adopted_notice is not None
+                    else parent_notice
+                )
+            raise ValueError(
+                f"An account named {fx_leaf!r} already exists under "
+                f"{income.name!r} but cannot receive realized FX "
+                f"gain/loss (type {existing.type}, denominated "
+                f"{existing.commodity.mnemonic}; needs INCOME/EXPENSE "
+                f"in the book default currency "
+                f"{default_currency.mnemonic}). Pass fx_account "
+                f"explicitly to choose a different account."
+            )
+
+        # Construct — piecash.Account auto-adds to the session via the
+        # parent linkage. Don't flush here: the caller is still building
+        # the payment transaction, and orphan Split objects already in
+        # the session would trip a NOT NULL on splits.tx_guid. The
+        # final book.save() at the end of pay_invoice flushes everything
+        # together with their now-set tx_guids.
         fx_acct = piecash.Account(
             name=fx_leaf,
             type="INCOME",
@@ -577,7 +651,8 @@ class BusinessMixin:
         self._store_designated_account(
             book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
         )
-        return fx_acct, notice
+        notice = _ambiguity_notice(fx_acct.fullname)
+        return fx_acct, notice if notice is not None else parent_notice
 
     def _get_or_create_discount_account(
         self, book, owner_type_is_bill: bool,
@@ -649,28 +724,43 @@ class BusinessMixin:
             if any(kw in name_lower for kw in keywords):
                 candidates.append(account)
 
-        notice = None
         if len(candidates) == 1:
             return candidates[0], None
-        if len(candidates) > 1:
-            sorted_paths = sorted(c.fullname for c in candidates)
-            notice = {
+
+        # Multi-candidate ambiguity: fall through to the canonical
+        # default; the message names the ACTUAL destination, built
+        # after resolution (parallel to the FX resolver).
+        ambiguous_paths = (
+            sorted(c.fullname for c in candidates)
+            if len(candidates) > 1 else None
+        )
+
+        def _ambiguity_notice(destination: str) -> dict | None:
+            if ambiguous_paths is None:
+                return None
+            return {
                 "type": "ambiguous_discount_account",
-                "candidates": sorted_paths,
+                "candidates": ambiguous_paths,
                 "message": (
-                    f"Found {len(candidates)} candidate {side_label} "
-                    f"accounts ({', '.join(sorted_paths)}). Routed to "
-                    f"{canonical_path} as the canonical default; pass "
+                    f"Found {len(ambiguous_paths)} candidate "
+                    f"{side_label} accounts "
+                    f"({', '.join(ambiguous_paths)}). Routed to "
+                    f"{destination} as the default; pass "
                     f"discount_account explicitly to disambiguate."
                 ),
             }
-            # Fall through to canonical default below.
 
-        # Layer 3: canonical default (existing or auto-create).
+        # Layer 3: canonical default (existing or auto-create). Adopt
+        # only a type-valid account — the discount side deliberately
+        # has no commodity gate (the discount split converts via
+        # _convert), so type is the one invariant to enforce.
         disc_acct = self._find_account(book, canonical_path)
-        if disc_acct is not None:
+        if (
+            disc_acct is not None
+            and disc_acct.type in {"INCOME", "EXPENSE"}
+        ):
             self._store_designated_account(book, slot_key, disc_acct)
-            return disc_acct, notice
+            return disc_acct, _ambiguity_notice(disc_acct.fullname)
 
         # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
         # name "Income"/"Expenses" — locale-robust and rename-proof.
@@ -688,8 +778,6 @@ class BusinessMixin:
                 commodity=default_currency,
                 placeholder=1,
             )
-        if notice is None:
-            notice = parent_notice
 
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
@@ -700,6 +788,35 @@ class BusinessMixin:
             concept, canonical_path.split(":")[-1],
             self._infer_book_locale(book),
         )
+
+        # Sibling-collision check BEFORE constructing — same wedge as
+        # the FX resolver: an unadoptable same-named child would make
+        # book.save() fail with piecash's opaque duplicate-children
+        # error on every retry. Matters today for an English book
+        # whose canonical account exists with a non-INCOME/EXPENSE
+        # type, and future-proofs the day discount leaf translations
+        # ship.
+        existing = next(
+            (c for c in parent.children if c.name == leaf_name), None
+        )
+        if existing is not None:
+            if (
+                existing.type in {"INCOME", "EXPENSE"}
+                and existing.guid not in template_guids
+            ):
+                self._store_designated_account(book, slot_key, existing)
+                adopted_notice = _ambiguity_notice(existing.fullname)
+                return existing, (
+                    adopted_notice if adopted_notice is not None
+                    else parent_notice
+                )
+            raise ValueError(
+                f"An account named {leaf_name!r} already exists under "
+                f"{parent.name!r} but is type {existing.type}; the "
+                f"{side_label} account must be INCOME or EXPENSE. "
+                f"Pass discount_account explicitly to choose a "
+                f"different account."
+            )
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,
@@ -713,7 +830,8 @@ class BusinessMixin:
             ),
         )
         self._store_designated_account(book, slot_key, disc_acct)
-        return disc_acct, notice
+        notice = _ambiguity_notice(disc_acct.fullname)
+        return disc_acct, notice if notice is not None else parent_notice
 
     def _get_invoice_billterm(self, book, inv):
         """Return the piecash Billterm linked to the invoice, or None.
