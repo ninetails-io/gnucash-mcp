@@ -388,6 +388,11 @@ class BusinessMixin:
             return None
         if acct.commodity != self._require_default_currency(book):
             return None
+        # A placeholder can't receive postings (GnuCash's UI treats
+        # them as non-postable organizers); a designation that became
+        # a placeholder falls through and re-resolves.
+        if acct.placeholder:
+            return None
         return acct
 
     def _store_designated_account(self, book, slot_key, account) -> None:
@@ -476,6 +481,13 @@ class BusinessMixin:
                     f"gain/loss account must be in the book default "
                     f"currency ({default_currency.mnemonic})."
                 )
+            if acct.placeholder:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is a placeholder; "
+                    f"placeholders organize the tree and cannot "
+                    f"receive postings. Pass a leaf INCOME/EXPENSE "
+                    f"account."
+                )
             return acct, None
 
         # Layer 0: a stored designation wins for the no-explicit-arg
@@ -488,17 +500,24 @@ class BusinessMixin:
             return slotted, None
 
         # Layer 2: fuzzy match by leaf-name substring, plus exact
-        # match against every shipped localization of the FX leaf —
-        # the machinery must be able to re-find names it generates
-        # itself (a stale slot on a German book would otherwise miss
-        # "Realisierter Gewinn/Verlust" and collide at Layer 3). Only
-        # default-currency candidates qualify — see the commodity
+        # match against the leaf THIS BOOK's machinery generates (the
+        # book's inferred-locale translation and the English default)
+        # — a stale slot on a German book would otherwise miss
+        # "Realisierter Gewinn/Verlust" and collide at Layer 3.
+        # Deliberately NOT all 47 shipped localizations: an English
+        # book where the user happens to have a German-named account
+        # is a coincidence, not this machinery re-finding its own
+        # name, and must not be silently adopted — let alone
+        # permanently designated. Only default-currency,
+        # non-placeholder candidates qualify — see the commodity
         # rationale on the explicit-account path above.
-        localized_fx_leaves = {
-            n.lower()
-            for n in self._LOCALIZED_ACCOUNT_NAMES.get(
-                "fx_gain_loss", {}
-            ).values()
+        own_fx_leaf = self._locale_account_name(
+            "fx_gain_loss", "Foreign Exchange Gain/Loss",
+            self._infer_book_locale(book),
+        )
+        own_fx_leaves = {
+            own_fx_leaf.lower(),
+            "foreign exchange gain/loss",
         }
         template_guids = self._template_account_guids(book)
         candidates = []
@@ -509,9 +528,11 @@ class BusinessMixin:
                 continue
             if account.commodity != default_currency:
                 continue
+            if account.placeholder:
+                continue
             name_lower = account.name.lower()
             if (
-                name_lower in localized_fx_leaves
+                name_lower in own_fx_leaves
                 or any(kw in name_lower for kw in self._FX_NAME_KEYWORDS)
             ):
                 candidates.append(account)
@@ -519,11 +540,11 @@ class BusinessMixin:
         if len(candidates) == 1:
             only = candidates[0]
             # A fuzzy keyword match stays per-call (don't permanently
-            # designate a guess), but an EXACT match on a leaf this
-            # machinery generates itself is the resolver re-finding
+            # designate a guess), but an EXACT match on the leaf this
+            # book's machinery generates is the resolver re-finding
             # its own account — designate it so the next call hits
             # Layer 0 and the healed slot survives renames.
-            if only.name.lower() in localized_fx_leaves:
+            if only.name.lower() in own_fx_leaves:
                 self._store_designated_account(
                     book, self._FX_ACCOUNT_SLOT_KEY, only
                 )
@@ -564,6 +585,7 @@ class BusinessMixin:
             fx_acct is not None
             and fx_acct.type in {"INCOME", "EXPENSE"}
             and fx_acct.commodity == default_currency
+            and not fx_acct.placeholder
         ):
             # Lock in the designation so the next call hits Layer 0
             # directly — even on a book that already had this account.
@@ -590,13 +612,11 @@ class BusinessMixin:
                 placeholder=1,
             )
 
-        # Localize the leaf on a non-English book (§6.3). Cosmetic only:
-        # the slot write below makes the next resolve GUID-based, so the
-        # localized name never has to be matched again.
-        fx_leaf = self._locale_account_name(
-            "fx_gain_loss", "Foreign Exchange Gain/Loss",
-            self._infer_book_locale(book),
-        )
+        # Localized leaf (§6.3) — already resolved for the Layer-2
+        # exact-match set above. Cosmetic only: the slot write below
+        # makes the next resolve GUID-based, so the localized name
+        # never has to be matched again.
+        fx_leaf = own_fx_leaf
 
         # Sibling-collision check BEFORE constructing: if the intended
         # leaf already exists under this parent, adopt it when it
@@ -612,6 +632,7 @@ class BusinessMixin:
             if (
                 existing.type in {"INCOME", "EXPENSE"}
                 and existing.commodity == default_currency
+                and not existing.placeholder
                 and existing.guid not in template_guids
             ):
                 self._store_designated_account(
@@ -626,8 +647,10 @@ class BusinessMixin:
                 f"An account named {fx_leaf!r} already exists under "
                 f"{income.name!r} but cannot receive realized FX "
                 f"gain/loss (type {existing.type}, denominated "
-                f"{existing.commodity.mnemonic}; needs INCOME/EXPENSE "
-                f"in the book default currency "
+                f"{existing.commodity.mnemonic}"
+                f"{', placeholder' if existing.placeholder else ''}; "
+                f"needs a non-placeholder INCOME/EXPENSE account in "
+                f"the book default currency "
                 f"{default_currency.mnemonic}). Pass fx_account "
                 f"explicitly to choose a different account."
             )
@@ -705,6 +728,13 @@ class BusinessMixin:
                     f"{acct.type}; must be INCOME or EXPENSE to "
                     f"receive an early-payment-discount split."
                 )
+            if acct.placeholder:
+                raise ValueError(
+                    f"discount_account {acct.fullname!r} is a "
+                    f"placeholder; placeholders organize the tree "
+                    f"and cannot receive postings. Pass a leaf "
+                    f"INCOME/EXPENSE account."
+                )
             return acct, None
 
         # Layer 0: a stored designation wins for the no-explicit-arg
@@ -713,13 +743,16 @@ class BusinessMixin:
         if slotted is not None:
             return slotted, None
 
-        # Layer 2: fuzzy match by leaf-name substring.
+        # Layer 2: fuzzy match by leaf-name substring. Placeholders
+        # are excluded — they can't receive postings.
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
             if account.guid in template_guids:
                 continue
             if account.type not in {"INCOME", "EXPENSE"}:
+                continue
+            if account.placeholder:
                 continue
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in keywords):
@@ -759,6 +792,7 @@ class BusinessMixin:
         if (
             disc_acct is not None
             and disc_acct.type in {"INCOME", "EXPENSE"}
+            and not disc_acct.placeholder
         ):
             self._store_designated_account(book, slot_key, disc_acct)
             return disc_acct, _ambiguity_notice(disc_acct.fullname)
@@ -803,6 +837,7 @@ class BusinessMixin:
         if existing is not None:
             if (
                 existing.type in {"INCOME", "EXPENSE"}
+                and not existing.placeholder
                 and existing.guid not in template_guids
             ):
                 self._store_designated_account(book, slot_key, existing)
@@ -813,10 +848,11 @@ class BusinessMixin:
                 )
             raise ValueError(
                 f"An account named {leaf_name!r} already exists under "
-                f"{parent.name!r} but is type {existing.type}; the "
-                f"{side_label} account must be INCOME or EXPENSE. "
-                f"Pass discount_account explicitly to choose a "
-                f"different account."
+                f"{parent.name!r} but is "
+                f"{'a placeholder' if existing.placeholder else f'type {existing.type}'}; "
+                f"the {side_label} account must be a non-placeholder "
+                f"INCOME or EXPENSE account. Pass discount_account "
+                f"explicitly to choose a different account."
             )
         disc_acct = piecash.Account(
             name=leaf_name,
