@@ -1034,22 +1034,34 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         A non-zero balance on one of these is a structural defect the
         dashboard surfaces. Locale-robust: match by **structure** —
         type ``BANK``, a direct child of root (both invariants of how
-        GnuCash hangs these accounts) — plus a leading word from the
-        known Imbalance/Orphan catalog translations. Unknown locales
-        degrade to the English forms; the structural gate keeps false
-        positives off ordinary user accounts. (``Orphaned Gains`` is
-        deliberately excluded — it is type ``INCOME``, a legitimate
-        account, not a defect.)
+        GnuCash hangs these accounts) — plus the NAME SHAPE GnuCash
+        actually emits: a catalog word exactly, or the word plus a
+        ``-<CUR>`` mnemonic suffix (Scrub.cpp writes
+        ``_("Imbalance")-<currency>``). A bare prefix match is too
+        loose across ~100 pooled locale words: a legitimate root
+        BANK account named with an ordinary word from ANY locale
+        ("Açık Hesap", "Thừa kế…") was misclassified as suspense —
+        warned about on the dashboard and silently excluded from
+        runway/low-cash liquidity. The suffix is shape-checked
+        (short, no spaces), not compared to the account's own
+        commodity: real books contain e.g. an EUR-book
+        ``Imbalance-USD``. (``Orphaned Gains`` is deliberately
+        excluded — it is type ``INCOME``, a legitimate account, not
+        a defect.)
         """
         if account.type != "BANK":
             return False
         if account.parent is None or account.parent.guid != root.guid:
             return False
-        leaf = account.name.lower()
-        return any(
-            leaf.startswith(p)
-            for p in self._BALANCING_ACCOUNT_NAME_PREFIXES
-        )
+        leaf = account.name.strip().lower()
+        for p in self._BALANCING_ACCOUNT_NAME_PREFIXES:
+            if leaf == p:
+                return True
+            if leaf.startswith(p + "-"):
+                suffix = leaf[len(p) + 1:]
+                if 0 < len(suffix) <= 10 and suffix.isalnum():
+                    return True
+        return False
 
     # ── Book-locale inference + localized account names (§6.3) ────────
     #
