@@ -630,6 +630,34 @@ class TestAutoBalancingAccountDetection:
                 by_name["Tagesgeld"], root
             )
 
+    def test_ordinary_word_prefix_not_misclassified(self, tmp_path):
+        """v1.4 review I18N-5: the pooled locale catalog contains
+        ordinary words ("Açık" is Turkish for open/deficit; "Thừa"
+        Vietnamese for surplus). A legitimate root BANK account merely
+        STARTING with one must not be classified as suspense — that
+        excluded it from runway/low-cash and warned on the dashboard.
+        Only the exact word or the word-<CUR> shape GnuCash emits
+        qualifies."""
+        path = tmp_path / "tr.gnucash"
+        self._make_book(path, [
+            ("Açık Hesap", "BANK", None),      # ordinary Turkish name
+            ("Thừa kế Fonu", "BANK", None),    # ordinary Vietnamese name
+            ("Açık", "BANK", None),            # exact catalog word: flagged
+            ("Açık-TRY", "BANK", None),        # GnuCash shape: flagged
+        ])
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            root = b.root_account
+            by_name = {a.name: a for a in b.accounts}
+            assert not gb._is_auto_balancing_account(
+                by_name["Açık Hesap"], root,
+            )
+            assert not gb._is_auto_balancing_account(
+                by_name["Thừa kế Fonu"], root,
+            )
+            assert gb._is_auto_balancing_account(by_name["Açık"], root)
+            assert gb._is_auto_balancing_account(by_name["Açık-TRY"], root)
+
     def test_structural_gate_excludes_nested_and_nonbank(self, tmp_path):
         path = tmp_path / "bal2.gnucash"
         self._make_book(path, [
