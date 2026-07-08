@@ -125,3 +125,12 @@ Internationalization, batch entry, pagination, and live price updates.
 
 **testing/**
 - [SYNTHETIC_BOOK_SPEC_SABINE.md](v1.4/testing/SYNTHETIC_BOOK_SPEC_SABINE.md) — **Sabine Brenner**, the German SKR03 / EUR book that exercises the i18n bug class.
+
+---
+
+## v1.5 — deferred / needs-attention backlog
+
+Not a release yet — the running list of items deferred out of
+prior releases or flagged for attention.
+
+- [README.md](v1.5/README.md) — the backlog: patch candidates (1.4.1), deferred features (price auto-retrieval, i18n output localization, taxtable cascade, accrual FX revaluation, DB backend), and maintenance items.

@@ -338,6 +338,24 @@ item.
 
 ---
 
+## Final status (2026-07-07, merge night)
+
+Everything below is MERGED to develop. The five fix branches landed
+as PRs #114-#118; a second 8-angle local review (Copilot was
+quota-blocked) over the combined diff produced 8 verified findings,
+fixed in follow-up commits that a masked `git push | tail` failure
+initially dropped from the PRs — recovered by cherry-pick as PR
+#119 (the test-count mismatch 1,780 vs 1,786 caught it; compare the
+numbers). Two of Stephen's three design rulings shipped the same
+night: per-book `.mcp` subdirs under `GNUCASH_LOG_DIR` (PR #120,
+retires MB-3) and the Imbalance/Orphan exact-word/`-CUR` matcher
+(PR #121, retires I18N-5). The third ruling — GB-1, per-period
+rates — is specced in `specs/v1.5/README.md` and awaits a
+bookkeeper loop, because it shifts validated numbers. Verification
+at merge: 1,787 tests green; all three oracles byte-identical
+across seven report surfaces; live multi-book smoke (torn-state
+heal, per-book backups, per-book audit trails).
+
 ## Status after the day-one fix pass (2026-07-01, same day)
 
 Five local branches off develop, **no PRs** — the bookkeeper loop
