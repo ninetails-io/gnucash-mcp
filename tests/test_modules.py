@@ -1024,6 +1024,31 @@ class TestMultiBook:
         with pytest.raises(ValueError, match="GNUCASH_BOOK_PATH"):
             _parse_book_paths("   ")
 
+    def test_parse_separator_only_fails_fast(self):
+        """A separator-only value (":") is an invalid VALUE, not an
+        unset variable — it must raise _BookPathError so main()'s
+        fail-fast catches it instead of an uncaught traceback."""
+        from gnucash_mcp.server import _parse_book_paths, _BookPathError
+        with pytest.raises(_BookPathError, match="only separators"):
+            _parse_book_paths(os.pathsep)
+        with pytest.raises(_BookPathError, match="only separators"):
+            _parse_book_paths(f" {os.pathsep} {os.pathsep} ")
+
+    def test_parse_duplicate_basename_case_insensitive(self, tmp_path):
+        """switch_book matches names case-insensitively, so uniqueness
+        must be checked the same way — otherwise Ledger.gnucash +
+        ledger.gnucash validate but every prefix is ambiguous and the
+        second book is permanently unswitchable."""
+        from gnucash_mcp.server import _parse_book_paths, _BookPathError
+        d1 = tmp_path / "a"
+        d2 = tmp_path / "b"
+        d1.mkdir()
+        d2.mkdir()
+        b1 = _make_min_book(d1 / "Ledger.gnucash")
+        b2 = _make_min_book(d2 / "ledger.gnucash")
+        with pytest.raises(_BookPathError, match="duplicate book filename"):
+            _parse_book_paths(f"{b1}{os.pathsep}{b2}")
+
     # ── switch_book visibility ─────────────────────────────────────
 
     def test_switch_book_present_with_two_books(self, two_books):
@@ -1109,6 +1134,58 @@ class TestMultiBook:
         assert msg.startswith("Already on: alex.gnucash")
         assert "CONTEXT RESET" not in msg
 
+    def test_failed_switch_leaves_state_consistent_and_heals(
+        self, two_books, tmp_path,
+    ):
+        """A switch that fails mid-flight must leave the server fully
+        on the previous book, and a retry after the cause clears must
+        perform a REAL switch — not a no-op that trusts the torn
+        ``_current_path`` and reports "Already on" while every tool
+        still operates on the old book (silent wrong-book writes)."""
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        self._select(srv, two_books)  # current = alex
+
+        # Transient failure: the book file vanishes (cloud-sync
+        # placeholder / unmounted drive) between validation and switch.
+        beast_bytes = beast.read_bytes()
+        beast.unlink()
+        with pytest.raises(FileNotFoundError):
+            srv._switch_book_impl("beast")
+
+        # Fully on the previous book — both globals agree.
+        assert srv._current_path == alex.resolve()
+        assert srv.get_book().book_path.name == "alex.gnucash"
+
+        # Cause clears; retry must really switch (banner, not noop).
+        beast.write_bytes(beast_bytes)
+        msg = srv._switch_book_impl("beast")
+        assert "Switched to: beast-man.gnucash" in msg
+        assert srv.get_book().book_path.name == "beast-man.gnucash"
+
+    def test_switch_activation_failure_rolls_back(
+        self, two_books, monkeypatch,
+    ):
+        """If logging activation fails AFTER the target book is
+        buildable, the switch must not half-happen: reads/writes and
+        the reported outcome must agree that the server is still on
+        the previous book."""
+        import gnucash_mcp.server as srv
+        self._select(srv, two_books)  # current = alex
+
+        real_activate = srv._activate_logging
+
+        def boom(path):
+            if path.name == "beast-man.gnucash":
+                raise ValueError("unsafe log dir")
+            return real_activate(path)
+
+        monkeypatch.setattr(srv, "_activate_logging", boom)
+        with pytest.raises(ValueError, match="unsafe log dir"):
+            srv._switch_book_impl("beast")
+        assert srv._current_path == two_books[0].resolve()
+        assert srv.get_book().book_path.name == "alex.gnucash"
+
     def test_orientation_reports_currency_and_count(self, two_books):
         import gnucash_mcp.server as srv
         alex, _ = two_books
@@ -1140,6 +1217,24 @@ class TestMultiBook:
         self._select(srv, two_books)
         with pytest.raises(ValueError, match="requires a book name"):
             srv._switch_book_impl("   ")
+
+    def test_all_tools_are_sync(self):
+        """Every registered tool must be a plain sync function. The
+        multi-book design keeps ``_book`` an unlocked global; that is
+        safe only while the MCP SDK runs sync tools inline on the
+        event loop, making each tool call atomic with respect to
+        switch_book. An async tool would break that atomicity —
+        see the comment on ``_book`` in server.py."""
+        import inspect
+        _apply_module_filter("all")
+        async_tools = [
+            name for name, tool in mcp._tool_manager._tools.items()
+            if inspect.iscoroutinefunction(tool.fn)
+        ]
+        assert async_tools == [], (
+            f"Async tools break the unlocked-_book atomicity "
+            f"assumption: {async_tools}"
+        )
 
     # ── get_book cold-start selection ──────────────────────────────
 

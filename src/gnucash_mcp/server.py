@@ -571,6 +571,17 @@ _server_state: dict = {}
 #                   GUID-prefix caches).
 # - _book:          the CURRENT instance. Resetting it to None is the
 #                   re-init point tests rely on.
+#
+# _book is an UNLOCKED global read by get_book() and written by
+# switch_book. That is safe only while every tool is a sync function
+# and the installed MCP SDK runs sync tools inline on the event loop
+# (mcp's FuncMetadata does; standalone fastmcp 2.x thread-pools them
+# instead). Under that scheduling, a whole tool call — audit staging
+# included — is atomic with respect to switch_book. If a tool ever
+# becomes async, or the SDK changes, reads of _book mid-call can see
+# a different book than the call started on (cross-book audit
+# attribution, wrong-book writes). test_all_tools_are_sync in
+# tests/test_modules.py pins our half of that contract.
 _book_paths: list[Path] = []
 _current_path: Path | None = None
 _book_registry: dict[str, GnuCashBook] = {}
@@ -629,8 +640,13 @@ def _parse_book_paths(value: str | None) -> list[Path]:
         )
     raw = [p.strip() for p in value.split(os.pathsep) if p.strip()]
     if not raw:
-        raise ValueError(
-            "GNUCASH_BOOK_PATH environment variable not set"
+        # Separator-only (e.g. ":") is an invalid VALUE, not an unset
+        # variable — _BookPathError so both fail-fast sites (import
+        # block and main()) catch it instead of an uncaught
+        # ValueError traceback.
+        raise _BookPathError(
+            "Invalid GNUCASH_BOOK_PATH: contains only separators, "
+            "no paths"
         )
 
     paths: list[Path] = []
@@ -646,17 +662,21 @@ def _parse_book_paths(value: str | None) -> list[Path]:
             continue
         paths.append(resolved)
 
-    # Filenames must be unique — switch_book matches on them.
+    # Filenames must be unique — switch_book matches on them, and it
+    # matches case-INSENSITIVELY, so uniqueness must be checked the
+    # same way: Ledger.gnucash + ledger.gnucash would make every
+    # prefix ambiguous and the second book permanently unswitchable.
     seen: dict[str, Path] = {}
     for path in paths:
-        if path.name in seen:
+        if path.name.lower() in seen:
             errors.append(
                 f"  - duplicate book filename {path.name!r}: "
-                f"{seen[path.name]} and {path} (filenames must be "
-                f"unique so switch_book can match by name)"
+                f"{seen[path.name.lower()]} and {path} (filenames "
+                f"must be unique, case-insensitively, so switch_book "
+                f"can match by name)"
             )
         else:
-            seen[path.name] = path
+            seen[path.name.lower()] = path
 
     if errors:
         raise _BookPathError(
@@ -787,16 +807,49 @@ def _switch_book_impl(name: str) -> str:
     previous = _current_path
 
     # No-op switch — already on this book. Don't emit the reset
-    # banner (nothing changed); just reaffirm and reorient.
-    if previous is not None and target == previous:
+    # banner (nothing changed); just reaffirm and reorient. The
+    # identity check on _book (not just _current_path) matters: a
+    # previously-failed switch may have left _current_path pointing
+    # at a book _book never became, and trusting the path alone
+    # would report success while every tool still operates on the
+    # old book. A torn state falls through to the full switch,
+    # which heals it.
+    if (
+        previous is not None
+        and target == previous
+        and _book is not None
+        and _book is _book_registry.get(str(target))
+    ):
         return (
             f"Already on: {target.name}\n"
-            f"{_book_orientation(_book_for(target))}"
+            f"{_book_orientation(_book)}"
         )
 
+    # Transactional order: everything fallible runs BEFORE the
+    # globals move, and they move together. _book_for can raise
+    # (constructor resolves the file strictly — transiently missing
+    # under cloud sync / external drives); _activate_logging can
+    # raise (resolve_mcp_dir refuses unsafe log dirs). A failure at
+    # either point must leave the server fully on the previous
+    # book — never a half-switched state where reads, writes, and
+    # audit logs disagree about which book is current.
+    new_book = _book_for(target)
+    try:
+        _activate_logging(target)  # logs follow the active book
+    except Exception:
+        # setup_logging raises before touching handlers, so logging
+        # still points at the previous book; re-assert anyway in
+        # case a future edit moves the fallible step, and surface
+        # the original error.
+        if previous is not None:
+            try:
+                _activate_logging(previous)
+            except Exception:
+                pass  # original error is the actionable one
+        raise
+
     _current_path = target
-    _book = _book_for(target)
-    _activate_logging(target)  # logs follow the active book
+    _book = new_book
     _server_state["book_path"] = str(target)
     _server_state["current_book"] = target.name
 
