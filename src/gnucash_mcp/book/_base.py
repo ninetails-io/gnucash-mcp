@@ -1072,7 +1072,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     _STRUCTURAL_TYPE_NAMES = {
         "ar": {"ASSET": "الأصول", "LIABILITY": "الالتزامات", "INCOME": "الدخل", "EXPENSE": "المصروفات", "EQUITY": "حقوق الملكية"},
         "as": {"ASSET": "সম্পত্তিবোৰ", "LIABILITY": "বিশ্বাসযোগ্যতাবোৰ", "INCOME": "উপাৰ্জন", "EXPENSE": "ব্যয়বোৰ", "EQUITY": "সাধাৰণ অংশ"},
-        "bg": {"ASSET": "Активи:", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
+        "bg": {"ASSET": "Активи", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
         "brx": {"ASSET": "सम्पति", "LIABILITY": "दाहार", "INCOME": "आय", "EXPENSE": "खरसा", "EQUITY": "बन्दक"},
         "ca": {"ASSET": "Actiu", "LIABILITY": "Passiu", "INCOME": "Ingressos", "EXPENSE": "Despeses", "EQUITY": "Patrimoni"},
         "cs": {"ASSET": "Aktiva", "LIABILITY": "Pasiva", "INCOME": "Příjmy", "EXPENSE": "Náklady", "EQUITY": "Vlastní jmění"},
@@ -1085,7 +1085,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)", "INCOME": "Revenus", "EXPENSE": "Dépenses", "EQUITY": "Capitaux propres"},
         "gu": {"ASSET": "સંપત્તિઓ", "LIABILITY": "જવાબદારી", "INCOME": "આવક", "EXPENSE": "ખર્ચ", "EQUITY": "હિસ્સો"},
         "he": {"ASSET": "נכסים", "LIABILITY": "התחייבויות", "INCOME": "הכנסות", "EXPENSE": "הוצאות", "EQUITY": "הון"},
-        "hi": {"ASSET": "संपत्तियां ", "LIABILITY": "देयताएं ", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "hi": {"ASSET": "संपत्तियां", "LIABILITY": "देयताएं", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
         "hr": {"ASSET": "Imovina", "LIABILITY": "Obveze", "INCOME": "Prihod", "EXPENSE": "Rashod", "EQUITY": "Kapital"},
         "hu": {"ASSET": "Eszközök", "LIABILITY": "Kötelezettségek", "INCOME": "Bevétel", "EXPENSE": "Kiadások", "EQUITY": "Saját tőke"},
         "id": {"ASSET": "Aset", "LIABILITY": "Liabilitas", "INCOME": "Pendapatan", "EXPENSE": "Pengeluaran", "EQUITY": "Ekuitas"},
@@ -1222,10 +1222,18 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         best_lang, best_score = None, 0
         for lang, type_words in self._STRUCTURAL_TYPE_NAMES.items():
+            # Normalize BOTH sides the same way (strip + lower) —
+            # account names are stripped above; a table entry carrying
+            # extraction residue (trailing space/colon) would
+            # otherwise be unmatchable in every book, silently
+            # weakening that locale's vote.
             score = sum(
                 1
                 for atype, word in type_words.items()
-                if any(n == word.lower() for n in names_by_type.get(atype, ()))
+                if any(
+                    n == word.strip().lower()
+                    for n in names_by_type.get(atype, ())
+                )
             )
             if score > best_score:
                 best_lang, best_score = lang, score
