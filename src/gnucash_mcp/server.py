@@ -1085,8 +1085,10 @@ Environment variables:
                              --modules (e.g. "bookkeeper" or "core,reporting")
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
-  GNUCASH_LOG_DIR            Override the .mcp storage directory (audit,
-                             debug, backups). Default: {book_path}.mcp
+  GNUCASH_LOG_DIR            Relocate .mcp storage (audit, debug, backups).
+                             Each book gets its own subdirectory:
+                             {GNUCASH_LOG_DIR}/{book}.mcp
+                             Default location: {book_path}.mcp
   GNUCASH_REDACT_PATHS=1     Collapse absolute paths to basenames in tool
                              responses and error messages (safe to share)
   GNUCASH_FX_GUARD_DAYS      Refuse a cross-currency invoice/bill post or pay
@@ -1102,7 +1104,7 @@ Environment variables:
                              (default 10; applies only when the rate is set)
 
 Logs and backups live under the .mcp directory — beside the book file by
-default, or at GNUCASH_LOG_DIR if set:
+default, or per-book under GNUCASH_LOG_DIR if set:
   {book_path}.mcp/audit/YYYY-MM-DD.txt
   {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
   {book_path}.mcp/backups/               (auto + manual snapshots)
