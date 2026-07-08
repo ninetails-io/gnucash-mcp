@@ -258,6 +258,97 @@ class TestFxAccountCollisionSafety:
                 not in notice["message"]
 
 
+class TestFxAdoptionGuards:
+    """Post-review follow-ups: adoption must not silently claim a
+    coincidentally-named account from another locale, and no
+    automatic layer may adopt or designate a placeholder."""
+
+    def test_foreign_locale_name_on_english_book_not_designated(
+        self, test_book,
+    ):
+        """An English book where the user created a German-named
+        income account must NOT have it silently adopted/designated —
+        the exact-match set is the book's OWN locale leaf plus the
+        English default, not all 47 shipped translations."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Income")
+            piecash.Account(
+                name="Realisierter Gewinn/Verlust",
+                type="INCOME",
+                parent=income,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            # Canonical English account created; the German-named
+            # coincidence untouched and undesignated.
+            assert acct.fullname == "Income:Foreign Exchange Gain/Loss"
+            slotted = gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            )
+            assert slotted is None or (
+                slotted.fullname == "Income:Foreign Exchange Gain/Loss"
+            )
+
+    def test_placeholder_canonical_not_adopted(self, test_book):
+        """A placeholder at the canonical path is not adoptable: the
+        resolver raises the explanatory sibling-collision error
+        rather than designating a non-postable organizer (or crashing
+        at save on the duplicate child it would otherwise create)."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Income")
+            piecash.Account(
+                name="Foreign Exchange Gain/Loss",
+                type="INCOME",
+                parent=income,
+                commodity=b.default_currency,
+                placeholder=1,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="placeholder"):
+                gb._get_or_create_fx_account(b)
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            ) is None
+
+    def test_explicit_placeholder_fx_account_rejected(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="FX Bucket", account_type="INCOME",
+            parent="Income", placeholder=True,
+        )
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="placeholder"):
+                gb._get_or_create_fx_account(
+                    b, fx_account="Income:FX Bucket",
+                )
+
+    def test_stale_placeholder_designation_falls_through(
+        self, test_book,
+    ):
+        """A designated account later turned into a placeholder must
+        not keep receiving postings via Layer 0 — the designation
+        falls through and re-resolves."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            b.save()
+        with gb.open(readonly=False) as b:
+            fx = gb._find_account(b, "Income:Foreign Exchange Gain/Loss")
+            fx.placeholder = 1
+            b.save()
+        with gb.open(readonly=True) as b:
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            ) is None
+
+
 class TestDesignatedAccountSlotLayer0:
     """§6.2 Layer 0: once resolved, the FX/discount account's GUID is
     stored in a root-account slot and every later resolution reads that

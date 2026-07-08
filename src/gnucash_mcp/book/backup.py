@@ -519,7 +519,14 @@ class BackupMixin:
         if not backups_dir.exists():
             return []
 
-        own_stem = self.book_path.stem
+        # Case-INSENSITIVE stem match, consistent with switch_book
+        # matching and the parse-time uniqueness check: on macOS a
+        # user can relaunch with ledger.gnucash after backups were
+        # written as Ledger-<ts>-... (same file — resolve() doesn't
+        # canonicalize case); an exact compare would make every
+        # existing backup invisible to listing, pruning, and the
+        # dashboard's backup-health signal.
+        own_stem = self.book_path.stem.lower()
         entries: list[dict] = []
         now = _now_utc()
         for path in backups_dir.iterdir():
@@ -527,7 +534,7 @@ class BackupMixin:
             if parsed is None:
                 continue
             ts, stage, label, stem = parsed
-            if stem != own_stem:
+            if stem.lower() != own_stem:
                 continue
             try:
                 size = path.stat().st_size

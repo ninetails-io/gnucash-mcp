@@ -917,3 +917,23 @@ class TestSharedLogDirScoping:
         a._maybe_auto_backup()
         assert _read_attempt_status(a._backups_dir(), a_path.stem)
         assert _read_attempt_status(b._backups_dir(), b_path.stem) is None
+
+    def test_listing_stem_match_is_case_insensitive(
+        self, test_book: Path, tmp_path, monkeypatch,
+    ):
+        """A case flip in GNUCASH_BOOK_PATH (same file on macOS's
+        case-insensitive filesystem) must not orphan existing
+        backups: the stem filter compares case-insensitively, like
+        switch_book matching and parse-time uniqueness."""
+        import shutil
+        shared = tmp_path / "shared-logs"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(shared))
+        book = GnuCashBook(str(test_book))
+        created = Path(book.create_backup(stage="manual", label="x")["path"])
+        # Simulate the pre-flip filename casing on disk.
+        upper = created.with_name(
+            created.name.replace(test_book.stem, test_book.stem.upper(), 1)
+        )
+        created.rename(upper)
+        listed = book.list_backups()
+        assert len(listed) == 1, "case-flipped stem orphaned the backup"

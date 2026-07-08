@@ -1223,10 +1223,12 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         best_lang, best_score = None, 0
         for lang, type_words in self._STRUCTURAL_TYPE_NAMES.items():
             # Normalize BOTH sides the same way (strip + lower) —
-            # account names are stripped above; a table entry carrying
-            # extraction residue (trailing space/colon) would
-            # otherwise be unmatchable in every book, silently
-            # weakening that locale's vote.
+            # account names are stripped above; a table entry with
+            # trailing WHITESPACE would otherwise be unmatchable in
+            # every book, silently weakening that locale's vote.
+            # strip() does NOT remove punctuation residue (a trailing
+            # ':' from po-label extraction) — that must be fixed in
+            # the table data itself, per the regeneration recipe.
             score = sum(
                 1
                 for atype, word in type_words.items()
