@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import sqlite3
@@ -155,20 +156,36 @@ def _describe_age(ts: datetime, reference: datetime | None = None) -> str:
 
 
 # ── State file (last-backup-per-stage) ───────────────────────────────
+#
+# State and attempt files are PER-BOOK (keyed by the book's filename
+# stem). Under a shared GNUCASH_LOG_DIR, every book resolves the same
+# backups/ directory — a single shared .state.json meant book A's
+# auto-backup advanced every stage timestamp and book B's
+# _maybe_auto_backup never found anything due: B ran with no
+# auto-backup protection at all. The legacy unscoped .state.json is
+# read as a fallback only when GNUCASH_LOG_DIR is unset (the default
+# {book}.mcp/ layout is per-book by construction, so the legacy file
+# can only belong to this book); under an override it is ignored —
+# treating the state as empty just means one extra backup, which is
+# the safe direction.
 
 
-def _state_path(backups_dir: Path) -> Path:
-    return backups_dir / ".state.json"
+def _state_path(backups_dir: Path, stem: str) -> Path:
+    return backups_dir / f".state-{stem}.json"
 
 
-def _read_state(backups_dir: Path) -> dict[str, datetime]:
+def _read_state(backups_dir: Path, stem: str) -> dict[str, datetime]:
     """Read ``last_backup_by_stage`` as a dict of stage → UTC datetime.
 
     Missing file, malformed JSON, or unparseable timestamps all degrade
     to an empty state — auto-backup reacts by treating every stage as
     due, which is the safe default.
     """
-    path = _state_path(backups_dir)
+    path = _state_path(backups_dir, stem)
+    if not path.exists() and not os.environ.get("GNUCASH_LOG_DIR"):
+        # Pre-scoping layout: per-book dir, so the unscoped file is
+        # unambiguously this book's.
+        path = backups_dir / ".state.json"
     try:
         with path.open() as f:
             data = json.load(f)
@@ -190,7 +207,9 @@ def _read_state(backups_dir: Path) -> dict[str, datetime]:
     return result
 
 
-def _write_state(backups_dir: Path, state: dict[str, datetime]) -> None:
+def _write_state(
+    backups_dir: Path, stem: str, state: dict[str, datetime],
+) -> None:
     """Persist ``last_backup_by_stage`` to disk."""
     backups_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -200,7 +219,7 @@ def _write_state(backups_dir: Path, state: dict[str, datetime]) -> None:
             for stage, ts in state.items()
         },
     }
-    path = _state_path(backups_dir)
+    path = _state_path(backups_dir, stem)
     # Write via a temp + rename so a partial write never leaves a
     # corrupted state file.
     tmp = path.with_suffix(".json.tmp")
@@ -221,15 +240,23 @@ def _attempt_path(backups_dir: Path) -> Path:
     return backups_dir / ".last_attempt.json"
 
 
-def _read_attempt_status(backups_dir: Path) -> dict | None:
+def _attempt_path_scoped(backups_dir: Path, stem: str) -> Path:
+    return backups_dir / f".last_attempt-{stem}.json"
+
+
+def _read_attempt_status(backups_dir: Path, stem: str) -> dict | None:
     """Return ``{status, reason, at}`` for the most recent auto-backup
     attempt, or None if no attempt has ever been recorded.
 
     ``status`` is ``"ok"`` or ``"failed"``. ``reason`` is the
     exception string for failures (None on success). ``at`` is a
-    tz-aware UTC datetime.
+    tz-aware UTC datetime. Per-book scoped like the state file (see
+    the state-file comment above); the unscoped legacy file is read
+    only when GNUCASH_LOG_DIR is unset.
     """
-    path = _attempt_path(backups_dir)
+    path = _attempt_path_scoped(backups_dir, stem)
+    if not path.exists() and not os.environ.get("GNUCASH_LOG_DIR"):
+        path = _attempt_path(backups_dir)
     try:
         with path.open() as f:
             data = json.load(f)
@@ -253,6 +280,7 @@ def _read_attempt_status(backups_dir: Path) -> dict | None:
 
 def _write_attempt_status(
     backups_dir: Path,
+    stem: str,
     status: str,
     reason: str | None,
     at: datetime,
@@ -266,7 +294,7 @@ def _write_attempt_status(
         "reason": reason,
         "at": at.astimezone(timezone.utc).isoformat(),
     }
-    path = _attempt_path(backups_dir)
+    path = _attempt_path_scoped(backups_dir, stem)
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -278,10 +306,12 @@ def _write_attempt_status(
 
 def _parse_backup_filename(
     path: Path,
-) -> tuple[datetime, str, str | None] | None:
-    """Return ``(timestamp, stage, label)`` if the filename looks like
-    a backup, else None. Used by ``list_backups`` and ``prune_backups``
-    to read metadata from filenames without consulting any other state.
+) -> tuple[datetime, str, str | None, str] | None:
+    """Return ``(timestamp, stage, label, stem)`` if the filename looks
+    like a backup, else None. Used by ``list_backups`` and
+    ``prune_backups`` to read metadata from filenames without
+    consulting any other state; the stem lets ``list_backups`` scope
+    to its own book when several books share a backups directory.
     """
     m = _FILENAME_RE.match(path.name)
     if not m:
@@ -293,7 +323,7 @@ def _parse_backup_filename(
     stage = m.group("stage")
     if stage not in _ALL_STAGE_NAMES:
         return None
-    return ts, stage, m.group("label")
+    return ts, stage, m.group("label"), m.group("stem")
 
 
 # ── Mixin ────────────────────────────────────────────────────────────
@@ -473,22 +503,32 @@ class BackupMixin:
     # ── Listing ──────────────────────────────────────────────────
 
     def list_backups(self) -> list[dict]:
-        """Return every recognized backup file under the backups dir,
-        newest first. Each entry carries ``stage``, ``timestamp`` (ISO
-        UTC), ``age`` (human-readable), ``size_bytes``, ``label``, and
-        ``path``.
+        """Return every recognized backup file OF THIS BOOK under the
+        backups dir, newest first. Each entry carries ``stage``,
+        ``timestamp`` (ISO UTC), ``age`` (human-readable),
+        ``size_bytes``, ``label``, and ``path``.
+
+        Scoped by filename stem: several books can share a backups
+        directory (GNUCASH_LOG_DIR), and every consumer of this
+        listing — retention slots in ``prune_backups`` /
+        ``_prune_auto_stages``, the newest-backup health signal —
+        must see only this book's snapshots. An unscoped listing let
+        one book's prune delete another book's backups.
         """
         backups_dir = self._backups_dir()
         if not backups_dir.exists():
             return []
 
+        own_stem = self.book_path.stem
         entries: list[dict] = []
         now = _now_utc()
         for path in backups_dir.iterdir():
             parsed = _parse_backup_filename(path)
             if parsed is None:
                 continue
-            ts, stage, label = parsed
+            ts, stage, label, stem = parsed
+            if stem != own_stem:
+                continue
             try:
                 size = path.stat().st_size
             except OSError as e:
@@ -688,9 +728,10 @@ class BackupMixin:
             self._backup_checked_in_process = True
 
         backups_dir = self._backups_dir()
+        stem = self.book_path.stem
         now = _now_utc()
         try:
-            state = _read_state(backups_dir)
+            state = _read_state(backups_dir, stem)
 
             # Identify due stages. Process in priority order (monthly
             # > weekly > session) so the first "due" stage becomes the
@@ -715,7 +756,7 @@ class BackupMixin:
             new_state = dict(state)
             for s in due_stages:
                 new_state[s.name] = now
-            _write_state(backups_dir, new_state)
+            _write_state(backups_dir, stem, new_state)
 
             # Prune each auto stage to its keep_last_n.
             self._prune_auto_stages()
@@ -724,7 +765,7 @@ class BackupMixin:
             # "auto-backup ran N minutes ago" signal — and so a later
             # failure becomes visible against the prior baseline.
             try:
-                _write_attempt_status(backups_dir, "ok", None, now)
+                _write_attempt_status(backups_dir, stem, "ok", None, now)
             except Exception as e:
                 debug_logger.warning(
                     f"Could not record auto-backup success status: {e}"
@@ -739,7 +780,7 @@ class BackupMixin:
             debug_logger.warning(f"Auto-backup skipped: {e}")
             try:
                 _write_attempt_status(
-                    backups_dir, "failed", str(e), now,
+                    backups_dir, stem, "failed", str(e), now,
                 )
             except Exception as write_err:
                 debug_logger.warning(
@@ -760,7 +801,7 @@ class BackupMixin:
             }``
         """
         backups_dir = self._backups_dir()
-        attempt = _read_attempt_status(backups_dir)
+        attempt = _read_attempt_status(backups_dir, self.book_path.stem)
         try:
             entries = self.list_backups()
         except Exception:
