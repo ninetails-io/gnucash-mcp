@@ -1380,18 +1380,23 @@ class TestResolveMcpDir:
         assert result == tmp_path / "alex.gnucash.mcp"
 
     def test_env_override_used(self, tmp_path, monkeypatch):
-        """GNUCASH_LOG_DIR takes precedence over derivation."""
+        """GNUCASH_LOG_DIR takes precedence over derivation — and
+        yields a PER-BOOK subdir under it, so two books sharing the
+        override never interleave audit files or backup state."""
         override = tmp_path / "elsewhere"
         monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
         result = resolve_mcp_dir(tmp_path / "alex.gnucash")
-        assert result == override
+        assert result == override / "alex.gnucash.mcp"
+        other = resolve_mcp_dir(tmp_path / "linwei.gnucash")
+        assert other == override / "linwei.gnucash.mcp"
+        assert result != other
 
     def test_env_override_expands_tilde(self, monkeypatch):
         """GNUCASH_LOG_DIR=~/foo expands to the user's home."""
         monkeypatch.setenv("GNUCASH_LOG_DIR", "~/my-logs")
         result = resolve_mcp_dir("/anywhere/book.gnucash")
         assert "~" not in str(result)
-        assert str(result).endswith("my-logs")
+        assert str(result).endswith("my-logs/book.gnucash.mcp")
 
     @pytest.mark.skipif(
         os.name != "posix",
@@ -1474,7 +1479,7 @@ class TestResolveMcpDir:
             # Should not raise despite the world-writable
             # parent — env override bypasses the check.
             result = resolve_mcp_dir(tmp_path / "alex.gnucash")
-            assert result == override
+            assert result == override / "alex.gnucash.mcp"
         finally:
             if os.name == "posix":
                 os.chmod(tmp_path, 0o755)

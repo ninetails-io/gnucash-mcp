@@ -173,8 +173,21 @@ def redact_paths(text: str) -> str:
 def resolve_mcp_dir(book_path: Path | str) -> Path:
     """Resolve the ``.mcp`` directory for audit / debug / backup storage.
 
-    ``GNUCASH_LOG_DIR`` set → that path is used directly, bypassing
-    all checks (explicit user opt-in). Otherwise the directory is
+    ``GNUCASH_LOG_DIR`` set → a PER-BOOK subdirectory under it:
+    ``{GNUCASH_LOG_DIR}/{book_filename}.mcp`` — the default layout,
+    relocated. The subdir is what makes the override safe for
+    multi-book: a flat shared directory interleaved two books' audit
+    entries in one daily file under one book's header. Always
+    per-book, never sniffed from what exists on disk — a
+    conditional "reuse the flat layout if present" rule can never
+    decide which book owns the flat files, so every book would
+    match and the interleave would persist. v1.4.0-and-earlier flat
+    files (``{GNUCASH_LOG_DIR}/audit`` …) stay on disk untouched;
+    move them into the book's subdir manually to keep old history
+    attached. Permission checks are bypassed under the override
+    (explicit user opt-in), as before.
+
+    Otherwise the directory is
     ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
     sanity checks fire:
 
@@ -198,7 +211,8 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     """
     env_override = os.environ.get("GNUCASH_LOG_DIR")
     if env_override:
-        return Path(env_override).expanduser()
+        base = Path(env_override).expanduser()
+        return base / f"{Path(book_path).name}.mcp"
 
     book_path = Path(book_path)
     parent = book_path.parent
