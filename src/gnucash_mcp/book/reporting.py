@@ -12,6 +12,7 @@ per-boundary snapshots — O(splits + intervals), not
 O(intervals × splits).
 """
 
+import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -20,11 +21,16 @@ import piecash
 from gnucash_mcp.book._base import _is_voided, _to_decimal
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
+    _PARTIAL_FOOTNOTE,
     _enumerate_periods,
     _format_grouped_tsv,
     _format_number,
+    _mark_partial,
+    _partial_period_labels,
     _period_label,
 )
+
+debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 # Account-type groups shared by the reports' SQL IN() clauses — one
 # canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
@@ -87,6 +93,7 @@ def _format_grouped_cashflow_tsv(
     outflows: dict[str, Decimal],
     account_label: str,
     transfers_excluded: int,
+    partial_labels: set[str] | None = None,
 ) -> str:
     """Render a multi-period cash-flow trend as a TSV table.
 
@@ -109,12 +116,18 @@ def _format_grouped_cashflow_tsv(
 
     lines = [
         account_label,
-        "\t".join(["Cash flow", *period_labels, "Total", "Avg"]),
+        "\t".join([
+            "Cash flow",
+            *_mark_partial(period_labels, partial_labels),
+            "Total", "Avg",
+        ]),
         _row("Inflows", inflows),
         _row("Outflows", outflows),
         _row("Net", net),
     ]
     out = "\n".join(lines)
+    if partial_labels:
+        out += f"\n{_PARTIAL_FOOTNOTE}"
     if transfers_excluded:
         out += (
             f"\n({transfers_excluded} internal transfer txn(s) excluded; "
@@ -278,9 +291,21 @@ class ReportingMixin:
         )
 
         # category fullname → {period_label: signed Decimal}
+        label_set = set(period_labels)
         totals: dict[str, dict[str, Decimal]] = {}
         for split, txn, account in rows:
             plabel = _period_label(txn.post_date, group_by)
+            if plabel not in label_set:
+                # _query_filtered_splits bounds post_date to
+                # [start, end], so every label is enumerated; a stray
+                # one means that invariant broke upstream. Skip with
+                # a trace rather than KeyError-ing the whole report.
+                debug_logger.warning(
+                    f"group_by split outside enumerated periods: "
+                    f"{plabel} not in {period_labels[0]}..."
+                    f"{period_labels[-1]}"
+                )
+                continue
             factor = factors_by_period.get(plabel, {}).get(account.guid)
             amount = sign * self._split_in_default_currency(
                 split, account, factor,
@@ -318,6 +343,9 @@ class ReportingMixin:
             grand_total=grand_total,
             excluded=excluded,
             label=label,
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
 
     def spending_by_category(
@@ -1088,6 +1116,15 @@ class ReportingMixin:
                 transfers_excluded.add(txn.guid)
                 continue
             plabel = _period_label(txn.post_date, group_by)
+            if plabel not in inflows:
+                # Same invariant guard as _grouped_breakdown: the SQL
+                # date bound guarantees containment; don't KeyError
+                # the report if it ever breaks.
+                debug_logger.warning(
+                    f"group_by split outside enumerated periods: "
+                    f"{plabel}"
+                )
+                continue
             amt = self._split_in_default_currency(
                 split, acct, factors_by_period.get(plabel, {}).get(acct.guid)
             )
@@ -1102,6 +1139,9 @@ class ReportingMixin:
             outflows=outflows,
             account_label=account_label,
             transfers_excluded=len(transfers_excluded),
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
 
     def _cashflow_txn_guids(

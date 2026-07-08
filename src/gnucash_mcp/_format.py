@@ -83,6 +83,58 @@ def _enumerate_periods(
     return periods
 
 
+def _partial_period_labels(
+    start_date: date, end_date: date, group_by: str
+) -> set[str]:
+    """Labels of sub-periods the report range only partially covers.
+
+    Only the first and last enumerated periods can be partial: the
+    first when ``start_date`` isn't the period's natural first day,
+    the last when ``end_date`` isn't its natural last day. Rendered
+    with a ``*`` marker so a half-month column isn't silently read
+    as a small full month (and so the Avg column's drag from a
+    partial period is visible).
+    """
+    partial: set[str] = set()
+    if group_by == "month":
+        first_start = date(start_date.year, start_date.month, 1)
+        last_end = date(
+            end_date.year, end_date.month,
+            calendar.monthrange(end_date.year, end_date.month)[1],
+        )
+    elif group_by == "quarter":
+        q_start = (start_date.month - 1) // 3
+        first_start = date(start_date.year, q_start * 3 + 1, 1)
+        q_end_month = ((end_date.month - 1) // 3 + 1) * 3
+        last_end = date(
+            end_date.year, q_end_month,
+            calendar.monthrange(end_date.year, q_end_month)[1],
+        )
+    else:  # year
+        first_start = date(start_date.year, 1, 1)
+        last_end = date(end_date.year, 12, 31)
+    if start_date != first_start:
+        partial.add(_period_label(start_date, group_by))
+    if end_date != last_end:
+        partial.add(_period_label(end_date, group_by))
+    return partial
+
+
+def _mark_partial(
+    period_labels: list[str], partial_labels: set[str] | None
+) -> list[str]:
+    """Header labels with ``*`` appended to partial periods."""
+    if not partial_labels:
+        return list(period_labels)
+    return [
+        f"{pl}*" if pl in partial_labels else pl
+        for pl in period_labels
+    ]
+
+
+_PARTIAL_FOOTNOTE = "(* period only partially covered by the date range)"
+
+
 def _strip_common_prefix(names: list[str]) -> list[str]:
     """Drop a shared top-level ``Expenses:`` / ``Income:`` prefix.
 
@@ -107,6 +159,7 @@ def _format_grouped_tsv(
     grand_total: Decimal,
     excluded: list[tuple[str, Decimal]],
     label: str,
+    partial_labels: set[str] | None = None,
 ) -> str:
     """Render an entity × sub-period breakdown as a TSV table.
 
@@ -123,7 +176,8 @@ def _format_grouped_tsv(
     """
     num_periods = len(period_labels)
     leaves = _strip_common_prefix(displayed_names)
-    lines = ["\t".join([label, *period_labels, "Total", "Avg"])]
+    header_labels = _mark_partial(period_labels, partial_labels)
+    lines = ["\t".join([label, *header_labels, "Total", "Avg"])]
     for name, leaf in zip(displayed_names, leaves):
         per = totals.get(name, {})
         cells = [leaf]
@@ -140,6 +194,8 @@ def _format_grouped_tsv(
     lines.append("\t".join(total_cells))
 
     out = "\n".join(lines)
+    if partial_labels:
+        out += f"\n{_PARTIAL_FOOTNOTE}"
     if excluded:
         netted = ", ".join(
             f"{n} {t:,.2f}"

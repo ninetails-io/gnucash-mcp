@@ -8458,7 +8458,8 @@ class TestGroupByBreakdown:
 
     def test_year_two_columns_partial_empty(self, tmp_path: Path):
         """18-month range → 2 year columns; the empty 2025 column
-        still renders as 0.00."""
+        still renders as 0.00, and the half-covered 2026 column is
+        marked partial so it isn't read as a small full year."""
         gc = GnuCashBook(str(self._book(tmp_path)))
         tsv = gc.spending_by_category(
             start_date=date(2025, 1, 1), end_date=date(2026, 6, 30),
@@ -8466,9 +8467,24 @@ class TestGroupByBreakdown:
         )
         rows = self._parse(tsv)
         assert rows["Category"] == [
-            "Category", "2025", "2026", "Total", "Avg",
+            "Category", "2025", "2026*", "Total", "Avg",
         ]
         assert rows["Groceries"][1:] == ["0.00", "1700.00", "1700.00", "850.00"]
+        assert "partially covered" in tsv
+
+    def test_partial_month_marked_with_footnote(self, tmp_path: Path):
+        """A range starting mid-month renders its first column with a
+        ``*`` marker and a footnote — a half month must not read as a
+        small full month (and the Avg drag is visible)."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 3, 15), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Category"][1] == "2026-03*"
+        assert rows["Category"][2:4] == ["2026-04", "2026-05"]
+        assert "partially covered" in tsv
 
     def test_no_group_by_unchanged(self, tmp_path: Path):
         """Regression guard: omitting group_by keeps the single-period

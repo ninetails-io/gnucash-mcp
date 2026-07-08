@@ -31,6 +31,7 @@ from gnucash_mcp._format import (
     _enumerate_periods,
     _format_grouped_tsv,
     _paginate,
+    _partial_period_labels,
     _period_label,
 )
 
@@ -7471,6 +7472,7 @@ class BusinessMixin:
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
+        label_set = set(period_labels)
 
         totals: dict[str, dict[str, Decimal]] = {}
         unconverted: dict[str, dict] = {}
@@ -7479,6 +7481,11 @@ class BusinessMixin:
             if posted is None:
                 continue
             plabel = _period_label(posted.date(), group_by)
+            if plabel not in label_set:
+                # The caller filters bills to [start, end]; a stray
+                # label means that invariant broke upstream. Skip
+                # rather than KeyError the period-totals pass below.
+                continue
             total, _paid, _out, unconv = self._bill_amounts_in_default(
                 book, bill, default_currency,
             )
@@ -7521,6 +7528,9 @@ class BusinessMixin:
             grand_total=grand_total,
             excluded=[],
             label="Vendor",
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
         if unconverted:
             mnem = default_currency.mnemonic
