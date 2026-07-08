@@ -14,6 +14,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 `_verify_composite_write` from _base.
 """
 
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -34,6 +35,9 @@ from gnucash_mcp._format import (
     _partial_period_labels,
     _period_label,
 )
+
+
+debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -7520,7 +7524,14 @@ class BusinessMixin:
             if plabel not in label_set:
                 # The caller filters bills to [start, end]; a stray
                 # label means that invariant broke upstream. Skip
-                # rather than KeyError the period-totals pass below.
+                # rather than KeyError the period-totals pass below —
+                # and leave a trace, matching the sibling guards in
+                # reporting.py: a silently dropped bill is a vendor
+                # total that's short with nothing to debug.
+                debug_logger.warning(
+                    f"group_by bill outside enumerated periods: "
+                    f"{plabel}"
+                )
                 continue
             total, _paid, _out, unconv = self._bill_amounts_in_default(
                 book, bill, default_currency,

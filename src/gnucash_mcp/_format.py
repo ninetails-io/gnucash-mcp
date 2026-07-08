@@ -18,7 +18,7 @@ Two pieces:
 
 import calendar
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TypeVar
 
@@ -88,34 +88,23 @@ def _partial_period_labels(
 ) -> set[str]:
     """Labels of sub-periods the report range only partially covers.
 
-    Only the first and last enumerated periods can be partial: the
-    first when ``start_date`` isn't the period's natural first day,
-    the last when ``end_date`` isn't its natural last day. Rendered
-    with a ``*`` marker so a half-month column isn't silently read
-    as a small full month (and so the Avg column's drag from a
-    partial period is visible).
+    Only the first and last enumerated periods can be partial.
+    Derived from ``_period_label`` itself instead of a third copy of
+    the calendar-boundary ladder: the range starts mid-period exactly
+    when the day BEFORE ``start_date`` still carries the same label,
+    and ends mid-period exactly when the day AFTER ``end_date`` does.
+    Provably consistent with the bucketing function by construction —
+    a new ``group_by`` granularity added to ``_period_label`` is
+    covered here with no edit. Rendered with a ``*`` marker so a
+    half-month column isn't silently read as a small full month (and
+    so the Avg column's drag from a partial period is visible).
     """
     partial: set[str] = set()
-    if group_by == "month":
-        first_start = date(start_date.year, start_date.month, 1)
-        last_end = date(
-            end_date.year, end_date.month,
-            calendar.monthrange(end_date.year, end_date.month)[1],
-        )
-    elif group_by == "quarter":
-        q_start = (start_date.month - 1) // 3
-        first_start = date(start_date.year, q_start * 3 + 1, 1)
-        q_end_month = ((end_date.month - 1) // 3 + 1) * 3
-        last_end = date(
-            end_date.year, q_end_month,
-            calendar.monthrange(end_date.year, q_end_month)[1],
-        )
-    else:  # year
-        first_start = date(start_date.year, 1, 1)
-        last_end = date(end_date.year, 12, 31)
-    if start_date != first_start:
+    if _period_label(start_date - timedelta(days=1), group_by) \
+            == _period_label(start_date, group_by):
         partial.add(_period_label(start_date, group_by))
-    if end_date != last_end:
+    if _period_label(end_date + timedelta(days=1), group_by) \
+            == _period_label(end_date, group_by):
         partial.add(_period_label(end_date, group_by))
     return partial
 
