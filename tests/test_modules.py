@@ -1049,6 +1049,24 @@ class TestMultiBook:
         with pytest.raises(_BookPathError, match="duplicate book filename"):
             _parse_book_paths(f"{b1}{os.pathsep}{b2}")
 
+    def test_parse_duplicate_stem_across_extensions_fails_fast(
+        self, tmp_path,
+    ):
+        """Backup state files, retention scoping, and backup filenames
+        are all keyed by the filename STEM — ledger.gnucash +
+        ledger.xac would share .state-ledger.json under a shared
+        GNUCASH_LOG_DIR and prune each other's snapshots. Uniqueness
+        must therefore be enforced on the stem, not the full name."""
+        from gnucash_mcp.server import _parse_book_paths, _BookPathError
+        d1 = tmp_path / "a"
+        d2 = tmp_path / "b"
+        d1.mkdir()
+        d2.mkdir()
+        b1 = _make_min_book(d1 / "ledger.gnucash")
+        b2 = _make_min_book(d2 / "ledger.xac")
+        with pytest.raises(_BookPathError, match="duplicate book filename"):
+            _parse_book_paths(f"{b1}{os.pathsep}{b2}")
+
     # ── switch_book visibility ─────────────────────────────────────
 
     def test_switch_book_present_with_two_books(self, two_books):

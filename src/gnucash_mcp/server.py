@@ -666,17 +666,24 @@ def _parse_book_paths(value: str | None) -> list[Path]:
     # matches case-INSENSITIVELY, so uniqueness must be checked the
     # same way: Ledger.gnucash + ledger.gnucash would make every
     # prefix ambiguous and the second book permanently unswitchable.
+    # STEMS must be unique too (also case-insensitively): backup
+    # state files, retention scoping, and backup filenames are all
+    # keyed by stem, so ledger.gnucash + ledger.xac sharing a
+    # GNUCASH_LOG_DIR would share .state-ledger.json and prune each
+    # other's snapshots — the cross-book data-loss class the stem
+    # scoping exists to prevent.
     seen: dict[str, Path] = {}
     for path in paths:
-        if path.name.lower() in seen:
+        stem_key = path.stem.lower()
+        if stem_key in seen:
             errors.append(
-                f"  - duplicate book filename {path.name!r}: "
-                f"{seen[path.name.lower()]} and {path} (filenames "
-                f"must be unique, case-insensitively, so switch_book "
-                f"can match by name)"
+                f"  - duplicate book filename stem {path.stem!r}: "
+                f"{seen[stem_key]} and {path} (book filename stems "
+                f"must be unique, case-insensitively — switch_book "
+                f"matches by name and backups are scoped by stem)"
             )
         else:
-            seen[path.name.lower()] = path
+            seen[stem_key] = path
 
     if errors:
         raise _BookPathError(
@@ -837,10 +844,11 @@ def _switch_book_impl(name: str) -> str:
     try:
         _activate_logging(target)  # logs follow the active book
     except Exception:
-        # setup_logging raises before touching handlers, so logging
-        # still points at the previous book; re-assert anyway in
-        # case a future edit moves the fallible step, and surface
-        # the original error.
+        # This fallback is LOAD-BEARING, not defensive: setup_logging
+        # clears the audit/debug handlers BEFORE its fallible steps
+        # (mkdir, FileHandler open), so a failure there leaves logging
+        # disabled entirely — re-asserting the previous book is what
+        # keeps its writes audited after a failed switch.
         if previous is not None:
             try:
                 _activate_logging(previous)
