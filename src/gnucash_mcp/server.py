@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -841,6 +841,27 @@ def _switch_book_impl(name: str) -> str:
     # book — never a half-switched state where reads, writes, and
     # audit logs disagree about which book is current.
     new_book = _book_for(target)
+
+    # The switch is THE event a multi-book audit trail exists to
+    # record (bookkeeper finding F1: silent switches turned a
+    # five-minute question into an hour of forensics). Departure is
+    # written to the PREVIOUS book's trail while logging still
+    # points there — after the target proved constructible, so a
+    # missing-file failure never forges a departure line — and
+    # arrival to the NEW book's trail after activation.
+    def _audit_line(text: str) -> None:
+        if _logging_audit:
+            stamp = datetime.now().astimezone().isoformat()
+            stamp = stamp.split("T")[1][:8]
+            logging.getLogger("gnucash_mcp.audit").info(
+                f"{stamp}  SWITCH BOOK  {text}"
+            )
+        logging.getLogger("gnucash_mcp.debug").info(
+            f"switch_book: {text}"
+        )
+
+    if previous is not None:
+        _audit_line(f"→ {target.name}")
     try:
         _activate_logging(target)  # logs follow the active book
     except Exception:
@@ -852,9 +873,17 @@ def _switch_book_impl(name: str) -> str:
         if previous is not None:
             try:
                 _activate_logging(previous)
+                # The departure line above is now false — correct
+                # the record on the trail that carries it.
+                _audit_line(f"FAILED → {target.name} (still on "
+                            f"{previous.name})")
             except Exception:
                 pass  # original error is the actionable one
         raise
+    _audit_line(
+        f"← now active (from "
+        f"{previous.name if previous else 'startup'})"
+    )
 
     _current_path = target
     _book = new_book

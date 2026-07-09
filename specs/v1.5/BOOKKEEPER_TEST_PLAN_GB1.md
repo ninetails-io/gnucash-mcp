@@ -83,18 +83,24 @@ whichever test book you like (alex is fine — it's a copy):
    **commodity EUR** (create the EUR commodity first via
    `create_commodity` if the book lacks it — alex has EUR already).
 2. `create_account`: `Assets:EUR Wallet`, type BANK, commodity EUR.
-3. `create_price` × 3 for EUR (quoted in the book default):
+3. **Prerequisite (F4, found in the first loop):** alex ships
+   with `user:market_data` EUR prices on these exact month-end
+   dates; same-date prices shadow the ones you're about to plant
+   (observed: 355.29 instead of 325.00). `get_prices` for EUR and
+   `delete_price` any existing EUR quotes dated 2026-01-31,
+   2026-02-28, or 2026-03-31 **before** planting yours.
+4. `create_price` × 3 for EUR (quoted in the book default):
    - 2026-01-31 → **1.05**
    - 2026-02-28 → **1.10**
    - 2026-03-31 → **1.20**
-4. Two cross-currency transactions (currency **EUR**):
+5. Two cross-currency transactions (currency **EUR**):
    - 2026-01-15, splits: `Expenses:EU Travel` +100,
      `Assets:EUR Wallet` −100
    - 2026-02-10, splits: `Expenses:EU Travel` +200,
      `Assets:EUR Wallet` −200
    (Expect the `fx_no_reference` / rate-sanity warnings to stay
    quiet or informative — they are non-blocking.)
-5. Now the assertions, range **2026-01-01 → 2026-03-31**, all four
+6. Now the assertions, range **2026-01-01 → 2026-03-31**, all four
    ways:
    - `spending_by_category(...)` single-period
    - `spending_by_category(..., group_by="month")`
@@ -151,6 +157,17 @@ whichever test book you like (alex is fine — it's a copy):
   chart, EUR default) this book's cross-currency features are
   hard to probe without USD flows; skip unless curious. The unit
   and oracle coverage is strong here.
+
+## Session-resilience protocol (F7, field-tested 2026-07-09)
+
+After ANY client network error or retried turn: re-verify
+`get_server_config` and `get_book_summary` before trusting the
+session's mental model of server state — tool calls from the lost
+turn may have executed server-side (including `switch_book`). In
+write-heavy phases, checkpoint with `create_backup` (manual stage,
+labeled) before each write phase and end the client turn at each
+checkpoint, so completed work is committed to the conversation
+record. Worst case under this protocol is a one-command rollback.
 
 ## Reporting
 
