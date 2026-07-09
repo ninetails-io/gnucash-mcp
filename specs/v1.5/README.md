@@ -68,6 +68,29 @@ before picking it up.
 
 ## Deferred features (1.5 candidates)
 
+**v1.5 scope (Stephen, 2026-07-09): the price downloader plus
+custom period alignment.** The rest of this section remains
+unscheduled.
+
+- **Custom period alignment (`periods` parameter)** — the three
+  breakdown reports (`spending_by_category`, `income_by_source`,
+  `cash_flow`) accept an explicit list of caller-supplied boundary
+  dates and render the same TSV with caller-labeled columns.
+  Deliberately NOT a calendar config: no 4-4-5/5-4-4 taxonomy, no
+  week-start env var, no fiscal-year setting — the LLM holds the
+  period semantics ("Jesse's April = Mar 30–Apr 26") and generates
+  boundaries; the server buckets and values. GB-1 unblocked this:
+  monthly-close per-split valuation makes totals
+  slicing-independent, so arbitrary boundaries sum exactly (13
+  custom periods == the year, guaranteed). Straddling days value at
+  their own month's close — consistent; document it. Partial-period
+  `*` markers generalize via the `_period_label` derivation.
+  Escape valve if boundary lists get re-derived every session: a
+  book slot holding the boundary rule for the LLM to read and
+  expand — still no server-side calendar logic. Moderate size:
+  `_enumerate_periods` grows an explicit-boundaries mode + label
+  plumbing. Demand: Jesse (household stakeholder, pre-month-start
+  periods like Mar 30 for April).
 - **Price auto-retrieval** (`update_prices`) — fetch FX rates
   (Frankfurter) and stock/fund quotes (yfinance), with
   `stale_only` auto-discovery and explicit `tickers=[...]` batch.
