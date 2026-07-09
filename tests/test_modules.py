@@ -1316,6 +1316,42 @@ class TestMultiBook:
         srv._switch_book_impl("beast")
         assert logcfg._book_path_str.endswith("beast-man.gnucash")
 
+    def test_switch_is_audited_in_both_books(
+        self, two_books, monkeypatch,
+    ):
+        """Bookkeeper finding F1: the switch is THE event a
+        multi-book audit trail exists to record. Departure must land
+        in the previous book's audit file, arrival in the new
+        book's — a silent switch turns audit forensics into
+        guesswork."""
+        import gnucash_mcp.server as srv
+        alex, beast = two_books
+        monkeypatch.delenv("GNUCASH_LOG_DIR", raising=False)
+        monkeypatch.setenv(
+            "GNUCASH_BOOK_PATH", f"{alex}{os.pathsep}{beast}",
+        )
+        srv._book = None
+        srv._current_path = None
+        srv._book_registry = {}
+        srv._book_paths = []
+        srv._logging_audit = True
+        srv._logging_debug = False
+        srv.get_book()
+        srv._activate_logging(alex.resolve())  # audit trail live on alex
+        srv._switch_book_impl("beast")
+
+        alex_audit = next(
+            (alex.parent / f"{alex.name}.mcp" / "audit").glob("*.txt")
+        ).read_text()
+        beast_audit = next(
+            (beast.parent / f"{beast.name}.mcp" / "audit").glob("*.txt")
+        ).read_text()
+        assert "SWITCH BOOK  → beast-man.gnucash" in alex_audit
+        assert "SWITCH BOOK  ← now active (from alex.gnucash)" \
+            in beast_audit
+        # And no arrival line polluting the departed book's trail.
+        assert "now active" not in alex_audit
+
     # ── get_book_summary current-book marker ───────────────────────
 
     def test_summary_marks_current_book_when_multi(self, two_books):

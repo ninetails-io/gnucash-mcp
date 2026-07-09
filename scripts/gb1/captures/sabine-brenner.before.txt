@@ -1,0 +1,45 @@
+== spending single ==
+Raumkosten             7,800.51  26.0%
+Zinsaufwendungen       7,278.77  24.3%
+verschiedene Kosten    6,323.18  21.1%
+Werbe-/Reisekosten     4,581.91  15.3%
+Kfz-Kosten             2,091.64  7.0%
+Abschreibungen         1,532.03  5.1%
+Versicherungsbeiträge    359.66  1.2%
+TOTAL                  29,967.70
+== spending by month ==
+Category	2026-01	2026-02	2026-03	2026-04	2026-05	2026-06	Total	Avg
+Raumkosten	1331.18	1331.18	1331.18	1268.99	1268.99	1268.99	7800.51	1300.08
+Zinsaufwendungen	1221.94	1218.43	1214.91	1211.38	1207.83	1204.28	7278.77	1213.13
+verschiedene Kosten	1245.21	853.88	1033.50	957.35	1184.87	1048.37	6323.18	1053.86
+Werbe-/Reisekosten	782.95	1227.70	1153.49	406.56	860.71	150.50	4581.91	763.65
+Kfz-Kosten	778.73	193.08	412.63	151.59	386.29	169.32	2091.64	348.61
+Abschreibungen	0.00	0.00	0.00	629.76	0.00	902.27	1532.03	255.34
+Versicherungsbeiträge	359.66	0.00	0.00	0.00	0.00	0.00	359.66	59.94
+TOTAL	5719.67	4824.27	5145.71	4625.63	4908.69	4743.73	29967.70	4994.62
+== spending by quarter ==
+Category	2026-Q1	2026-Q2	Total	Avg
+Raumkosten	3993.54	3806.97	7800.51	3900.26
+Zinsaufwendungen	3655.28	3623.49	7278.77	3639.38
+verschiedene Kosten	3132.59	3190.59	6323.18	3161.59
+Werbe-/Reisekosten	3164.14	1417.77	4581.91	2290.96
+Kfz-Kosten	1384.44	707.20	2091.64	1045.82
+Abschreibungen	0.00	1532.03	1532.03	766.02
+Versicherungsbeiträge	359.66	0.00	359.66	179.83
+TOTAL	15689.65	14278.05	29967.70	14983.85
+== income single ==
+Erlöskonten 8  54,415.00  100.0%
+TOTAL          54,415.00
+== income by month ==
+Source	2026-01	2026-02	2026-03	2026-04	2026-05	2026-06	Total	Avg
+Erlöskonten 8	8373.00	8358.00	8156.00	8549.00	6057.00	14922.00	54415.00	9069.17
+TOTAL	8373.00	8358.00	8156.00	8549.00	6057.00	14922.00	54415.00	9069.17
+== cash_flow single ==
+{'account': 'All cash/bank accounts', 'inflows': '59689.33', 'outflows': '39499.49', 'transfers_excluded': 201}
+== cash_flow by quarter ==
+All cash/bank accounts
+Cash flow	2026-Q1	2026-Q2	Total	Avg
+Inflows	29418.25	30271.08	59689.33	29844.66
+Outflows	20553.25	18946.24	39499.49	19749.74
+Net	8865.00	11324.84	20189.84	10094.92
+(201 internal transfer txn(s) excluded; include_transfers=true to include)

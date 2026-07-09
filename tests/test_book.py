@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import piecash
+from piecash import factories
 import pytest
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
@@ -8344,6 +8345,104 @@ class TestIncomeBySource:
         assert Decimal(result["total"]) == Decimal("700")  # 1000 - 300, net
         assert len(result["sources"]) == 1
         assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
+
+
+class TestModeAgreement:
+    """GB-1 (maintainer ruling 2026-07-07): flow reports value every
+    split at its own MONTH's closing rate in every mode, so the same
+    range reports the same grand total whether viewed single-period,
+    by month, by quarter, or by year. Pre-unification, single-period
+    anchored everything at range-end while group_by anchored at each
+    period's close — two totals for one question on any
+    foreign-currency book."""
+
+    @staticmethod
+    def _fx_book(path):
+        """USD book; EUR expenses in Jan and Feb; EUR/USD closes
+        1.05 (Jan), 1.10 (Feb), 1.20 (Mar). Monthly-close total:
+        100*1.05 + 200*1.10 = 325.00. The old range-end policy said
+        300*1.20 = 360.00 — the moving rate is what makes the
+        agreement assertion meaningful."""
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel = piecash.Account(
+            name="EU Travel", type="EXPENSE", parent=expenses,
+            commodity=eur,
+        )
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        eur_bank = piecash.Account(
+            name="EUR Account", type="BANK", parent=assets,
+            commodity=eur,
+        )
+        for d, amt in ((date(2026, 1, 15), "100"), (date(2026, 2, 10), "200")):
+            book.session.add(piecash.Transaction(
+                currency=eur, description="trip", post_date=d,
+                splits=[
+                    piecash.Split(account=travel,
+                                  value=Decimal(amt), quantity=Decimal(amt)),
+                    piecash.Split(account=eur_bank,
+                                  value=-Decimal(amt), quantity=-Decimal(amt)),
+                ],
+            ))
+        for d, rate in ((date(2026, 1, 31), "1.05"),
+                        (date(2026, 2, 28), "1.10"),
+                        (date(2026, 3, 31), "1.20")):
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=d,
+                value=Decimal(rate),
+            ))
+        book.save()
+        book.close()
+        return path
+
+    @staticmethod
+    def _grand_total(tsv: str) -> Decimal:
+        total_row = next(
+            ln for ln in tsv.splitlines() if ln.startswith("TOTAL\t")
+        )
+        return Decimal(total_row.split("\t")[-2])  # Total column
+
+    def test_spending_totals_agree_across_granularities(self, tmp_path):
+        gc = GnuCashBook(str(self._fx_book(tmp_path / "fx.gnucash")))
+        s, e = date(2026, 1, 1), date(2026, 3, 31)
+        single = Decimal(gc.spending_by_category(
+            start_date=s, end_date=e, compact=False,
+        )["total"])
+        by_month = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="month",
+        ))
+        by_quarter = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="quarter",
+        ))
+        by_year = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="year",
+        ))
+        # Monthly-close valuation: 100*1.05 + 200*1.10 — and NOT the
+        # old range-end policy's 300*1.20 = 360.00.
+        assert single == Decimal("325.00")
+        assert single == by_month == by_quarter == by_year
+
+    def test_cash_flow_totals_agree(self, tmp_path):
+        gc = GnuCashBook(str(self._fx_book(tmp_path / "fx2.gnucash")))
+        s, e = date(2026, 1, 1), date(2026, 3, 31)
+        single = gc.cash_flow(start_date=s, end_date=e)
+        grouped = gc.cash_flow(start_date=s, end_date=e, group_by="quarter")
+        out_row = next(
+            ln for ln in grouped.splitlines() if ln.startswith("Outflows\t")
+        )
+        grouped_out = Decimal(out_row.split("\t")[-2])
+        assert Decimal(single["outflows"]) == Decimal("325.00")
+        assert Decimal(single["outflows"]) == grouped_out
 
 
 class TestGroupByBreakdown:
