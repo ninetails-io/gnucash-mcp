@@ -937,3 +937,62 @@ class TestSharedLogDirScoping:
         created.rename(upper)
         listed = book.list_backups()
         assert len(listed) == 1, "case-flipped stem orphaned the backup"
+
+
+class TestIdenticalContentSkip:
+    """Bookkeeper finding F2: the auto-backup hook fires before the
+    tool body runs, so a write that fails validation still triggered
+    a full snapshot — duplicating multi-MB content for a no-op. When
+    the book's bytes match the newest existing snapshot, the hook now
+    advances the schedule without writing a duplicate file."""
+
+    @staticmethod
+    def _rewind_stages(book, test_book):
+        """Make every stage due again while preserving the recorded
+        book hash — simulating a later process on an unchanged book."""
+        from gnucash_mcp.book.backup import (
+            _read_book_hash, _write_state,
+        )
+        backups_dir = book._backups_dir()
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        _write_state(
+            backups_dir, test_book.stem,
+            {s: old for s in ("session", "weekly", "monthly")},
+            book_sha256=_read_book_hash(backups_dir, test_book.stem),
+        )
+        book._backup_checked_in_process = False
+
+    def test_identical_content_skips_duplicate_snapshot(
+        self, test_book: Path,
+    ):
+        book = GnuCashBook(str(test_book))
+        # First auto pass takes the real snapshot + records the anchor.
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 1
+
+        # Later process, everything due again, content unchanged.
+        self._rewind_stages(book, test_book)
+        book._maybe_auto_backup()
+
+        assert len(book.list_backups()) == 1, (
+            "duplicate snapshot written for unchanged content"
+        )
+        # The schedule still advanced.
+        state = _read_state(book._backups_dir(), test_book.stem)
+        now = datetime.now(timezone.utc)
+        assert all((now - ts).days < 1 for ts in state.values())
+
+    def test_changed_content_still_backs_up(self, test_book: Path):
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 1
+
+        # Mutate the book through the real write path, rewind, retry.
+        book.create_account(
+            name="F2 Probe", account_type="EXPENSE", parent="Expenses",
+        )
+        self._rewind_stages(book, test_book)
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 2, (
+            "changed content must still take a real snapshot"
+        )
