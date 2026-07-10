@@ -392,9 +392,15 @@ def setup_logging(
         debug_handler = logging.FileHandler(
             debug_dir / f"{today}.log", encoding="utf-8",
         )
+        # PID in every line: MCP clients can spawn multiple server
+        # processes against one config (observed: Claude Desktop
+        # starts twins), and they all append to this same per-book
+        # file. Without the PID, incident forensics cannot attribute
+        # a line to a process — the exact wall the 2026-07-10
+        # switch-timeout investigation hit.
         debug_handler.setFormatter(
             logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s",
+                "%(asctime)s [%(levelname)s] [pid %(process)d] %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
             )
         )

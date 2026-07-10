@@ -137,6 +137,20 @@ unscheduled.
   `Users/...` entry without leading slash loaded), zero-total
   categories dropped from group_by tables rather than shown as
   0.00.
+- **F6 ESCALATION (2026-07-10 live incident)** — beyond the README
+  note: a switch_book to sabine completed entirely server-side
+  (both audit trails + orientation, all within one second) yet the
+  client timed out and reported the server unresponsive — with twin
+  processes attached to one config (twins reproduced again on the
+  restart, same-second starts). Suspected client-side
+  routing/reading split across the twins; the mid-session "error
+  examining data" appeared in NO server log, consistent with a
+  second process on a different current-book. Server-side hardening
+  shipped same day (PID in debug-log lines; no-op switch logging).
+  Remaining: consider a single-instance guard or an upstream client
+  bug report. The F7 protocol (re-verify get_server_config after
+  any timeout) is the standing mitigation and was validated again
+  by this incident.
 - **v1.4 review LOWs deliberately left open** (see
   `specs/v1.4/review/CODE_REVIEW_v1_4.md` for mechanisms): FX-1
   (`allow_after` inconsistency on cost-basis fallback legs — math
