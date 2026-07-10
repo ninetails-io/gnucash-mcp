@@ -385,3 +385,34 @@ def test_market_value_cost_basis_converts_foreign_purchase(tmp_path):
         assert "no price data" in note
         # 1000 EUR x 1.20 = 1200 USD, not a raw 1000.
         assert value == Decimal("1200.00")
+
+
+class TestSameDatePriceTieBreak:
+    """Bookkeeper finding F3: two prices on the same
+    commodity/currency/date used to resolve by an accident of query
+    order — posting math and month-close valuation could flip between
+    runs. The rule is now deliberate: a manual quote (user:price /
+    user:price-editor) outranks feed sources; guid breaks residual
+    ties (arbitrary but stable)."""
+
+    def test_manual_quote_beats_feed_on_same_date(
+        self, multi_currency_book,
+    ):
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        # Insert feed first, manual second AND manual first, feed
+        # second on a different date — order must not matter.
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="user:market-data")
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+                        source="user:price")
+        with gc.open(readonly=True) as book:
+            eur = book.commodities(mnemonic="EUR")
+            usd = book.default_currency
+            rate = gc._find_exchange_rate(book, eur, usd, d)
+            assert rate == Decimal("1.10"), (
+                f"manual quote must win the same-date tie, got {rate}"
+            )
+            rates = gc._rates_as_of(book, d)
+            assert rates[eur.guid] == Decimal("1.10")
