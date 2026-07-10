@@ -207,10 +207,27 @@ def _read_state(backups_dir: Path, stem: str) -> dict[str, datetime]:
     return result
 
 
+def _read_book_hash(backups_dir: Path, stem: str) -> str | None:
+    """The ``book_sha256`` recorded by the last auto-backup, or None
+    (pre-upgrade state file, or none recorded). Same file-resolution
+    rules as ``_read_state``."""
+    path = _state_path(backups_dir, stem)
+    if not path.exists() and not os.environ.get("GNUCASH_LOG_DIR"):
+        path = backups_dir / ".state.json"
+    try:
+        with path.open() as f:
+            return json.load(f).get("book_sha256")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
 def _write_state(
     backups_dir: Path, stem: str, state: dict[str, datetime],
+    book_sha256: str | None = None,
 ) -> None:
-    """Persist ``last_backup_by_stage`` to disk."""
+    """Persist ``last_backup_by_stage`` (and, when provided, the
+    sha256 of the BOOK file at backup time — the identical-content
+    skip's comparison anchor) to disk."""
     backups_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
@@ -219,6 +236,8 @@ def _write_state(
             for stage, ts in state.items()
         },
     }
+    if book_sha256 is not None:
+        payload["book_sha256"] = book_sha256
     path = _state_path(backups_dir, stem)
     # Write via a temp + rename so a partial write never leaves a
     # corrupted state file.
@@ -380,6 +399,48 @@ class BackupMixin:
         backups dir, so the basename round-trips cleanly.)
         """
         return self._backups_dir() / Path(entry["path"]).name
+
+    def _current_book_hash(self) -> str | None:
+        """sha256 of the book file's bytes right now, or None on any
+        read error (callers fail toward taking a backup)."""
+        import hashlib
+
+        try:
+            return hashlib.sha256(
+                Path(self.book_path).read_bytes()
+            ).hexdigest()
+        except OSError as e:
+            debug_logger.warning(f"Book hash failed: {e}")
+            return None
+
+    def _book_unchanged_since_last_backup(
+        self, current_hash: str | None,
+    ) -> bool:
+        """True iff the book's bytes match the hash the last
+        auto-backup recorded AND at least one snapshot still exists.
+
+        The comparison anchor is the BOOK file's own hash at backup
+        time (recorded in the state file), not the snapshot's bytes —
+        SQLite's online-backup API legitimately produces a different
+        page layout, so book-vs-snapshot comparison always differs.
+        Manual backups don't update the anchor; the cost is one
+        redundant auto snapshot after a manual backup, the safe
+        direction. Missing anchor (pre-upgrade state) reads as
+        "changed".
+        """
+        if current_hash is None:
+            return False
+        try:
+            recorded = _read_book_hash(self._backups_dir(),
+                                       self.book_path.stem)
+            if recorded is None or recorded != current_hash:
+                return False
+            return bool(self.list_backups())
+        except Exception as e:  # noqa: BLE001 — fail toward backing up
+            debug_logger.warning(
+                f"Backup identity check failed (backing up anyway): {e}"
+            )
+            return False
 
     # ── Core primitive: create a backup ──────────────────────────
 
@@ -755,15 +816,36 @@ class BackupMixin:
                 # the chain is healthy and recent.
                 return
 
-            # Take ONE backup tagged with the highest-priority due
-            # stage. Advance every due stage's timestamp so multiple
-            # stages don't each trigger their own separate backup.
-            highest = due_stages[0]
-            self.create_backup(stage=highest.name, label=None)
+            # Content-aware skip (bookkeeper finding F2): the audit
+            # decorator fires this hook before the tool body runs, so
+            # a write that later fails validation still lands here —
+            # and duplicated a multi-MB snapshot for a no-op. True
+            # validate-then-open would need a second book open per
+            # write (the perf sin the project eliminated); instead,
+            # when the book's bytes match the newest existing
+            # snapshot, the protection a new backup would add already
+            # exists — advance the schedule without writing a
+            # duplicate file. Comparison failure of any kind falls
+            # through to a normal backup (today's behavior — the
+            # fail-safe direction).
+            current_hash = self._current_book_hash()
+            if self._book_unchanged_since_last_backup(current_hash):
+                debug_logger.info(
+                    "Auto-backup skipped: book content unchanged "
+                    "since the last snapshot; stages advanced."
+                )
+            else:
+                # Take ONE backup tagged with the highest-priority
+                # due stage. Advance every due stage's timestamp so
+                # multiple stages don't each trigger their own
+                # separate backup.
+                highest = due_stages[0]
+                self.create_backup(stage=highest.name, label=None)
             new_state = dict(state)
             for s in due_stages:
                 new_state[s.name] = now
-            _write_state(backups_dir, stem, new_state)
+            _write_state(backups_dir, stem, new_state,
+                         book_sha256=current_hash)
 
             # Prune each auto stage to its keep_last_n.
             self._prune_auto_stages()
