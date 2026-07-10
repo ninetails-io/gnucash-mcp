@@ -827,6 +827,12 @@ def _switch_book_impl(name: str) -> str:
         and _book is not None
         and _book is _book_registry.get(str(target))
     ):
+        # Debug-visible, not audited: retries after client timeouts
+        # are exactly what incident forensics needs to see, and this
+        # branch was invisible during the 2026-07-10 investigation.
+        logging.getLogger("gnucash_mcp.debug").info(
+            f"switch_book: no-op, already on {target.name}"
+        )
         return (
             f"Already on: {target.name}\n"
             f"{_book_orientation(_book)}"

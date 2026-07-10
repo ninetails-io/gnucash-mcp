@@ -136,9 +136,20 @@ unscheduled.
     newest insertion) and document it in `_find_prices`.
   - **F5** — timestamp conventions differ: backup filenames are
     UTC, audit/debug day-files are local-dated. Label or unify.
-  - **F6** — README note: Claude Desktop may spawn 2-3 server
-    processes on relaunch; the open-per-request design limits
-    lock exposure, but the behavior should be documented.
+  - **F6** — README note shipped, then ESCALATED by the 2026-07-10
+    live incident: a switch_book to sabine completed entirely
+    server-side (both audit trails + orientation, all within one
+    second) yet the client timed out and reported the server
+    unresponsive — with twin processes attached to one config (twins
+    reproduced again on the restart, same-second starts). Suspected
+    client-side routing/reading split across the twins; the
+    mid-session "error examining data" appeared in NO server log,
+    consistent with a second process on a different current-book.
+    Server-side hardening shipped (PID in debug-log lines; no-op
+    switch logging). Remaining: consider a single-instance guard or
+    upstream Desktop bug report. The F7 protocol (re-verify
+    get_server_config after any timeout) is the standing mitigation
+    and was validated again by this incident.
   - Reads-oddly: over-forgiving path normalization (a
     `Users/...` entry without leading slash loaded), zero-total
     categories dropped from group_by tables rather than shown as
