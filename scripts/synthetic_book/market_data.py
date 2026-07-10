@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import sys
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -70,7 +70,12 @@ FX_PAIRS = [  # (foreign, base) -> base per foreign
 ]
 
 START = date(2025, 1, 1)
-END = date(2026, 6, 30)  # fixed range for determinism
+# Default fetch horizon when --through isn't given. Determinism comes
+# from the COMMITTED cache, not from pinning the fetch window — a
+# refresh deliberately extends the horizon (generators forward-fill
+# past whatever the cache holds, so an older cache degrades gracefully
+# rather than failing).
+DEFAULT_END = date(2026, 6, 30)
 
 CACHE_PATH = Path(__file__).with_name("market_data_cache.json")
 
@@ -185,13 +190,15 @@ class MarketData:
 # --- Refresh path (yfinance + frankfurter; network required) --------------
 
 
-def _fetch_security(mnemonic: str, ticker: str) -> dict[str, float]:
+def _fetch_security(
+    mnemonic: str, ticker: str, end: date,
+) -> dict[str, float]:
     """Fetch daily closes for one security via yfinance. Retries once."""
     import yfinance as yf  # lazy: only needed on --refresh
 
-    # yfinance 'end' is exclusive; bump a day to include END.
+    # yfinance 'end' is exclusive; bump a day to include ``end``.
     start_s = START.isoformat()
-    end_s = (date(END.year, END.month, END.day)).isoformat()
+    end_s = (end + timedelta(days=1)).isoformat()
 
     last_err: Exception | None = None
     for attempt in (1, 2):
@@ -220,11 +227,11 @@ def _fetch_security(mnemonic: str, ticker: str) -> dict[str, float]:
     raise RuntimeError(f"Failed to fetch {mnemonic} ({ticker}): {last_err}")
 
 
-def _fetch_fx(foreign: str, base: str) -> dict[str, float]:
+def _fetch_fx(foreign: str, base: str, end: date) -> dict[str, float]:
     """Fetch base-per-foreign daily rates from frankfurter. Retries once."""
     url = _FRANKFURTER_URL.format(
         start=START.isoformat(),
-        end=END.isoformat(),
+        end=end.isoformat(),
         base=foreign,
         symbols=base,
     )
@@ -252,16 +259,22 @@ def _fetch_fx(foreign: str, base: str) -> dict[str, float]:
     raise RuntimeError(f"Failed to fetch FX {foreign}/{base}: {last_err}")
 
 
-def refresh(path: Path | str | None = None) -> dict:
-    """Fetch every instrument and FX pair and write the cache JSON."""
+def refresh(
+    path: Path | str | None = None, through: date | None = None,
+) -> dict:
+    """Fetch every instrument and FX pair from START through
+    ``through`` (default: today) and write the cache JSON. A full
+    refetch each time — the committed JSON is the cache; there is
+    nothing incremental worth the complexity at ~15 series."""
     path = Path(path) if path is not None else CACHE_PATH
+    end = through or date.today()
     failures: list[str] = []
 
     securities: dict[str, dict[str, float]] = {}
     print(f"Fetching {len(SECURITIES)} securities via yfinance...")
     for mnemonic, ticker in SECURITIES.items():
         try:
-            series = _fetch_security(mnemonic, ticker)
+            series = _fetch_security(mnemonic, ticker, end)
             securities[mnemonic] = series
             print(f"  ok  {mnemonic:8s} {ticker:12s} {len(series):4d} rows")
         except Exception as exc:  # noqa: BLE001
@@ -272,7 +285,7 @@ def refresh(path: Path | str | None = None) -> dict:
     for foreign, base in FX_PAIRS:
         key = _fx_key(foreign, base)
         try:
-            series = _fetch_fx(foreign, base)
+            series = _fetch_fx(foreign, base, end)
             fx[key] = series
             print(f"  ok  {key:10s} {len(series):4d} rows")
         except Exception as exc:  # noqa: BLE001
@@ -281,7 +294,7 @@ def refresh(path: Path | str | None = None) -> dict:
     data = {
         "meta": {
             "start": START.isoformat(),
-            "end": END.isoformat(),
+            "end": end.isoformat(),
             "refreshed": datetime.now().isoformat(timespec="seconds"),
         },
         "securities": securities,
@@ -333,14 +346,30 @@ def selftest() -> None:
 
 
 def main(argv: list[str]) -> int:
+    def _opt(flag: str) -> str | None:
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 < len(argv):
+                return argv[i + 1]
+        return None
+
     if "--refresh" in argv:
-        refresh()
+        through_s = _opt("--through")
+        cache_s = _opt("--cache")
+        refresh(
+            path=cache_s,
+            through=date.fromisoformat(through_s) if through_s else None,
+        )
         return 0
     if "--selftest" in argv:
         selftest()
         return 0
     print(__doc__)
-    print("Flags: --refresh (fetch+write cache), --selftest (sample lookups)")
+    print(
+        "Flags: --refresh [--through YYYY-MM-DD] [--cache PATH] "
+        "(fetch+write cache; horizon defaults to today), "
+        "--selftest (sample lookups)"
+    )
     return 0
 
 

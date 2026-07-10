@@ -404,8 +404,17 @@ session, the server snapshots your book to
 wrong, you can roll back to a known-good state without
 relying on Time Machine or your own habit. Backups are
 verified with `PRAGMA integrity_check` before being declared
-valid. See [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
+valid, and skipped when the book hasn't changed since the
+last snapshot. See [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
 for the rollback procedure.
+
+> **Reading timestamps:** backup *filenames* carry UTC
+> timestamps (filesystem-safe and unambiguous across travel
+> and DST); audit and debug logs use *local-dated* daily
+> files, matching how you'd search for "what happened
+> Tuesday." Near midnight these can differ by a day — the
+> `list_backups` tool always reports both the ISO timestamp
+> and a human age, so prefer it over eyeballing filenames.
 
 **Reconciled splits are protected.** The server refuses to
 delete or modify reconciled splits without an explicit
@@ -526,6 +535,17 @@ A condensed changelog of major releases lives in
 - Use full account paths: `Expenses:Groceries`, not just
   `Groceries`.
 - Or ask the assistant to list accounts: "List my accounts."
+
+### Multiple server processes after a client restart
+
+Claude Desktop (and some other MCP clients) may briefly spawn
+two or three copies of the server when relaunching. This is
+client behavior, not a server bug, and it's mostly harmless:
+the server opens your book per-request and releases the file
+lock between calls, so overlapping processes contend only for
+moments. If you see persistent `Lock on the file` errors after
+a client restart, quit the client fully, confirm with
+`pgrep -fl gnucash-mcp` that no strays remain, and relaunch.
 
 ### Something went wrong
 
