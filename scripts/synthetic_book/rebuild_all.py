@@ -147,6 +147,10 @@ def main() -> int:
         "--only", choices=[b.key for b in BOOKS], default=None,
         help="Rebuild a single book (default: all three).")
     parser.add_argument(
+        "--force", action="store_true",
+        help="Promote even if a gnucash-mcp server process is "
+             "running (it may be serving the canonical books).")
+    parser.add_argument(
         "--no-promote", action="store_true",
         help="Stop after verification; leave the canonical books "
              "untouched (outputs stay at samples/*.generated.gnucash).")
@@ -176,6 +180,24 @@ def main() -> int:
         for _, path in built:
             print(f"  {path}")
         return 0
+
+    # Live-server guard (learned 2026-07-10): a running gnucash-mcp
+    # may have these exact canonical files configured — the samples
+    # double as live oracle books. Promotion rewrites SQLite files
+    # in place; doing that under an active server risks a read
+    # landing mid-truncate. Open-per-request keeps the window small,
+    # but the safe move is not to race it at all.
+    probe = subprocess.run(
+        ["pgrep", "-f", "gnucash-mcp"], capture_output=True, text=True,
+    )
+    if probe.stdout.strip() and not args.force:
+        raise SystemExit(
+            "A gnucash-mcp server appears to be running (pids: "
+            f"{' '.join(probe.stdout.split())}). Promotion rewrites "
+            "the canonical sample books in place — stop the client/"
+            "server first, or rerun with --force if you are certain "
+            "no configured server is serving these files."
+        )
 
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     backup_dir = Path("/tmp") / f"sample-books-pre-rebuild-{stamp}"
