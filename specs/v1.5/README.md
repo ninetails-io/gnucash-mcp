@@ -18,9 +18,8 @@ before picking it up.
   stem scoping (PR #115, hardened in #119), audit interleave via
   per-book `.mcp` subdirs under `GNUCASH_LOG_DIR` (PR #120). See
   `specs/v1.4/review/CODE_REVIEW_v1_4.md` MB-2/MB-3.
-- **`.gitignore` gap** — `samples/*.gnucash.<timestamp>.log`
-  isn't matched by the current `*.gnucash.log` rule, so those
-  files show as untracked. Tighten to `samples/*.gnucash.*.log`.
+- ~~**`.gitignore` gap**~~ — **CLOSED 2026-07-10** with the loop
+  follow-ups (`samples/*.gnucash.*.log`).
 
 ---
 
@@ -122,27 +121,22 @@ unscheduled.
 
 ## Maintenance / hygiene
 
-- **GB-1 bookkeeper-loop follow-ups** (2026-07-09 report,
-  `specs/v1.5/BOOKKEEPER_TEST_REPORT_GB1.md`; F1 was fixed on the
-  GB-1 branch itself):
-  - **F2** — validate-then-open: a write tool that fails input
-    validation still opened the book readonly=False, consuming the
-    monthly auto-backup trigger on a no-op. Move account/argument
-    resolution ahead of the write-mode open where feasible.
-  - **F3** — same-date price tie-break is undefined/undocumented:
-    two prices on one commodity/currency/date resolve by an
-    accident of query order (observed `user:market_data` beating
-    `user:price`). Define the rule (e.g. source priority, then
-    newest insertion) and document it in `_find_prices`.
-  - **F5** — timestamp conventions differ: backup filenames are
-    UTC, audit/debug day-files are local-dated. Label or unify.
-  - **F6** — README note: Claude Desktop may spawn 2-3 server
-    processes on relaunch; the open-per-request design limits
-    lock exposure, but the behavior should be documented.
-  - Reads-oddly: over-forgiving path normalization (a
-    `Users/...` entry without leading slash loaded), zero-total
-    categories dropped from group_by tables rather than shown as
-    0.00.
+- ~~**GB-1 bookkeeper-loop follow-ups**~~ — **CLOSED 2026-07-10**
+  on `chore/loop-followups` (F1 was fixed on the GB-1 branch
+  itself): **F2** via the identical-content skip (the hook can't
+  validate-then-open without a second book open per write, so an
+  unchanged book now advances the schedule without writing a
+  duplicate snapshot; anchor = book-file sha256 recorded in the
+  state file); **F3** via `_price_tie_rank` (manual quotes beat
+  feed sources on the same date, guid breaks residual ties —
+  applied in `_find_prices`, `_rates_as_of`, and
+  `_find_exchange_rate_aged`); **F5/F6** documented in README
+  (timestamp conventions; client multi-spawn); `.gitignore`
+  tightened for timestamped sample logs. Still open from the
+  reads-oddly ledger: over-forgiving path normalization (a
+  `Users/...` entry without leading slash loaded), zero-total
+  categories dropped from group_by tables rather than shown as
+  0.00.
 - **v1.4 review LOWs deliberately left open** (see
   `specs/v1.4/review/CODE_REVIEW_v1_4.md` for mechanisms): FX-1
   (`allow_after` inconsistency on cost-basis fallback legs — math

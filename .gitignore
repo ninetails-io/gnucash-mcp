@@ -53,6 +53,10 @@ htmlcov/
 samples/*.generated.gnucash
 samples/*.generated.gnucash.*
 samples/*.gnucash.mcp/
+# piecash writes {book}.<timestamp>.log next to the book on some
+# operations; the bare *.gnucash.log rule above doesn't match the
+# timestamped form under samples/ (where !samples/*.gnucash re-includes).
+samples/*.gnucash.*.log
 
 # OS
 .DS_Store
