@@ -1630,6 +1630,37 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         return guids
 
     @staticmethod
+    def _preload_split_graph(book) -> None:
+        """Bulk-load accounts, transactions and their split collections,
+        so that later traversals of ``txn.splits``, ``split.transaction``
+        and ``split.account`` resolve in memory instead of lazy-loading
+        per row. Intended for whole-book reports; a single-account lookup
+        would load rows it never touches.
+
+        The loaded rows are parked on the book deliberately: SQLAlchemy's
+        identity map holds them only weakly, so without a strong
+        reference they would be collected immediately and every traversal
+        would query again. The reference lives as long as the book, i.e.
+        one ``open()`` context.
+        """
+        from piecash.core.account import Account
+        from piecash.core.transaction import Transaction
+        from sqlalchemy.orm import selectinload
+
+        if getattr(book, "_gnucash_mcp_split_graph", None) is not None:
+            return
+
+        accounts = (
+            book.session.query(Account).options(selectinload(Account.splits)).all()
+        )
+        transactions = (
+            book.session.query(Transaction)
+            .options(selectinload(Transaction.splits))
+            .all()
+        )
+        book._gnucash_mcp_split_graph = (accounts, transactions)
+
+    @staticmethod
     def _is_template_transaction(txn, template_guids: set) -> bool:
         """True iff ``txn`` is a scheduled-transaction template recipe.
 
