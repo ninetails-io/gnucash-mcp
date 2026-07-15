@@ -116,7 +116,10 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="transaction")
+    @audit_log(
+        classification="write", operation="create_from_scheduled",
+        entity_type="transaction",
+    )
     def create_transaction_from_scheduled(
         guid: ScheduledTransactionGuid,
         transaction_date: str | None = None,

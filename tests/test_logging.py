@@ -663,6 +663,75 @@ class TestBudgetAndScheduledAuditHandlers:
         assert "frequency: monthly  start: 2026-01-01" in rendered
         assert "had run 4 times" in rendered
 
+    def test_scheduled_create_renders_description(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {
+                "name": "Car Insurance",
+                "description": "Progressive policy #4471",
+                "start_date": "2026-08-01",
+            },
+            "after_state": {
+                "name": "Car Insurance",
+                "frequency": "monthly",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE SCHEDULED  "Car Insurance"' in rendered
+        assert "description: Progressive policy #4471" in rendered
+
+    def test_create_from_scheduled_shows_txn_guid_and_description(self):
+        """The instantiation response keys the new transaction as
+        ``transaction_guid`` — the generic CREATE handler used to
+        fall back to the params GUID (the SCHEDULE's) and render an
+        empty description. The dedicated handler reads the response."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_from_scheduled",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"guid": "aaaa1111", "transaction_date": "2026-08-01"},
+            "after_state": {
+                "transaction_guid": "bcd3e6e1",
+                "scheduled_transaction": "Car Insurance",
+                "description": "Progressive policy #4471, autopay",
+                "transaction_date": "2026-08-01",
+                "instance_count": 1,
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "CREATE FROM SCHEDULED  guid:bcd3e6e1" in rendered
+        assert "aaaa1111" not in rendered
+        assert '"Progressive policy #4471, autopay" (2026-08-01)' in rendered
+        assert 'schedule: "Car Insurance"  instance #1' in rendered
+
+    def test_create_from_scheduled_rejected_duplicate(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_from_scheduled",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"guid": "aaaa1111"},
+            "after_state": {
+                "transaction_guid": None,
+                "scheduled_transaction": "Car Insurance",
+                "description": "Progressive policy #4471, autopay",
+                "transaction_date": "2026-08-01",
+                "instance_count": 2,
+                "status": "rejected",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE FROM SCHEDULED  "Car Insurance" (2026-08-01)' in rendered
+        assert "rejected: equivalent transaction already exists" in rendered
+
 
 class TestBudgetAndScheduledStaging:
     """Verify the book methods actually stage before-state.

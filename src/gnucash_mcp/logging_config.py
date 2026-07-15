@@ -536,6 +536,39 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
+    """SX instantiation — the response carries ``transaction_guid``
+    (not ``guid``), so the generic transaction handler would fall
+    back to the params GUID, which is the SCHEDULE's. Read the
+    response fields directly instead.
+    """
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    sx_name = after.get("scheduled_transaction", "")
+    date_str = after.get("transaction_date", "")
+
+    if after.get("status") == "rejected":
+        # Duplicate already posted for this period — the schedule
+        # advanced but no transaction was written.
+        return [
+            f"{time_part}  CREATE FROM SCHEDULED  \"{sx_name}\" "
+            f"({date_str})",
+            f"{_INDENT}rejected: equivalent transaction already "
+            f"exists for this period",
+        ]
+
+    guid = after.get("transaction_guid", "")
+    desc = after.get("description", "")
+    lines = [f"{time_part}  CREATE FROM SCHEDULED  guid:{guid}"]
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+    detail = f'schedule: "{sx_name}"'
+    instance = after.get("instance_count")
+    if instance:
+        detail += f"  instance #{instance}"
+    lines.append(f"{_INDENT}{detail}")
+    return lines
+
+
 def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
     """Header-bearing TSV string -> row dicts (display-only)."""
     if not tsv:
@@ -1703,6 +1736,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     name = after.get("name", params.get("name", ""))
     lines = [f'{time_part}  CREATE SCHEDULED  "{name}"']
+    description = params.get("description", "")
+    if description and description != name:
+        lines.append(f"{_INDENT}description: {description}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
@@ -1770,6 +1806,8 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
 
 _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "CREATE_FROM_SCHEDULED"):
+        _fmt_transaction_create_from_scheduled,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
     ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,

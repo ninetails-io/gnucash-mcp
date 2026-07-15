@@ -532,6 +532,7 @@ def register(mcp, get_book) -> None:
             splits: List of split updates with 'account' and 'amount' (optional).
                     Must match existing splits by account name and balance to zero.
                     For cross-currency splits, include 'quantity' (amount in account's commodity).
+                    Include 'memo' to set that split's memo (omit to leave it unchanged).
                     ``amount``/``quantity`` are decimal strings (e.g. "94.87").
             notes: New transaction notes (optional). Pass empty string to clear.
             force: Allow modifying transactions with reconciled splits
