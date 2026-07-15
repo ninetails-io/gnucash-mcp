@@ -32,6 +32,7 @@ from gnucash_mcp.book._base import (
     _is_market_price,
     _is_unreconciled,
     _is_voided,
+    _slot_value_str,
     _split_to_compact_dict,
     _split_to_dict,
     _to_decimal,
@@ -3467,6 +3468,22 @@ class CoreMixin:
                 f"Got: {name!r}."
             )
 
+    # UTF-8 byte cap for the account "notes" slot — same limit as
+    # customer/vendor notes in the business module (kept as a local
+    # constant: core must not depend on BusinessMixin, which may not
+    # be composed into the book class).
+    _ACCOUNT_NOTES_MAX_BYTES = 4096
+
+    @classmethod
+    def _validate_account_notes(cls, notes: str) -> None:
+        byte_len = len(notes.encode("utf-8"))
+        if byte_len > cls._ACCOUNT_NOTES_MAX_BYTES:
+            raise ValueError(
+                f"notes exceeds {cls._ACCOUNT_NOTES_MAX_BYTES}-byte "
+                f"cap ({byte_len} bytes supplied). Shorten the value "
+                f"and retry."
+            )
+
     def create_account(
         self,
         name: str,
@@ -3476,6 +3493,7 @@ class CoreMixin:
         placeholder: bool = False,
         commodity: str | None = None,
         commodity_namespace: str = "CURRENCY",
+        notes: str = "",
     ) -> dict:
         """Create a new account in the chart of accounts.
 
@@ -3490,6 +3508,8 @@ class CoreMixin:
                        Defaults to book's default currency.
             commodity_namespace: Commodity namespace for non-currency commodities.
                                 Default "CURRENCY".
+            notes: Optional free-text notes, stored in the "notes"
+                   slot GnuCash desktop's account editor reads.
 
         Returns:
             Dict with guid, fullname, and status. Includes a warning if
@@ -3509,6 +3529,8 @@ class CoreMixin:
         # Validate the account name (shared chokepoint with
         # update_account's rename branch).
         self._validate_account_name(name)
+        if notes:
+            self._validate_account_notes(notes)
 
         with self.open(readonly=False) as book:
             # Determine parent account
@@ -3552,6 +3574,8 @@ class CoreMixin:
                 description=description,
                 placeholder=placeholder,
             )
+            if notes:
+                new_account["notes"] = notes
 
             book.save()
 
@@ -3596,6 +3620,7 @@ class CoreMixin:
         description: str | None = None,
         placeholder: bool | None = None,
         account_type: str | None = None,
+        notes: str | None = None,
     ) -> dict:
         """Update an existing account's properties.
 
@@ -3607,6 +3632,9 @@ class CoreMixin:
             account_type: New account type (e.g., "CREDIT", "BANK"). Only
                 changes within the same debit/credit polarity family are
                 allowed (e.g., LIABILITY to CREDIT, ASSET to BANK).
+            notes: New notes ("notes" slot, shared with GnuCash
+                desktop's account editor). Pass "" to clear — the
+                slot is deleted, matching a desktop-cleared field.
 
         Returns:
             Dict with updated account details.
@@ -3650,6 +3678,19 @@ class CoreMixin:
             if placeholder is not None and bool(placeholder) != bool(account.placeholder):
                 account.placeholder = placeholder
                 changed["placeholder"] = bool(placeholder)
+
+            if notes is not None:
+                self._validate_account_notes(notes)
+                try:
+                    current_notes = _slot_value_str(account["notes"])
+                except KeyError:
+                    current_notes = ""
+                if notes == "" and current_notes:
+                    del account["notes"]
+                    changed["notes"] = ""
+                elif notes and notes != current_notes:
+                    account["notes"] = notes
+                    changed["notes"] = notes
 
             if account_type is not None:
                 new_type = account_type.upper()

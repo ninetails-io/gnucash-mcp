@@ -318,7 +318,7 @@ class StaleFXRateError(ValueError):
 
 def _account_to_dict(account: piecash.Account) -> dict:
     """Convert a piecash Account to a serializable dict."""
-    return {
+    result = {
         "guid": account.guid,
         "name": account.name,
         "fullname": account.fullname,
@@ -327,6 +327,16 @@ def _account_to_dict(account: piecash.Account) -> dict:
         "description": account.description or "",
         "placeholder": bool(account.placeholder),
     }
+    # Account notes live in the "notes" slot — the same key GnuCash
+    # desktop's account editor reads/writes. Conditional so
+    # note-less accounts keep their original shape.
+    try:
+        notes = _slot_value_str(account["notes"])
+    except KeyError:
+        notes = ""
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 # Default type per conventional top-level name — used by

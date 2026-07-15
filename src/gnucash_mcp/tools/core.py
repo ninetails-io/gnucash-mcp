@@ -401,6 +401,7 @@ def register(mcp, get_book) -> None:
         placeholder: bool = False,
         commodity: str | None = None,
         commodity_namespace: str = "CURRENCY",
+        notes: str = "",
     ) -> str:
         """Create a new account in the chart of accounts.
 
@@ -418,6 +419,8 @@ def register(mcp, get_book) -> None:
             commodity_namespace: "CURRENCY" (default), "FUND", or an
                 exchange ("NASDAQ", "NYSE"). Required with non-currency
                 commodities.
+            notes: Optional free-text notes (max 4096 bytes). Shows in
+                GnuCash desktop's account editor Notes field.
         """
         book = get_book()
         result = book.create_account(
@@ -428,6 +431,7 @@ def register(mcp, get_book) -> None:
             placeholder=placeholder,
             commodity=commodity,
             commodity_namespace=commodity_namespace,
+            notes=notes,
         )
         return _json(result)
 
@@ -440,6 +444,7 @@ def register(mcp, get_book) -> None:
         description: str | None = None,
         placeholder: bool | None = None,
         account_type: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Update an existing account's properties.
 
@@ -452,6 +457,8 @@ def register(mcp, get_book) -> None:
                 within the same debit/credit polarity are allowed — e.g.,
                 LIABILITY to CREDIT, ASSET to BANK. Cross-polarity changes
                 (e.g., ASSET to LIABILITY) are blocked.
+            notes: New notes (max 4096 bytes; shared with GnuCash
+                desktop's Notes field). Pass "" to clear.
         """
         book = get_book()
         result = book.update_account(
@@ -460,6 +467,7 @@ def register(mcp, get_book) -> None:
             description=description,
             placeholder=placeholder,
             account_type=account_type,
+            notes=notes,
         )
         return _json(result)
 
