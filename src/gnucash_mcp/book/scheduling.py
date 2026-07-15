@@ -813,6 +813,7 @@ class SchedulingMixin:
         response = {
             "transaction_guid": txn_result.get("guid"),
             "scheduled_transaction": sx_name,
+            "description": sx_description,
             "transaction_date": txn_date.isoformat(),
             "instance_count": instance_count,
             "status": txn_result.get("status", "created"),
