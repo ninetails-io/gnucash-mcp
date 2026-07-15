@@ -1406,6 +1406,9 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+    memo = params.get("memo", "")
+    if memo:
+        lines.append(f"{_INDENT}memo: {memo}")
     lines += _fx_stale_lines(entry)
     return lines
 

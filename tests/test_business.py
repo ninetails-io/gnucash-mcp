@@ -7218,6 +7218,34 @@ class TestPayInvoice:
         )
         assert Decimal(result["remaining_balance"]) == Decimal("300")
 
+    def test_memo_lands_on_bank_split_only(self, business_book):
+        """User memo annotates the cash movement; the A/R//A/P split
+        keeps its action='Payment' convention with an empty memo."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            memo="check #1042",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        memos = {s["account"]: s.get("memo", "") for s in txn["splits"]}
+        assert memos["Assets:Checking"] == "check #1042"
+        assert memos["Assets:Accounts Receivable"] == ""
+
+    def test_no_memo_keeps_prior_shape(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_bill(gb, "50.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="50",
+            owner_type="vendor",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert all(not s.get("memo") for s in txn["splits"])
+
     def test_multiple_payments(self, business_book):
         gb = GnuCashBook(str(business_book))
         self._post_invoice(gb, "500.00")
