@@ -215,6 +215,25 @@ class TestListScheduled:
             {"account": "Expenses:Rent", "amount": "1850.00", "memo": ""},
             {"account": "Assets:Checking", "amount": "-1850.00", "memo": ""},
         ]
+        # description == name → suppressed as noise.
+        assert "description" not in result[0]
+
+    def test_verbose_list_shows_distinct_description(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Monthly Rent",
+            description="Rent payment to Lakeview Property Mgmt",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        result = gb.list_scheduled_transactions(compact=False)["scheduled_transactions"]
+        assert result[0]["description"] == (
+            "Rent payment to Lakeview Property Mgmt"
+        )
 
     def test_enabled_only_filter(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
@@ -339,9 +358,44 @@ class TestCreateFromScheduled:
         assert result["transaction_date"] == "2026-02-01"
         assert result["instance_count"] == 1
 
-        # Verify the transaction actually exists
+        # Verify the transaction actually exists, carrying the
+        # template's stored description (not the SX name).
         txn = gb.get_transaction(result["transaction_guid"])
         assert txn is not None
+        assert txn["description"] == "Rent"
+
+    def test_falls_back_to_name_without_description_slot(
+        self, scheduled_book,
+    ):
+        """Templates created before the description slot existed
+        instantiate with the SX name, as they always did."""
+        from sqlalchemy import text
+
+        gb = GnuCashBook(str(scheduled_book))
+        gb.create_scheduled_transaction(
+            name="Monthly Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date="2026-01-01",
+            frequency="monthly",
+        )
+        # Simulate a pre-slot template by removing the slot.
+        with gb.open(readonly=False) as book:
+            book.session.execute(
+                text("DELETE FROM slots WHERE name = 'description'")
+            )
+            book.save()
+            sx_guid = book.session.execute(
+                text("SELECT guid FROM schedxactions")
+            ).first()[0]
+
+        result = gb.create_transaction_from_scheduled(
+            guid=sx_guid, transaction_date="2026-02-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
         assert txn["description"] == "Monthly Rent"
 
     def test_updates_tracking(self, scheduled_book):
@@ -516,6 +570,17 @@ class TestDeleteScheduled:
         # Verify gone
         listed = gb.list_scheduled_transactions(enabled_only=False, compact=False)["scheduled_transactions"]
         assert len(listed) == 0
+
+        # No orphaned SX slots (splits-json, description) remain.
+        from sqlalchemy import text
+        with gb.open(readonly=True) as book:
+            count = book.session.execute(
+                text(
+                    "SELECT COUNT(*) FROM slots "
+                    "WHERE name IN ('splits-json', 'description')"
+                )
+            ).first()[0]
+        assert count == 0
 
     def test_delete_nonexistent_error(self, scheduled_book):
         gb = GnuCashBook(str(scheduled_book))
@@ -698,9 +763,10 @@ class TestScheduledIntegration:
         )
         assert txn["status"] == "created"
 
-        # Verify transaction exists with correct details
+        # Verify transaction exists with correct details — the
+        # stored description, not the SX name.
         real_txn = gb.get_transaction(txn["transaction_guid"])
-        assert real_txn["description"] == "Monthly Rent"
+        assert real_txn["description"] == "Rent payment"
         assert len(real_txn["splits"]) == 2
 
         # Check amounts in splits

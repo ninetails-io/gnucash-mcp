@@ -1703,6 +1703,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     name = after.get("name", params.get("name", ""))
     lines = [f'{time_part}  CREATE SCHEDULED  "{name}"']
+    description = params.get("description", "")
+    if description and description != name:
+        lines.append(f"{_INDENT}description: {description}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")

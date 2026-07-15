@@ -165,6 +165,23 @@ class SchedulingMixin:
             "auto_create": bool(sx.auto_create),
         }
 
+    def _get_sx_slot_string(
+        self, book, obj_guid: str, name: str,
+    ) -> str | None:
+        """Read a string slot off a ScheduledTransaction via raw SQL.
+
+        Raw SQL because the Slot ORM has polymorphic-relationship
+        conflicts on reads (see the piecash gotchas in CLAUDE.md).
+        """
+        row = book.session.execute(
+            text(
+                "SELECT string_val FROM slots "
+                "WHERE obj_guid = :guid AND name = :name"
+            ),
+            {"guid": obj_guid, "name": name},
+        ).first()
+        return row[0] if row else None
+
     def _get_sx_splits(self, book, sx) -> list[dict]:
         """Read split templates from the scheduled transaction's slot.
 
@@ -173,16 +190,23 @@ class SchedulingMixin:
         """
         import json
 
-        row = book.session.execute(
-            text(
-                "SELECT string_val FROM slots "
-                "WHERE obj_guid = :guid AND name = :name"
-            ),
-            {"guid": sx.guid, "name": "splits-json"},
-        ).first()
-        if row:
-            return json.loads(row[0])
+        raw = self._get_sx_slot_string(book, sx.guid, "splits-json")
+        if raw:
+            return json.loads(raw)
         return []
+
+    def _get_sx_description(self, book, sx) -> str:
+        """Instantiation description for a scheduled transaction.
+
+        MCP-created templates store it in a ``description`` slot
+        (bare key — universal financial concept). Templates from
+        before the slot existed have no row and fall back to the
+        SX name, which is what instantiation always used to use.
+        """
+        return (
+            self._get_sx_slot_string(book, sx.guid, "description")
+            or sx.name
+        )
 
     def _find_scheduled_transaction(self, book, guid: str):
         """Find a scheduled transaction by GUID (supports partial GUIDs, 8+ chars)."""
@@ -357,6 +381,25 @@ class SchedulingMixin:
                     f"Splits slot for scheduled transaction '{name}'",
                 )
 
+                # Instantiation description — read back by
+                # _get_sx_description, which falls back to the SX
+                # name when the slot is absent (pre-slot templates).
+                if description:
+                    book.session.execute(
+                        Slot.__table__.insert().values(
+                            obj_guid=sx_guid,
+                            name="description",
+                            slot_type=KVP_Type.KVP_TYPE_STRING,
+                            string_val=description,
+                        )
+                    )
+                    _verify_composite_write(
+                        book.session, Slot.__table__,
+                        {"obj_guid": sx_guid, "name": "description"},
+                        f"Description slot for scheduled "
+                        f"transaction '{name}'",
+                    )
+
                 book.save()
             except Exception:
                 # Clean up the orphan template; swallow cleanup
@@ -426,6 +469,13 @@ class SchedulingMixin:
                     continue
                 d = self._sx_to_dict(sx)
                 if not compact:
+                    # Only when a slot exists — echoing the name
+                    # back as "description" would just be noise.
+                    desc = self._get_sx_slot_string(
+                        book, sx.guid, "description",
+                    )
+                    if desc and desc != sx.name:
+                        d["description"] = desc
                     d["splits"] = self._get_sx_splits(book, sx)
                 results.append(d)
 
@@ -725,10 +775,11 @@ class SchedulingMixin:
                 )
 
             sx_name = sx.name
+            sx_description = self._get_sx_description(book, sx)
 
         # ── Phase 2: create the transaction (see docstring). ─────
         txn_result = self.create_transaction(
-            description=sx_name,
+            description=sx_description,
             splits=splits,
             trans_date=txn_date,
         )
@@ -864,18 +915,19 @@ class SchedulingMixin:
                 "status": "deleted",
             }
 
-            # splits-json slot deleted via Core.
+            # All SX-owned slots (splits-json, description) deleted
+            # via Core — the parent row is going away, so anything
+            # left keyed on its GUID would be an orphan.
             book.session.execute(
                 Slot.__table__.delete().where(
-                    (Slot.__table__.c.obj_guid == sx.guid)
-                    & (Slot.__table__.c.name == "splits-json")
+                    Slot.__table__.c.obj_guid == sx.guid
                 )
             )
             _verify_delete(
                 book.session,
                 Slot.__table__,
-                {"obj_guid": sx.guid, "name": "splits-json"},
-                f"Splits slot for scheduled transaction '{result['name']}'",
+                {"obj_guid": sx.guid},
+                f"Slots for scheduled transaction '{result['name']}'",
             )
 
             template_acct = sx.template_account
