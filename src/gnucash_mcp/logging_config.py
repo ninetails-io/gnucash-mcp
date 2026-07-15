@@ -1649,10 +1649,20 @@ def _fmt_entry_create(entry: dict) -> list[str]:
         or params.get("voucher_id", "")
         or params.get("credit_note_id", "")
     )
-    return [
+    lines = [
         f"{time_part}  CREATE ENTRY",
         f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
     ]
+    action = after.get("action", params.get("action", ""))
+    notes = after.get("notes", params.get("notes", ""))
+    if action or notes:
+        detail = []
+        if action:
+            detail.append(f"action: {action}")
+        if notes:
+            detail.append(f"notes: {notes}")
+        lines.append(f"{_INDENT}{'  '.join(detail)}")
+    return lines
 
 
 # ── Budget handlers ────────────────────────────────────────────────

@@ -1756,6 +1756,12 @@ class BusinessMixin:
             "price": str(price),
             "total": str(total),
         }
+        # Conditional keys — plain entries keep their shape.
+        if entry_row.notes:
+            result["notes"] = entry_row.notes
+        if entry_row.action:
+            result["action"] = entry_row.action
+
         if account_paths is not None and acct_guid:
             # Surface the readable path. Falls back to the
             # raw GUID when a stale entry references a deleted account.
@@ -4287,6 +4293,8 @@ class BusinessMixin:
         owner_type: str | None = None,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item to a credit note.
 
@@ -4316,6 +4324,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
         # Re-key invoice_id/bill_id → credit_note_id for clarity.
         legacy_key = (
@@ -4413,6 +4423,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Write a line-item entry on an invoice, bill, voucher, or
         credit note.
@@ -4421,6 +4433,10 @@ class BusinessMixin:
         ``_ENTRY_CONFIG``: which entries-table column side gets the
         price/account, the allowed account types, and the response
         id key.
+
+        ``notes`` is per-line free text (same 4096-byte cap as
+        customer/vendor notes); ``action`` is GnuCash's line-type
+        label (desktop suggests "Hours", "Material", "Project").
 
         Taxtable wire-up: ``taxtable`` marks the entry taxable and
         writes the resolved GUID to ``i_taxtable``/``b_taxtable``;
@@ -4441,6 +4457,7 @@ class BusinessMixin:
                 "tax_included=True requires a taxtable. Specify "
                 "which taxtable applies, or omit tax_included."
             )
+        self._validate_business_freetext(notes=notes)
 
         cfg = self._ENTRY_CONFIG[owner_type]
         # Bills (4) and vouchers (5) share the ``b_*`` / ``bill``
@@ -4538,8 +4555,8 @@ class BusinessMixin:
                     date=datetime.now(),
                     date_entered=datetime.now(),
                     description=description,
-                    action="",
-                    notes="",
+                    action=action,
+                    notes=notes,
                     quantity_num=q_num,
                     quantity_denom=q_denom,
                     i_discount_num=0,
@@ -4569,7 +4586,7 @@ class BusinessMixin:
 
             total = qty * unit_price
             # Entry ``guid`` omitted — no standalone tool surface.
-            return {
+            result = {
                 cfg["id_param"]: doc_id,
                 "description": description,
                 "quantity": str(qty),
@@ -4577,6 +4594,12 @@ class BusinessMixin:
                 "total": str(total),
                 "status": "created",
             }
+            # Conditional keys — plain entries keep their shape.
+            if notes:
+                result["notes"] = notes
+            if action:
+                result["action"] = action
+            return result
 
     def add_invoice_entry(
         self,
@@ -4587,6 +4610,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to a customer invoice.
 
@@ -4596,6 +4621,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '100.00').
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with guid, invoice_id, total, status.
@@ -4609,6 +4635,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def add_bill_entry(
@@ -4620,6 +4648,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to a vendor bill.
 
@@ -4629,7 +4659,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '50.00').
-            taxtable, tax_included: See ``_add_entry``.
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with bill_id, total, status.
@@ -4643,6 +4673,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def add_voucher_entry(
@@ -4654,6 +4686,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to an employee expense voucher.
 
@@ -4667,7 +4701,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1').
             price: Unit price as string (e.g., '42.50').
-            taxtable, tax_included: See ``_add_entry``.
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with voucher_id, total, status.
@@ -4681,6 +4715,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def list_invoices(

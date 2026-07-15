@@ -732,6 +732,47 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'CREATE FROM SCHEDULED  "Car Insurance" (2026-08-01)' in rendered
         assert "rejected: equivalent transaction already exists" in rendered
 
+    def test_entry_create_renders_notes_and_action(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"invoice_id": "000001"},
+            "after_state": {
+                "invoice_id": "000001",
+                "description": "April retainer",
+                "total": "1500.00",
+                "notes": "PO #2231",
+                "action": "Hours",
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert '"April retainer"  total: 1500.00  on: 000001' in rendered
+        assert "action: Hours  notes: PO #2231" in rendered
+
+    def test_entry_create_plain_has_no_detail_line(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"bill_id": "000001"},
+            "after_state": {
+                "bill_id": "000001",
+                "description": "Paper",
+                "total": "50.00",
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert '"Paper"  total: 50.00  on: 000001' in rendered
+        assert "notes:" not in rendered
+        assert "action:" not in rendered
+
 
 class TestBudgetAndScheduledStaging:
     """Verify the book methods actually stage before-state.
