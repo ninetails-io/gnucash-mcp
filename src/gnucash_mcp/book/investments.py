@@ -304,6 +304,7 @@ class InvestmentsMixin:
                 )
 
             book.save()
+            self._invalidate_price_caches(book)
 
             result = {
                 "commodity": commodity,
@@ -399,6 +400,7 @@ class InvestmentsMixin:
 
             book.session.delete(target)
             book.save()
+            self._invalidate_price_caches(book)
 
             return result
 
