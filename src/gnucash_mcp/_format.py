@@ -196,6 +196,77 @@ def _format_grouped_tsv(
     return out
 
 
+# ── Batch-entry TSV layout ─────────────────────────────────────────
+#
+# Shared by the tool-layer parser (tools/core.py) and the audit-log
+# display parser (logging_config.py) so the two can never drift on
+# what a submitted batch means.
+
+
+def _batch_tsv_layout(header_line: str) -> dict:
+    """Column layout of a batch-entry TSV, derived from its header.
+
+    The original format ignored the header entirely (positional
+    ``(amount, account)`` pairs). Extensions are header-declared so
+    legacy submissions parse byte-identically:
+
+    - a ``notes`` token in column 4 → a per-transaction notes column
+      sits between ``description`` and the split columns
+    - any ``memo`` token among the split columns → splits are
+      ``(amount, account, memo)`` TRIPLES instead of pairs
+
+    Tokens match case-insensitively with trailing digits stripped
+    (``amt1`` / ``acct2`` / ``memo3`` → ``amt`` / ``acct`` /
+    ``memo``), so numbered and unnumbered headers both work.
+
+    Returns ``{"has_notes": bool, "has_memos": bool}``.
+    """
+    tokens = [
+        t.strip().lower().rstrip("0123456789")
+        for t in header_line.split("\t")
+    ]
+    has_notes = len(tokens) > 3 and tokens[3] == "notes"
+    split_tokens = tokens[4:] if has_notes else tokens[3:]
+    return {
+        "has_notes": has_notes,
+        "has_memos": "memo" in split_tokens,
+    }
+
+
+def _batch_row_splits(rest: list[str], has_memos: bool) -> list[dict]:
+    """Chunk a batch row's trailing fields into split dicts.
+
+    Pairs mode: ``(amount, account)``. Triples mode (header declared
+    memos): ``(amount, account, memo)`` — empty memo cells are fine,
+    and the ``memo`` key appears only when non-empty so plain splits
+    keep their shape downstream.
+
+    Raises ValueError when the count doesn't divide evenly; the
+    triples-mode message calls out the likely culprit (a dropped
+    trailing tab on an empty final memo).
+    """
+    width = 3 if has_memos else 2
+    if len(rest) % width != 0:
+        if has_memos:
+            raise ValueError(
+                f"trailing fields must be (amount, account, memo) "
+                f"triples per the memo-declaring header — got "
+                f"{len(rest)} fields. A split with an empty memo "
+                f"still needs the memo cell's tab."
+            )
+        raise ValueError(
+            f"trailing fields must be (amount, account) pairs — "
+            f"got an odd count ({len(rest)})"
+        )
+    splits: list[dict] = []
+    for j in range(0, len(rest), width):
+        split = {"account": rest[j + 1], "amount": rest[j]}
+        if has_memos and rest[j + 2].strip():
+            split["memo"] = rest[j + 2].strip()
+        splits.append(split)
+    return splits
+
+
 # ── Numeric formatting ─────────────────────────────────────────────
 
 

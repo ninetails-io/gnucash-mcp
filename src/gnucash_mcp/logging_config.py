@@ -451,7 +451,10 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
         account = split.get("account", "Unknown")
         short_name = account.split(":")[-1]
         amount = _format_amount(split.get("amount") or split.get("value"))
-        lines.append(f"{indent}{short_name:<{max_name_len}}  {amount:>12}")
+        line = f"{indent}{short_name:<{max_name_len}}  {amount:>12}"
+        if split.get("memo"):
+            line += f"  {split['memo']}"
+        lines.append(line)
 
     return "\n".join(lines)
 
@@ -579,24 +582,37 @@ def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
 
 
 def _parse_batch_submission(tsv: str) -> dict:
-    """ref -> {description, date, splits} from the submitted batch TSV.
-    Positional parse mirroring the tool layer; tolerant of ragged rows
-    since this is display-only."""
+    """ref -> {description, date, notes?, splits} from the submitted
+    batch TSV. Layout comes from the shared header reader
+    (``_batch_tsv_layout``) so this display parse can't drift from
+    the tool-layer parse; tolerant of malformed rows since this is
+    display-only (a row the chunker rejects renders without its
+    splits — the write path rejected such rows anyway).
+    """
+    from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
+
     out: dict = {}
-    for ln in (tsv.split("\n")[1:] if tsv else []):
+    lines = tsv.split("\n") if tsv else []
+    if not lines:
+        return out
+    layout = _batch_tsv_layout(lines[0])
+    fixed = 4 if layout["has_notes"] else 3
+    for ln in lines[1:]:
         if not ln.strip():
             continue
         f = ln.split("\t")
         if len(f) < 3:
             continue
-        rest = f[3:]
-        splits = [
-            {"account": rest[j + 1], "amount": rest[j]}
-            for j in range(0, len(rest) - 1, 2)
-        ]
-        out[f[0].strip()] = {
+        try:
+            splits = _batch_row_splits(f[fixed:], layout["has_memos"])
+        except ValueError:
+            splits = []
+        entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
+        if layout["has_notes"] and len(f) > 3 and f[3].strip():
+            entry["notes"] = f[3].strip()
+        out[f[0].strip()] = entry
     return out
 
 
@@ -626,6 +642,8 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         lines.append(
             f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({date_str})'
         )
+        if src.get("notes"):
+            lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
         splits = src.get("splits") or []
         if splits:
             lines.append(_format_splits_text(splits, _INDENT_SPLITS))
