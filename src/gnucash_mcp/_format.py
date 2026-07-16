@@ -213,57 +213,68 @@ _BATCH_SPLIT_TOKENS = {
     "qty": "quantity", "quantity": "quantity",
 }
 
-# The legacy positional shape, used whenever the header doesn't
-# declare an extension token (memo/qty) — pre-extension headers were
-# purely decorative, so anything non-declaring parses as pairs.
+# Fallback shape for the audit log's display parser when a stored
+# submission's header no longer validates (it renders rows as
+# pairs rather than crashing log rendering).
 _BATCH_LEGACY_GROUP = ("amount", "account")
 
 
 def _batch_tsv_layout(header_line: str) -> dict:
     """Column layout of a batch-entry TSV, derived from its header.
 
-    The original format ignored the header entirely (positional
-    ``(amount, account)`` pairs). Extensions are header-declared so
-    legacy submissions parse byte-identically:
+    Fixed prefix ``ref, date, description``, an optional ``notes``
+    column, then split columns. The split-group field sequence is
+    whatever the header's FIRST group declares (``amt, acct`` pairs;
+    ``amt, acct, memo`` triples; ``amt, acct, qty``;
+    ``amt, acct, memo, qty`` — in any intra-group order): the header
+    is the schema, for field order too.
 
-    - a ``notes`` token in column 4 → a per-transaction notes column
-      sits between ``description`` and the split columns
-    - a ``memo`` and/or ``qty`` token among the split columns →
-      each split group widens to include that field, in the order
-      the header's FIRST group declares (e.g. ``amt, acct, memo,
-      qty`` or ``amt, acct, qty`` — the header is the schema, for
-      field order too)
+    EVERY column name is validated. Now that the header is
+    load-bearing, an unknown or typo'd token (``meno1``,
+    ``currency2``) must fail on the format — silently falling back
+    to positional pairs would misparse the row and surface a raw
+    decimal error on whatever landed in an amount slot (bookkeeper
+    finding, 1.4.1 validation round).
 
-    Returns ``{"has_notes": bool, "group": tuple[str, ...]}`` where
-    ``group`` is the per-split field sequence in canonical names
-    (``amount`` / ``account`` / ``memo`` / ``quantity``).
+    Returns ``{"has_notes": bool, "group": tuple[str, ...]}`` with
+    ``group`` in canonical names (``amount`` / ``account`` /
+    ``memo`` / ``quantity``).
 
-    Raises ValueError when an extension is declared but the first
-    group is malformed (unknown token mixed in, duplicate field, or
-    missing amount/account).
+    Raises ValueError naming the offending column on any unknown
+    token, a wrong fixed prefix, or a first group missing
+    amount/account.
     """
-    tokens = [
-        t.strip().lower().rstrip("0123456789")
-        for t in header_line.split("\t")
-    ]
+    raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
+    # Tolerate trailing empty cells (a trailing tab on the header).
+    while raw_tokens and not raw_tokens[-1]:
+        raw_tokens.pop()
+    tokens = [t.rstrip("0123456789") for t in raw_tokens]
+
+    if len(tokens) < 3 or tokens[0] != "ref" or tokens[1] != "date" \
+            or tokens[2] not in ("description", "desc"):
+        raise ValueError(
+            "batch header must start with ref, date, description "
+            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}"
+        )
     has_notes = len(tokens) > 3 and tokens[3] == "notes"
-    split_tokens = tokens[4:] if has_notes else tokens[3:]
+    start = 4 if has_notes else 3
 
-    canonical = [_BATCH_SPLIT_TOKENS.get(t) for t in split_tokens]
-    if not ({"memo", "quantity"} & set(canonical)):
-        # No extension declared — legacy positional pairs, header
-        # content otherwise irrelevant.
-        return {"has_notes": has_notes, "group": _BATCH_LEGACY_GROUP}
-
-    # Extension mode: the first group runs until a field repeats.
-    group: list[str] = []
-    for raw, name in zip(split_tokens, canonical):
+    canonical: list[str] = []
+    for raw, token in zip(raw_tokens[start:], tokens[start:]):
+        name = _BATCH_SPLIT_TOKENS.get(token)
         if name is None:
             raise ValueError(
-                f"unrecognized split column {raw!r} in a header that "
-                f"declares memo/qty columns — split columns must be "
-                f"amt, acct, memo, or qty"
+                f"unrecognized column {raw!r} in batch header — "
+                f"columns are ref, date, description, notes, then "
+                f"amt, acct, memo, qty split groups"
             )
+        canonical.append(name)
+
+    # The first group runs until a field repeats; later groups are
+    # not order-checked (rows are chunked by the first group's
+    # shape), but every token was validated above.
+    group: list[str] = []
+    for name in canonical:
         if name in group:
             break
         group.append(name)
