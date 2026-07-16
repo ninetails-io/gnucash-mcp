@@ -732,6 +732,60 @@ class TestBudgetAndScheduledAuditHandlers:
         assert 'CREATE FROM SCHEDULED  "Car Insurance" (2026-08-01)' in rendered
         assert "rejected: equivalent transaction already exists" in rendered
 
+    def test_batch_create_renders_notes_and_memos(self):
+        """The batch audit block re-parses the submitted TSV via the
+        shared header-aware layout — memo-declaring headers render
+        per-split memos, and the notes column gets its own line."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        submitted = (
+            "ref\tdate\tdescription\tnotes\tamt\tacct\tmemo\n"
+            "1\t2026-07-15\tGas\tstatement p.2\t-54.19"
+            "\tAssets:Checking\tcard #4471"
+            "\t54.19\tExpenses:Auto:Fuel\t"
+        )
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_batch",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"transactions": submitted},
+            "after_state": {
+                "results": (
+                    "ref\tstatus\ttxn_guid\tdup_count\treason\n"
+                    "1\tcreated\tabcd1234\t\t"
+                ),
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE  guid:abcd1234  "Gas" (2026-07-15)' in rendered
+        assert "notes: statement p.2" in rendered
+        assert "card #4471" in rendered
+
+    def test_legacy_batch_submission_renders_as_before(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        submitted = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t2026-07-15\tGas\t-54.19\tAssets:Checking"
+            "\t54.19\tExpenses:Auto:Fuel"
+        )
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_batch",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"transactions": submitted},
+            "after_state": {
+                "results": (
+                    "ref\tstatus\ttxn_guid\tdup_count\treason\n"
+                    "1\tcreated\tabcd1234\t\t"
+                ),
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE  guid:abcd1234  "Gas" (2026-07-15)' in rendered
+        assert "notes:" not in rendered
+        assert "Checking" in rendered
+
     def test_entry_create_renders_notes_and_action(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
         entry = {

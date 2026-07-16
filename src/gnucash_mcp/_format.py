@@ -196,6 +196,123 @@ def _format_grouped_tsv(
     return out
 
 
+# ── Batch-entry TSV layout ─────────────────────────────────────────
+#
+# Shared by the tool-layer parser (tools/core.py) and the audit-log
+# display parser (logging_config.py) so the two can never drift on
+# what a submitted batch means.
+
+
+# Canonical names for split-column header tokens. Trailing digits
+# are stripped before lookup (``amt1`` → ``amt``), so numbered and
+# unnumbered headers both work.
+_BATCH_SPLIT_TOKENS = {
+    "amt": "amount", "amount": "amount",
+    "acct": "account", "account": "account", "acc": "account",
+    "memo": "memo",
+    "qty": "quantity", "quantity": "quantity",
+}
+
+# The legacy positional shape, used whenever the header doesn't
+# declare an extension token (memo/qty) — pre-extension headers were
+# purely decorative, so anything non-declaring parses as pairs.
+_BATCH_LEGACY_GROUP = ("amount", "account")
+
+
+def _batch_tsv_layout(header_line: str) -> dict:
+    """Column layout of a batch-entry TSV, derived from its header.
+
+    The original format ignored the header entirely (positional
+    ``(amount, account)`` pairs). Extensions are header-declared so
+    legacy submissions parse byte-identically:
+
+    - a ``notes`` token in column 4 → a per-transaction notes column
+      sits between ``description`` and the split columns
+    - a ``memo`` and/or ``qty`` token among the split columns →
+      each split group widens to include that field, in the order
+      the header's FIRST group declares (e.g. ``amt, acct, memo,
+      qty`` or ``amt, acct, qty`` — the header is the schema, for
+      field order too)
+
+    Returns ``{"has_notes": bool, "group": tuple[str, ...]}`` where
+    ``group`` is the per-split field sequence in canonical names
+    (``amount`` / ``account`` / ``memo`` / ``quantity``).
+
+    Raises ValueError when an extension is declared but the first
+    group is malformed (unknown token mixed in, duplicate field, or
+    missing amount/account).
+    """
+    tokens = [
+        t.strip().lower().rstrip("0123456789")
+        for t in header_line.split("\t")
+    ]
+    has_notes = len(tokens) > 3 and tokens[3] == "notes"
+    split_tokens = tokens[4:] if has_notes else tokens[3:]
+
+    canonical = [_BATCH_SPLIT_TOKENS.get(t) for t in split_tokens]
+    if not ({"memo", "quantity"} & set(canonical)):
+        # No extension declared — legacy positional pairs, header
+        # content otherwise irrelevant.
+        return {"has_notes": has_notes, "group": _BATCH_LEGACY_GROUP}
+
+    # Extension mode: the first group runs until a field repeats.
+    group: list[str] = []
+    for raw, name in zip(split_tokens, canonical):
+        if name is None:
+            raise ValueError(
+                f"unrecognized split column {raw!r} in a header that "
+                f"declares memo/qty columns — split columns must be "
+                f"amt, acct, memo, or qty"
+            )
+        if name in group:
+            break
+        group.append(name)
+    if "amount" not in group or "account" not in group:
+        raise ValueError(
+            "split columns must include both an amount and an "
+            "account column"
+        )
+    return {"has_notes": has_notes, "group": tuple(group)}
+
+
+def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
+    """Chunk a batch row's trailing fields into split dicts.
+
+    ``group`` is the per-split field sequence from
+    ``_batch_tsv_layout``. ``amount`` and ``account`` are always
+    present; ``memo`` / ``quantity`` cells may be empty (the key is
+    included only when non-empty, so plain splits keep their shape
+    downstream — and an empty qty means "account commodity equals
+    the transaction currency", the same-currency default).
+
+    Raises ValueError when the count doesn't divide evenly; the
+    message names the declared shape and calls out the likely
+    culprit (a dropped trailing tab on an empty final cell).
+    """
+    width = len(group)
+    if len(rest) % width != 0:
+        shape = ", ".join(group)
+        hint = (
+            " A split with an empty trailing cell still needs "
+            "its tab." if width > 2 else ""
+        )
+        raise ValueError(
+            f"trailing fields must be ({shape}) groups per the "
+            f"header — got {len(rest)} fields.{hint}"
+        )
+    splits: list[dict] = []
+    for j in range(0, len(rest), width):
+        split: dict = {}
+        for k, field in enumerate(group):
+            cell = rest[j + k]
+            if field in ("amount", "account"):
+                split[field] = cell
+            elif cell.strip():
+                split[field] = cell.strip()
+        splits.append(split)
+    return splits
+
+
 # ── Numeric formatting ─────────────────────────────────────────────
 
 

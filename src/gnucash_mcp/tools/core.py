@@ -8,6 +8,7 @@ way (pure lazy-load orchestration, no hardcoded imports).
 
 from datetime import date
 
+from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     SplitInput,
@@ -22,43 +23,51 @@ from gnucash_mcp.tools._helpers import (
 def _parse_transactions_tsv(tsv: str) -> list[dict]:
     """Parse the batch-entry TSV into structured transactions.
 
-    Header row + one row per transaction; positional parse so rows may
-    be ragged. First three fields are ref / date / description; the rest
-    are ``(amount, account)`` pairs. Raises ValueError on a missing
-    header, too-few columns, or an odd trailing count.
+    The header row is load-bearing (see ``_batch_tsv_layout``): a
+    legacy header parses as positional ``(amount, account)`` pairs
+    exactly as before; a header declaring ``memo`` and/or ``qty``
+    split columns widens each split group accordingly (field order
+    per the header's first group), and a ``notes`` token in column 4
+    inserts a per-transaction notes column after ``description``.
+
+    Rows may be ragged (2 splits vs 3). Raises ValueError on a
+    missing header, too-few columns, or a split count that doesn't
+    match the declared shape.
     """
     lines = [ln for ln in tsv.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise ValueError(
             "transactions TSV needs a header row and at least one data row"
         )
+    layout = _batch_tsv_layout(lines[0])
+    group = layout["group"]
+    fixed = 4 if layout["has_notes"] else 3
+    shape = f"({', '.join(group)}) group"
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
-        if len(fields) < 5:
+        if len(fields) < fixed + len(group):
+            notes_part = ", notes" if layout["has_notes"] else ""
             raise ValueError(
-                f"row {i}: expected ref, date, description, and at least "
-                f"one (amount, account) pair"
+                f"row {i}: expected ref, date, description"
+                f"{notes_part}, and at least one {shape}"
             )
         ref, dt, desc = fields[0].strip(), fields[1].strip(), fields[2]
         if not ref:
             raise ValueError(f"row {i}: empty ref (each row needs a key)")
-        rest = fields[3:]
-        if len(rest) % 2 != 0:
-            raise ValueError(
-                f"row {i} (ref {ref!r}): trailing fields must be "
-                f"(amount, account) pairs — got an odd count"
-            )
-        splits = [
-            {"account": rest[j + 1], "amount": rest[j]}
-            for j in range(0, len(rest), 2)
-        ]
-        out.append({
+        try:
+            splits = _batch_row_splits(fields[fixed:], group)
+        except ValueError as e:
+            raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        txn = {
             "ref": ref,
             "date": _parse_iso_date(dt) or date.today(),
             "description": desc,
             "splits": splits,
-        })
+        }
+        if layout["has_notes"] and fields[3].strip():
+            txn["notes"] = fields[3].strip()
+        out.append(txn)
     return out
 
 
@@ -308,21 +317,57 @@ def register(mcp, get_book) -> None:
         """Create MANY transactions in one atomic command (bulk entry).
 
         INPUT — ``transactions`` is a TSV block: a header row, then one
-        row per transaction. Splits are ``(amount, account)`` column
-        PAIRS, repeated as wide as a transaction needs::
+        row per transaction. The HEADER DECLARES THE LAYOUT. Base form:
+        splits are ``(amount, account)`` column PAIRS, repeated as wide
+        as a transaction needs::
 
             ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
             1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
 
+        Two opt-in extensions, each activated by naming it in the
+        header (legacy headers parse exactly as before):
+
+        - PER-SPLIT MEMOS — declare ``memo`` split columns; splits
+          become ``(amount, account, memo)`` TRIPLES::
+
+              ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>memo1<TAB>amt2<TAB>acct2<TAB>memo2
+              1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>card #4471<TAB>54.19<TAB>Expenses:Auto:Fuel<TAB>
+
+          An empty memo cell is fine, but every split is a FULL
+          triple — keep the tab even when the memo is blank.
+        - PER-TRANSACTION NOTES — declare a ``notes`` column directly
+          after ``description``::
+
+              ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
+
+        - PER-SPLIT QUANTITY — declare ``qty`` split columns for
+          splits whose ACCOUNT commodity differs from the book
+          default (investment shares, foreign-currency accounts)::
+
+              ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>qty1<TAB>amt2<TAB>acct2<TAB>qty2
+              1<TAB>2026-07-01<TAB>VFIFX Purchase<TAB>-505.17<TAB>Assets:Checking<TAB><TAB>505.17<TAB>Assets:401k:VFIFX<TAB>7.7936
+
+          ``amount`` stays in the book's default currency (the
+          transaction currency — batch never changes that); ``qty``
+          is the amount in the account's own commodity. An EMPTY qty
+          cell means the account uses the default currency
+          (quantity == amount). A non-default-commodity account with
+          an empty qty rejects that row.
+
+        All extensions combine; when several split fields are
+        declared, the header's FIRST group fixes their order (e.g.
+        ``amt, acct, memo, qty``).
+
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
           to what you sent; the server never reuses or interprets it.
-        - ``date``: ISO YYYY-MM-DD. ``amount``: decimal STRING (never a
-          raw JSON number). Each transaction needs >=2 splits balancing
-          to zero. Rows may differ in width (2 splits vs 3).
-        - v1 is same-currency (book default) with no per-split memo —
-          use ``create_transaction`` for cross-currency, investment, or
-          memo-bearing entries.
+        - ``date``: ISO YYYY-MM-DD. ``amount``/``qty``: decimal
+          STRINGS (never raw JSON numbers). Each transaction needs
+          >=2 splits balancing to zero in the default currency. Rows
+          may differ in width (2 splits vs 3).
+        - The transaction currency is always the book default — for
+          a transaction denominated in another currency, use
+          ``create_transaction`` with its ``currency`` parameter.
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)

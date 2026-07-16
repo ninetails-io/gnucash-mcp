@@ -3090,7 +3090,11 @@ class CoreMixin:
         """Create multiple transactions in one atomic save.
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
-        ``{ref, date (date), description, splits: [{account, amount}]}``.
+        ``{ref, date (date), description, notes (optional),
+        splits: [{account, amount, memo (optional),
+        quantity (optional)}]}`` — quantity per the
+        ``_validate_transaction_splits`` contract (required iff the
+        account commodity differs from the book default).
 
         Three phases under one book-open: validate all structurally,
         screen each against existing-book duplicates, then build every
@@ -3101,9 +3105,11 @@ class CoreMixin:
 
         Returns a thin envelope: ``results`` TSV (always) and
         ``duplicates`` TSV (only when a match exists; otherwise empty,
-        which ``_strip_noise`` drops). v1 is same-currency (book
-        default), no per-split memo, no intra-batch dedup — exotic cases
-        use ``create_transaction``.
+        which ``_strip_noise`` drops). The transaction currency is
+        always the book default (a differently-denominated
+        transaction needs ``create_transaction``'s ``currency``
+        parameter); splits on non-default-commodity accounts carry
+        an explicit ``quantity``. No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -3139,6 +3145,7 @@ class CoreMixin:
                     prepared.append({
                         "ref": ref,
                         "description": txn["description"],
+                        "notes": txn.get("notes") or "",
                         "trans_date": txn["date"],
                         "validated": validated,
                         "proposed_amounts": [
@@ -3213,6 +3220,7 @@ class CoreMixin:
                 txn_obj = piecash.Transaction(
                     currency=default_currency,
                     description=p["description"],
+                    notes=p["notes"] or None,
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
