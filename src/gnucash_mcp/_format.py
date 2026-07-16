@@ -296,21 +296,35 @@ def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
     downstream — and an empty qty means "account commodity equals
     the transaction currency", the same-currency default).
 
-    Raises ValueError when the count doesn't divide evenly; the
-    message names the declared shape and calls out the likely
-    culprit (a dropped trailing tab on an empty final cell).
+    A row may end mid-group once the final split's REQUIRED fields
+    are present: omitted trailing cells are read as empty, so a
+    quad-header row can end right after its last account with no
+    placeholder tabs. Rows are still rejected when the omission
+    would swallow an amount or account — that's a misalignment, not
+    a shorthand.
     """
     width = len(group)
-    if len(rest) % width != 0:
-        shape = ", ".join(group)
-        hint = (
-            " A split with an empty trailing cell still needs "
-            "its tab." if width > 2 else ""
-        )
-        raise ValueError(
-            f"trailing fields must be ({shape}) groups per the "
-            f"header — got {len(rest)} fields.{hint}"
-        )
+    # Index just past the last required field — a trailing group
+    # shorter than this is missing amount/account, not merely
+    # skipping optional cells.
+    required_span = max(
+        i for i, f in enumerate(group) if f in ("amount", "account")
+    ) + 1
+    remainder = len(rest) % width
+    if remainder:
+        if remainder < required_span:
+            shape = ", ".join(group)
+            missing = ", ".join(
+                f for f in group[remainder:]
+                if f in ("amount", "account")
+            )
+            raise ValueError(
+                f"row ends mid-group: the last ({shape}) group has "
+                f"only {remainder} cell(s) and is missing {missing}. "
+                f"Optional trailing cells (memo/qty) may be omitted; "
+                f"amount and account may not."
+            )
+        rest = list(rest) + [""] * (width - remainder)
     splits: list[dict] = []
     for j in range(0, len(rest), width):
         split: dict = {}

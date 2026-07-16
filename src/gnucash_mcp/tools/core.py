@@ -332,10 +332,12 @@ def register(mcp, get_book) -> None:
           become ``(amount, account, memo)`` TRIPLES::
 
               ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>memo1<TAB>amt2<TAB>acct2<TAB>memo2
-              1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>card #4471<TAB>54.19<TAB>Expenses:Auto:Fuel<TAB>
+              1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>card #4471<TAB>54.19<TAB>Expenses:Auto:Fuel
 
-          An empty memo cell is fine, but every split is a FULL
-          triple — keep the tab even when the memo is blank.
+          Empty memo cells mid-row keep their tabs; a row may simply
+          END once its last split's amount and account are present
+          (trailing memo/qty cells are read as empty — no
+          placeholder tabs needed, as above).
         - PER-TRANSACTION NOTES — declare a ``notes`` column directly
           after ``description``::
 

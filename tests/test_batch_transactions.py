@@ -226,14 +226,70 @@ class TestBatchTsvParser:
         with pytest.raises(ValueError, match="unrecognized column"):
             _parse_transactions_tsv(tsv)
 
-    def test_triple_count_mismatch_names_the_tab(self):
-        # Last memo cell's tab dropped — THE likely mistake.
+    def test_row_may_end_after_last_required_field(self):
+        """Trailing optional cells may be omitted — a triple-header
+        row ending right after its last account parses with an empty
+        memo (was THE most common formatting mistake; now shorthand)."""
         tsv = (
             "ref\tdate\tdescription\tamt\tacct\tmemo\n"
             "1\t2026-05-21\tGas\t-5.00\tAssets:Checking\tcard"
             "\t5.00\tExpenses:Groceries"
         )
-        with pytest.raises(ValueError, match="still needs\\s+its tab"):
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"] == [
+            {
+                "account": "Assets:Checking", "amount": "-5.00",
+                "memo": "card",
+            },
+            {"account": "Expenses:Groceries", "amount": "5.00"},
+        ]
+
+    def test_quad_row_may_omit_both_trailing_optionals(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tmemo\tqty\n"
+            "1\t2026-05-21\tCoffee\t-4.50\tAssets:Checking\t\t"
+            "\t4.50\tExpenses:Dining"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][1] == {
+            "account": "Expenses:Dining", "amount": "4.50",
+        }
+
+    def test_quad_row_may_omit_just_the_final_optional(self):
+        # Ends after memo — only qty omitted.
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tmemo\tqty\n"
+            "1\t2026-05-21\tCoffee\t-4.50\tAssets:Checking\t\t"
+            "\t4.50\tExpenses:Dining\ttip included"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][1] == {
+            "account": "Expenses:Dining", "amount": "4.50",
+            "memo": "tip included",
+        }
+
+    def test_omission_respects_header_field_order(self):
+        # qty before memo in the header → ending after qty omits
+        # only the memo.
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tqty\tmemo\n"
+            "1\t2026-07-01\tShares\t-10.00\tAssets:Checking\t\tsettle"
+            "\t10.00\tAssets:401k:VFIFX\t0.153"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][1] == {
+            "account": "Assets:401k:VFIFX", "amount": "10.00",
+            "quantity": "0.153",
+        }
+
+    def test_omitting_required_fields_still_rejects(self):
+        # Row ends after an amount — the account is missing; that's
+        # a misalignment, not an optional-cell shorthand.
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tmemo\n"
+            "1\t2026-05-21\tGas\t-5.00\tAssets:Checking\tcard\t5.00"
+        )
+        with pytest.raises(ValueError, match="missing account"):
             _parse_transactions_tsv(tsv)
 
 
