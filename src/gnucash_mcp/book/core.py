@@ -3833,6 +3833,41 @@ class CoreMixin:
 
             return result
 
+    def _validate_transaction_deletable(
+        self, book, transaction, force: bool,
+    ) -> int:
+        """Shared delete safeguards; returns the reconciled-split
+        count (0 when clean).
+
+        - Refuses an invoice's posting transaction: deleting it
+          orphans the invoice's posted-state metadata, after which
+          the invoice refuses both delete ("posted") and re-post
+          ("already posted") — SQL surgery is the only escape.
+          unpost_invoice clears the metadata properly.
+        - Refuses reconciled splits unless ``force``.
+        """
+        from sqlalchemy import text
+        posting_for = book.session.execute(
+            text("SELECT id FROM invoices WHERE post_txn = :guid"),
+            {"guid": transaction.guid},
+        ).fetchone()
+        if posting_for:
+            raise ValueError(
+                f"Transaction is the posting record for invoice "
+                f"{posting_for[0]}. Use unpost_invoice first."
+            )
+
+        reconciled = [
+            s for s in transaction.splits if s.reconcile_state == "y"
+        ]
+        if reconciled and not force:
+            acct_names = ", ".join(s.account.fullname for s in reconciled)
+            raise ValueError(
+                f"Transaction has reconciled splits in: {acct_names}. "
+                f"Deleting will break reconciliation. Use force=true to override."
+            )
+        return len(reconciled)
+
     def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
@@ -3852,32 +3887,9 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # Refuse to delete an invoice's posting transaction: it
-            # orphans the invoice's posted-state metadata, after
-            # which the invoice refuses both delete ("posted") and
-            # re-post ("already posted") — SQL surgery is the only
-            # escape. unpost_invoice clears the metadata properly.
-            from sqlalchemy import text
-            posting_for = book.session.execute(
-                text("SELECT id FROM invoices WHERE post_txn = :guid"),
-                {"guid": transaction.guid},
-            ).fetchone()
-            if posting_for:
-                raise ValueError(
-                    f"Transaction is the posting record for invoice "
-                    f"{posting_for[0]}. Use unpost_invoice first."
-                )
-
-            # Check for reconciled splits
-            reconciled = [
-                s for s in transaction.splits if s.reconcile_state == "y"
-            ]
-            if reconciled and not force:
-                acct_names = ", ".join(s.account.fullname for s in reconciled)
-                raise ValueError(
-                    f"Transaction has reconciled splits in: {acct_names}. "
-                    f"Deleting will break reconciliation. Use force=true to override."
-                )
+            reconciled_count = self._validate_transaction_deletable(
+                book, transaction, force,
+            )
 
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
@@ -3891,14 +3903,92 @@ class CoreMixin:
                 "description": transaction.description,
                 "status": "deleted",
             }
-            if reconciled:
-                result["reconciled_splits_affected"] = len(reconciled)
+            if reconciled_count:
+                result["reconciled_splits_affected"] = reconciled_count
 
             # Delete the transaction
             book.session.delete(transaction)
             book.save()
 
             return result
+
+    def delete_transactions(
+        self, guids: list[str], force: bool = False,
+    ) -> dict:
+        """Delete several transactions in one book open / one save.
+
+        All-or-nothing: every guid must resolve and pass the same
+        safeguards as ``delete_transaction`` (invoice-posting guard,
+        reconciled splits vs ``force``) BEFORE anything is deleted —
+        validate-then-mutate, so a bad guid mid-list can't leave a
+        half-deleted batch.
+
+        Returns:
+            ``{status, count, transactions: [{guid, description,
+            reconciled_splits_affected?}]}`` — a dict envelope (not a
+            bare list) so the response machinery and audit decorator
+            see the same shape every write returns.
+
+        Raises:
+            ValueError: empty list, duplicate guid, any guid not
+                found, or any safeguard failure — nothing deleted.
+        """
+        if not guids:
+            raise ValueError("guids list is empty")
+
+        with self.open(readonly=False) as book:
+            resolved: list[tuple] = []
+            seen: set[str] = set()
+            for ref in guids:
+                transaction = self._find_transaction(book, ref)
+                if not transaction:
+                    raise ValueError(
+                        f"Transaction not found: {ref} (nothing deleted)"
+                    )
+                if transaction.guid in seen:
+                    raise ValueError(
+                        f"Duplicate guid in list: {ref} (nothing deleted)"
+                    )
+                seen.add(transaction.guid)
+                try:
+                    reconciled_count = self._validate_transaction_deletable(
+                        book, transaction, force,
+                    )
+                except ValueError as e:
+                    raise ValueError(f"{e} (nothing deleted)")
+                resolved.append((transaction, reconciled_count))
+
+            # Composite before-state — the audit formatter renders
+            # one block per deleted transaction from this list.
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for t, _ in resolved
+                ],
+            })
+
+            # Everything captured pre-delete: prefixes need the rows
+            # still present, attributes detach after the session
+            # closes.
+            all_guids = [t.guid for t in book.transactions]
+            items = []
+            for transaction, reconciled_count in resolved:
+                item = {
+                    "guid": _unique_prefix(transaction.guid, all_guids),
+                    "description": transaction.description,
+                }
+                if reconciled_count:
+                    item["reconciled_splits_affected"] = reconciled_count
+                items.append(item)
+
+            for transaction, _ in resolved:
+                book.session.delete(transaction)
+            book.save()
+
+            return {
+                "status": "deleted",
+                "count": len(items),
+                "transactions": items,
+            }
 
     def _verify_transaction_state(
         self,

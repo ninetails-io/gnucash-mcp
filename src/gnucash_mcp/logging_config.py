@@ -736,8 +736,31 @@ def _fmt_transaction_unvoid(entry: dict) -> list[str]:
 def _fmt_transaction_delete(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
-    guid = _transaction_guid(entry)
+    after = entry.get("after_state") or {}
 
+    # Batch form: multi-guid delete_transaction. The response
+    # carries short guids + descriptions; the composite before-state
+    # carries dates and splits, in the same order.
+    if "transactions" in after:
+        after_txns = after.get("transactions") or []
+        before_txns = (before or {}).get("transactions") or []
+        count = after.get("count", len(after_txns))
+        lines = [
+            f"{time_part}  DELETE TRANSACTIONS (batch)  {count} deleted"
+        ]
+        for i, at in enumerate(after_txns):
+            bt = before_txns[i] if i < len(before_txns) else {}
+            lines.append(
+                f'{_INDENT}DELETE  guid:{at.get("guid", "")}  '
+                f'"{at.get("description", "")}" ({bt.get("date", "")})'
+            )
+            if bt.get("splits"):
+                lines.append(
+                    _format_splits_text(bt["splits"], _INDENT_SPLITS)
+                )
+        return lines
+
+    guid = _transaction_guid(entry)
     lines = [f"{time_part}  DELETE TRANSACTION  guid:{guid}"]
     if before:
         desc = before.get("description", "")
