@@ -23,12 +23,13 @@ from gnucash_mcp.tools._helpers import (
 def _parse_transactions_tsv(tsv: str) -> list[dict]:
     """Parse the batch-entry TSV into structured transactions.
 
-    The header row is load-bearing (see ``_batch_tsv_layout``): a
-    legacy header parses as positional ``(amount, account)`` pairs
-    exactly as before; a header declaring ``memo`` and/or ``qty``
-    split columns widens each split group accordingly (field order
-    per the header's first group), and a ``notes`` token in column 4
-    inserts a per-transaction notes column after ``description``.
+    The header row is load-bearing (see ``_batch_tsv_layout``): the
+    documented base header parses as positional ``(amount, account)``
+    pairs exactly as before; ``memo`` and/or ``qty`` split columns
+    widen each split group accordingly (field order per the header's
+    first group); a ``notes`` token in column 4 inserts a
+    per-transaction notes column after ``description``. Unknown or
+    typo'd column names reject with the offending name.
 
     Rows may be ragged (2 splits vs 3). Raises ValueError on a
     missing header, too-few columns, or a split count that doesn't

@@ -72,17 +72,46 @@ class TestBatchTsvParser:
         ]
         assert "notes" not in rows[0]
 
-    def test_arbitrary_legacy_header_still_pairs(self):
-        """Pre-extension callers could put anything in the header
-        (it was purely decorative) — those parse as pairs still."""
+    def test_unknown_header_columns_reject_by_name(self):
+        """6c (bookkeeper finding): now that the header is load-
+        bearing, unknown columns must fail on the FORMAT with the
+        offending name — falling back to positional pairs misparsed
+        rows into raw decimal errors."""
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tcurrency1"
+            "\tamt2\tacct2\tcurrency2\n"
+            "1\t2026-05-21\tGas\t-5.00\tAssets:Checking\tUSD"
+            "\t5.00\tExpenses:Groceries\tUSD"
+        )
+        with pytest.raises(ValueError, match="unrecognized column 'currency1'"):
+            _parse_transactions_tsv(tsv)
+
+    def test_typoed_memo_token_rejects_instead_of_misparsing(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tmeno1\n"
+            "1\t2026-05-21\tGas\t-5.00\tAssets:Checking\toops"
+            "\t5.00\tExpenses:Groceries\t"
+        )
+        with pytest.raises(ValueError, match="unrecognized column 'meno1'"):
+            _parse_transactions_tsv(tsv)
+
+    def test_wrong_fixed_prefix_rejects(self):
         tsv = (
             "col_a\tcol_b\tcol_c\tcol_d\tcol_e\n"
             "1\t2026-05-21\tGas\t-5.00\tAssets:Checking"
             "\t5.00\tExpenses:Groceries"
         )
+        with pytest.raises(ValueError, match="must start with ref, date"):
+            _parse_transactions_tsv(tsv)
+
+    def test_trailing_header_tab_tolerated(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\t\n"
+            "1\t2026-05-21\tGas\t-5.00\tAssets:Checking"
+            "\t5.00\tExpenses:Groceries"
+        )
         rows = _parse_transactions_tsv(tsv)
         assert len(rows[0]["splits"]) == 2
-        assert "memo" not in rows[0]["splits"][0]
 
     def test_memo_header_switches_to_triples(self):
         tsv = (
@@ -194,7 +223,7 @@ class TestBatchTsvParser:
             "ref\tdate\tdescription\tamt\tacct\tmemo\tcurrency\n"
             "1\t2026-07-01\tX\t-1\tA\tm\tEUR\t1\tB\t\t"
         )
-        with pytest.raises(ValueError, match="unrecognized split column"):
+        with pytest.raises(ValueError, match="unrecognized column"):
             _parse_transactions_tsv(tsv)
 
     def test_triple_count_mismatch_names_the_tab(self):
