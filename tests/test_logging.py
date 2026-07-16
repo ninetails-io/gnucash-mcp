@@ -786,6 +786,46 @@ class TestBudgetAndScheduledAuditHandlers:
         assert "notes:" not in rendered
         assert "Checking" in rendered
 
+    def test_batch_delete_renders_per_transaction_blocks(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-07-15T20:00:00",
+            "params": {"guid": ["83862278", "d868498f"]},
+            "before_state": {
+                "transactions": [
+                    {
+                        "description": "Test Legacy Coffee",
+                        "date": "2026-07-10",
+                        "splits": [
+                            {"account": "Assets:Checking", "value": "-4.50"},
+                            {"account": "Expenses:Dining", "value": "4.50"},
+                        ],
+                    },
+                    {
+                        "description": "Test Legacy Gas",
+                        "date": "2026-07-11",
+                        "splits": [],
+                    },
+                ],
+            },
+            "after_state": {
+                "status": "deleted",
+                "count": 2,
+                "transactions": [
+                    {"guid": "83862278", "description": "Test Legacy Coffee"},
+                    {"guid": "d868498f", "description": "Test Legacy Gas"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "DELETE TRANSACTIONS (batch)  2 deleted" in rendered
+        assert 'DELETE  guid:83862278  "Test Legacy Coffee" (2026-07-10)' in rendered
+        assert 'DELETE  guid:d868498f  "Test Legacy Gas" (2026-07-11)' in rendered
+        assert "Checking" in rendered
+
     def test_entry_create_renders_notes_and_action(self):
         from gnucash_mcp.logging_config import _format_audit_entry_text
         entry = {

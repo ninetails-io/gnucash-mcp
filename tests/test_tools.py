@@ -518,6 +518,25 @@ class TestDeleteTransactionTool:
         get_result = server_module.get_transaction(guid)
         assert "error" in json.loads(get_result)
 
+    def test_delete_list_of_guids(self, setup_book_env):
+        """A list dispatches to the batch path; response is the
+        envelope, and one call removes them all."""
+        transactions = json.loads(
+            server_module.list_transactions(verbose=True)
+        )["transactions"]
+        guids = [t["guid"] for t in transactions[:2]]
+
+        result = server_module.delete_transaction(guids)
+
+        data = json.loads(result)
+        assert data["status"] == "deleted"
+        assert data["count"] == 2
+        assert len(data["transactions"]) == 2
+        for guid in guids:
+            assert "error" in json.loads(
+                server_module.get_transaction(guid)
+            )
+
     def test_delete_reconciled_rejected(self, setup_book_env):
         """Should reject deleting a transaction with reconciled splits."""
         transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]

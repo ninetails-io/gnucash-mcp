@@ -550,20 +550,32 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="transaction")
     def delete_transaction(
-        guid: TransactionGuid,
+        guid: TransactionGuid | list[TransactionGuid],
         force: bool = False,
     ) -> str:
-        """Delete a transaction by GUID.
+        """Delete one transaction by GUID — or several in one call.
 
-        Safeguards prevent deletion if the transaction has reconciled splits.
-        Use force=true to override.
+        Safeguards prevent deletion if a transaction has reconciled
+        splits (force=true overrides) or is an invoice's posting
+        record (unpost_invoice first).
+
+        Pass a LIST of GUIDs to delete several in one book open /
+        one save. The batch is all-or-nothing: every guid is
+        validated before anything is deleted, so a bad guid rejects
+        the whole call with nothing removed. Response for a list is
+        ``{status, count, transactions: [{guid, description}]}``;
+        a single guid returns the single-object shape as before.
 
         Args:
-            guid: Transaction GUID (32-character hex string, or 8+ char prefix)
-            force: Allow deleting transactions with reconciled splits
+            guid: Transaction GUID (32-char hex or 8+ char prefix),
+                or a list of them.
+            force: Allow deleting transactions with reconciled splits.
         """
         book = get_book()
-        result = book.delete_transaction(guid, force=force)
+        if isinstance(guid, list):
+            result = book.delete_transactions(guid, force=force)
+        else:
+            result = book.delete_transaction(guid, force=force)
         return _json(result)
 
     @mcp.tool()

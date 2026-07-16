@@ -6576,6 +6576,75 @@ class TestDeleteTransaction:
         assert gc_book.get_transaction(guid) is None
 
 
+class TestDeleteTransactions:
+    """Multi-guid delete: one open/save, all-or-nothing."""
+
+    def _make(self, gc_book, description: str) -> str:
+        result = gc_book.create_transaction(
+            description=description,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+            ],
+            check_duplicates=False,
+        )
+        return result["guid"]
+
+    def test_deletes_all_in_one_call(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guids = [self._make(gc_book, f"Cleanup {i}") for i in range(3)]
+
+        result = gc_book.delete_transactions(guids)
+        assert result["status"] == "deleted"
+        assert result["count"] == 3
+        assert [t["description"] for t in result["transactions"]] == [
+            "Cleanup 0", "Cleanup 1", "Cleanup 2",
+        ]
+        for guid in guids:
+            assert gc_book.get_transaction(guid) is None
+
+    def test_bad_guid_aborts_whole_batch(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guids = [self._make(gc_book, f"Keep {i}") for i in range(2)]
+
+        with pytest.raises(ValueError, match="nothing deleted"):
+            gc_book.delete_transactions(guids + ["deadbeef00000000"])
+        # All-or-nothing: the good guids survived.
+        for guid in guids:
+            assert gc_book.get_transaction(guid) is not None
+
+    def test_reconciled_without_force_aborts_whole_batch(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        clean = self._make(gc_book, "Clean one")
+        rec = self._make(gc_book, "Reconciled one")
+        txn = gc_book.get_transaction(rec)
+        gc_book.set_reconcile_state(txn["splits"][0]["guid"], "y")
+
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.delete_transactions([clean, rec])
+        assert gc_book.get_transaction(clean) is not None
+
+        result = gc_book.delete_transactions([clean, rec], force=True)
+        assert result["count"] == 2
+        by_desc = {t["description"]: t for t in result["transactions"]}
+        assert by_desc["Reconciled one"]["reconciled_splits_affected"] == 1
+        assert "reconciled_splits_affected" not in by_desc["Clean one"]
+
+    def test_duplicate_guid_rejects(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make(gc_book, "Once only")
+        with pytest.raises(ValueError, match="Duplicate guid"):
+            gc_book.delete_transactions([guid, guid])
+        assert gc_book.get_transaction(guid) is not None
+
+    def test_empty_list_rejects(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="empty"):
+            gc_book.delete_transactions([])
+
+
 class TestUpdateTransaction:
     """Tests for update_transaction method."""
 
