@@ -769,6 +769,9 @@ def _fmt_account_create(entry: dict) -> list[str]:
         desc = after.get("description", params.get("description", ""))
         if desc:
             lines.append(f'{_INDENT}Description: "{desc}"')
+        notes = after.get("notes", params.get("notes", ""))
+        if notes:
+            lines.append(f'{_INDENT}Notes: "{notes}"')
     return lines
 
 
@@ -791,6 +794,16 @@ def _fmt_account_update(entry: dict) -> list[str]:
         new_desc = after.get("description", "")
         if old_desc != new_desc:
             lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+        # ``notes`` is a diff-echo key: present in after_state only
+        # when the update changed it ("" = cleared).
+        if "notes" in after:
+            old_notes = before.get("notes", "")
+            if after["notes"]:
+                lines.append(
+                    f'{_INDENT}Notes: "{old_notes}" → "{after["notes"]}"'
+                )
+            else:
+                lines.append(f'{_INDENT}Notes: "{old_notes}" → (cleared)')
     return lines
 
 
@@ -1406,6 +1419,9 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+    memo = params.get("memo", "")
+    if memo:
+        lines.append(f"{_INDENT}memo: {memo}")
     lines += _fx_stale_lines(entry)
     return lines
 

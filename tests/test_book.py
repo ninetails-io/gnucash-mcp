@@ -5902,6 +5902,99 @@ class TestSearchTransactions:
         assert "limit capped at 250" in result.split("\n")[0]
 
 
+class TestAccountNotes:
+    """Account notes via the desktop-compatible "notes" slot."""
+
+    def test_create_with_notes_round_trip(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Chase Sapphire",
+            account_type="EXPENSE",
+            parent="Expenses",
+            notes="Closed to new charges 2026-07; autopay off",
+        )
+        account = gc_book.get_account("Expenses:Chase Sapphire")
+        assert account["notes"] == (
+            "Closed to new charges 2026-07; autopay off"
+        )
+
+        # Stored under the flat "notes" slot key — the one GnuCash
+        # desktop's account editor reads.
+        import sqlite3
+        conn = sqlite3.connect(str(test_book))
+        row = conn.execute(
+            "SELECT s.string_val FROM slots s "
+            "JOIN accounts a ON a.guid = s.obj_guid "
+            "WHERE a.name = 'Chase Sapphire' AND s.name = 'notes'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "Closed to new charges 2026-07; autopay off"
+
+    def test_create_without_notes_keeps_shape(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Plain", account_type="EXPENSE", parent="Expenses",
+        )
+        account = gc_book.get_account("Expenses:Plain")
+        assert "notes" not in account
+
+    def test_update_sets_changes_and_clears(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Annotated", account_type="EXPENSE", parent="Expenses",
+        )
+
+        r1 = gc_book.update_account(
+            "Expenses:Annotated", notes="first note",
+        )
+        assert r1["notes"] == "first note"
+        assert gc_book.get_account("Expenses:Annotated")["notes"] == (
+            "first note"
+        )
+
+        r2 = gc_book.update_account(
+            "Expenses:Annotated", notes="second note",
+        )
+        assert r2["notes"] == "second note"
+
+        # "" clears: the slot row is deleted, not left empty.
+        r3 = gc_book.update_account("Expenses:Annotated", notes="")
+        assert r3["notes"] == ""
+        assert "notes" not in gc_book.get_account("Expenses:Annotated")
+
+        import sqlite3
+        conn = sqlite3.connect(str(test_book))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM slots s "
+            "JOIN accounts a ON a.guid = s.obj_guid "
+            "WHERE a.name = 'Annotated' AND s.name = 'notes'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_update_unchanged_notes_not_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Stable", account_type="EXPENSE", parent="Expenses",
+            notes="same",
+        )
+        result = gc_book.update_account("Expenses:Stable", notes="same")
+        assert "notes" not in result  # diff-style echo: no change
+
+    def test_notes_byte_cap(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="notes exceeds"):
+            gc_book.create_account(
+                name="Chatty", account_type="EXPENSE", parent="Expenses",
+                notes="x" * 5000,
+            )
+        gc_book.create_account(
+            name="Chatty", account_type="EXPENSE", parent="Expenses",
+        )
+        with pytest.raises(ValueError, match="notes exceeds"):
+            gc_book.update_account("Expenses:Chatty", notes="x" * 5000)
+
+
 class TestCreateAccount:
     """Tests for create_account method."""
 

@@ -1175,6 +1175,7 @@ def register(mcp, get_book) -> None:
         apply_discount: bool = False,
         discount_account: str | None = None,
         force: bool = False,
+        memo: str = "",
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
@@ -1231,6 +1232,10 @@ def register(mcp, get_book) -> None:
                 is refused with ``stale_fx_rate`` unless ``force=True``
                 (the override is recorded as ``fx_stale``/"forced").
                 A rate beyond the 90-day cap cannot be forced.
+            memo: Optional memo for the bank-account split (e.g.,
+                check number or wire reference). ``description``
+                names the whole transaction; ``memo`` annotates the
+                cash movement.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1245,6 +1250,7 @@ def register(mcp, get_book) -> None:
             apply_discount=apply_discount,
             discount_account=discount_account,
             force=force,
+            memo=memo,
         )
         return _json(result)
 

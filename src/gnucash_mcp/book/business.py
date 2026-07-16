@@ -5535,11 +5535,17 @@ class BusinessMixin:
         apply_discount: bool = False,
         discount_account: str | None = None,
         force: bool = False,
+        memo: str = "",
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction and assigns the A/R or A/P
         split to the invoice's lot. Partial payments are supported.
+
+        ``memo`` lands on the bank-account split (check number, wire
+        reference). The A/R//A/P split keeps its ``action="Payment"``
+        convention, and server-authored memos (FX drift, discount)
+        are untouched.
 
         ``amount`` is always in the **invoice's currency**. For
         cross-currency payments the pay account's quantity comes
@@ -5917,7 +5923,7 @@ class BusinessMixin:
                     account=pay_acct,
                     value=-payment_amount,
                     quantity=-pay_quantity,
-                    memo="",
+                    memo=memo,
                 )
             else:
                 # Receive customer payment (or refund-in from a
@@ -5933,7 +5939,7 @@ class BusinessMixin:
                     account=pay_acct,
                     value=payment_amount,
                     quantity=pay_quantity,
-                    memo="",
+                    memo=memo,
                 )
 
             # Realized FX gain/loss on post→pay rate drift, factored
