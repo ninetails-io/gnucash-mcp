@@ -25,8 +25,9 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
 
     The header row is load-bearing (see ``_batch_tsv_layout``): a
     legacy header parses as positional ``(amount, account)`` pairs
-    exactly as before; a header declaring ``memo`` split columns
-    switches splits to triples, and a ``notes`` token in column 4
+    exactly as before; a header declaring ``memo`` and/or ``qty``
+    split columns widens each split group accordingly (field order
+    per the header's first group), and a ``notes`` token in column 4
     inserts a per-transaction notes column after ``description``.
 
     Rows may be ragged (2 splits vs 3). Raises ValueError on a
@@ -39,31 +40,13 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
             "transactions TSV needs a header row and at least one data row"
         )
     layout = _batch_tsv_layout(lines[0])
-    # Forward-compat guard: qty columns are the planned cross-currency
-    # extension, not yet implemented. Without this check a qty header
-    # falls into pairs mode and rejects rows with a bewildering
-    # "Account not found: <number>" — fail on the format instead.
-    header_tokens = {
-        t.strip().lower().rstrip("0123456789")
-        for t in lines[0].split("\t")
-    }
-    if header_tokens & {"qty", "quantity"}:
-        raise ValueError(
-            "qty columns are not supported yet — batch entry is "
-            "same-currency (quantity always equals amount). Use "
-            "create_transaction for cross-currency or investment "
-            "entries."
-        )
+    group = layout["group"]
     fixed = 4 if layout["has_notes"] else 3
-    width = 3 if layout["has_memos"] else 2
-    shape = (
-        "(amount, account, memo) triple" if layout["has_memos"]
-        else "(amount, account) pair"
-    )
+    shape = f"({', '.join(group)}) group"
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
-        if len(fields) < fixed + width:
+        if len(fields) < fixed + len(group):
             notes_part = ", notes" if layout["has_notes"] else ""
             raise ValueError(
                 f"row {i}: expected ref, date, description"
@@ -73,7 +56,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         if not ref:
             raise ValueError(f"row {i}: empty ref (each row needs a key)")
         try:
-            splits = _batch_row_splits(fields[fixed:], layout["has_memos"])
+            splits = _batch_row_splits(fields[fixed:], group)
         except ValueError as e:
             raise ValueError(f"row {i} (ref {ref!r}): {e}")
         txn = {
@@ -357,19 +340,34 @@ def register(mcp, get_book) -> None:
 
               ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
 
-        Both extensions combine (ref, date, description, notes, then
-        triples).
+        - PER-SPLIT QUANTITY — declare ``qty`` split columns for
+          splits whose ACCOUNT commodity differs from the book
+          default (investment shares, foreign-currency accounts)::
+
+              ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>qty1<TAB>amt2<TAB>acct2<TAB>qty2
+              1<TAB>2026-07-01<TAB>VFIFX Purchase<TAB>-505.17<TAB>Assets:Checking<TAB><TAB>505.17<TAB>Assets:401k:VFIFX<TAB>7.7936
+
+          ``amount`` stays in the book's default currency (the
+          transaction currency — batch never changes that); ``qty``
+          is the amount in the account's own commodity. An EMPTY qty
+          cell means the account uses the default currency
+          (quantity == amount). A non-default-commodity account with
+          an empty qty rejects that row.
+
+        All extensions combine; when several split fields are
+        declared, the header's FIRST group fixes their order (e.g.
+        ``amt, acct, memo, qty``).
 
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
           to what you sent; the server never reuses or interprets it.
-        - ``date``: ISO YYYY-MM-DD. ``amount``: decimal STRING (never a
-          raw JSON number). Each transaction needs >=2 splits balancing
-          to zero. Rows may differ in width (2 splits vs 3).
-        - v1 is same-currency (book default) — use
-          ``create_transaction`` for cross-currency or investment
-          entries. ``qty`` columns are a planned extension and are
-          rejected explicitly for now, not misparsed.
+        - ``date``: ISO YYYY-MM-DD. ``amount``/``qty``: decimal
+          STRINGS (never raw JSON numbers). Each transaction needs
+          >=2 splits balancing to zero in the default currency. Rows
+          may differ in width (2 splits vs 3).
+        - The transaction currency is always the book default — for
+          a transaction denominated in another currency, use
+          ``create_transaction`` with its ``currency`` parameter.
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)

@@ -5,6 +5,7 @@ method directly (the tool wrapper + audit are tested separately).
 """
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -137,18 +138,63 @@ class TestBatchTsvParser:
         assert len(rows[1]["splits"]) == 3
         assert rows[1]["splits"][2]["memo"] == "c"
 
-    def test_qty_columns_rejected_clearly(self):
-        """qty is the planned 1.5 cross-currency extension. Until it
-        exists, a qty header must fail on the FORMAT — falling into
-        pairs mode would reject rows with a bewildering
-        'Account not found: <number>' instead."""
+    def test_qty_header_switches_to_quantity_groups(self):
         tsv = (
             "ref\tdate\tdescription\tamt1\tacct1\tqty1"
             "\tamt2\tacct2\tqty2\n"
             "1\t2026-07-01\tVFIFX Purchase\t-505.17\tAssets:Checking\t"
             "\t505.17\tAssets:401k:VFIFX\t7.7936"
         )
-        with pytest.raises(ValueError, match="qty columns are not supported"):
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"] == [
+            # empty qty cell → same-currency split, no quantity key
+            {"account": "Assets:Checking", "amount": "-505.17"},
+            {
+                "account": "Assets:401k:VFIFX", "amount": "505.17",
+                "quantity": "7.7936",
+            },
+        ]
+
+    def test_quad_group_memo_and_qty(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tmemo\tqty\n"
+            "1\t2026-07-01\tShares\t-10.00\tAssets:Checking\tsettle\t"
+            "\t10.00\tAssets:401k:VFIFX\t\t0.153"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][0] == {
+            "account": "Assets:Checking", "amount": "-10.00",
+            "memo": "settle",
+        }
+        assert rows[0]["splits"][1] == {
+            "account": "Assets:401k:VFIFX", "amount": "10.00",
+            "quantity": "0.153",
+        }
+
+    def test_header_first_group_fixes_field_order(self):
+        """qty-before-memo in the header → qty-before-memo in rows.
+        The header is the schema for ORDER, not just presence."""
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tqty\tmemo\n"
+            "1\t2026-07-01\tShares\t10.00\tAssets:401k:VFIFX"
+            "\t0.153\tbuy\t-10.00\tAssets:Checking\t\tsettle"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][0] == {
+            "account": "Assets:401k:VFIFX", "amount": "10.00",
+            "quantity": "0.153", "memo": "buy",
+        }
+        assert rows[0]["splits"][1] == {
+            "account": "Assets:Checking", "amount": "-10.00",
+            "memo": "settle",
+        }
+
+    def test_unknown_split_token_in_extension_header_rejects(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt\tacct\tmemo\tcurrency\n"
+            "1\t2026-07-01\tX\t-1\tA\tm\tEUR\t1\tB\t\t"
+        )
+        with pytest.raises(ValueError, match="unrecognized split column"):
             _parse_transactions_tsv(tsv)
 
     def test_triple_count_mismatch_names_the_tab(self):
@@ -158,7 +204,7 @@ class TestBatchTsvParser:
             "1\t2026-05-21\tGas\t-5.00\tAssets:Checking\tcard"
             "\t5.00\tExpenses:Groceries"
         )
-        with pytest.raises(ValueError, match="memo cell's tab"):
+        with pytest.raises(ValueError, match="still needs\\s+its tab"):
             _parse_transactions_tsv(tsv)
 
 
@@ -253,6 +299,52 @@ class TestBatchCreate:
         txn = gc.get_transaction(rows[0]["txn_guid"])
         assert "notes" not in txn
         assert all(not s.get("memo") for s in txn["splits"])
+
+    def test_cross_commodity_quantity_round_trip(self, multi_currency_book):
+        """A batch row with an explicit quantity on a non-default-
+        commodity account books value in the transaction currency
+        and quantity in the account's commodity — same contract as
+        create_transaction, same validation chokepoint."""
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1",
+            "date": date(2026, 7, 1),
+            "description": "EUR top-up",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-1100.00"},
+                {
+                    "account": "Assets:Euro Savings",
+                    "amount": "1100.00",
+                    "quantity": "1000.00",
+                    "memo": "wire ref 4471",
+                },
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        txn = gc.get_transaction(rows[0]["txn_guid"])
+        eur = [s for s in txn["splits"]
+               if s["account"] == "Assets:Euro Savings"][0]
+        assert Decimal(eur["value"]) == Decimal("1100.00")
+        assert Decimal(eur["quantity"]) == Decimal("1000.00")
+        assert eur["memo"] == "wire ref 4471"
+
+    def test_missing_quantity_on_foreign_account_rejects_row(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1",
+            "date": date(2026, 7, 1),
+            "description": "EUR top-up sans qty",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-1100.00"},
+                {"account": "Assets:Euro Savings", "amount": "1100.00"},
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "quantity" in rows[0]["reason"].lower()
 
     def test_checksum_dupcount_equals_table_rows(self, test_book):
         gc = GnuCashBook(str(test_book))

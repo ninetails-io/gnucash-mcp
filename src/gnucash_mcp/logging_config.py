@@ -589,13 +589,22 @@ def _parse_batch_submission(tsv: str) -> dict:
     display-only (a row the chunker rejects renders without its
     splits — the write path rejected such rows anyway).
     """
-    from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
+    from gnucash_mcp._format import (
+        _BATCH_LEGACY_GROUP,
+        _batch_row_splits,
+        _batch_tsv_layout,
+    )
 
     out: dict = {}
     lines = tsv.split("\n") if tsv else []
     if not lines:
         return out
-    layout = _batch_tsv_layout(lines[0])
+    try:
+        layout = _batch_tsv_layout(lines[0])
+    except ValueError:
+        # Malformed extension header — the write path rejected the
+        # whole submission; render rows in the legacy shape.
+        layout = {"has_notes": False, "group": _BATCH_LEGACY_GROUP}
     fixed = 4 if layout["has_notes"] else 3
     for ln in lines[1:]:
         if not ln.strip():
@@ -604,7 +613,7 @@ def _parse_batch_submission(tsv: str) -> dict:
         if len(f) < 3:
             continue
         try:
-            splits = _batch_row_splits(f[fixed:], layout["has_memos"])
+            splits = _batch_row_splits(f[fixed:], layout["group"])
         except ValueError:
             splits = []
         entry = {
