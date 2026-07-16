@@ -137,6 +137,20 @@ class TestBatchTsvParser:
         assert len(rows[1]["splits"]) == 3
         assert rows[1]["splits"][2]["memo"] == "c"
 
+    def test_qty_columns_rejected_clearly(self):
+        """qty is the planned 1.5 cross-currency extension. Until it
+        exists, a qty header must fail on the FORMAT — falling into
+        pairs mode would reject rows with a bewildering
+        'Account not found: <number>' instead."""
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tqty1"
+            "\tamt2\tacct2\tqty2\n"
+            "1\t2026-07-01\tVFIFX Purchase\t-505.17\tAssets:Checking\t"
+            "\t505.17\tAssets:401k:VFIFX\t7.7936"
+        )
+        with pytest.raises(ValueError, match="qty columns are not supported"):
+            _parse_transactions_tsv(tsv)
+
     def test_triple_count_mismatch_names_the_tab(self):
         # Last memo cell's tab dropped — THE likely mistake.
         tsv = (

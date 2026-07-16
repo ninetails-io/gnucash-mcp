@@ -39,6 +39,21 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
             "transactions TSV needs a header row and at least one data row"
         )
     layout = _batch_tsv_layout(lines[0])
+    # Forward-compat guard: qty columns are the planned cross-currency
+    # extension, not yet implemented. Without this check a qty header
+    # falls into pairs mode and rejects rows with a bewildering
+    # "Account not found: <number>" — fail on the format instead.
+    header_tokens = {
+        t.strip().lower().rstrip("0123456789")
+        for t in lines[0].split("\t")
+    }
+    if header_tokens & {"qty", "quantity"}:
+        raise ValueError(
+            "qty columns are not supported yet — batch entry is "
+            "same-currency (quantity always equals amount). Use "
+            "create_transaction for cross-currency or investment "
+            "entries."
+        )
     fixed = 4 if layout["has_notes"] else 3
     width = 3 if layout["has_memos"] else 2
     shape = (
@@ -353,7 +368,8 @@ def register(mcp, get_book) -> None:
           to zero. Rows may differ in width (2 splits vs 3).
         - v1 is same-currency (book default) — use
           ``create_transaction`` for cross-currency or investment
-          entries.
+          entries. ``qty`` columns are a planned extension and are
+          rejected explicitly for now, not misparsed.
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
