@@ -2175,6 +2175,7 @@ class CoreMixin:
         compact: bool = True,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
     ) -> dict | str:
         """List all accounts in the chart of accounts.
 
@@ -2185,11 +2186,19 @@ class CoreMixin:
         resolve ``%xxxxxxx``, full GUIDs, and paths interchangeably via
         ``_resolve_account``).
 
+        ``query`` is a case-insensitive substring match against the
+        full path AND the description — the description matters on
+        numbered charts (SKR03 "4930" carries its meaning in the
+        description, not the name). Substring, not word match, so it
+        is locale-neutral by construction. Composes with ``root``.
+
         Args:
             root: Optional subtree filter (path, ``%short``, or GUID).
             compact: If False, return a verbose envelope instead.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return.
+            query: Optional case-insensitive substring filter on
+                path/description.
         """
         with self.open(readonly=True) as book:
             # Template accounts are GnuCash internals, not part of
@@ -2204,6 +2213,7 @@ class CoreMixin:
                 resolved_root = self._resolve_account(book, root)
                 root = resolved_root.fullname if resolved_root else root
 
+            needle = query.lower() if query else None
             filtered = []
             for account in book.accounts:
                 if account.type == "ROOT":
@@ -2213,6 +2223,13 @@ class CoreMixin:
                 if root is not None:
                     fn = account.fullname
                     if fn != root and not fn.startswith(root + ":"):
+                        continue
+                if needle is not None:
+                    haystack = (
+                        f"{account.fullname}\n"
+                        f"{account.description or ''}"
+                    ).lower()
+                    if needle not in haystack:
                         continue
                 filtered.append(account)
 
