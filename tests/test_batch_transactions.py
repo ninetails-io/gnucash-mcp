@@ -282,6 +282,39 @@ class TestBatchTsvParser:
             "quantity": "0.153",
         }
 
+    def test_splitless_row_parses_as_auto_fill_request(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t2026-07-01\tRent\n"
+            "2\t2026-07-01\tNetflix\t\t"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"] == []
+        # Stray trailing tabs stripped — still an auto-fill request.
+        assert rows[1]["splits"] == []
+
+    def test_minimal_header_for_all_autofill_batch(self):
+        """ref/date/description with no split columns at all — the
+        natural header for a pure auto-fill batch (found live: the
+        layout validator used to reject the empty split region)."""
+        tsv = (
+            "ref\tdate\tdescription\n"
+            "1\t2026-08-01\tMortgage Payment\n"
+            "2\t2026-08-01\tNetflix"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert [r["splits"] for r in rows] == [[], []]
+
+    def test_splitless_row_with_notes_column(self):
+        tsv = (
+            "ref\tdate\tdescription\tnotes\tamt\tacct\n"
+            "1\t2026-07-01\tRent\tJuly\n"
+            "2\t2026-07-01\tNetflix"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"] == [] and rows[0]["notes"] == "July"
+        assert rows[1]["splits"] == [] and "notes" not in rows[1]
+
     def test_omitting_required_fields_still_rejects(self):
         # Row ends after an amount — the account is missing; that's
         # a misalignment, not an optional-cell shorthand.
@@ -430,6 +463,86 @@ class TestBatchCreate:
         rows = _parse(env["results"])
         assert rows[0]["status"] == "rejected"
         assert "quantity" in rows[0]["reason"].lower()
+
+    def test_auto_fill_reproduces_last_shape(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        gc.create_transaction(
+            description="Rent",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1800",
+                 "memo": "unit 4B"},
+                {"account": "Expenses:Groceries", "amount": "1800"},
+            ],
+            trans_date=date(2026, 5, 20),
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 6, 20),
+            "description": "Rent", "splits": [],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        assert rows[0]["reason"].startswith("auto_filled_from:")
+
+        txn = gc.get_transaction(rows[0]["txn_guid"])
+        by_acct = {s["account"]: s for s in txn["splits"]}
+        assert by_acct["Assets:Checking"]["value"].startswith("-1800")
+        assert by_acct["Assets:Checking"]["memo"] == "unit 4B"
+        assert txn["date"] == "2026-06-20"
+
+    def test_auto_fill_no_match_rejects_row(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([
+            {"ref": "1", "date": date(2026, 6, 20),
+             "description": "Nothing like this exists", "splits": []},
+            _txn(2, "Real one", "25.00"),
+        ], on_error="skip")
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["1"]["status"] == "rejected"
+        assert "auto-fill" in rows["1"]["reason"]
+        assert rows["2"]["status"] == "created"
+
+    def test_auto_fill_no_match_aborts_batch_by_default(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([
+            {"ref": "1", "date": date(2026, 6, 20),
+             "description": "Nothing like this exists", "splits": []},
+            _txn(2, "Casualty", "25.00"),
+        ])
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["2"]["reason"] == "batch_aborted"
+        assert "Casualty" not in _descriptions(gc)
+
+    def test_auto_fill_dry_run_carries_marker(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        before = len(
+            gc.list_transactions(compact=False)["transactions"]
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 6, 20),
+            "description": "Rent", "splits": [],
+        }], dry_run=True)
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "would_create"
+        assert rows[0]["reason"].startswith("auto_filled_from:")
+        after = len(
+            gc.list_transactions(compact=False)["transactions"]
+        )
+        assert after == before  # nothing written
+
+    def test_auto_fill_still_screened_for_duplicates(self, test_book):
+        """Auto-filling 'Rent' dated within the duplicate window of
+        the source rejects like any other duplicate — auto-fill is
+        not a bypass."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)  # 2026-05-20
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 5, 21),
+            "description": "Rent", "splits": [],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert rows[0]["reason"] == "duplicate_detected"
 
     def test_checksum_dupcount_equals_table_rows(self, test_book):
         gc = GnuCashBook(str(test_book))

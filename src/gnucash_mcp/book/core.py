@@ -3111,7 +3111,11 @@ class CoreMixin:
         splits: [{account, amount, memo (optional),
         quantity (optional)}]}`` — quantity per the
         ``_validate_transaction_splits`` contract (required iff the
-        account commodity differs from the book default).
+        account commodity differs from the book default). An EMPTY
+        splits list is an auto-fill request: the row reproduces the
+        most recent matching-description transaction (splits, memos,
+        quantities), marked ``auto_filled_from:<guid>`` in the
+        results ``reason`` column; no match rejects the row.
 
         Three phases under one book-open: validate all structurally,
         screen each against existing-book duplicates, then build every
@@ -3148,6 +3152,26 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    auto_filled_from = None
+                    auto_fill_warnings: list[dict] = []
+                    if not splits:
+                        # A splitless row is an auto-fill request —
+                        # same contract as create_transaction with
+                        # ``splits`` omitted: reproduce the most
+                        # recent matching-description transaction.
+                        preflight = self._collect_create_signals(
+                            book, txn["description"], txn["date"],
+                            proposed_amounts=[],
+                            want_auto_fill=True, want_stability=True,
+                            want_duplicates=False, want_recent=False,
+                        )
+                        if preflight.auto_fill is None:
+                            raise ValueError(
+                                "no matching transaction to auto-fill "
+                                "from — provide explicit splits"
+                            )
+                        splits, auto_filled_from = preflight.auto_fill
+                        auto_fill_warnings = preflight.stability_warnings
                     if len(splits) < 2:
                         raise ValueError("at least 2 splits required")
                     validated = self._validate_transaction_splits(
@@ -3168,6 +3192,8 @@ class CoreMixin:
                         "proposed_amounts": [
                             abs(_to_decimal(s["amount"])) for s in splits
                         ],
+                        "auto_filled_from": auto_filled_from,
+                        "auto_fill_warnings": auto_fill_warnings,
                     })
                 except (ValueError, KeyError) as e:
                     by_ref[ref] = {
@@ -3209,10 +3235,25 @@ class CoreMixin:
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
             for p, _dc in accepted:
+                for w in p["auto_fill_warnings"]:
+                    warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
                     book, p["validated"], default_currency, p["trans_date"],
                 ):
                     warn_rows.append((p["ref"], w["message"]))
+
+            # Auto-fill must be loud in the results: a row that
+            # ACCIDENTALLY lost its splits either rejects (no match)
+            # or lands here, visibly marked with its source.
+            def _fill_marker(p) -> dict:
+                if p["auto_filled_from"]:
+                    return {
+                        "reason": (
+                            f"auto_filled_from:"
+                            f"{p['auto_filled_from']['guid']}"
+                        ),
+                    }
+                return {}
 
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
@@ -3220,6 +3261,7 @@ class CoreMixin:
                     by_ref[p["ref"]] = {
                         "ref": p["ref"], "status": "would_create",
                         "dup_count": dup_count,
+                        **_fill_marker(p),
                     }
                 return self._batch_envelope(
                     transactions, by_ref, dup_rows, warn_rows,
@@ -3241,7 +3283,7 @@ class CoreMixin:
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
-                built.append((p["ref"], txn_obj, dup_count))
+                built.append((p, txn_obj, dup_count))
 
             # Single flush for the whole batch — per the "don't flush
             # mid-build" rule, every Transaction is fully constructed
@@ -3249,11 +3291,12 @@ class CoreMixin:
             book.save()
 
             all_guids = [t.guid for t in book.transactions]
-            for ref, txn_obj, dup_count in built:
-                by_ref[ref] = {
-                    "ref": ref, "status": "created",
+            for p, txn_obj, dup_count in built:
+                by_ref[p["ref"]] = {
+                    "ref": p["ref"], "status": "created",
                     "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
                     "dup_count": dup_count,
+                    **_fill_marker(p),
                 }
 
             return self._batch_envelope(
