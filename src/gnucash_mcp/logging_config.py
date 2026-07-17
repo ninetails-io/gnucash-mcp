@@ -653,6 +653,14 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         )
         if src.get("notes"):
             lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+        reason = r.get("reason", "")
+        if reason.startswith("auto_filled_from:"):
+            # Splitless submission — the source guid is the trail to
+            # what actually got booked.
+            source = reason.split(":", 1)[1]
+            lines.append(
+                f"{_INDENT_SPLITS}auto-filled from guid:{source}"
+            )
         splits = src.get("splits") or []
         if splits:
             lines.append(_format_splits_text(splits, _INDENT_SPLITS))

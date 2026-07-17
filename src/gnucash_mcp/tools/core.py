@@ -43,30 +43,39 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     layout = _batch_tsv_layout(lines[0])
     group = layout["group"]
     fixed = 4 if layout["has_notes"] else 3
-    shape = f"({', '.join(group)}) group"
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
-        if len(fields) < fixed + len(group):
-            notes_part = ", notes" if layout["has_notes"] else ""
+        # Trailing empty cells carry nothing in any position —
+        # stripping them makes "row ends after description" (the
+        # auto-fill request) robust to stray trailing tabs.
+        while fields and not fields[-1].strip():
+            fields.pop()
+        if len(fields) < 3:
             raise ValueError(
-                f"row {i}: expected ref, date, description"
-                f"{notes_part}, and at least one {shape}"
+                f"row {i}: expected at least ref, date, description"
             )
         ref, dt, desc = fields[0].strip(), fields[1].strip(), fields[2]
         if not ref:
             raise ValueError(f"row {i}: empty ref (each row needs a key)")
-        try:
-            splits = _batch_row_splits(fields[fixed:], group)
-        except ValueError as e:
-            raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        if len(fields) <= fixed:
+            # No split cells at all: an auto-fill request — the book
+            # layer reproduces the most recent matching-description
+            # transaction (create_transaction's omitted-splits
+            # contract), or rejects the row when nothing matches.
+            splits: list[dict] = []
+        else:
+            try:
+                splits = _batch_row_splits(fields[fixed:], group)
+            except ValueError as e:
+                raise ValueError(f"row {i} (ref {ref!r}): {e}")
         txn = {
             "ref": ref,
             "date": _parse_iso_date(dt) or date.today(),
             "description": desc,
             "splits": splits,
         }
-        if layout["has_notes"] and fields[3].strip():
+        if layout["has_notes"] and len(fields) > 3 and fields[3].strip():
             txn["notes"] = fields[3].strip()
         out.append(txn)
     return out
@@ -371,6 +380,22 @@ def register(mcp, get_book) -> None:
         All extensions combine; when several split fields are
         declared, the header's FIRST group fixes their order (e.g.
         ``amt, acct, memo, qty``).
+
+        AUTO-FILL — a row with NO split cells at all (ends right
+        after ``description``/``notes``) reproduces the most recent
+        transaction with the same description — splits, memos, and
+        quantities included — exactly like calling
+        ``create_transaction`` without ``splits``::
+
+            1<TAB>2026-07-01<TAB>Rent
+            2<TAB>2026-07-01<TAB>Netflix
+
+        Auto-filled rows are marked ``auto_filled_from:<guid>`` in
+        the results ``reason`` column; a row whose description
+        matches nothing rejects ("no matching transaction to
+        auto-fill from"). Use ``dry_run=true`` to preview what a
+        batch of auto-fills would book. Perfect for recurring
+        monthly entries.
 
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results

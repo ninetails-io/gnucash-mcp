@@ -270,6 +270,12 @@ def _batch_tsv_layout(header_line: str) -> dict:
             )
         canonical.append(name)
 
+    if not canonical:
+        # No split columns declared at all — the natural header for
+        # an all-auto-fill batch (``ref, date, description``). Rows
+        # that do carry splits chunk as legacy pairs.
+        return {"has_notes": has_notes, "group": _BATCH_LEGACY_GROUP}
+
     # The first group runs until a field repeats; later groups are
     # not order-checked (rows are chunked by the first group's
     # shape), but every token was validated above.
