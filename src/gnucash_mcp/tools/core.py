@@ -110,6 +110,7 @@ def register(mcp, get_book) -> None:
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
     ) -> str:
         """List all accounts in the GnuCash chart of accounts.
 
@@ -118,15 +119,25 @@ def register(mcp, get_book) -> None:
         ``limit=0`` returns the count only. Use verbose=true for full
         JSON with guid, type, commodity, etc.
 
+        To FIND an account without paging the whole chart, pass
+        ``query`` — a case-insensitive substring matched against each
+        account's full path and description (e.g. query="grocer" or
+        query="4930" on a numbered chart). Results emit %short GUIDs
+        that every account-taking tool accepts. For searching
+        transactions by text or amount, use ``search_transactions``.
+
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
             verbose: If true, return full JSON details for each account.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
+            query: Case-insensitive substring filter on account
+                path/description. Combines with ``root``.
         """
         book = get_book()
         result = book.list_accounts(
-            root=root, compact=not verbose, limit=limit, offset=offset
+            root=root, compact=not verbose, limit=limit, offset=offset,
+            query=query,
         )
         if verbose:
             return _json(result)

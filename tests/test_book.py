@@ -3471,6 +3471,48 @@ class TestListAccounts:
         assert "Expenses:Groceries" in result
         assert "Income:Salary" in result
 
+    def test_query_matches_path_substring(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(query="grocer")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Expenses:Groceries" in lines[1]
+
+    def test_query_is_case_insensitive(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        assert "Expenses:Groceries" in gc_book.list_accounts(query="GROCER")
+
+    def test_query_matches_description_on_numbered_chart(
+        self, test_book: Path,
+    ):
+        """SKR03-style: the name is a number, the meaning lives in
+        the description. query must reach it."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="4930", account_type="EXPENSE", parent="Expenses",
+            description="Bürobedarf",
+        )
+        result = gc_book.list_accounts(query="bürobedarf")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Expenses:4930" in lines[1]
+        # And the number itself matches too.
+        assert "Expenses:4930" in gc_book.list_accounts(query="4930")
+
+    def test_query_composes_with_root(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # "s" appears everywhere; scoped to Income it can't match
+        # any Expenses account.
+        result = gc_book.list_accounts(root="Income", query="salary")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Income:Salary" in lines[1]
+
+    def test_query_no_match_reports_zero(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(query="zzz-not-there")
+        assert "Showing 0 of 0 accounts" in result
+
     def test_list_accounts_sorted(self, test_book: Path):
         """Compact output lines should be sorted by account name."""
         gc_book = GnuCashBook(str(test_book))
