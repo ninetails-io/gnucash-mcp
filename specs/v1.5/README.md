@@ -29,7 +29,8 @@ before picking it up.
   2026-07-08** on `feat/gb1-per-period-rates` (monthly-close
   valuation, TestModeAgreement lock, zero oracle drift) and
   **loop-signed-off 2026-07-09**
-  (`BOOKKEEPER_TEST_REPORT_GB1.md`: Tracks A+B fully green, twice).
+  ([`../v1.4/testing/BOOKKEEPER_TEST_REPORT_GB1.md`](../v1.4/testing/BOOKKEEPER_TEST_REPORT_GB1.md):
+  Tracks A+B fully green, twice).
   Original ruling kept below for the record. Stephen's ruling: single-period `spending_by_category` /
   `income_by_source` / `cash_flow` adopt per-sub-period valuation so
   their totals agree with `group_by` mode (today: single-period
