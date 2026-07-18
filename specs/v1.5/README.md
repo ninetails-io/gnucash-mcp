@@ -68,8 +68,30 @@ before picking it up.
 ## Deferred features (1.5 candidates)
 
 **v1.5 scope (Stephen, 2026-07-09): the price downloader plus
-custom period alignment.** The rest of this section remains
-unscheduled.
+custom period alignment.** Expanded 2026-07-16 with three items
+from the 1.4.1 sprint's discussions (first three bullets below).
+The rest of this section remains unscheduled.
+
+- **MCPB one-click install** — package the server as a `.mcpb`
+  bundle (manifest v0.4, `server.type: "uv"` — the host manages
+  Python and dependencies). Book file picker replaces pathsep
+  paths; four persona checkboxes replace `--modules`. Server
+  prerequisites: repeatable `--book` arg, env-var module toggles,
+  friendly startup errors (XML-format book message). _Spec:
+  [MCPB_SPEC.md](MCPB_SPEC.md) (research complete, incl. tool-count
+  budget)._
+- **Batch `cur` column** — per-transaction currency in the batch
+  TSV (a fixed optional column after `description`/`notes`, like
+  `notes`). Closes the last capability gap vs `create_transaction`
+  except auto-fill (shipped 1.4.1) and typed-schema ergonomics.
+  Multi-currency math on the write path → explicit code review +
+  full loop per `feedback_bookkeeper_validates_base_cases`.
+- **Two-tools question** — once `cur` lands and bakes, revisit
+  deprecating the `create_transaction` tool (batch would cover
+  everything; remaining argument is typed-schema vs TSV
+  ergonomics). Ruled 2026-07-16: legitimate conversation AFTER
+  `cur`, never a same-release deletion — deprecation notice first,
+  removal a release later.
 
 - **Custom period alignment (`periods` parameter)** — the three
   breakdown reports (`spending_by_category`, `income_by_source`,
