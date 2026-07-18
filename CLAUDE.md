@@ -75,7 +75,11 @@ arc, not the chronicle.
 server.py              FastMCP bootstrap. TOOL_MODULES registry.
                        Lazy-loads tool modules from an enabled set;
                        disabled modules never build their Pydantic
-                       schemas.
+                       schemas. Multi-book: GNUCASH_BOOK_PATH takes
+                       an os.pathsep-separated list; a module-level
+                       singleton holds the CURRENT book and the
+                       inline switch_book tool repoints it (visible
+                       only when 2+ books are configured).
 
 tools/<area>.py        MCP tool registration. Thin wrappers that
                        validate schemas, unpack arguments (date
@@ -151,6 +155,29 @@ module contributes zero tools to the MCP surface.
   `self._template_account_guids(book)`. `_find_account` and
   `_resolve_account` already do this; raw iterations need the filter
   added explicitly.
+- **Flow reports value at monthly closes; stock reports value
+  as-of.** `spending_by_category` / `income_by_source` / `cash_flow`
+  convert every split at its own MONTH's closing rate in single-
+  period and `group_by` modes alike, so grand totals are identical
+  at every granularity (locked by `TestModeAgreement`).
+  `balance_sheet` / `net_worth` value holdings as of the report
+  date — deliberately different semantics. Don't "fix" one to match
+  the other.
+- **A book switch is transactional and audited.** `switch_book`
+  runs everything fallible (book construction, log activation)
+  BEFORE the current-book globals move together; a failure leaves
+  the server fully on the previous book, and the switch itself is
+  written to BOTH books' audit trails. The unlocked current-book
+  global is safe only while every tool is sync and the MCP SDK runs
+  sync tools inline — `test_all_tools_are_sync` pins that
+  assumption; don't add an async tool without redesigning it.
+- **Backup/log state is per-book, even under a shared
+  `GNUCASH_LOG_DIR`.** The override resolves to a per-book
+  subdirectory (`{log_dir}/{book}.mcp`); backup state files and
+  retention scoping key on the book's filename stem
+  (case-insensitively — stems are validated unique at startup).
+  Anything new that persists per-book state under the log dir must
+  follow the same scoping or two books will share it.
 - **`owner_type` is validated at the entry point**, not pattern-
   matched inline. All six business tools that take it call
   `_parse_owner_type(value)`, which returns the piecash int code or
@@ -237,7 +264,7 @@ existed.
   (`SlotString`, `SlotInt64`, etc.).
 - **Slot key naming convention**: bare keys for universal
   financial concepts (`apr`, `credit_limit`,
-  `statement_close_day`, `reward_rate`); namespaced
+  `statement_close_day`, `reward_rate`, `is_retirement`); namespaced
   `gnc-mcp/<key>` prefix for tool-specific state where collisions
   with another tool's convention are plausible (e.g.
   `gnc-mcp/applies-to-invoice` for our credit-note linkage).
@@ -322,9 +349,13 @@ The contributor checklist that the test suite enforces:
 When touching anything that aggregates balances or flows across
 accounts of different commodities:
 
-- Use `_split_in_default_currency(split, account, factor)` from
-  `book/reporting.py` (or the equivalent `_market_value` helper in
-  `book/core.py`).
+- Use `_split_in_default_currency(split, account, factor)` (or the
+  `_market_value` helper) from `book/_currency.py` — the
+  CurrencyMixin is composed into every book class unconditionally.
+- Flow reports get their factors from `_monthly_conversion_factors`
+  (each split at its month's close); as-of valuations use
+  `_account_conversion_factors(book, as_of)`. Pick by report kind,
+  not convenience — see the flow-vs-stock invariant above.
 - Skip `type='transaction'` prices (auto-defaults).
 - Fall back to `split.value` when no market rate is on file —
   that's the transaction-currency amount, which equals cost basis
@@ -351,9 +382,7 @@ pattern rather than trying to use the ORM constructors directly.
   `SUM(num/denom)` in SQL — float precision is wrong for money).
 - **Finders**: `book.session.query(X).filter_by(guid=full_guid).first()`
   is indexed. Avoid `for x in book.x:` linear scans for finder
-  patterns; the `_find_*` helpers use the indexed form. (A handful
-  of business.py call sites still use linear scans — see
-  `specs/NEXT_STEPS_1_3.md`.)
+  patterns; the `_find_*` helpers use the indexed form.
 
 ---
 
@@ -368,9 +397,10 @@ Three layers:
 - **Persona-based integration** via `scripts/synthetic_book/*.py`.
   Phase scripts build a realistic multi-year book exercising most
   tool paths. Reporting regressions surface here before unit tests
-  catch them. Two synthetic personas ship under `samples/`: Alex
-  (USD-default, full feature exercise) and Lin Wei (CNY-default,
-  multi-currency stress).
+  catch them. Three synthetic personas ship under `samples/`: Alex
+  (USD-default, full feature exercise), Lin Wei (CNY-default,
+  zh_CN chart, multi-currency stress), and Sabine Brenner
+  (EUR-default, German SKR03 chart — the i18n bug-class oracle).
 
 Run with `uv run pytest`. Per-phase synthetic-book rebuild:
 `uv run python scripts/synthetic_book/phase_<N>.py` in order. Each
@@ -408,8 +438,13 @@ For live verification against a personal GnuCash book, ensure
 
 ### Committing
 
-- Pause for live testing before committing changes that affect real
-  book data.
+- Commits flow freely as work progresses; live validation happens at
+  the BRANCH level, not per commit. The bookkeeper loop (live
+  testing against a real server on the feature branch, with a
+  written test plan and report) runs before the PR opens — the PR
+  is the outcome of that loop, not the substrate for it. Changes
+  that shift bookkeeper-validated report numbers additionally need
+  a capture-rig before/after against the sample oracles.
 
 ### Branch workflow (gitflow)
 
@@ -441,6 +476,10 @@ For live verification against a personal GnuCash book, ensure
   needs a restart for tool-layer changes. Scripts that import
   `gnucash_mcp.book.GnuCashBook` directly bypass the server and
   pick up changes on next invocation.
+- **Not sure which book a session was on**: switch_book writes
+  `SWITCH BOOK` lines to BOTH books' audit trails (departure on the
+  old book, arrival on the new). If those lines are absent, the
+  session never switched.
 - **Audit log entries missing fields**: the formatter for
   `(entity_type, operation)` may not be in the dispatch table.
   Falls through to a generic renderer that drops detail.

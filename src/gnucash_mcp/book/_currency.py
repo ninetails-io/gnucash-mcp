@@ -130,6 +130,24 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+def _price_tie_rank(price) -> tuple:
+    """Deterministic tie-break key for prices sharing a date
+    (bookkeeper finding F3 — the winner used to be an accident of
+    query/iteration order, so posting math and month-close valuation
+    could flip between runs on books carrying same-date duplicates).
+
+    Higher tuple wins. Rule: a deliberate manual quote
+    (``user:price`` from create_price, ``user:price-editor`` from
+    GnuCash's editor) outranks feed/import sources
+    (``user:market-data``, ``Finance::Quote``, anything else); the
+    guid breaks residual ties — arbitrary but STABLE, which is the
+    property that matters.
+    """
+    source = getattr(price, "source", None) or ""
+    manual = 1 if source in ("user:price", "user:price-editor") else 0
+    return (manual, price.guid or "")
+
+
 def _is_market_price(price) -> bool:
     """True iff ``price`` is a real market quote, not a piecash
     auto-placeholder.
@@ -178,6 +196,11 @@ class CurrencyMixin:
         prices = list(q)
         if market_only:
             prices = [p for p in prices if _is_market_price(p)]
+        # Same-date ties resolve by _price_tie_rank, not row order.
+        prices.sort(
+            key=lambda p: (_to_date(p.date), _price_tie_rank(p)),
+            reverse=True,
+        )
         return prices
 
     @staticmethod
@@ -242,9 +265,13 @@ class CurrencyMixin:
                 continue
             key = p.commodity.guid
             existing = latest.get(key)
-            if existing is None or p_date > existing[0]:
-                latest[key] = (p_date, Decimal(str(p.value)))
-        result = {guid: rate for guid, (_d, rate) in latest.items()}
+            cand = (p_date, _price_tie_rank(p))
+            if existing is None or cand > (existing[0], existing[1]):
+                latest[key] = (p_date, _price_tie_rank(p),
+                               Decimal(str(p.value)))
+        result = {
+            guid: rate for guid, (_d, _rank, rate) in latest.items()
+        }
 
         # Chain pass for commodities the direct pass couldn't rate
         # (only priced commodities are candidates — no price, no leg).
@@ -779,11 +806,21 @@ class CurrencyMixin:
         # staleness window.
         cap_enabled = respect_staleness_cap and cap > 0
 
-        # Each candidate: (abs_age_days, rate, price_date).
-        best_before_direct: tuple[int, Decimal, date] | None = None
-        best_after_direct: tuple[int, Decimal, date] | None = None
-        best_before_inverse: tuple[int, Decimal, date] | None = None
-        best_after_inverse: tuple[int, Decimal, date] | None = None
+        # Each candidate: (abs_age_days, tie_rank, rate, price_date).
+        # Equal-distance candidates resolve by _price_tie_rank (F3) —
+        # a same-date duplicate must not make posting math depend on
+        # iteration order.
+        best_before_direct: tuple | None = None
+        best_after_direct: tuple | None = None
+        best_before_inverse: tuple | None = None
+        best_after_inverse: tuple | None = None
+
+        def _better(days: int, rank: tuple, best: tuple | None) -> bool:
+            if best is None:
+                return True
+            if days != best[0]:
+                return days < best[0]
+            return rank > best[1]
 
         for p in book.prices:
             if not _is_market_price(p):
@@ -798,12 +835,13 @@ class CurrencyMixin:
                 rate = Decimal(str(p.value))
                 if rate <= 0:
                     continue
+                rank = _price_tie_rank(p)
                 if days >= 0:
-                    if best_before_direct is None or days < best_before_direct[0]:
-                        best_before_direct = (days, rate, p_date)
+                    if _better(days, rank, best_before_direct):
+                        best_before_direct = (days, rank, rate, p_date)
                 else:
-                    if best_after_direct is None or -days < best_after_direct[0]:
-                        best_after_direct = (-days, rate, p_date)
+                    if _better(-days, rank, best_after_direct):
+                        best_after_direct = (-days, rank, rate, p_date)
             elif p.commodity == to_commodity and p.currency == from_commodity:
                 days = (as_of - p_date).days
                 if days < 0 and not allow_after:
@@ -813,12 +851,13 @@ class CurrencyMixin:
                 if Decimal(str(p.value)) <= 0:
                     continue
                 rate = Decimal("1") / Decimal(str(p.value))
+                rank = _price_tie_rank(p)
                 if days >= 0:
-                    if best_before_inverse is None or days < best_before_inverse[0]:
-                        best_before_inverse = (days, rate, p_date)
+                    if _better(days, rank, best_before_inverse):
+                        best_before_inverse = (days, rank, rate, p_date)
                 else:
-                    if best_after_inverse is None or -days < best_after_inverse[0]:
-                        best_after_inverse = (-days, rate, p_date)
+                    if _better(-days, rank, best_after_inverse):
+                        best_after_inverse = (-days, rank, rate, p_date)
 
         for candidate in (
             best_before_direct,
@@ -827,6 +866,6 @@ class CurrencyMixin:
             best_after_inverse,
         ):
             if candidate is not None:
-                age_days, rate, p_date = candidate
+                age_days, _rank, rate, p_date = candidate
                 return (rate, age_days, p_date)
         return None

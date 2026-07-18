@@ -404,8 +404,17 @@ session, the server snapshots your book to
 wrong, you can roll back to a known-good state without
 relying on Time Machine or your own habit. Backups are
 verified with `PRAGMA integrity_check` before being declared
-valid. See [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
+valid, and skipped when the book hasn't changed since the
+last snapshot. See [docs/RESTORE_FROM_BACKUP.md](docs/RESTORE_FROM_BACKUP.md)
 for the rollback procedure.
+
+> **Reading timestamps:** backup *filenames* carry UTC
+> timestamps (filesystem-safe and unambiguous across travel
+> and DST); audit and debug logs use *local-dated* daily
+> files, matching how you'd search for "what happened
+> Tuesday." Near midnight these can differ by a day — the
+> `list_backups` tool always reports both the ISO timestamp
+> and a human age, so prefer it over eyeballing filenames.
 
 **Reconciled splits are protected.** The server refuses to
 delete or modify reconciled splits without an explicit
@@ -441,6 +450,36 @@ environment variable instead of `--modules=...` in the JSON
 args.
 
 ---
+
+## What's new in v1.4.1
+
+Batch entry grows up, driven by the bookkeeper's daily workflow:
+
+- **The TSV header declares the layout** — opt-in `memo` columns
+  (per-split memos), a `notes` column (per-transaction notes), and
+  `qty` columns (investment shares / foreign-currency splits).
+  Legacy submissions parse unchanged; typo'd column names reject
+  by name; a row may simply end once its last split's amount and
+  account are present.
+- **Auto-fill from history** — a row with no split cells at all
+  reproduces your most recent transaction with that description,
+  marked with its source. Twelve recurring bills = twelve
+  ref-date-description rows; `dry_run` the batch to preview every
+  match first.
+- **Batch delete** — `delete_transaction` takes a list of GUIDs:
+  one call, one save, all-or-nothing.
+- **Every annotation field reachable** — notes + action on
+  invoice/bill/voucher/credit-note line items, a payment memo on
+  `pay_invoice`, account notes (shared with GnuCash desktop's
+  editor), and scheduled transactions that actually keep their
+  description.
+- **Find accounts without paging** — `query` on `list_accounts`
+  matches path and description, so "4930" finds the SKR03 account.
+- Plus the v1.4 adversarial-review hardening (transactional
+  `switch_book`, per-book backup scoping, i18n fixes) and
+  monthly-close valuation for flow reports.
+
+**Tests:** 1,856 passing.
 
 ## What's in v1.4.0
 
@@ -527,6 +566,17 @@ A condensed changelog of major releases lives in
   `Groceries`.
 - Or ask the assistant to list accounts: "List my accounts."
 
+### Multiple server processes after a client restart
+
+Claude Desktop (and some other MCP clients) may briefly spawn
+two or three copies of the server when relaunching. This is
+client behavior, not a server bug, and it's mostly harmless:
+the server opens your book per-request and releases the file
+lock between calls, so overlapping processes contend only for
+moments. If you see persistent `Lock on the file` errors after
+a client restart, quit the client fully, confirm with
+`pgrep -fl gnucash-mcp` that no strays remain, and relaunch.
+
 ### Something went wrong
 
 - Open the audit log at `<your-book>.gnucash.mcp/audit/` —
@@ -552,7 +602,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,714 tests as of v1.4.0
+uv run pytest                       # 1,856 tests as of v1.4.1
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```

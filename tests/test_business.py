@@ -5852,6 +5852,112 @@ class TestCreditNoteDisplayPolish:
         assert ar_balance == Decimal("400.00")
 
 
+class TestEntryNotesAction:
+    """Per-line ``notes`` and ``action`` on the add_*_entry paths.
+
+    All four tools route through ``_add_entry``, which previously
+    hardcoded both columns to "" — the schema had the fields, the
+    caller couldn't reach them.
+    """
+
+    def test_invoice_entry_notes_action_round_trip(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="April retainer",
+            quantity="10",
+            price="150.00",
+            notes="PO #2231, contact: J. Doe",
+            action="Hours",
+        )
+        assert result["notes"] == "PO #2231, contact: J. Doe"
+        assert result["action"] == "Hours"
+
+        entry = gb.get_invoice("000001")["entries"][0]
+        assert entry["notes"] == "PO #2231, contact: J. Doe"
+        assert entry["action"] == "Hours"
+
+    def test_plain_entry_shape_unchanged(self, business_book):
+        """Entries without notes/action keep their exact key set —
+        conditional emission, not new always-present fields."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        result = gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Service",
+            quantity="1",
+            price="100.00",
+        )
+        assert "notes" not in result
+        assert "action" not in result
+        entry = gb.get_invoice("000001")["entries"][0]
+        assert "notes" not in entry
+        assert "action" not in entry
+
+    def test_notes_byte_cap_enforced(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        with pytest.raises(ValueError, match="notes exceeds"):
+            gb.add_invoice_entry(
+                invoice_id="000001",
+                account="Income:Sales",
+                description="Too chatty",
+                quantity="1",
+                price="100.00",
+                notes="x" * 5000,
+            )
+
+    def test_bill_and_voucher_entries_carry_notes(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Vendor One")
+        gb.create_bill(vendor_id="000001")
+        bill_result = gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="2",
+            price="25.00",
+            notes="restock for Q3",
+            action="Material",
+        )
+        assert bill_result["notes"] == "restock for Q3"
+        assert bill_result["action"] == "Material"
+
+        gb.create_employee(name="Field Tech")
+        voucher = gb.create_voucher(employee_id="000001")
+        voucher_result = gb.add_voucher_entry(
+            voucher_id=voucher["id"],
+            account="Expenses:Office Supplies",
+            description="Client lunch",
+            quantity="1",
+            price="42.50",
+            notes="attendees: 3, receipt #881",
+        )
+        assert voucher_result["notes"] == "attendees: 3, receipt #881"
+        assert "action" not in voucher_result
+
+    def test_credit_note_entry_carries_notes(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_credit_note(owner_id="000001", owner_type="customer")
+        result = gb.add_credit_note_entry(
+            credit_note_id="000001",
+            account="Income:Sales",
+            description="Overbilled hours",
+            quantity="2",
+            price="150.00",
+            notes="per 2026-07-01 email thread",
+        )
+        assert result["notes"] == "per 2026-07-01 email thread"
+        assert result["credit_note_id"] == "000001"
+
+
 class TestAddInvoiceEntry:
     """Tests for add_invoice_entry."""
 
@@ -7217,6 +7323,34 @@ class TestPayInvoice:
             amount="200",
         )
         assert Decimal(result["remaining_balance"]) == Decimal("300")
+
+    def test_memo_lands_on_bank_split_only(self, business_book):
+        """User memo annotates the cash movement; the A/R//A/P split
+        keeps its action='Payment' convention with an empty memo."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            memo="check #1042",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        memos = {s["account"]: s.get("memo", "") for s in txn["splits"]}
+        assert memos["Assets:Checking"] == "check #1042"
+        assert memos["Assets:Accounts Receivable"] == ""
+
+    def test_no_memo_keeps_prior_shape(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_bill(gb, "50.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="50",
+            owner_type="vendor",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert all(not s.get("memo") for s in txn["splits"])
 
     def test_multiple_payments(self, business_book):
         gb = GnuCashBook(str(business_book))

@@ -597,7 +597,7 @@ class TestMaybeAutoBackup:
             "weekly": now - timedelta(days=1),
             "monthly": now - timedelta(days=5),
         }
-        _write_state(backups_dir, state)
+        _write_state(backups_dir, test_book.stem, state)
 
         book._maybe_auto_backup()
         entries = book.list_backups()
@@ -636,7 +636,7 @@ class TestMaybeAutoBackup:
         book._maybe_auto_backup()
 
         backups_dir = book._backups_dir()
-        state = _read_state(backups_dir)
+        state = _read_state(backups_dir, test_book.stem)
         assert set(state.keys()) == {"session", "weekly", "monthly"}
         # All three timestamps equal (same moment)
         timestamps = list(state.values())
@@ -648,7 +648,7 @@ class TestMaybeAutoBackup:
         book = GnuCashBook(str(test_book))
         book._maybe_auto_backup()
 
-        attempt = _read_attempt_status(book._backups_dir())
+        attempt = _read_attempt_status(book._backups_dir(), test_book.stem)
         assert attempt is not None
         assert attempt["status"] == "ok"
         assert attempt["reason"] is None
@@ -669,7 +669,7 @@ class TestMaybeAutoBackup:
         ):
             book._maybe_auto_backup()  # swallows
 
-        attempt = _read_attempt_status(book._backups_dir())
+        attempt = _read_attempt_status(book._backups_dir(), test_book.stem)
         assert attempt is not None
         assert attempt["status"] == "failed"
         assert "disk full" in (attempt["reason"] or "")
@@ -716,7 +716,7 @@ class TestMaybeAutoBackup:
             "weekly": now - timedelta(days=10),    # overdue
             "monthly": now - timedelta(days=45),   # overdue
         }
-        _write_state(backups_dir, state)
+        _write_state(backups_dir, test_book.stem, state)
 
         book._maybe_auto_backup()
         entries = book.list_backups()
@@ -725,7 +725,7 @@ class TestMaybeAutoBackup:
 
         # Both overdue stages' timestamps advanced; the "recent"
         # session timestamp did not change.
-        new_state = _read_state(backups_dir)
+        new_state = _read_state(backups_dir, test_book.stem)
         assert new_state["monthly"] > state["monthly"]
         assert new_state["weekly"] > state["weekly"]
         assert new_state["session"] == state["session"]
@@ -838,3 +838,161 @@ class TestBackupPathRedaction:
         assert listed, "fixture failed: backup not created"
         for entry in listed:
             assert "/" not in entry["path"], entry
+
+
+# ── Multi-book scoping under a shared GNUCASH_LOG_DIR ────────────────
+
+
+class TestSharedLogDirScoping:
+    """Several books can share one backups directory via
+    GNUCASH_LOG_DIR. Backup state, listings, retention slots, and
+    attempt status must each be scoped to their own book — a shared
+    .state.json starved every book after the first of auto-backups
+    entirely, and an unscoped listing let one book's prune delete
+    another book's snapshots (v1.4 review finding MB-2)."""
+
+    @pytest.fixture
+    def two_books_shared_dir(self, test_book: Path, tmp_path, monkeypatch):
+        import shutil
+        other = test_book.parent / "other-ledger.gnucash"
+        shutil.copy(test_book, other)
+        shared = tmp_path / "shared-logs"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(shared))
+        return test_book, other
+
+    def test_second_book_auto_backup_not_starved(
+        self, two_books_shared_dir,
+    ):
+        """Book A's auto-backup must not advance book B's stage
+        timestamps: B's first write still takes its own backup."""
+        a_path, b_path = two_books_shared_dir
+        a = GnuCashBook(str(a_path))
+        b = GnuCashBook(str(b_path))
+
+        a._maybe_auto_backup()
+        assert len(a.list_backups()) == 1
+
+        b._maybe_auto_backup()
+        assert len(b.list_backups()) == 1, (
+            "book B took no auto-backup — its schedule was consumed "
+            "by book A's shared state file"
+        )
+
+    def test_listing_scoped_to_own_book(self, two_books_shared_dir):
+        a_path, b_path = two_books_shared_dir
+        a = GnuCashBook(str(a_path))
+        b = GnuCashBook(str(b_path))
+        a.create_backup(stage="manual", label="a-only")
+        b.create_backup(stage="manual", label="b-only")
+
+        a_labels = {e["label"] for e in a.list_backups()}
+        b_labels = {e["label"] for e in b.list_backups()}
+        assert a_labels == {"a-only"}
+        assert b_labels == {"b-only"}
+
+    def test_prune_cannot_delete_other_books_backups(
+        self, two_books_shared_dir, monkeypatch,
+    ):
+        """Book B pruning its manual stage must not count — or
+        delete — book A's manual snapshots sharing the directory."""
+        monkeypatch.delenv("GNUCASH_REDACT_PATHS", raising=False)
+        a_path, b_path = two_books_shared_dir
+        a = GnuCashBook(str(a_path))
+        b = GnuCashBook(str(b_path))
+        precious = Path(
+            a.create_backup(stage="manual", label="precious")["path"]
+        )
+        b.create_backup(stage="manual", label="expendable")
+
+        result = b.prune_backups(1, stage="manual", dry_run=False)
+        assert precious.exists(), (
+            "book B's prune deleted book A's manual backup"
+        )
+        assert len(b.list_backups()) == 1
+
+    def test_attempt_status_scoped(self, two_books_shared_dir):
+        a_path, b_path = two_books_shared_dir
+        a = GnuCashBook(str(a_path))
+        b = GnuCashBook(str(b_path))
+        a._maybe_auto_backup()
+        assert _read_attempt_status(a._backups_dir(), a_path.stem)
+        assert _read_attempt_status(b._backups_dir(), b_path.stem) is None
+
+    def test_listing_stem_match_is_case_insensitive(
+        self, test_book: Path, tmp_path, monkeypatch,
+    ):
+        """A case flip in GNUCASH_BOOK_PATH (same file on macOS's
+        case-insensitive filesystem) must not orphan existing
+        backups: the stem filter compares case-insensitively, like
+        switch_book matching and parse-time uniqueness."""
+        import shutil
+        shared = tmp_path / "shared-logs"
+        monkeypatch.setenv("GNUCASH_LOG_DIR", str(shared))
+        book = GnuCashBook(str(test_book))
+        created = Path(book.create_backup(stage="manual", label="x")["path"])
+        # Simulate the pre-flip filename casing on disk.
+        upper = created.with_name(
+            created.name.replace(test_book.stem, test_book.stem.upper(), 1)
+        )
+        created.rename(upper)
+        listed = book.list_backups()
+        assert len(listed) == 1, "case-flipped stem orphaned the backup"
+
+
+class TestIdenticalContentSkip:
+    """Bookkeeper finding F2: the auto-backup hook fires before the
+    tool body runs, so a write that fails validation still triggered
+    a full snapshot — duplicating multi-MB content for a no-op. When
+    the book's bytes match the newest existing snapshot, the hook now
+    advances the schedule without writing a duplicate file."""
+
+    @staticmethod
+    def _rewind_stages(book, test_book):
+        """Make every stage due again while preserving the recorded
+        book hash — simulating a later process on an unchanged book."""
+        from gnucash_mcp.book.backup import (
+            _read_book_hash, _write_state,
+        )
+        backups_dir = book._backups_dir()
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        _write_state(
+            backups_dir, test_book.stem,
+            {s: old for s in ("session", "weekly", "monthly")},
+            book_sha256=_read_book_hash(backups_dir, test_book.stem),
+        )
+        book._backup_checked_in_process = False
+
+    def test_identical_content_skips_duplicate_snapshot(
+        self, test_book: Path,
+    ):
+        book = GnuCashBook(str(test_book))
+        # First auto pass takes the real snapshot + records the anchor.
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 1
+
+        # Later process, everything due again, content unchanged.
+        self._rewind_stages(book, test_book)
+        book._maybe_auto_backup()
+
+        assert len(book.list_backups()) == 1, (
+            "duplicate snapshot written for unchanged content"
+        )
+        # The schedule still advanced.
+        state = _read_state(book._backups_dir(), test_book.stem)
+        now = datetime.now(timezone.utc)
+        assert all((now - ts).days < 1 for ts in state.values())
+
+    def test_changed_content_still_backs_up(self, test_book: Path):
+        book = GnuCashBook(str(test_book))
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 1
+
+        # Mutate the book through the real write path, rewind, retry.
+        book.create_account(
+            name="F2 Probe", account_type="EXPENSE", parent="Expenses",
+        )
+        self._rewind_stages(book, test_book)
+        book._maybe_auto_backup()
+        assert len(book.list_backups()) == 2, (
+            "changed content must still take a real snapshot"
+        )

@@ -32,6 +32,7 @@ from gnucash_mcp.book._base import (
     _is_market_price,
     _is_unreconciled,
     _is_voided,
+    _slot_value_str,
     _split_to_compact_dict,
     _split_to_dict,
     _to_decimal,
@@ -540,17 +541,50 @@ class CoreMixin:
     # the source of truth.
     _RUNWAY_LIQUID_TYPES = frozenset({"BANK", "CASH", "STOCK", "MUTUAL"})
 
-    @staticmethod
-    def _is_in_retirement_subtree(account) -> bool:
-        """True if any path component of the account's fullname
-        contains "retirement" (case-insensitive).
+    # Bare slot key per the slot-naming convention (a universal
+    # financial concept another tool could plausibly converge on).
+    # Set via set_account_slot on the account or any ancestor:
+    # "1"/"true"/"yes" marks the subtree as retirement (excluded from
+    # runway/low-cash liquidity), "0"/"false"/"no" un-marks it —
+    # nearest ancestor wins, so one flag on the "Retirement"
+    # placeholder covers every account under it, and a child can
+    # opt back in.
+    _RETIREMENT_SLOT_KEY = "is_retirement"
 
-        Structural heuristic for excluding retirement accounts from
-        the runway liquid pool — users typically organize them under
-        a "Retirement" placeholder. A subtree named "Tax-advantaged"
-        slips through; the long-term answer is a slot-based
-        ``is_retirement`` flag.
+    _RETIREMENT_SLOT_TRUE = frozenset({"1", "true", "yes", "y"})
+    _RETIREMENT_SLOT_FALSE = frozenset({"0", "false", "no", "n"})
+
+    def _is_in_retirement_subtree(self, account) -> bool:
+        """True when the account is penalty-locked retirement money
+        that must not count as liquid for runway / low-cash.
+
+        Authoritative signal: the ``is_retirement`` slot on the
+        account or its nearest flagged ancestor (see the key comment
+        above) — locale- and naming-proof. Fallback when no slot is
+        set anywhere on the path: any fullname component containing
+        the English word "retirement" (case-insensitive). The
+        fallback is English-only by construction — a zh_CN
+        ``资产:投资:退休金`` or German ``Altersvorsorge`` is invisible
+        to it, which overstates runway on localized books; set the
+        slot there. A subtree named "Tax-advantaged" has the same
+        gap in any locale.
         """
+        from gnucash_mcp.book._base import _slot_value_str
+
+        node = account
+        while node is not None and node.type != "ROOT":
+            try:
+                raw = node[self._RETIREMENT_SLOT_KEY]
+            except KeyError:
+                raw = None
+            if raw is not None:
+                val = (_slot_value_str(raw) or "").strip().lower()
+                if val in self._RETIREMENT_SLOT_TRUE:
+                    return True
+                if val in self._RETIREMENT_SLOT_FALSE:
+                    return False
+                # Unrecognized value: keep walking rather than guess.
+            node = node.parent
         return any(
             "retirement" in part.lower()
             for part in account.fullname.split(":")
@@ -2141,6 +2175,7 @@ class CoreMixin:
         compact: bool = True,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
     ) -> dict | str:
         """List all accounts in the chart of accounts.
 
@@ -2151,11 +2186,19 @@ class CoreMixin:
         resolve ``%xxxxxxx``, full GUIDs, and paths interchangeably via
         ``_resolve_account``).
 
+        ``query`` is a case-insensitive substring match against the
+        full path AND the description — the description matters on
+        numbered charts (SKR03 "4930" carries its meaning in the
+        description, not the name). Substring, not word match, so it
+        is locale-neutral by construction. Composes with ``root``.
+
         Args:
             root: Optional subtree filter (path, ``%short``, or GUID).
             compact: If False, return a verbose envelope instead.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return.
+            query: Optional case-insensitive substring filter on
+                path/description.
         """
         with self.open(readonly=True) as book:
             # Template accounts are GnuCash internals, not part of
@@ -2170,6 +2213,7 @@ class CoreMixin:
                 resolved_root = self._resolve_account(book, root)
                 root = resolved_root.fullname if resolved_root else root
 
+            needle = query.lower() if query else None
             filtered = []
             for account in book.accounts:
                 if account.type == "ROOT":
@@ -2179,6 +2223,13 @@ class CoreMixin:
                 if root is not None:
                     fn = account.fullname
                     if fn != root and not fn.startswith(root + ":"):
+                        continue
+                if needle is not None:
+                    haystack = (
+                        f"{account.fullname}\n"
+                        f"{account.description or ''}"
+                    ).lower()
+                    if needle not in haystack:
                         continue
                 filtered.append(account)
 
@@ -3056,7 +3107,15 @@ class CoreMixin:
         """Create multiple transactions in one atomic save.
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
-        ``{ref, date (date), description, splits: [{account, amount}]}``.
+        ``{ref, date (date), description, notes (optional),
+        splits: [{account, amount, memo (optional),
+        quantity (optional)}]}`` — quantity per the
+        ``_validate_transaction_splits`` contract (required iff the
+        account commodity differs from the book default). An EMPTY
+        splits list is an auto-fill request: the row reproduces the
+        most recent matching-description transaction (splits, memos,
+        quantities), marked ``auto_filled_from:<guid>`` in the
+        results ``reason`` column; no match rejects the row.
 
         Three phases under one book-open: validate all structurally,
         screen each against existing-book duplicates, then build every
@@ -3067,9 +3126,11 @@ class CoreMixin:
 
         Returns a thin envelope: ``results`` TSV (always) and
         ``duplicates`` TSV (only when a match exists; otherwise empty,
-        which ``_strip_noise`` drops). v1 is same-currency (book
-        default), no per-split memo, no intra-batch dedup — exotic cases
-        use ``create_transaction``.
+        which ``_strip_noise`` drops). The transaction currency is
+        always the book default (a differently-denominated
+        transaction needs ``create_transaction``'s ``currency``
+        parameter); splits on non-default-commodity accounts carry
+        an explicit ``quantity``. No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -3091,6 +3152,26 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    auto_filled_from = None
+                    auto_fill_warnings: list[dict] = []
+                    if not splits:
+                        # A splitless row is an auto-fill request —
+                        # same contract as create_transaction with
+                        # ``splits`` omitted: reproduce the most
+                        # recent matching-description transaction.
+                        preflight = self._collect_create_signals(
+                            book, txn["description"], txn["date"],
+                            proposed_amounts=[],
+                            want_auto_fill=True, want_stability=True,
+                            want_duplicates=False, want_recent=False,
+                        )
+                        if preflight.auto_fill is None:
+                            raise ValueError(
+                                "no matching transaction to auto-fill "
+                                "from — provide explicit splits"
+                            )
+                        splits, auto_filled_from = preflight.auto_fill
+                        auto_fill_warnings = preflight.stability_warnings
                     if len(splits) < 2:
                         raise ValueError("at least 2 splits required")
                     validated = self._validate_transaction_splits(
@@ -3105,11 +3186,14 @@ class CoreMixin:
                     prepared.append({
                         "ref": ref,
                         "description": txn["description"],
+                        "notes": txn.get("notes") or "",
                         "trans_date": txn["date"],
                         "validated": validated,
                         "proposed_amounts": [
                             abs(_to_decimal(s["amount"])) for s in splits
                         ],
+                        "auto_filled_from": auto_filled_from,
+                        "auto_fill_warnings": auto_fill_warnings,
                     })
                 except (ValueError, KeyError) as e:
                     by_ref[ref] = {
@@ -3151,10 +3235,25 @@ class CoreMixin:
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
             for p, _dc in accepted:
+                for w in p["auto_fill_warnings"]:
+                    warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
                     book, p["validated"], default_currency, p["trans_date"],
                 ):
                     warn_rows.append((p["ref"], w["message"]))
+
+            # Auto-fill must be loud in the results: a row that
+            # ACCIDENTALLY lost its splits either rejects (no match)
+            # or lands here, visibly marked with its source.
+            def _fill_marker(p) -> dict:
+                if p["auto_filled_from"]:
+                    return {
+                        "reason": (
+                            f"auto_filled_from:"
+                            f"{p['auto_filled_from']['guid']}"
+                        ),
+                    }
+                return {}
 
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
@@ -3162,6 +3261,7 @@ class CoreMixin:
                     by_ref[p["ref"]] = {
                         "ref": p["ref"], "status": "would_create",
                         "dup_count": dup_count,
+                        **_fill_marker(p),
                     }
                 return self._batch_envelope(
                     transactions, by_ref, dup_rows, warn_rows,
@@ -3179,10 +3279,11 @@ class CoreMixin:
                 txn_obj = piecash.Transaction(
                     currency=default_currency,
                     description=p["description"],
+                    notes=p["notes"] or None,
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
-                built.append((p["ref"], txn_obj, dup_count))
+                built.append((p, txn_obj, dup_count))
 
             # Single flush for the whole batch — per the "don't flush
             # mid-build" rule, every Transaction is fully constructed
@@ -3190,11 +3291,12 @@ class CoreMixin:
             book.save()
 
             all_guids = [t.guid for t in book.transactions]
-            for ref, txn_obj, dup_count in built:
-                by_ref[ref] = {
-                    "ref": ref, "status": "created",
+            for p, txn_obj, dup_count in built:
+                by_ref[p["ref"]] = {
+                    "ref": p["ref"], "status": "created",
                     "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
                     "dup_count": dup_count,
+                    **_fill_marker(p),
                 }
 
             return self._batch_envelope(
@@ -3434,6 +3536,22 @@ class CoreMixin:
                 f"Got: {name!r}."
             )
 
+    # UTF-8 byte cap for the account "notes" slot — same limit as
+    # customer/vendor notes in the business module (kept as a local
+    # constant: core must not depend on BusinessMixin, which may not
+    # be composed into the book class).
+    _ACCOUNT_NOTES_MAX_BYTES = 4096
+
+    @classmethod
+    def _validate_account_notes(cls, notes: str) -> None:
+        byte_len = len(notes.encode("utf-8"))
+        if byte_len > cls._ACCOUNT_NOTES_MAX_BYTES:
+            raise ValueError(
+                f"notes exceeds {cls._ACCOUNT_NOTES_MAX_BYTES}-byte "
+                f"cap ({byte_len} bytes supplied). Shorten the value "
+                f"and retry."
+            )
+
     def create_account(
         self,
         name: str,
@@ -3443,6 +3561,7 @@ class CoreMixin:
         placeholder: bool = False,
         commodity: str | None = None,
         commodity_namespace: str = "CURRENCY",
+        notes: str = "",
     ) -> dict:
         """Create a new account in the chart of accounts.
 
@@ -3457,6 +3576,8 @@ class CoreMixin:
                        Defaults to book's default currency.
             commodity_namespace: Commodity namespace for non-currency commodities.
                                 Default "CURRENCY".
+            notes: Optional free-text notes, stored in the "notes"
+                   slot GnuCash desktop's account editor reads.
 
         Returns:
             Dict with guid, fullname, and status. Includes a warning if
@@ -3476,6 +3597,8 @@ class CoreMixin:
         # Validate the account name (shared chokepoint with
         # update_account's rename branch).
         self._validate_account_name(name)
+        if notes:
+            self._validate_account_notes(notes)
 
         with self.open(readonly=False) as book:
             # Determine parent account
@@ -3519,6 +3642,8 @@ class CoreMixin:
                 description=description,
                 placeholder=placeholder,
             )
+            if notes:
+                new_account["notes"] = notes
 
             book.save()
 
@@ -3563,6 +3688,7 @@ class CoreMixin:
         description: str | None = None,
         placeholder: bool | None = None,
         account_type: str | None = None,
+        notes: str | None = None,
     ) -> dict:
         """Update an existing account's properties.
 
@@ -3574,6 +3700,9 @@ class CoreMixin:
             account_type: New account type (e.g., "CREDIT", "BANK"). Only
                 changes within the same debit/credit polarity family are
                 allowed (e.g., LIABILITY to CREDIT, ASSET to BANK).
+            notes: New notes ("notes" slot, shared with GnuCash
+                desktop's account editor). Pass "" to clear — the
+                slot is deleted, matching a desktop-cleared field.
 
         Returns:
             Dict with updated account details.
@@ -3617,6 +3746,19 @@ class CoreMixin:
             if placeholder is not None and bool(placeholder) != bool(account.placeholder):
                 account.placeholder = placeholder
                 changed["placeholder"] = bool(placeholder)
+
+            if notes is not None:
+                self._validate_account_notes(notes)
+                try:
+                    current_notes = _slot_value_str(account["notes"])
+                except KeyError:
+                    current_notes = ""
+                if notes == "" and current_notes:
+                    del account["notes"]
+                    changed["notes"] = ""
+                elif notes and notes != current_notes:
+                    account["notes"] = notes
+                    changed["notes"] = notes
 
             if account_type is not None:
                 new_type = account_type.upper()
@@ -3751,6 +3893,41 @@ class CoreMixin:
 
             return result
 
+    def _validate_transaction_deletable(
+        self, book, transaction, force: bool,
+    ) -> int:
+        """Shared delete safeguards; returns the reconciled-split
+        count (0 when clean).
+
+        - Refuses an invoice's posting transaction: deleting it
+          orphans the invoice's posted-state metadata, after which
+          the invoice refuses both delete ("posted") and re-post
+          ("already posted") — SQL surgery is the only escape.
+          unpost_invoice clears the metadata properly.
+        - Refuses reconciled splits unless ``force``.
+        """
+        from sqlalchemy import text
+        posting_for = book.session.execute(
+            text("SELECT id FROM invoices WHERE post_txn = :guid"),
+            {"guid": transaction.guid},
+        ).fetchone()
+        if posting_for:
+            raise ValueError(
+                f"Transaction is the posting record for invoice "
+                f"{posting_for[0]}. Use unpost_invoice first."
+            )
+
+        reconciled = [
+            s for s in transaction.splits if s.reconcile_state == "y"
+        ]
+        if reconciled and not force:
+            acct_names = ", ".join(s.account.fullname for s in reconciled)
+            raise ValueError(
+                f"Transaction has reconciled splits in: {acct_names}. "
+                f"Deleting will break reconciliation. Use force=true to override."
+            )
+        return len(reconciled)
+
     def delete_transaction(self, guid: str, force: bool = False) -> dict:
         """Delete a transaction by GUID.
 
@@ -3770,32 +3947,9 @@ class CoreMixin:
             if not transaction:
                 raise ValueError(f"Transaction not found: {guid}")
 
-            # Refuse to delete an invoice's posting transaction: it
-            # orphans the invoice's posted-state metadata, after
-            # which the invoice refuses both delete ("posted") and
-            # re-post ("already posted") — SQL surgery is the only
-            # escape. unpost_invoice clears the metadata properly.
-            from sqlalchemy import text
-            posting_for = book.session.execute(
-                text("SELECT id FROM invoices WHERE post_txn = :guid"),
-                {"guid": transaction.guid},
-            ).fetchone()
-            if posting_for:
-                raise ValueError(
-                    f"Transaction is the posting record for invoice "
-                    f"{posting_for[0]}. Use unpost_invoice first."
-                )
-
-            # Check for reconciled splits
-            reconciled = [
-                s for s in transaction.splits if s.reconcile_state == "y"
-            ]
-            if reconciled and not force:
-                acct_names = ", ".join(s.account.fullname for s in reconciled)
-                raise ValueError(
-                    f"Transaction has reconciled splits in: {acct_names}. "
-                    f"Deleting will break reconciliation. Use force=true to override."
-                )
+            reconciled_count = self._validate_transaction_deletable(
+                book, transaction, force,
+            )
 
             # Stage pre-delete state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
@@ -3809,14 +3963,92 @@ class CoreMixin:
                 "description": transaction.description,
                 "status": "deleted",
             }
-            if reconciled:
-                result["reconciled_splits_affected"] = len(reconciled)
+            if reconciled_count:
+                result["reconciled_splits_affected"] = reconciled_count
 
             # Delete the transaction
             book.session.delete(transaction)
             book.save()
 
             return result
+
+    def delete_transactions(
+        self, guids: list[str], force: bool = False,
+    ) -> dict:
+        """Delete several transactions in one book open / one save.
+
+        All-or-nothing: every guid must resolve and pass the same
+        safeguards as ``delete_transaction`` (invoice-posting guard,
+        reconciled splits vs ``force``) BEFORE anything is deleted —
+        validate-then-mutate, so a bad guid mid-list can't leave a
+        half-deleted batch.
+
+        Returns:
+            ``{status, count, transactions: [{guid, description,
+            reconciled_splits_affected?}]}`` — a dict envelope (not a
+            bare list) so the response machinery and audit decorator
+            see the same shape every write returns.
+
+        Raises:
+            ValueError: empty list, duplicate guid, any guid not
+                found, or any safeguard failure — nothing deleted.
+        """
+        if not guids:
+            raise ValueError("guids list is empty")
+
+        with self.open(readonly=False) as book:
+            resolved: list[tuple] = []
+            seen: set[str] = set()
+            for ref in guids:
+                transaction = self._find_transaction(book, ref)
+                if not transaction:
+                    raise ValueError(
+                        f"Transaction not found: {ref} (nothing deleted)"
+                    )
+                if transaction.guid in seen:
+                    raise ValueError(
+                        f"Duplicate guid in list: {ref} (nothing deleted)"
+                    )
+                seen.add(transaction.guid)
+                try:
+                    reconciled_count = self._validate_transaction_deletable(
+                        book, transaction, force,
+                    )
+                except ValueError as e:
+                    raise ValueError(f"{e} (nothing deleted)")
+                resolved.append((transaction, reconciled_count))
+
+            # Composite before-state — the audit formatter renders
+            # one block per deleted transaction from this list.
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for t, _ in resolved
+                ],
+            })
+
+            # Everything captured pre-delete: prefixes need the rows
+            # still present, attributes detach after the session
+            # closes.
+            all_guids = [t.guid for t in book.transactions]
+            items = []
+            for transaction, reconciled_count in resolved:
+                item = {
+                    "guid": _unique_prefix(transaction.guid, all_guids),
+                    "description": transaction.description,
+                }
+                if reconciled_count:
+                    item["reconciled_splits_affected"] = reconciled_count
+                items.append(item)
+
+            for transaction, _ in resolved:
+                book.session.delete(transaction)
+            book.save()
+
+            return {
+                "status": "deleted",
+                "count": len(items),
+                "transactions": items,
+            }
 
     def _verify_transaction_state(
         self,

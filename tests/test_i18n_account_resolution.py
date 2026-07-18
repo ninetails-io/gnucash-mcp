@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import piecash
 import pytest
+from piecash import factories
 
 from gnucash_mcp.book import GnuCashBook
 
@@ -135,6 +136,217 @@ class TestLocalizedHelperAccounts:
             assert purchase.type == "INCOME"
             assert purchase.parent.fullname == "Erträge"
             b.save()
+
+
+class TestFxAccountCollisionSafety:
+    """v1.4 review I18N-1 / I18N-2: the resolver must re-find (or
+    refuse loudly) an existing account bearing the exact name it
+    would create, and must never adopt-and-designate an account the
+    Layer-0 gates reject.
+
+    Pre-fix wedge: a German book with a pre-existing
+    ``Erträge:Realisierter Gewinn/Verlust`` and no designation slot
+    hit Layer 3's construct, ``book.save()`` failed with piecash's
+    opaque "two children with the same name", nothing persisted, and
+    every cross-currency ``pay_invoice`` retry failed identically.
+    """
+
+    def test_adopts_preexisting_localized_fx_account(
+        self, localized_book,
+    ):
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Erträge")
+            piecash.Account(
+                name="Realisierter Gewinn/Verlust",
+                type="INCOME",
+                parent=income,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            assert acct.fullname == "Erträge:Realisierter Gewinn/Verlust"
+            b.save()  # pre-fix: ValueError (duplicate children)
+
+        # The adoption self-healed the designation: Layer 0 now
+        # resolves the same account directly.
+        with gb.open(readonly=True) as b:
+            slotted = gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            )
+            assert slotted is not None
+            assert slotted.fullname == "Erträge:Realisierter Gewinn/Verlust"
+
+    def test_unadoptable_same_named_sibling_raises_clearly(
+        self, localized_book,
+    ):
+        """A same-named sibling that fails the gates (wrong
+        commodity) must produce an explanatory error naming
+        ``fx_account`` — not a save-time duplicate-children crash."""
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            usd = factories.create_currency_from_ISO("USD")
+            income = gb._find_account(b, "Erträge")
+            piecash.Account(
+                name="Realisierter Gewinn/Verlust",
+                type="INCOME",
+                parent=income,
+                commodity=usd,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="fx_account"):
+                gb._get_or_create_fx_account(b)
+
+    def test_invalid_canonical_account_never_designated(
+        self, test_book,
+    ):
+        """An account sitting at the English canonical path but
+        denominated in a foreign currency must not be adopted: the FX
+        split books a default-currency quantity, so adopting it would
+        record $X as €X — and storing its designation would create a
+        permanent store/reject disagreement with Layer 0."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            eur = factories.create_currency_from_ISO("EUR")
+            income = gb._find_account(b, "Income")
+            piecash.Account(
+                name="Foreign Exchange Gain/Loss",
+                type="INCOME",
+                parent=income,
+                commodity=eur,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="fx_account"):
+                gb._get_or_create_fx_account(b)
+            # And nothing was designated on the failure path.
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            ) is None
+
+    def test_ambiguity_notice_names_actual_destination(
+        self, localized_book,
+    ):
+        """With multiple fuzzy candidates the resolver falls back to
+        the default destination — and the notice must name the REAL
+        destination (the localized leaf under the type-resolved
+        income root), not the English canonical path that does not
+        exist on this book."""
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Erträge")
+            for name in ("FX Adjustments", "Forex Rounding"):
+                piecash.Account(
+                    name=name,
+                    type="INCOME",
+                    parent=income,
+                    commodity=b.default_currency,
+                )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            acct, notice = gb._get_or_create_fx_account(b)
+            assert notice is not None
+            assert notice["type"] == "ambiguous_fx_account"
+            assert acct.fullname in notice["message"]
+            assert "Income:Foreign Exchange Gain/Loss" \
+                not in notice["message"]
+
+
+class TestFxAdoptionGuards:
+    """Post-review follow-ups: adoption must not silently claim a
+    coincidentally-named account from another locale, and no
+    automatic layer may adopt or designate a placeholder."""
+
+    def test_foreign_locale_name_on_english_book_not_designated(
+        self, test_book,
+    ):
+        """An English book where the user created a German-named
+        income account must NOT have it silently adopted/designated —
+        the exact-match set is the book's OWN locale leaf plus the
+        English default, not all 47 shipped translations."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Income")
+            piecash.Account(
+                name="Realisierter Gewinn/Verlust",
+                type="INCOME",
+                parent=income,
+                commodity=b.default_currency,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            # Canonical English account created; the German-named
+            # coincidence untouched and undesignated.
+            assert acct.fullname == "Income:Foreign Exchange Gain/Loss"
+            slotted = gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            )
+            assert slotted is None or (
+                slotted.fullname == "Income:Foreign Exchange Gain/Loss"
+            )
+
+    def test_placeholder_canonical_not_adopted(self, test_book):
+        """A placeholder at the canonical path is not adoptable: the
+        resolver raises the explanatory sibling-collision error
+        rather than designating a non-postable organizer (or crashing
+        at save on the duplicate child it would otherwise create)."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            income = gb._find_account(b, "Income")
+            piecash.Account(
+                name="Foreign Exchange Gain/Loss",
+                type="INCOME",
+                parent=income,
+                commodity=b.default_currency,
+                placeholder=1,
+            )
+            b.save()
+
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="placeholder"):
+                gb._get_or_create_fx_account(b)
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            ) is None
+
+    def test_explicit_placeholder_fx_account_rejected(self, test_book):
+        gb = GnuCashBook(str(test_book))
+        gb.create_account(
+            name="FX Bucket", account_type="INCOME",
+            parent="Income", placeholder=True,
+        )
+        with gb.open(readonly=False) as b:
+            with pytest.raises(ValueError, match="placeholder"):
+                gb._get_or_create_fx_account(
+                    b, fx_account="Income:FX Bucket",
+                )
+
+    def test_stale_placeholder_designation_falls_through(
+        self, test_book,
+    ):
+        """A designated account later turned into a placeholder must
+        not keep receiving postings via Layer 0 — the designation
+        falls through and re-resolves."""
+        gb = GnuCashBook(str(test_book))
+        with gb.open(readonly=False) as b:
+            acct, _ = gb._get_or_create_fx_account(b)
+            b.save()
+        with gb.open(readonly=False) as b:
+            fx = gb._find_account(b, "Income:Foreign Exchange Gain/Loss")
+            fx.placeholder = 1
+            b.save()
+        with gb.open(readonly=True) as b:
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY,
+            ) is None
 
 
 class TestDesignatedAccountSlotLayer0:
@@ -417,6 +629,34 @@ class TestAutoBalancingAccountDetection:
             assert not gb._is_auto_balancing_account(
                 by_name["Tagesgeld"], root
             )
+
+    def test_ordinary_word_prefix_not_misclassified(self, tmp_path):
+        """v1.4 review I18N-5: the pooled locale catalog contains
+        ordinary words ("Açık" is Turkish for open/deficit; "Thừa"
+        Vietnamese for surplus). A legitimate root BANK account merely
+        STARTING with one must not be classified as suspense — that
+        excluded it from runway/low-cash and warned on the dashboard.
+        Only the exact word or the word-<CUR> shape GnuCash emits
+        qualifies."""
+        path = tmp_path / "tr.gnucash"
+        self._make_book(path, [
+            ("Açık Hesap", "BANK", None),      # ordinary Turkish name
+            ("Thừa kế Fonu", "BANK", None),    # ordinary Vietnamese name
+            ("Açık", "BANK", None),            # exact catalog word: flagged
+            ("Açık-TRY", "BANK", None),        # GnuCash shape: flagged
+        ])
+        gb = GnuCashBook(str(path))
+        with gb.open() as b:
+            root = b.root_account
+            by_name = {a.name: a for a in b.accounts}
+            assert not gb._is_auto_balancing_account(
+                by_name["Açık Hesap"], root,
+            )
+            assert not gb._is_auto_balancing_account(
+                by_name["Thừa kế Fonu"], root,
+            )
+            assert gb._is_auto_balancing_account(by_name["Açık"], root)
+            assert gb._is_auto_balancing_account(by_name["Açık-TRY"], root)
 
     def test_structural_gate_excludes_nested_and_nonbank(self, tmp_path):
         path = tmp_path / "bal2.gnucash"

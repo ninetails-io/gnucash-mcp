@@ -1,5 +1,107 @@
 # Changelog
 
+## v1.4.1 - Batch entry grows up; every annotation field reachable
+
+v1.4.0 introduced batch transaction entry; v1.4.1 is the release
+where it grows up — memos, notes, cross-commodity quantities, and
+batch delete, driven directly by the bookkeeper's daily
+reconciliation workflow. Alongside it: the adversarial-review
+hardening pass, monthly-close valuation for flow reports, and memo/
+notes coverage for every write surface that was silently dropping
+them.
+
+**Batch entry - the header is the schema.**
+
+The `create_transactions` TSV header row now declares the layout.
+Legacy submissions parse byte-identically; extensions are opt-in by
+naming them:
+
+- **Per-split memos** - declare `memo` columns and splits become
+  `(amount, account, memo)` groups. Check numbers and statement
+  refs now ride the PDF-reconcile workflow in one call.
+- **Per-transaction notes** - a `notes` column after `description`.
+- **Cross-commodity quantities** - declare `qty` columns for splits
+  on investment or foreign-currency accounts (`qty` in the
+  account's own commodity, `amt` always in the book default). The
+  book layer supported this all along - the restriction was
+  parser-only.
+- **Field order from the header** - `amt, acct, qty, memo` is as
+  valid as `amt, acct, memo, qty`; the header's first group fixes
+  the order.
+- **Trailing shorthand** - a row may end once its last split's
+  amount and account are present; trailing memo/qty cells read as
+  empty. The most common formatting mistake is now valid input.
+- **Auto-fill from history** - a row with NO split cells at all
+  reproduces the most recent matching-description transaction
+  (splits, memos, quantities), marked `auto_filled_from:<guid>` in
+  the results. Twelve recurring bills become twelve
+  ref-date-description rows; dry-run the batch first to preview
+  every match, then run it for real. Filled rows still pass the
+  duplicate screen - auto-fill is not a bypass.
+- **Strict header validation** - unknown or typo'd column names
+  (`meno1`, `currency2`) reject naming the offending column instead
+  of misparsing into raw decimal errors.
+
+**Batch delete.**
+
+- `delete_transaction` accepts a list of GUIDs - one book open, one
+  save, all-or-nothing (every guid validates before anything is
+  deleted). Ten 20-second cleanup calls become one. Single-guid
+  behavior unchanged.
+
+**Memo & notes coverage - every annotation field the schema had.**
+
+- Invoice/bill/voucher/credit-note line items take `notes` (4096-
+  byte cap) and `action` ("Hours", "Material") - columns that
+  existed in the entries table since day one, hardcoded empty.
+- `pay_invoice` takes a `memo` for the bank split (check number,
+  wire reference); the A/R//A/P split keeps its Payment action.
+- Account notes on `create_account` / `update_account`, stored in
+  the same `notes` slot GnuCash desktop's account editor reads.
+  Pass `""` to clear (slot deleted, matching desktop).
+- Scheduled transactions persist their `description` (previously
+  accepted and silently dropped; instantiation used the name).
+  Existing templates fall back to the name - no behavior change.
+- Instantiation audit entries show the created transaction's GUID
+  and description (previously the schedule's GUID and an empty
+  string); duplicate rejections render as such.
+
+**Correctness & hardening - the v1.4 adversarial review closed out.**
+
+- **Transactional `switch_book`** - a failed switch no longer tears
+  server state (retry said "Already on: B" while writes went to
+  book A). Everything fallible runs before the globals move; PID-
+  stamped debug lines and no-op switch logging for forensics.
+- **Per-book backup scoping** - two books under a shared
+  `GNUCASH_LOG_DIR` no longer starve or cross-prune each other's
+  backups; the log dir resolves to per-book `.mcp` subdirectories.
+- **i18n follow-through** - the localized FX-account wedge fixed
+  (cross-currency `pay_invoice` on a German book failed forever);
+  Imbalance/Orphan matching requires the exact word or `-CUR`
+  shape; retirement accounts classify via an `is_retirement` slot,
+  not English name-sniffing.
+- **Monthly-close valuation (GB-1)** - flow reports value every
+  split at its own month's closing rate in single-period and
+  `group_by` modes alike, so grand totals agree at every
+  granularity. Stock reports keep as-of semantics - deliberately
+  different. Partial `group_by` sub-periods are marked `*`.
+
+**Discovery.**
+
+- **Find accounts without paging** - `query` on `list_accounts`:
+  case-insensitive substring against path AND description, so
+  "4930" finds the SKR03 account and "保险" finds every insurance
+  account. Composes with `root`; results emit ready-to-use %short
+  GUIDs. A parameter, not a new tool.
+
+**Tooling.**
+
+- One-command sample-book rebuild through today.
+
+**Tests:** 1,856 passing.
+
+---
+
 ## v1.4.0 - Internationalization, batch entry, and multi-book
 
 The first widely-promoted release. v1.3 finished the business

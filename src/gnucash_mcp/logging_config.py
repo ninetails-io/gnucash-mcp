@@ -173,8 +173,21 @@ def redact_paths(text: str) -> str:
 def resolve_mcp_dir(book_path: Path | str) -> Path:
     """Resolve the ``.mcp`` directory for audit / debug / backup storage.
 
-    ``GNUCASH_LOG_DIR`` set → that path is used directly, bypassing
-    all checks (explicit user opt-in). Otherwise the directory is
+    ``GNUCASH_LOG_DIR`` set → a PER-BOOK subdirectory under it:
+    ``{GNUCASH_LOG_DIR}/{book_filename}.mcp`` — the default layout,
+    relocated. The subdir is what makes the override safe for
+    multi-book: a flat shared directory interleaved two books' audit
+    entries in one daily file under one book's header. Always
+    per-book, never sniffed from what exists on disk — a
+    conditional "reuse the flat layout if present" rule can never
+    decide which book owns the flat files, so every book would
+    match and the interleave would persist. v1.4.0-and-earlier flat
+    files (``{GNUCASH_LOG_DIR}/audit`` …) stay on disk untouched;
+    move them into the book's subdir manually to keep old history
+    attached. Permission checks are bypassed under the override
+    (explicit user opt-in), as before.
+
+    Otherwise the directory is
     ``book_path.parent / f"{book_path.name}.mcp"`` and two POSIX
     sanity checks fire:
 
@@ -198,7 +211,8 @@ def resolve_mcp_dir(book_path: Path | str) -> Path:
     """
     env_override = os.environ.get("GNUCASH_LOG_DIR")
     if env_override:
-        return Path(env_override).expanduser()
+        base = Path(env_override).expanduser()
+        return base / f"{Path(book_path).name}.mcp"
 
     book_path = Path(book_path)
     parent = book_path.parent
@@ -336,7 +350,12 @@ def setup_logging(
         # Write header if file is new
         write_header = not audit_file.exists()
 
-        audit_handler = logging.FileHandler(audit_file)
+        # Explicit UTF-8: under a C/POSIX locale (common for
+        # daemonized MCP servers) the platform default encoding is
+        # ASCII, and audit lines carrying localized account names
+        # ("已实现获利(亏损)", "Erträge:…") would hit UnicodeEncodeError
+        # inside the handler and be dropped to stderr.
+        audit_handler = logging.FileHandler(audit_file, encoding="utf-8")
         audit_handler.setFormatter(logging.Formatter("%(message)s"))
         audit_handler.stream.reconfigure(line_buffering=True)
         audit_logger.addHandler(audit_handler)
@@ -370,10 +389,18 @@ def setup_logging(
         debug_logger.setLevel(logging.DEBUG)
         debug_logger.propagate = False
 
-        debug_handler = logging.FileHandler(debug_dir / f"{today}.log")
+        debug_handler = logging.FileHandler(
+            debug_dir / f"{today}.log", encoding="utf-8",
+        )
+        # PID in every line: MCP clients can spawn multiple server
+        # processes against one config (observed: Claude Desktop
+        # starts twins), and they all append to this same per-book
+        # file. Without the PID, incident forensics cannot attribute
+        # a line to a process — the exact wall the 2026-07-10
+        # switch-timeout investigation hit.
         debug_handler.setFormatter(
             logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s",
+                "%(asctime)s [%(levelname)s] [pid %(process)d] %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S",
             )
         )
@@ -424,7 +451,10 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
         account = split.get("account", "Unknown")
         short_name = account.split(":")[-1]
         amount = _format_amount(split.get("amount") or split.get("value"))
-        lines.append(f"{indent}{short_name:<{max_name_len}}  {amount:>12}")
+        line = f"{indent}{short_name:<{max_name_len}}  {amount:>12}"
+        if split.get("memo"):
+            line += f"  {split['memo']}"
+        lines.append(line)
 
     return "\n".join(lines)
 
@@ -509,6 +539,39 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
+    """SX instantiation — the response carries ``transaction_guid``
+    (not ``guid``), so the generic transaction handler would fall
+    back to the params GUID, which is the SCHEDULE's. Read the
+    response fields directly instead.
+    """
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    sx_name = after.get("scheduled_transaction", "")
+    date_str = after.get("transaction_date", "")
+
+    if after.get("status") == "rejected":
+        # Duplicate already posted for this period — the schedule
+        # advanced but no transaction was written.
+        return [
+            f"{time_part}  CREATE FROM SCHEDULED  \"{sx_name}\" "
+            f"({date_str})",
+            f"{_INDENT}rejected: equivalent transaction already "
+            f"exists for this period",
+        ]
+
+    guid = after.get("transaction_guid", "")
+    desc = after.get("description", "")
+    lines = [f"{time_part}  CREATE FROM SCHEDULED  guid:{guid}"]
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+    detail = f'schedule: "{sx_name}"'
+    instance = after.get("instance_count")
+    if instance:
+        detail += f"  instance #{instance}"
+    lines.append(f"{_INDENT}{detail}")
+    return lines
+
+
 def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
     """Header-bearing TSV string -> row dicts (display-only)."""
     if not tsv:
@@ -519,24 +582,46 @@ def _parse_audit_tsv_rows(tsv: str) -> list[dict]:
 
 
 def _parse_batch_submission(tsv: str) -> dict:
-    """ref -> {description, date, splits} from the submitted batch TSV.
-    Positional parse mirroring the tool layer; tolerant of ragged rows
-    since this is display-only."""
+    """ref -> {description, date, notes?, splits} from the submitted
+    batch TSV. Layout comes from the shared header reader
+    (``_batch_tsv_layout``) so this display parse can't drift from
+    the tool-layer parse; tolerant of malformed rows since this is
+    display-only (a row the chunker rejects renders without its
+    splits — the write path rejected such rows anyway).
+    """
+    from gnucash_mcp._format import (
+        _BATCH_LEGACY_GROUP,
+        _batch_row_splits,
+        _batch_tsv_layout,
+    )
+
     out: dict = {}
-    for ln in (tsv.split("\n")[1:] if tsv else []):
+    lines = tsv.split("\n") if tsv else []
+    if not lines:
+        return out
+    try:
+        layout = _batch_tsv_layout(lines[0])
+    except ValueError:
+        # Malformed extension header — the write path rejected the
+        # whole submission; render rows in the legacy shape.
+        layout = {"has_notes": False, "group": _BATCH_LEGACY_GROUP}
+    fixed = 4 if layout["has_notes"] else 3
+    for ln in lines[1:]:
         if not ln.strip():
             continue
         f = ln.split("\t")
         if len(f) < 3:
             continue
-        rest = f[3:]
-        splits = [
-            {"account": rest[j + 1], "amount": rest[j]}
-            for j in range(0, len(rest) - 1, 2)
-        ]
-        out[f[0].strip()] = {
+        try:
+            splits = _batch_row_splits(f[fixed:], layout["group"])
+        except ValueError:
+            splits = []
+        entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
+        if layout["has_notes"] and len(f) > 3 and f[3].strip():
+            entry["notes"] = f[3].strip()
+        out[f[0].strip()] = entry
     return out
 
 
@@ -566,6 +651,16 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         lines.append(
             f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({date_str})'
         )
+        if src.get("notes"):
+            lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+        reason = r.get("reason", "")
+        if reason.startswith("auto_filled_from:"):
+            # Splitless submission — the source guid is the trail to
+            # what actually got booked.
+            source = reason.split(":", 1)[1]
+            lines.append(
+                f"{_INDENT_SPLITS}auto-filled from guid:{source}"
+            )
         splits = src.get("splits") or []
         if splits:
             lines.append(_format_splits_text(splits, _INDENT_SPLITS))
@@ -649,8 +744,31 @@ def _fmt_transaction_unvoid(entry: dict) -> list[str]:
 def _fmt_transaction_delete(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
-    guid = _transaction_guid(entry)
+    after = entry.get("after_state") or {}
 
+    # Batch form: multi-guid delete_transaction. The response
+    # carries short guids + descriptions; the composite before-state
+    # carries dates and splits, in the same order.
+    if "transactions" in after:
+        after_txns = after.get("transactions") or []
+        before_txns = (before or {}).get("transactions") or []
+        count = after.get("count", len(after_txns))
+        lines = [
+            f"{time_part}  DELETE TRANSACTIONS (batch)  {count} deleted"
+        ]
+        for i, at in enumerate(after_txns):
+            bt = before_txns[i] if i < len(before_txns) else {}
+            lines.append(
+                f'{_INDENT}DELETE  guid:{at.get("guid", "")}  '
+                f'"{at.get("description", "")}" ({bt.get("date", "")})'
+            )
+            if bt.get("splits"):
+                lines.append(
+                    _format_splits_text(bt["splits"], _INDENT_SPLITS)
+                )
+        return lines
+
+    guid = _transaction_guid(entry)
     lines = [f"{time_part}  DELETE TRANSACTION  guid:{guid}"]
     if before:
         desc = before.get("description", "")
@@ -709,6 +827,9 @@ def _fmt_account_create(entry: dict) -> list[str]:
         desc = after.get("description", params.get("description", ""))
         if desc:
             lines.append(f'{_INDENT}Description: "{desc}"')
+        notes = after.get("notes", params.get("notes", ""))
+        if notes:
+            lines.append(f'{_INDENT}Notes: "{notes}"')
     return lines
 
 
@@ -731,6 +852,16 @@ def _fmt_account_update(entry: dict) -> list[str]:
         new_desc = after.get("description", "")
         if old_desc != new_desc:
             lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+        # ``notes`` is a diff-echo key: present in after_state only
+        # when the update changed it ("" = cleared).
+        if "notes" in after:
+            old_notes = before.get("notes", "")
+            if after["notes"]:
+                lines.append(
+                    f'{_INDENT}Notes: "{old_notes}" → "{after["notes"]}"'
+                )
+            else:
+                lines.append(f'{_INDENT}Notes: "{old_notes}" → (cleared)')
     return lines
 
 
@@ -1346,6 +1477,9 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
         lines.append(
             f"{_INDENT}from: {params.get('payment_account', '')}  txn:{txn_guid}"
         )
+    memo = params.get("memo", "")
+    if memo:
+        lines.append(f"{_INDENT}memo: {memo}")
     lines += _fx_stale_lines(entry)
     return lines
 
@@ -1589,10 +1723,20 @@ def _fmt_entry_create(entry: dict) -> list[str]:
         or params.get("voucher_id", "")
         or params.get("credit_note_id", "")
     )
-    return [
+    lines = [
         f"{time_part}  CREATE ENTRY",
         f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
     ]
+    action = after.get("action", params.get("action", ""))
+    notes = after.get("notes", params.get("notes", ""))
+    if action or notes:
+        detail = []
+        if action:
+            detail.append(f"action: {action}")
+        if notes:
+            detail.append(f"notes: {notes}")
+        lines.append(f"{_INDENT}{'  '.join(detail)}")
+    return lines
 
 
 # ── Budget handlers ────────────────────────────────────────────────
@@ -1676,6 +1820,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     name = after.get("name", params.get("name", ""))
     lines = [f'{time_part}  CREATE SCHEDULED  "{name}"']
+    description = params.get("description", "")
+    if description and description != name:
+        lines.append(f"{_INDENT}description: {description}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
@@ -1743,6 +1890,8 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
 
 _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "CREATE_FROM_SCHEDULED"):
+        _fmt_transaction_create_from_scheduled,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
     ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,

@@ -625,6 +625,8 @@ def register(mcp, get_book) -> None:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> str:
         """Add a line item to a customer invoice.
 
@@ -644,12 +646,17 @@ def register(mcp, get_book) -> None:
             tax_included: If true, ``price`` is the gross (tax-included)
                 value; pretax extracted at posting. If false (default),
                 ``price`` is pre-tax and tax adds on top.
+            notes: Optional per-line notes (max 4096 bytes) — detail
+                that doesn't belong on the printed description line.
+            action: Optional line-type label (GnuCash convention:
+                "Hours", "Material", "Project").
         """
         book = get_book()
         result = book.add_invoice_entry(
             invoice_id=invoice_id, account=account,
             description=description, quantity=quantity, price=price,
             taxtable=taxtable, tax_included=tax_included,
+            notes=notes, action=action,
         )
         return _json(result)
 
@@ -664,6 +671,8 @@ def register(mcp, get_book) -> None:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> str:
         """Add a line item to a vendor bill.
 
@@ -682,12 +691,16 @@ def register(mcp, get_book) -> None:
                 entries.
             tax_included: If true, ``price`` is gross; pretax extracted
                 at posting. If false (default), tax adds on top.
+            notes: Optional per-line notes (max 4096 bytes).
+            action: Optional line-type label (GnuCash convention:
+                "Hours", "Material", "Project").
         """
         book = get_book()
         result = book.add_bill_entry(
             bill_id=bill_id, account=account,
             description=description, quantity=quantity, price=price,
             taxtable=taxtable, tax_included=tax_included,
+            notes=notes, action=action,
         )
         return _json(result)
 
@@ -740,6 +753,8 @@ def register(mcp, get_book) -> None:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> str:
         """Add a line item to an employee expense voucher.
 
@@ -758,12 +773,17 @@ def register(mcp, get_book) -> None:
                 ``add_bill_entry``.
             tax_included: If true, ``price`` is gross; pretax extracted
                 at posting.
+            notes: Optional per-line notes (max 4096 bytes) — e.g.
+                receipt reference or attendee list.
+            action: Optional line-type label (GnuCash convention:
+                "Hours", "Material", "Project").
         """
         book = get_book()
         result = book.add_voucher_entry(
             voucher_id=voucher_id, account=account,
             description=description, quantity=quantity, price=price,
             taxtable=taxtable, tax_included=tax_included,
+            notes=notes, action=action,
         )
         return _json(result)
 
@@ -866,6 +886,8 @@ def register(mcp, get_book) -> None:
         owner_type: str | None = None,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> str:
         """Add a line item to a credit note.
 
@@ -893,6 +915,10 @@ def register(mcp, get_book) -> None:
                 account.
             tax_included: If true, ``price`` is gross; pretax
                 extracted at posting.
+            notes: Optional per-line notes (max 4096 bytes) — e.g.
+                the reason this line is being credited.
+            action: Optional line-type label (GnuCash convention:
+                "Hours", "Material", "Project").
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -905,6 +931,8 @@ def register(mcp, get_book) -> None:
             owner_type=owner_type,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
         return _json(result)
 
@@ -1147,6 +1175,7 @@ def register(mcp, get_book) -> None:
         apply_discount: bool = False,
         discount_account: str | None = None,
         force: bool = False,
+        memo: str = "",
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
@@ -1203,6 +1232,10 @@ def register(mcp, get_book) -> None:
                 is refused with ``stale_fx_rate`` unless ``force=True``
                 (the override is recorded as ``fx_stale``/"forced").
                 A rate beyond the 90-day cap cannot be forced.
+            memo: Optional memo for the bank-account split (e.g.,
+                check number or wire reference). ``description``
+                names the whole transaction; ``memo`` annotates the
+                cash movement.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1217,6 +1250,7 @@ def register(mcp, get_book) -> None:
             apply_discount=apply_discount,
             discount_account=discount_account,
             force=force,
+            memo=memo,
         )
         return _json(result)
 

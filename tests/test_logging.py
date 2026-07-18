@@ -663,6 +663,210 @@ class TestBudgetAndScheduledAuditHandlers:
         assert "frequency: monthly  start: 2026-01-01" in rendered
         assert "had run 4 times" in rendered
 
+    def test_scheduled_create_renders_description(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "scheduled_transaction",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {
+                "name": "Car Insurance",
+                "description": "Progressive policy #4471",
+                "start_date": "2026-08-01",
+            },
+            "after_state": {
+                "name": "Car Insurance",
+                "frequency": "monthly",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE SCHEDULED  "Car Insurance"' in rendered
+        assert "description: Progressive policy #4471" in rendered
+
+    def test_create_from_scheduled_shows_txn_guid_and_description(self):
+        """The instantiation response keys the new transaction as
+        ``transaction_guid`` — the generic CREATE handler used to
+        fall back to the params GUID (the SCHEDULE's) and render an
+        empty description. The dedicated handler reads the response."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_from_scheduled",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"guid": "aaaa1111", "transaction_date": "2026-08-01"},
+            "after_state": {
+                "transaction_guid": "bcd3e6e1",
+                "scheduled_transaction": "Car Insurance",
+                "description": "Progressive policy #4471, autopay",
+                "transaction_date": "2026-08-01",
+                "instance_count": 1,
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "CREATE FROM SCHEDULED  guid:bcd3e6e1" in rendered
+        assert "aaaa1111" not in rendered
+        assert '"Progressive policy #4471, autopay" (2026-08-01)' in rendered
+        assert 'schedule: "Car Insurance"  instance #1' in rendered
+
+    def test_create_from_scheduled_rejected_duplicate(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_from_scheduled",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"guid": "aaaa1111"},
+            "after_state": {
+                "transaction_guid": None,
+                "scheduled_transaction": "Car Insurance",
+                "description": "Progressive policy #4471, autopay",
+                "transaction_date": "2026-08-01",
+                "instance_count": 2,
+                "status": "rejected",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE FROM SCHEDULED  "Car Insurance" (2026-08-01)' in rendered
+        assert "rejected: equivalent transaction already exists" in rendered
+
+    def test_batch_create_renders_notes_and_memos(self):
+        """The batch audit block re-parses the submitted TSV via the
+        shared header-aware layout — memo-declaring headers render
+        per-split memos, and the notes column gets its own line."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        submitted = (
+            "ref\tdate\tdescription\tnotes\tamt\tacct\tmemo\n"
+            "1\t2026-07-15\tGas\tstatement p.2\t-54.19"
+            "\tAssets:Checking\tcard #4471"
+            "\t54.19\tExpenses:Auto:Fuel\t"
+        )
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_batch",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"transactions": submitted},
+            "after_state": {
+                "results": (
+                    "ref\tstatus\ttxn_guid\tdup_count\treason\n"
+                    "1\tcreated\tabcd1234\t\t"
+                ),
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE  guid:abcd1234  "Gas" (2026-07-15)' in rendered
+        assert "notes: statement p.2" in rendered
+        assert "card #4471" in rendered
+
+    def test_legacy_batch_submission_renders_as_before(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        submitted = (
+            "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t2026-07-15\tGas\t-54.19\tAssets:Checking"
+            "\t54.19\tExpenses:Auto:Fuel"
+        )
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "create_batch",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"transactions": submitted},
+            "after_state": {
+                "results": (
+                    "ref\tstatus\ttxn_guid\tdup_count\treason\n"
+                    "1\tcreated\tabcd1234\t\t"
+                ),
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert 'CREATE  guid:abcd1234  "Gas" (2026-07-15)' in rendered
+        assert "notes:" not in rendered
+        assert "Checking" in rendered
+
+    def test_batch_delete_renders_per_transaction_blocks(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "transaction",
+            "operation": "delete",
+            "timestamp": "2026-07-15T20:00:00",
+            "params": {"guid": ["83862278", "d868498f"]},
+            "before_state": {
+                "transactions": [
+                    {
+                        "description": "Test Legacy Coffee",
+                        "date": "2026-07-10",
+                        "splits": [
+                            {"account": "Assets:Checking", "value": "-4.50"},
+                            {"account": "Expenses:Dining", "value": "4.50"},
+                        ],
+                    },
+                    {
+                        "description": "Test Legacy Gas",
+                        "date": "2026-07-11",
+                        "splits": [],
+                    },
+                ],
+            },
+            "after_state": {
+                "status": "deleted",
+                "count": 2,
+                "transactions": [
+                    {"guid": "83862278", "description": "Test Legacy Coffee"},
+                    {"guid": "d868498f", "description": "Test Legacy Gas"},
+                ],
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "DELETE TRANSACTIONS (batch)  2 deleted" in rendered
+        assert 'DELETE  guid:83862278  "Test Legacy Coffee" (2026-07-10)' in rendered
+        assert 'DELETE  guid:d868498f  "Test Legacy Gas" (2026-07-11)' in rendered
+        assert "Checking" in rendered
+
+    def test_entry_create_renders_notes_and_action(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"invoice_id": "000001"},
+            "after_state": {
+                "invoice_id": "000001",
+                "description": "April retainer",
+                "total": "1500.00",
+                "notes": "PO #2231",
+                "action": "Hours",
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert '"April retainer"  total: 1500.00  on: 000001' in rendered
+        assert "action: Hours  notes: PO #2231" in rendered
+
+    def test_entry_create_plain_has_no_detail_line(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-07-15T18:00:00",
+            "params": {"bill_id": "000001"},
+            "after_state": {
+                "bill_id": "000001",
+                "description": "Paper",
+                "total": "50.00",
+                "status": "created",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert '"Paper"  total: 50.00  on: 000001' in rendered
+        assert "notes:" not in rendered
+        assert "action:" not in rendered
+
 
 class TestBudgetAndScheduledStaging:
     """Verify the book methods actually stage before-state.
@@ -1380,18 +1584,23 @@ class TestResolveMcpDir:
         assert result == tmp_path / "alex.gnucash.mcp"
 
     def test_env_override_used(self, tmp_path, monkeypatch):
-        """GNUCASH_LOG_DIR takes precedence over derivation."""
+        """GNUCASH_LOG_DIR takes precedence over derivation — and
+        yields a PER-BOOK subdir under it, so two books sharing the
+        override never interleave audit files or backup state."""
         override = tmp_path / "elsewhere"
         monkeypatch.setenv("GNUCASH_LOG_DIR", str(override))
         result = resolve_mcp_dir(tmp_path / "alex.gnucash")
-        assert result == override
+        assert result == override / "alex.gnucash.mcp"
+        other = resolve_mcp_dir(tmp_path / "linwei.gnucash")
+        assert other == override / "linwei.gnucash.mcp"
+        assert result != other
 
     def test_env_override_expands_tilde(self, monkeypatch):
         """GNUCASH_LOG_DIR=~/foo expands to the user's home."""
         monkeypatch.setenv("GNUCASH_LOG_DIR", "~/my-logs")
         result = resolve_mcp_dir("/anywhere/book.gnucash")
         assert "~" not in str(result)
-        assert str(result).endswith("my-logs")
+        assert str(result).endswith("my-logs/book.gnucash.mcp")
 
     @pytest.mark.skipif(
         os.name != "posix",
@@ -1474,7 +1683,7 @@ class TestResolveMcpDir:
             # Should not raise despite the world-writable
             # parent — env override bypasses the check.
             result = resolve_mcp_dir(tmp_path / "alex.gnucash")
-            assert result == override
+            assert result == override / "alex.gnucash.mcp"
         finally:
             if os.name == "posix":
                 os.chmod(tmp_path, 0o755)

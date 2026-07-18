@@ -18,7 +18,7 @@ Two pieces:
 
 import calendar
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import TypeVar
 
@@ -83,6 +83,47 @@ def _enumerate_periods(
     return periods
 
 
+def _partial_period_labels(
+    start_date: date, end_date: date, group_by: str
+) -> set[str]:
+    """Labels of sub-periods the report range only partially covers.
+
+    Only the first and last enumerated periods can be partial.
+    Derived from ``_period_label`` itself instead of a third copy of
+    the calendar-boundary ladder: the range starts mid-period exactly
+    when the day BEFORE ``start_date`` still carries the same label,
+    and ends mid-period exactly when the day AFTER ``end_date`` does.
+    Provably consistent with the bucketing function by construction —
+    a new ``group_by`` granularity added to ``_period_label`` is
+    covered here with no edit. Rendered with a ``*`` marker so a
+    half-month column isn't silently read as a small full month (and
+    so the Avg column's drag from a partial period is visible).
+    """
+    partial: set[str] = set()
+    if _period_label(start_date - timedelta(days=1), group_by) \
+            == _period_label(start_date, group_by):
+        partial.add(_period_label(start_date, group_by))
+    if _period_label(end_date + timedelta(days=1), group_by) \
+            == _period_label(end_date, group_by):
+        partial.add(_period_label(end_date, group_by))
+    return partial
+
+
+def _mark_partial(
+    period_labels: list[str], partial_labels: set[str] | None
+) -> list[str]:
+    """Header labels with ``*`` appended to partial periods."""
+    if not partial_labels:
+        return list(period_labels)
+    return [
+        f"{pl}*" if pl in partial_labels else pl
+        for pl in period_labels
+    ]
+
+
+_PARTIAL_FOOTNOTE = "(* period only partially covered by the date range)"
+
+
 def _strip_common_prefix(names: list[str]) -> list[str]:
     """Drop a shared top-level ``Expenses:`` / ``Income:`` prefix.
 
@@ -107,6 +148,7 @@ def _format_grouped_tsv(
     grand_total: Decimal,
     excluded: list[tuple[str, Decimal]],
     label: str,
+    partial_labels: set[str] | None = None,
 ) -> str:
     """Render an entity × sub-period breakdown as a TSV table.
 
@@ -123,7 +165,8 @@ def _format_grouped_tsv(
     """
     num_periods = len(period_labels)
     leaves = _strip_common_prefix(displayed_names)
-    lines = ["\t".join([label, *period_labels, "Total", "Avg"])]
+    header_labels = _mark_partial(period_labels, partial_labels)
+    lines = ["\t".join([label, *header_labels, "Total", "Avg"])]
     for name, leaf in zip(displayed_names, leaves):
         per = totals.get(name, {})
         cells = [leaf]
@@ -140,6 +183,8 @@ def _format_grouped_tsv(
     lines.append("\t".join(total_cells))
 
     out = "\n".join(lines)
+    if partial_labels:
+        out += f"\n{_PARTIAL_FOOTNOTE}"
     if excluded:
         netted = ", ".join(
             f"{n} {t:,.2f}"
@@ -149,6 +194,154 @@ def _format_grouped_tsv(
             f"\n({len(excluded)} net-negative netted into TOTAL: {netted})"
         )
     return out
+
+
+# ── Batch-entry TSV layout ─────────────────────────────────────────
+#
+# Shared by the tool-layer parser (tools/core.py) and the audit-log
+# display parser (logging_config.py) so the two can never drift on
+# what a submitted batch means.
+
+
+# Canonical names for split-column header tokens. Trailing digits
+# are stripped before lookup (``amt1`` → ``amt``), so numbered and
+# unnumbered headers both work.
+_BATCH_SPLIT_TOKENS = {
+    "amt": "amount", "amount": "amount",
+    "acct": "account", "account": "account", "acc": "account",
+    "memo": "memo",
+    "qty": "quantity", "quantity": "quantity",
+}
+
+# Fallback shape for the audit log's display parser when a stored
+# submission's header no longer validates (it renders rows as
+# pairs rather than crashing log rendering).
+_BATCH_LEGACY_GROUP = ("amount", "account")
+
+
+def _batch_tsv_layout(header_line: str) -> dict:
+    """Column layout of a batch-entry TSV, derived from its header.
+
+    Fixed prefix ``ref, date, description``, an optional ``notes``
+    column, then split columns. The split-group field sequence is
+    whatever the header's FIRST group declares (``amt, acct`` pairs;
+    ``amt, acct, memo`` triples; ``amt, acct, qty``;
+    ``amt, acct, memo, qty`` — in any intra-group order): the header
+    is the schema, for field order too.
+
+    EVERY column name is validated. Now that the header is
+    load-bearing, an unknown or typo'd token (``meno1``,
+    ``currency2``) must fail on the format — silently falling back
+    to positional pairs would misparse the row and surface a raw
+    decimal error on whatever landed in an amount slot (bookkeeper
+    finding, 1.4.1 validation round).
+
+    Returns ``{"has_notes": bool, "group": tuple[str, ...]}`` with
+    ``group`` in canonical names (``amount`` / ``account`` /
+    ``memo`` / ``quantity``).
+
+    Raises ValueError naming the offending column on any unknown
+    token, a wrong fixed prefix, or a first group missing
+    amount/account.
+    """
+    raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
+    # Tolerate trailing empty cells (a trailing tab on the header).
+    while raw_tokens and not raw_tokens[-1]:
+        raw_tokens.pop()
+    tokens = [t.rstrip("0123456789") for t in raw_tokens]
+
+    if len(tokens) < 3 or tokens[0] != "ref" or tokens[1] != "date" \
+            or tokens[2] not in ("description", "desc"):
+        raise ValueError(
+            "batch header must start with ref, date, description "
+            f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}"
+        )
+    has_notes = len(tokens) > 3 and tokens[3] == "notes"
+    start = 4 if has_notes else 3
+
+    canonical: list[str] = []
+    for raw, token in zip(raw_tokens[start:], tokens[start:]):
+        name = _BATCH_SPLIT_TOKENS.get(token)
+        if name is None:
+            raise ValueError(
+                f"unrecognized column {raw!r} in batch header — "
+                f"columns are ref, date, description, notes, then "
+                f"amt, acct, memo, qty split groups"
+            )
+        canonical.append(name)
+
+    if not canonical:
+        # No split columns declared at all — the natural header for
+        # an all-auto-fill batch (``ref, date, description``). Rows
+        # that do carry splits chunk as legacy pairs.
+        return {"has_notes": has_notes, "group": _BATCH_LEGACY_GROUP}
+
+    # The first group runs until a field repeats; later groups are
+    # not order-checked (rows are chunked by the first group's
+    # shape), but every token was validated above.
+    group: list[str] = []
+    for name in canonical:
+        if name in group:
+            break
+        group.append(name)
+    if "amount" not in group or "account" not in group:
+        raise ValueError(
+            "split columns must include both an amount and an "
+            "account column"
+        )
+    return {"has_notes": has_notes, "group": tuple(group)}
+
+
+def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
+    """Chunk a batch row's trailing fields into split dicts.
+
+    ``group`` is the per-split field sequence from
+    ``_batch_tsv_layout``. ``amount`` and ``account`` are always
+    present; ``memo`` / ``quantity`` cells may be empty (the key is
+    included only when non-empty, so plain splits keep their shape
+    downstream — and an empty qty means "account commodity equals
+    the transaction currency", the same-currency default).
+
+    A row may end mid-group once the final split's REQUIRED fields
+    are present: omitted trailing cells are read as empty, so a
+    quad-header row can end right after its last account with no
+    placeholder tabs. Rows are still rejected when the omission
+    would swallow an amount or account — that's a misalignment, not
+    a shorthand.
+    """
+    width = len(group)
+    # Index just past the last required field — a trailing group
+    # shorter than this is missing amount/account, not merely
+    # skipping optional cells.
+    required_span = max(
+        i for i, f in enumerate(group) if f in ("amount", "account")
+    ) + 1
+    remainder = len(rest) % width
+    if remainder:
+        if remainder < required_span:
+            shape = ", ".join(group)
+            missing = ", ".join(
+                f for f in group[remainder:]
+                if f in ("amount", "account")
+            )
+            raise ValueError(
+                f"row ends mid-group: the last ({shape}) group has "
+                f"only {remainder} cell(s) and is missing {missing}. "
+                f"Optional trailing cells (memo/qty) may be omitted; "
+                f"amount and account may not."
+            )
+        rest = list(rest) + [""] * (width - remainder)
+    splits: list[dict] = []
+    for j in range(0, len(rest), width):
+        split: dict = {}
+        for k, field in enumerate(group):
+            cell = rest[j + k]
+            if field in ("amount", "account"):
+                split[field] = cell
+            elif cell.strip():
+                split[field] = cell.strip()
+        splits.append(split)
+    return splits
 
 
 # ── Numeric formatting ─────────────────────────────────────────────

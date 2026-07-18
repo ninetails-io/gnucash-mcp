@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import piecash
+from piecash import factories
 import pytest
 
 from gnucash_mcp.book import GnuCashBook, GnuCashLockError
@@ -1803,6 +1804,69 @@ class TestGetBookSummaryRunway:
         assert "7,000" not in runway_line
         assert "2,670" in runway_line
 
+    def test_retirement_slot_marks_foreign_named_subtree(
+        self, test_book: Path,
+    ):
+        """The ``is_retirement`` slot is the locale-proof signal: a
+        subtree with no English "retirement" in any path component
+        (a zh_CN 退休金, a German Altersvorsorge) is excluded from
+        liquid once the flag is set on the parent — and the flag
+        inherits, so children need nothing."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Altersvorsorge",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="Riester-Rente",
+            account_type="BANK",
+            parent="Assets:Altersvorsorge",
+        )
+        gc.set_account_slot(
+            "Assets:Altersvorsorge", "is_retirement", "true",
+        )
+        with gc.open(readonly=False) as book:
+            acct = gc._find_account(
+                book, "Assets:Altersvorsorge:Riester-Rente",
+            )
+            assert gc._is_in_retirement_subtree(acct) is True
+            # The placeholder itself is flagged too.
+            parent = gc._find_account(book, "Assets:Altersvorsorge")
+            assert gc._is_in_retirement_subtree(parent) is True
+
+    def test_retirement_slot_false_overrides_name_fallback(
+        self, test_book: Path,
+    ):
+        """An explicit falsy slot un-marks an account the English
+        name heuristic would otherwise exclude — e.g. an HSA the
+        user keeps under their Retirement placeholder but treats
+        as spendable."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Retirement",
+            account_type="ASSET",
+            parent="Assets",
+            placeholder=True,
+        )
+        gc.create_account(
+            name="HSA",
+            account_type="BANK",
+            parent="Assets:Retirement",
+        )
+        gc.set_account_slot(
+            "Assets:Retirement:HSA", "is_retirement", "false",
+        )
+        with gc.open(readonly=False) as book:
+            hsa = gc._find_account(book, "Assets:Retirement:HSA")
+            assert gc._is_in_retirement_subtree(hsa) is False
+            # Nearest-ancestor precedence: siblings without their own
+            # slot still fall back to the name heuristic and stay
+            # excluded.
+            parent = gc._find_account(book, "Assets:Retirement")
+            assert gc._is_in_retirement_subtree(parent) is True
+
     def test_stock_without_price_uses_cost_basis(
         self, test_book: Path,
     ):
@@ -3406,6 +3470,48 @@ class TestListAccounts:
         assert "Assets:Checking" in result
         assert "Expenses:Groceries" in result
         assert "Income:Salary" in result
+
+    def test_query_matches_path_substring(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(query="grocer")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Expenses:Groceries" in lines[1]
+
+    def test_query_is_case_insensitive(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        assert "Expenses:Groceries" in gc_book.list_accounts(query="GROCER")
+
+    def test_query_matches_description_on_numbered_chart(
+        self, test_book: Path,
+    ):
+        """SKR03-style: the name is a number, the meaning lives in
+        the description. query must reach it."""
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="4930", account_type="EXPENSE", parent="Expenses",
+            description="Bürobedarf",
+        )
+        result = gc_book.list_accounts(query="bürobedarf")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Expenses:4930" in lines[1]
+        # And the number itself matches too.
+        assert "Expenses:4930" in gc_book.list_accounts(query="4930")
+
+    def test_query_composes_with_root(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        # "s" appears everywhere; scoped to Income it can't match
+        # any Expenses account.
+        result = gc_book.list_accounts(root="Income", query="salary")
+        lines = result.strip().split("\n")
+        assert "of 1 accounts" in lines[0]
+        assert "Income:Salary" in lines[1]
+
+    def test_query_no_match_reports_zero(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.list_accounts(query="zzz-not-there")
+        assert "Showing 0 of 0 accounts" in result
 
     def test_list_accounts_sorted(self, test_book: Path):
         """Compact output lines should be sorted by account name."""
@@ -5838,6 +5944,99 @@ class TestSearchTransactions:
         assert "limit capped at 250" in result.split("\n")[0]
 
 
+class TestAccountNotes:
+    """Account notes via the desktop-compatible "notes" slot."""
+
+    def test_create_with_notes_round_trip(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Chase Sapphire",
+            account_type="EXPENSE",
+            parent="Expenses",
+            notes="Closed to new charges 2026-07; autopay off",
+        )
+        account = gc_book.get_account("Expenses:Chase Sapphire")
+        assert account["notes"] == (
+            "Closed to new charges 2026-07; autopay off"
+        )
+
+        # Stored under the flat "notes" slot key — the one GnuCash
+        # desktop's account editor reads.
+        import sqlite3
+        conn = sqlite3.connect(str(test_book))
+        row = conn.execute(
+            "SELECT s.string_val FROM slots s "
+            "JOIN accounts a ON a.guid = s.obj_guid "
+            "WHERE a.name = 'Chase Sapphire' AND s.name = 'notes'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "Closed to new charges 2026-07; autopay off"
+
+    def test_create_without_notes_keeps_shape(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Plain", account_type="EXPENSE", parent="Expenses",
+        )
+        account = gc_book.get_account("Expenses:Plain")
+        assert "notes" not in account
+
+    def test_update_sets_changes_and_clears(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Annotated", account_type="EXPENSE", parent="Expenses",
+        )
+
+        r1 = gc_book.update_account(
+            "Expenses:Annotated", notes="first note",
+        )
+        assert r1["notes"] == "first note"
+        assert gc_book.get_account("Expenses:Annotated")["notes"] == (
+            "first note"
+        )
+
+        r2 = gc_book.update_account(
+            "Expenses:Annotated", notes="second note",
+        )
+        assert r2["notes"] == "second note"
+
+        # "" clears: the slot row is deleted, not left empty.
+        r3 = gc_book.update_account("Expenses:Annotated", notes="")
+        assert r3["notes"] == ""
+        assert "notes" not in gc_book.get_account("Expenses:Annotated")
+
+        import sqlite3
+        conn = sqlite3.connect(str(test_book))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM slots s "
+            "JOIN accounts a ON a.guid = s.obj_guid "
+            "WHERE a.name = 'Annotated' AND s.name = 'notes'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_update_unchanged_notes_not_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        gc_book.create_account(
+            name="Stable", account_type="EXPENSE", parent="Expenses",
+            notes="same",
+        )
+        result = gc_book.update_account("Expenses:Stable", notes="same")
+        assert "notes" not in result  # diff-style echo: no change
+
+    def test_notes_byte_cap(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="notes exceeds"):
+            gc_book.create_account(
+                name="Chatty", account_type="EXPENSE", parent="Expenses",
+                notes="x" * 5000,
+            )
+        gc_book.create_account(
+            name="Chatty", account_type="EXPENSE", parent="Expenses",
+        )
+        with pytest.raises(ValueError, match="notes exceeds"):
+            gc_book.update_account("Expenses:Chatty", notes="x" * 5000)
+
+
 class TestCreateAccount:
     """Tests for create_account method."""
 
@@ -6417,6 +6616,75 @@ class TestDeleteTransaction:
         assert result["status"] == "deleted"
         assert result["reconciled_splits_affected"] == 1
         assert gc_book.get_transaction(guid) is None
+
+
+class TestDeleteTransactions:
+    """Multi-guid delete: one open/save, all-or-nothing."""
+
+    def _make(self, gc_book, description: str) -> str:
+        result = gc_book.create_transaction(
+            description=description,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+            ],
+            check_duplicates=False,
+        )
+        return result["guid"]
+
+    def test_deletes_all_in_one_call(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guids = [self._make(gc_book, f"Cleanup {i}") for i in range(3)]
+
+        result = gc_book.delete_transactions(guids)
+        assert result["status"] == "deleted"
+        assert result["count"] == 3
+        assert [t["description"] for t in result["transactions"]] == [
+            "Cleanup 0", "Cleanup 1", "Cleanup 2",
+        ]
+        for guid in guids:
+            assert gc_book.get_transaction(guid) is None
+
+    def test_bad_guid_aborts_whole_batch(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guids = [self._make(gc_book, f"Keep {i}") for i in range(2)]
+
+        with pytest.raises(ValueError, match="nothing deleted"):
+            gc_book.delete_transactions(guids + ["deadbeef00000000"])
+        # All-or-nothing: the good guids survived.
+        for guid in guids:
+            assert gc_book.get_transaction(guid) is not None
+
+    def test_reconciled_without_force_aborts_whole_batch(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        clean = self._make(gc_book, "Clean one")
+        rec = self._make(gc_book, "Reconciled one")
+        txn = gc_book.get_transaction(rec)
+        gc_book.set_reconcile_state(txn["splits"][0]["guid"], "y")
+
+        with pytest.raises(ValueError, match="reconciled splits"):
+            gc_book.delete_transactions([clean, rec])
+        assert gc_book.get_transaction(clean) is not None
+
+        result = gc_book.delete_transactions([clean, rec], force=True)
+        assert result["count"] == 2
+        by_desc = {t["description"]: t for t in result["transactions"]}
+        assert by_desc["Reconciled one"]["reconciled_splits_affected"] == 1
+        assert "reconciled_splits_affected" not in by_desc["Clean one"]
+
+    def test_duplicate_guid_rejects(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make(gc_book, "Once only")
+        with pytest.raises(ValueError, match="Duplicate guid"):
+            gc_book.delete_transactions([guid, guid])
+        assert gc_book.get_transaction(guid) is not None
+
+    def test_empty_list_rejects(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError, match="empty"):
+            gc_book.delete_transactions([])
 
 
 class TestUpdateTransaction:
@@ -8283,6 +8551,104 @@ class TestIncomeBySource:
         assert Decimal(result["sources"][0]["amount"]) == Decimal("700")
 
 
+class TestModeAgreement:
+    """GB-1 (maintainer ruling 2026-07-07): flow reports value every
+    split at its own MONTH's closing rate in every mode, so the same
+    range reports the same grand total whether viewed single-period,
+    by month, by quarter, or by year. Pre-unification, single-period
+    anchored everything at range-end while group_by anchored at each
+    period's close — two totals for one question on any
+    foreign-currency book."""
+
+    @staticmethod
+    def _fx_book(path):
+        """USD book; EUR expenses in Jan and Feb; EUR/USD closes
+        1.05 (Jan), 1.10 (Feb), 1.20 (Mar). Monthly-close total:
+        100*1.05 + 200*1.10 = 325.00. The old range-end policy said
+        300*1.20 = 360.00 — the moving rate is what makes the
+        agreement assertion meaningful."""
+        book = piecash.create_book(str(path), currency="USD", overwrite=True)
+        root = book.root_account
+        usd = book.default_currency
+        eur = factories.create_currency_from_ISO("EUR")
+        book.session.add(eur)
+        expenses = piecash.Account(
+            name="Expenses", type="EXPENSE", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        travel = piecash.Account(
+            name="EU Travel", type="EXPENSE", parent=expenses,
+            commodity=eur,
+        )
+        assets = piecash.Account(
+            name="Assets", type="ASSET", parent=root,
+            commodity=usd, placeholder=True,
+        )
+        eur_bank = piecash.Account(
+            name="EUR Account", type="BANK", parent=assets,
+            commodity=eur,
+        )
+        for d, amt in ((date(2026, 1, 15), "100"), (date(2026, 2, 10), "200")):
+            book.session.add(piecash.Transaction(
+                currency=eur, description="trip", post_date=d,
+                splits=[
+                    piecash.Split(account=travel,
+                                  value=Decimal(amt), quantity=Decimal(amt)),
+                    piecash.Split(account=eur_bank,
+                                  value=-Decimal(amt), quantity=-Decimal(amt)),
+                ],
+            ))
+        for d, rate in ((date(2026, 1, 31), "1.05"),
+                        (date(2026, 2, 28), "1.10"),
+                        (date(2026, 3, 31), "1.20")):
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=d,
+                value=Decimal(rate),
+            ))
+        book.save()
+        book.close()
+        return path
+
+    @staticmethod
+    def _grand_total(tsv: str) -> Decimal:
+        total_row = next(
+            ln for ln in tsv.splitlines() if ln.startswith("TOTAL\t")
+        )
+        return Decimal(total_row.split("\t")[-2])  # Total column
+
+    def test_spending_totals_agree_across_granularities(self, tmp_path):
+        gc = GnuCashBook(str(self._fx_book(tmp_path / "fx.gnucash")))
+        s, e = date(2026, 1, 1), date(2026, 3, 31)
+        single = Decimal(gc.spending_by_category(
+            start_date=s, end_date=e, compact=False,
+        )["total"])
+        by_month = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="month",
+        ))
+        by_quarter = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="quarter",
+        ))
+        by_year = self._grand_total(gc.spending_by_category(
+            start_date=s, end_date=e, group_by="year",
+        ))
+        # Monthly-close valuation: 100*1.05 + 200*1.10 — and NOT the
+        # old range-end policy's 300*1.20 = 360.00.
+        assert single == Decimal("325.00")
+        assert single == by_month == by_quarter == by_year
+
+    def test_cash_flow_totals_agree(self, tmp_path):
+        gc = GnuCashBook(str(self._fx_book(tmp_path / "fx2.gnucash")))
+        s, e = date(2026, 1, 1), date(2026, 3, 31)
+        single = gc.cash_flow(start_date=s, end_date=e)
+        grouped = gc.cash_flow(start_date=s, end_date=e, group_by="quarter")
+        out_row = next(
+            ln for ln in grouped.splitlines() if ln.startswith("Outflows\t")
+        )
+        grouped_out = Decimal(out_row.split("\t")[-2])
+        assert Decimal(single["outflows"]) == Decimal("325.00")
+        assert Decimal(single["outflows"]) == grouped_out
+
+
 class TestGroupByBreakdown:
     """group_by sub-period columns for spending/income breakdowns."""
 
@@ -8395,7 +8761,8 @@ class TestGroupByBreakdown:
 
     def test_year_two_columns_partial_empty(self, tmp_path: Path):
         """18-month range → 2 year columns; the empty 2025 column
-        still renders as 0.00."""
+        still renders as 0.00, and the half-covered 2026 column is
+        marked partial so it isn't read as a small full year."""
         gc = GnuCashBook(str(self._book(tmp_path)))
         tsv = gc.spending_by_category(
             start_date=date(2025, 1, 1), end_date=date(2026, 6, 30),
@@ -8403,9 +8770,24 @@ class TestGroupByBreakdown:
         )
         rows = self._parse(tsv)
         assert rows["Category"] == [
-            "Category", "2025", "2026", "Total", "Avg",
+            "Category", "2025", "2026*", "Total", "Avg",
         ]
         assert rows["Groceries"][1:] == ["0.00", "1700.00", "1700.00", "850.00"]
+        assert "partially covered" in tsv
+
+    def test_partial_month_marked_with_footnote(self, tmp_path: Path):
+        """A range starting mid-month renders its first column with a
+        ``*`` marker and a footnote — a half month must not read as a
+        small full month (and the Avg drag is visible)."""
+        gc = GnuCashBook(str(self._book(tmp_path)))
+        tsv = gc.spending_by_category(
+            start_date=date(2026, 3, 15), end_date=date(2026, 5, 31),
+            group_by="month",
+        )
+        rows = self._parse(tsv)
+        assert rows["Category"][1] == "2026-03*"
+        assert rows["Category"][2:4] == ["2026-04", "2026-05"]
+        assert "partially covered" in tsv
 
     def test_no_group_by_unchanged(self, tmp_path: Path):
         """Regression guard: omitting group_by keeps the single-period

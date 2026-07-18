@@ -12,6 +12,7 @@ per-boundary snapshots — O(splits + intervals), not
 O(intervals × splits).
 """
 
+import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -20,11 +21,16 @@ import piecash
 from gnucash_mcp.book._base import _is_voided, _to_decimal
 from gnucash_mcp._format import (
     _GROUP_BY_VALUES,
+    _PARTIAL_FOOTNOTE,
     _enumerate_periods,
     _format_grouped_tsv,
     _format_number,
+    _mark_partial,
+    _partial_period_labels,
     _period_label,
 )
+
+debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 # Account-type groups shared by the reports' SQL IN() clauses — one
 # canonical definition. RECEIVABLE/PAYABLE are included: A/R is an
@@ -87,6 +93,7 @@ def _format_grouped_cashflow_tsv(
     outflows: dict[str, Decimal],
     account_label: str,
     transfers_excluded: int,
+    partial_labels: set[str] | None = None,
 ) -> str:
     """Render a multi-period cash-flow trend as a TSV table.
 
@@ -109,12 +116,18 @@ def _format_grouped_cashflow_tsv(
 
     lines = [
         account_label,
-        "\t".join(["Cash flow", *period_labels, "Total", "Avg"]),
+        "\t".join([
+            "Cash flow",
+            *_mark_partial(period_labels, partial_labels),
+            "Total", "Avg",
+        ]),
         _row("Inflows", inflows),
         _row("Outflows", outflows),
         _row("Net", net),
     ]
     out = "\n".join(lines)
+    if partial_labels:
+        out += f"\n{_PARTIAL_FOOTNOTE}"
     if transfers_excluded:
         out += (
             f"\n({transfers_excluded} internal transfer txn(s) excluded; "
@@ -239,6 +252,54 @@ class ReportingMixin:
 
     # ── Period breakdowns ─────────────────────────────────────────────
 
+    def _monthly_conversion_factors(
+        self,
+        book: piecash.Book,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, dict[str, Decimal | None]]:
+        """``{YYYY-MM: {account_guid: factor}}`` covering the range —
+        the FLOW-report valuation quantum (GB-1 ruling, 2026-07-07).
+
+        Flow reports (spending / income / cash_flow) value every
+        split at its own MONTH's closing rate, in single-period and
+        group_by modes alike. Month is the quantum because it makes
+        totals granularity-invariant (quarter/year/single are sums of
+        month-valued splits), matches the ``group_by="month"``
+        numbers users had already seen before unification, and is a
+        recognizable accounting convention (monthly close). Anchors
+        clamp to ``end_date`` via ``_enumerate_periods``, so a
+        partial final month values at the range end and the
+        forecast-price convention (``_anchor_for_as_of``) applies
+        through ``_account_conversion_factors`` as everywhere else.
+
+        STOCK reports (balance_sheet, net_worth) are deliberately
+        different: they value holdings as of their report date, not
+        per flow month.
+        """
+        return {
+            pl: self._account_conversion_factors(book, anchor)
+            for pl, anchor in _enumerate_periods(
+                start_date, end_date, "month",
+            )
+        }
+
+    @staticmethod
+    def _monthly_factor(
+        monthly_factors: dict[str, dict[str, Decimal | None]],
+        txn,
+        account,
+    ) -> Decimal | None:
+        """The conversion factor for one split under the monthly
+        quantum: its transaction's month, its account. ``None`` (no
+        rate on file that month, or a month outside the built range)
+        falls back to ``split.value`` in
+        ``_split_in_default_currency`` — the same degradation as
+        every other missing-rate path.
+        """
+        month = _period_label(txn.post_date, "month")
+        return monthly_factors.get(month, {}).get(account.guid)
+
     def _grouped_breakdown(
         self,
         book: piecash.Book,
@@ -263,12 +324,17 @@ class ReportingMixin:
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
-        # Each period values at its own close — never today's rates
-        # against a historical period's quantities.
-        factors_by_period = {
-            pl: self._account_conversion_factors(book, anchor)
-            for pl, anchor in periods
-        }
+        # MONTHLY-close valuation regardless of display granularity
+        # (GB-1 ruling, 2026-07-07): every split converts at its own
+        # month's closing rate, and quarter/year columns are sums of
+        # month-valued splits. This is what makes totals
+        # granularity-invariant — the same range reports the same
+        # grand total whether viewed single-period, by month, by
+        # quarter, or by year (locked by TestModeAgreement). Never
+        # today's rates against a historical period's quantities.
+        monthly_factors = self._monthly_conversion_factors(
+            book, start_date, end_date,
+        )
 
         rows = self._query_filtered_splits(
             book,
@@ -278,10 +344,22 @@ class ReportingMixin:
         )
 
         # category fullname → {period_label: signed Decimal}
+        label_set = set(period_labels)
         totals: dict[str, dict[str, Decimal]] = {}
         for split, txn, account in rows:
             plabel = _period_label(txn.post_date, group_by)
-            factor = factors_by_period.get(plabel, {}).get(account.guid)
+            if plabel not in label_set:
+                # _query_filtered_splits bounds post_date to
+                # [start, end], so every label is enumerated; a stray
+                # one means that invariant broke upstream. Skip with
+                # a trace rather than KeyError-ing the whole report.
+                debug_logger.warning(
+                    f"group_by split outside enumerated periods: "
+                    f"{plabel} not in {period_labels[0]}..."
+                    f"{period_labels[-1]}"
+                )
+                continue
+            factor = self._monthly_factor(monthly_factors, txn, account)
             amount = sign * self._split_in_default_currency(
                 split, account, factor,
             )
@@ -318,6 +396,9 @@ class ReportingMixin:
             grand_total=grand_total,
             excluded=excluded,
             label=label,
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
 
     def spending_by_category(
@@ -373,17 +454,22 @@ class ReportingMixin:
                 account_types=frozenset({"EXPENSE"}),
             )
 
-            # Rates anchored to the period's end — historical
-            # periods must not value at today's rates.
-            factors = self._account_conversion_factors(book, end_date)
+            # Monthly-close valuation (GB-1): each split converts
+            # at its own month's rate, so this total equals the
+            # group_by grand total for the same range — never
+            # today's rates against historical quantities.
+            monthly_factors = self._monthly_conversion_factors(
+                book, start_date, end_date,
+            )
 
             totals: dict[str, Decimal] = {}
-            for split, _txn, account in rows:
+            for split, txn, account in rows:
                 # Accumulate SIGNED amounts so refunds net against
                 # spending within a category — dropping negatives
                 # would report GROSS spend.
                 amount = self._split_in_default_currency(
-                    split, account, factors.get(account.guid),
+                    split, account,
+                    self._monthly_factor(monthly_factors, txn, account),
                 )
                 # ``depth`` (not ``depth - 1``): path[0] is the type
                 # root ("Expenses"), so "depth 1 = Expenses:Food"
@@ -492,15 +578,20 @@ class ReportingMixin:
                 account_types=frozenset({"INCOME"}),
             )
 
-            factors = self._account_conversion_factors(book, end_date)
+            # Monthly-close valuation (GB-1) — see
+            # spending_by_category.
+            monthly_factors = self._monthly_conversion_factors(
+                book, start_date, end_date,
+            )
 
             totals: dict[str, Decimal] = {}
-            for split, _txn, account in rows:
+            for split, txn, account in rows:
                 # Income is stored negative; flip. Signed
                 # accumulation so losses/clawbacks net against gains
                 # within a source — see spending_by_category.
                 amount = -self._split_in_default_currency(
-                    split, account, factors.get(account.guid),
+                    split, account,
+                    self._monthly_factor(monthly_factors, txn, account),
                 )
                 # ``depth`` not ``depth - 1`` — same off-by-one
                 # hazard as spending_by_category.
@@ -1018,7 +1109,11 @@ class ReportingMixin:
                     account_label=account_label,
                 )
 
-            factors = self._account_conversion_factors(book, end_date)
+            # Monthly-close valuation (GB-1) — see
+            # spending_by_category.
+            monthly_factors = self._monthly_conversion_factors(
+                book, start_date, end_date,
+            )
             inflows = Decimal("0")
             outflows = Decimal("0")
             transfers_excluded: set[str] = set()
@@ -1033,7 +1128,8 @@ class ReportingMixin:
                     transfers_excluded.add(txn.guid)
                     continue
                 amt = self._split_in_default_currency(
-                    split, acct, factors.get(acct.guid)
+                    split, acct,
+                    self._monthly_factor(monthly_factors, txn, acct),
                 )
                 if amt > 0:
                     inflows += amt
@@ -1067,15 +1163,18 @@ class ReportingMixin:
 
         Same classification as the single-period path — voided splits
         skipped, internal transfers excluded unless the caller passed
-        ``cashflow_txn_guids=None`` — but each split lands in its
-        post_date's sub-period and converts at that period's close.
+        ``cashflow_txn_guids=None`` — with each split landing in its
+        post_date's sub-period and converting at its MONTH's close
+        (the flow-report valuation quantum; see
+        ``_monthly_conversion_factors``).
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
-        factors_by_period = {
-            pl: self._account_conversion_factors(book, anchor)
-            for pl, anchor in periods
-        }
+        # Monthly-close valuation regardless of display granularity
+        # (GB-1) — see _monthly_conversion_factors.
+        monthly_factors = self._monthly_conversion_factors(
+            book, start_date, end_date,
+        )
 
         inflows = {pl: Decimal("0") for pl in period_labels}
         outflows = {pl: Decimal("0") for pl in period_labels}
@@ -1088,8 +1187,18 @@ class ReportingMixin:
                 transfers_excluded.add(txn.guid)
                 continue
             plabel = _period_label(txn.post_date, group_by)
+            if plabel not in inflows:
+                # Same invariant guard as _grouped_breakdown: the SQL
+                # date bound guarantees containment; don't KeyError
+                # the report if it ever breaks.
+                debug_logger.warning(
+                    f"group_by split outside enumerated periods: "
+                    f"{plabel}"
+                )
+                continue
             amt = self._split_in_default_currency(
-                split, acct, factors_by_period.get(plabel, {}).get(acct.guid)
+                split, acct,
+                self._monthly_factor(monthly_factors, txn, acct),
             )
             if amt > 0:
                 inflows[plabel] += amt
@@ -1102,6 +1211,9 @@ class ReportingMixin:
             outflows=outflows,
             account_label=account_label,
             transfers_excluded=len(transfers_excluded),
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
 
     def _cashflow_txn_guids(

@@ -318,7 +318,7 @@ class StaleFXRateError(ValueError):
 
 def _account_to_dict(account: piecash.Account) -> dict:
     """Convert a piecash Account to a serializable dict."""
-    return {
+    result = {
         "guid": account.guid,
         "name": account.name,
         "fullname": account.fullname,
@@ -327,6 +327,16 @@ def _account_to_dict(account: piecash.Account) -> dict:
         "description": account.description or "",
         "placeholder": bool(account.placeholder),
     }
+    # Account notes live in the "notes" slot — the same key GnuCash
+    # desktop's account editor reads/writes. Conditional so
+    # note-less accounts keep their original shape.
+    try:
+        notes = _slot_value_str(account["notes"])
+    except KeyError:
+        notes = ""
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 # Default type per conventional top-level name — used by
@@ -1034,22 +1044,34 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         A non-zero balance on one of these is a structural defect the
         dashboard surfaces. Locale-robust: match by **structure** —
         type ``BANK``, a direct child of root (both invariants of how
-        GnuCash hangs these accounts) — plus a leading word from the
-        known Imbalance/Orphan catalog translations. Unknown locales
-        degrade to the English forms; the structural gate keeps false
-        positives off ordinary user accounts. (``Orphaned Gains`` is
-        deliberately excluded — it is type ``INCOME``, a legitimate
-        account, not a defect.)
+        GnuCash hangs these accounts) — plus the NAME SHAPE GnuCash
+        actually emits: a catalog word exactly, or the word plus a
+        ``-<CUR>`` mnemonic suffix (Scrub.cpp writes
+        ``_("Imbalance")-<currency>``). A bare prefix match is too
+        loose across ~100 pooled locale words: a legitimate root
+        BANK account named with an ordinary word from ANY locale
+        ("Açık Hesap", "Thừa kế…") was misclassified as suspense —
+        warned about on the dashboard and silently excluded from
+        runway/low-cash liquidity. The suffix is shape-checked
+        (short, no spaces), not compared to the account's own
+        commodity: real books contain e.g. an EUR-book
+        ``Imbalance-USD``. (``Orphaned Gains`` is deliberately
+        excluded — it is type ``INCOME``, a legitimate account, not
+        a defect.)
         """
         if account.type != "BANK":
             return False
         if account.parent is None or account.parent.guid != root.guid:
             return False
-        leaf = account.name.lower()
-        return any(
-            leaf.startswith(p)
-            for p in self._BALANCING_ACCOUNT_NAME_PREFIXES
-        )
+        leaf = account.name.strip().lower()
+        for p in self._BALANCING_ACCOUNT_NAME_PREFIXES:
+            if leaf == p:
+                return True
+            if leaf.startswith(p + "-"):
+                suffix = leaf[len(p) + 1:]
+                if 0 < len(suffix) <= 10 and suffix.isalnum():
+                    return True
+        return False
 
     # ── Book-locale inference + localized account names (§6.3) ────────
     #
@@ -1072,7 +1094,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
     _STRUCTURAL_TYPE_NAMES = {
         "ar": {"ASSET": "الأصول", "LIABILITY": "الالتزامات", "INCOME": "الدخل", "EXPENSE": "المصروفات", "EQUITY": "حقوق الملكية"},
         "as": {"ASSET": "সম্পত্তিবোৰ", "LIABILITY": "বিশ্বাসযোগ্যতাবোৰ", "INCOME": "উপাৰ্জন", "EXPENSE": "ব্যয়বোৰ", "EQUITY": "সাধাৰণ অংশ"},
-        "bg": {"ASSET": "Активи:", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
+        "bg": {"ASSET": "Активи", "LIABILITY": "Пасиви", "INCOME": "Доход", "EXPENSE": "Разходи", "EQUITY": "Собствен капитал"},
         "brx": {"ASSET": "सम्पति", "LIABILITY": "दाहार", "INCOME": "आय", "EXPENSE": "खरसा", "EQUITY": "बन्दक"},
         "ca": {"ASSET": "Actiu", "LIABILITY": "Passiu", "INCOME": "Ingressos", "EXPENSE": "Despeses", "EQUITY": "Patrimoni"},
         "cs": {"ASSET": "Aktiva", "LIABILITY": "Pasiva", "INCOME": "Příjmy", "EXPENSE": "Náklady", "EQUITY": "Vlastní jmění"},
@@ -1085,7 +1107,7 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         "fr": {"ASSET": "Actifs (avoirs)", "LIABILITY": "Passifs (dettes)", "INCOME": "Revenus", "EXPENSE": "Dépenses", "EQUITY": "Capitaux propres"},
         "gu": {"ASSET": "સંપત્તિઓ", "LIABILITY": "જવાબદારી", "INCOME": "આવક", "EXPENSE": "ખર્ચ", "EQUITY": "હિસ્સો"},
         "he": {"ASSET": "נכסים", "LIABILITY": "התחייבויות", "INCOME": "הכנסות", "EXPENSE": "הוצאות", "EQUITY": "הון"},
-        "hi": {"ASSET": "संपत्तियां ", "LIABILITY": "देयताएं ", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
+        "hi": {"ASSET": "संपत्तियां", "LIABILITY": "देयताएं", "INCOME": "आय", "EXPENSE": "खर्चे", "EQUITY": "इक्विटी"},
         "hr": {"ASSET": "Imovina", "LIABILITY": "Obveze", "INCOME": "Prihod", "EXPENSE": "Rashod", "EQUITY": "Kapital"},
         "hu": {"ASSET": "Eszközök", "LIABILITY": "Kötelezettségek", "INCOME": "Bevétel", "EXPENSE": "Kiadások", "EQUITY": "Saját tőke"},
         "id": {"ASSET": "Aset", "LIABILITY": "Liabilitas", "INCOME": "Pendapatan", "EXPENSE": "Pengeluaran", "EQUITY": "Ekuitas"},
@@ -1222,10 +1244,20 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
 
         best_lang, best_score = None, 0
         for lang, type_words in self._STRUCTURAL_TYPE_NAMES.items():
+            # Normalize BOTH sides the same way (strip + lower) —
+            # account names are stripped above; a table entry with
+            # trailing WHITESPACE would otherwise be unmatchable in
+            # every book, silently weakening that locale's vote.
+            # strip() does NOT remove punctuation residue (a trailing
+            # ':' from po-label extraction) — that must be fixed in
+            # the table data itself, per the regeneration recipe.
             score = sum(
                 1
                 for atype, word in type_words.items()
-                if any(n == word.lower() for n in names_by_type.get(atype, ()))
+                if any(
+                    n == word.strip().lower()
+                    for n in names_by_type.get(atype, ())
+                )
             )
             if score > best_score:
                 best_lang, best_score = lang, score

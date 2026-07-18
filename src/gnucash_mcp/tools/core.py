@@ -8,6 +8,7 @@ way (pure lazy-load orchestration, no hardcoded imports).
 
 from datetime import date
 
+from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     SplitInput,
@@ -22,43 +23,61 @@ from gnucash_mcp.tools._helpers import (
 def _parse_transactions_tsv(tsv: str) -> list[dict]:
     """Parse the batch-entry TSV into structured transactions.
 
-    Header row + one row per transaction; positional parse so rows may
-    be ragged. First three fields are ref / date / description; the rest
-    are ``(amount, account)`` pairs. Raises ValueError on a missing
-    header, too-few columns, or an odd trailing count.
+    The header row is load-bearing (see ``_batch_tsv_layout``): the
+    documented base header parses as positional ``(amount, account)``
+    pairs exactly as before; ``memo`` and/or ``qty`` split columns
+    widen each split group accordingly (field order per the header's
+    first group); a ``notes`` token in column 4 inserts a
+    per-transaction notes column after ``description``. Unknown or
+    typo'd column names reject with the offending name.
+
+    Rows may be ragged (2 splits vs 3). Raises ValueError on a
+    missing header, too-few columns, or a split count that doesn't
+    match the declared shape.
     """
     lines = [ln for ln in tsv.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise ValueError(
             "transactions TSV needs a header row and at least one data row"
         )
+    layout = _batch_tsv_layout(lines[0])
+    group = layout["group"]
+    fixed = 4 if layout["has_notes"] else 3
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
-        if len(fields) < 5:
+        # Trailing empty cells carry nothing in any position —
+        # stripping them makes "row ends after description" (the
+        # auto-fill request) robust to stray trailing tabs.
+        while fields and not fields[-1].strip():
+            fields.pop()
+        if len(fields) < 3:
             raise ValueError(
-                f"row {i}: expected ref, date, description, and at least "
-                f"one (amount, account) pair"
+                f"row {i}: expected at least ref, date, description"
             )
         ref, dt, desc = fields[0].strip(), fields[1].strip(), fields[2]
         if not ref:
             raise ValueError(f"row {i}: empty ref (each row needs a key)")
-        rest = fields[3:]
-        if len(rest) % 2 != 0:
-            raise ValueError(
-                f"row {i} (ref {ref!r}): trailing fields must be "
-                f"(amount, account) pairs — got an odd count"
-            )
-        splits = [
-            {"account": rest[j + 1], "amount": rest[j]}
-            for j in range(0, len(rest), 2)
-        ]
-        out.append({
+        if len(fields) <= fixed:
+            # No split cells at all: an auto-fill request — the book
+            # layer reproduces the most recent matching-description
+            # transaction (create_transaction's omitted-splits
+            # contract), or rejects the row when nothing matches.
+            splits: list[dict] = []
+        else:
+            try:
+                splits = _batch_row_splits(fields[fixed:], group)
+            except ValueError as e:
+                raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        txn = {
             "ref": ref,
             "date": _parse_iso_date(dt) or date.today(),
             "description": desc,
             "splits": splits,
-        })
+        }
+        if layout["has_notes"] and len(fields) > 3 and fields[3].strip():
+            txn["notes"] = fields[3].strip()
+        out.append(txn)
     return out
 
 
@@ -100,6 +119,7 @@ def register(mcp, get_book) -> None:
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
+        query: str | None = None,
     ) -> str:
         """List all accounts in the GnuCash chart of accounts.
 
@@ -108,15 +128,25 @@ def register(mcp, get_book) -> None:
         ``limit=0`` returns the count only. Use verbose=true for full
         JSON with guid, type, commodity, etc.
 
+        To FIND an account without paging the whole chart, pass
+        ``query`` — a case-insensitive substring matched against each
+        account's full path and description (e.g. query="grocer" or
+        query="4930" on a numbered chart). Results emit %short GUIDs
+        that every account-taking tool accepts. For searching
+        transactions by text or amount, use ``search_transactions``.
+
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
             verbose: If true, return full JSON details for each account.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
+            query: Case-insensitive substring filter on account
+                path/description. Combines with ``root``.
         """
         book = get_book()
         result = book.list_accounts(
-            root=root, compact=not verbose, limit=limit, offset=offset
+            root=root, compact=not verbose, limit=limit, offset=offset,
+            query=query,
         )
         if verbose:
             return _json(result)
@@ -308,21 +338,75 @@ def register(mcp, get_book) -> None:
         """Create MANY transactions in one atomic command (bulk entry).
 
         INPUT — ``transactions`` is a TSV block: a header row, then one
-        row per transaction. Splits are ``(amount, account)`` column
-        PAIRS, repeated as wide as a transaction needs::
+        row per transaction. The HEADER DECLARES THE LAYOUT. Base form:
+        splits are ``(amount, account)`` column PAIRS, repeated as wide
+        as a transaction needs::
 
             ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2...
             1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
 
+        Two opt-in extensions, each activated by naming it in the
+        header (legacy headers parse exactly as before):
+
+        - PER-SPLIT MEMOS — declare ``memo`` split columns; splits
+          become ``(amount, account, memo)`` TRIPLES::
+
+              ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>memo1<TAB>amt2<TAB>acct2<TAB>memo2
+              1<TAB>2026-05-21<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>card #4471<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+          Empty memo cells mid-row keep their tabs; a row may simply
+          END once its last split's amount and account are present
+          (trailing memo/qty cells are read as empty — no
+          placeholder tabs needed, as above).
+        - PER-TRANSACTION NOTES — declare a ``notes`` column directly
+          after ``description``::
+
+              ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
+
+        - PER-SPLIT QUANTITY — declare ``qty`` split columns for
+          splits whose ACCOUNT commodity differs from the book
+          default (investment shares, foreign-currency accounts)::
+
+              ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>qty1<TAB>amt2<TAB>acct2<TAB>qty2
+              1<TAB>2026-07-01<TAB>VFIFX Purchase<TAB>-505.17<TAB>Assets:Checking<TAB><TAB>505.17<TAB>Assets:401k:VFIFX<TAB>7.7936
+
+          ``amount`` stays in the book's default currency (the
+          transaction currency — batch never changes that); ``qty``
+          is the amount in the account's own commodity. An EMPTY qty
+          cell means the account uses the default currency
+          (quantity == amount). A non-default-commodity account with
+          an empty qty rejects that row.
+
+        All extensions combine; when several split fields are
+        declared, the header's FIRST group fixes their order (e.g.
+        ``amt, acct, memo, qty``).
+
+        AUTO-FILL — a row with NO split cells at all (ends right
+        after ``description``/``notes``) reproduces the most recent
+        transaction with the same description — splits, memos, and
+        quantities included — exactly like calling
+        ``create_transaction`` without ``splits``::
+
+            1<TAB>2026-07-01<TAB>Rent
+            2<TAB>2026-07-01<TAB>Netflix
+
+        Auto-filled rows are marked ``auto_filled_from:<guid>`` in
+        the results ``reason`` column; a row whose description
+        matches nothing rejects ("no matching transaction to
+        auto-fill from"). Use ``dry_run=true`` to preview what a
+        batch of auto-fills would book. Perfect for recurring
+        monthly entries.
+
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
           to what you sent; the server never reuses or interprets it.
-        - ``date``: ISO YYYY-MM-DD. ``amount``: decimal STRING (never a
-          raw JSON number). Each transaction needs >=2 splits balancing
-          to zero. Rows may differ in width (2 splits vs 3).
-        - v1 is same-currency (book default) with no per-split memo —
-          use ``create_transaction`` for cross-currency, investment, or
-          memo-bearing entries.
+        - ``date``: ISO YYYY-MM-DD. ``amount``/``qty``: decimal
+          STRINGS (never raw JSON numbers). Each transaction needs
+          >=2 splits balancing to zero in the default currency. Rows
+          may differ in width (2 splits vs 3).
+        - The transaction currency is always the book default — for
+          a transaction denominated in another currency, use
+          ``create_transaction`` with its ``currency`` parameter.
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
@@ -401,6 +485,7 @@ def register(mcp, get_book) -> None:
         placeholder: bool = False,
         commodity: str | None = None,
         commodity_namespace: str = "CURRENCY",
+        notes: str = "",
     ) -> str:
         """Create a new account in the chart of accounts.
 
@@ -418,6 +503,8 @@ def register(mcp, get_book) -> None:
             commodity_namespace: "CURRENCY" (default), "FUND", or an
                 exchange ("NASDAQ", "NYSE"). Required with non-currency
                 commodities.
+            notes: Optional free-text notes (max 4096 bytes). Shows in
+                GnuCash desktop's account editor Notes field.
         """
         book = get_book()
         result = book.create_account(
@@ -428,6 +515,7 @@ def register(mcp, get_book) -> None:
             placeholder=placeholder,
             commodity=commodity,
             commodity_namespace=commodity_namespace,
+            notes=notes,
         )
         return _json(result)
 
@@ -440,6 +528,7 @@ def register(mcp, get_book) -> None:
         description: str | None = None,
         placeholder: bool | None = None,
         account_type: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Update an existing account's properties.
 
@@ -452,6 +541,8 @@ def register(mcp, get_book) -> None:
                 within the same debit/credit polarity are allowed — e.g.,
                 LIABILITY to CREDIT, ASSET to BANK. Cross-polarity changes
                 (e.g., ASSET to LIABILITY) are blocked.
+            notes: New notes (max 4096 bytes; shared with GnuCash
+                desktop's Notes field). Pass "" to clear.
         """
         book = get_book()
         result = book.update_account(
@@ -460,6 +551,7 @@ def register(mcp, get_book) -> None:
             description=description,
             placeholder=placeholder,
             account_type=account_type,
+            notes=notes,
         )
         return _json(result)
 
@@ -496,20 +588,32 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="transaction")
     def delete_transaction(
-        guid: TransactionGuid,
+        guid: TransactionGuid | list[TransactionGuid],
         force: bool = False,
     ) -> str:
-        """Delete a transaction by GUID.
+        """Delete one transaction by GUID — or several in one call.
 
-        Safeguards prevent deletion if the transaction has reconciled splits.
-        Use force=true to override.
+        Safeguards prevent deletion if a transaction has reconciled
+        splits (force=true overrides) or is an invoice's posting
+        record (unpost_invoice first).
+
+        Pass a LIST of GUIDs to delete several in one book open /
+        one save. The batch is all-or-nothing: every guid is
+        validated before anything is deleted, so a bad guid rejects
+        the whole call with nothing removed. Response for a list is
+        ``{status, count, transactions: [{guid, description}]}``;
+        a single guid returns the single-object shape as before.
 
         Args:
-            guid: Transaction GUID (32-character hex string, or 8+ char prefix)
-            force: Allow deleting transactions with reconciled splits
+            guid: Transaction GUID (32-char hex or 8+ char prefix),
+                or a list of them.
+            force: Allow deleting transactions with reconciled splits.
         """
         book = get_book()
-        result = book.delete_transaction(guid, force=force)
+        if isinstance(guid, list):
+            result = book.delete_transactions(guid, force=force)
+        else:
+            result = book.delete_transaction(guid, force=force)
         return _json(result)
 
     @mcp.tool()
@@ -532,6 +636,7 @@ def register(mcp, get_book) -> None:
             splits: List of split updates with 'account' and 'amount' (optional).
                     Must match existing splits by account name and balance to zero.
                     For cross-currency splits, include 'quantity' (amount in account's commodity).
+                    Include 'memo' to set that split's memo (omit to leave it unchanged).
                     ``amount``/``quantity`` are decimal strings (e.g. "94.87").
             notes: New transaction notes (optional). Pass empty string to clear.
             force: Allow modifying transactions with reconciled splits

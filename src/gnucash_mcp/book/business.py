@@ -14,6 +14,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 `_verify_composite_write` from _base.
 """
 
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -31,8 +32,12 @@ from gnucash_mcp._format import (
     _enumerate_periods,
     _format_grouped_tsv,
     _paginate,
+    _partial_period_labels,
     _period_label,
 )
+
+
+debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
 def _commodity_quantum(commodity) -> Decimal:
@@ -387,6 +392,11 @@ class BusinessMixin:
             return None
         if acct.commodity != self._require_default_currency(book):
             return None
+        # A placeholder can't receive postings (GnuCash's UI treats
+        # them as non-postable organizers); a designation that became
+        # a placeholder falls through and re-resolves.
+        if acct.placeholder:
+            return None
         return acct
 
     def _store_designated_account(self, book, slot_key, account) -> None:
@@ -475,6 +485,13 @@ class BusinessMixin:
                     f"gain/loss account must be in the book default "
                     f"currency ({default_currency.mnemonic})."
                 )
+            if acct.placeholder:
+                raise ValueError(
+                    f"fx_account {acct.fullname!r} is a placeholder; "
+                    f"placeholders organize the tree and cannot "
+                    f"receive postings. Pass a leaf INCOME/EXPENSE "
+                    f"account."
+                )
             return acct, None
 
         # Layer 0: a stored designation wins for the no-explicit-arg
@@ -486,9 +503,26 @@ class BusinessMixin:
         if slotted is not None:
             return slotted, None
 
-        # Layer 2: fuzzy match by leaf-name substring. Only
-        # default-currency candidates qualify — see the commodity
+        # Layer 2: fuzzy match by leaf-name substring, plus exact
+        # match against the leaf THIS BOOK's machinery generates (the
+        # book's inferred-locale translation and the English default)
+        # — a stale slot on a German book would otherwise miss
+        # "Realisierter Gewinn/Verlust" and collide at Layer 3.
+        # Deliberately NOT all 47 shipped localizations: an English
+        # book where the user happens to have a German-named account
+        # is a coincidence, not this machinery re-finding its own
+        # name, and must not be silently adopted — let alone
+        # permanently designated. Only default-currency,
+        # non-placeholder candidates qualify — see the commodity
         # rationale on the explicit-account path above.
+        own_fx_leaf = self._locale_account_name(
+            "fx_gain_loss", "Foreign Exchange Gain/Loss",
+            self._infer_book_locale(book),
+        )
+        own_fx_leaves = {
+            own_fx_leaf.lower(),
+            "foreign exchange gain/loss",
+        }
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
@@ -498,37 +532,71 @@ class BusinessMixin:
                 continue
             if account.commodity != default_currency:
                 continue
+            if account.placeholder:
+                continue
             name_lower = account.name.lower()
-            if any(kw in name_lower for kw in self._FX_NAME_KEYWORDS):
+            if (
+                name_lower in own_fx_leaves
+                or any(kw in name_lower for kw in self._FX_NAME_KEYWORDS)
+            ):
                 candidates.append(account)
 
-        notice = None
         if len(candidates) == 1:
-            return candidates[0], None
-        if len(candidates) > 1:
-            sorted_paths = sorted(c.fullname for c in candidates)
-            notice = {
+            only = candidates[0]
+            # A fuzzy keyword match stays per-call (don't permanently
+            # designate a guess), but an EXACT match on the leaf this
+            # book's machinery generates is the resolver re-finding
+            # its own account — designate it so the next call hits
+            # Layer 0 and the healed slot survives renames.
+            if only.name.lower() in own_fx_leaves:
+                self._store_designated_account(
+                    book, self._FX_ACCOUNT_SLOT_KEY, only
+                )
+            return only, None
+
+        # Multi-candidate ambiguity: fall through to the canonical
+        # default and report where the split actually went. The
+        # message is built AFTER resolution — on a localized book the
+        # destination is the localized leaf under the type-resolved
+        # income root, not the English canonical path.
+        ambiguous_paths = (
+            sorted(c.fullname for c in candidates)
+            if len(candidates) > 1 else None
+        )
+
+        def _ambiguity_notice(destination: str) -> dict | None:
+            if ambiguous_paths is None:
+                return None
+            return {
                 "type": "ambiguous_fx_account",
-                "candidates": sorted_paths,
+                "candidates": ambiguous_paths,
                 "message": (
-                    f"Found {len(candidates)} candidate FX accounts "
-                    f"({', '.join(sorted_paths)}). Routed to "
-                    f"{self.FX_GAIN_LOSS_PATH} as the canonical "
-                    f"default; pass fx_account explicitly to "
-                    f"disambiguate."
+                    f"Found {len(ambiguous_paths)} candidate FX "
+                    f"accounts ({', '.join(ambiguous_paths)}). Routed "
+                    f"to {destination} as the default; pass fx_account "
+                    f"explicitly to disambiguate."
                 ),
             }
-            # Fall through to canonical default below.
 
-        # Layer 3: canonical default (existing or auto-create).
+        # Layer 3: canonical default (existing or auto-create). An
+        # existing canonical account is adopted only if it passes the
+        # same gates Layers 0 and 1 enforce — adopting (and slotting)
+        # e.g. a EUR-denominated account here would book a
+        # default-currency delta as EUR (silent corruption) and store
+        # a designation Layer 0 rejects on every later call.
         fx_acct = self._find_account(book, self.FX_GAIN_LOSS_PATH)
-        if fx_acct is not None:
+        if (
+            fx_acct is not None
+            and fx_acct.type in {"INCOME", "EXPENSE"}
+            and fx_acct.commodity == default_currency
+            and not fx_acct.placeholder
+        ):
             # Lock in the designation so the next call hits Layer 0
             # directly — even on a book that already had this account.
             self._store_designated_account(
                 book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
             )
-            return fx_acct, notice
+            return fx_acct, _ambiguity_notice(fx_acct.fullname)
 
         # Resolve the parent by TYPE, not the English name "Income".
         # On a localized book the income root is "Erträge"/"Ingresos"/…,
@@ -547,8 +615,49 @@ class BusinessMixin:
                 commodity=default_currency,
                 placeholder=1,
             )
-        if notice is None:
-            notice = parent_notice
+
+        # Localized leaf (§6.3) — already resolved for the Layer-2
+        # exact-match set above. Cosmetic only: the slot write below
+        # makes the next resolve GUID-based, so the localized name
+        # never has to be matched again.
+        fx_leaf = own_fx_leaf
+
+        # Sibling-collision check BEFORE constructing: if the intended
+        # leaf already exists under this parent, adopt it when it
+        # passes the gates — otherwise raise a clear error instead of
+        # letting book.save() fail with piecash's opaque "two children
+        # with the same name". That failure never persisted anything,
+        # so the slot never self-healed and every retry failed
+        # identically — a permanently wedged cross-currency pay path.
+        existing = next(
+            (c for c in income.children if c.name == fx_leaf), None
+        )
+        if existing is not None:
+            if (
+                existing.type in {"INCOME", "EXPENSE"}
+                and existing.commodity == default_currency
+                and not existing.placeholder
+                and existing.guid not in template_guids
+            ):
+                self._store_designated_account(
+                    book, self._FX_ACCOUNT_SLOT_KEY, existing
+                )
+                adopted_notice = _ambiguity_notice(existing.fullname)
+                return existing, (
+                    adopted_notice if adopted_notice is not None
+                    else parent_notice
+                )
+            raise ValueError(
+                f"An account named {fx_leaf!r} already exists under "
+                f"{income.name!r} but cannot receive realized FX "
+                f"gain/loss (type {existing.type}, denominated "
+                f"{existing.commodity.mnemonic}"
+                f"{', placeholder' if existing.placeholder else ''}; "
+                f"needs a non-placeholder INCOME/EXPENSE account in "
+                f"the book default currency "
+                f"{default_currency.mnemonic}). Pass fx_account "
+                f"explicitly to choose a different account."
+            )
 
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
@@ -556,13 +665,6 @@ class BusinessMixin:
         # the session would trip a NOT NULL on splits.tx_guid. The
         # final book.save() at the end of pay_invoice flushes everything
         # together with their now-set tx_guids.
-        # Localize the leaf on a non-English book (§6.3). Cosmetic only:
-        # the slot write below makes the next resolve GUID-based, so the
-        # localized name never has to be matched again.
-        fx_leaf = self._locale_account_name(
-            "fx_gain_loss", "Foreign Exchange Gain/Loss",
-            self._infer_book_locale(book),
-        )
         fx_acct = piecash.Account(
             name=fx_leaf,
             type="INCOME",
@@ -577,7 +679,8 @@ class BusinessMixin:
         self._store_designated_account(
             book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
         )
-        return fx_acct, notice
+        notice = _ambiguity_notice(fx_acct.fullname)
+        return fx_acct, notice if notice is not None else parent_notice
 
     def _get_or_create_discount_account(
         self, book, owner_type_is_bill: bool,
@@ -629,6 +732,13 @@ class BusinessMixin:
                     f"{acct.type}; must be INCOME or EXPENSE to "
                     f"receive an early-payment-discount split."
                 )
+            if acct.placeholder:
+                raise ValueError(
+                    f"discount_account {acct.fullname!r} is a "
+                    f"placeholder; placeholders organize the tree "
+                    f"and cannot receive postings. Pass a leaf "
+                    f"INCOME/EXPENSE account."
+                )
             return acct, None
 
         # Layer 0: a stored designation wins for the no-explicit-arg
@@ -637,7 +747,8 @@ class BusinessMixin:
         if slotted is not None:
             return slotted, None
 
-        # Layer 2: fuzzy match by leaf-name substring.
+        # Layer 2: fuzzy match by leaf-name substring. Placeholders
+        # are excluded — they can't receive postings.
         template_guids = self._template_account_guids(book)
         candidates = []
         for account in book.accounts:
@@ -645,32 +756,50 @@ class BusinessMixin:
                 continue
             if account.type not in {"INCOME", "EXPENSE"}:
                 continue
+            if account.placeholder:
+                continue
             name_lower = account.name.lower()
             if any(kw in name_lower for kw in keywords):
                 candidates.append(account)
 
-        notice = None
         if len(candidates) == 1:
             return candidates[0], None
-        if len(candidates) > 1:
-            sorted_paths = sorted(c.fullname for c in candidates)
-            notice = {
+
+        # Multi-candidate ambiguity: fall through to the canonical
+        # default; the message names the ACTUAL destination, built
+        # after resolution (parallel to the FX resolver).
+        ambiguous_paths = (
+            sorted(c.fullname for c in candidates)
+            if len(candidates) > 1 else None
+        )
+
+        def _ambiguity_notice(destination: str) -> dict | None:
+            if ambiguous_paths is None:
+                return None
+            return {
                 "type": "ambiguous_discount_account",
-                "candidates": sorted_paths,
+                "candidates": ambiguous_paths,
                 "message": (
-                    f"Found {len(candidates)} candidate {side_label} "
-                    f"accounts ({', '.join(sorted_paths)}). Routed to "
-                    f"{canonical_path} as the canonical default; pass "
+                    f"Found {len(ambiguous_paths)} candidate "
+                    f"{side_label} accounts "
+                    f"({', '.join(ambiguous_paths)}). Routed to "
+                    f"{destination} as the default; pass "
                     f"discount_account explicitly to disambiguate."
                 ),
             }
-            # Fall through to canonical default below.
 
-        # Layer 3: canonical default (existing or auto-create).
+        # Layer 3: canonical default (existing or auto-create). Adopt
+        # only a type-valid account — the discount side deliberately
+        # has no commodity gate (the discount split converts via
+        # _convert), so type is the one invariant to enforce.
         disc_acct = self._find_account(book, canonical_path)
-        if disc_acct is not None:
+        if (
+            disc_acct is not None
+            and disc_acct.type in {"INCOME", "EXPENSE"}
+            and not disc_acct.placeholder
+        ):
             self._store_designated_account(book, slot_key, disc_acct)
-            return disc_acct, notice
+            return disc_acct, _ambiguity_notice(disc_acct.fullname)
 
         # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
         # name "Income"/"Expenses" — locale-robust and rename-proof.
@@ -688,8 +817,6 @@ class BusinessMixin:
                 commodity=default_currency,
                 placeholder=1,
             )
-        if notice is None:
-            notice = parent_notice
 
         # Don't flush here; the caller is still building the payment
         # transaction. Same rationale as the FX-account auto-create.
@@ -700,6 +827,37 @@ class BusinessMixin:
             concept, canonical_path.split(":")[-1],
             self._infer_book_locale(book),
         )
+
+        # Sibling-collision check BEFORE constructing — same wedge as
+        # the FX resolver: an unadoptable same-named child would make
+        # book.save() fail with piecash's opaque duplicate-children
+        # error on every retry. Matters today for an English book
+        # whose canonical account exists with a non-INCOME/EXPENSE
+        # type, and future-proofs the day discount leaf translations
+        # ship.
+        existing = next(
+            (c for c in parent.children if c.name == leaf_name), None
+        )
+        if existing is not None:
+            if (
+                existing.type in {"INCOME", "EXPENSE"}
+                and not existing.placeholder
+                and existing.guid not in template_guids
+            ):
+                self._store_designated_account(book, slot_key, existing)
+                adopted_notice = _ambiguity_notice(existing.fullname)
+                return existing, (
+                    adopted_notice if adopted_notice is not None
+                    else parent_notice
+                )
+            raise ValueError(
+                f"An account named {leaf_name!r} already exists under "
+                f"{parent.name!r} but is "
+                f"{'a placeholder' if existing.placeholder else f'type {existing.type}'}; "
+                f"the {side_label} account must be a non-placeholder "
+                f"INCOME or EXPENSE account. Pass discount_account "
+                f"explicitly to choose a different account."
+            )
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,
@@ -713,7 +871,8 @@ class BusinessMixin:
             ),
         )
         self._store_designated_account(book, slot_key, disc_acct)
-        return disc_acct, notice
+        notice = _ambiguity_notice(disc_acct.fullname)
+        return disc_acct, notice if notice is not None else parent_notice
 
     def _get_invoice_billterm(self, book, inv):
         """Return the piecash Billterm linked to the invoice, or None.
@@ -1597,6 +1756,12 @@ class BusinessMixin:
             "price": str(price),
             "total": str(total),
         }
+        # Conditional keys — plain entries keep their shape.
+        if entry_row.notes:
+            result["notes"] = entry_row.notes
+        if entry_row.action:
+            result["action"] = entry_row.action
+
         if account_paths is not None and acct_guid:
             # Surface the readable path. Falls back to the
             # raw GUID when a stale entry references a deleted account.
@@ -4128,6 +4293,8 @@ class BusinessMixin:
         owner_type: str | None = None,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item to a credit note.
 
@@ -4157,6 +4324,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
         # Re-key invoice_id/bill_id → credit_note_id for clarity.
         legacy_key = (
@@ -4254,6 +4423,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Write a line-item entry on an invoice, bill, voucher, or
         credit note.
@@ -4262,6 +4433,10 @@ class BusinessMixin:
         ``_ENTRY_CONFIG``: which entries-table column side gets the
         price/account, the allowed account types, and the response
         id key.
+
+        ``notes`` is per-line free text (same 4096-byte cap as
+        customer/vendor notes); ``action`` is GnuCash's line-type
+        label (desktop suggests "Hours", "Material", "Project").
 
         Taxtable wire-up: ``taxtable`` marks the entry taxable and
         writes the resolved GUID to ``i_taxtable``/``b_taxtable``;
@@ -4282,6 +4457,7 @@ class BusinessMixin:
                 "tax_included=True requires a taxtable. Specify "
                 "which taxtable applies, or omit tax_included."
             )
+        self._validate_business_freetext(notes=notes)
 
         cfg = self._ENTRY_CONFIG[owner_type]
         # Bills (4) and vouchers (5) share the ``b_*`` / ``bill``
@@ -4379,8 +4555,8 @@ class BusinessMixin:
                     date=datetime.now(),
                     date_entered=datetime.now(),
                     description=description,
-                    action="",
-                    notes="",
+                    action=action,
+                    notes=notes,
                     quantity_num=q_num,
                     quantity_denom=q_denom,
                     i_discount_num=0,
@@ -4410,7 +4586,7 @@ class BusinessMixin:
 
             total = qty * unit_price
             # Entry ``guid`` omitted — no standalone tool surface.
-            return {
+            result = {
                 cfg["id_param"]: doc_id,
                 "description": description,
                 "quantity": str(qty),
@@ -4418,6 +4594,12 @@ class BusinessMixin:
                 "total": str(total),
                 "status": "created",
             }
+            # Conditional keys — plain entries keep their shape.
+            if notes:
+                result["notes"] = notes
+            if action:
+                result["action"] = action
+            return result
 
     def add_invoice_entry(
         self,
@@ -4428,6 +4610,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to a customer invoice.
 
@@ -4437,6 +4621,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '100.00').
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with guid, invoice_id, total, status.
@@ -4450,6 +4635,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def add_bill_entry(
@@ -4461,6 +4648,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to a vendor bill.
 
@@ -4470,7 +4659,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1', '2.5').
             price: Unit price as string (e.g., '50.00').
-            taxtable, tax_included: See ``_add_entry``.
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with bill_id, total, status.
@@ -4484,6 +4673,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def add_voucher_entry(
@@ -4495,6 +4686,8 @@ class BusinessMixin:
         price: str,
         taxtable: str | None = None,
         tax_included: bool = False,
+        notes: str = "",
+        action: str = "",
     ) -> dict:
         """Add a line item entry to an employee expense voucher.
 
@@ -4508,7 +4701,7 @@ class BusinessMixin:
             description: Line item description.
             quantity: Quantity as string (e.g., '1').
             price: Unit price as string (e.g., '42.50').
-            taxtable, tax_included: See ``_add_entry``.
+            taxtable, tax_included, notes, action: See ``_add_entry``.
 
         Returns:
             Dict with voucher_id, total, status.
@@ -4522,6 +4715,8 @@ class BusinessMixin:
             price=price,
             taxtable=taxtable,
             tax_included=tax_included,
+            notes=notes,
+            action=action,
         )
 
     def list_invoices(
@@ -5340,11 +5535,17 @@ class BusinessMixin:
         apply_discount: bool = False,
         discount_account: str | None = None,
         force: bool = False,
+        memo: str = "",
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction and assigns the A/R or A/P
         split to the invoice's lot. Partial payments are supported.
+
+        ``memo`` lands on the bank-account split (check number, wire
+        reference). The A/R//A/P split keeps its ``action="Payment"``
+        convention, and server-authored memos (FX drift, discount)
+        are untouched.
 
         ``amount`` is always in the **invoice's currency**. For
         cross-currency payments the pay account's quantity comes
@@ -5722,7 +5923,7 @@ class BusinessMixin:
                     account=pay_acct,
                     value=-payment_amount,
                     quantity=-pay_quantity,
-                    memo="",
+                    memo=memo,
                 )
             else:
                 # Receive customer payment (or refund-in from a
@@ -5738,7 +5939,7 @@ class BusinessMixin:
                     account=pay_acct,
                     value=payment_amount,
                     quantity=pay_quantity,
-                    memo="",
+                    memo=memo,
                 )
 
             # Realized FX gain/loss on post→pay rate drift, factored
@@ -7353,6 +7554,7 @@ class BusinessMixin:
         """
         periods = _enumerate_periods(start_date, end_date, group_by)
         period_labels = [pl for pl, _ in periods]
+        label_set = set(period_labels)
 
         totals: dict[str, dict[str, Decimal]] = {}
         unconverted: dict[str, dict] = {}
@@ -7361,6 +7563,18 @@ class BusinessMixin:
             if posted is None:
                 continue
             plabel = _period_label(posted.date(), group_by)
+            if plabel not in label_set:
+                # The caller filters bills to [start, end]; a stray
+                # label means that invariant broke upstream. Skip
+                # rather than KeyError the period-totals pass below —
+                # and leave a trace, matching the sibling guards in
+                # reporting.py: a silently dropped bill is a vendor
+                # total that's short with nothing to debug.
+                debug_logger.warning(
+                    f"group_by bill outside enumerated periods: "
+                    f"{plabel}"
+                )
+                continue
             total, _paid, _out, unconv = self._bill_amounts_in_default(
                 book, bill, default_currency,
             )
@@ -7403,6 +7617,9 @@ class BusinessMixin:
             grand_total=grand_total,
             excluded=[],
             label="Vendor",
+            partial_labels=_partial_period_labels(
+                start_date, end_date, group_by,
+            ),
         )
         if unconverted:
             mnem = default_currency.mnemonic
