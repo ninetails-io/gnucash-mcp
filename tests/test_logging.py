@@ -1129,6 +1129,173 @@ class TestAuditBeforeStateLeak:
         assert "this call's own description" in content
 
 
+class TestReconcileAuditRendering:
+    """The RECONCILE formatter must render the splits that were
+    ACTUALLY reconciled, sourced from the staged before-state.
+
+    Pre-fix it counted ``params["split_guids"]`` — absent in bulk
+    mode (``reconcile_all=true``), so a 51-split sweep logged
+    "Splits reconciled (0):" with an empty list. The book method
+    stages ``{"splits": [...]}`` in both modes; that list is the
+    authoritative record.
+    """
+
+    def _run(self, temp_book_path, staged: dict | None, result: dict,
+             **params) -> None:
+        """Run an audit-decorated fake reconcile_account with the
+        given staged before-state, JSON result, and tool params."""
+        book = _StagedBook(staged)
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation="reconcile",
+            entity_type="split",
+        )
+        def reconcile_account(**kwargs) -> str:
+            return json.dumps(result)
+
+        reconcile_account(**params)
+
+    def _read_log(self, temp_log_dir) -> str:
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        return (temp_log_dir / "audit" / f"{today}.txt").read_text()
+
+    def test_bulk_mode_renders_splits_from_before_state(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """reconcile_all=true sends no split_guids; the count and
+        split lines must come from the staged before-state."""
+        staged = {
+            "splits": [
+                {
+                    "guid": f"{i:032x}",
+                    "account": "Assets:Checking",
+                    "amount": f"-{i + 1}.00",
+                    "reconcile_state": "n",
+                    "reconcile_date": None,
+                    "transaction_description": f"Payment {i + 1}",
+                    "transaction_date": "2026-07-01",
+                }
+                for i in range(12)
+            ]
+        }
+        self._run(
+            temp_book_path,
+            staged,
+            {"splits_reconciled": 12,
+             "new_reconciled_balance": "2089.42",
+             "status": "reconciled"},
+            account="Assets:Checking",
+            statement_date="2026-07-19",
+            statement_balance="2089.42",
+            reconcile_all=True,
+        )
+        content = self._read_log(temp_log_dir)
+
+        assert "Splits reconciled (12):" in content
+        assert "Splits reconciled (0):" not in content
+        assert '"Payment 1"' in content
+        assert f"guid:{0:032x}" in content
+        # Only the first 10 render; the rest collapse to a count.
+        assert "... and 2 more" in content
+        assert "Mode: bulk (reconcile_all)" in content
+
+    def test_bulk_mode_renders_through_date_and_exclusions(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """through_date and except_guids are part of what happened
+        and must appear in the entry."""
+        staged = {
+            "splits": [{
+                "guid": "a" * 32,
+                "account": "Assets:Checking",
+                "amount": "-45.67",
+                "reconcile_state": "n",
+                "reconcile_date": None,
+                "transaction_description": "Groceries",
+                "transaction_date": "2026-06-30",
+            }]
+        }
+        self._run(
+            temp_book_path,
+            staged,
+            {"splits_reconciled": 1,
+             "new_reconciled_balance": "100.00",
+             "status": "reconciled"},
+            account="Assets:Checking",
+            statement_date="2026-07-19",
+            statement_balance="100.00",
+            reconcile_all=True,
+            through_date="2026-07-01",
+            except_guids=["cafe1234", "beef5678"],
+        )
+        content = self._read_log(temp_log_dir)
+
+        assert "Mode: bulk (reconcile_all), through 2026-07-01" in content
+        assert "Excluded (2): guid:cafe1234, guid:beef5678" in content
+        assert "Splits reconciled (1):" in content
+
+    def test_targeted_mode_details_from_before_state(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """Targeted mode renders the same before-state details."""
+        staged = {
+            "splits": [{
+                "guid": "b" * 32,
+                "account": "Assets:Checking",
+                "amount": "-12.50",
+                "reconcile_state": "n",
+                "reconcile_date": None,
+                "transaction_description": "Lunch",
+                "transaction_date": "2026-07-10",
+            }]
+        }
+        self._run(
+            temp_book_path,
+            staged,
+            {"splits_reconciled": 1,
+             "new_reconciled_balance": "50.00",
+             "status": "reconciled"},
+            account="Assets:Checking",
+            statement_date="2026-07-19",
+            statement_balance="50.00",
+            split_guids=["b" * 8],
+        )
+        content = self._read_log(temp_log_dir)
+
+        assert "Splits reconciled (1):" in content
+        assert '"Lunch"' in content
+        assert f"guid:{'b' * 32}" in content
+        # No bulk-mode line for targeted reconciliation.
+        assert "Mode: bulk" not in content
+
+    def test_params_fallback_without_before_state(
+        self, temp_book_path, temp_log_dir,
+    ):
+        """Entries logged without a staged before-state fall back to
+        the split_guids param — bare guid lines, correct count."""
+        self._run(
+            temp_book_path,
+            None,
+            {"splits_reconciled": 2,
+             "new_reconciled_balance": "75.00",
+             "status": "reconciled"},
+            account="Assets:Checking",
+            statement_date="2026-07-19",
+            statement_balance="75.00",
+            split_guids=["cafe1234", "beef5678"],
+        )
+        content = self._read_log(temp_log_dir)
+
+        assert "Splits reconciled (2):" in content
+        assert "guid:cafe1234" in content
+        assert "guid:beef5678" in content
+
+
 class TestAuditLogIntegration:
     """Integration tests for the complete audit trail."""
 

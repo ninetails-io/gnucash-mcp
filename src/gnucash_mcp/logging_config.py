@@ -911,37 +911,49 @@ def _fmt_split_reconcile(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     before = entry.get("before_state")
     split_details = (before or {}).get("splits", []) if before else []
-    split_guids = params.get("split_guids", []) or []
+
+    # The staged before-state lists the splits ACTUALLY reconciled —
+    # the only source in bulk mode, where reconcile_all=true sends no
+    # split_guids at all (reading only the param rendered
+    # "Splits reconciled (0):" on a 51-split sweep). Params remain the
+    # fallback for entries logged without a before-state.
+    if split_details:
+        reconciled = split_details
+    else:
+        reconciled = [{"guid": g} for g in (params.get("split_guids") or [])]
 
     lines = [
         f"{time_part}  RECONCILE  {params.get('account', '')}",
         f"{_INDENT}Statement date: {params.get('statement_date', '')}",
         f"{_INDENT}Statement balance: {_format_amount(params.get('statement_balance'))}",
-        f"{_INDENT}Splits reconciled ({len(split_guids)}):",
     ]
+    if params.get("reconcile_all"):
+        mode = "bulk (reconcile_all)"
+        if params.get("through_date"):
+            mode += f", through {params['through_date']}"
+        lines.append(f"{_INDENT}Mode: {mode}")
+    lines.append(f"{_INDENT}Splits reconciled ({len(reconciled)}):")
 
-    # First 10 splits with context. GUID matching tolerates prefix
-    # vs full forms (params may carry prefixes; before_state full).
-    for guid in split_guids[:10]:
-        split_info = next(
-            (
-                s for s in split_details
-                if s and (
-                    s.get("guid") == guid
-                    or s.get("guid", "").startswith(guid)
-                    or guid.startswith(s.get("guid", ""))
-                )
-            ),
-            None,
-        )
-        if split_info:
-            desc = split_info.get("transaction_description", "")
+    for split_info in reconciled[:10]:
+        guid = split_info.get("guid", "")
+        desc = split_info.get("transaction_description")
+        if desc is None:
+            lines.append(f"{_INDENT}  guid:{guid}")
+        else:
             amount = _format_amount(split_info.get("amount"))
             lines.append(f'{_INDENT}  guid:{guid}  "{desc}"  {amount:>10}')
-        else:
-            lines.append(f"{_INDENT}  guid:{guid}")
-    if len(split_guids) > 10:
-        lines.append(f"{_INDENT}  ... and {len(split_guids) - 10} more")
+    if len(reconciled) > 10:
+        lines.append(f"{_INDENT}  ... and {len(reconciled) - 10} more")
+
+    # Exclusions are part of "what happened": a bulk sweep that
+    # skipped a pending ACH should say so. Rendered as the caller
+    # supplied them (prefixes that didn't resolve were ignored).
+    excluded = params.get("except_guids") or []
+    if excluded:
+        lines.append(
+            f"{_INDENT}Excluded ({len(excluded)}): "
+            + ", ".join(f"guid:{g}" for g in excluded)
+        )
     return lines
 
 
@@ -2098,7 +2110,7 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
             return data
 
         # reconcile_account returns a summary
-        if "reconciled_splits" in data:
+        if "splits_reconciled" in data:
             return data
 
         return data if data else None
