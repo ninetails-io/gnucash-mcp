@@ -169,7 +169,8 @@ class SplitInput(BaseModel):
         Field(
             description=(
                 "Account ref: full path (e.g. 'Expenses:Rent'), "
-                "%short GUID (e.g. '%2e78c86'), or full 32-char GUID"
+                "%short GUID (e.g. '%xxxxxxx' — 7+ hex chars copied "
+                "from list_accounts), or full 32-char GUID"
             )
         ),
     ]
