@@ -532,6 +532,10 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     date_str = after.get("date") or params.get("transaction_date", "")
     lines.append(f'{_INDENT}"{desc}" ({date_str})')
 
+    notes = after.get("notes") or params.get("notes") or ""
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
+
     # after_state preferred; fall back to params (thin-response case)
     splits = after.get("splits") or params.get("splits") or []
     if splits:
@@ -698,6 +702,19 @@ def _fmt_transaction_update(entry: dict) -> list[str]:
         lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
     else:
         lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    # Notes are three-state at the tool boundary (text / "" clears /
+    # absent leaves unchanged) — render only when the call carried
+    # the field. Without this, a notes-only update logs as a no-op
+    # entry: every field it DID print marked "(unchanged)".
+    params = entry.get("params") or {}
+    if "notes" in params and params["notes"] is not None:
+        old_notes = before.get("notes") or None
+        new_notes = params["notes"] or None
+        if old_notes != new_notes:
+            old_str = f'"{old_notes}"' if old_notes else "(none)"
+            new_str = f'"{new_notes}"' if new_notes else "(cleared)"
+            lines.append(f"{_INDENT}Notes: {old_str} → {new_str}")
 
     if old_splits != new_splits:
         lines.append(f"{_INDENT}Splits (before):")

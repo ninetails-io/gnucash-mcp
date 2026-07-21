@@ -2038,3 +2038,104 @@ class TestWriteRateLimiter:
         # Now allowed.
         allowed, _ = limiter.consume()
         assert allowed
+
+
+class TestTransactionNotesAuditRendering:
+    """CREATE and UPDATE TRANSACTION entries must render notes.
+
+    Pre-fix, update_transaction calls that only set notes logged as
+    no-op entries (every printed field "(unchanged)") — a 156-
+    transaction backfill left no trace in the trail. Single create
+    dropped the notes param entirely (batch create rendered it)."""
+
+    def _run(self, temp_book_path, staged, result, operation, **params):
+        book = _StagedBook(staged)
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation=operation,
+            entity_type="transaction",
+        )
+        def txn_tool(**kwargs) -> str:
+            return json.dumps(result)
+
+        txn_tool(**params)
+
+    def _read_log(self, temp_log_dir) -> str:
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        return (temp_log_dir / "audit" / f"{today}.txt").read_text()
+
+    BEFORE = {
+        "guid": "ab" * 16,
+        "date": "2026-06-27",
+        "description": "HoopFest Doughnut - Sheena",
+        "splits": [],
+    }
+
+    def test_notes_only_update_is_not_a_noop_entry(
+        self, temp_book_path, temp_log_dir,
+    ):
+        self._run(
+            temp_book_path,
+            self.BEFORE,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            notes="KK doughnut sale via Cash App. Liability, not income.",
+        )
+        content = self._read_log(temp_log_dir)
+        assert (
+            'Notes: (none) → "KK doughnut sale via Cash App. '
+            'Liability, not income."'
+        ) in content
+
+    def test_update_renders_notes_replacement_and_clear(
+        self, temp_book_path, temp_log_dir,
+    ):
+        before = dict(self.BEFORE, notes="old annotation")
+        self._run(
+            temp_book_path,
+            before,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            notes="",
+        )
+        content = self._read_log(temp_log_dir)
+        assert 'Notes: "old annotation" → (cleared)' in content
+
+    def test_update_without_notes_param_stays_silent(
+        self, temp_book_path, temp_log_dir,
+    ):
+        before = dict(self.BEFORE, notes="standing annotation")
+        self._run(
+            temp_book_path,
+            before,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            description="New Description",
+        )
+        content = self._read_log(temp_log_dir)
+        assert "Notes:" not in content
+
+    def test_single_create_renders_notes(
+        self, temp_book_path, temp_log_dir,
+    ):
+        self._run(
+            temp_book_path,
+            None,
+            {"guid": "cd" * 8, "status": "created"},
+            "create",
+            description="Fogo de Chao - Bellevue",
+            transaction_date="2026-03-10",
+            notes="Celebration dinner. Unreimbursed work expense.",
+        )
+        content = self._read_log(temp_log_dir)
+        assert (
+            "notes: Celebration dinner. Unreimbursed work expense."
+        ) in content
