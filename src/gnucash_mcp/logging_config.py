@@ -369,10 +369,15 @@ def setup_logging(
         except OSError:
             pass
 
-        # Write header if needed
+        # Write header if needed. The trailing "\n" (plus the
+        # logger's own newline) leaves a blank line after the
+        # banner — get_audit_log splits entries on blank lines, so
+        # without it the day's first entry glues to the header
+        # block: excluded from the count, rendered on every page,
+        # and leaked through limit=0.
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
-            audit_logger.info(header)
+            audit_logger.info(header + "\n")
             _flush_logger(audit_logger)
     else:
         # Disable audit logging

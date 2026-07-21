@@ -20,6 +20,8 @@ from gnucash_mcp.tools._helpers import _json, safe_tool
 # ``*.txt`` files. Prompt injection through any free-text field
 # that surfaces into the audit log is the attack vector.
 _LOG_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+# An audit entry's first line: "HH:MM:SS  OPERATION ...".
+_AUDIT_ENTRY_TS_RE = re.compile(r"\A\d{2}:\d{2}:\d{2}  ")
 
 
 def register(mcp, get_book) -> None:
@@ -176,6 +178,17 @@ def register(mcp, get_book) -> None:
         header = None
         if blocks and "═" in blocks[0]:
             header, blocks = blocks[0], blocks[1:]
+            # Files written before the banner gained its trailing
+            # blank line glue the day's FIRST entry to the header
+            # block — hiding it from the count, rendering it on
+            # every page, and leaking it through limit=0. Split it
+            # back out at the first timestamped line.
+            header_lines = header.split("\n")
+            for i, ln in enumerate(header_lines):
+                if _AUDIT_ENTRY_TS_RE.match(ln):
+                    header = "\n".join(header_lines[:i]).rstrip()
+                    blocks.insert(0, "\n".join(header_lines[i:]))
+                    break
 
         total = len(blocks)
         # Recency-anchored window: offset counts back from the newest
