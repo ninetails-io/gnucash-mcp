@@ -286,6 +286,20 @@ def register(mcp, get_book) -> None:
         strings (e.g. "94.87") — never raw JSON numbers, which would
         lose precision on non-dyadic decimals.
 
+        FIELD TARGETING — three annotation fields, three jobs, in
+        GnuCash-register visibility order:
+
+        - ``description``: the clean name ("Chevron 0090706
+          Portland"). Always visible.
+        - ``notes``: what the purchase WAS, when the description
+          alone doesn't say ("Fuel, road trip to Portland").
+          Visible in the register's double-line view — this is the
+          annotation humans read. Interpret; don't transcribe.
+        - split ``memo`` (bank/card leg): the RAW statement line as
+          provenance ("Withdrawal ACH TRAVELERS TYPE: PER INSUR…").
+          Visible only in expanded split view — evidence, not
+          narrative.
+
         When duplicate detection surfaces candidates (either rejecting
         the write with ``status: "rejected"`` or returning alongside a
         successful create), ``duplicates`` in the response is a
@@ -304,7 +318,7 @@ def register(mcp, get_book) -> None:
                 from the most recent matching-description transaction.
             transaction_date: ISO date (YYYY-MM-DD). Defaults to today.
             currency: ISO currency code. Defaults to book's default.
-            notes: Optional free-text annotation.
+            notes: What the purchase was (see FIELD TARGETING above).
             check_duplicates: Run duplicate detection. Default True.
             force_create: Create even if HIGH-confidence duplicates found.
             dry_run: Validate + dupe check only; don't write.
@@ -362,6 +376,14 @@ def register(mcp, get_book) -> None:
           after ``description``::
 
               ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
+
+          FIELD TARGETING for statement entry: ``description`` is
+          the clean name; ``notes`` is what the purchase WAS —
+          interpreted, not transcribed — and is what humans see in
+          GnuCash's double-line register; the bank leg's ``memo``
+          is where the RAW statement line goes (provenance, visible
+          only in expanded split view). Prefer filling ``notes``
+          whenever the description alone doesn't tell the story.
 
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
