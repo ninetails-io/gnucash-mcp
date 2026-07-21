@@ -48,8 +48,8 @@ ORIENTATION:
 - Use search_transactions before creating to avoid duplicates.
 - Every transaction has splits that MUST sum to zero.
 ACCOUNT REFERENCES:
-- Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%2e78c86"), or full 32-char GUIDs.
-- list_accounts emits short GUIDs at line start: "%2e78c86\\tAssets:Savings [BANK]". Reuse them — ~80% smaller than paths.
+- Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%xxxxxxx" form), or full 32-char GUIDs.
+- list_accounts emits short GUIDs at line start: "%xxxxxxx\\tAssets:Savings [BANK]" (x's are a placeholder — copy real GUIDs from list_accounts output). Reuse them — ~80% smaller than paths.
 - Paths are colon-delimited, case-sensitive. Use paths when naming new accounts or reasoning about hierarchy; short GUIDs for everything else.
 - Account short GUIDs: 7+ hex chars with leading "%". Transaction/split GUIDs: 8+ bare hex prefix, no marker.
 DOUBLE-ENTRY SIGN CONVENTION:

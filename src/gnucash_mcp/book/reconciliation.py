@@ -404,8 +404,9 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Computed info only — the audit log reads the inputs
-            # from tool params.
+            # Computed info only — the audit log reads the statement
+            # inputs from tool params and the reconciled-split list
+            # from the staged before-state above.
             return {
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),
