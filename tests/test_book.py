@@ -7282,7 +7282,12 @@ class TestReplaceSplits:
             )
 
     def test_reconciled_requires_force(self, test_book: Path):
-        """Should reject recategorizing reconciled splits without force."""
+        """Should reject CHANGING reconciled splits without force.
+
+        The amounts differ from the originals so the reconciled leg
+        actually changes — an identical resubmission is an unchanged
+        leg and is preserved without force (covered in
+        TestReplaceSplitsPreservation)."""
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction and reconcile one of its splits
@@ -7295,8 +7300,8 @@ class TestReplaceSplits:
             gc_book.replace_splits(
                 guid=guid,
                 splits=[
-                    {"account": "Expenses:Groceries", "amount": "150.00"},
-                    {"account": "Assets:Checking", "amount": "-150.00"},
+                    {"account": "Expenses:Groceries", "amount": "151.00"},
+                    {"account": "Assets:Checking", "amount": "-151.00"},
                 ],
             )
 
@@ -11856,3 +11861,168 @@ class TestIssue94IntermediateCurrencyChain:
             assert by_mnem["UKFUND"] == "via GBP→USD"      # C
             assert by_mnem["LOCALFUND"] is None            # D direct
             assert by_mnem["ORPHANFUND"] is None           # E unreachable
+
+
+class TestReplaceSplitsPreservation:
+    """Unchanged legs survive replace_splits intact.
+
+    A new split reproducing an old one (account, value, quantity)
+    keeps the old memo and reconcile state, and no longer trips the
+    force gate — recategorizing one leg of a reconciled bank
+    transaction must not destroy the other leg's provenance or its
+    reconciliation (found live: five reconciled checking splits,
+    including a $2,243.71 deposit, knocked to 'n' with their
+    statement memos erased by routine recategorization)."""
+
+    PROVENANCE = "Withdrawal ACH PAYPAL TYPE: INST XFER CO: PAYPAL"
+
+    def _make_reconciled(self, gc_book):
+        """Fresh 2-split transaction, checking leg memo'd + reconciled."""
+        gc_book.create_account(
+            name="Dining", account_type="EXPENSE", parent="Expenses",
+        )
+        result = gc_book.create_transaction(
+            description="PayPal Instant Transfer",
+            splits=[
+                {
+                    "account": "Assets:Checking",
+                    "amount": "-250.00",
+                    "memo": self.PROVENANCE,
+                },
+                {"account": "Expenses:Groceries", "amount": "250.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        from datetime import date as _date
+        gc_book.set_reconcile_state(
+            chk["guid"], "y", reconcile_date=_date(2026, 7, 15),
+        )
+        return result["guid"]
+
+    def test_unchanged_leg_keeps_memo_and_reconciliation(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        # Recategorize the expense leg only; resubmit the bank leg
+        # as-is, memo-less, and WITHOUT force.
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-250.00"},
+                {"account": "Expenses:Dining", "amount": "250.00"},
+            ],
+        )
+        assert result["status"] == "splits_replaced"
+        assert not any(
+            "reconciled" in w.lower()
+            for w in result.get("warnings", [])
+        )
+
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        exp = next(
+            s for s in txn["splits"]
+            if s["account"] == "Expenses:Dining"
+        )
+        assert chk["memo"] == self.PROVENANCE
+        assert chk["reconcile_state"] == "y"
+        assert chk["reconcile_date"].startswith("2026-07-15")
+        assert exp["reconcile_state"] == "n"
+
+    def test_caller_supplied_memo_wins(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {
+                    "account": "Assets:Checking",
+                    "amount": "-250.00",
+                    "memo": "corrected memo",
+                },
+                {"account": "Expenses:Dining", "amount": "250.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["memo"] == "corrected memo"
+        assert chk["reconcile_state"] == "y"
+
+    def test_changed_reconciled_leg_still_gated_and_reset(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        with pytest.raises(ValueError, match="force=true"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Assets:Checking", "amount": "-260.00"},
+                    {"account": "Expenses:Dining", "amount": "260.00"},
+                ],
+            )
+
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-260.00"},
+                {"account": "Expenses:Dining", "amount": "260.00"},
+            ],
+            force=True,
+        )
+        assert any(
+            "reconciled" in w.lower() for w in result["warnings"]
+        )
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["reconcile_state"] == "n"
+        assert not chk.get("memo")
+
+    def test_twin_splits_each_claim_their_own_memo(
+        self, test_book: Path,
+    ):
+        """Two same-account same-amount legs: greedy one-to-one
+        matching preserves both memos (as a multiset)."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Split lunch",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00",
+                 "memo": "first twin"},
+                {"account": "Expenses:Groceries", "amount": "10.00",
+                 "memo": "second twin"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+        )
+        guid = result["guid"]
+        gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(guid)
+        memos = sorted(
+            s.get("memo", "") for s in txn["splits"]
+            if s["account"] == "Expenses:Groceries"
+        )
+        assert memos == ["first twin", "second twin"]

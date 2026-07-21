@@ -417,7 +417,10 @@ def register(mcp, get_book) -> None:
         matches nothing rejects ("no matching transaction to
         auto-fill from"). Use ``dry_run=true`` to preview what a
         batch of auto-fills would book. Perfect for recurring
-        monthly entries.
+        monthly entries. Transaction ``notes`` are NOT copied from
+        the source (notes are often time-bound — "first
+        appearance, investigate" must not replicate); supply a
+        notes cell when the new instance needs one.
 
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
@@ -689,6 +692,13 @@ def register(mcp, get_book) -> None:
         The transaction's currency, description, date, and notes are preserved.
         New splits must balance to zero.
 
+        A new split that reproduces an existing one (same account,
+        amount, and quantity) is an UNCHANGED leg: it keeps the old
+        split's memo (supply a memo to override) and its reconcile
+        state. So recategorizing the expense leg of a reconciled
+        bank transaction is safe — resubmit the bank leg as-is and
+        only the changed leg resets.
+
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
             splits: Complete new set of splits. Each split needs:
@@ -697,7 +707,9 @@ def register(mcp, get_book) -> None:
                 - 'quantity' (optional): Amount in account's commodity, as a decimal string.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo
-            force: Allow replacing reconciled splits or splits in lots
+            force: Required only when the replacement would CHANGE a
+                reconciled split (or remove splits from lots) —
+                unchanged reconciled legs are preserved without it.
         """
         book = get_book()
         result = book.replace_splits(

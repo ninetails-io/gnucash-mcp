@@ -4331,11 +4331,19 @@ class CoreMixin:
         Currency, description, date, and notes are preserved; the
         new splits must balance to zero.
 
+        A new split that reproduces an existing one (same account,
+        value, and quantity) is treated as an UNCHANGED leg: it
+        keeps the old split's memo (a caller-supplied memo wins)
+        and its reconcile state — recategorizing one leg doesn't
+        destroy the other leg's provenance or reconciliation.
+
         Args:
             splits: Complete new set — 'account', 'amount', optional
                 'quantity' (cross-currency) and 'memo'.
-            force: Required if existing splits are reconciled or
-                assigned to lots.
+            force: Required if the replacement would CHANGE a
+                reconciled split, or remove splits from lots.
+                Unchanged reconciled legs are preserved and need no
+                override.
 
         Returns:
             Thin dict with guid, status, previous_splits (audit
@@ -4396,18 +4404,78 @@ class CoreMixin:
                     f"unvoid_transaction first, then replace splits."
                 )
 
-            # 4. Check reconciled splits
-            reconciled = [
-                s for s in transaction.splits if s.reconcile_state == "y"
+            # 4. Carry-forward snapshot: a new split that reproduces
+            # an old one (same account, value, and quantity) is an
+            # UNCHANGED leg — recategorizing one side of a
+            # transaction must not destroy the other side's
+            # provenance memo or knock it out of reconciliation.
+            # Greedy one-to-one claim so same-account same-amount
+            # twins each match once.
+            carryover = [
+                {
+                    "account_guid": s.account.guid,
+                    "value": s.value,
+                    "quantity": s.quantity,
+                    "memo": s.memo or "",
+                    "state": s.reconcile_state,
+                    "rdate": s.reconcile_date,
+                    "claimed": False,
+                }
+                for s in transaction.splits
             ]
-            if reconciled and not force:
-                names = ", ".join(s.account.fullname for s in reconciled)
+
+            def _new_split_quantity(account, split_data):
+                """Quantity a new split would carry, or None when a
+                required cross-commodity quantity is absent (step 7
+                rejects that row; the pre-pass just skips it)."""
+                amount = _to_decimal(split_data["amount"])
+                if account.commodity == transaction.currency:
+                    return amount
+                if "quantity" in split_data:
+                    return _to_decimal(split_data["quantity"])
+                return None
+
+            def _claim(pool, account_guid, value, quantity):
+                for c in pool:
+                    if (
+                        not c["claimed"]
+                        and c["account_guid"] == account_guid
+                        and c["value"] == value
+                        and c["quantity"] == quantity
+                    ):
+                        c["claimed"] = True
+                        return c
+                return None
+
+            # Pre-pair on a scratch copy so the force gate applies
+            # only to reconciled legs the replacement would CHANGE —
+            # an unchanged reconciled leg is preserved verbatim and
+            # needs no override.
+            scratch = [dict(c) for c in carryover]
+            for account, split_data in resolved_accounts:
+                quantity = _new_split_quantity(account, split_data)
+                if quantity is not None:
+                    _claim(
+                        scratch, account.guid,
+                        _to_decimal(split_data["amount"]), quantity,
+                    )
+            reconciled_changed = [
+                s for s, c in zip(transaction.splits, scratch)
+                if s.reconcile_state == "y" and not c["claimed"]
+            ]
+            if reconciled_changed and not force:
+                names = ", ".join(
+                    s.account.fullname for s in reconciled_changed
+                )
                 raise ValueError(
-                    f"Transaction has reconciled splits in: {names}. "
+                    f"Transaction has reconciled splits in: {names} "
+                    f"that this replacement would change. "
                     f"Use force=true to override."
                 )
-            if reconciled:
-                names = ", ".join(s.account.fullname for s in reconciled)
+            if reconciled_changed:
+                names = ", ".join(
+                    s.account.fullname for s in reconciled_changed
+                )
                 warnings.append(f"Replaced reconciled splits in: {names}")
 
             # 5. Check lot assignments
@@ -4459,13 +4527,23 @@ class CoreMixin:
                 fx_check_splits.append({
                     "account": account, "value": amount, "quantity": quantity,
                 })
-                piecash.Split(
+                # Unchanged leg: keep its memo (caller-supplied memo
+                # wins) and its reconciliation, verbatim.
+                match = _claim(carryover, account.guid, amount, quantity)
+                new_split = piecash.Split(
                     account=account,
                     value=amount,
                     quantity=quantity,
-                    memo=split_data.get("memo", ""),
+                    memo=(
+                        split_data.get("memo")
+                        or (match["memo"] if match else "")
+                    ),
                     transaction=transaction,
                 )
+                if match and match["state"] in ("y", "c"):
+                    new_split.reconcile_state = match["state"]
+                    if match["rdate"] is not None:
+                        new_split.reconcile_date = match["rdate"]
 
             # Cross-commodity implied-rate sanity (non-blocking) — this
             # path's warnings are plain strings, so emit messages.
