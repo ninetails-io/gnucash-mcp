@@ -230,6 +230,7 @@ class SchedulingMixin:
         frequency: str,
         end_date: str | None = None,
         enabled: bool = True,
+        notes: str | None = None,
     ) -> dict:
         """Create a recurring transaction template.
 
@@ -243,6 +244,9 @@ class SchedulingMixin:
                       "quarterly", "yearly".
             end_date: Optional last occurrence date (YYYY-MM-DD).
             enabled: Whether active. Default True.
+            notes: Transaction-level notes applied to every
+                instantiated transaction (what the purchase is —
+                visible in GnuCash's double-line register view).
 
         Returns:
             Dict with guid, name, next_occurrence, and status.
@@ -400,6 +404,24 @@ class SchedulingMixin:
                         f"transaction '{name}'",
                     )
 
+                # Instantiation notes — same lifecycle as the
+                # description slot; absent row means "no notes".
+                if notes:
+                    book.session.execute(
+                        Slot.__table__.insert().values(
+                            obj_guid=sx_guid,
+                            name="notes",
+                            slot_type=KVP_Type.KVP_TYPE_STRING,
+                            string_val=notes,
+                        )
+                    )
+                    _verify_composite_write(
+                        book.session, Slot.__table__,
+                        {"obj_guid": sx_guid, "name": "notes"},
+                        f"Notes slot for scheduled "
+                        f"transaction '{name}'",
+                    )
+
                 book.save()
             except Exception:
                 # Clean up the orphan template; swallow cleanup
@@ -476,6 +498,11 @@ class SchedulingMixin:
                     )
                     if desc and desc != sx.name:
                         d["description"] = desc
+                    sx_notes = self._get_sx_slot_string(
+                        book, sx.guid, "notes",
+                    )
+                    if sx_notes:
+                        d["notes"] = sx_notes
                     d["splits"] = self._get_sx_splits(book, sx)
                 results.append(d)
 
@@ -776,12 +803,16 @@ class SchedulingMixin:
 
             sx_name = sx.name
             sx_description = self._get_sx_description(book, sx)
+            sx_notes = self._get_sx_slot_string(
+                book, sx.guid, "notes",
+            )
 
         # ── Phase 2: create the transaction (see docstring). ─────
         txn_result = self.create_transaction(
             description=sx_description,
             splits=splits,
             trans_date=txn_date,
+            notes=sx_notes,
         )
 
         # ── Phase 3: advance the schedule. ──────────────────────
@@ -832,6 +863,7 @@ class SchedulingMixin:
         guid: str,
         enabled: bool | None = None,
         end_date: str | None = None,
+        notes: str | None = None,
     ) -> dict:
         """Update a scheduled transaction.
 
@@ -843,6 +875,10 @@ class SchedulingMixin:
                 empty-string sentinel exists because ``None``
                 already means "no change" and MCP schemas don't
                 express three-state strings cleanly.
+            notes: Instantiation notes applied to future created
+                transactions. Same three-state convention: text to
+                set, ``""`` to clear, ``None`` to leave unchanged.
+                Does not touch transactions already created.
 
         Raises:
             ValueError: If not found.
@@ -862,6 +898,9 @@ class SchedulingMixin:
                 "end_date": (
                     sx.end_date.isoformat() if sx.end_date else None
                 ),
+                "notes": self._get_sx_slot_string(
+                    book, sx.guid, "notes",
+                ),
             })
 
             if enabled is not None:
@@ -872,6 +911,38 @@ class SchedulingMixin:
                     sx.end_date = None
                 else:
                     sx.end_date = date.fromisoformat(end_date)
+
+            if notes is not None:
+                # Upsert as delete-then-insert: the slot table has
+                # no unique constraint to UPSERT against, and the
+                # polymorphic Slot ORM can't be queried directly.
+                book.session.execute(
+                    Slot.__table__.delete().where(
+                        (Slot.__table__.c.obj_guid == sx.guid)
+                        & (Slot.__table__.c.name == "notes")
+                    )
+                )
+                _verify_delete(
+                    book.session, Slot.__table__,
+                    {"obj_guid": sx.guid, "name": "notes"},
+                    f"Notes slot for scheduled transaction "
+                    f"'{sx.name}'",
+                )
+                if notes != "":
+                    book.session.execute(
+                        Slot.__table__.insert().values(
+                            obj_guid=sx.guid,
+                            name="notes",
+                            slot_type=KVP_Type.KVP_TYPE_STRING,
+                            string_val=notes,
+                        )
+                    )
+                    _verify_composite_write(
+                        book.session, Slot.__table__,
+                        {"obj_guid": sx.guid, "name": "notes"},
+                        f"Notes slot for scheduled transaction "
+                        f"'{sx.name}'",
+                    )
 
             book.save()
 

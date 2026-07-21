@@ -1835,6 +1835,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     description = params.get("description", "")
     if description and description != name:
         lines.append(f"{_INDENT}description: {description}")
+    notes = params.get("notes", "")
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
@@ -1873,6 +1876,13 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
         new_str = new or "(cleared)"
         if old != new:
             lines.append(f"{_INDENT}end_date: {old_str} → {new_str}")
+    if "notes" in params and params["notes"] is not None:
+        old = before.get("notes")
+        new = params["notes"] if params["notes"] != "" else None
+        old_str = old or "(none)"
+        new_str = new or "(cleared)"
+        if old != new:
+            lines.append(f"{_INDENT}notes: {old_str} → {new_str}")
     return lines
 
 
