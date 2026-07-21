@@ -2038,3 +2038,208 @@ class TestWriteRateLimiter:
         # Now allowed.
         allowed, _ = limiter.consume()
         assert allowed
+
+
+class TestTransactionNotesAuditRendering:
+    """CREATE and UPDATE TRANSACTION entries must render notes.
+
+    Pre-fix, update_transaction calls that only set notes logged as
+    no-op entries (every printed field "(unchanged)") — a 156-
+    transaction backfill left no trace in the trail. Single create
+    dropped the notes param entirely (batch create rendered it)."""
+
+    def _run(self, temp_book_path, staged, result, operation, **params):
+        book = _StagedBook(staged)
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation=operation,
+            entity_type="transaction",
+        )
+        def txn_tool(**kwargs) -> str:
+            return json.dumps(result)
+
+        txn_tool(**params)
+
+    def _read_log(self, temp_log_dir) -> str:
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        return (temp_log_dir / "audit" / f"{today}.txt").read_text()
+
+    BEFORE = {
+        "guid": "ab" * 16,
+        "date": "2026-06-27",
+        "description": "HoopFest Doughnut - Sheena",
+        "splits": [],
+    }
+
+    def test_notes_only_update_is_not_a_noop_entry(
+        self, temp_book_path, temp_log_dir,
+    ):
+        self._run(
+            temp_book_path,
+            self.BEFORE,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            notes="KK doughnut sale via Cash App. Liability, not income.",
+        )
+        content = self._read_log(temp_log_dir)
+        assert (
+            'Notes: (none) → "KK doughnut sale via Cash App. '
+            'Liability, not income."'
+        ) in content
+
+    def test_update_renders_notes_replacement_and_clear(
+        self, temp_book_path, temp_log_dir,
+    ):
+        before = dict(self.BEFORE, notes="old annotation")
+        self._run(
+            temp_book_path,
+            before,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            notes="",
+        )
+        content = self._read_log(temp_log_dir)
+        assert 'Notes: "old annotation" → (cleared)' in content
+
+    def test_update_without_notes_param_stays_silent(
+        self, temp_book_path, temp_log_dir,
+    ):
+        before = dict(self.BEFORE, notes="standing annotation")
+        self._run(
+            temp_book_path,
+            before,
+            {"guid": "ab" * 8, "status": "updated"},
+            "update",
+            guid="ab" * 8,
+            description="New Description",
+        )
+        content = self._read_log(temp_log_dir)
+        assert "Notes:" not in content
+
+    def test_single_create_renders_notes(
+        self, temp_book_path, temp_log_dir,
+    ):
+        self._run(
+            temp_book_path,
+            None,
+            {"guid": "cd" * 8, "status": "created"},
+            "create",
+            description="Fogo de Chao - Bellevue",
+            transaction_date="2026-03-10",
+            notes="Celebration dinner. Unreimbursed work expense.",
+        )
+        content = self._read_log(temp_log_dir)
+        assert (
+            "notes: Celebration dinner. Unreimbursed work expense."
+        ) in content
+
+
+class TestAuditHeaderEntrySeparation:
+    """The day banner must be its own blank-line-separated block.
+
+    Pre-fix the banner was written without a trailing blank line, so
+    the day's FIRST entry glued to the header block: excluded from
+    the entry count, rendered on every page regardless of offset,
+    and leaked through limit=0. Writer now emits the separator;
+    reader un-glues files written before the fix."""
+
+    def test_writer_separates_banner_from_first_entry(
+        self, temp_book_path, temp_log_dir,
+    ):
+        book = _StagedBook(None)
+        setup_logging(
+            book_path=str(temp_book_path),
+            debug=False,
+            get_book=lambda: book,
+        )
+
+        @audit_log(
+            classification="write", operation="create",
+            entity_type="transaction",
+        )
+        def create_transaction(**kwargs) -> str:
+            return json.dumps({"guid": "ab" * 8, "status": "created"})
+
+        create_transaction(description="First of the day")
+
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        raw = (temp_log_dir / "audit" / f"{today}.txt").read_text()
+        banner_end = raw.index("═" * 64, raw.index("═" * 64) + 1)
+        after_banner = raw[banner_end + 64:]
+        assert after_banner.startswith("\n\n"), (
+            "banner must be followed by a blank line so the first "
+            "entry forms its own block"
+        )
+
+    @pytest.fixture
+    def audit_tool(self, tmp_path):
+        """get_audit_log tool against a seeded legacy (glued) file."""
+        from gnucash_mcp.server import (
+            _apply_module_filter,
+            _reset_lazy_load_state,
+            mcp,
+        )
+
+        book_path = tmp_path / "glued.gnucash"
+        book_path.touch()
+        setup_logging(book_path=str(book_path), debug=False)
+
+        banner = "═" * 64
+        log_dir = tmp_path / "glued.gnucash.mcp" / "audit"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Legacy shape: no blank line between banner and entry one.
+        (log_dir / "2026-07-21.txt").write_text(
+            f"{banner}\n"
+            f"GNUCASH MCP AUDIT LOG — 2026-07-21\n"
+            f"Book: {book_path}\nTimezone: PDT\n"
+            f"{banner}\n"
+            '10:00:00  UPDATE TRANSACTION  guid:aaaaaaaa\n'
+            '          Notes: (none) → "first entry"\n'
+            "\n"
+            '11:00:00  UPDATE TRANSACTION  guid:bbbbbbbb\n'
+            '          Notes: (none) → "second entry"\n'
+            "\n"
+            '12:00:00  UPDATE TRANSACTION  guid:cccccccc\n'
+            '          Notes: (none) → "third entry"\n'
+        )
+
+        original = dict(mcp._tool_manager._tools)
+        try:
+            mcp._tool_manager._tools.clear()
+            _reset_lazy_load_state()
+            _apply_module_filter("audit")
+            yield mcp._tool_manager._tools["get_audit_log"]
+        finally:
+            mcp._tool_manager._tools.clear()
+            mcp._tool_manager._tools.update(original)
+            _reset_lazy_load_state()
+
+    def test_glued_first_entry_is_counted(self, audit_tool):
+        result = audit_tool.fn(log_date="2026-07-21", limit=0)
+        assert "Showing 0 of 3 audit entries" in result
+
+    def test_limit_zero_leaks_no_entries(self, audit_tool):
+        result = audit_tool.fn(log_date="2026-07-21", limit=0)
+        assert "10:00:00" not in result
+        assert "first entry" not in result
+        # The banner itself still renders for context.
+        assert "GNUCASH MCP AUDIT LOG" in result
+
+    def test_glued_first_entry_pages_correctly(self, audit_tool):
+        # Newest page of one: only the third entry.
+        newest = audit_tool.fn(log_date="2026-07-21", limit=1)
+        assert "third entry" in newest
+        assert "first entry" not in newest
+        # Two pages back: the glued-off first entry, exactly once.
+        oldest = audit_tool.fn(log_date="2026-07-21", limit=1, offset=2)
+        assert "first entry" in oldest
+        assert oldest.count("10:00:00") == 1
+        assert "second entry" not in oldest
+        assert "third entry" not in oldest

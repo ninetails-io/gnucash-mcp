@@ -52,6 +52,8 @@ ACCOUNT REFERENCES:
 - list_accounts emits short GUIDs at line start: "%xxxxxxx\\tAssets:Savings [BANK]" (x's are a placeholder — copy real GUIDs from list_accounts output). Reuse them — ~80% smaller than paths.
 - Paths are colon-delimited, case-sensitive. Use paths when naming new accounts or reasoning about hierarchy; short GUIDs for everything else.
 - Account short GUIDs: 7+ hex chars with leading "%". Transaction/split GUIDs: 8+ bare hex prefix, no marker.
+ANNOTATIONS (visibility order in GnuCash's register):
+- description = clean payee/name. notes = what the purchase was, interpreted (double-line view — what humans read). Bank-leg split memo = raw statement line (provenance; only visible in expanded splits).
 DOUBLE-ENTRY SIGN CONVENTION:
 - Positive = debit (increases Asset/Expense, decreases Liability/Income/Equity).
 - Negative = credit (reverse).

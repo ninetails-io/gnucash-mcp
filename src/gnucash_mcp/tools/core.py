@@ -286,6 +286,20 @@ def register(mcp, get_book) -> None:
         strings (e.g. "94.87") — never raw JSON numbers, which would
         lose precision on non-dyadic decimals.
 
+        FIELD TARGETING — three annotation fields, three jobs, in
+        GnuCash-register visibility order:
+
+        - ``description``: the clean name ("Chevron 0090706
+          Portland"). Always visible.
+        - ``notes``: what the purchase WAS, when the description
+          alone doesn't say ("Fuel, road trip to Portland").
+          Visible in the register's double-line view — this is the
+          annotation humans read. Interpret; don't transcribe.
+        - split ``memo`` (bank/card leg): the RAW statement line as
+          provenance ("Withdrawal ACH TRAVELERS TYPE: PER INSUR…").
+          Visible only in expanded split view — evidence, not
+          narrative.
+
         When duplicate detection surfaces candidates (either rejecting
         the write with ``status: "rejected"`` or returning alongside a
         successful create), ``duplicates`` in the response is a
@@ -304,7 +318,7 @@ def register(mcp, get_book) -> None:
                 from the most recent matching-description transaction.
             transaction_date: ISO date (YYYY-MM-DD). Defaults to today.
             currency: ISO currency code. Defaults to book's default.
-            notes: Optional free-text annotation.
+            notes: What the purchase was (see FIELD TARGETING above).
             check_duplicates: Run duplicate detection. Default True.
             force_create: Create even if HIGH-confidence duplicates found.
             dry_run: Validate + dupe check only; don't write.
@@ -363,6 +377,14 @@ def register(mcp, get_book) -> None:
 
               ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
 
+          FIELD TARGETING for statement entry: ``description`` is
+          the clean name; ``notes`` is what the purchase WAS —
+          interpreted, not transcribed — and is what humans see in
+          GnuCash's double-line register; the bank leg's ``memo``
+          is where the RAW statement line goes (provenance, visible
+          only in expanded split view). Prefer filling ``notes``
+          whenever the description alone doesn't tell the story.
+
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
           default (investment shares, foreign-currency accounts)::
@@ -395,7 +417,10 @@ def register(mcp, get_book) -> None:
         matches nothing rejects ("no matching transaction to
         auto-fill from"). Use ``dry_run=true`` to preview what a
         batch of auto-fills would book. Perfect for recurring
-        monthly entries.
+        monthly entries. Transaction ``notes`` are NOT copied from
+        the source (notes are often time-bound — "first
+        appearance, investigate" must not replicate); supply a
+        notes cell when the new instance needs one.
 
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
@@ -667,6 +692,13 @@ def register(mcp, get_book) -> None:
         The transaction's currency, description, date, and notes are preserved.
         New splits must balance to zero.
 
+        A new split that reproduces an existing one (same account,
+        amount, and quantity) is an UNCHANGED leg: it keeps the old
+        split's memo (supply a memo to override) and its reconcile
+        state. So recategorizing the expense leg of a reconciled
+        bank transaction is safe — resubmit the bank leg as-is and
+        only the changed leg resets.
+
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
             splits: Complete new set of splits. Each split needs:
@@ -675,7 +707,9 @@ def register(mcp, get_book) -> None:
                 - 'quantity' (optional): Amount in account's commodity, as a decimal string.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo
-            force: Allow replacing reconciled splits or splits in lots
+            force: Required only when the replacement would CHANGE a
+                reconciled split (or remove splits from lots) —
+                unchanged reconciled legs are preserved without it.
         """
         book = get_book()
         result = book.replace_splits(

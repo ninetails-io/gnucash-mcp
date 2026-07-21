@@ -803,3 +803,108 @@ class TestScheduledIntegration:
         assert len(listed) == 5
         freqs = {sx["frequency"] for sx in listed}
         assert freqs == {"weekly", "biweekly", "monthly", "quarterly", "yearly"}
+
+
+class TestScheduledNotes:
+    """Notes ride the template: stored as a slot at create, applied
+    to every instantiated transaction, editable three-state via
+    update. Templates without the slot behave exactly as before."""
+
+    RENT_SPLITS = [
+        {"account": "Expenses:Rent", "amount": "1850.00"},
+        {"account": "Assets:Checking", "amount": "-1850.00"},
+    ]
+
+    def _create(self, gb, **kwargs):
+        return gb.create_scheduled_transaction(
+            name="Monthly Rent",
+            description="Rent",
+            splits=self.RENT_SPLITS,
+            start_date="2026-01-01",
+            frequency="monthly",
+            **kwargs,
+        )
+
+    def test_notes_stored_and_applied_at_instantiation(
+        self, scheduled_book,
+    ):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = self._create(
+            gb, notes="Apartment 4B, includes water surcharge",
+        )
+        result = gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-02-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert txn["notes"] == "Apartment 4B, includes water surcharge"
+
+    def test_without_notes_instantiates_clean(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = self._create(gb)
+        result = gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-02-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert not txn.get("notes")
+
+    def test_list_verbose_shows_notes_only_when_present(
+        self, scheduled_book,
+    ):
+        gb = GnuCashBook(str(scheduled_book))
+        self._create(gb, notes="Apartment 4B")
+        gb.create_scheduled_transaction(
+            name="Electric",
+            description="Seattle City Light",
+            splits=self.RENT_SPLITS,
+            start_date="2026-01-10",
+            frequency="monthly",
+        )
+        listed = {
+            sx["name"]: sx
+            for sx in gb.list_scheduled_transactions(
+                compact=False,
+            )["scheduled_transactions"]
+        }
+        assert listed["Monthly Rent"]["notes"] == "Apartment 4B"
+        assert "notes" not in listed["Electric"]
+
+    def test_update_sets_clears_and_leaves_notes(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = self._create(gb)
+
+        # Set on a template that never had notes.
+        gb.update_scheduled_transaction(
+            guid=sx["guid"], notes="Lease renews each June",
+        )
+        result = gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-02-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert txn["notes"] == "Lease renews each June"
+
+        # Omitting notes leaves them unchanged.
+        gb.update_scheduled_transaction(guid=sx["guid"], enabled=True)
+        listed = gb.list_scheduled_transactions(
+            compact=False,
+        )["scheduled_transactions"]
+        assert listed[0]["notes"] == "Lease renews each June"
+
+        # Empty string clears.
+        gb.update_scheduled_transaction(guid=sx["guid"], notes="")
+        result = gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-03-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert not txn.get("notes")
+
+    def test_replacing_existing_notes(self, scheduled_book):
+        gb = GnuCashBook(str(scheduled_book))
+        sx = self._create(gb, notes="old annotation")
+        gb.update_scheduled_transaction(
+            guid=sx["guid"], notes="new annotation",
+        )
+        result = gb.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-02-01",
+        )
+        txn = gb.get_transaction(result["transaction_guid"])
+        assert txn["notes"] == "new annotation"

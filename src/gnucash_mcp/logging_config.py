@@ -369,10 +369,15 @@ def setup_logging(
         except OSError:
             pass
 
-        # Write header if needed
+        # Write header if needed. The trailing "\n" (plus the
+        # logger's own newline) leaves a blank line after the
+        # banner — get_audit_log splits entries on blank lines, so
+        # without it the day's first entry glues to the header
+        # block: excluded from the count, rendered on every page,
+        # and leaked through limit=0.
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
-            audit_logger.info(header)
+            audit_logger.info(header + "\n")
             _flush_logger(audit_logger)
     else:
         # Disable audit logging
@@ -531,6 +536,10 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     desc = after.get("description") or params.get("description", "")
     date_str = after.get("date") or params.get("transaction_date", "")
     lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    notes = after.get("notes") or params.get("notes") or ""
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
 
     # after_state preferred; fall back to params (thin-response case)
     splits = after.get("splits") or params.get("splits") or []
@@ -698,6 +707,19 @@ def _fmt_transaction_update(entry: dict) -> list[str]:
         lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
     else:
         lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    # Notes are three-state at the tool boundary (text / "" clears /
+    # absent leaves unchanged) — render only when the call carried
+    # the field. Without this, a notes-only update logs as a no-op
+    # entry: every field it DID print marked "(unchanged)".
+    params = entry.get("params") or {}
+    if "notes" in params and params["notes"] is not None:
+        old_notes = before.get("notes") or None
+        new_notes = params["notes"] or None
+        if old_notes != new_notes:
+            old_str = f'"{old_notes}"' if old_notes else "(none)"
+            new_str = f'"{new_notes}"' if new_notes else "(cleared)"
+            lines.append(f"{_INDENT}Notes: {old_str} → {new_str}")
 
     if old_splits != new_splits:
         lines.append(f"{_INDENT}Splits (before):")
@@ -1835,6 +1857,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     description = params.get("description", "")
     if description and description != name:
         lines.append(f"{_INDENT}description: {description}")
+    notes = params.get("notes", "")
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
@@ -1873,6 +1898,13 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
         new_str = new or "(cleared)"
         if old != new:
             lines.append(f"{_INDENT}end_date: {old_str} → {new_str}")
+    if "notes" in params and params["notes"] is not None:
+        old = before.get("notes")
+        new = params["notes"] if params["notes"] != "" else None
+        old_str = old or "(none)"
+        new_str = new or "(cleared)"
+        if old != new:
+            lines.append(f"{_INDENT}notes: {old_str} → {new_str}")
     return lines
 
 
