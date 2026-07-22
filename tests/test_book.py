@@ -3184,6 +3184,64 @@ class TestGetBookSummaryUpcomingScheduled:
             or "none due in next 7 days" in sched_line
         )
 
+    def test_scheduled_line_carries_overdue_count(
+        self, scheduled_book: Path,
+    ):
+        """An overdue SX shows on the Scheduled line as
+        "N overdue ⚠", and the count agrees with the number of
+        Overdue-scheduled entries in Warnings — pre-fix the line
+        could say "none due in next 7 days" while Warnings showed
+        10 overdue, a flat contradiction."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Overdue Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() - timedelta(days=400)).isoformat(),
+            frequency="monthly",
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        warning_count = sum(
+            1 for l in result.splitlines()
+            if "Overdue scheduled:" in l
+        )
+        assert warning_count >= 1
+        assert f"{warning_count} overdue ⚠" in sched_line
+
+    def test_scheduled_line_omits_overdue_when_none(
+        self, scheduled_book: Path,
+    ):
+        """No overdue SX → no overdue bucket on the line
+        (absence-as-signal, matching the section conventions)."""
+        from datetime import date as _date, timedelta as _td
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Far Future Yearly",
+            description="Yearly",
+            start_date=(
+                _date.today() + _td(days=180)
+            ).isoformat(),
+            frequency="yearly",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Rent", "amount": "100"},
+            ],
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        if "Overdue scheduled:" not in result:
+            assert "overdue" not in sched_line
+
 
 class TestGetBookSummaryReconciliationSplitCount:
     """Stale reconciliation lines carry "47 splits unreconciled

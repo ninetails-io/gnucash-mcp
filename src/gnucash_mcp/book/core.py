@@ -594,11 +594,74 @@ class CoreMixin:
     # quotes are likely skewing net-worth and runway numbers.
     _STALE_PRICE_DAYS = 30
 
+    def _overdue_scheduled_warnings(
+        self, book: piecash.Book, today: date,
+    ) -> list[str]:
+        """Overdue-scheduled warning strings, most overdue first.
+
+        Requires SchedulingMixin's helpers (_next_occurrence,
+        RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
+        the attribute lookup degrades gracefully via getattr and
+        this returns []. Shared between the Warnings section and
+        the Scheduled line's overdue count so the two surfaces
+        agree by construction.
+        """
+        next_occ_fn = getattr(self, "_next_occurrence", None)
+        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
+        if next_occ_fn is None or rec_to_freq is None:
+            return []
+        try:
+            from piecash.core.transaction import ScheduledTransaction
+            overdue_entries: list[tuple[int, str]] = []
+            for sx in book.session.query(ScheduledTransaction).all():
+                if not sx.enabled:
+                    continue
+                try:
+                    rec = sx.recurrence
+                    key = (
+                        rec.recurrence_period_type,
+                        rec.recurrence_mult,
+                    )
+                    frequency = rec_to_freq.get(key)
+                    if not frequency:
+                        continue
+                    start = sx.start_date
+                    if isinstance(start, datetime):
+                        start = start.date()
+                    end = sx.end_date
+                    if isinstance(end, datetime):
+                        end = end.date()
+                    last = sx.last_occur
+                    if isinstance(last, datetime):
+                        last = last.date()
+                    # Search relative to "yesterday" so today's
+                    # occurrence isn't classified as overdue
+                    # before the user has a chance to enter it.
+                    next_occ = next_occ_fn(
+                        start, frequency,
+                        after=start - timedelta(days=1),
+                        end_date=end, last_occur=last,
+                    )
+                    if next_occ and next_occ < today:
+                        days_overdue = (today - next_occ).days
+                        overdue_entries.append((
+                            days_overdue,
+                            f"Overdue scheduled: {sx.name} "
+                            f"due {next_occ.isoformat()}",
+                        ))
+                except Exception:
+                    continue
+            overdue_entries.sort(reverse=True)
+            return [msg for _, msg in overdue_entries]
+        except Exception:
+            return []
+
     def _collect_warnings(
         self,
         book: piecash.Book,
         transactions: list,
         accounts: list,
+        overdue_scheduled: list[str] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -617,6 +680,10 @@ class CoreMixin:
         Each per-category collector swallows its own exceptions — a
         failed check in one category never breaks the rest. Category
         specifics are commented at each collector below.
+
+        ``overdue_scheduled`` lets get_book_summary pass the list it
+        already computed (shared with the Scheduled line); ``None``
+        computes it here for direct callers.
         """
         today = date.today()
         default_currency = self._require_default_currency(book)
@@ -910,58 +977,10 @@ class CoreMixin:
             pass
 
         # ── 5. Overdue scheduled transactions ──
-        # Requires SchedulingMixin's helpers (_next_occurrence,
-        # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
-        # the attribute lookup degrades gracefully via getattr.
-        overdue_scheduled: list[str] = []
-        next_occ_fn = getattr(self, "_next_occurrence", None)
-        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
-        if next_occ_fn is not None and rec_to_freq is not None:
-            try:
-                from piecash.core.transaction import ScheduledTransaction
-                overdue_entries: list[tuple[int, str]] = []
-                for sx in book.session.query(ScheduledTransaction).all():
-                    if not sx.enabled:
-                        continue
-                    try:
-                        rec = sx.recurrence
-                        key = (
-                            rec.recurrence_period_type,
-                            rec.recurrence_mult,
-                        )
-                        frequency = rec_to_freq.get(key)
-                        if not frequency:
-                            continue
-                        start = sx.start_date
-                        if isinstance(start, datetime):
-                            start = start.date()
-                        end = sx.end_date
-                        if isinstance(end, datetime):
-                            end = end.date()
-                        last = sx.last_occur
-                        if isinstance(last, datetime):
-                            last = last.date()
-                        # Search relative to "yesterday" so today's
-                        # occurrence isn't classified as overdue
-                        # before the user has a chance to enter it.
-                        next_occ = next_occ_fn(
-                            start, frequency,
-                            after=start - timedelta(days=1),
-                            end_date=end, last_occur=last,
-                        )
-                        if next_occ and next_occ < today:
-                            days_overdue = (today - next_occ).days
-                            overdue_entries.append((
-                                days_overdue,
-                                f"Overdue scheduled: {sx.name} "
-                                f"due {next_occ.isoformat()}",
-                            ))
-                    except Exception:
-                        continue
-                overdue_entries.sort(reverse=True)
-                overdue_scheduled = [msg for _, msg in overdue_entries]
-            except Exception:
-                pass
+        if overdue_scheduled is None:
+            overdue_scheduled = self._overdue_scheduled_warnings(
+                book, today,
+            )
 
         # ── 6. Backup health ──
         # Auto-backup chain breaks render next to integrity issues:
@@ -1959,18 +1978,25 @@ class CoreMixin:
         total_txns: int,
         enabled_sx: int,
         currency: str,
+        overdue_count: int = 0,
     ) -> list[str]:
         """Render the Transactions count + Scheduled line.
 
-        Scheduled folds in the "due in next 7 days" stat — turns
-        the dashboard from "what is the state" into "what do I
-        need to do next" without a second tool call. Uses
+        Scheduled folds in the overdue count and the "due in next
+        7 days" stat — turns the dashboard from "what is the
+        state" into "what do I need to do next" without a second
+        tool call. The overdue bucket must agree with the Warnings
+        section (same underlying list) — "10 overdue" in Warnings
+        next to a bare "none due in next 7 days" here read as a
+        contradiction, since overdue items ARE due. Uses
         ``hasattr`` to skip the upcoming-line render cleanly on
         book classes built without scheduling.
         """
         lines = [f"Transactions: {total_txns}"]
         if enabled_sx > 0:
             line = f"Scheduled: {enabled_sx} recurring"
+            if overdue_count > 0:
+                line += f", {overdue_count} overdue ⚠"
             if hasattr(self, "_upcoming_within_days"):
                 upcoming = self._upcoming_within_days(book, days=7)
                 if upcoming["count"] > 0:
@@ -2153,9 +2179,16 @@ class CoreMixin:
             )
 
             # Warnings near the top — integrity/stale-price issues
-            # inform how the LLM reads the numbers below.
+            # inform how the LLM reads the numbers below. Overdue
+            # scheduled computes once here and feeds BOTH the
+            # Warnings section and the Scheduled line's overdue
+            # count, so the two can't disagree.
+            overdue_sched = self._overdue_scheduled_warnings(
+                book, date.today(),
+            )
             warnings = self._collect_warnings(
                 book, transactions, accounts,
+                overdue_scheduled=overdue_sched,
             )
             if warnings:
                 lines.append("Warnings:")
@@ -2219,6 +2252,7 @@ class CoreMixin:
             lines.extend(
                 self._render_transactions_scheduled(
                     book, total_txns, enabled_sx, currency,
+                    overdue_count=len(overdue_sched),
                 )
             )
             lines.extend(
