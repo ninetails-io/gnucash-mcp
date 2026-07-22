@@ -2004,9 +2004,18 @@ class CoreMixin:
                         "s" if upcoming["count"] != 1 else ""
                     )
                     total_int = int(upcoming["total"])
+                    amount_part = f"{currency} {total_int:,}"
+                    # Foreign-currency schedules with no market
+                    # rate can't join the sum — say so rather than
+                    # silently understate the week's bills.
+                    if upcoming.get("unrated"):
+                        amount_part += (
+                            f" + {upcoming['unrated']} foreign "
+                            f"w/o rate ⚠"
+                        )
                     line += (
                         f", {upcoming['count']} due in next "
-                        f"7 days ({currency} {total_int:,})"
+                        f"7 days ({amount_part})"
                     )
                 else:
                     line += ", none due in next 7 days"
@@ -2574,6 +2583,7 @@ class CoreMixin:
         want_stability: bool,
         want_duplicates: bool,
         want_recent: bool,
+        trans_currency: str | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
         stability_limit: int = 5,
@@ -2733,7 +2743,20 @@ class CoreMixin:
                 # kills the noise without losing real duplicates
                 # (paycheck-vs-paycheck still matches on gross).
                 primary_amount = max(abs(s.value) for s in txn.splits)
-                amount_match = (
+                # Amounts only compare within the same currency
+                # frame: 188 HKD and 188 CNY are not the same money,
+                # and the cross-frame version of a true duplicate
+                # has numerically DIFFERENT values — so cross-
+                # currency amount matches are coincidence by
+                # construction (bookkeeper finding, cur-column
+                # round). Cross-currency candidates can still reach
+                # MEDIUM on description+date, labeled by the cur
+                # column.
+                same_frame = (
+                    trans_currency is None
+                    or txn.currency.mnemonic == trans_currency
+                )
+                amount_match = same_frame and (
                     abs(proposed_primary - primary_amount) <= Decimal("1.00")
                 )
 
@@ -2756,6 +2779,17 @@ class CoreMixin:
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "amount": str(primary_amount),
+                        # Labeling non-default candidates lets the
+                        # caller interpret a cross-currency MEDIUM
+                        # (desc+date) without a follow-up read —
+                        # and explains why equal-looking numbers
+                        # did NOT amount-match. Empty = book
+                        # default.
+                        "currency": (
+                            txn.currency.mnemonic
+                            if txn.currency != book.default_currency
+                            else ""
+                        ),
                         "signals": signal_str,
                     })
 
@@ -2820,7 +2854,7 @@ class CoreMixin:
         string (no header — ``create_transaction``'s docstring
         documents the shape)::
 
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
         ~40 chars per candidate vs ~120 for list-of-dicts JSON.
         Returns ``""`` for empty input — ``_strip_noise`` drops
@@ -2830,7 +2864,8 @@ class CoreMixin:
         """
         return "\n".join(
             f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-            f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            f"{d['amount']}\t{d.get('currency', '')}\t"
+            f"{d['description']}\t{d['signals']}"
             for d in duplicates
         )
 
@@ -2994,7 +3029,7 @@ class CoreMixin:
 
             'duplicates', when present, is newline-separated TSV::
 
-                confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+                confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
             Confidence is HIGH or MEDIUM; signals is a three-char
             D/A/D code (description / amount / date, dash = no match).
@@ -3050,6 +3085,15 @@ class CoreMixin:
             proposed_amounts = [abs(_to_decimal(s["amount"])) for s in splits]
 
             # --- Preflight pass 2: duplicates + recent matches ---
+            # The frame is passed as a mnemonic (currency resolution
+            # proper happens below and may CREATE the commodity —
+            # mutation stays after the rejection path). A currency
+            # not yet in the book matches no existing transaction's
+            # frame, which is exactly right.
+            frame_code = (
+                currency.upper() if currency
+                else self._require_default_currency(book).mnemonic
+            )
             signals = self._collect_create_signals(
                 book,
                 description,
@@ -3059,6 +3103,7 @@ class CoreMixin:
                 want_stability=False,
                 want_duplicates=check_duplicates,
                 want_recent=True,
+                trans_currency=frame_code,
             )
             duplicates = signals.duplicates
 
@@ -3203,10 +3248,13 @@ class CoreMixin:
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
         ``{ref, date (date), description, notes (optional),
+        currency (optional ISO code — the row's transaction
+        currency, defaulting to the book default),
         splits: [{account, amount, memo (optional),
         quantity (optional)}]}`` — quantity per the
         ``_validate_transaction_splits`` contract (required iff the
-        account commodity differs from the book default). An EMPTY
+        account commodity differs from the row's transaction
+        currency). An EMPTY
         splits list is an auto-fill request: the row reproduces the
         most recent matching-description transaction (splits, memos,
         quantities), marked ``auto_filled_from:<guid>`` in the
@@ -3221,11 +3269,16 @@ class CoreMixin:
 
         Returns a thin envelope: ``results`` TSV (always) and
         ``duplicates`` TSV (only when a match exists; otherwise empty,
-        which ``_strip_noise`` drops). The transaction currency is
-        always the book default (a differently-denominated
-        transaction needs ``create_transaction``'s ``currency``
-        parameter); splits on non-default-commodity accounts carry
-        an explicit ``quantity``. No intra-batch dedup.
+        which ``_strip_noise`` drops). Rows without ``currency``
+        denominate in the book default; rows with it balance in
+        that currency instead (splits on accounts of any OTHER
+        commodity carry an explicit ``quantity``). The duplicate
+        amount signal compares within the same currency frame only
+        (188 HKD is not 188 CNY); a same-description same-date twin
+        in another currency can still surface as a labeled,
+        non-blocking MEDIUM. ``currency`` cannot combine with an
+        auto-fill row (the source transaction's own currency
+        governs a reproduction). No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -3247,6 +3300,30 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    # Row's transaction currency (the ``cur``
+                    # column); absent means the book default.
+                    row_currency = default_currency
+                    if txn.get("currency"):
+                        row_currency = self._find_commodity(
+                            book, txn["currency"],
+                        )
+                        if not row_currency:
+                            raise ValueError(
+                                f"currency '{txn['currency']}' not "
+                                f"found in book — create it first "
+                                f"(create_commodity) or record a "
+                                f"transaction in it once"
+                            )
+                        if not splits:
+                            # Auto-fill reproduces a source txn in
+                            # the SOURCE's currency — silently
+                            # re-denominating it would corrupt the
+                            # copied amounts.
+                            raise ValueError(
+                                "cur cannot combine with an "
+                                "auto-fill (splitless) row — supply "
+                                "explicit splits"
+                            )
                     auto_filled_from = None
                     auto_fill_warnings: list[dict] = []
                     if not splits:
@@ -3270,7 +3347,7 @@ class CoreMixin:
                     if len(splits) < 2:
                         raise ValueError("at least 2 splits required")
                     validated = self._validate_transaction_splits(
-                        book, splits, default_currency,
+                        book, splits, row_currency,
                     )
                     for v in validated:
                         if v["account"].placeholder:
@@ -3283,6 +3360,7 @@ class CoreMixin:
                         "description": txn["description"],
                         "notes": txn.get("notes") or "",
                         "trans_date": txn["date"],
+                        "currency": row_currency,
                         "validated": validated,
                         "proposed_amounts": [
                             abs(_to_decimal(s["amount"])) for s in splits
@@ -3313,6 +3391,7 @@ class CoreMixin:
                     p["proposed_amounts"],
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
+                    trans_currency=p["currency"].mnemonic,
                 )
                 dups = signals.duplicates
                 for d in dups:
@@ -3333,7 +3412,7 @@ class CoreMixin:
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
-                    book, p["validated"], default_currency, p["trans_date"],
+                    book, p["validated"], p["currency"], p["trans_date"],
                 ):
                     warn_rows.append((p["ref"], w["message"]))
 
@@ -3372,7 +3451,7 @@ class CoreMixin:
                     for v in p["validated"]
                 ]
                 txn_obj = piecash.Transaction(
-                    currency=default_currency,
+                    currency=p["currency"],
                     description=p["description"],
                     notes=p["notes"] or None,
                     post_date=p["trans_date"],
@@ -3444,11 +3523,15 @@ class CoreMixin:
         prepended as the FK. Empty string when no row has a match."""
         if not dup_rows:
             return ""
-        lines = ["ref\tconfidence\tguid\tdate\tamount\tdescription\tsignals"]
+        lines = [
+            "ref\tconfidence\tguid\tdate\tamount\tcur\t"
+            "description\tsignals"
+        ]
         for ref, d in dup_rows:
             lines.append(
                 f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-                f"{d['amount']}\t{d['description']}\t{d['signals']}"
+                f"{d['amount']}\t{d.get('currency', '')}\t"
+                f"{d['description']}\t{d['signals']}"
             )
         return "\n".join(lines)
 

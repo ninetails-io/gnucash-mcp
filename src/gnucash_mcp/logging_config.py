@@ -613,8 +613,12 @@ def _parse_batch_submission(tsv: str) -> dict:
     except ValueError:
         # Malformed extension header — the write path rejected the
         # whole submission; render rows in the legacy shape.
-        layout = {"has_notes": False, "group": _BATCH_LEGACY_GROUP}
-    fixed = 4 if layout["has_notes"] else 3
+        layout = {
+            "has_notes": False, "has_cur": False,
+            "notes_idx": None, "cur_idx": None, "fixed": 3,
+            "group": _BATCH_LEGACY_GROUP,
+        }
+    fixed = layout["fixed"]
     for ln in lines[1:]:
         if not ln.strip():
             continue
@@ -628,8 +632,12 @@ def _parse_batch_submission(tsv: str) -> dict:
         entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
-        if layout["has_notes"] and len(f) > 3 and f[3].strip():
-            entry["notes"] = f[3].strip()
+        ni = layout["notes_idx"]
+        if ni is not None and len(f) > ni and f[ni].strip():
+            entry["notes"] = f[ni].strip()
+        ci = layout["cur_idx"]
+        if ci is not None and len(f) > ci and f[ci].strip():
+            entry["currency"] = f[ci].strip().upper()
         out[f[0].strip()] = entry
     return out
 
@@ -657,8 +665,11 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         guid = r.get("txn_guid", "")
         desc = src.get("description", "")
         date_str = src.get("date", "")
+        when = date_str
+        if src.get("currency"):
+            when = f"{date_str}, {src['currency']}"
         lines.append(
-            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({date_str})'
+            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
         )
         if src.get("notes"):
             lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
@@ -1860,6 +1871,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     notes = params.get("notes", "")
     if notes:
         lines.append(f"{_INDENT}notes: {notes}")
+    sx_currency = params.get("currency", "")
+    if sx_currency:
+        lines.append(f"{_INDENT}currency: {sx_currency}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")

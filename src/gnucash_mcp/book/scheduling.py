@@ -231,6 +231,7 @@ class SchedulingMixin:
         end_date: str | None = None,
         enabled: bool = True,
         notes: str | None = None,
+        currency: str | None = None,
     ) -> dict:
         """Create a recurring transaction template.
 
@@ -239,6 +240,10 @@ class SchedulingMixin:
             description: Transaction description when created.
             splits: List of splits, same format as create_transaction:
                 [{"account": "Expenses:Rent", "amount": "1850.00"}, ...]
+                ``quantity`` per the shared contract — required when
+                an account's commodity differs from the template's
+                transaction currency; stored and replayed at every
+                instantiation.
             start_date: First occurrence date (YYYY-MM-DD).
             frequency: How often: "weekly", "biweekly", "monthly",
                       "quarterly", "yearly".
@@ -247,6 +252,16 @@ class SchedulingMixin:
             notes: Transaction-level notes applied to every
                 instantiated transaction (what the purchase is —
                 visible in GnuCash's double-line register view).
+            currency: ISO code denominating every instantiated
+                transaction; defaults to the book default. A
+                template whose legs are all in one foreign currency
+                (Lin Wei's USD-to-USD card payment in a CNY book)
+                needs this — amounts are then that currency's, with
+                no fabricated conversions. Deliberately not
+                updatable after creation: stored amounts are
+                denominated in it, so changing it would silently
+                re-denominate the schedule — delete and recreate
+                instead.
 
         Returns:
             Dict with guid, name, next_occurrence, and status.
@@ -285,12 +300,22 @@ class SchedulingMixin:
         ]
 
         with self.open(readonly=False) as book:
-            for s in splits:
-                acct = self._resolve_account(book, s["account"])
-                if not acct:
+            sx_currency = None
+            if currency:
+                sx_currency = self._find_commodity(book, currency)
+                if not sx_currency:
                     raise ValueError(
-                        f"Account not found: {s['account']}"
+                        f"Currency '{currency}' not found in book — "
+                        f"create it first (create_commodity) or "
+                        f"record a transaction in it once"
                     )
+            frame = sx_currency or self._require_default_currency(book)
+            # Shared split contract (resolution, sum-to-zero,
+            # quantity rules) at CREATE time — a template must
+            # reject here anything instantiation couldn't book.
+            # Pre-fix, an all-foreign-leg template created fine
+            # and then failed at every instantiation forever.
+            self._validate_transaction_splits(book, splits, frame)
 
             for sx in book.session.query(
                 ScheduledTransaction
@@ -368,6 +393,12 @@ class SchedulingMixin:
                         "account": s["account"],
                         "amount": str(_to_decimal(s["amount"])),
                         "memo": s.get("memo", ""),
+                        # Cross-commodity legs replay their stored
+                        # quantity at every instantiation.
+                        **(
+                            {"quantity": str(_to_decimal(s["quantity"]))}
+                            if s.get("quantity") is not None else {}
+                        ),
                     }
                     for s in splits
                 ])
@@ -401,6 +432,24 @@ class SchedulingMixin:
                         book.session, Slot.__table__,
                         {"obj_guid": sx_guid, "name": "description"},
                         f"Description slot for scheduled "
+                        f"transaction '{name}'",
+                    )
+
+                # Instantiation currency — absent slot means the
+                # book default at instantiation time.
+                if sx_currency is not None:
+                    book.session.execute(
+                        Slot.__table__.insert().values(
+                            obj_guid=sx_guid,
+                            name="currency",
+                            slot_type=KVP_Type.KVP_TYPE_STRING,
+                            string_val=sx_currency.mnemonic,
+                        )
+                    )
+                    _verify_composite_write(
+                        book.session, Slot.__table__,
+                        {"obj_guid": sx_guid, "name": "currency"},
+                        f"Currency slot for scheduled "
                         f"transaction '{name}'",
                     )
 
@@ -503,6 +552,11 @@ class SchedulingMixin:
                     )
                     if sx_notes:
                         d["notes"] = sx_notes
+                    sx_cur = self._get_sx_slot_string(
+                        book, sx.guid, "currency",
+                    )
+                    if sx_cur:
+                        d["currency"] = sx_cur
                     d["splits"] = self._get_sx_splits(book, sx)
                 results.append(d)
 
@@ -531,20 +585,30 @@ class SchedulingMixin:
         self, book, days: int = 7,
     ) -> dict:
         """Summary stats for scheduled transactions due within
-        ``days`` days: ``{"count": int, "total": Decimal}``.
+        ``days`` days: ``{"count": int, "total": Decimal,
+        "unrated": int}``.
 
         Total = sum of positive split amounts per occurrence (same
-        convention as ``get_upcoming_transactions``). Feeds the
-        get_book_summary Scheduled line; lives here so a book class
-        built without scheduling lacks the method and the summary
-        skips the line via ``hasattr``.
+        convention as ``get_upcoming_transactions``), in the BOOK
+        DEFAULT currency: foreign-currency templates convert at the
+        latest market rate; templates whose currency has no rate on
+        file are counted but excluded from the total (``unrated``
+        reports how many, so the summary line can say so instead of
+        silently understating). Feeds the get_book_summary Scheduled
+        line; lives here so a book class built without scheduling
+        lacks the method and the summary skips the line via
+        ``hasattr``.
         """
 
         today = date.today()
         window_end = today + timedelta(days=days)
 
+        default_currency = self._require_default_currency(book)
+        rates = self._rates_as_of(book, today, default_currency)
+
         count = 0
         total = Decimal("0")
+        unrated = 0
         for sx in book.session.query(ScheduledTransaction).all():
             if not sx.enabled:
                 continue
@@ -576,16 +640,26 @@ class SchedulingMixin:
                 continue
 
             count += 1
-            # splits-json amounts are in the book default currency
-            # by construction (create pins the default; instantiate
-            # passes no override), so no FX conversion is needed. A
-            # foreign-currency SX would be a native-GnuCash template
-            # with no splits-json slot — it contributes nothing here.
+            # splits-json amounts are denominated in the template's
+            # currency (the ``currency`` slot; absent = book
+            # default). Foreign templates convert at the latest
+            # market rate; no rate on file → counted, excluded from
+            # the total, reported via ``unrated``.
+            rate = Decimal("1")
+            sx_cur = self._get_sx_slot_string(book, sx.guid, "currency")
+            if sx_cur and sx_cur != default_currency.mnemonic:
+                commodity = self._find_commodity(book, sx_cur)
+                rate = (
+                    rates.get(commodity.guid) if commodity else None
+                )
+                if rate is None:
+                    unrated += 1
+                    continue
             for s in self._get_sx_splits(book, sx):
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
-                    total += amt
-        return {"count": count, "total": total}
+                    total += amt * rate
+        return {"count": count, "total": total, "unrated": unrated}
 
     def get_upcoming_transactions(
         self,
@@ -668,6 +742,14 @@ class SchedulingMixin:
                         "days_until": (next_occ - today).days,
                         "amount": str(total),
                     }
+                    # Amounts are denominated in the template's
+                    # currency — label foreign ones so the bill
+                    # list never reads HKD numbers as book-default.
+                    sx_cur = self._get_sx_slot_string(
+                        book, sx.guid, "currency",
+                    )
+                    if sx_cur:
+                        entry["currency"] = sx_cur
                     if not compact:
                         entry["splits"] = splits
                     upcoming.append(entry)
@@ -806,6 +888,9 @@ class SchedulingMixin:
             sx_notes = self._get_sx_slot_string(
                 book, sx.guid, "notes",
             )
+            sx_currency = self._get_sx_slot_string(
+                book, sx.guid, "currency",
+            )
 
         # ── Phase 2: create the transaction (see docstring). ─────
         txn_result = self.create_transaction(
@@ -813,6 +898,7 @@ class SchedulingMixin:
             splits=splits,
             trans_date=txn_date,
             notes=sx_notes,
+            currency=sx_currency,
         )
 
         # ── Phase 3: advance the schedule. ──────────────────────
