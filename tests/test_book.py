@@ -1509,6 +1509,9 @@ class TestGetBookSummaryRunway:
         assert "USD" in runway_line
         assert "liquid" in runway_line
         assert "/day burn" in runway_line
+        # Burn-averaging window is disclosed (book-age clamped,
+        # so the exact day count varies with the fixture's age).
+        assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
         # No decimals.

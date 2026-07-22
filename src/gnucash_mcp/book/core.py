@@ -1155,6 +1155,30 @@ class CoreMixin:
             "variance_pct": variance_pct,
         }
 
+    def _burn_window_days(
+        self, transactions: list, days: int | None = None,
+    ) -> int:
+        """Actual burn-averaging window in days.
+
+        Book-age clamp: ``_RUNWAY_BURN_DAYS`` is a MAX, not a fixed
+        denominator — dividing by 180 on a 19-day-old book
+        overstates runway ~10×. The 1-day floor avoids
+        divide-by-zero. Shared between ``_daily_expense_burn`` (the
+        divisor) and the Runway render (the label) so the displayed
+        window always matches the math.
+        """
+        if days is None:
+            days = self._RUNWAY_BURN_DAYS
+        today = date.today()
+        dated = [
+            t.post_date for t in transactions
+            if t.post_date is not None  # old-book artifact
+        ]
+        if dated:
+            book_age_days = max(1, (today - min(dated)).days)
+            days = min(days, book_age_days)
+        return days
+
     def _daily_expense_burn(
         self,
         book: piecash.Book,
@@ -1172,21 +1196,8 @@ class CoreMixin:
         book default currency — raw ``split.value`` would mix
         currencies on books with foreign-currency expenses.
         """
-        if days is None:
-            days = self._RUNWAY_BURN_DAYS
+        days = self._burn_window_days(transactions, days)
         today = date.today()
-        # Book-age clamp: the window is a MAX, not a fixed
-        # denominator — dividing by 180 on a 19-day-old book
-        # overstates runway ~10×. The 1-day floor avoids
-        # divide-by-zero.
-        dated = [
-            t.post_date for t in transactions
-            if t.post_date is not None  # old-book artifact
-        ]
-        if dated:
-            first_txn_date = min(dated)
-            book_age_days = max(1, (today - first_txn_date).days)
-            days = min(days, book_age_days)
         window_start = today - timedelta(days=days)
         # "Now" burn signal — anchor factors to today.
         factors = self._account_conversion_factors(book, today)
@@ -1280,6 +1291,9 @@ class CoreMixin:
         daily_burn = self._daily_expense_burn(
             book, transactions, days=self._RUNWAY_BURN_DAYS,
         )
+        burn_window = self._burn_window_days(
+            transactions, self._RUNWAY_BURN_DAYS,
+        )
 
         if daily_burn <= 0:
             return None
@@ -1289,6 +1303,7 @@ class CoreMixin:
                 "negative_liquid": True,
                 "liquid": liquid.quantize(Decimal("1")),
                 "daily_burn": daily_burn.quantize(Decimal("1")),
+                "burn_window_days": burn_window,
             }
 
         runway_days = int(liquid / daily_burn)
@@ -1297,6 +1312,7 @@ class CoreMixin:
             "runway_days": runway_days,
             "liquid": liquid.quantize(Decimal("1")),
             "daily_burn": daily_burn.quantize(Decimal("1")),
+            "burn_window_days": burn_window,
         }
 
     def _monthly_net_income(
@@ -1547,11 +1563,13 @@ class CoreMixin:
         days = runway["runway_days"]
         liquid = int(runway["liquid"])
         burn = int(runway["daily_burn"])
+        window = runway["burn_window_days"]
         warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
         return [
             f"Runway: {days} days{warn} "
             f"({currency} {liquid:,} liquid / "
-            f"{currency} {burn:,}/day burn)"
+            f"{currency} {burn:,}/day burn, "
+            f"{window}-day avg)"
         ]
 
     # ── Summary collector / section renderers ────────────────────
