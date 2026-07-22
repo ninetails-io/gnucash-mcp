@@ -1444,6 +1444,65 @@ class TestGetBookSummaryMonthlyNet:
         rows = section.split("\n")[:6]
         assert not any("999,999" in r for r in rows)
 
+    @staticmethod
+    def _prior_month_last_day() -> int:
+        """Length of last month in days."""
+        first_of_current = date.today().replace(day=1)
+        return (first_of_current - timedelta(days=1)).day
+
+    def test_mtd_row_carries_prior_month_comparable(
+        self, test_book: Path,
+    ):
+        """The MTD row shows the prior month's net over the same
+        day window: '(vs <Mon> 1-<day>: <net>)'."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        mtd_row = section.split("\n", 1)[0]
+        cutoff = min(date.today().day, self._prior_month_last_day())
+        expected = (
+            f"(vs {prior_first.strftime('%b')} 1-{cutoff}: +700)"
+        )
+        assert expected in mtd_row
+
+    def test_comparable_excludes_prior_month_tail(
+        self, test_book: Path,
+    ):
+        """Activity after the cutoff day counts toward the prior
+        month's full-month row but not the MTD comparable."""
+        prior_len = self._prior_month_last_day()
+        if date.today().day >= prior_len:
+            pytest.skip(
+                "run-date is past the prior month's length — "
+                "no tail exists to exclude"
+            )
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+        # Tail: last day of prior month, beyond today's day-of-month.
+        tail_day = date(
+            prior_first.year, prior_first.month, prior_len,
+        )
+        self._seed_income(gc, "111", tail_day)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        rows = section.split("\n")[:6]
+        mtd_row = rows[0]
+        # Comparable holds only the in-window 700.
+        assert ": +700)" in mtd_row
+        # Full prior-month row still carries the whole 811.
+        prior_row = next(
+            r for r in rows
+            if prior_first.strftime("%b %Y") in r
+        )
+        assert "+811" in prior_row
+
 
 class TestGetBookSummaryRunway:
     """Runway section in get_book_summary.

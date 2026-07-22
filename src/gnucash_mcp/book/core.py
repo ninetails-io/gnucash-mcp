@@ -1331,6 +1331,12 @@ class CoreMixin:
         for the current (partial) month. Empty list when the window
         has no activity → caller omits the section.
 
+        The MTD entry additionally carries ``mtd_comparable``:
+        the prior month's net over the SAME day window (day 1
+        through today's day-of-month, clamped to the prior
+        month's length) — a partial month next to full months
+        misleads without a like-for-like anchor.
+
         Each split converts to the book default at the most recent
         market rate — raw ``split.value`` sums mix currencies.
         """
@@ -1372,6 +1378,16 @@ class CoreMixin:
         window_end = month_ends[-1]
         has_activity = False
 
+        # Prior-month same-day-window accumulator for the MTD
+        # comparable (clamped: Jul 30 compares against Jun 30, and
+        # Mar 30 against Feb 28).
+        prior_idx = len(month_starts) - 2
+        prior_cutoff_day = (
+            min(today.day, month_ends[prior_idx].day)
+            if prior_idx >= 0 else None
+        )
+        prior_window_net = Decimal("0")
+
         # Single pass; bucket index = months-from-window-start.
         for txn in transactions:
             d = txn.post_date
@@ -1385,6 +1401,9 @@ class CoreMixin:
             )
             if idx < 0 or idx >= len(nets):
                 continue
+            in_prior_window = (
+                idx == prior_idx and d.day <= prior_cutoff_day
+            )
             for s in txn.splits:
                 atype = s.account.type
                 if atype not in ("INCOME", "EXPENSE"):
@@ -1392,12 +1411,14 @@ class CoreMixin:
                 amt = self._split_in_default_currency(
                     s, s.account, factors.get(s.account.guid),
                 )
-                if atype == "INCOME":
-                    # INCOME stored negative (credit-natural); flip
-                    # to positive contribution to monthly net.
-                    nets[idx] += -amt
-                else:  # EXPENSE
-                    nets[idx] -= amt
+                # INCOME is stored negative (credit-natural) and
+                # flips to a positive contribution; EXPENSE is
+                # stored positive and subtracts. Both reduce to
+                # negating the raw amount.
+                contribution = -amt
+                nets[idx] += contribution
+                if in_prior_window:
+                    prior_window_net += contribution
                 has_activity = True
 
         if not has_activity:
@@ -1407,11 +1428,21 @@ class CoreMixin:
         result: list[dict] = []
         for i in range(len(month_starts) - 1, -1, -1):
             start = month_starts[i]
-            result.append({
+            entry = {
                 "label": start.strftime("%b %Y"),
                 "net": nets[i].quantize(Decimal("1")),
                 "is_mtd": start == today_month_start,
-            })
+            }
+            if entry["is_mtd"] and prior_idx >= 0:
+                prior_start = month_starts[prior_idx]
+                entry["mtd_comparable"] = {
+                    "label": (
+                        f"{prior_start.strftime('%b')} "
+                        f"1-{prior_cutoff_day}"
+                    ),
+                    "net": prior_window_net.quantize(Decimal("1")),
+                }
+            result.append(entry)
         return result
 
     @staticmethod
@@ -1531,18 +1562,28 @@ class CoreMixin:
 
         Surfaces seasonality and recent anomalies. Empty list = no
         income/expense activity in the window → omit the section.
-        MTD entries get a "(MTD)" suffix on the label.
+        MTD entries get a "(MTD)" suffix plus the prior month's
+        net over the same day window — without the like-for-like
+        anchor, a partial month reads as a collapse next to full
+        months.
         """
         if not monthly:
             return []
         out = ["Monthly net (income - expenses, last 6 months):"]
         for entry in monthly:
             label = entry["label"]
+            suffix = ""
             if entry["is_mtd"]:
                 label += " (MTD)"
+                comparable = entry.get("mtd_comparable")
+                if comparable is not None:
+                    suffix = (
+                        f" (vs {comparable['label']}: "
+                        f"{int(comparable['net']):+,})"
+                    )
             # Always shows explicit sign + thousands separator;
             # whole dollars (cents would noise up the summary).
-            out.append(f"  {label}: {int(entry['net']):+,}")
+            out.append(f"  {label}: {int(entry['net']):+,}{suffix}")
         return out
 
     def _render_runway(
