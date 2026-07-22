@@ -42,7 +42,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         )
     layout = _batch_tsv_layout(lines[0])
     group = layout["group"]
-    fixed = 4 if layout["has_notes"] else 3
+    fixed = layout["fixed"]
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
@@ -75,8 +75,12 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
             "description": desc,
             "splits": splits,
         }
-        if layout["has_notes"] and len(fields) > 3 and fields[3].strip():
-            txn["notes"] = fields[3].strip()
+        ni = layout["notes_idx"]
+        if ni is not None and len(fields) > ni and fields[ni].strip():
+            txn["notes"] = fields[ni].strip()
+        ci = layout["cur_idx"]
+        if ci is not None and len(fields) > ci and fields[ci].strip():
+            txn["currency"] = fields[ci].strip().upper()
         out.append(txn)
     return out
 
@@ -384,6 +388,22 @@ def register(mcp, get_book) -> None:
           is where the RAW statement line goes (provenance, visible
           only in expanded split view). Prefer filling ``notes``
           whenever the description alone doesn't tell the story.
+
+        - PER-TRANSACTION CURRENCY — declare a ``cur`` column after
+          ``description`` (before or after ``notes``); an ISO code
+          cell sets THAT ROW's transaction currency, an empty cell
+          keeps the book default::
+
+              ref<TAB>date<TAB>description<TAB>cur<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2
+              1<TAB>2026-07-15<TAB>USD Card Payment<TAB>USD<TAB>-500<TAB>Assets:USD Checking<TAB>500<TAB>Liabilities:USD Card
+
+          With ``cur``, the row's ``amt`` cells are in that
+          currency and must balance in it. Use it when NO leg is in
+          the book's default currency (a USD-to-USD transfer inside
+          a CNY book needs no invented CNY values and no qty).
+          Splits on accounts of any OTHER commodity still need
+          ``qty``. The currency must already exist in the book, and
+          ``cur`` cannot combine with an auto-fill row.
 
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book

@@ -3203,10 +3203,13 @@ class CoreMixin:
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
         ``{ref, date (date), description, notes (optional),
+        currency (optional ISO code — the row's transaction
+        currency, defaulting to the book default),
         splits: [{account, amount, memo (optional),
         quantity (optional)}]}`` — quantity per the
         ``_validate_transaction_splits`` contract (required iff the
-        account commodity differs from the book default). An EMPTY
+        account commodity differs from the row's transaction
+        currency). An EMPTY
         splits list is an auto-fill request: the row reproduces the
         most recent matching-description transaction (splits, memos,
         quantities), marked ``auto_filled_from:<guid>`` in the
@@ -3221,11 +3224,16 @@ class CoreMixin:
 
         Returns a thin envelope: ``results`` TSV (always) and
         ``duplicates`` TSV (only when a match exists; otherwise empty,
-        which ``_strip_noise`` drops). The transaction currency is
-        always the book default (a differently-denominated
-        transaction needs ``create_transaction``'s ``currency``
-        parameter); splits on non-default-commodity accounts carry
-        an explicit ``quantity``. No intra-batch dedup.
+        which ``_strip_noise`` drops). Rows without ``currency``
+        denominate in the book default; rows with it balance in
+        that currency instead (splits on accounts of any OTHER
+        commodity carry an explicit ``quantity``). The duplicate
+        screen compares amounts numerically without currency
+        awareness — a same-description same-date twin in another
+        currency can false-match; the dup table's ref column makes
+        that visible for review. ``currency`` cannot combine with
+        an auto-fill row (the source transaction's own currency
+        governs a reproduction). No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -3247,6 +3255,30 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    # Row's transaction currency (the ``cur``
+                    # column); absent means the book default.
+                    row_currency = default_currency
+                    if txn.get("currency"):
+                        row_currency = self._find_commodity(
+                            book, txn["currency"],
+                        )
+                        if not row_currency:
+                            raise ValueError(
+                                f"currency '{txn['currency']}' not "
+                                f"found in book — create it first "
+                                f"(create_commodity) or record a "
+                                f"transaction in it once"
+                            )
+                        if not splits:
+                            # Auto-fill reproduces a source txn in
+                            # the SOURCE's currency — silently
+                            # re-denominating it would corrupt the
+                            # copied amounts.
+                            raise ValueError(
+                                "cur cannot combine with an "
+                                "auto-fill (splitless) row — supply "
+                                "explicit splits"
+                            )
                     auto_filled_from = None
                     auto_fill_warnings: list[dict] = []
                     if not splits:
@@ -3270,7 +3302,7 @@ class CoreMixin:
                     if len(splits) < 2:
                         raise ValueError("at least 2 splits required")
                     validated = self._validate_transaction_splits(
-                        book, splits, default_currency,
+                        book, splits, row_currency,
                     )
                     for v in validated:
                         if v["account"].placeholder:
@@ -3283,6 +3315,7 @@ class CoreMixin:
                         "description": txn["description"],
                         "notes": txn.get("notes") or "",
                         "trans_date": txn["date"],
+                        "currency": row_currency,
                         "validated": validated,
                         "proposed_amounts": [
                             abs(_to_decimal(s["amount"])) for s in splits
@@ -3333,7 +3366,7 @@ class CoreMixin:
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
-                    book, p["validated"], default_currency, p["trans_date"],
+                    book, p["validated"], p["currency"], p["trans_date"],
                 ):
                     warn_rows.append((p["ref"], w["message"]))
 
@@ -3372,7 +3405,7 @@ class CoreMixin:
                     for v in p["validated"]
                 ]
                 txn_obj = piecash.Transaction(
-                    currency=default_currency,
+                    currency=p["currency"],
                     description=p["description"],
                     notes=p["notes"] or None,
                     post_date=p["trans_date"],

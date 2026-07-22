@@ -559,3 +559,165 @@ class TestBatchCreate:
         gc = GnuCashBook(str(test_book))
         with pytest.raises(ValueError):
             gc.create_transactions([_txn(1, "x", "1")], on_error="bad")
+
+
+class TestBatchCurColumn:
+    """The ``cur`` column sets a ROW's transaction currency.
+
+    Motivating case: a USD-to-USD transfer inside a CNY/USD-default
+    book — with no book-currency leg, the pinned default frame
+    forced fabricated conversion values on both sides of an event
+    containing no conversion at all."""
+
+    def test_cur_parses_after_description(self):
+        tsv = (
+            "ref\tdate\tdescription\tcur\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t2026-07-15\tCard Payment\tUSD\t-500\tA:U\t500\tL:U\n"
+            "2\t2026-07-16\tLocal Rent\t\t-900\tA:C\t900\tE:R"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["currency"] == "USD"
+        assert "currency" not in rows[1]  # empty cell = book default
+
+    def test_cur_and_notes_in_either_order(self):
+        for header in (
+            "ref\tdate\tdescription\tnotes\tcur\tamt1\tacct1\tamt2\tacct2",
+            "ref\tdate\tdescription\tcur\tnotes\tamt1\tacct1\tamt2\tacct2",
+        ):
+            cells = {"notes": "why", "cur": "eur"}
+            order = [t for t in header.split("\t")[3:5]]
+            row = "1\t2026-07-15\tX\t" + "\t".join(
+                cells[c] for c in order
+            ) + "\t-10\tA\t10\tB"
+            rows = _parse_transactions_tsv(header + "\n" + row)
+            assert rows[0]["currency"] == "EUR"
+            assert rows[0]["notes"] == "why"
+
+    def test_duplicate_cur_rejects(self):
+        with pytest.raises(ValueError, match="duplicate 'cur'"):
+            _parse_transactions_tsv(
+                "ref\tdate\tdescription\tcur\tcur\tamt1\tacct1\n"
+                "1\t2026-07-15\tX\tUSD\tUSD\t-10\tA"
+            )
+
+    def test_currency_token_still_rejects(self):
+        """'currency' (and typo'd 'currency2') stay unknown tokens —
+        the 1.4.1 reject-by-name contract is unchanged."""
+        with pytest.raises(ValueError, match="currency"):
+            _parse_transactions_tsv(
+                "ref\tdate\tdescription\tcurrency\tamt1\tacct1\n"
+                "1\t2026-07-15\tX\tUSD\t-10\tA"
+            )
+
+    def test_foreign_pair_books_in_foreign_frame(
+        self, multi_currency_book,
+    ):
+        """EUR->EUR transfer in a USD book: cur=EUR, statement
+        numbers as amounts, no qty, transaction denominated EUR."""
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_account(
+            name="EUR Checking", account_type="BANK",
+            parent="Assets", commodity="EUR",
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "Move to savings", "currency": "EUR",
+            "splits": [
+                {"account": "Assets:EUR Checking", "amount": "-40.00"},
+                {"account": "Assets:Euro Savings", "amount": "40.00"},
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        txn = gc.get_transaction(rows[0]["txn_guid"])
+        assert txn["currency"] == "EUR"
+        splits = {s["account"]: s for s in txn["splits"]}
+        sav = splits["Assets:Euro Savings"]
+        assert sav["value"] == "40" and sav["quantity"] == "40"
+
+    def test_cur_row_with_default_commodity_leg_needs_qty(
+        self, multi_currency_book,
+    ):
+        """A USD leg inside a EUR-frame row is the cross-commodity
+        one now — omitting its qty rejects the row."""
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "EUR purchase from USD account",
+            "currency": "EUR",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-40.00"},
+                {"account": "Assets:Euro Savings", "amount": "40.00"},
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "quantity" in rows[0]["reason"]
+
+    def test_mixed_batch_default_and_cur_rows(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_account(
+            name="EUR Checking", account_type="BANK",
+            parent="Assets", commodity="EUR",
+        )
+        env = gc.create_transactions([
+            {
+                "ref": "1", "date": date(2026, 7, 15),
+                "description": "USD groceries",
+                "splits": [
+                    {"account": "Assets:Checking", "amount": "-30.00"},
+                    {"account": "Expenses:Groceries", "amount": "30.00"},
+                ],
+            },
+            {
+                "ref": "2", "date": date(2026, 7, 15),
+                "description": "EUR shuffle", "currency": "EUR",
+                "splits": [
+                    {"account": "Assets:EUR Checking", "amount": "-15.00"},
+                    {"account": "Assets:Euro Savings", "amount": "15.00"},
+                ],
+            },
+        ])
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["1"]["status"] == "created"
+        assert rows["2"]["status"] == "created"
+        gc2 = GnuCashBook(str(multi_currency_book))
+        t1 = gc2.get_transaction(rows["1"]["txn_guid"])
+        t2 = gc2.get_transaction(rows["2"]["txn_guid"])
+        assert t1["currency"] == "USD"
+        assert t2["currency"] == "EUR"
+
+    def test_unknown_currency_rejects_row(self, multi_currency_book):
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "X", "currency": "CHF",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-1.00"},
+                {"account": "Expenses:Groceries", "amount": "1.00"},
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "CHF" in rows[0]["reason"]
+
+    def test_cur_with_autofill_row_rejects(self, multi_currency_book):
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "Groceries", "currency": "EUR",
+            "splits": [],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "auto-fill" in rows[0]["reason"]
+
+    def test_audit_submission_parse_carries_currency(self):
+        from gnucash_mcp.logging_config import _parse_batch_submission
+        parsed = _parse_batch_submission(
+            "ref\tdate\tdescription\tcur\tamt1\tacct1\tamt2\tacct2\n"
+            "1\t2026-07-15\tCard Payment\tusd\t-500\tA:U\t500\tL:U"
+        )
+        assert parsed["1"]["currency"] == "USD"
