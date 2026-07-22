@@ -192,6 +192,18 @@ class SplitInput(BaseModel):
         str | None,
         Field(default=None, description="Optional split memo."),
     ] = None
+    action: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Optional split action — GnuCash's typed movement "
+                "tag (free text; register conventions: 'Buy', "
+                "'Sell', 'Dividend' on investment legs, 'Wire', "
+                "'ATM', 'Interest' on bank legs)."
+            ),
+        ),
+    ] = None
 
 
 def _splits_to_dicts(

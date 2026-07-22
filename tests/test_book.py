@@ -12151,3 +12151,54 @@ class TestReplaceSplitsPreservation:
             if s["account"] == "Expenses:Groceries"
         )
         assert memos == ["first twin", "second twin"]
+
+
+class TestSplitAction:
+    """Split ``action`` — native splits.action column, exposed on
+    the create paths and preserved through replace_splits."""
+
+    def test_create_and_read_back(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        result = gc.create_transaction(
+            description="Interest posting",
+            splits=[
+                {"account": "Assets:Checking", "amount": "1.23",
+                 "action": "Interest"},
+                {"account": "Income:Salary", "amount": "-1.23"},
+            ],
+        )
+        txn = gc.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["action"] == "Interest"
+
+    def test_replace_splits_preserves_action_on_unchanged_leg(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Dining", account_type="EXPENSE", parent="Expenses",
+        )
+        result = gc.create_transaction(
+            description="Wire out",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00",
+                 "action": "Wire"},
+                {"account": "Expenses:Groceries", "amount": "90.00"},
+            ],
+        )
+        gc.replace_splits(
+            guid=result["guid"],
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00"},
+                {"account": "Expenses:Dining", "amount": "90.00"},
+            ],
+        )
+        txn = gc.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["action"] == "Wire"

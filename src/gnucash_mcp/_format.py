@@ -211,6 +211,7 @@ _BATCH_SPLIT_TOKENS = {
     "acct": "account", "account": "account", "acc": "account",
     "memo": "memo",
     "qty": "quantity", "quantity": "quantity",
+    "act": "action", "action": "action",
 }
 
 # Fallback shape for the audit log's display parser when a stored

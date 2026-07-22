@@ -457,6 +457,8 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
         short_name = account.split(":")[-1]
         amount = _format_amount(split.get("amount") or split.get("value"))
         line = f"{indent}{short_name:<{max_name_len}}  {amount:>12}"
+        if split.get("action"):
+            line += f"  [{split['action']}]"
         if split.get("memo"):
             line += f"  {split['memo']}"
         lines.append(line)
