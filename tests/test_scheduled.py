@@ -908,3 +908,115 @@ class TestScheduledNotes:
         )
         txn = gb.get_transaction(result["transaction_guid"])
         assert txn["notes"] == "new annotation"
+
+
+class TestScheduledCurrency:
+    """Templates denominate their instantiations.
+
+    Pre-fix wedge: an all-foreign-leg template (Lin Wei's USD-to-USD
+    card payment in a CNY book) CREATED fine — the manual account
+    loop never checked quantity rules — then failed at every
+    instantiation forever. Creation now runs the shared split
+    validator against the template's currency, and a ``currency``
+    slot denominates instantiated transactions."""
+
+    def _eur_accounts(self, gc):
+        gc.create_account(
+            name="EUR Checking", account_type="BANK",
+            parent="Assets", commodity="EUR",
+        )
+        # Fixture already has Assets:Euro Savings (EUR).
+
+    def test_foreign_pair_template_instantiates_in_currency(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        self._eur_accounts(gc)
+        sx = gc.create_scheduled_transaction(
+            name="EUR Sweep", description="Monthly EUR sweep",
+            splits=[
+                {"account": "Assets:EUR Checking", "amount": "-25.00"},
+                {"account": "Assets:Euro Savings", "amount": "25.00"},
+            ],
+            start_date="2026-08-01", frequency="monthly",
+            currency="EUR",
+        )
+        r = gc.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-08-01",
+        )
+        assert r["status"] == "created"
+        txn = gc.get_transaction(r["transaction_guid"])
+        assert txn["currency"] == "EUR"
+        sav = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Euro Savings"
+        )
+        assert sav["value"] == "25" and sav["quantity"] == "25"
+
+    def test_all_foreign_template_without_currency_rejects_at_create(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        self._eur_accounts(gc)
+        with pytest.raises(ValueError, match="quantity"):
+            gc.create_scheduled_transaction(
+                name="Broken Sweep", description="x",
+                splits=[
+                    {"account": "Assets:EUR Checking",
+                     "amount": "-25.00"},
+                    {"account": "Assets:Euro Savings",
+                     "amount": "25.00"},
+                ],
+                start_date="2026-08-01", frequency="monthly",
+            )
+        # Nothing half-created: template list is empty.
+        assert gc.list_scheduled_transactions(
+            enabled_only=False, compact=False,
+        )["total"] == 0
+
+    def test_cross_commodity_template_replays_quantity(
+        self, multi_currency_book,
+    ):
+        """Default-frame template with a EUR leg + qty: stored and
+        replayed at instantiation (paycheck-with-401k shape)."""
+        gc = GnuCashBook(str(multi_currency_book))
+        sx = gc.create_scheduled_transaction(
+            name="EUR Savings Feed", description="Monthly EUR feed",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-110.00"},
+                {"account": "Assets:Euro Savings", "amount": "110.00",
+                 "quantity": "100.00"},
+            ],
+            start_date="2026-08-01", frequency="monthly",
+        )
+        r = gc.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-08-01",
+        )
+        assert r["status"] == "created"
+        txn = gc.get_transaction(r["transaction_guid"])
+        assert txn["currency"] == "USD"
+        eur_leg = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Euro Savings"
+        )
+        assert eur_leg["value"] == "110"
+        assert eur_leg["quantity"] == "100"
+
+    def test_currency_shown_in_verbose_list(self, multi_currency_book):
+        gc = GnuCashBook(str(multi_currency_book))
+        self._eur_accounts(gc)
+        gc.create_scheduled_transaction(
+            name="EUR Sweep", description="x",
+            splits=[
+                {"account": "Assets:EUR Checking", "amount": "-25.00"},
+                {"account": "Assets:Euro Savings", "amount": "25.00"},
+            ],
+            start_date="2026-08-01", frequency="monthly",
+            currency="EUR",
+        )
+        listed = gc.list_scheduled_transactions(
+            enabled_only=False, compact=False,
+        )["scheduled_transactions"]
+        assert listed[0]["currency"] == "EUR"
+        # Stored splits carry no quantity keys (same-currency legs).
+        assert all("quantity" not in s for s in listed[0]["splits"])

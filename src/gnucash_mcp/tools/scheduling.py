@@ -25,6 +25,7 @@ def register(mcp, get_book) -> None:
         end_date: str | None = None,
         enabled: bool = True,
         notes: str | None = None,
+        currency: str | None = None,
     ) -> str:
         """Create a recurring transaction template.
 
@@ -33,7 +34,9 @@ def register(mcp, get_book) -> None:
             description: Transaction description at instantiation.
             splits: Same format as create_transaction, e.g.
                 ``[{"account": "Expenses:Rent", "amount": "1850.00"}, ...]``.
-                ``amount`` / ``quantity`` must be decimal strings.
+                ``amount`` / ``quantity`` must be decimal strings;
+                ``quantity`` is required when an account's commodity
+                differs from the template's transaction currency.
             start_date: First occurrence (YYYY-MM-DD).
             frequency: "weekly", "biweekly" (2w), "monthly",
                 "bimonthly" (2mo), "quarterly" (3mo), or "yearly".
@@ -42,6 +45,12 @@ def register(mcp, get_book) -> None:
             notes: Transaction notes applied to every instantiated
                 transaction (what the payment is — visible in
                 GnuCash's double-line register view).
+            currency: ISO code denominating every instantiated
+                transaction; defaults to the book default. Use when
+                no leg is in the book currency (a USD-to-USD card
+                payment scheduled inside a CNY book) so amounts are
+                the foreign currency's own numbers. Not updatable
+                after creation — delete and recreate to change it.
         """
         book = get_book()
         result = book.create_scheduled_transaction(
@@ -53,6 +62,7 @@ def register(mcp, get_book) -> None:
             end_date=end_date,
             enabled=enabled,
             notes=notes,
+            currency=currency,
         )
         return _json(result)
 

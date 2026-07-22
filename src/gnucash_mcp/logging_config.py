@@ -1871,6 +1871,9 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     notes = params.get("notes", "")
     if notes:
         lines.append(f"{_INDENT}notes: {notes}")
+    sx_currency = params.get("currency", "")
+    if sx_currency:
+        lines.append(f"{_INDENT}currency: {sx_currency}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
