@@ -1843,7 +1843,9 @@ class CoreMixin:
         accounts. The action-signal suffix (``N invoice(s),
         M overdue``) lets the LLM see "2 overdue" and ask about
         collections without us having to spell that out
-        explicitly.
+        explicitly. The "included in ..." note prevents the
+        breakout from being double-counted against the Assets /
+        Liabilities headline totals, which already fold these in.
         """
         lines: list[str] = []
         if data.receivable_accts:
@@ -1852,8 +1854,8 @@ class CoreMixin:
             signal = (
                 f" ({inv_n} invoice"
                 f"{'s' if inv_n != 1 else ''}, "
-                f"{overdue} overdue)"
-            ) if inv_n else ""
+                f"{overdue} overdue; included in Assets total)"
+            ) if inv_n else " (included in Assets total)"
             lines.append(
                 f"Receivables: {len(data.receivable_accts)} "
                 f"account"
@@ -1874,8 +1876,8 @@ class CoreMixin:
             signal = (
                 f" ({bill_n} bill"
                 f"{'s' if bill_n != 1 else ''}, "
-                f"{overdue} overdue)"
-            ) if bill_n else ""
+                f"{overdue} overdue; included in Liabilities total)"
+            ) if bill_n else " (included in Liabilities total)"
             lines.append(
                 f"Payables: {len(data.payable_accts)} "
                 f"account"

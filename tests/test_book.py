@@ -3346,6 +3346,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 invoice" in recv
         assert "1 overdue" in recv
+        assert "included in Assets total" in recv
 
     def test_payables_signal_shows_open_count(
         self, business_book: Path,
@@ -3359,6 +3360,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 bill" in pay
         assert "0 overdue" in pay
+        assert "included in Liabilities total" in pay
 
     def test_jobs_line_present_when_active(
         self, business_book: Path,
