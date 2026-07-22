@@ -721,3 +721,37 @@ class TestBatchCurColumn:
             "1\t2026-07-15\tCard Payment\tusd\t-500\tA:U\t500\tL:U"
         )
         assert parsed["1"]["currency"] == "USD"
+
+    def test_dup_table_labels_cross_currency_candidates(
+        self, multi_currency_book,
+    ):
+        """A currency-blind amount match against a foreign-frame
+        transaction is labeled with the candidate's currency in the
+        dup table (empty cell = book default), so a cross-currency
+        false positive is visible without a follow-up read."""
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_account(
+            name="EUR Checking", account_type="BANK",
+            parent="Assets", commodity="EUR",
+        )
+        # Existing EUR-frame transaction: 188 EUR.
+        gc.create_transaction(
+            description="Tea House", currency="EUR",
+            splits=[
+                {"account": "Assets:EUR Checking", "amount": "-188.00"},
+                {"account": "Assets:Euro Savings", "amount": "188.00"},
+            ],
+            trans_date=date(2026, 7, 15),
+        )
+        # New default-frame (USD) row, same description/amount/date.
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "Tea House",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-188.00"},
+                {"account": "Expenses:Groceries", "amount": "188.00"},
+            ],
+        }], force=True)
+        dups = _parse(env["duplicates"])
+        assert dups, "expected a cross-currency HIGH/MEDIUM match"
+        assert dups[0]["cur"] == "EUR"

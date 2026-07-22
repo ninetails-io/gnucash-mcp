@@ -80,8 +80,9 @@ def _parse_duplicates(tsv: str) -> list[dict]:
             "guid": parts[1],
             "date": parts[2],
             "amount": parts[3],
-            "description": parts[4],
-            "signals": parts[5],
+            "cur": parts[4],
+            "description": parts[5],
+            "signals": parts[6],
         })
     return rows
 
@@ -5253,9 +5254,10 @@ class TestDuplicatesTsvShape:
         assert "{" not in result["duplicates"]
 
     def test_tsv_columns_and_order(self, test_book: Path):
-        """Each row is six tab-separated columns in the documented
-        order. The first row is the one with the strongest match
-        (HIGH confidence when all three signals hit)."""
+        """Each row is seven tab-separated columns in the documented
+        order (``cur`` is empty for book-default candidates). The
+        first row is the one with the strongest match (HIGH
+        confidence when all three signals hit)."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Weekly Groceries",
@@ -5267,14 +5269,15 @@ class TestDuplicatesTsvShape:
         )
         first_line = result["duplicates"].split("\n")[0]
         cols = first_line.split("\t")
-        assert len(cols) == 6
-        confidence, guid, dt, amount, description, signals = cols
+        assert len(cols) == 7
+        confidence, guid, dt, amount, cur, description, signals = cols
         assert confidence == "HIGH"
         assert len(guid) >= 8  # short prefix, never a raw 32-char guid
         assert dt == "2024-01-20"
         # piecash's GncNumeric strips trailing zeros (150, not 150.00),
         # so compare numerically rather than asserting exact text.
         assert Decimal(amount) == Decimal("150")
+        assert cur == ""  # book-default candidate: empty cell
         assert description == "Weekly Groceries"
         assert signals == "DAD"
 

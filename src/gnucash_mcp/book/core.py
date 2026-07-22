@@ -2756,6 +2756,16 @@ class CoreMixin:
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "amount": str(primary_amount),
+                        # The amount comparison is currency-blind;
+                        # labeling non-default candidates lets the
+                        # caller spot a cross-currency false match
+                        # (CNY 188 vs HKD 188) without a follow-up
+                        # read. Empty = book default.
+                        "currency": (
+                            txn.currency.mnemonic
+                            if txn.currency != book.default_currency
+                            else ""
+                        ),
                         "signals": signal_str,
                     })
 
@@ -2820,7 +2830,7 @@ class CoreMixin:
         string (no header — ``create_transaction``'s docstring
         documents the shape)::
 
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
         ~40 chars per candidate vs ~120 for list-of-dicts JSON.
         Returns ``""`` for empty input — ``_strip_noise`` drops
@@ -2830,7 +2840,8 @@ class CoreMixin:
         """
         return "\n".join(
             f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-            f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            f"{d['amount']}\t{d.get('currency', '')}\t"
+            f"{d['description']}\t{d['signals']}"
             for d in duplicates
         )
 
@@ -2994,7 +3005,7 @@ class CoreMixin:
 
             'duplicates', when present, is newline-separated TSV::
 
-                confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+                confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
             Confidence is HIGH or MEDIUM; signals is a three-char
             D/A/D code (description / amount / date, dash = no match).
@@ -3477,11 +3488,15 @@ class CoreMixin:
         prepended as the FK. Empty string when no row has a match."""
         if not dup_rows:
             return ""
-        lines = ["ref\tconfidence\tguid\tdate\tamount\tdescription\tsignals"]
+        lines = [
+            "ref\tconfidence\tguid\tdate\tamount\tcur\t"
+            "description\tsignals"
+        ]
         for ref, d in dup_rows:
             lines.append(
                 f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-                f"{d['amount']}\t{d['description']}\t{d['signals']}"
+                f"{d['amount']}\t{d.get('currency', '')}\t"
+                f"{d['description']}\t{d['signals']}"
             )
         return "\n".join(lines)
 

@@ -309,7 +309,7 @@ def register(mcp, get_book) -> None:
         successful create), ``duplicates`` in the response is a
         newline-separated TSV string, not a list of dicts. Columns::
 
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
         Confidence is ``HIGH`` (all three signals match) or ``MEDIUM``
         (two of three). Signals is a three-char code: position 0
