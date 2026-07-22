@@ -2004,9 +2004,18 @@ class CoreMixin:
                         "s" if upcoming["count"] != 1 else ""
                     )
                     total_int = int(upcoming["total"])
+                    amount_part = f"{currency} {total_int:,}"
+                    # Foreign-currency schedules with no market
+                    # rate can't join the sum — say so rather than
+                    # silently understate the week's bills.
+                    if upcoming.get("unrated"):
+                        amount_part += (
+                            f" + {upcoming['unrated']} foreign "
+                            f"w/o rate ⚠"
+                        )
                     line += (
                         f", {upcoming['count']} due in next "
-                        f"7 days ({currency} {total_int:,})"
+                        f"7 days ({amount_part})"
                     )
                 else:
                     line += ", none due in next 7 days"

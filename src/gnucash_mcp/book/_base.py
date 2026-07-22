@@ -704,6 +704,10 @@ def _upcoming_to_compact_line(
     occ_date = entry["occurrence_date"]
     days = entry["days_until"]
     amount = entry["amount"]
+    # Foreign-currency templates label their amount — an unlabeled
+    # "2000" from an HKD schedule reads as the book currency.
+    if entry.get("currency"):
+        amount = f"{amount} {entry['currency']}"
     return f"{short}\t{name}\t{occ_date}\t{days} days\t{amount}"
 
 

@@ -1020,3 +1020,66 @@ class TestScheduledCurrency:
         assert listed[0]["currency"] == "EUR"
         # Stored splits carry no quantity keys (same-currency legs).
         assert all("quantity" not in s for s in listed[0]["splits"])
+
+    def test_upcoming_labels_foreign_template_amounts(
+        self, multi_currency_book,
+    ):
+        """A foreign template's bill-list amount carries its
+        currency code — '25.00' from an EUR schedule must not read
+        as a book-default amount."""
+        from datetime import date as _date, timedelta as _td
+
+        gc = GnuCashBook(str(multi_currency_book))
+        self._eur_accounts(gc)
+        gc.create_scheduled_transaction(
+            name="EUR Sweep", description="x",
+            splits=[
+                {"account": "Assets:EUR Checking", "amount": "-25.00"},
+                {"account": "Assets:Euro Savings", "amount": "25.00"},
+            ],
+            start_date=(_date.today() + _td(days=2)).isoformat(),
+            frequency="monthly", currency="EUR",
+        )
+        verbose = gc.get_upcoming_transactions(days=7, compact=False)
+        entry = verbose["upcoming_transactions"][0]
+        assert entry["currency"] == "EUR"
+        compact = gc.get_upcoming_transactions(days=7, compact=True)
+        assert "25 EUR" in compact or "25.00 EUR" in compact
+
+    def test_summary_window_converts_or_flags_foreign(
+        self, multi_currency_book,
+    ):
+        """Dashboard 7-day total: foreign templates convert at the
+        latest market rate; with no rate on file they're counted
+        but flagged unrated instead of silently mixed in."""
+        from datetime import date as _date, timedelta as _td
+
+        gc = GnuCashBook(str(multi_currency_book))
+        self._eur_accounts(gc)
+        gc.create_scheduled_transaction(
+            name="EUR Sweep", description="x",
+            splits=[
+                {"account": "Assets:EUR Checking", "amount": "-25.00"},
+                {"account": "Assets:Euro Savings", "amount": "25.00"},
+            ],
+            start_date=(_date.today() + _td(days=2)).isoformat(),
+            frequency="monthly", currency="EUR",
+        )
+        # The fixture's only EUR price is piecash's auto
+        # type='transaction' placeholder, which the market-rate
+        # chokepoint skips → unrated.
+        with gc.open(readonly=True) as book:
+            stats = gc._upcoming_within_days(book, days=7)
+        assert stats["count"] == 1
+        assert stats["unrated"] == 1
+        assert stats["total"] == 0
+
+        # A real market rate converts the total.
+        gc.create_price(
+            commodity="EUR", namespace="CURRENCY", value="1.08",
+            price_date=_date.today(),
+        )
+        with gc.open(readonly=True) as book:
+            stats = gc._upcoming_within_days(book, days=7)
+        assert stats["unrated"] == 0
+        assert stats["total"] == Decimal("25.00") * Decimal("1.08")

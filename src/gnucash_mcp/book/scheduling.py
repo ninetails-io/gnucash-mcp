@@ -585,20 +585,30 @@ class SchedulingMixin:
         self, book, days: int = 7,
     ) -> dict:
         """Summary stats for scheduled transactions due within
-        ``days`` days: ``{"count": int, "total": Decimal}``.
+        ``days`` days: ``{"count": int, "total": Decimal,
+        "unrated": int}``.
 
         Total = sum of positive split amounts per occurrence (same
-        convention as ``get_upcoming_transactions``). Feeds the
-        get_book_summary Scheduled line; lives here so a book class
-        built without scheduling lacks the method and the summary
-        skips the line via ``hasattr``.
+        convention as ``get_upcoming_transactions``), in the BOOK
+        DEFAULT currency: foreign-currency templates convert at the
+        latest market rate; templates whose currency has no rate on
+        file are counted but excluded from the total (``unrated``
+        reports how many, so the summary line can say so instead of
+        silently understating). Feeds the get_book_summary Scheduled
+        line; lives here so a book class built without scheduling
+        lacks the method and the summary skips the line via
+        ``hasattr``.
         """
 
         today = date.today()
         window_end = today + timedelta(days=days)
 
+        default_currency = self._require_default_currency(book)
+        rates = self._rates_as_of(book, today, default_currency)
+
         count = 0
         total = Decimal("0")
+        unrated = 0
         for sx in book.session.query(ScheduledTransaction).all():
             if not sx.enabled:
                 continue
@@ -630,16 +640,26 @@ class SchedulingMixin:
                 continue
 
             count += 1
-            # splits-json amounts are in the book default currency
-            # by construction (create pins the default; instantiate
-            # passes no override), so no FX conversion is needed. A
-            # foreign-currency SX would be a native-GnuCash template
-            # with no splits-json slot — it contributes nothing here.
+            # splits-json amounts are denominated in the template's
+            # currency (the ``currency`` slot; absent = book
+            # default). Foreign templates convert at the latest
+            # market rate; no rate on file → counted, excluded from
+            # the total, reported via ``unrated``.
+            rate = Decimal("1")
+            sx_cur = self._get_sx_slot_string(book, sx.guid, "currency")
+            if sx_cur and sx_cur != default_currency.mnemonic:
+                commodity = self._find_commodity(book, sx_cur)
+                rate = (
+                    rates.get(commodity.guid) if commodity else None
+                )
+                if rate is None:
+                    unrated += 1
+                    continue
             for s in self._get_sx_splits(book, sx):
                 amt = _to_decimal(s["amount"])
                 if amt > 0:
-                    total += amt
-        return {"count": count, "total": total}
+                    total += amt * rate
+        return {"count": count, "total": total, "unrated": unrated}
 
     def get_upcoming_transactions(
         self,
@@ -722,6 +742,14 @@ class SchedulingMixin:
                         "days_until": (next_occ - today).days,
                         "amount": str(total),
                     }
+                    # Amounts are denominated in the template's
+                    # currency — label foreign ones so the bill
+                    # list never reads HKD numbers as book-default.
+                    sx_cur = self._get_sx_slot_string(
+                        book, sx.guid, "currency",
+                    )
+                    if sx_cur:
+                        entry["currency"] = sx_cur
                     if not compact:
                         entry["splits"] = splits
                     upcoming.append(entry)
