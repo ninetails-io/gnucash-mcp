@@ -1329,7 +1329,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        assert "Monthly net (last 6 months):" in result
+        assert "Monthly net (income - expenses, last 6 months):" in result
 
     def test_six_months_emitted_oldest_to_newest(
         self, test_book: Path,
@@ -1339,7 +1339,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # Section runs until the next non-indented line.
         rows = []
         for line in section.split("\n"):
@@ -1362,7 +1362,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "(MTD)" in first_row
 
@@ -1375,7 +1375,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "1000", date.today())
         # No activity 3 months ago.
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         three_ago_label = self._months_ago(3).strftime("%b %Y")
         three_ago_row = next(
             line for line in section.split("\n")
@@ -1397,7 +1397,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "300", one_ago_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         rows = section.split("\n")[:6]
 
         # Current month: +1500
@@ -1420,7 +1420,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "200", d, "groceries 2")
         # Net: 6000 - 1700 = 4300
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "+4,300" in first_row
 
@@ -1439,10 +1439,69 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "999999", old_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # No row should contain the old amount.
         rows = section.split("\n")[:6]
         assert not any("999,999" in r for r in rows)
+
+    @staticmethod
+    def _prior_month_last_day() -> int:
+        """Length of last month in days."""
+        first_of_current = date.today().replace(day=1)
+        return (first_of_current - timedelta(days=1)).day
+
+    def test_mtd_row_carries_prior_month_comparable(
+        self, test_book: Path,
+    ):
+        """The MTD row shows the prior month's net over the same
+        day window: '(vs <Mon> 1-<day>: <net>)'."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        mtd_row = section.split("\n", 1)[0]
+        cutoff = min(date.today().day, self._prior_month_last_day())
+        expected = (
+            f"(vs {prior_first.strftime('%b')} 1-{cutoff}: +700)"
+        )
+        assert expected in mtd_row
+
+    def test_comparable_excludes_prior_month_tail(
+        self, test_book: Path,
+    ):
+        """Activity after the cutoff day counts toward the prior
+        month's full-month row but not the MTD comparable."""
+        prior_len = self._prior_month_last_day()
+        if date.today().day >= prior_len:
+            pytest.skip(
+                "run-date is past the prior month's length — "
+                "no tail exists to exclude"
+            )
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+        # Tail: last day of prior month, beyond today's day-of-month.
+        tail_day = date(
+            prior_first.year, prior_first.month, prior_len,
+        )
+        self._seed_income(gc, "111", tail_day)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        rows = section.split("\n")[:6]
+        mtd_row = rows[0]
+        # Comparable holds only the in-window 700.
+        assert ": +700)" in mtd_row
+        # Full prior-month row still carries the whole 811.
+        prior_row = next(
+            r for r in rows
+            if prior_first.strftime("%b %Y") in r
+        )
+        assert "+811" in prior_row
 
 
 class TestGetBookSummaryRunway:
@@ -1509,6 +1568,9 @@ class TestGetBookSummaryRunway:
         assert "USD" in runway_line
         assert "liquid" in runway_line
         assert "/day burn" in runway_line
+        # Burn-averaging window is disclosed (book-age clamped,
+        # so the exact day count varies with the fixture's age).
+        assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
         # No decimals.
@@ -3122,6 +3184,64 @@ class TestGetBookSummaryUpcomingScheduled:
             or "none due in next 7 days" in sched_line
         )
 
+    def test_scheduled_line_carries_overdue_count(
+        self, scheduled_book: Path,
+    ):
+        """An overdue SX shows on the Scheduled line as
+        "N overdue ⚠", and the count agrees with the number of
+        Overdue-scheduled entries in Warnings — pre-fix the line
+        could say "none due in next 7 days" while Warnings showed
+        10 overdue, a flat contradiction."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Overdue Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() - timedelta(days=400)).isoformat(),
+            frequency="monthly",
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        warning_count = sum(
+            1 for l in result.splitlines()
+            if "Overdue scheduled:" in l
+        )
+        assert warning_count >= 1
+        assert f"{warning_count} overdue ⚠" in sched_line
+
+    def test_scheduled_line_omits_overdue_when_none(
+        self, scheduled_book: Path,
+    ):
+        """No overdue SX → no overdue bucket on the line
+        (absence-as-signal, matching the section conventions)."""
+        from datetime import date as _date, timedelta as _td
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Far Future Yearly",
+            description="Yearly",
+            start_date=(
+                _date.today() + _td(days=180)
+            ).isoformat(),
+            frequency="yearly",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Rent", "amount": "100"},
+            ],
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        if "Overdue scheduled:" not in result:
+            assert "overdue" not in sched_line
+
 
 class TestGetBookSummaryReconciliationSplitCount:
     """Stale reconciliation lines carry "47 splits unreconciled
@@ -3346,6 +3466,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 invoice" in recv
         assert "1 overdue" in recv
+        assert "included in Assets total" in recv
 
     def test_payables_signal_shows_open_count(
         self, business_book: Path,
@@ -3359,6 +3480,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 bill" in pay
         assert "0 overdue" in pay
+        assert "included in Liabilities total" in pay
 
     def test_jobs_line_present_when_active(
         self, business_book: Path,
