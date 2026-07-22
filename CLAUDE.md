@@ -454,6 +454,12 @@ For live verification against a personal GnuCash book, ensure
   `develop`.
 - Docs-only changes can go directly to `develop`.
 - Release: open PR `develop` → `main` only after tester signoff.
+- The version-bump commit (the last before the release PR) must
+  also run `uv lock` and stage `uv.lock` — the lockfile records
+  the project's own version, and a bump without it ships a
+  lockfile that contradicts the release (v1.4.1 did; it breaks
+  `uv sync --locked`/`--frozen` consumers such as CI and bundle
+  builds).
 
 ---
 
