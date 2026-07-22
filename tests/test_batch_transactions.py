@@ -722,13 +722,15 @@ class TestBatchCurColumn:
         )
         assert parsed["1"]["currency"] == "USD"
 
-    def test_dup_table_labels_cross_currency_candidates(
+    def test_cross_currency_coincidence_is_nonblocking_and_labeled(
         self, multi_currency_book,
     ):
-        """A currency-blind amount match against a foreign-frame
-        transaction is labeled with the candidate's currency in the
-        dup table (empty cell = book default), so a cross-currency
-        false positive is visible without a follow-up read."""
+        """188 EUR is not 188 USD: the amount signal only fires
+        within the same currency frame, so a cross-currency numeric
+        coincidence lands as a non-blocking MEDIUM (desc+date,
+        'D-D') labeled with the candidate's currency — visible,
+        interpretable, and never forcing a weaker model to refuse
+        a legitimate entry (bookkeeper finding, cur-column round)."""
         gc = GnuCashBook(str(multi_currency_book))
         gc.create_account(
             name="EUR Checking", account_type="BANK",
@@ -743,7 +745,8 @@ class TestBatchCurColumn:
             ],
             trans_date=date(2026, 7, 15),
         )
-        # New default-frame (USD) row, same description/amount/date.
+        # New default-frame (USD) row, same description/amount/date
+        # — creates WITHOUT force: the coincidence is not a HIGH.
         env = gc.create_transactions([{
             "ref": "1", "date": date(2026, 7, 15),
             "description": "Tea House",
@@ -751,7 +754,11 @@ class TestBatchCurColumn:
                 {"account": "Assets:Checking", "amount": "-188.00"},
                 {"account": "Expenses:Groceries", "amount": "188.00"},
             ],
-        }], force=True)
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
         dups = _parse(env["duplicates"])
-        assert dups, "expected a cross-currency HIGH/MEDIUM match"
+        assert dups, "expected a labeled cross-currency MEDIUM"
+        assert dups[0]["confidence"] == "MEDIUM"
+        assert dups[0]["signals"] == "D-D"
         assert dups[0]["cur"] == "EUR"

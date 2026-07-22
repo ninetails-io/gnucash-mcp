@@ -2583,6 +2583,7 @@ class CoreMixin:
         want_stability: bool,
         want_duplicates: bool,
         want_recent: bool,
+        trans_currency: str | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
         stability_limit: int = 5,
@@ -2742,7 +2743,20 @@ class CoreMixin:
                 # kills the noise without losing real duplicates
                 # (paycheck-vs-paycheck still matches on gross).
                 primary_amount = max(abs(s.value) for s in txn.splits)
-                amount_match = (
+                # Amounts only compare within the same currency
+                # frame: 188 HKD and 188 CNY are not the same money,
+                # and the cross-frame version of a true duplicate
+                # has numerically DIFFERENT values — so cross-
+                # currency amount matches are coincidence by
+                # construction (bookkeeper finding, cur-column
+                # round). Cross-currency candidates can still reach
+                # MEDIUM on description+date, labeled by the cur
+                # column.
+                same_frame = (
+                    trans_currency is None
+                    or txn.currency.mnemonic == trans_currency
+                )
+                amount_match = same_frame and (
                     abs(proposed_primary - primary_amount) <= Decimal("1.00")
                 )
 
@@ -2765,11 +2779,12 @@ class CoreMixin:
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "amount": str(primary_amount),
-                        # The amount comparison is currency-blind;
-                        # labeling non-default candidates lets the
-                        # caller spot a cross-currency false match
-                        # (CNY 188 vs HKD 188) without a follow-up
-                        # read. Empty = book default.
+                        # Labeling non-default candidates lets the
+                        # caller interpret a cross-currency MEDIUM
+                        # (desc+date) without a follow-up read —
+                        # and explains why equal-looking numbers
+                        # did NOT amount-match. Empty = book
+                        # default.
                         "currency": (
                             txn.currency.mnemonic
                             if txn.currency != book.default_currency
@@ -3070,6 +3085,15 @@ class CoreMixin:
             proposed_amounts = [abs(_to_decimal(s["amount"])) for s in splits]
 
             # --- Preflight pass 2: duplicates + recent matches ---
+            # The frame is passed as a mnemonic (currency resolution
+            # proper happens below and may CREATE the commodity —
+            # mutation stays after the rejection path). A currency
+            # not yet in the book matches no existing transaction's
+            # frame, which is exactly right.
+            frame_code = (
+                currency.upper() if currency
+                else self._require_default_currency(book).mnemonic
+            )
             signals = self._collect_create_signals(
                 book,
                 description,
@@ -3079,6 +3103,7 @@ class CoreMixin:
                 want_stability=False,
                 want_duplicates=check_duplicates,
                 want_recent=True,
+                trans_currency=frame_code,
             )
             duplicates = signals.duplicates
 
@@ -3248,11 +3273,11 @@ class CoreMixin:
         denominate in the book default; rows with it balance in
         that currency instead (splits on accounts of any OTHER
         commodity carry an explicit ``quantity``). The duplicate
-        screen compares amounts numerically without currency
-        awareness — a same-description same-date twin in another
-        currency can false-match; the dup table's ref column makes
-        that visible for review. ``currency`` cannot combine with
-        an auto-fill row (the source transaction's own currency
+        amount signal compares within the same currency frame only
+        (188 HKD is not 188 CNY); a same-description same-date twin
+        in another currency can still surface as a labeled,
+        non-blocking MEDIUM. ``currency`` cannot combine with an
+        auto-fill row (the source transaction's own currency
         governs a reproduction). No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
@@ -3366,6 +3391,7 @@ class CoreMixin:
                     p["proposed_amounts"],
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
+                    trans_currency=p["currency"].mnemonic,
                 )
                 dups = signals.duplicates
                 for d in dups:
