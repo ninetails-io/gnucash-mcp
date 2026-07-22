@@ -1535,7 +1535,7 @@ class CoreMixin:
         """
         if not monthly:
             return []
-        out = ["Monthly net (last 6 months):"]
+        out = ["Monthly net (income - expenses, last 6 months):"]
         for entry in monthly:
             label = entry["label"]
             if entry["is_mtd"]:

@@ -1329,7 +1329,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        assert "Monthly net (last 6 months):" in result
+        assert "Monthly net (income - expenses, last 6 months):" in result
 
     def test_six_months_emitted_oldest_to_newest(
         self, test_book: Path,
@@ -1339,7 +1339,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # Section runs until the next non-indented line.
         rows = []
         for line in section.split("\n"):
@@ -1362,7 +1362,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "(MTD)" in first_row
 
@@ -1375,7 +1375,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "1000", date.today())
         # No activity 3 months ago.
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         three_ago_label = self._months_ago(3).strftime("%b %Y")
         three_ago_row = next(
             line for line in section.split("\n")
@@ -1397,7 +1397,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "300", one_ago_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         rows = section.split("\n")[:6]
 
         # Current month: +1500
@@ -1420,7 +1420,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "200", d, "groceries 2")
         # Net: 6000 - 1700 = 4300
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "+4,300" in first_row
 
@@ -1439,7 +1439,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "999999", old_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # No row should contain the old amount.
         rows = section.split("\n")[:6]
         assert not any("999,999" in r for r in rows)
