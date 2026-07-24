@@ -286,11 +286,12 @@ def register(mcp, get_book) -> None:
         Each split: ``account`` (full path, required), ``amount``
         (required, in transaction currency), ``quantity`` (required
         when account commodity differs from transaction currency),
-        ``memo`` (optional). ``amount`` and ``quantity`` are decimal
-        strings (e.g. "94.87") — never raw JSON numbers, which would
-        lose precision on non-dyadic decimals.
+        ``memo`` (optional), ``action`` (optional). ``amount`` and
+        ``quantity`` are decimal strings (e.g. "94.87") — never raw
+        JSON numbers, which would lose precision on non-dyadic
+        decimals.
 
-        FIELD TARGETING — three annotation fields, three jobs, in
+        FIELD TARGETING — the annotation fields, one job each, in
         GnuCash-register visibility order:
 
         - ``description``: the clean name ("Chevron 0090706
@@ -303,6 +304,11 @@ def register(mcp, get_book) -> None:
           provenance ("Withdrawal ACH TRAVELERS TYPE: PER INSUR…").
           Visible only in expanded split view — evidence, not
           narrative.
+        - split ``action``: the typed KIND of movement, one word.
+          Matters most on investment legs, where desktop convention
+          (and the Advanced Portfolio report) expects "Buy" /
+          "Sell" / "Dividend"; bank legs may use "Wire" / "ATM" /
+          "Interest". Skip it for ordinary spending.
 
         When duplicate detection surfaces candidates (either rejecting
         the write with ``status: "rejected"`` or returning alongside a
@@ -418,6 +424,12 @@ def register(mcp, get_book) -> None:
           cell means the account uses the default currency
           (quantity == amount). A non-default-commodity account with
           an empty qty rejects that row.
+
+        - PER-SPLIT ACTION — declare ``act`` split columns for
+          GnuCash's typed movement tag ("Buy"/"Sell"/"Dividend" on
+          investment legs — desktop convention; "Wire"/"ATM" on
+          bank legs). Same group mechanics as ``memo``/``qty``;
+          empty cells skip it. Rarely needed for plain spending.
 
         All extensions combine; when several split fields are
         declared, the header's FIRST group fixes their order (e.g.

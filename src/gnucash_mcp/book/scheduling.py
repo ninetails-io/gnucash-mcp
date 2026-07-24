@@ -394,10 +394,16 @@ class SchedulingMixin:
                         "amount": str(_to_decimal(s["amount"])),
                         "memo": s.get("memo", ""),
                         # Cross-commodity legs replay their stored
-                        # quantity at every instantiation.
+                        # quantity at every instantiation; actions
+                        # (Buy/Sell on investment templates) replay
+                        # the same way.
                         **(
                             {"quantity": str(_to_decimal(s["quantity"]))}
                             if s.get("quantity") is not None else {}
+                        ),
+                        **(
+                            {"action": s["action"]}
+                            if s.get("action") else {}
                         ),
                     }
                     for s in splits

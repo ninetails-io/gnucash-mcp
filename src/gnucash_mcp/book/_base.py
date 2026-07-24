@@ -417,6 +417,7 @@ def _split_to_dict(
         "value": str(split.value),
         "quantity": str(split.quantity),
         "memo": split.memo or "",
+        "action": split.action or "",
         "reconcile_state": split.reconcile_state,
         "reconcile_date": rec_date.isoformat() if rec_date else None,
         "lot_guid": lot_guid,

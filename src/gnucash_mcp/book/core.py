@@ -2991,6 +2991,7 @@ class CoreMixin:
                 "value": value,
                 "quantity": quantity,
                 "memo": split.get("memo"),
+                "action": split.get("action"),
                 "original_ref": ref,
             })
 
@@ -3167,6 +3168,7 @@ class CoreMixin:
                             value=v["value"],
                             quantity=v["quantity"],
                             memo=v["memo"] or "",
+                            action=v["action"] or "",
                         )
                     )
 
@@ -3447,6 +3449,7 @@ class CoreMixin:
                     piecash.Split(
                         account=v["account"], value=v["value"],
                         quantity=v["quantity"], memo=v["memo"] or "",
+                        action=v["action"] or "",
                     )
                     for v in p["validated"]
                 ]
@@ -4595,6 +4598,7 @@ class CoreMixin:
                     "value": s.value,
                     "quantity": s.quantity,
                     "memo": s.memo or "",
+                    "action": s.action or "",
                     "state": s.reconcile_state,
                     "rdate": s.reconcile_date,
                     "claimed": False,
@@ -4705,8 +4709,9 @@ class CoreMixin:
                 fx_check_splits.append({
                     "account": account, "value": amount, "quantity": quantity,
                 })
-                # Unchanged leg: keep its memo (caller-supplied memo
-                # wins) and its reconciliation, verbatim.
+                # Unchanged leg: keep its memo and action (caller-
+                # supplied values win) and its reconciliation,
+                # verbatim.
                 match = _claim(carryover, account.guid, amount, quantity)
                 new_split = piecash.Split(
                     account=account,
@@ -4715,6 +4720,10 @@ class CoreMixin:
                     memo=(
                         split_data.get("memo")
                         or (match["memo"] if match else "")
+                    ),
+                    action=(
+                        split_data.get("action")
+                        or (match["action"] if match else "")
                     ),
                     transaction=transaction,
                 )

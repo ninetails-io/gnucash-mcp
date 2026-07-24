@@ -1083,3 +1083,29 @@ class TestScheduledCurrency:
             stats = gc._upcoming_within_days(book, days=7)
         assert stats["unrated"] == 0
         assert stats["total"] == Decimal("25.00") * Decimal("1.08")
+
+
+class TestScheduledSplitAction:
+    def test_template_action_replays_at_instantiation(
+        self, multi_currency_book,
+    ):
+        """A DCA-style template stamps Buy on every instantiation."""
+        gc = GnuCashBook(str(multi_currency_book))
+        sx = gc.create_scheduled_transaction(
+            name="EUR DCA", description="Monthly EUR feed",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-110.00"},
+                {"account": "Assets:Euro Savings", "amount": "110.00",
+                 "quantity": "100.00", "action": "Buy"},
+            ],
+            start_date="2026-08-01", frequency="monthly",
+        )
+        r = gc.create_transaction_from_scheduled(
+            guid=sx["guid"], transaction_date="2026-08-01",
+        )
+        txn = gc.get_transaction(r["transaction_guid"])
+        eur = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Euro Savings"
+        )
+        assert eur["action"] == "Buy"
