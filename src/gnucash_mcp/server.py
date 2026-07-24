@@ -215,6 +215,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "list_commodities",
         "create_commodity",
         "create_price",
+        "create_prices",
         "get_prices",
         "get_latest_price",
         "delete_price",

@@ -2,6 +2,81 @@
 
 from datetime import date as date_type
 
+# Batch price TSV columns: the required prefix, then optional
+# extensions accepted only in this order (a header may stop at any
+# point). Order-fixed because the columns are scalar per row — no
+# repeating groups to disambiguate, so header freedom buys nothing.
+_PRICE_TSV_REQUIRED = ("ref", "commodity", "date", "value")
+_PRICE_TSV_OPTIONAL = ("ns", "cur", "source", "type")
+_PRICE_KEY_FOR = {
+    "ns": "namespace", "cur": "currency",
+    "source": "source", "type": "price_type",
+}
+
+
+def _parse_prices_tsv(tsv: str) -> list[dict]:
+    """Parse the batch price TSV into the book-layer dict shape.
+
+    Header validated token-by-token (typos reject by name, per the
+    batch-entry convention); rows may end early, empty optional
+    cells take defaults. Dates parse here — the book layer works in
+    ``datetime.date``.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "prices TSV needs a header row and at least one data row"
+        )
+    tokens = [t.strip().lower() for t in lines[0].split("\t")]
+    while tokens and not tokens[-1]:
+        tokens.pop()
+    expected = list(_PRICE_TSV_REQUIRED)
+    for opt in _PRICE_TSV_OPTIONAL:
+        expected.append(opt)
+    if len(tokens) < len(_PRICE_TSV_REQUIRED) or \
+            tokens != expected[:len(tokens)]:
+        for i, tok in enumerate(tokens):
+            if i >= len(expected) or tok != expected[i]:
+                raise ValueError(
+                    f"unrecognized or misplaced column {tok!r} in "
+                    f"prices header — columns are "
+                    f"ref, commodity, date, value, then optional "
+                    f"ns, cur, source, type in that order"
+                )
+        raise ValueError(
+            "prices header must start with ref, commodity, date, value"
+        )
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        fields = ln.split("\t")
+        while fields and not fields[-1].strip():
+            fields.pop()
+        if len(fields) < 4:
+            raise ValueError(
+                f"row {i}: expected at least ref, commodity, date, value"
+            )
+        ref = fields[0].strip()
+        if not ref:
+            raise ValueError(f"row {i}: empty ref (each row needs a key)")
+        try:
+            row_date = date_type.fromisoformat(fields[2].strip())
+        except ValueError as e:
+            raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        entry: dict = {
+            "ref": ref,
+            "commodity": fields[1].strip(),
+            "date": row_date,
+            "value": fields[3].strip(),
+        }
+        for col_idx, tok in enumerate(tokens[4:], start=4):
+            if col_idx < len(fields) and fields[col_idx].strip():
+                cell = fields[col_idx].strip()
+                if tok == "cur":
+                    cell = cell.upper()
+                entry[_PRICE_KEY_FOR[tok]] = cell
+        out.append(entry)
+    return out
+
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     LotGuid,
@@ -21,6 +96,8 @@ def register(mcp, get_book) -> None:
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
+        stale_days: int | None = None,
+        held_only: bool = False,
     ) -> str:
         """List all commodities (currencies, stocks, etc.) in the book.
 
@@ -29,14 +106,26 @@ def register(mcp, get_book) -> None:
         ``offset``; ``limit=0`` returns the count only. Use verbose=true
         for full JSON with fraction, latest prices, etc.
 
+        THE PRICE-UPDATE WORK LIST: ``stale_days=30, held_only=true``
+        returns exactly the commodities needing fresh quotes, each
+        marked ``Nd stale`` or ``no price on file``. Look the quotes
+        up, then record them all in one ``create_prices`` call.
+
         Args:
             verbose: If true, return full JSON details for each commodity.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
+            stale_days: Only commodities whose latest market price is
+                at least this many days old, including never-priced
+                ones, excluding the book default currency. Omit for
+                the unfiltered list.
+            held_only: Only commodities some real account is
+                denominated in. Filters AND-combine.
         """
         book = get_book()
         result = book.list_commodities(
-            compact=not verbose, limit=limit, offset=offset
+            compact=not verbose, limit=limit, offset=offset,
+            stale_days=stale_days, held_only=held_only,
         )
         if verbose:
             return _json(result)
@@ -71,6 +160,54 @@ def register(mcp, get_book) -> None:
             namespace=namespace,
             fraction=fraction,
             cusip=cusip,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="create_batch",
+        entity_type="price",
+    )
+    def create_prices(
+        prices: str,
+        on_error: str = "abort",
+        dry_run: bool = False,
+    ) -> str:
+        """Record MANY prices in one call (bulk quote entry).
+
+        INPUT — ``prices`` is a TSV block: a header row, then one row
+        per price. Required columns ``ref, commodity, date, value``;
+        optional columns extend the header IN ORDER:
+        ``ns, cur, source, type`` (stop anywhere; rows may end early;
+        empty cells take defaults)::
+
+            ref<TAB>commodity<TAB>date<TAB>value<TAB>cur<TAB>source
+            1<TAB>VTSAX<TAB>2026-07-21<TAB>148.32<TAB><TAB>web:yahoo
+            2<TAB>EUR<TAB>2026-07-21<TAB>1.0845<TAB><TAB>web:ecb
+
+        - ``ref``: your correlation key, echoed in results.
+        - ``ns``: commodity namespace; empty auto-resolves when the
+          symbol is unambiguous across namespaces.
+        - ``cur``: quote currency; empty = book default.
+        - ``source``: where the quote came from (provenance —
+          default "user:price"); ``type``: nav/last/bid/ask.
+
+        Per-row semantics are ``create_price``'s exactly: an existing
+        price with the same commodity/currency/date/source is UPDATED
+        in place (``status: updated``), never duplicated. One book
+        open, one save, ``on_error="abort"`` (default) sinks the
+        whole batch on any bad row; ``dry_run=true`` previews as
+        ``would_create`` / ``would_update``.
+
+        The companion work list: ``list_commodities(stale_days=30,
+        held_only=true)``.
+        """
+        book = get_book()
+        result = book.create_prices(
+            prices=_parse_prices_tsv(prices),
+            on_error=on_error,
+            dry_run=dry_run,
         )
         return _json(result)
 

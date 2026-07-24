@@ -1401,6 +1401,37 @@ def _fmt_commodity_create(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_price_create_batch(entry: dict) -> list[str]:
+    """Batch price entry — one line per row from the results TSV
+    (which is self-contained: status, commodity, date, value,
+    currency), headlined by the created/updated/rejected counts."""
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    rows = _parse_audit_tsv_rows(after.get("results") or "")
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r.get("status", "")] = counts.get(r.get("status", ""), 0) + 1
+    headline = ", ".join(
+        f"{n} {status}" for status, n in sorted(counts.items())
+    ) or "no rows"
+    lines = [f"{time_part}  CREATE PRICES (batch)  {headline}"]
+    for r in rows:
+        status = r.get("status", "")
+        if status in ("rejected",):
+            lines.append(
+                f"{_INDENT}{r.get('ref', '')}  rejected: "
+                f"{r.get('reason', '')}"
+            )
+        else:
+            cur = r.get("currency", "")
+            lines.append(
+                f"{_INDENT}{r.get('commodity', ''):<8}  "
+                f"{r.get('value', ''):>12} {cur}  "
+                f"({r.get('date', '')})  {status}"
+            )
+    return lines
+
+
 def _fmt_price_create(entry: dict) -> list[str]:
     """``create_price`` returns ``status="updated"`` when a price at
     the same (commodity, currency, date, source) already existed and
@@ -2008,6 +2039,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("entry", "CREATE"): _fmt_entry_create,
     ("commodity", "CREATE"): _fmt_commodity_create,
     ("price", "CREATE"): _fmt_price_create,
+    ("price", "CREATE_BATCH"): _fmt_price_create_batch,
     ("price", "DELETE"): _fmt_price_delete,
     ("lot", "CREATE"): _fmt_lot_create,
     ("lot", "UPDATE"): _fmt_lot_update,
