@@ -498,6 +498,11 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     lp = entry.get("latest_price")
     if lp:
         parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
+    # Work-list markers, present only under the stale_days filter.
+    if entry.get("no_price"):
+        parts.append("no price on file")
+    elif entry.get("days_stale") is not None:
+        parts.append(f"{entry['days_stale']}d stale")
     return "\t".join(parts)
 
 

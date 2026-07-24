@@ -12151,3 +12151,183 @@ class TestReplaceSplitsPreservation:
             if s["account"] == "Expenses:Groceries"
         )
         assert memos == ["first twin", "second twin"]
+
+
+def _parse_results_tsv(tsv: str) -> list[dict]:
+    """Header-bearing TSV → list of dicts (batch results tables)."""
+    lines = tsv.split("\n")
+    header = lines[0].split("\t")
+    return [dict(zip(header, ln.split("\t"))) for ln in lines[1:]]
+
+
+class TestBatchPrices:
+    """create_prices: many quotes, one book-open, one save, with
+    create_price's exact upsert semantics via the shared chokepoint."""
+
+    def _setup(self, gc):
+        gc.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_commodity(mnemonic="VFIFX", fullname="Vanguard 2050",
+                            namespace="FUND")
+
+    def test_creates_then_updates_in_place(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        rows = [
+            {"ref": "1", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+            {"ref": "2", "commodity": "VFIFX",
+             "date": date(2026, 7, 20), "value": "66.10"},
+        ]
+        env = gc.create_prices(rows)
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["1"]["status"] == "created"
+        assert parsed["2"]["status"] == "created"
+
+        # Same commodity/date/source, new value → updated, not doubled.
+        rows[0]["value"] = "149.01"
+        env = gc.create_prices([rows[0]])
+        assert _parse_results_tsv(env["results"])[0]["status"] == "updated"
+        latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
+        assert latest["value"] == "149.01"
+
+    def test_abort_sinks_batch_on_bad_row(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "NOPE",
+             "date": date(2026, 7, 20), "value": "1.00"},
+            {"ref": "2", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert "not found" in parsed["1"]["reason"]
+        assert parsed["2"]["reason"] == "batch_aborted"
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_skip_keeps_good_rows(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "NOPE",
+             "date": date(2026, 7, 20), "value": "1.00"},
+            {"ref": "2", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ], on_error="skip")
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["1"]["status"] == "rejected"
+        assert parsed["2"]["status"] == "created"
+
+    def test_dry_run_writes_nothing(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ], dry_run=True)
+        assert _parse_results_tsv(env["results"])[0]["status"] == "would_create"
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_ambiguous_symbol_requires_ns(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_commodity(mnemonic="DUP", fullname="Dup Fund",
+                            namespace="FUND")
+        gc.create_commodity(mnemonic="DUP", fullname="Dup Stock",
+                            namespace="NASDAQ")
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "DUP",
+             "date": date(2026, 7, 20), "value": "10.00"},
+        ], on_error="skip")
+        assert "ambiguous" in _parse_results_tsv(env["results"])[0]["reason"]
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "DUP", "namespace": "FUND",
+             "date": date(2026, 7, 20), "value": "10.00"},
+        ])
+        assert _parse_results_tsv(env["results"])[0]["status"] == "created"
+
+
+class TestPricesTsvParser:
+    def test_minimal_and_extended_headers(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        rows = _parse_prices_tsv(
+            "ref\tcommodity\tdate\tvalue\n"
+            "1\tVTSAX\t2026-07-21\t148.32"
+        )
+        assert rows[0] == {
+            "ref": "1", "commodity": "VTSAX",
+            "date": date(2026, 7, 21), "value": "148.32",
+        }
+        rows = _parse_prices_tsv(
+            "ref\tcommodity\tdate\tvalue\tns\tcur\tsource\n"
+            "1\tEUR\t2026-07-21\t1.0845\tCURRENCY\tusd\tweb:ecb\n"
+            "2\tVTSAX\t2026-07-21\t148.32"
+        )
+        assert rows[0]["currency"] == "USD"
+        assert rows[0]["source"] == "web:ecb"
+        assert "currency" not in rows[1]  # row ended early
+
+    def test_misplaced_or_unknown_column_rejects_by_name(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        with pytest.raises(ValueError, match="'source'"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalue\tsource\tcur\n"
+                "1\tVTSAX\t2026-07-21\t148.32\tx\ty"
+            )
+        with pytest.raises(ValueError, match="'valu'"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalu\n1\tV\t2026-07-21\t1"
+            )
+
+    def test_bad_date_names_the_row(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        with pytest.raises(ValueError, match="row 1"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalue\n1\tVTSAX\tJuly 21\t1"
+            )
+
+
+class TestListCommoditiesStaleFilter:
+    def test_work_list_filters_and_markers(self, multi_currency_book):
+        from datetime import timedelta
+
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_price(
+            commodity="VTSAX", namespace="FUND", value="120.00",
+            price_date=date.today() - timedelta(days=200),
+        )
+
+        # Unfiltered: unchanged shape, no staleness markers.
+        full = gc.list_commodities(compact=True, limit=0)
+        assert "stale" not in full and "no price on file" not in full
+
+        # Stale filter: old VTSAX marked with its age; EUR (only a
+        # piecash transaction-type placeholder price from the
+        # fixture's transfer) counts as no market price; USD (book
+        # default) excluded.
+        stale = gc.list_commodities(compact=True, stale_days=30)
+        assert "VTSAX" in stale and "200d stale" in stale
+        assert "EUR" in stale and "no price on file" in stale
+        assert "\tUSD\t" not in stale
+
+        # held_only: VTSAX has no account; EUR does.
+        work = gc.list_commodities(
+            compact=True, stale_days=30, held_only=True,
+        )
+        assert "EUR" in work
+        assert "VTSAX" not in work
+
+        # Fresh price falls off the stale list.
+        gc.create_price(
+            commodity="VTSAX", namespace="FUND", value="148.00",
+        )
+        stale = gc.list_commodities(compact=True, stale_days=30)
+        assert "VTSAX" not in stale
