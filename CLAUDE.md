@@ -464,16 +464,20 @@ For live verification against a personal GnuCash book, ensure
    a first-time visitor's click lands here, so the headline
    workflow must reflect the current release, not the one before
    it.
-3. Tester/bookkeeper signoff on develop.
-4. **Version bump LAST** — one commit: `pyproject.toml`,
+3. **Regenerate the sample books** through the current date
+   (`scripts/synthetic_book/phase_<N>.py`, in order) — the personas
+   are the release's oracles, and stale samples validate the
+   previous release's world, not this one's.
+4. Tester/bookkeeper signoff on develop.
+5. **Version bump LAST** — one commit: `pyproject.toml`,
    `__init__.py`, and a fresh `uv lock` staging `uv.lock`. The
    lockfile records the project's own version; a bump without the
    re-lock ships a lockfile that contradicts the release (v1.4.1
    did; it breaks `uv sync --locked`/`--frozen` consumers such as
    CI and bundle builds). Version numbering and timing are the
    maintainer's call.
-5. Release PR `develop` → `main`; merge on the maintainer's go.
-6. Annotated tag, push verified with `git ls-remote` (never trust
+6. Release PR `develop` → `main`; merge on the maintainer's go.
+7. Annotated tag, push verified with `git ls-remote` (never trust
    a piped push).
 
 ---
