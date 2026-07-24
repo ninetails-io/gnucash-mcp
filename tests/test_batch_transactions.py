@@ -762,3 +762,38 @@ class TestBatchCurColumn:
         assert dups[0]["confidence"] == "MEDIUM"
         assert dups[0]["signals"] == "D-D"
         assert dups[0]["cur"] == "EUR"
+
+
+class TestSplitActionColumn:
+    """The ``act`` split column carries GnuCash's typed movement
+    tag (investment-register convention: Buy/Sell/Dividend)."""
+
+    def test_act_column_parses_into_split_dicts(self):
+        tsv = (
+            "ref\tdate\tdescription\tamt1\tacct1\tact1\tamt2\tacct2\tact2\n"
+            "1\t2026-07-01\tVFIFX Purchase\t-500\tA:Chk\t\t500\tA:VFIFX\tBuy"
+        )
+        rows = _parse_transactions_tsv(tsv)
+        assert rows[0]["splits"][1]["action"] == "Buy"
+        assert "action" not in rows[0]["splits"][0]  # empty cell
+
+    def test_batch_action_lands_on_split(self, multi_currency_book):
+        gc = GnuCashBook(str(multi_currency_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 15),
+            "description": "EUR feed",
+            "splits": [
+                {"account": "Assets:Checking", "amount": "-110.00",
+                 "action": "Wire"},
+                {"account": "Assets:Euro Savings", "amount": "110.00",
+                 "quantity": "100.00"},
+            ],
+        }])
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        txn = gc.get_transaction(rows[0]["txn_guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["action"] == "Wire"
