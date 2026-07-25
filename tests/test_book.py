@@ -12507,3 +12507,137 @@ class TestAccountErrorSuggestions:
         assert rows[0]["status"] == "rejected"
         assert "Did you mean" in rows[0]["reason"]
         assert "Expenses:Groceries" in rows[0]["reason"]
+
+
+class TestUpdateTransactionBroadcast:
+    """guid-list broadcast: same values to N transactions, one save.
+
+    The 44-identical-notes annotation pass that previously burned
+    three turns of tool-call budget (bookkeeper finding)."""
+
+    def _three(self, gc):
+        guids = []
+        for i in range(3):
+            r = gc.create_transaction(
+                description=f"HoopFest Doughnut {i}",
+                splits=[
+                    {"account": "Assets:Checking", "amount": f"{10 + i}.00"},
+                    {"account": "Income:Salary", "amount": f"-{10 + i}.00"},
+                ],
+            )
+            guids.append(r["guid"])
+        return guids
+
+    def test_broadcast_notes(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        result = gc.update_transaction(
+            guid=guids, notes="HoopFest 2026 — liability, not income.",
+        )
+        assert result["status"] == "updated"
+        assert result["count"] == 3
+        for g in guids:
+            txn = gc.get_transaction(g)
+            assert txn["notes"] == "HoopFest 2026 — liability, not income."
+            assert txn["description"].startswith("HoopFest Doughnut")
+
+    def test_all_or_nothing_on_bad_guid(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="not found"):
+            gc.update_transaction(
+                guid=[guids[0], "deadbeef00000000"], notes="x",
+            )
+        assert not gc.get_transaction(guids[0]).get("notes")
+
+    def test_splits_rejected_with_list(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="single-transaction only"):
+            gc.update_transaction(
+                guid=guids,
+                splits=[{"account": "Assets:Checking", "amount": "1"}],
+            )
+
+    def test_empty_field_set_rejected(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="nothing to update"):
+            gc.update_transaction(guid=guids)
+
+
+class TestUpdateTransactionsTsv:
+    """Per-row bulk edit: empty cells leave fields unchanged; the
+    batch can annotate but never clear."""
+
+    def _two(self, gc):
+        a = gc.create_transaction(
+            description="PayPal Instant Transfer (investigate)",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-250.00"},
+                {"account": "Expenses:Groceries", "amount": "250.00"},
+            ],
+        )["guid"]
+        b = gc.create_transaction(
+            description="PayPal Purchase (investigate)",
+            notes="original note",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-22.10"},
+                {"account": "Expenses:Groceries", "amount": "22.10"},
+            ],
+        )["guid"]
+        return a, b
+
+    def test_per_row_values_and_empty_cells(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, b = self._two(gc)
+        env = gc.update_transactions([
+            {"guid": a, "description": "PayPal Credit Payment",
+             "notes": "Resolved — card payment"},
+            {"guid": b, "description": "Netflix via PayPal"},
+        ])
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["status"] == "updated"
+        assert rows[b]["status"] == "updated"
+        ta, tb = gc.get_transaction(a), gc.get_transaction(b)
+        assert ta["description"] == "PayPal Credit Payment"
+        assert ta["notes"] == "Resolved — card payment"
+        assert tb["description"] == "Netflix via PayPal"
+        # Empty cell left the existing note untouched — never cleared.
+        assert tb["notes"] == "original note"
+
+    def test_abort_and_skip(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, _b = self._two(gc)
+        bad = {"guid": "deadbeef00000000", "notes": "x"}
+        good = {"guid": a, "notes": "kept"}
+        env = gc.update_transactions([bad, good])
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["reason"] == "batch_aborted"
+        assert not gc.get_transaction(a).get("notes")
+        env = gc.update_transactions([bad, good], on_error="skip")
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["status"] == "updated"
+        assert gc.get_transaction(a)["notes"] == "kept"
+
+    def test_row_changing_nothing_rejects(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, _b = self._two(gc)
+        env = gc.update_transactions(
+            [{"guid": a}], on_error="skip",
+        )
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "changes nothing" in rows[0]["reason"]
+
+    def test_update_tsv_parser_contract(self):
+        from gnucash_mcp._format import _parse_update_tsv
+
+        with pytest.raises(ValueError, match="unrecognized column 'payee'"):
+            _parse_update_tsv("guid\tpayee\nabc\tX")
+        with pytest.raises(ValueError, match="at least one field"):
+            _parse_update_tsv("guid\nabc")
+        rows = _parse_update_tsv(
+            "guid\tdescription\tnotes\nabc123\t\tonly notes"
+        )
+        assert rows[0] == {"guid": "abc123", "notes": "only notes"}

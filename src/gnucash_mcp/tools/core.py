@@ -8,7 +8,11 @@ way (pure lazy-load orchestration, no hardcoded imports).
 
 from datetime import date
 
-from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
+from gnucash_mcp._format import (
+    _batch_row_splits,
+    _batch_tsv_layout,
+    _parse_update_tsv,
+)
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     SplitInput,
@@ -677,17 +681,24 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="transaction")
     def update_transaction(
-        guid: TransactionGuid,
+        guid: TransactionGuid | list[TransactionGuid],
         description: str | None = None,
         transaction_date: str | None = None,
         splits: list[SplitInput] | None = None,
         notes: str | None = None,
         force: bool = False,
     ) -> str:
-        """Update an existing transaction.
+        """Update an existing transaction — or broadcast to several.
+
+        Pass a LIST of GUIDs to apply the SAME supplied values to
+        every listed transaction in one book open / one save
+        (all-or-nothing) — the batch-annotation case: one note
+        across 35 related entries, one call. ``splits`` stays
+        single-transaction. For per-row DIFFERENT values, use
+        ``update_transactions``.
 
         Args:
-            guid: Transaction GUID to update (32-character hex string, or 8+ char prefix)
+            guid: Transaction GUID (32-character hex string, or 8+ char prefix), or a list of them
             description: New transaction description (optional)
             transaction_date: New date in ISO format YYYY-MM-DD (optional)
             splits: List of split updates with 'account' and 'amount' (optional).
@@ -707,6 +718,47 @@ def register(mcp, get_book) -> None:
             splits=_splits_to_dicts(splits),
             notes=notes,
             force=force,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="update_batch",
+        entity_type="transaction",
+    )
+    def update_transactions(
+        updates: str,
+        on_error: str = "abort",
+    ) -> str:
+        """Update MANY transactions with per-row values (bulk edit).
+
+        INPUT — ``updates`` is a TSV block: header ``guid`` plus any
+        of ``description``, ``notes``, ``date`` (at least one), then
+        one row per transaction::
+
+            guid<TAB>description<TAB>notes
+            56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
+            7f0fc117<TAB><TAB>Netflix subscription, $22.10/mo
+
+        An EMPTY cell leaves that field UNCHANGED — this batch can
+        annotate but never clear (clearing is ``update_transaction``
+        with ``notes=""``, deliberately single-transaction). Splits
+        and memos are not updatable here (``replace_splits``).
+
+        One book open, one save; ``on_error="abort"`` (default)
+        sinks the batch on any bad row, ``"skip"`` keeps good rows.
+        Returns a results TSV keyed by your input guids. For the
+        SAME value across many transactions, ``update_transaction``
+        with a guid list is cheaper than repeating rows.
+        """
+        book = get_book()
+        rows = _parse_update_tsv(updates)
+        for r in rows:
+            if "date" in r:
+                r["date"] = date.fromisoformat(r["date"])
+        result = book.update_transactions(
+            updates=rows, on_error=on_error,
         )
         return _json(result)
 

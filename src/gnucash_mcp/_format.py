@@ -626,3 +626,60 @@ def _paginate(
         f"{entity_name}{cap_note}{_range_suffix(page, date_key)}"
     )
     return page, indicator
+
+
+# ── Batch transaction-update TSV ──────────────────────────────────
+
+_UPDATE_TSV_FIELDS = ("description", "notes", "date")
+
+
+def _parse_update_tsv(tsv: str) -> list[dict]:
+    """``update_transactions`` TSV → row dicts.
+
+    Header: ``guid`` then any of ``description``, ``notes``,
+    ``date`` (at least one, any order, no repeats); unknown tokens
+    reject by name. An EMPTY cell leaves that field unchanged — the
+    key is simply absent from the row dict. ``date`` stays an ISO
+    string here (the tool layer parses; the audit display reuses
+    this parser and wants text). Shared with the audit formatter so
+    the display parse can't drift from the tool parse.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "updates TSV needs a header row and at least one data row"
+        )
+    tokens = [t.strip().lower() for t in lines[0].split("\t")]
+    while tokens and not tokens[-1]:
+        tokens.pop()
+    if not tokens or tokens[0] != "guid":
+        raise ValueError("updates header must start with guid")
+    fields = tokens[1:]
+    if not fields:
+        raise ValueError(
+            "updates header needs at least one field column "
+            "(description, notes, date)"
+        )
+    seen: set = set()
+    for tok in fields:
+        if tok not in _UPDATE_TSV_FIELDS:
+            raise ValueError(
+                f"unrecognized column {tok!r} in updates header — "
+                f"columns are guid, then description, notes, date"
+            )
+        if tok in seen:
+            raise ValueError(f"duplicate {tok!r} column in updates header")
+        seen.add(tok)
+
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        cells = ln.split("\t")
+        guid = cells[0].strip() if cells else ""
+        if not guid:
+            raise ValueError(f"row {i}: empty guid")
+        row: dict = {"guid": guid}
+        for j, tok in enumerate(fields, start=1):
+            if j < len(cells) and cells[j].strip():
+                row[tok] = cells[j].strip()
+        out.append(row)
+    return out

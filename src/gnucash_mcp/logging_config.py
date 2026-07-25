@@ -689,10 +689,87 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_transaction_update_batch(entry: dict) -> list[str]:
+    """``update_transactions`` (TSV, per-row values) — old→new per
+    touched field, old values from the staged before-state, new
+    from the submitted TSV re-parsed through the SAME parser the
+    tool used (no display drift)."""
+    from gnucash_mcp._format import _parse_update_tsv
+
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    befores = {
+        (t.get("guid") or ""): t
+        for t in before.get("transactions") or []
+    }
+    try:
+        rows = _parse_update_tsv(params.get("updates") or "")
+    except ValueError:
+        rows = []
+    lines = [
+        f"{time_part}  UPDATE TRANSACTIONS (batch)  {len(rows)} rows"
+    ]
+    for r in rows[:15]:
+        key = r["guid"]
+        old = next(
+            (
+                b for g, b in befores.items()
+                if g.startswith(key) or key.startswith(g[:8])
+            ),
+            {},
+        )
+        parts = [f"guid:{key}"]
+        if "description" in r:
+            old_d = old.get("description", "")
+            parts.append(f'"{old_d}" → "{r["description"]}"')
+        if "notes" in r:
+            old_n = old.get("notes") or "(none)"
+            parts.append(f"Notes: {old_n} → {r['notes']}")
+        if "date" in r:
+            old_dt = old.get("date", "")
+            parts.append(f"Date: {old_dt} → {r['date']}")
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    if len(rows) > 15:
+        lines.append(f"{_INDENT}... and {len(rows) - 15} more")
+    return lines
+
+
 def _fmt_transaction_update(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
     guid = _transaction_guid(entry)
+
+    # Broadcast form (guid list): one entry, shared values once,
+    # then the touched transactions. Same dispatch key as single
+    # update — the staged shape is the discriminator, mirroring
+    # batch delete.
+    if before and "transactions" in before:
+        params = entry.get("params") or {}
+        touched = before.get("transactions") or []
+        lines = [
+            f"{time_part}  UPDATE TRANSACTIONS (broadcast)  "
+            f"{len(touched)} updated"
+        ]
+        if params.get("description") is not None:
+            lines.append(
+                f'{_INDENT}Description → "{params["description"]}"'
+            )
+        if params.get("transaction_date"):
+            lines.append(
+                f"{_INDENT}Date → {params['transaction_date']}"
+            )
+        if params.get("notes") is not None:
+            new = params["notes"] or "(cleared)"
+            lines.append(f"{_INDENT}Notes → {new}")
+        for t in touched[:10]:
+            lines.append(
+                f'{_INDENT}  guid:{(t.get("guid") or "")[:8]}  '
+                f'"{t.get("description", "")}"'
+            )
+        if len(touched) > 10:
+            lines.append(f"{_INDENT}  ... and {len(touched) - 10} more")
+        return lines
 
     lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
     if not before:
@@ -1984,6 +2061,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("transaction", "CREATE_FROM_SCHEDULED"):
         _fmt_transaction_create_from_scheduled,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
+    ("transaction", "UPDATE_BATCH"): _fmt_transaction_update_batch,
     ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,
     ("transaction", "UNVOID"): _fmt_transaction_unvoid,

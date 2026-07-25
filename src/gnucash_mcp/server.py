@@ -149,6 +149,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "create_transaction",
         "create_transactions",
         "update_transaction",
+        "update_transactions",
         "delete_transaction",
         "replace_splits",
         "search_transactions",
