@@ -4350,18 +4350,206 @@ class CoreMixin:
                     )
                 bucket.pop(match_idx)
 
+    def _update_transactions_broadcast(
+        self,
+        guids: list[str],
+        description: str | None = None,
+        trans_date: date | None = None,
+        splits: list[dict] | None = None,
+        notes: str | None = None,
+    ) -> dict:
+        """Apply the same field values to every listed transaction.
+
+        All-or-nothing: every guid resolves and passes the voided
+        gate before anything mutates, mirroring batch delete. Splits
+        are single-transaction territory — a broadcast split edit
+        matched "by account" against N different transactions is a
+        semantic minefield, so it rejects loudly.
+        """
+        if not guids:
+            raise ValueError("guid list is empty")
+        if splits is not None:
+            raise ValueError(
+                "splits updates are single-transaction only — pass "
+                "one guid, or use replace_splits per transaction"
+            )
+        if description is None and trans_date is None and notes is None:
+            raise ValueError(
+                "nothing to update — supply description, "
+                "transaction_date, and/or notes"
+            )
+        with self.open(readonly=False) as book:
+            transactions = []
+            for g in guids:
+                txn = self._find_transaction(book, g)
+                if not txn:
+                    raise ValueError(f"Transaction not found: {g}")
+                if any(_is_voided(sp) for sp in txn.splits):
+                    raise ValueError(
+                        f"Transaction {g} is voided. Use "
+                        f"unvoid_transaction first, then update."
+                    )
+                transactions.append(txn)
+
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for t in transactions
+                ],
+            })
+
+            for txn in transactions:
+                if description is not None:
+                    txn.description = description
+                if notes is not None:
+                    txn.notes = notes if notes else None
+                if trans_date is not None:
+                    txn.post_date = trans_date
+
+            book.save()
+
+            for txn in transactions:
+                self._verify_transaction_state(
+                    book, txn,
+                    expected_description=description,
+                    expected_date=trans_date,
+                    expected_notes=notes,
+                )
+
+            all_guids = [t.guid for t in book.transactions]
+            return {
+                "status": "updated",
+                "count": len(transactions),
+                "transactions": [
+                    {
+                        "guid": _unique_prefix(t.guid, all_guids),
+                        "description": t.description,
+                    }
+                    for t in transactions
+                ],
+            }
+
+    def update_transactions(
+        self,
+        updates: list[dict],
+        on_error: str = "abort",
+    ) -> dict:
+        """Per-row transaction updates in one book-open / one save.
+
+        Each entry: ``{guid, description (optional), notes
+        (optional), date (optional, datetime.date)}`` — absent keys
+        leave the field unchanged (the TSV's empty cells). Clearing
+        a field is deliberately single-tool territory
+        (``update_transaction`` with ``notes=""``) so a sparse batch
+        can never mass-erase.
+
+        ``on_error="abort"`` (default) sinks the batch on any bad
+        row; ``"skip"`` keeps the good rows. Returns ``{"results":
+        TSV}`` keyed by the input guid.
+        """
+        if on_error not in ("abort", "skip"):
+            raise ValueError("on_error must be 'abort' or 'skip'")
+        keys = [u["guid"] for u in updates]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "duplicate guid in batch — each transaction may "
+                "appear once"
+            )
+
+        by_key: dict = {}
+        with self.open(readonly=False) as book:
+            prepared = []
+            for u in updates:
+                key = u["guid"]
+                try:
+                    if not any(
+                        f in u for f in ("description", "notes", "date")
+                    ):
+                        raise ValueError(
+                            "row changes nothing — every cell empty"
+                        )
+                    txn = self._find_transaction(book, key)
+                    if not txn:
+                        raise ValueError(f"Transaction not found: {key}")
+                    if any(_is_voided(sp) for sp in txn.splits):
+                        raise ValueError(
+                            f"Transaction {key} is voided. Use "
+                            f"unvoid_transaction first, then update."
+                        )
+                    prepared.append((u, txn))
+                except (ValueError, KeyError) as e:
+                    by_key[key] = {
+                        "guid": key, "status": "rejected",
+                        "reason": str(e),
+                    }
+
+            if by_key and on_error == "abort":
+                for u, _txn in prepared:
+                    by_key[u["guid"]] = {
+                        "guid": u["guid"], "status": "rejected",
+                        "reason": "batch_aborted",
+                    }
+                return self._updates_envelope(updates, by_key)
+
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for _u, t in prepared
+                ],
+            })
+
+            for u, txn in prepared:
+                if "description" in u:
+                    txn.description = u["description"]
+                if "notes" in u:
+                    txn.notes = u["notes"] or None
+                if "date" in u:
+                    txn.post_date = u["date"]
+
+            if prepared:
+                book.save()
+
+            for u, txn in prepared:
+                self._verify_transaction_state(
+                    book, txn,
+                    expected_description=u.get("description"),
+                    expected_date=u.get("date"),
+                    expected_notes=u.get("notes"),
+                )
+                by_key[u["guid"]] = {
+                    "guid": u["guid"], "status": "updated",
+                    "description": txn.description,
+                }
+
+            return self._updates_envelope(updates, by_key)
+
+    @staticmethod
+    def _updates_envelope(updates: list[dict], by_key: dict) -> dict:
+        lines = ["guid\tstatus\tdescription\treason"]
+        for u in updates:
+            r = by_key.get(u["guid"], {})
+            lines.append(
+                f"{u['guid']}\t{r.get('status', '')}\t"
+                f"{r.get('description', '')}\t{r.get('reason', '')}"
+            )
+        return {"results": "\n".join(lines)}
+
     def update_transaction(
         self,
-        guid: str,
+        guid: str | list[str],
         description: str | None = None,
         trans_date: date | None = None,
         splits: list[dict] | None = None,
         notes: str | None = None,
         force: bool = False,
     ) -> dict:
-        """Update an existing transaction.
+        """Update an existing transaction — or broadcast one change
+        to several.
 
         Args:
+            guid: One GUID, or a LIST of them: the supplied field
+                values apply to EVERY listed transaction (one book
+                open, one save, all-or-nothing). The batch-annotation
+                case — same note on 35 related entries — in one call.
+                ``splits`` is single-transaction only.
             description / trans_date / notes: Optional; ``notes=""``
                 clears.
             splits: Optional split updates matched to existing splits
@@ -4370,13 +4558,20 @@ class CoreMixin:
                 when splits change).
 
         Returns:
-            Thin dict: {guid, date, description, status}.
+            Thin dict: {guid, date, description, status}; for a
+            list, ``{status, count, transactions: [{guid,
+            description}]}``.
 
         Raises:
             ValueError: not found, voided, imbalance, account not in
                 transaction, missing quantity, or reconciled without
                 force.
         """
+        if isinstance(guid, list):
+            return self._update_transactions_broadcast(
+                guid, description=description, trans_date=trans_date,
+                splits=splits, notes=notes,
+            )
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
