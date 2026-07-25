@@ -127,6 +127,69 @@ class ReconciliationMixin:
                 "status": "updated",
             }
 
+    def get_reconciliation_status(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
+        """Per-account reconciliation table behind the dashboard's
+        aggregate counts — the drill-down that answers "WHICH five
+        accounts are never reconciled?"
+
+        One row per reconcilable account with activity, bucketed by
+        the same classification the dashboard uses (agree-by-
+        construction): ``behind`` (most-behind first), ``never``,
+        ``current``, ``dormant`` ($0, fully reconciled, idle), and
+        ``excluded`` (the account's ``no_reconcile`` slot — set via
+        set_account_slot — opts it out of dashboard warnings;
+        loans and escrow payables with no statement to reconcile).
+
+        Args:
+            compact: One TSV line per account (default) or the
+                verbose envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
+        """
+        with self.open(readonly=True) as book:
+            accounts = list(book.accounts)
+            rows = self._account_reconciliation_status(book, accounts)
+            for r in rows:
+                r["bucket"] = self._classify_reconciliation(r)
+            bucket_rank = {
+                "behind": 0, "never": 1, "current": 2,
+                "dormant": 3, "excluded": 4,
+            }
+            rows.sort(key=lambda r: (
+                bucket_rank[r["bucket"]],
+                -(r["days_behind"] or 0),
+                r["account"],
+            ))
+
+            page, indicator = _paginate(
+                rows, offset=offset, limit=limit,
+                entity_name="accounts",
+            )
+            if compact:
+                lines = [indicator]
+                for r in page:
+                    cells = [r["account"], r["bucket"], r["status"]]
+                    n = r["unreconciled_count"]
+                    if n:
+                        cell = f"{n} unreconciled"
+                        if r.get("oldest_unreconciled_date"):
+                            cell += (
+                                f" (oldest: "
+                                f"{r['oldest_unreconciled_date']})"
+                            )
+                        cells.append(cell)
+                    lines.append("\t".join(cells))
+                return "\n".join(lines)
+            return {
+                "showing": indicator,
+                "total": len(rows),
+                "offset": offset,
+                "count": len(page),
+                "accounts": page,
+            }
+
     def get_unreconciled_splits(
         self,
         account_name: str,

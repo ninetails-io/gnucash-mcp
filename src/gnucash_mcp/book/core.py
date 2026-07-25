@@ -1507,6 +1507,33 @@ class CoreMixin:
     # cross-section state: adding or reordering a section is a
     # one-method change.
 
+    def _classify_reconciliation(self, entry: dict) -> str:
+        """One bucket per reconciliation-status row — the SHARED
+        classification for the dashboard renderer and
+        get_reconciliation_status, so the aggregate counts and the
+        drill-down table agree by construction.
+
+        Buckets: ``excluded`` (no_reconcile opt-out), ``never``,
+        ``behind`` (stale with pending work OR a carried balance —
+        months of silence on a carried balance means missing
+        entries, since interest posts monthly), ``dormant`` (stale
+        but $0 and fully reconciled: nothing owed, nothing a
+        statement could reveal — the bookkeeper's stamped-dormant-
+        cards finding), ``current``.
+        """
+        if entry.get("excluded"):
+            return "excluded"
+        if entry["status"] == "never reconciled":
+            return "never"
+        if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+            if (
+                entry["unreconciled_count"] == 0
+                and entry.get("balance_zero")
+            ):
+                return "dormant"
+            return "behind"
+        return "current"
+
     def _render_reconciliation(
         self, reconciliation: list[dict],
     ) -> list[str]:
@@ -1525,31 +1552,18 @@ class CoreMixin:
         never_count = 0
         dormant_count = 0
         for entry in reconciliation:
-            if entry.get("excluded"):
+            bucket = self._classify_reconciliation(entry)
+            if bucket == "excluded":
                 # no_reconcile opt-outs: dashboard-silent by the
                 # user's own declaration; get_reconciliation_status
                 # is the honesty backstop.
                 continue
-            if entry["status"] == "never reconciled":
+            if bucket == "never":
                 never_count += 1
-            elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
-                # Fully reconciled + zero balance + no activity =
-                # DORMANT, not behind: nothing owed, nothing
-                # unentered that a statement could reveal. A $0
-                # card idle since March needs no orange badge —
-                # but a CARRIED balance with months of silence
-                # means missing entries (interest posts monthly),
-                # so those stay individually warned. (Bookkeeper
-                # finding: stamped dormant cards kept warning
-                # because "through" tracks the last reconciled
-                # SPLIT, which a 0-split sweep can't advance.)
-                if (
-                    entry["unreconciled_count"] == 0
-                    and entry.get("balance_zero")
-                ):
-                    dormant_count += 1
-                else:
-                    stale.append(entry)
+            elif bucket == "dormant":
+                dormant_count += 1
+            elif bucket == "behind":
+                stale.append(entry)
             else:
                 current_count += 1
 

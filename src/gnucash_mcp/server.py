@@ -183,6 +183,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_server_config",
     ],
     "reconciliation": [
+        "get_reconciliation_status",
         "get_unreconciled_splits",
         "set_reconcile_state",
         "reconcile_account",

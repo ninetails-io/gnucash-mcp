@@ -12826,3 +12826,72 @@ class TestNoReconcileSlot:
             recon = summary.split("Reconciliation:")[1]
             hidden = "never reconciled" not in recon
             assert hidden is expected_hidden, (raw, expected_hidden)
+
+
+class TestGetReconciliationStatus:
+    """The drill-down behind the dashboard aggregates: WHICH
+    accounts are behind / never reconciled / dormant / excluded,
+    bucketed by the same classification the dashboard uses."""
+
+    def test_buckets_named_and_ordered(self, test_book: Path):
+        from datetime import timedelta as _td
+
+        gc = GnuCashBook(str(test_book))
+        # never: a loan with activity, no stamps.
+        gc.create_account(
+            name="Navient", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest",
+            splits=[
+                {"account": "Liabilities:Navient", "amount": "-55.00"},
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+            ],
+        )
+        # excluded: same shape, flagged.
+        gc.create_account(
+            name="MOHELA", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest 2",
+            splits=[
+                {"account": "Liabilities:MOHELA", "amount": "-10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+            ],
+        )
+        gc.set_account_slot("Liabilities:MOHELA", "no_reconcile", "1")
+        # behind: stamp ONE Checking split so the account has
+        # reconcile history plus pending 2024-dated work.
+        pending = gc.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        gc.set_reconcile_state(pending[0]["guid"], "y")
+
+        out = gc.get_reconciliation_status(compact=True)
+        lines = out.split("\n")[1:]
+        by_account = {ln.split("\t")[0]: ln for ln in lines}
+        assert "never" in by_account["Liabilities:Navient"]
+        assert "excluded" in by_account["Liabilities:MOHELA"]
+        # Checking: reconciled once, years of pending work — behind,
+        # sorted first with its scope of work.
+        assert lines[0].startswith("Assets:Checking")
+        assert "behind" in lines[0]
+        assert "unreconciled" in lines[0]
+        # Excluded sorts last.
+        assert "excluded" in lines[-1]
+
+    def test_dashboard_and_drilldown_agree(self, test_book: Path):
+        """Aggregate counts in the summary equal the bucket counts
+        in the drill-down — agree-by-construction check."""
+        gc = GnuCashBook(str(test_book))
+        out = gc.get_reconciliation_status(compact=False)
+        buckets: dict = {}
+        for r in out["accounts"]:
+            buckets[r["bucket"]] = buckets.get(r["bucket"], 0) + 1
+        summary = gc.get_book_summary()
+        recon = summary.split("Reconciliation:")[1].split("Net worth")[0]
+        import re
+        m = re.search(r"(\d+) accounts? never reconciled", recon)
+        assert (int(m.group(1)) if m else 0) == buckets.get("never", 0)
