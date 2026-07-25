@@ -12754,3 +12754,75 @@ class TestReconciliationDormancy:
             ln for ln in recon.split("\n") if "Care Credit" in ln
         ][0]
         assert "dormant" not in recon
+
+
+class TestNoReconcileSlot:
+    """The ``no_reconcile`` slot: user-declared 'this account has no
+    statement to reconcile against' (loans, escrow payables). The
+    dashboard drops flagged accounts from warnings and counts;
+    reconciliation TOOLS still work on them (reporting-only flag).
+    Also the third boolean slot — the trigger that consolidated
+    _slot_bool per the standing backlog note."""
+
+    def _never_reconciled_loan(self, gc):
+        # Stamp the fixture's Checking splits first so the loan is
+        # the SOLE never-reconciled account and the aggregate line's
+        # presence/absence is attributable to the flag under test.
+        pending = gc.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        for sp in pending:
+            gc.set_reconcile_state(sp["guid"], "y")
+        gc.create_account(
+            name="Navient", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest",
+            splits=[
+                {"account": "Liabilities:Navient", "amount": "-55.00"},
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+            ],
+        )
+
+    def test_flag_removes_from_dashboard(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        before = gc.get_book_summary()
+        assert "never reconciled ⚠" in before
+
+        gc.set_account_slot("Liabilities:Navient", "no_reconcile", "1")
+        after = gc.get_book_summary()
+        recon = after.split("Reconciliation:")[1].split("Net worth")[0]
+        assert "Navient" not in recon
+        # The loan was the only never-reconciled account; its
+        # aggregate line vanishes with it.
+        assert "never reconciled" not in recon
+
+    def test_flag_is_reporting_only(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        gc.set_account_slot("Liabilities:Navient", "no_reconcile", "1")
+        d = gc.get_unreconciled_splits(
+            "Liabilities:Navient", compact=False,
+        )
+        assert d["count"] == 1  # tools unaffected by the flag
+
+    def test_slot_bool_convention(self, test_book: Path):
+        """Lenient parse, tri-state: unrecognized values read as
+        absent so callers keep their own fallbacks."""
+        from gnucash_mcp.book._base import _slot_bool
+
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        for raw, expected_hidden in (
+            ("yes", True), ("TRUE", True), ("on", True),
+            ("0", False), ("no", False), ("garbage", False),
+        ):
+            gc.set_account_slot(
+                "Liabilities:Navient", "no_reconcile", raw,
+            )
+            summary = gc.get_book_summary()
+            recon = summary.split("Reconciliation:")[1]
+            hidden = "never reconciled" not in recon
+            assert hidden is expected_hidden, (raw, expected_hidden)

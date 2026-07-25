@@ -26,6 +26,7 @@ from gnucash_mcp._format import _paginate
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
+    _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
@@ -296,6 +297,23 @@ class CoreMixin:
                     and account.type != "ASSET":
                 continue
 
+            # User-declared opt-out: loans, escrow payables, cash
+            # wallets — accounts with no statement to reconcile
+            # against. Reporting-only: reconcile_account and
+            # get_unreconciled_splits still work normally on
+            # flagged accounts. The excluded row keeps the account
+            # visible to get_reconciliation_status (no silent
+            # caps); the dashboard renderer drops it.
+            if _slot_bool(account, "no_reconcile") is True:
+                results.append({
+                    "account": account.fullname,
+                    "status": "excluded (no_reconcile)",
+                    "days_behind": None,
+                    "unreconciled_count": 0,
+                    "excluded": True,
+                })
+                continue
+
             # Single pass over splits derives latest_y_date, has_yc
             # (the ASSET gate), any_splits, unreconciled_count, and
             # oldest_unreconciled_date. ``_is_unreconciled`` is the
@@ -554,9 +572,6 @@ class CoreMixin:
     # opt back in.
     _RETIREMENT_SLOT_KEY = "is_retirement"
 
-    _RETIREMENT_SLOT_TRUE = frozenset({"1", "true", "yes", "y"})
-    _RETIREMENT_SLOT_FALSE = frozenset({"0", "false", "no", "n"})
-
     def _is_in_retirement_subtree(self, account) -> bool:
         """True when the account is penalty-locked retirement money
         that must not count as liquid for runway / low-cash.
@@ -572,21 +587,14 @@ class CoreMixin:
         slot there. A subtree named "Tax-advantaged" has the same
         gap in any locale.
         """
-        from gnucash_mcp.book._base import _slot_value_str
+        from gnucash_mcp.book._base import _slot_bool
 
         node = account
         while node is not None and node.type != "ROOT":
-            try:
-                raw = node[self._RETIREMENT_SLOT_KEY]
-            except KeyError:
-                raw = None
-            if raw is not None:
-                val = (_slot_value_str(raw) or "").strip().lower()
-                if val in self._RETIREMENT_SLOT_TRUE:
-                    return True
-                if val in self._RETIREMENT_SLOT_FALSE:
-                    return False
-                # Unrecognized value: keep walking rather than guess.
+            flag = _slot_bool(node, self._RETIREMENT_SLOT_KEY)
+            if flag is not None:
+                return flag
+            # Absent or unrecognized: keep walking rather than guess.
             node = node.parent
         return any(
             "retirement" in part.lower()
@@ -1517,6 +1525,11 @@ class CoreMixin:
         never_count = 0
         dormant_count = 0
         for entry in reconciliation:
+            if entry.get("excluded"):
+                # no_reconcile opt-outs: dashboard-silent by the
+                # user's own declaration; get_reconciliation_status
+                # is the honesty backstop.
+                continue
             if entry["status"] == "never reconciled":
                 never_count += 1
             elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:

@@ -357,6 +357,35 @@ _DEFAULT_TYPES = {
 }
 
 
+_SLOT_BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
+_SLOT_BOOL_FALSE = frozenset({"0", "false", "no", "n", "off", ""})
+
+
+def _slot_bool(entity, key: str) -> bool | None:
+    """Tri-state boolean slot read: True, False, or None (absent /
+    unrecognized).
+
+    THE convention for boolean slots — extracted per the standing
+    backlog note when the third boolean slot (``no_reconcile``)
+    arrived: ``credit-note`` parsed strictly (== "1") while
+    ``is_retirement`` parsed leniently, and a third private
+    convention was the trigger to consolidate. Lenient wins because
+    slot values are user-typed through set_account_slot; an
+    unrecognized value returns None so each caller keeps its own
+    fallback semantics instead of this helper guessing.
+    """
+    try:
+        raw = entity[key]
+    except KeyError:
+        return None
+    val = (_slot_value_str(raw) or "").strip().lower()
+    if val in _SLOT_BOOL_TRUE:
+        return True
+    if val in _SLOT_BOOL_FALSE:
+        return False
+    return None
+
+
 def _account_to_compact_line(account: piecash.Account) -> str:
     """Convert a piecash Account to a compact one-line string.
 
