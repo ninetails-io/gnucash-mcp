@@ -12641,3 +12641,55 @@ class TestUpdateTransactionsTsv:
             "guid\tdescription\tnotes\nabc123\t\tonly notes"
         )
         assert rows[0] == {"guid": "abc123", "notes": "only notes"}
+
+
+class TestFrequentAccounts:
+    """get_book_summary hands each session its working vocabulary:
+    top accounts by recent posting frequency, in list_accounts'
+    exact %short-GUID line format (bookkeeper finding: short GUIDs
+    went unused because they were never in context when the
+    model's account vocabulary formed)."""
+
+    def test_section_present_ordered_and_reusable(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        # Groceries gets three recent postings, Salary one.
+        for i in range(3):
+            gc.create_transaction(
+                description=f"G{i}",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            )
+        summary = gc.get_book_summary()
+        assert "Frequently used accounts (last 180 days):" in summary
+        section = summary.split("Frequently used accounts")[1]
+        lines = [
+            ln.strip() for ln in section.split("\n")[1:]
+            if ln.strip().startswith("%")
+        ]
+        assert lines, "expected %short-GUID vocabulary lines"
+        # list_accounts line format: %short<TAB>fullname [TYPE].
+        first = lines[0]
+        assert "\t" in first
+        short, rest = first.split("\t", 1)
+        assert short.startswith("%") and len(short) >= 8
+        # Ordering: the two most-posted are checking + groceries.
+        top_two = {ln.split("\t", 1)[1].split(" [")[0] for ln in lines[:2]}
+        assert top_two == {"Assets:Checking", "Expenses:Groceries"}
+        # The emitted short ref actually resolves (book-layer
+        # get_balance returns a bare Decimal; an unresolvable ref
+        # raises).
+        assert isinstance(gc.get_balance(short), Decimal)
+
+    def test_old_activity_outside_window_excluded(
+        self, test_book: Path,
+    ):
+        """The fixture's 2024 transactions are outside the 180-day
+        window; with no recent activity the section is absent
+        rather than rendering stale vocabulary."""
+        gc = GnuCashBook(str(test_book))
+        summary = gc.get_book_summary()
+        assert "Frequently used accounts" not in summary

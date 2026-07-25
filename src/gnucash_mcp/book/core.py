@@ -1777,6 +1777,54 @@ class CoreMixin:
         )
         return data
 
+    def _frequent_accounts(
+        self, book, transactions, days: int = 180, top: int = 15,
+    ) -> list[str]:
+        """The book's working vocabulary: most-posted accounts.
+
+        Short GUIDs went essentially unused in live bookkeeping
+        because they were never in the model's context at the
+        moment its account vocabulary formed — it paged
+        list_accounts once, or guessed paths. Handing the top
+        accounts (with their ``%short`` refs, in list_accounts'
+        exact line format) to every session at orientation makes
+        the compact refs the path of least resistance, and the
+        list is book-adaptive: each book surfaces its own chart's
+        vocabulary in its own language.
+
+        Placeholders can't receive splits, so posting frequency
+        naturally yields only postable accounts; template
+        recipes are excluded explicitly.
+        """
+        cutoff = date.today() - timedelta(days=days)
+        template_guids = self._template_account_guids(book)
+        counts: dict[str, int] = {}
+        by_guid: dict = {}
+        for txn in transactions:
+            post_date = txn.post_date
+            if isinstance(post_date, datetime):
+                post_date = post_date.date()
+            if post_date is None or post_date < cutoff:
+                continue
+            if self._is_template_transaction(txn, template_guids):
+                continue
+            for s in txn.splits:
+                g = s.account.guid
+                counts[g] = counts.get(g, 0) + 1
+                by_guid[g] = s.account
+        ranked = sorted(
+            counts.items(), key=lambda kv: (-kv[1], by_guid[kv[0]].fullname),
+        )[:top]
+        if not ranked:
+            return []
+        short_map = self._account_short_guid_map(book)
+        lines = [f"Frequently used accounts (last {days} days):"]
+        for g, _n in ranked:
+            lines.append(
+                f"  {short_map[g]}\t{_account_to_compact_line(by_guid[g])}"
+            )
+        return lines
+
     def _render_book_metadata(
         self,
         currency: str,
@@ -2231,6 +2279,10 @@ class CoreMixin:
             lines.append(
                 f"Expenses: {data.expense_active} active "
                 f"({data.expense_total} total)"
+            )
+
+            lines.extend(
+                self._frequent_accounts(book, transactions)
             )
 
             reconciliation = self._account_reconciliation_status(
