@@ -2407,7 +2407,7 @@ class CoreMixin:
         with self.open(readonly=True) as book:
             account = self._resolve_account(book, account_name)
             if not account:
-                raise ValueError(f"Account not found: {account_name}")
+                raise self._account_not_found_error(book, account_name)
 
             return self._own_splits_balance(account, as_of=as_of_date)
 
@@ -2965,7 +2965,7 @@ class CoreMixin:
             ref = split["account"]
             account = self._resolve_account(book, ref)
             if not account:
-                raise ValueError(f"Account not found: {ref}")
+                raise self._account_not_found_error(book, ref)
 
             value = _to_decimal(split["amount"])
             if account.commodity == trans_currency:
@@ -3353,10 +3353,7 @@ class CoreMixin:
                     )
                     for v in validated:
                         if v["account"].placeholder:
-                            raise ValueError(
-                                f"account '{v['account'].fullname}' is a "
-                                f"placeholder and cannot receive splits"
-                            )
+                            raise self._placeholder_error(v["account"])
                     prepared.append({
                         "ref": ref,
                         "description": txn["description"],
@@ -4570,11 +4567,11 @@ class CoreMixin:
                 account_name = split_data["account"]
                 account = self._resolve_account(book, account_name)
                 if not account:
-                    raise ValueError(f"Account not found: {account_name}")
-                if account.placeholder:
-                    raise ValueError(
-                        f"Cannot use placeholder account: {account_name}"
+                    raise self._account_not_found_error(
+                        book, account_name,
                     )
+                if account.placeholder:
+                    raise self._placeholder_error(account)
                 resolved_accounts.append((account, split_data))
 
             # 4a. Voided transactions are immutable — same

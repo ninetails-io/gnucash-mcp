@@ -7384,7 +7384,7 @@ class TestReplaceSplits:
         guid = transactions[0]["guid"]
 
         # Expenses is a placeholder in test_book
-        with pytest.raises(ValueError, match="placeholder account"):
+        with pytest.raises(ValueError, match="is a placeholder.*post to one of its children"):
             gc_book.replace_splits(
                 guid=guid,
                 splits=[
@@ -8027,48 +8027,102 @@ class TestReconcileAccount:
         )
         assert unreconciled_after["splits"] == []
 
-    def test_reconcile_all_no_default_date_filter(self, test_book: Path):
-        """Bulk mode must NOT default to a date filter — the
-        bookkeeper's CareCredit payoff scenario had payment splits
-        dated AFTER the statement_date, and the test fixture's
-        analogue is splits across Jan 1 / 15 / 20 reconciled against
-        a Jan 10 statement. Pre-fix the default ``through_date =
-        statement_date`` excluded Jan 15 and Jan 20 splits silently;
-        post-fix every unreconciled split is included regardless of
-        date when no ``through_date`` is passed.
+    def test_bulk_default_bounded_by_statement_date(self, test_book: Path):
+        """Bulk mode defaults ``through_date`` to ``statement_date``.
+
+        This default has now flipped once in each direction — read
+        both incidents before flipping it a third time:
+
+        - **CareCredit payoff (2026-05, shaped the original
+          no-filter default):** a final statement plus a payoff
+          payment dated AFTER the statement date needed one sweep.
+          Under the bounded default that flow passes an explicit
+          later ``through_date`` (see
+          ``test_reconcile_all_respects_through_date``), and the
+          bulk balance-mismatch error hints exactly that.
+        - **Multi-month catch-up (2026-07, flipped it to bounded):**
+          enter several months of card transactions, reconcile each
+          statement in turn. Under no-filter, every statement but
+          the last broke the balance tie, forcing a per-statement
+          GUID-picking dance (live bookkeeper finding, four cards
+          in one night). Statement reconciliation is definitionally
+          bounded by the statement; the frequent case wins the
+          default and the rare payoff case pays one parameter.
+
+        Fixture has splits on 2024-01-01, 01-15, 01-20: the Jan-10
+        statement sweeps only Jan 1; the Jan-31 statement then
+        sweeps the rest — two bare calls, no GUIDs.
         """
         gc_book = GnuCashBook(str(test_book))
 
         unreconciled_all = gc_book.get_unreconciled_splits(
             "Assets:Checking", compact=False,
         )
-        total = sum(
-            (Decimal(s["amount"]) for s in unreconciled_all["splits"]),
-            Decimal("0"),
-        )
-        expected_count = len(unreconciled_all["splits"])
-        # The test fixture has at least one split AFTER the early
-        # statement date; if not, this assertion documents the gap.
-        early_cutoff = date(2024, 1, 10)
-        after_cutoff = [
-            s for s in unreconciled_all["splits"]
-            if date.fromisoformat(s["date"]) > early_cutoff
+        all_splits = unreconciled_all["splits"]
+        cutoff = date(2024, 1, 10)
+        early = [
+            s for s in all_splits
+            if date.fromisoformat(s["date"]) <= cutoff
         ]
-        assert after_cutoff, (
-            "Test setup: expected at least one split after the "
-            "early statement date to exercise the no-default-filter "
-            "behavior."
+        late = [
+            s for s in all_splits
+            if date.fromisoformat(s["date"]) > cutoff
+        ]
+        assert early and late, (
+            "Test setup: need splits on both sides of the early "
+            "statement date."
+        )
+        early_total = sum(
+            (Decimal(s["amount"]) for s in early), Decimal("0"),
         )
 
-        # statement_date is BEFORE some splits, but no through_date
-        # is passed — every unreconciled split must be included.
+        # Statement 1: bare bulk call sweeps ONLY through Jan 10.
         result = gc_book.reconcile_account(
             account_name="Assets:Checking",
-            statement_date=early_cutoff,
-            statement_balance=str(total),
+            statement_date=cutoff,
+            statement_balance=str(early_total),
             reconcile_all=True,
         )
-        assert result["splits_reconciled"] == expected_count
+        assert result["splits_reconciled"] == len(early)
+        remaining = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        assert len(remaining) == len(late)
+
+        # Statement 2: the next bare call finishes the catch-up.
+        full_total = sum(
+            (Decimal(s["amount"]) for s in all_splits), Decimal("0"),
+        )
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(full_total),
+            reconcile_all=True,
+        )
+        assert result["splits_reconciled"] == len(late)
+
+    def test_bulk_mismatch_error_hints_through_date(
+        self, test_book: Path,
+    ):
+        """The payoff shape fails the tie loudly WITH the fix named:
+        the bulk mismatch error tells the caller to widen
+        through_date."""
+        gc_book = GnuCashBook(str(test_book))
+        all_splits = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        full_total = sum(
+            (Decimal(s["amount"]) for s in all_splits), Decimal("0"),
+        )
+        # Statement balance includes post-statement items, but the
+        # bounded sweep can't reach them.
+        with pytest.raises(ValueError, match="pass through_date"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 10),
+                statement_balance=str(full_total),
+                reconcile_all=True,
+            )
 
     def test_reconcile_all_respects_through_date(self, test_book: Path):
         """When ``through_date`` is set, ``reconcile_all`` only touches
@@ -12382,3 +12436,74 @@ class TestSplitAction:
             if s["account"] == "Assets:Checking"
         )
         assert chk["action"] == "Wire"
+
+
+class TestAccountErrorSuggestions:
+    """Account-resolution failures teach instead of just rejecting.
+
+    Every wrong path guess in a batch was a rejected row and a
+    retry round-trip (bookkeeper friction, 2026-07-24): near-miss
+    paths get did-you-mean candidates, placeholder rejections name
+    postable children. Error-path only — success costs nothing."""
+
+    def test_truncated_leaf_suggests_full_path(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.create_transaction(
+                description="x",
+                splits=[
+                    {"account": "Expenses:Grocer", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            )
+        assert "Did you mean" in str(e.value)
+        assert "Expenses:Groceries" in str(e.value)
+
+    def test_nonsense_ref_stays_plain(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.get_balance("Zzz:Qqqqq:Wwww")
+        assert "Account not found" in str(e.value)
+        assert "Did you mean" not in str(e.value)
+
+    def test_placeholder_rejection_names_children(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Utilities", account_type="EXPENSE",
+            parent="Expenses", placeholder=True,
+        )
+        gc.create_account(
+            name="Water", account_type="EXPENSE",
+            parent="Expenses:Utilities",
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "Water bill",
+            "splits": [
+                {"account": "Expenses:Utilities", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "placeholder" in rows[0]["reason"]
+        assert "Expenses:Utilities:Water" in rows[0]["reason"]
+
+    def test_batch_row_rejection_carries_suggestion(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "x",
+            "splits": [
+                {"account": "Expenses:Grocery", "amount": "5.00"},
+                {"account": "Assets:Checking", "amount": "-5.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "Did you mean" in rows[0]["reason"]
+        assert "Expenses:Groceries" in rows[0]["reason"]
