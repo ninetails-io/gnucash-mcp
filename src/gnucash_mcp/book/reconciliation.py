@@ -259,13 +259,19 @@ class ReconciliationMixin:
         - **Targeted** (``split_guids=[...]``): reconcile exactly
           the listed splits.
         - **Bulk** (``reconcile_all=True``): reconcile every
-          unreconciled split on the account — the OFX-import common
-          case. ``through_date`` optionally bounds the sweep; the
-          default is NO date filter (defaulting to statement_date
-          would silently exclude payments dated after the
-          statement). ``except_guids`` excludes named splits ("the
-          statement covers everything except this pending ACH");
-          non-resolving prefixes are silently ignored.
+          unreconciled split on the account dated on or before
+          ``through_date``, which DEFAULTS TO ``statement_date`` —
+          a statement reconciliation is bounded by the statement.
+          (The old no-filter default made multi-month entry
+          unreconcilable in bulk: later months broke the balance
+          tie, forcing a targeted GUID-picking dance per statement
+          — live bookkeeper finding, 2026-07-24. Nothing is
+          silently excluded either way: the tie check rejects with
+          the discrepancy when the window and the statement
+          disagree.) Pass a later ``through_date`` explicitly to
+          widen the sweep. ``except_guids`` excludes named splits
+          ("the statement covers everything except this pending
+          ACH"); non-resolving prefixes are silently ignored.
 
         The two modes are mutually exclusive, and both verify the
         resulting reconciled balance ties to ``statement_balance``
@@ -292,6 +298,9 @@ class ReconciliationMixin:
                 "Use either bulk mode (reconcile_all=True) or targeted "
                 "mode (split_guids=[...]), not both."
             )
+        if reconcile_all and through_date is None:
+            through_date = statement_date
+
         if not reconcile_all and not split_guids:
             raise ValueError(
                 "Must provide split_guids for targeted reconciliation, "
@@ -385,10 +394,18 @@ class ReconciliationMixin:
                 reconciled_balance + reconciling_total
             ).quantize(quantum)
             if new_balance != expected_q:
+                hint = ""
+                if reconcile_all:
+                    hint = (
+                        " Bulk mode swept splits through "
+                        f"{through_date.isoformat()}; if the statement "
+                        "includes later-dated items (e.g. a payoff "
+                        "payment), pass through_date past them."
+                    )
                 raise ValueError(
                     f"Balance mismatch: reconciled balance would be {new_balance}, "
                     f"but statement balance is {expected_q}. "
-                    f"Difference: {expected_q - new_balance}"
+                    f"Difference: {expected_q - new_balance}.{hint}"
                 )
 
             # Audit before-state in the multi-split shape the

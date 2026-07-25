@@ -94,9 +94,10 @@ def register(mcp, get_book) -> None:
             list[str] | None,
             Field(
                 description=(
-                    "List of split GUIDs to reconcile (8+ char prefixes "
-                    "accepted). Required for targeted mode; omit when "
-                    "using reconcile_all=true."
+                    "List of SPLIT GUIDs to reconcile (8+ char prefixes "
+                    "accepted). These are NOT transaction GUIDs — get "
+                    "them from get_unreconciled_splits. Required for "
+                    "targeted mode; omit when using reconcile_all=true."
                 ),
                 default=None,
             ),
@@ -106,11 +107,12 @@ def register(mcp, get_book) -> None:
             Field(
                 description=(
                     "When true, reconcile every unreconciled split on "
-                    "the account. Avoids the ~300-token GUID round-"
-                    "trip for OFX-import workflows. Pass through_date "
-                    "to add an upper-date filter; by default no date "
-                    "filter is applied. Mutually exclusive with "
-                    "split_guids."
+                    "the account dated on or before through_date "
+                    "(default: statement_date). Avoids the ~300-token "
+                    "GUID round-trip for statement workflows — enter "
+                    "several months of transactions, then reconcile "
+                    "each statement with just its date and balance. "
+                    "Mutually exclusive with split_guids."
                 ),
                 default=False,
             ),
@@ -119,11 +121,11 @@ def register(mcp, get_book) -> None:
             str | None,
             Field(
                 description=(
-                    "Optional upper-date filter for reconcile_all "
-                    "(YYYY-MM-DD). When set, only splits with "
-                    "post_date <= through_date are included. Default "
-                    "is no filter — every unreconciled split is "
-                    "reconciled regardless of date."
+                    "Upper-date bound for reconcile_all (YYYY-MM-DD); "
+                    "only splits with post_date <= through_date are "
+                    "swept. DEFAULTS TO statement_date — pass a later "
+                    "date explicitly to widen the sweep past the "
+                    "statement."
                 ),
                 default=None,
             ),
@@ -146,20 +148,32 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Reconcile splits against a statement balance.
 
+        SIGN CONVENTION: statement_balance is the ACCOUNT's balance
+        in GnuCash's signs — for liability accounts (credit cards)
+        a $5,000 owed balance is "-5000", not "5000".
+
         Two modes:
 
         - **Targeted** (`split_guids=[...]`): reconcile exactly the
-          listed splits. Use when statement and book disagree and
-          you need to pick a subset.
+          listed splits (SPLIT guids from get_unreconciled_splits,
+          not transaction guids). Use when statement and book
+          disagree and you need to pick a subset.
         - **Bulk** (`reconcile_all=true`): reconcile every
-          unreconciled split on the account. One call, no GUID
-          round-trip — the common case for OFX-import workflows.
-          By default no date filter is applied; pass through_date
-          to restrict to splits on or before a specific date.
+          unreconciled split dated on or before through_date
+          (default: statement_date — a statement reconciliation is
+          bounded by the statement). One call, no GUID round-trip.
 
         Both modes verify the resulting reconciled balance ties to
         statement_balance before mutating; mismatch rejects with
         the discrepancy amount.
+
+        TYPICAL STATEMENT FLOW (credit card or bank): batch-enter
+        the statement's transactions (create_transactions), then
+        reconcile_all with the statement's closing date and balance.
+        Multi-month catch-up: enter all months in one batch, then
+        one reconcile_all per statement, oldest first — the
+        through_date default keeps each sweep inside its own
+        statement.
 
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
