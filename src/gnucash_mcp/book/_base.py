@@ -1649,6 +1649,72 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         guids.update(a.guid for a in descendants)
         return guids
 
+    def _account_suggestions(
+        self, book: piecash.Book, ref: str, limit: int = 3,
+    ) -> list[str]:
+        """Closest real account fullnames to a failed ref.
+
+        Prefix/substring hits rank first — the common near-miss is
+        the right branch with a wrong or truncated leaf
+        ("Expenses:Insurance:Auto" for
+        "Expenses:Insurance:Auto Insurance") — then difflib
+        similarity for typos. Error-path only: costs nothing on
+        successful resolution.
+        """
+        import difflib
+
+        template_guids = self._template_account_guids(book)
+        names = [
+            a.fullname for a in book.accounts
+            if a.guid not in template_guids
+        ]
+        ref_l = ref.lower()
+        subs = [
+            n for n in names
+            if n.lower().startswith(ref_l) or ref_l in n.lower()
+        ]
+        close = difflib.get_close_matches(ref, names, n=limit, cutoff=0.6)
+        out: list[str] = []
+        for n in subs + close:
+            if n not in out:
+                out.append(n)
+        return out[:limit]
+
+    def _account_not_found_error(
+        self, book: piecash.Book, ref: str,
+    ) -> ValueError:
+        """`Account not found` with did-you-mean suggestions.
+
+        Every wrong path guess in a batch is a rejected row and a
+        retry round-trip (live bookkeeper friction, 2026-07-24);
+        three candidates turn the retry into a one-shot correction.
+        """
+        msg = f"Account not found: {ref}"
+        suggestions = self._account_suggestions(book, ref)
+        if suggestions:
+            listed = ", ".join(f"'{s}'" for s in suggestions)
+            msg += (
+                f". Did you mean: {listed}? "
+                f"(list_accounts(query=...) to browse.)"
+            )
+        return ValueError(msg)
+
+    @staticmethod
+    def _placeholder_error(account) -> ValueError:
+        """Placeholder rejection that names postable children."""
+        kids = [
+            c.fullname for c in account.children if not c.placeholder
+        ]
+        msg = (
+            f"Account '{account.fullname}' is a placeholder and "
+            f"cannot receive splits"
+        )
+        if kids:
+            shown = ", ".join(f"'{k}'" for k in kids[:3])
+            more = f" (+{len(kids) - 3} more)" if len(kids) > 3 else ""
+            msg += f" — post to one of its children: {shown}{more}"
+        return ValueError(msg)
+
     @staticmethod
     def _is_template_transaction(txn, template_guids: set) -> bool:
         """True iff ``txn`` is a scheduled-transaction template recipe.

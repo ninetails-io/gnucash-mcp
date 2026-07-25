@@ -7384,7 +7384,7 @@ class TestReplaceSplits:
         guid = transactions[0]["guid"]
 
         # Expenses is a placeholder in test_book
-        with pytest.raises(ValueError, match="placeholder account"):
+        with pytest.raises(ValueError, match="is a placeholder.*post to one of its children"):
             gc_book.replace_splits(
                 guid=guid,
                 splits=[
@@ -12436,3 +12436,74 @@ class TestSplitAction:
             if s["account"] == "Assets:Checking"
         )
         assert chk["action"] == "Wire"
+
+
+class TestAccountErrorSuggestions:
+    """Account-resolution failures teach instead of just rejecting.
+
+    Every wrong path guess in a batch was a rejected row and a
+    retry round-trip (bookkeeper friction, 2026-07-24): near-miss
+    paths get did-you-mean candidates, placeholder rejections name
+    postable children. Error-path only — success costs nothing."""
+
+    def test_truncated_leaf_suggests_full_path(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.create_transaction(
+                description="x",
+                splits=[
+                    {"account": "Expenses:Grocer", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            )
+        assert "Did you mean" in str(e.value)
+        assert "Expenses:Groceries" in str(e.value)
+
+    def test_nonsense_ref_stays_plain(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.get_balance("Zzz:Qqqqq:Wwww")
+        assert "Account not found" in str(e.value)
+        assert "Did you mean" not in str(e.value)
+
+    def test_placeholder_rejection_names_children(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Utilities", account_type="EXPENSE",
+            parent="Expenses", placeholder=True,
+        )
+        gc.create_account(
+            name="Water", account_type="EXPENSE",
+            parent="Expenses:Utilities",
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "Water bill",
+            "splits": [
+                {"account": "Expenses:Utilities", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "placeholder" in rows[0]["reason"]
+        assert "Expenses:Utilities:Water" in rows[0]["reason"]
+
+    def test_batch_row_rejection_carries_suggestion(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "x",
+            "splits": [
+                {"account": "Expenses:Grocery", "amount": "5.00"},
+                {"account": "Assets:Checking", "amount": "-5.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "Did you mean" in rows[0]["reason"]
+        assert "Expenses:Groceries" in rows[0]["reason"]
