@@ -12693,3 +12693,64 @@ class TestFrequentAccounts:
         gc = GnuCashBook(str(test_book))
         summary = gc.get_book_summary()
         assert "Frequently used accounts" not in summary
+
+
+class TestReconciliationDormancy:
+    """A $0, fully-reconciled, long-idle account is DORMANT — an
+    aggregate line, no orange badge. A CARRIED balance with months
+    of silence stays individually warned: interest posts monthly,
+    so silence means missing entries. (Bookkeeper finding: stamped
+    dormant cards warned forever because a 0-split sweep can't
+    advance the last-reconciled-split date.)"""
+
+    def _card_with_history(self, gc, name, pay_off: bool):
+        from datetime import timedelta as _td
+        gc.create_account(
+            name=name, account_type="CREDIT", parent="Liabilities",
+        )
+        old = date.today() - _td(days=150)
+        r = gc.create_transaction(
+            description=f"{name} purchase",
+            splits=[
+                {"account": f"Liabilities:{name}", "amount": "-500.00"},
+                {"account": "Expenses:Groceries", "amount": "500.00"},
+            ],
+            trans_date=old,
+        )
+        guids = [r["guid"]]
+        if pay_off:
+            r2 = gc.create_transaction(
+                description=f"{name} payoff",
+                splits=[
+                    {"account": f"Liabilities:{name}", "amount": "500.00"},
+                    {"account": "Assets:Checking", "amount": "-500.00"},
+                ],
+                trans_date=old,
+            )
+            guids.append(r2["guid"])
+        # Reconcile every card split (dated 150 days ago).
+        for g in guids:
+            txn = gc.get_transaction(g)
+            for s in txn["splits"]:
+                if name in s["account"]:
+                    gc.set_reconcile_state(s["guid"], "y", reconcile_date=old)
+
+    def test_dormant_zero_card_aggregates_without_warning(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._card_with_history(gc, "Old Apple Card", pay_off=True)
+        summary = gc.get_book_summary()
+        assert "1 account dormant ($0, fully reconciled)" in summary
+        assert "Old Apple Card" not in summary.split("Reconciliation:")[1]
+
+    def test_carried_balance_stays_warned(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._card_with_history(gc, "Care Credit", pay_off=False)
+        summary = gc.get_book_summary()
+        recon = summary.split("Reconciliation:")[1]
+        assert "Care Credit" in recon
+        assert "⚠" in [
+            ln for ln in recon.split("\n") if "Care Credit" in ln
+        ][0]
+        assert "dormant" not in recon

@@ -308,6 +308,7 @@ class CoreMixin:
             any_splits = False
             unreconciled_count = 0
             oldest_unreconciled_date = None
+            balance = Decimal("0")
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
                 # activity — they must not make an account
@@ -315,6 +316,7 @@ class CoreMixin:
                 if _is_voided(s):
                     continue
                 any_splits = True
+                balance += s.quantity
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
                     has_yc = True
@@ -373,6 +375,7 @@ class CoreMixin:
                 else:
                     days_behind = (today - latest_y_date).days
                     results.append({
+                        "balance_zero": balance == 0,
                         "account": account.fullname,
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
@@ -1512,11 +1515,28 @@ class CoreMixin:
         stale: list[dict] = []
         current_count = 0
         never_count = 0
+        dormant_count = 0
         for entry in reconciliation:
             if entry["status"] == "never reconciled":
                 never_count += 1
             elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
-                stale.append(entry)
+                # Fully reconciled + zero balance + no activity =
+                # DORMANT, not behind: nothing owed, nothing
+                # unentered that a statement could reveal. A $0
+                # card idle since March needs no orange badge —
+                # but a CARRIED balance with months of silence
+                # means missing entries (interest posts monthly),
+                # so those stay individually warned. (Bookkeeper
+                # finding: stamped dormant cards kept warning
+                # because "through" tracks the last reconciled
+                # SPLIT, which a 0-split sweep can't advance.)
+                if (
+                    entry["unreconciled_count"] == 0
+                    and entry.get("balance_zero")
+                ):
+                    dormant_count += 1
+                else:
+                    stale.append(entry)
             else:
                 current_count += 1
 
@@ -1548,6 +1568,12 @@ class CoreMixin:
         if current_count:
             plural = "s" if current_count != 1 else ""
             out.append(f"  {current_count} account{plural} current")
+        if dormant_count:
+            plural = "s" if dormant_count != 1 else ""
+            out.append(
+                f"  {dormant_count} account{plural} dormant "
+                f"($0, fully reconciled)"
+            )
         if never_count:
             plural = "s" if never_count != 1 else ""
             out.append(
