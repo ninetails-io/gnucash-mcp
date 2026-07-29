@@ -12895,3 +12895,48 @@ class TestGetReconciliationStatus:
         import re
         m = re.search(r"(\d+) accounts? never reconciled", recon)
         assert (int(m.group(1)) if m else 0) == buckets.get("never", 0)
+
+
+class TestSplitGraphPreload:
+    """_preload_split_graph exists so whole-book reports traverse
+    splits from memory instead of lazy-loading per row — on a large
+    book that is the difference between finishing and hanging. The
+    parked strong reference (``book._gnucash_mcp_split_graph``) looks
+    like dead code but is load-bearing: SQLAlchemy's identity map
+    holds instances only weakly, so deleting it silently restores the
+    per-row queries. This test makes that regression loud instead."""
+
+    def test_preloaded_traversal_issues_no_sql(self, test_book):
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book)
+            # Snapshot the object lists BEFORE counting: fetching
+            # them is allowed to query; traversing them is not.
+            accounts = list(book.accounts)
+            transactions = list(book.transactions)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for acct in accounts:
+                    for s in acct.splits:
+                        _ = s.transaction
+                for txn in transactions:
+                    for s in txn.splits:
+                        _ = s.account
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+
+            assert statements == [], (
+                f"split traversal after preload issued "
+                f"{len(statements)} SQL statements — the preload's "
+                f"strong reference has been lost"
+            )
