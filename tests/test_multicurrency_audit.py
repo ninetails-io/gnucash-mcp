@@ -486,3 +486,46 @@ class TestPriceLookupMemo:
                 "a price added mid-call must be visible once the "
                 "caches are invalidated"
             )
+
+    def test_every_price_write_path_invalidates_the_memo(
+        self, multi_currency_book, monkeypatch,
+    ):
+        """The cache-safety argument rests on one invariant: every
+        path that adds or removes a Price row invalidates the memo
+        after its save. create_price and delete_price were the only
+        write paths when the memo landed; bulk create_prices shipped
+        separately and silently fell outside the claim. This test
+        turns the invariant into a contract over all three."""
+        gc = GnuCashBook(str(multi_currency_book))
+        cls = type(gc)
+        calls: list[bool] = []
+        real = cls._invalidate_price_caches
+
+        def spy(book):
+            calls.append(True)
+            real(book)
+
+        monkeypatch.setattr(
+            cls, "_invalidate_price_caches", staticmethod(spy),
+        )
+
+        gc.create_price("EUR", "CURRENCY", "1.31",
+                        price_date=date(2026, 5, 1),
+                        source="user:price")
+        assert calls, "create_price must invalidate after its save"
+
+        calls.clear()
+        gc.create_prices([{
+            "ref": "r1", "commodity": "EUR",
+            "namespace": "CURRENCY", "date": date(2026, 5, 2),
+            "value": "1.32",
+        }])
+        assert calls, (
+            "bulk create_prices must invalidate after its save"
+        )
+
+        calls.clear()
+        gc.delete_price("EUR", "CURRENCY",
+                        price_date=date(2026, 5, 2),
+                        source="user:price")
+        assert calls, "delete_price must invalidate after its save"
