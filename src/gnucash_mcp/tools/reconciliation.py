@@ -45,6 +45,41 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
+    def get_reconciliation_status(
+        verbose: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
+        """Per-account reconciliation table behind the dashboard's
+        aggregate counts — answers "WHICH accounts are never
+        reconciled / dormant / behind?"
+
+        One line per reconcilable account with activity, bucketed
+        exactly as the dashboard classifies them: ``behind``
+        (most-behind first, with pending-split counts), ``never``,
+        ``current``, ``dormant`` ($0, fully reconciled, idle), and
+        ``excluded`` (opted out via the account's ``no_reconcile``
+        slot — the right setting for loans, escrow payables, and
+        other statement-less accounts: set_account_slot(account,
+        "no_reconcile", "1"). Reporting-only; reconcile tools still
+        work on excluded accounts).
+
+        Args:
+            verbose: Full JSON rows instead of compact TSV lines.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
+        """
+        book = get_book()
+        result = book.get_reconciliation_status(
+            compact=not verbose, limit=limit, offset=offset,
+        )
+        if verbose:
+            return _json(result)
+        return result
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="read")
     def get_unreconciled_splits(
         account: str,
         as_of_date: str | None = None,

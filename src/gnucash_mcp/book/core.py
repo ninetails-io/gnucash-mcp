@@ -26,6 +26,7 @@ from gnucash_mcp._format import _paginate
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
+    _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
@@ -296,6 +297,23 @@ class CoreMixin:
                     and account.type != "ASSET":
                 continue
 
+            # User-declared opt-out: loans, escrow payables, cash
+            # wallets — accounts with no statement to reconcile
+            # against. Reporting-only: reconcile_account and
+            # get_unreconciled_splits still work normally on
+            # flagged accounts. The excluded row keeps the account
+            # visible to get_reconciliation_status (no silent
+            # caps); the dashboard renderer drops it.
+            if _slot_bool(account, "no_reconcile") is True:
+                results.append({
+                    "account": account.fullname,
+                    "status": "excluded (no_reconcile)",
+                    "days_behind": None,
+                    "unreconciled_count": 0,
+                    "excluded": True,
+                })
+                continue
+
             # Single pass over splits derives latest_y_date, has_yc
             # (the ASSET gate), any_splits, unreconciled_count, and
             # oldest_unreconciled_date. ``_is_unreconciled`` is the
@@ -308,6 +326,7 @@ class CoreMixin:
             any_splits = False
             unreconciled_count = 0
             oldest_unreconciled_date = None
+            balance = Decimal("0")
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
                 # activity — they must not make an account
@@ -315,6 +334,7 @@ class CoreMixin:
                 if _is_voided(s):
                     continue
                 any_splits = True
+                balance += s.quantity
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
                     has_yc = True
@@ -373,6 +393,7 @@ class CoreMixin:
                 else:
                     days_behind = (today - latest_y_date).days
                     results.append({
+                        "balance_zero": balance == 0,
                         "account": account.fullname,
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
@@ -551,9 +572,6 @@ class CoreMixin:
     # opt back in.
     _RETIREMENT_SLOT_KEY = "is_retirement"
 
-    _RETIREMENT_SLOT_TRUE = frozenset({"1", "true", "yes", "y"})
-    _RETIREMENT_SLOT_FALSE = frozenset({"0", "false", "no", "n"})
-
     def _is_in_retirement_subtree(self, account) -> bool:
         """True when the account is penalty-locked retirement money
         that must not count as liquid for runway / low-cash.
@@ -569,21 +587,14 @@ class CoreMixin:
         slot there. A subtree named "Tax-advantaged" has the same
         gap in any locale.
         """
-        from gnucash_mcp.book._base import _slot_value_str
+        from gnucash_mcp.book._base import _slot_bool
 
         node = account
         while node is not None and node.type != "ROOT":
-            try:
-                raw = node[self._RETIREMENT_SLOT_KEY]
-            except KeyError:
-                raw = None
-            if raw is not None:
-                val = (_slot_value_str(raw) or "").strip().lower()
-                if val in self._RETIREMENT_SLOT_TRUE:
-                    return True
-                if val in self._RETIREMENT_SLOT_FALSE:
-                    return False
-                # Unrecognized value: keep walking rather than guess.
+            flag = _slot_bool(node, self._RETIREMENT_SLOT_KEY)
+            if flag is not None:
+                return flag
+            # Absent or unrecognized: keep walking rather than guess.
             node = node.parent
         return any(
             "retirement" in part.lower()
@@ -1496,6 +1507,33 @@ class CoreMixin:
     # cross-section state: adding or reordering a section is a
     # one-method change.
 
+    def _classify_reconciliation(self, entry: dict) -> str:
+        """One bucket per reconciliation-status row — the SHARED
+        classification for the dashboard renderer and
+        get_reconciliation_status, so the aggregate counts and the
+        drill-down table agree by construction.
+
+        Buckets: ``excluded`` (no_reconcile opt-out), ``never``,
+        ``behind`` (stale with pending work OR a carried balance —
+        months of silence on a carried balance means missing
+        entries, since interest posts monthly), ``dormant`` (stale
+        but $0 and fully reconciled: nothing owed, nothing a
+        statement could reveal — the bookkeeper's stamped-dormant-
+        cards finding), ``current``.
+        """
+        if entry.get("excluded"):
+            return "excluded"
+        if entry["status"] == "never reconciled":
+            return "never"
+        if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+            if (
+                entry["unreconciled_count"] == 0
+                and entry.get("balance_zero")
+            ):
+                return "dormant"
+            return "behind"
+        return "current"
+
     def _render_reconciliation(
         self, reconciliation: list[dict],
     ) -> list[str]:
@@ -1512,10 +1550,19 @@ class CoreMixin:
         stale: list[dict] = []
         current_count = 0
         never_count = 0
+        dormant_count = 0
         for entry in reconciliation:
-            if entry["status"] == "never reconciled":
+            bucket = self._classify_reconciliation(entry)
+            if bucket == "excluded":
+                # no_reconcile opt-outs: dashboard-silent by the
+                # user's own declaration; get_reconciliation_status
+                # is the honesty backstop.
+                continue
+            if bucket == "never":
                 never_count += 1
-            elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+            elif bucket == "dormant":
+                dormant_count += 1
+            elif bucket == "behind":
                 stale.append(entry)
             else:
                 current_count += 1
@@ -1548,6 +1595,12 @@ class CoreMixin:
         if current_count:
             plural = "s" if current_count != 1 else ""
             out.append(f"  {current_count} account{plural} current")
+        if dormant_count:
+            plural = "s" if dormant_count != 1 else ""
+            out.append(
+                f"  {dormant_count} account{plural} dormant "
+                f"($0, fully reconciled)"
+            )
         if never_count:
             plural = "s" if never_count != 1 else ""
             out.append(
@@ -1776,6 +1829,54 @@ class CoreMixin:
             + data.payables_total
         )
         return data
+
+    def _frequent_accounts(
+        self, book, transactions, days: int = 180, top: int = 15,
+    ) -> list[str]:
+        """The book's working vocabulary: most-posted accounts.
+
+        Short GUIDs went essentially unused in live bookkeeping
+        because they were never in the model's context at the
+        moment its account vocabulary formed — it paged
+        list_accounts once, or guessed paths. Handing the top
+        accounts (with their ``%short`` refs, in list_accounts'
+        exact line format) to every session at orientation makes
+        the compact refs the path of least resistance, and the
+        list is book-adaptive: each book surfaces its own chart's
+        vocabulary in its own language.
+
+        Placeholders can't receive splits, so posting frequency
+        naturally yields only postable accounts; template
+        recipes are excluded explicitly.
+        """
+        cutoff = date.today() - timedelta(days=days)
+        template_guids = self._template_account_guids(book)
+        counts: dict[str, int] = {}
+        by_guid: dict = {}
+        for txn in transactions:
+            post_date = txn.post_date
+            if isinstance(post_date, datetime):
+                post_date = post_date.date()
+            if post_date is None or post_date < cutoff:
+                continue
+            if self._is_template_transaction(txn, template_guids):
+                continue
+            for s in txn.splits:
+                g = s.account.guid
+                counts[g] = counts.get(g, 0) + 1
+                by_guid[g] = s.account
+        ranked = sorted(
+            counts.items(), key=lambda kv: (-kv[1], by_guid[kv[0]].fullname),
+        )[:top]
+        if not ranked:
+            return []
+        short_map = self._account_short_guid_map(book)
+        lines = [f"Frequently used accounts (last {days} days):"]
+        for g, _n in ranked:
+            lines.append(
+                f"  {short_map[g]}\t{_account_to_compact_line(by_guid[g])}"
+            )
+        return lines
 
     def _render_book_metadata(
         self,
@@ -2231,6 +2332,10 @@ class CoreMixin:
             lines.append(
                 f"Expenses: {data.expense_active} active "
                 f"({data.expense_total} total)"
+            )
+
+            lines.extend(
+                self._frequent_accounts(book, transactions)
             )
 
             reconciliation = self._account_reconciliation_status(

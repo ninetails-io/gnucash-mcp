@@ -1465,6 +1465,7 @@ _PAGINATED_TOOLS = [
     ("list_budgets", {}, "budgets"),
     ("list_backups", {}, None),
     ("get_audit_log", {}, None),
+    ("get_reconciliation_status", {}, None),
 ]
 
 

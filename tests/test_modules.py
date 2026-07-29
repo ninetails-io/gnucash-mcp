@@ -84,22 +84,22 @@ class TestToolModulesMapping:
                 seen.add(tool)
 
     def test_core_group_resolves_to_29_tools(self):
-        """The ``core`` group expands to 31 tools across its nine
+        """The ``core`` group expands to 32 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 11 + slots
         3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
-        reconciliation 3). Reconciliation joined core in v1.3.1
+        reconciliation 4). Reconciliation joined core in v1.3.1
         per the bookkeeper-driven principle that any configuration
         which handles money must include reconciliation.
         """
-        assert len(_core_tool_names()) == 31
+        assert len(_core_tool_names()) == 32
 
     def test_total_tool_count(self):
-        """Total tools across all sub-modules should be 109 —
+        """Total tools across all sub-modules should be 110 —
         88 post-module-restructure + 3 voucher tools +
         4 credit-note tools + 5 job CRUD tools +
         1 get_job_report + 5 taxtable CRUD tools added in v1.3."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 109
+        assert total == 110
 
     def test_expected_modules_exist(self):
         """All expected leaf-module names should be present.
@@ -265,7 +265,7 @@ class TestApplyModuleFilter:
     def test_all_keeps_everything(self):
         """--modules=all should keep all 108 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report + 5 taxtables + 1 batch prices)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 109
+        assert len(self._tool_names()) == 110
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -297,12 +297,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 109
+        assert len(self._tool_names()) == 110
 
     def test_all_in_list_keeps_everything(self):
         """'all' mixed with other modules should keep all 108 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 109
+        assert len(self._tool_names()) == 110
 
     def test_unknown_module_fails_fast(self, capsys):
         """Unknown module names fail-fast at startup with SystemExit.
@@ -1094,7 +1094,7 @@ class TestMultiBook:
         alex, _ = two_books
         srv._book_paths = [alex.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 109
+        assert len(mcp._tool_manager._tools) == 110
 
     def test_tool_count_multi_book(self, two_books):
         """The lone runtime delta from single-book: switch_book (109).
@@ -1104,7 +1104,7 @@ class TestMultiBook:
         alex, beast = two_books
         srv._book_paths = [alex.resolve(), beast.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 110
+        assert len(mcp._tool_manager._tools) == 111
 
     # ── switch_book matching ───────────────────────────────────────
 
