@@ -12286,6 +12286,73 @@ class TestBatchPrices:
             commodity="VTSAX", namespace="FUND",
         ) is None
 
+    def test_duplicate_identity_dry_run_and_live_agree(
+        self, test_book: Path,
+    ):
+        """Two rows sharing one canonical identity (commodity,
+        currency, date, source) are rejected up front — identically
+        in dry_run and live. Pre-fix, dry_run promised would_create
+        for both while live crashed at piecash's commit-time
+        uniqueness validation with an internals-leaking error."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        rows = [
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ]
+
+        env = gc.create_prices(rows, on_error="skip", dry_run=True)
+        dry = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert dry["a"]["status"] == "would_create"
+        assert dry["b"]["status"] == "rejected"
+        assert "duplicate price identity" in dry["b"]["reason"]
+
+        env = gc.create_prices(rows, on_error="skip")
+        live = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert live["a"]["status"] == "created"
+        assert live["b"]["status"] == "rejected"
+        assert "duplicate price identity" in live["b"]["reason"]
+
+        # First row won; exactly one price landed.
+        latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
+        assert latest["value"] == "100"
+
+    def test_duplicate_identity_aborts_batch_by_default(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["reason"] == "batch_aborted"
+        assert "duplicate price identity" in parsed["b"]["reason"]
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_distinct_source_is_not_a_duplicate(self, test_book: Path):
+        """Identity includes source — a feed quote and a manual
+        quote on the same date are both legitimate."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "101",
+             "source": "user:market_data"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["status"] == "created"
+        assert parsed["b"]["status"] == "created"
+
     def test_ambiguous_symbol_requires_ns(self, test_book: Path):
         gc = GnuCashBook(str(test_book))
         gc.create_commodity(mnemonic="DUP", fullname="Dup Fund",
