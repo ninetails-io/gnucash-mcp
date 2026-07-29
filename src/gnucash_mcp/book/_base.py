@@ -1757,6 +1757,13 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         reference they would be collected immediately and every traversal
         would query again. The reference lives as long as the book, i.e.
         one ``open()`` context.
+
+        Deliberate tradeoff: the whole split graph is held in memory
+        for the duration of the call — tens of MB on a tens-of-
+        thousands-of-splits book. That is the price of the report
+        completing at all at that scale (lazy loading was a query per
+        transaction), and the biggest books are exactly the ones that
+        need it, so there is no size cutoff.
         """
         from piecash.core.account import Account
         from piecash.core.transaction import Transaction

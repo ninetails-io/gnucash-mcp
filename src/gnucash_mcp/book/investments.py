@@ -460,6 +460,7 @@ class InvestmentsMixin:
 
             if wrote:
                 book.save()
+                self._invalidate_price_caches(book)
             return self._prices_envelope(prices, by_ref)
 
     @staticmethod
