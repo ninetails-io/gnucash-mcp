@@ -9,6 +9,7 @@ Logs are stored alongside the GnuCash book file:
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -2187,6 +2188,106 @@ def _normalize_account_refs_for_audit(
     )
 
 
+# The audit file's record boundary is a blank line, and its reader
+# (get_audit_log) splits on "\n\n" — so a raw newline inside a
+# user-controlled value (description, memo, notes, payee text from an
+# imported statement) could forge an apparent entry, corrupt entry
+# counts, or smuggle instructions to the LLM reading the log. Every
+# string that reaches the audit file must pass through
+# _escape_audit_value; entries go through the recursive walk at the
+# _format_audit_entry_text chokepoint, and the decorator's error line
+# escapes str(e) directly.
+_AUDIT_UNSAFE_RE = re.compile(
+    "[\\\\\\x00-\\x1f\\x7f"      # backslash + C0 controls + DEL
+    "\\u2028\\u2029"              # line/paragraph separators
+    "\\u200e\\u200f"              # LRM / RLM
+    "\\u202a-\\u202e"             # bidi embedding/override controls
+    "\\u2066-\\u2069]"            # bidi isolate controls
+)
+
+_AUDIT_MNEMONIC_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\r": "\\r",
+                           "\t": "\\t"}
+
+
+def _escape_audit_value(text: str) -> str:
+    """Visibly escape control and direction-override characters.
+
+    Backslash doubles first so the escaping is injective — a value
+    that literally contained the two characters ``\\n`` stays
+    distinguishable from one that contained a newline. Clean strings
+    (the overwhelmingly common case) return unchanged, same object.
+    """
+    if not _AUDIT_UNSAFE_RE.search(text):
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        ch = m.group(0)
+        mnemonic = _AUDIT_MNEMONIC_ESCAPES.get(ch)
+        if mnemonic is not None:
+            return mnemonic
+        cp = ord(ch)
+        return f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}"
+
+    return _AUDIT_UNSAFE_RE.sub(_sub, text)
+
+
+# TSV blobs embedded in entries (batch submissions and results) are
+# structural strings the handlers RE-PARSE — their tabs and newlines
+# are separators, not user text, so the full escape would break the
+# parse. Exempting them is sound for boundary forging: a cell cannot
+# contain a raw newline or tab (it would have been a separator at
+# tool-parse time). They get the TSV-preserving escape instead, which
+# still neutralizes \r, stray C0 controls, and bidi overrides that
+# could survive inside a cell.
+_AUDIT_TSV_KEYS = frozenset({"transactions", "updates", "results",
+                             "prices"})
+
+_AUDIT_UNSAFE_TSV_RE = re.compile(
+    "[\\\\\\x00-\\x08\\x0b-\\x1f\\x7f"  # C0 minus \t \n, + DEL
+    "\\u2028\\u2029"
+    "\\u200e\\u200f"
+    "\\u202a-\\u202e"
+    "\\u2066-\\u2069]"
+)
+
+
+def _escape_audit_tsv(text: str) -> str:
+    """The cell-safe escape: preserves the structural tab/newline
+    separators, escapes everything else unsafe."""
+    if not _AUDIT_UNSAFE_TSV_RE.search(text):
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        ch = m.group(0)
+        mnemonic = _AUDIT_MNEMONIC_ESCAPES.get(ch)
+        if mnemonic is not None:
+            return mnemonic
+        cp = ord(ch)
+        return f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}"
+
+    return _AUDIT_UNSAFE_TSV_RE.sub(_sub, text)
+
+
+def _escape_audit_strings(value):
+    """Recursively escape every string in an entry's data (values
+    only — keys are schema-fixed, never user text). String values
+    under _AUDIT_TSV_KEYS keep their structural separators."""
+    if isinstance(value, str):
+        return _escape_audit_value(value)
+    if isinstance(value, dict):
+        return {
+            k: (
+                _escape_audit_tsv(v)
+                if k in _AUDIT_TSV_KEYS and isinstance(v, str)
+                else _escape_audit_strings(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_escape_audit_strings(v) for v in value]
+    return value
+
+
 def _format_audit_entry_text(entry: dict) -> str:
     """Format an audit entry as human-readable text.
 
@@ -2223,8 +2324,18 @@ def _format_audit_entry_text(entry: dict) -> str:
     if normalized_params is not (entry.get("params") or {}):
         entry = {**entry, "params": normalized_params}
 
+    # After normalization so resolved account names are covered too.
+    # Escaping here, at the single dispatch chokepoint, covers every
+    # handler and every field a handler might render.
+    entry = _escape_audit_strings(entry)
+
     lines = handler(entry)
-    return "\n".join(lines) if lines else ""
+    if not lines:
+        return ""
+    # Belt to the escaping's suspenders: a blank line inside an
+    # entry IS the record boundary, so none may survive whatever a
+    # handler emits. Render any as a visible marker instead.
+    return "\n".join(ln if ln.strip() else "\\n" for ln in lines)
 
 
 def _normalize_for_audit(value):
@@ -2457,9 +2568,16 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms error={e}"
                 )
 
-                # Log a simple error line
+                # Log a simple error line. Exception text embeds
+                # user-controlled values (account names, descriptions
+                # echoed by validators), so it passes the same escape
+                # as formatted entries — a raw newline here could
+                # forge an entry boundary just as well.
                 time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
+                error_text = (
+                    f"{time_part}  ERROR  {func.__name__}: "
+                    f"{_escape_audit_value(str(e))}"
+                )
                 logger.info(error_text)
                 logger.info("")
                 _flush_logger(logger)

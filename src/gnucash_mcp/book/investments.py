@@ -421,6 +421,37 @@ class InvestmentsMixin:
                         "reason": str(e),
                     }
 
+            # Two rows sharing one canonical price identity
+            # (commodity, currency, date, source) would race the
+            # upsert against piecash's commit-time uniqueness
+            # validation: the second row creates a duplicate the
+            # save then rejects with an internals-leaking error,
+            # while dry_run (each row checked against the original
+            # book state) reports both as would_create. Rejecting
+            # the duplicate up front keeps dry-run and live
+            # agreeing and turns the failure into a per-row reason.
+            seen_identity: dict = {}
+            deduped = []
+            for row in prepared:
+                identity = (
+                    row["comm"].guid, row["currency"].guid,
+                    row["date"], row["source"],
+                )
+                first_ref = seen_identity.get(identity)
+                if first_ref is not None:
+                    by_ref[row["ref"]] = {
+                        "ref": row["ref"], "status": "rejected",
+                        "reason": (
+                            f"duplicate price identity — same "
+                            f"commodity/currency/date/source as "
+                            f"ref '{first_ref}'"
+                        ),
+                    }
+                    continue
+                seen_identity[identity] = row["ref"]
+                deduped.append(row)
+            prepared = deduped
+
             if by_ref and on_error == "abort":
                 for row in prepared:
                     by_ref[row["ref"]] = {

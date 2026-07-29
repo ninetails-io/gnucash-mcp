@@ -7059,7 +7059,9 @@ class TestUpdateTransaction:
         assert result["status"] == "updated"
 
     def test_update_description_on_reconciled_ok(self, test_book: Path):
-        """Should allow description/date/notes changes without force on reconciled."""
+        """Description/notes changes stay force-free on reconciled
+        transactions — they don't move money or periods. Date moves
+        DO need force (see the date-move tests below)."""
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.search_transactions("Groceries", compact=False)["transactions"]
@@ -7073,6 +7075,108 @@ class TestUpdateTransaction:
         )
         assert result["status"] == "updated"
         assert result["description"] == "Updated Groceries"
+
+    def test_date_move_on_reconciled_requires_force(
+        self, test_book: Path,
+    ):
+        """A date move relocates the transaction across statement /
+        reporting periods while its splits stay 'y' — same
+        reconciliation damage as editing splits, same force gate."""
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+
+        with pytest.raises(ValueError, match="posting date"):
+            gc_book.update_transaction(
+                guid=tx["guid"],
+                trans_date=date.fromisoformat(tx["date"])
+                + timedelta(days=40),
+            )
+
+    def test_date_move_on_reconciled_with_force(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+        new_date = date.fromisoformat(tx["date"]) + timedelta(days=40)
+
+        result = gc_book.update_transaction(
+            guid=tx["guid"], trans_date=new_date, force=True,
+        )
+        assert result["status"] == "updated"
+        assert result["date"] == new_date.isoformat()
+
+    def test_same_date_on_reconciled_needs_no_force(
+        self, test_book: Path,
+    ):
+        """Re-submitting the current date is a no-op, not a move."""
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+
+        result = gc_book.update_transaction(
+            guid=tx["guid"],
+            trans_date=date.fromisoformat(tx["date"]),
+        )
+        assert result["status"] == "updated"
+
+    def test_broadcast_date_move_on_reconciled_requires_force(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+        moved = date.fromisoformat(tx["date"]) + timedelta(days=40)
+
+        with pytest.raises(ValueError, match="posting date"):
+            gc_book.update_transaction(
+                guid=[tx["guid"]], trans_date=moved,
+            )
+        result = gc_book.update_transaction(
+            guid=[tx["guid"]], trans_date=moved, force=True,
+        )
+        assert result["status"] == "updated"
+
+    def test_batch_date_move_on_reconciled_rejected_per_row(
+        self, test_book: Path,
+    ):
+        """update_transactions rejects the date-moving row (skip
+        mode keeps siblings); force=True lets it through — same
+        gate, batch semantics."""
+        gc_book = GnuCashBook(str(test_book))
+        txns = gc_book.search_transactions(
+            "", compact=False,
+        )["transactions"]
+        rec, other = txns[0], txns[1]
+        gc_book.set_reconcile_state(rec["splits"][0]["guid"], "y")
+        moved = (
+            date.fromisoformat(rec["date"]) + timedelta(days=40)
+        )
+
+        env = gc_book.update_transactions([
+            {"guid": rec["guid"], "date": moved},
+            {"guid": other["guid"], "description": "Renamed"},
+        ], on_error="skip")
+        rows = {
+            r["guid"]: r
+            for r in _parse_results_tsv(env["results"])
+        }
+        assert rows[rec["guid"]]["status"] == "rejected"
+        assert "reconciled splits" in rows[rec["guid"]]["reason"]
+        assert rows[other["guid"]]["status"] == "updated"
+
+        env = gc_book.update_transactions([
+            {"guid": rec["guid"], "date": moved},
+        ], force=True)
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "updated"
 
     def test_update_splits_validates_before_mutating(
         self, multi_currency_book: Path,
@@ -12285,6 +12389,73 @@ class TestBatchPrices:
         assert gc.get_latest_price(
             commodity="VTSAX", namespace="FUND",
         ) is None
+
+    def test_duplicate_identity_dry_run_and_live_agree(
+        self, test_book: Path,
+    ):
+        """Two rows sharing one canonical identity (commodity,
+        currency, date, source) are rejected up front — identically
+        in dry_run and live. Pre-fix, dry_run promised would_create
+        for both while live crashed at piecash's commit-time
+        uniqueness validation with an internals-leaking error."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        rows = [
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ]
+
+        env = gc.create_prices(rows, on_error="skip", dry_run=True)
+        dry = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert dry["a"]["status"] == "would_create"
+        assert dry["b"]["status"] == "rejected"
+        assert "duplicate price identity" in dry["b"]["reason"]
+
+        env = gc.create_prices(rows, on_error="skip")
+        live = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert live["a"]["status"] == "created"
+        assert live["b"]["status"] == "rejected"
+        assert "duplicate price identity" in live["b"]["reason"]
+
+        # First row won; exactly one price landed.
+        latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
+        assert latest["value"] == "100"
+
+    def test_duplicate_identity_aborts_batch_by_default(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["reason"] == "batch_aborted"
+        assert "duplicate price identity" in parsed["b"]["reason"]
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_distinct_source_is_not_a_duplicate(self, test_book: Path):
+        """Identity includes source — a feed quote and a manual
+        quote on the same date are both legitimate."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "101",
+             "source": "user:market_data"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["status"] == "created"
+        assert parsed["b"]["status"] == "created"
 
     def test_ambiguous_symbol_requires_ns(self, test_book: Path):
         gc = GnuCashBook(str(test_book))

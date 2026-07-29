@@ -707,7 +707,10 @@ def register(mcp, get_book) -> None:
                     Include 'memo' to set that split's memo (omit to leave it unchanged).
                     ``amount``/``quantity`` are decimal strings (e.g. "94.87").
             notes: New transaction notes (optional). Pass empty string to clear.
-            force: Allow modifying transactions with reconciled splits
+            force: Allow modifying transactions with reconciled splits —
+                required for split changes AND for moving the date of a
+                transaction with reconciled splits (a date move shifts
+                it out of its reconciled statement period).
         """
         book = get_book()
         trans_date = _parse_iso_date(transaction_date)
@@ -730,6 +733,7 @@ def register(mcp, get_book) -> None:
     def update_transactions(
         updates: str,
         on_error: str = "abort",
+        force: bool = False,
     ) -> str:
         """Update MANY transactions with per-row values (bulk edit).
 
@@ -748,6 +752,9 @@ def register(mcp, get_book) -> None:
 
         One book open, one save; ``on_error="abort"`` (default)
         sinks the batch on any bad row, ``"skip"`` keeps good rows.
+        Date moves on transactions with reconciled splits are
+        rejected per row unless ``force=true`` (they shift the
+        transaction out of its reconciled statement period).
         Returns a results TSV keyed by your input guids. For the
         SAME value across many transactions, ``update_transaction``
         with a guid list is cheaper than repeating rows.
@@ -758,7 +765,7 @@ def register(mcp, get_book) -> None:
             if "date" in r:
                 r["date"] = date.fromisoformat(r["date"])
         result = book.update_transactions(
-            updates=rows, on_error=on_error,
+            updates=rows, on_error=on_error, force=force,
         )
         return _json(result)
 
