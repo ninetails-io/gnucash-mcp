@@ -175,15 +175,19 @@ class CurrencyMixin:
     # persisted. A Book instance only exists for the duration of a
     # single ``open()`` context — one tool call — so a cache cannot
     # go stale across calls; ``_invalidate_price_caches`` covers the
-    # one path that mutates prices mid-call.
+    # paths that mutate prices mid-call.
     _PRICE_LOOKUPS_ATTR = "_gnucash_mcp_price_lookups"
     _PRICE_COMMODITIES_ATTR = "_gnucash_mcp_price_commodities"
 
     @staticmethod
     def _invalidate_price_caches(book: piecash.Book) -> None:
-        """Drop the memoized price lookups. Call this after adding or
-        deleting a Price so that a later lookup in the same call sees
-        the change."""
+        """Drop the memoized price lookups. Every path that adds or
+        removes a Price row must call this after its save so a later
+        lookup in the same call sees the change — today that is
+        create_price, create_prices, and delete_price. (piecash's
+        auto-created ``type='transaction'`` placeholders on
+        cross-currency saves skip this deliberately: every consumer
+        filters them out via ``market_only``.)"""
         for attr in (
             CurrencyMixin._PRICE_LOOKUPS_ATTR,
             CurrencyMixin._PRICE_COMMODITIES_ATTR,
@@ -208,7 +212,9 @@ class CurrencyMixin:
 
         Memoized per ``(commodity_guid, currency_guid)`` on the open
         book: the first request for a pair runs one indexed query,
-        and every repeat is a dict hit. The pivot search requests the
+        and every repeat is served from memory (``market_only``
+        re-filters the memoized list per call — cheap, since a
+        pair's list is small). The pivot search requests the
         same handful of pairs once per candidate leg per commodity,
         so without the memo a whole-book report re-runs identical
         queries thousands of times; with it the query count is
@@ -236,10 +242,14 @@ class CurrencyMixin:
             prices = list(q)
             # Newest first, with same-date ties resolved by
             # _price_tie_rank rather than row order (see its
-            # docstring for the rule). Sorted once, at memoization
-            # time, so every consumer sees the same ordering.
+            # docstring for the rule), and full-key ties by guid so
+            # the ordering never falls through to arbitrary DB row
+            # order. Sorted once, at memoization time, so every
+            # consumer sees the same ordering.
             prices.sort(
-                key=lambda p: (_to_date(p.date), _price_tie_rank(p)),
+                key=lambda p: (
+                    _to_date(p.date), _price_tie_rank(p), p.guid,
+                ),
                 reverse=True,
             )
             lookups[key] = prices
@@ -885,6 +895,7 @@ class CurrencyMixin:
             book,
             commodity_guid=from_commodity.guid,
             currency_guid=to_commodity.guid,
+            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
@@ -907,6 +918,7 @@ class CurrencyMixin:
             book,
             commodity_guid=to_commodity.guid,
             currency_guid=from_commodity.guid,
+            market_only=True,  # load-bearing: skips FX placeholders
         ):
             p_date = _to_date(p.date)
             days = (as_of - p_date).days
