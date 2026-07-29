@@ -2206,6 +2206,10 @@ class CoreMixin:
         from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
+            # Whole-book report: every pass below traverses splits, so
+            # load the graph once instead of lazily per traversal.
+            self._preload_split_graph(book)
+
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
