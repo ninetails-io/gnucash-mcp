@@ -111,6 +111,15 @@ class _SummaryData:
     expense_total: int = 0
 
 
+def _post_date_as_date(transaction) -> date | None:
+    """Transaction post_date normalized to a bare date — piecash
+    stores it with a neutral-time datetime component."""
+    pd = transaction.post_date
+    if hasattr(pd, "date") and callable(pd.date):
+        return pd.date()
+    return pd
+
+
 class CoreMixin:
     """Accounts, transactions, and the book-summary view. Always loaded."""
 
@@ -4466,6 +4475,7 @@ class CoreMixin:
         trans_date: date | None = None,
         splits: list[dict] | None = None,
         notes: str | None = None,
+        force: bool = False,
     ) -> dict:
         """Apply the same field values to every listed transaction.
 
@@ -4497,6 +4507,11 @@ class CoreMixin:
                     raise ValueError(
                         f"Transaction {g} is voided. Use "
                         f"unvoid_transaction first, then update."
+                    )
+                if trans_date is not None \
+                        and _post_date_as_date(txn) != trans_date:
+                    self._require_force_for_reconciled(
+                        txn, force, "Moving its posting date",
                     )
                 transactions.append(txn)
 
@@ -4541,6 +4556,7 @@ class CoreMixin:
         self,
         updates: list[dict],
         on_error: str = "abort",
+        force: bool = False,
     ) -> dict:
         """Per-row transaction updates in one book-open / one save.
 
@@ -4552,8 +4568,10 @@ class CoreMixin:
         can never mass-erase.
 
         ``on_error="abort"`` (default) sinks the batch on any bad
-        row; ``"skip"`` keeps the good rows. Returns ``{"results":
-        TSV}`` keyed by the input guid.
+        row; ``"skip"`` keeps the good rows. ``force`` allows date
+        moves on transactions with reconciled splits (rejected per
+        row otherwise — same gate as ``update_transaction``).
+        Returns ``{"results": TSV}`` keyed by the input guid.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -4583,6 +4601,11 @@ class CoreMixin:
                         raise ValueError(
                             f"Transaction {key} is voided. Use "
                             f"unvoid_transaction first, then update."
+                        )
+                    if "date" in u \
+                            and _post_date_as_date(txn) != u["date"]:
+                        self._require_force_for_reconciled(
+                            txn, force, "Moving its posting date",
                         )
                     prepared.append((u, txn))
                 except (ValueError, KeyError) as e:
@@ -4641,6 +4664,32 @@ class CoreMixin:
             )
         return {"results": "\n".join(lines)}
 
+    @staticmethod
+    def _require_force_for_reconciled(
+        transaction, force: bool, action: str,
+    ) -> None:
+        """Raise unless ``force`` when the transaction has reconciled
+        ('y') splits — the shared gate for every edit that would
+        damage reconciliation (split changes AND posting-date moves;
+        a date move relocates the transaction across statement
+        periods while its splits stay 'y'). ``action`` names the
+        change in the error message."""
+        if force:
+            return
+        reconciled = [
+            s for s in transaction.splits if s.reconcile_state == "y"
+        ]
+        if not reconciled:
+            return
+        acct_names = ", ".join(
+            s.account.fullname for s in reconciled
+        )
+        raise ValueError(
+            f"Transaction has reconciled splits in: {acct_names}. "
+            f"{action} will break reconciliation. "
+            f"Use force=true to override."
+        )
+
     def update_transaction(
         self,
         guid: str | list[str],
@@ -4679,7 +4728,7 @@ class CoreMixin:
         if isinstance(guid, list):
             return self._update_transactions_broadcast(
                 guid, description=description, trans_date=trans_date,
-                splits=splits, notes=notes,
+                splits=splits, notes=notes, force=force,
             )
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
@@ -4699,18 +4748,19 @@ class CoreMixin:
 
             # Check for reconciled splits when modifying splits
             if splits is not None:
-                reconciled = [
-                    s for s in transaction.splits if s.reconcile_state == "y"
-                ]
-                if reconciled and not force:
-                    acct_names = ", ".join(
-                        s.account.fullname for s in reconciled
-                    )
-                    raise ValueError(
-                        f"Transaction has reconciled splits in: {acct_names}. "
-                        f"Modifying will break reconciliation. "
-                        f"Use force=true to override."
-                    )
+                self._require_force_for_reconciled(
+                    transaction, force, "Modifying",
+                )
+
+            # A date move relocates the transaction across statement
+            # / reporting periods while its splits stay 'y' — same
+            # reconciliation damage as editing the splits, so the
+            # same force gate. Same-date is a no-op and passes.
+            if trans_date is not None \
+                    and _post_date_as_date(transaction) != trans_date:
+                self._require_force_for_reconciled(
+                    transaction, force, "Moving its posting date",
+                )
 
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
