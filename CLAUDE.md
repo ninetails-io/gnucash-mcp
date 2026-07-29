@@ -207,6 +207,58 @@ module contributes zero tools to the MCP surface.
     which is what makes localized created-account names (§6.3) safe. A
     stale slot falls through to the lower layers and is rewritten.
 
+### The chokepoint pattern
+
+The invariants above stay true because each one lives in exactly ONE
+helper, with every caller routed through it. This is the codebase's
+core bug-class strategy, adopted during the v1.3 review arc after the
+dominant finding shape turned out to be "an invariant exists but is
+enforced at only some sites." The fix for that class is never to patch
+the divergent sites — it's to consolidate the rule into a single
+helper, convert every site into a caller, and lock the convergence
+with a test that fails when a new site skips the helper.
+
+Established chokepoints and the rule each one owns:
+
+- `_find_prices` — price-history access (market-price filter,
+  same-date tie-break, and since #126 the per-pair memo).
+- `_rates_as_of` / `_monthly_conversion_factors` /
+  `_account_conversion_factors` — which FX rate a report may use
+  (as-of is mandatory; flow vs. stock semantics pick the factory).
+- `_resolve_account` / `_resolve_guid` — every inbound account/GUID
+  ref, template-filtered, before any comparison or lookup.
+- `_is_voided` / `_is_unreconciled` — split-state predicates shared
+  by dashboards and detail tools so counts agree by construction.
+- `_slot_bool` — tri-state boolean slot parsing (the third private
+  parsing convention was the trigger to consolidate).
+- `_upsert_price` — single/batch price writes can't diverge.
+- `_classify_reconciliation` — dashboard aggregates and the
+  drill-down table bucket rows identically.
+- `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
+  `_effective_owner_type` — same story, smaller surface.
+
+Working rules:
+
+1. **Second duplicate is a smell; third is the trigger.** When you
+   find yourself writing a rule that exists elsewhere — even in a
+   slightly different private form — consolidate before extending.
+2. **Fix a bug at its chokepoint, then grep for siblings.** A bug of
+   the form "the check and the act disagree" almost always has
+   relatives enforcing the same invariant elsewhere by hand.
+3. **Lock it.** A chokepoint without a contract test is a
+   convention; with one it's an invariant. See
+   `TestToolFileVsModulesMapping`, `TestWriteVerificationCoverage`,
+   `TestModeAgreement`, `TestShortGuidRoundTripClosure`, and the
+   price-invalidation and preload SQL-count tests for the house
+   styles: set-equality, grep-the-source, output-agreement, and
+   count-the-queries all work.
+4. **The payoff is legibility, not just correctness.** PR #126 — an
+   outside contributor fixing a never-completes pathology on a
+   33k-split book — was possible as a small, safe diff because every
+   rate lookup already flowed through one function. Keep it that
+   way: new code that bypasses a chokepoint makes the next
+   contributor's change bigger than it should be.
+
 ### Data model conventions
 
 - Dates as `datetime.date` internally; ISO strings (`YYYY-MM-DD`) at
