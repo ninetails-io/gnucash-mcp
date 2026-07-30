@@ -344,7 +344,13 @@ existed.
   `for x in book.x:` for finders. `_find_transaction`, `_find_split`,
   etc. use the indexed form.
 - **Never sum num/denom in SQL** — float precision is wrong for
-  money. Fetch rows and aggregate in Python with `Decimal`.
+  money. Fetch rows and aggregate in Python with `Decimal`. The
+  input-side twin of this rule — floats decimalize via
+  `Decimal(str(value))`, never `Decimal(float)` — was first
+  demonstrated in a 2026 fork by Junaid Saeed Uppal
+  ([@uppaljs](https://github.com/uppaljs)), whose
+  `Decimal(22167.58) == 22167.579999...` example became
+  `_to_decimal`.
 - **Voided splits are zombies, not gone.** GnuCash's void operation
   preserves the split with zeroed values and `reconcile_state='v'`
   for audit-trail purposes. Code that asks "does this lot/account

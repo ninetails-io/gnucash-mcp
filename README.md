@@ -270,7 +270,11 @@ Desktop clients:
   This writes a project `.gemini/settings.json` with the server
   registered; run `/mcp list` inside Gemini to confirm it shows
   `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
-  a SQLite3 export, see the `libdbd-sqlite3` note above.)
+  a SQLite3 export, see the `libdbd-sqlite3` note above. The Gemini
+  walkthrough and the Linux driver fix both come from
+  [@hpuri](https://github.com/hpuri)'s testing in
+  [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
+  thanks.)
 - **Anything else**: set `GNUCASH_BOOK_PATH` and run `uv run
   --directory /path/to/gnucash-mcp gnucash-mcp`. Any client that
   can spawn a command and speak MCP over stdio will work.
