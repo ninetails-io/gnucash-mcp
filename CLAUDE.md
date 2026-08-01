@@ -522,10 +522,18 @@ For live verification against a personal GnuCash book, ensure
    a first-time visitor's click lands here, so the headline
    workflow must reflect the current release, not the one before
    it.
-3. **Regenerate the sample books** through the current date
-   (`scripts/synthetic_book/phase_<N>.py`, in order) — the personas
-   are the release's oracles, and stale samples validate the
-   previous release's world, not this one's.
+3. **Sample books are NOT regenerated per release** (policy since
+   v1.4.2 — each committed regeneration permanently grows every
+   future clone, and stable books are better byte-identity
+   oracles). They ship as frozen demos; stale-price warnings and
+   pending scheduled transactions accumulating between
+   regenerations is expected. Regenerate
+   (`scripts/synthetic_book/phase_<N>.py`, in order) only when
+   phase scripts gain coverage for new features, or when
+   date-decay warrants it — and treat it as a deliberate,
+   capture-rig-invalidating event. For before/after report
+   verification, capture against the committed books at HEAD (or
+   generate locally and capture both sides same-machine).
 4. Tester/bookkeeper signoff on develop.
 5. **Version bump LAST** — one commit: `pyproject.toml`,
    `__init__.py`, and a fresh `uv lock` staging `uv.lock`. The
