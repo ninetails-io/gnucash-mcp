@@ -26,6 +26,7 @@ from gnucash_mcp._format import _paginate
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
 from gnucash_mcp.book._base import (
+    _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
     _guid_prefix_map,
@@ -108,6 +109,15 @@ class _SummaryData:
     income_total: int = 0
     expense_active: int = 0
     expense_total: int = 0
+
+
+def _post_date_as_date(transaction) -> date | None:
+    """Transaction post_date normalized to a bare date — piecash
+    stores it with a neutral-time datetime component."""
+    pd = transaction.post_date
+    if hasattr(pd, "date") and callable(pd.date):
+        return pd.date()
+    return pd
 
 
 class CoreMixin:
@@ -296,6 +306,23 @@ class CoreMixin:
                     and account.type != "ASSET":
                 continue
 
+            # User-declared opt-out: loans, escrow payables, cash
+            # wallets — accounts with no statement to reconcile
+            # against. Reporting-only: reconcile_account and
+            # get_unreconciled_splits still work normally on
+            # flagged accounts. The excluded row keeps the account
+            # visible to get_reconciliation_status (no silent
+            # caps); the dashboard renderer drops it.
+            if _slot_bool(account, "no_reconcile") is True:
+                results.append({
+                    "account": account.fullname,
+                    "status": "excluded (no_reconcile)",
+                    "days_behind": None,
+                    "unreconciled_count": 0,
+                    "excluded": True,
+                })
+                continue
+
             # Single pass over splits derives latest_y_date, has_yc
             # (the ASSET gate), any_splits, unreconciled_count, and
             # oldest_unreconciled_date. ``_is_unreconciled`` is the
@@ -308,6 +335,7 @@ class CoreMixin:
             any_splits = False
             unreconciled_count = 0
             oldest_unreconciled_date = None
+            balance = Decimal("0")
             for s in account.splits:
                 # Voided splits are zombies, not reconcilable
                 # activity — they must not make an account
@@ -315,6 +343,7 @@ class CoreMixin:
                 if _is_voided(s):
                     continue
                 any_splits = True
+                balance += s.quantity
                 rstate = s.reconcile_state
                 if rstate in ("y", "c"):
                     has_yc = True
@@ -373,6 +402,7 @@ class CoreMixin:
                 else:
                     days_behind = (today - latest_y_date).days
                     results.append({
+                        "balance_zero": balance == 0,
                         "account": account.fullname,
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
@@ -551,9 +581,6 @@ class CoreMixin:
     # opt back in.
     _RETIREMENT_SLOT_KEY = "is_retirement"
 
-    _RETIREMENT_SLOT_TRUE = frozenset({"1", "true", "yes", "y"})
-    _RETIREMENT_SLOT_FALSE = frozenset({"0", "false", "no", "n"})
-
     def _is_in_retirement_subtree(self, account) -> bool:
         """True when the account is penalty-locked retirement money
         that must not count as liquid for runway / low-cash.
@@ -569,21 +596,14 @@ class CoreMixin:
         slot there. A subtree named "Tax-advantaged" has the same
         gap in any locale.
         """
-        from gnucash_mcp.book._base import _slot_value_str
+        from gnucash_mcp.book._base import _slot_bool
 
         node = account
         while node is not None and node.type != "ROOT":
-            try:
-                raw = node[self._RETIREMENT_SLOT_KEY]
-            except KeyError:
-                raw = None
-            if raw is not None:
-                val = (_slot_value_str(raw) or "").strip().lower()
-                if val in self._RETIREMENT_SLOT_TRUE:
-                    return True
-                if val in self._RETIREMENT_SLOT_FALSE:
-                    return False
-                # Unrecognized value: keep walking rather than guess.
+            flag = _slot_bool(node, self._RETIREMENT_SLOT_KEY)
+            if flag is not None:
+                return flag
+            # Absent or unrecognized: keep walking rather than guess.
             node = node.parent
         return any(
             "retirement" in part.lower()
@@ -594,11 +614,74 @@ class CoreMixin:
     # quotes are likely skewing net-worth and runway numbers.
     _STALE_PRICE_DAYS = 30
 
+    def _overdue_scheduled_warnings(
+        self, book: piecash.Book, today: date,
+    ) -> list[str]:
+        """Overdue-scheduled warning strings, most overdue first.
+
+        Requires SchedulingMixin's helpers (_next_occurrence,
+        RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
+        the attribute lookup degrades gracefully via getattr and
+        this returns []. Shared between the Warnings section and
+        the Scheduled line's overdue count so the two surfaces
+        agree by construction.
+        """
+        next_occ_fn = getattr(self, "_next_occurrence", None)
+        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
+        if next_occ_fn is None or rec_to_freq is None:
+            return []
+        try:
+            from piecash.core.transaction import ScheduledTransaction
+            overdue_entries: list[tuple[int, str]] = []
+            for sx in book.session.query(ScheduledTransaction).all():
+                if not sx.enabled:
+                    continue
+                try:
+                    rec = sx.recurrence
+                    key = (
+                        rec.recurrence_period_type,
+                        rec.recurrence_mult,
+                    )
+                    frequency = rec_to_freq.get(key)
+                    if not frequency:
+                        continue
+                    start = sx.start_date
+                    if isinstance(start, datetime):
+                        start = start.date()
+                    end = sx.end_date
+                    if isinstance(end, datetime):
+                        end = end.date()
+                    last = sx.last_occur
+                    if isinstance(last, datetime):
+                        last = last.date()
+                    # Search relative to "yesterday" so today's
+                    # occurrence isn't classified as overdue
+                    # before the user has a chance to enter it.
+                    next_occ = next_occ_fn(
+                        start, frequency,
+                        after=start - timedelta(days=1),
+                        end_date=end, last_occur=last,
+                    )
+                    if next_occ and next_occ < today:
+                        days_overdue = (today - next_occ).days
+                        overdue_entries.append((
+                            days_overdue,
+                            f"Overdue scheduled: {sx.name} "
+                            f"due {next_occ.isoformat()}",
+                        ))
+                except Exception:
+                    continue
+            overdue_entries.sort(reverse=True)
+            return [msg for _, msg in overdue_entries]
+        except Exception:
+            return []
+
     def _collect_warnings(
         self,
         book: piecash.Book,
         transactions: list,
         accounts: list,
+        overdue_scheduled: list[str] | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -617,6 +700,10 @@ class CoreMixin:
         Each per-category collector swallows its own exceptions — a
         failed check in one category never breaks the rest. Category
         specifics are commented at each collector below.
+
+        ``overdue_scheduled`` lets get_book_summary pass the list it
+        already computed (shared with the Scheduled line); ``None``
+        computes it here for direct callers.
         """
         today = date.today()
         default_currency = self._require_default_currency(book)
@@ -910,58 +997,10 @@ class CoreMixin:
             pass
 
         # ── 5. Overdue scheduled transactions ──
-        # Requires SchedulingMixin's helpers (_next_occurrence,
-        # RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
-        # the attribute lookup degrades gracefully via getattr.
-        overdue_scheduled: list[str] = []
-        next_occ_fn = getattr(self, "_next_occurrence", None)
-        rec_to_freq = getattr(self, "RECURRENCE_TO_FREQUENCY", None)
-        if next_occ_fn is not None and rec_to_freq is not None:
-            try:
-                from piecash.core.transaction import ScheduledTransaction
-                overdue_entries: list[tuple[int, str]] = []
-                for sx in book.session.query(ScheduledTransaction).all():
-                    if not sx.enabled:
-                        continue
-                    try:
-                        rec = sx.recurrence
-                        key = (
-                            rec.recurrence_period_type,
-                            rec.recurrence_mult,
-                        )
-                        frequency = rec_to_freq.get(key)
-                        if not frequency:
-                            continue
-                        start = sx.start_date
-                        if isinstance(start, datetime):
-                            start = start.date()
-                        end = sx.end_date
-                        if isinstance(end, datetime):
-                            end = end.date()
-                        last = sx.last_occur
-                        if isinstance(last, datetime):
-                            last = last.date()
-                        # Search relative to "yesterday" so today's
-                        # occurrence isn't classified as overdue
-                        # before the user has a chance to enter it.
-                        next_occ = next_occ_fn(
-                            start, frequency,
-                            after=start - timedelta(days=1),
-                            end_date=end, last_occur=last,
-                        )
-                        if next_occ and next_occ < today:
-                            days_overdue = (today - next_occ).days
-                            overdue_entries.append((
-                                days_overdue,
-                                f"Overdue scheduled: {sx.name} "
-                                f"due {next_occ.isoformat()}",
-                            ))
-                    except Exception:
-                        continue
-                overdue_entries.sort(reverse=True)
-                overdue_scheduled = [msg for _, msg in overdue_entries]
-            except Exception:
-                pass
+        if overdue_scheduled is None:
+            overdue_scheduled = self._overdue_scheduled_warnings(
+                book, today,
+            )
 
         # ── 6. Backup health ──
         # Auto-backup chain breaks render next to integrity issues:
@@ -1155,6 +1194,30 @@ class CoreMixin:
             "variance_pct": variance_pct,
         }
 
+    def _burn_window_days(
+        self, transactions: list, days: int | None = None,
+    ) -> int:
+        """Actual burn-averaging window in days.
+
+        Book-age clamp: ``_RUNWAY_BURN_DAYS`` is a MAX, not a fixed
+        denominator — dividing by 180 on a 19-day-old book
+        overstates runway ~10×. The 1-day floor avoids
+        divide-by-zero. Shared between ``_daily_expense_burn`` (the
+        divisor) and the Runway render (the label) so the displayed
+        window always matches the math.
+        """
+        if days is None:
+            days = self._RUNWAY_BURN_DAYS
+        today = date.today()
+        dated = [
+            t.post_date for t in transactions
+            if t.post_date is not None  # old-book artifact
+        ]
+        if dated:
+            book_age_days = max(1, (today - min(dated)).days)
+            days = min(days, book_age_days)
+        return days
+
     def _daily_expense_burn(
         self,
         book: piecash.Book,
@@ -1172,21 +1235,8 @@ class CoreMixin:
         book default currency — raw ``split.value`` would mix
         currencies on books with foreign-currency expenses.
         """
-        if days is None:
-            days = self._RUNWAY_BURN_DAYS
+        days = self._burn_window_days(transactions, days)
         today = date.today()
-        # Book-age clamp: the window is a MAX, not a fixed
-        # denominator — dividing by 180 on a 19-day-old book
-        # overstates runway ~10×. The 1-day floor avoids
-        # divide-by-zero.
-        dated = [
-            t.post_date for t in transactions
-            if t.post_date is not None  # old-book artifact
-        ]
-        if dated:
-            first_txn_date = min(dated)
-            book_age_days = max(1, (today - first_txn_date).days)
-            days = min(days, book_age_days)
         window_start = today - timedelta(days=days)
         # "Now" burn signal — anchor factors to today.
         factors = self._account_conversion_factors(book, today)
@@ -1280,6 +1330,9 @@ class CoreMixin:
         daily_burn = self._daily_expense_burn(
             book, transactions, days=self._RUNWAY_BURN_DAYS,
         )
+        burn_window = self._burn_window_days(
+            transactions, self._RUNWAY_BURN_DAYS,
+        )
 
         if daily_burn <= 0:
             return None
@@ -1289,6 +1342,7 @@ class CoreMixin:
                 "negative_liquid": True,
                 "liquid": liquid.quantize(Decimal("1")),
                 "daily_burn": daily_burn.quantize(Decimal("1")),
+                "burn_window_days": burn_window,
             }
 
         runway_days = int(liquid / daily_burn)
@@ -1297,6 +1351,7 @@ class CoreMixin:
             "runway_days": runway_days,
             "liquid": liquid.quantize(Decimal("1")),
             "daily_burn": daily_burn.quantize(Decimal("1")),
+            "burn_window_days": burn_window,
         }
 
     def _monthly_net_income(
@@ -1314,6 +1369,12 @@ class CoreMixin:
         stored negative and sign-flipped. ``is_mtd`` is True only
         for the current (partial) month. Empty list when the window
         has no activity → caller omits the section.
+
+        The MTD entry additionally carries ``mtd_comparable``:
+        the prior month's net over the SAME day window (day 1
+        through today's day-of-month, clamped to the prior
+        month's length) — a partial month next to full months
+        misleads without a like-for-like anchor.
 
         Each split converts to the book default at the most recent
         market rate — raw ``split.value`` sums mix currencies.
@@ -1356,6 +1417,16 @@ class CoreMixin:
         window_end = month_ends[-1]
         has_activity = False
 
+        # Prior-month same-day-window accumulator for the MTD
+        # comparable (clamped: Jul 30 compares against Jun 30, and
+        # Mar 30 against Feb 28).
+        prior_idx = len(month_starts) - 2
+        prior_cutoff_day = (
+            min(today.day, month_ends[prior_idx].day)
+            if prior_idx >= 0 else None
+        )
+        prior_window_net = Decimal("0")
+
         # Single pass; bucket index = months-from-window-start.
         for txn in transactions:
             d = txn.post_date
@@ -1369,6 +1440,9 @@ class CoreMixin:
             )
             if idx < 0 or idx >= len(nets):
                 continue
+            in_prior_window = (
+                idx == prior_idx and d.day <= prior_cutoff_day
+            )
             for s in txn.splits:
                 atype = s.account.type
                 if atype not in ("INCOME", "EXPENSE"):
@@ -1376,12 +1450,14 @@ class CoreMixin:
                 amt = self._split_in_default_currency(
                     s, s.account, factors.get(s.account.guid),
                 )
-                if atype == "INCOME":
-                    # INCOME stored negative (credit-natural); flip
-                    # to positive contribution to monthly net.
-                    nets[idx] += -amt
-                else:  # EXPENSE
-                    nets[idx] -= amt
+                # INCOME is stored negative (credit-natural) and
+                # flips to a positive contribution; EXPENSE is
+                # stored positive and subtracts. Both reduce to
+                # negating the raw amount.
+                contribution = -amt
+                nets[idx] += contribution
+                if in_prior_window:
+                    prior_window_net += contribution
                 has_activity = True
 
         if not has_activity:
@@ -1391,11 +1467,21 @@ class CoreMixin:
         result: list[dict] = []
         for i in range(len(month_starts) - 1, -1, -1):
             start = month_starts[i]
-            result.append({
+            entry = {
                 "label": start.strftime("%b %Y"),
                 "net": nets[i].quantize(Decimal("1")),
                 "is_mtd": start == today_month_start,
-            })
+            }
+            if entry["is_mtd"] and prior_idx >= 0:
+                prior_start = month_starts[prior_idx]
+                entry["mtd_comparable"] = {
+                    "label": (
+                        f"{prior_start.strftime('%b')} "
+                        f"1-{prior_cutoff_day}"
+                    ),
+                    "net": prior_window_net.quantize(Decimal("1")),
+                }
+            result.append(entry)
         return result
 
     @staticmethod
@@ -1430,6 +1516,33 @@ class CoreMixin:
     # cross-section state: adding or reordering a section is a
     # one-method change.
 
+    def _classify_reconciliation(self, entry: dict) -> str:
+        """One bucket per reconciliation-status row — the SHARED
+        classification for the dashboard renderer and
+        get_reconciliation_status, so the aggregate counts and the
+        drill-down table agree by construction.
+
+        Buckets: ``excluded`` (no_reconcile opt-out), ``never``,
+        ``behind`` (stale with pending work OR a carried balance —
+        months of silence on a carried balance means missing
+        entries, since interest posts monthly), ``dormant`` (stale
+        but $0 and fully reconciled: nothing owed, nothing a
+        statement could reveal — the bookkeeper's stamped-dormant-
+        cards finding), ``current``.
+        """
+        if entry.get("excluded"):
+            return "excluded"
+        if entry["status"] == "never reconciled":
+            return "never"
+        if entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+            if (
+                entry["unreconciled_count"] == 0
+                and entry.get("balance_zero")
+            ):
+                return "dormant"
+            return "behind"
+        return "current"
+
     def _render_reconciliation(
         self, reconciliation: list[dict],
     ) -> list[str]:
@@ -1446,10 +1559,19 @@ class CoreMixin:
         stale: list[dict] = []
         current_count = 0
         never_count = 0
+        dormant_count = 0
         for entry in reconciliation:
-            if entry["status"] == "never reconciled":
+            bucket = self._classify_reconciliation(entry)
+            if bucket == "excluded":
+                # no_reconcile opt-outs: dashboard-silent by the
+                # user's own declaration; get_reconciliation_status
+                # is the honesty backstop.
+                continue
+            if bucket == "never":
                 never_count += 1
-            elif entry["days_behind"] > self._RECONCILE_WARN_DAYS:
+            elif bucket == "dormant":
+                dormant_count += 1
+            elif bucket == "behind":
                 stale.append(entry)
             else:
                 current_count += 1
@@ -1482,6 +1604,12 @@ class CoreMixin:
         if current_count:
             plural = "s" if current_count != 1 else ""
             out.append(f"  {current_count} account{plural} current")
+        if dormant_count:
+            plural = "s" if dormant_count != 1 else ""
+            out.append(
+                f"  {dormant_count} account{plural} dormant "
+                f"($0, fully reconciled)"
+            )
         if never_count:
             plural = "s" if never_count != 1 else ""
             out.append(
@@ -1515,18 +1643,28 @@ class CoreMixin:
 
         Surfaces seasonality and recent anomalies. Empty list = no
         income/expense activity in the window → omit the section.
-        MTD entries get a "(MTD)" suffix on the label.
+        MTD entries get a "(MTD)" suffix plus the prior month's
+        net over the same day window — without the like-for-like
+        anchor, a partial month reads as a collapse next to full
+        months.
         """
         if not monthly:
             return []
-        out = ["Monthly net (last 6 months):"]
+        out = ["Monthly net (income - expenses, last 6 months):"]
         for entry in monthly:
             label = entry["label"]
+            suffix = ""
             if entry["is_mtd"]:
                 label += " (MTD)"
+                comparable = entry.get("mtd_comparable")
+                if comparable is not None:
+                    suffix = (
+                        f" (vs {comparable['label']}: "
+                        f"{int(comparable['net']):+,})"
+                    )
             # Always shows explicit sign + thousands separator;
             # whole dollars (cents would noise up the summary).
-            out.append(f"  {label}: {int(entry['net']):+,}")
+            out.append(f"  {label}: {int(entry['net']):+,}{suffix}")
         return out
 
     def _render_runway(
@@ -1547,11 +1685,13 @@ class CoreMixin:
         days = runway["runway_days"]
         liquid = int(runway["liquid"])
         burn = int(runway["daily_burn"])
+        window = runway["burn_window_days"]
         warn = " ⚠" if days < self._RUNWAY_WARN_DAYS else ""
         return [
             f"Runway: {days} days{warn} "
             f"({currency} {liquid:,} liquid / "
-            f"{currency} {burn:,}/day burn)"
+            f"{currency} {burn:,}/day burn, "
+            f"{window}-day avg)"
         ]
 
     # ── Summary collector / section renderers ────────────────────
@@ -1699,6 +1839,54 @@ class CoreMixin:
         )
         return data
 
+    def _frequent_accounts(
+        self, book, transactions, days: int = 180, top: int = 15,
+    ) -> list[str]:
+        """The book's working vocabulary: most-posted accounts.
+
+        Short GUIDs went essentially unused in live bookkeeping
+        because they were never in the model's context at the
+        moment its account vocabulary formed — it paged
+        list_accounts once, or guessed paths. Handing the top
+        accounts (with their ``%short`` refs, in list_accounts'
+        exact line format) to every session at orientation makes
+        the compact refs the path of least resistance, and the
+        list is book-adaptive: each book surfaces its own chart's
+        vocabulary in its own language.
+
+        Placeholders can't receive splits, so posting frequency
+        naturally yields only postable accounts; template
+        recipes are excluded explicitly.
+        """
+        cutoff = date.today() - timedelta(days=days)
+        template_guids = self._template_account_guids(book)
+        counts: dict[str, int] = {}
+        by_guid: dict = {}
+        for txn in transactions:
+            post_date = txn.post_date
+            if isinstance(post_date, datetime):
+                post_date = post_date.date()
+            if post_date is None or post_date < cutoff:
+                continue
+            if self._is_template_transaction(txn, template_guids):
+                continue
+            for s in txn.splits:
+                g = s.account.guid
+                counts[g] = counts.get(g, 0) + 1
+                by_guid[g] = s.account
+        ranked = sorted(
+            counts.items(), key=lambda kv: (-kv[1], by_guid[kv[0]].fullname),
+        )[:top]
+        if not ranked:
+            return []
+        short_map = self._account_short_guid_map(book)
+        lines = [f"Frequently used accounts (last {days} days):"]
+        for g, _n in ranked:
+            lines.append(
+                f"  {short_map[g]}\t{_account_to_compact_line(by_guid[g])}"
+            )
+        return lines
+
     def _render_book_metadata(
         self,
         currency: str,
@@ -1843,7 +2031,9 @@ class CoreMixin:
         accounts. The action-signal suffix (``N invoice(s),
         M overdue``) lets the LLM see "2 overdue" and ask about
         collections without us having to spell that out
-        explicitly.
+        explicitly. The "included in ..." note prevents the
+        breakout from being double-counted against the Assets /
+        Liabilities headline totals, which already fold these in.
         """
         lines: list[str] = []
         if data.receivable_accts:
@@ -1852,8 +2042,8 @@ class CoreMixin:
             signal = (
                 f" ({inv_n} invoice"
                 f"{'s' if inv_n != 1 else ''}, "
-                f"{overdue} overdue)"
-            ) if inv_n else ""
+                f"{overdue} overdue; included in Assets total)"
+            ) if inv_n else " (included in Assets total)"
             lines.append(
                 f"Receivables: {len(data.receivable_accts)} "
                 f"account"
@@ -1874,8 +2064,8 @@ class CoreMixin:
             signal = (
                 f" ({bill_n} bill"
                 f"{'s' if bill_n != 1 else ''}, "
-                f"{overdue} overdue)"
-            ) if bill_n else ""
+                f"{overdue} overdue; included in Liabilities total)"
+            ) if bill_n else " (included in Liabilities total)"
             lines.append(
                 f"Payables: {len(data.payable_accts)} "
                 f"account"
@@ -1898,18 +2088,25 @@ class CoreMixin:
         total_txns: int,
         enabled_sx: int,
         currency: str,
+        overdue_count: int = 0,
     ) -> list[str]:
         """Render the Transactions count + Scheduled line.
 
-        Scheduled folds in the "due in next 7 days" stat — turns
-        the dashboard from "what is the state" into "what do I
-        need to do next" without a second tool call. Uses
+        Scheduled folds in the overdue count and the "due in next
+        7 days" stat — turns the dashboard from "what is the
+        state" into "what do I need to do next" without a second
+        tool call. The overdue bucket must agree with the Warnings
+        section (same underlying list) — "10 overdue" in Warnings
+        next to a bare "none due in next 7 days" here read as a
+        contradiction, since overdue items ARE due. Uses
         ``hasattr`` to skip the upcoming-line render cleanly on
         book classes built without scheduling.
         """
         lines = [f"Transactions: {total_txns}"]
         if enabled_sx > 0:
             line = f"Scheduled: {enabled_sx} recurring"
+            if overdue_count > 0:
+                line += f", {overdue_count} overdue ⚠"
             if hasattr(self, "_upcoming_within_days"):
                 upcoming = self._upcoming_within_days(book, days=7)
                 if upcoming["count"] > 0:
@@ -1917,9 +2114,18 @@ class CoreMixin:
                         "s" if upcoming["count"] != 1 else ""
                     )
                     total_int = int(upcoming["total"])
+                    amount_part = f"{currency} {total_int:,}"
+                    # Foreign-currency schedules with no market
+                    # rate can't join the sum — say so rather than
+                    # silently understate the week's bills.
+                    if upcoming.get("unrated"):
+                        amount_part += (
+                            f" + {upcoming['unrated']} foreign "
+                            f"w/o rate ⚠"
+                        )
                     line += (
                         f", {upcoming['count']} due in next "
-                        f"7 days ({currency} {total_int:,})"
+                        f"7 days ({amount_part})"
                     )
                 else:
                     line += ", none due in next 7 days"
@@ -2009,6 +2215,10 @@ class CoreMixin:
         from piecash.core.transaction import ScheduledTransaction
 
         with self.open(readonly=True) as book:
+            # Whole-book report: every pass below traverses splits, so
+            # load the graph once instead of lazily per traversal.
+            self._preload_split_graph(book)
+
             default_currency = self._require_default_currency(book)
             currency = default_currency.mnemonic
 
@@ -2092,9 +2302,16 @@ class CoreMixin:
             )
 
             # Warnings near the top — integrity/stale-price issues
-            # inform how the LLM reads the numbers below.
+            # inform how the LLM reads the numbers below. Overdue
+            # scheduled computes once here and feeds BOTH the
+            # Warnings section and the Scheduled line's overdue
+            # count, so the two can't disagree.
+            overdue_sched = self._overdue_scheduled_warnings(
+                book, date.today(),
+            )
             warnings = self._collect_warnings(
                 book, transactions, accounts,
+                overdue_scheduled=overdue_sched,
             )
             if warnings:
                 lines.append("Warnings:")
@@ -2130,6 +2347,10 @@ class CoreMixin:
                 f"({data.expense_total} total)"
             )
 
+            lines.extend(
+                self._frequent_accounts(book, transactions)
+            )
+
             reconciliation = self._account_reconciliation_status(
                 book, accounts,
             )
@@ -2158,6 +2379,7 @@ class CoreMixin:
             lines.extend(
                 self._render_transactions_scheduled(
                     book, total_txns, enabled_sx, currency,
+                    overdue_count=len(overdue_sched),
                 )
             )
             lines.extend(
@@ -2303,7 +2525,7 @@ class CoreMixin:
         with self.open(readonly=True) as book:
             account = self._resolve_account(book, account_name)
             if not account:
-                raise ValueError(f"Account not found: {account_name}")
+                raise self._account_not_found_error(book, account_name)
 
             return self._own_splits_balance(account, as_of=as_of_date)
 
@@ -2479,6 +2701,7 @@ class CoreMixin:
         want_stability: bool,
         want_duplicates: bool,
         want_recent: bool,
+        trans_currency: str | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
         stability_limit: int = 5,
@@ -2638,7 +2861,20 @@ class CoreMixin:
                 # kills the noise without losing real duplicates
                 # (paycheck-vs-paycheck still matches on gross).
                 primary_amount = max(abs(s.value) for s in txn.splits)
-                amount_match = (
+                # Amounts only compare within the same currency
+                # frame: 188 HKD and 188 CNY are not the same money,
+                # and the cross-frame version of a true duplicate
+                # has numerically DIFFERENT values — so cross-
+                # currency amount matches are coincidence by
+                # construction (bookkeeper finding, cur-column
+                # round). Cross-currency candidates can still reach
+                # MEDIUM on description+date, labeled by the cur
+                # column.
+                same_frame = (
+                    trans_currency is None
+                    or txn.currency.mnemonic == trans_currency
+                )
+                amount_match = same_frame and (
                     abs(proposed_primary - primary_amount) <= Decimal("1.00")
                 )
 
@@ -2661,6 +2897,17 @@ class CoreMixin:
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "amount": str(primary_amount),
+                        # Labeling non-default candidates lets the
+                        # caller interpret a cross-currency MEDIUM
+                        # (desc+date) without a follow-up read —
+                        # and explains why equal-looking numbers
+                        # did NOT amount-match. Empty = book
+                        # default.
+                        "currency": (
+                            txn.currency.mnemonic
+                            if txn.currency != book.default_currency
+                            else ""
+                        ),
                         "signals": signal_str,
                     })
 
@@ -2725,7 +2972,7 @@ class CoreMixin:
         string (no header — ``create_transaction``'s docstring
         documents the shape)::
 
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
         ~40 chars per candidate vs ~120 for list-of-dicts JSON.
         Returns ``""`` for empty input — ``_strip_noise`` drops
@@ -2735,7 +2982,8 @@ class CoreMixin:
         """
         return "\n".join(
             f"{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-            f"{d['amount']}\t{d['description']}\t{d['signals']}"
+            f"{d['amount']}\t{d.get('currency', '')}\t"
+            f"{d['description']}\t{d['signals']}"
             for d in duplicates
         )
 
@@ -2835,7 +3083,7 @@ class CoreMixin:
             ref = split["account"]
             account = self._resolve_account(book, ref)
             if not account:
-                raise ValueError(f"Account not found: {ref}")
+                raise self._account_not_found_error(book, ref)
 
             value = _to_decimal(split["amount"])
             if account.commodity == trans_currency:
@@ -2861,6 +3109,7 @@ class CoreMixin:
                 "value": value,
                 "quantity": quantity,
                 "memo": split.get("memo"),
+                "action": split.get("action"),
                 "original_ref": ref,
             })
 
@@ -2899,7 +3148,7 @@ class CoreMixin:
 
             'duplicates', when present, is newline-separated TSV::
 
-                confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+                confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
             Confidence is HIGH or MEDIUM; signals is a three-char
             D/A/D code (description / amount / date, dash = no match).
@@ -2955,6 +3204,15 @@ class CoreMixin:
             proposed_amounts = [abs(_to_decimal(s["amount"])) for s in splits]
 
             # --- Preflight pass 2: duplicates + recent matches ---
+            # The frame is passed as a mnemonic (currency resolution
+            # proper happens below and may CREATE the commodity —
+            # mutation stays after the rejection path). A currency
+            # not yet in the book matches no existing transaction's
+            # frame, which is exactly right.
+            frame_code = (
+                currency.upper() if currency
+                else self._require_default_currency(book).mnemonic
+            )
             signals = self._collect_create_signals(
                 book,
                 description,
@@ -2964,6 +3222,7 @@ class CoreMixin:
                 want_stability=False,
                 want_duplicates=check_duplicates,
                 want_recent=True,
+                trans_currency=frame_code,
             )
             duplicates = signals.duplicates
 
@@ -3027,6 +3286,7 @@ class CoreMixin:
                             value=v["value"],
                             quantity=v["quantity"],
                             memo=v["memo"] or "",
+                            action=v["action"] or "",
                         )
                     )
 
@@ -3108,10 +3368,13 @@ class CoreMixin:
 
         Spec: specs/BATCH_TRANSACTION_ENTRY_SPEC.md. Each entry is
         ``{ref, date (date), description, notes (optional),
+        currency (optional ISO code — the row's transaction
+        currency, defaulting to the book default),
         splits: [{account, amount, memo (optional),
         quantity (optional)}]}`` — quantity per the
         ``_validate_transaction_splits`` contract (required iff the
-        account commodity differs from the book default). An EMPTY
+        account commodity differs from the row's transaction
+        currency). An EMPTY
         splits list is an auto-fill request: the row reproduces the
         most recent matching-description transaction (splits, memos,
         quantities), marked ``auto_filled_from:<guid>`` in the
@@ -3126,11 +3389,16 @@ class CoreMixin:
 
         Returns a thin envelope: ``results`` TSV (always) and
         ``duplicates`` TSV (only when a match exists; otherwise empty,
-        which ``_strip_noise`` drops). The transaction currency is
-        always the book default (a differently-denominated
-        transaction needs ``create_transaction``'s ``currency``
-        parameter); splits on non-default-commodity accounts carry
-        an explicit ``quantity``. No intra-batch dedup.
+        which ``_strip_noise`` drops). Rows without ``currency``
+        denominate in the book default; rows with it balance in
+        that currency instead (splits on accounts of any OTHER
+        commodity carry an explicit ``quantity``). The duplicate
+        amount signal compares within the same currency frame only
+        (188 HKD is not 188 CNY); a same-description same-date twin
+        in another currency can still surface as a labeled,
+        non-blocking MEDIUM. ``currency`` cannot combine with an
+        auto-fill row (the source transaction's own currency
+        governs a reproduction). No intra-batch dedup.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -3152,6 +3420,30 @@ class CoreMixin:
                 ref = txn["ref"]
                 try:
                     splits = txn["splits"]
+                    # Row's transaction currency (the ``cur``
+                    # column); absent means the book default.
+                    row_currency = default_currency
+                    if txn.get("currency"):
+                        row_currency = self._find_commodity(
+                            book, txn["currency"],
+                        )
+                        if not row_currency:
+                            raise ValueError(
+                                f"currency '{txn['currency']}' not "
+                                f"found in book — create it first "
+                                f"(create_commodity) or record a "
+                                f"transaction in it once"
+                            )
+                        if not splits:
+                            # Auto-fill reproduces a source txn in
+                            # the SOURCE's currency — silently
+                            # re-denominating it would corrupt the
+                            # copied amounts.
+                            raise ValueError(
+                                "cur cannot combine with an "
+                                "auto-fill (splitless) row — supply "
+                                "explicit splits"
+                            )
                     auto_filled_from = None
                     auto_fill_warnings: list[dict] = []
                     if not splits:
@@ -3175,19 +3467,17 @@ class CoreMixin:
                     if len(splits) < 2:
                         raise ValueError("at least 2 splits required")
                     validated = self._validate_transaction_splits(
-                        book, splits, default_currency,
+                        book, splits, row_currency,
                     )
                     for v in validated:
                         if v["account"].placeholder:
-                            raise ValueError(
-                                f"account '{v['account'].fullname}' is a "
-                                f"placeholder and cannot receive splits"
-                            )
+                            raise self._placeholder_error(v["account"])
                     prepared.append({
                         "ref": ref,
                         "description": txn["description"],
                         "notes": txn.get("notes") or "",
                         "trans_date": txn["date"],
+                        "currency": row_currency,
                         "validated": validated,
                         "proposed_amounts": [
                             abs(_to_decimal(s["amount"])) for s in splits
@@ -3218,6 +3508,7 @@ class CoreMixin:
                     p["proposed_amounts"],
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
+                    trans_currency=p["currency"].mnemonic,
                 )
                 dups = signals.duplicates
                 for d in dups:
@@ -3238,7 +3529,7 @@ class CoreMixin:
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
-                    book, p["validated"], default_currency, p["trans_date"],
+                    book, p["validated"], p["currency"], p["trans_date"],
                 ):
                     warn_rows.append((p["ref"], w["message"]))
 
@@ -3273,11 +3564,12 @@ class CoreMixin:
                     piecash.Split(
                         account=v["account"], value=v["value"],
                         quantity=v["quantity"], memo=v["memo"] or "",
+                        action=v["action"] or "",
                     )
                     for v in p["validated"]
                 ]
                 txn_obj = piecash.Transaction(
-                    currency=default_currency,
+                    currency=p["currency"],
                     description=p["description"],
                     notes=p["notes"] or None,
                     post_date=p["trans_date"],
@@ -3349,11 +3641,15 @@ class CoreMixin:
         prepended as the FK. Empty string when no row has a match."""
         if not dup_rows:
             return ""
-        lines = ["ref\tconfidence\tguid\tdate\tamount\tdescription\tsignals"]
+        lines = [
+            "ref\tconfidence\tguid\tdate\tamount\tcur\t"
+            "description\tsignals"
+        ]
         for ref, d in dup_rows:
             lines.append(
                 f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-                f"{d['amount']}\t{d['description']}\t{d['signals']}"
+                f"{d['amount']}\t{d.get('currency', '')}\t"
+                f"{d['description']}\t{d['signals']}"
             )
         return "\n".join(lines)
 
@@ -4172,18 +4468,246 @@ class CoreMixin:
                     )
                 bucket.pop(match_idx)
 
-    def update_transaction(
+    def _update_transactions_broadcast(
         self,
-        guid: str,
+        guids: list[str],
         description: str | None = None,
         trans_date: date | None = None,
         splits: list[dict] | None = None,
         notes: str | None = None,
         force: bool = False,
     ) -> dict:
-        """Update an existing transaction.
+        """Apply the same field values to every listed transaction.
+
+        All-or-nothing: every guid resolves and passes the voided
+        gate before anything mutates, mirroring batch delete. Splits
+        are single-transaction territory — a broadcast split edit
+        matched "by account" against N different transactions is a
+        semantic minefield, so it rejects loudly.
+        """
+        if not guids:
+            raise ValueError("guid list is empty")
+        if splits is not None:
+            raise ValueError(
+                "splits updates are single-transaction only — pass "
+                "one guid, or use replace_splits per transaction"
+            )
+        if description is None and trans_date is None and notes is None:
+            raise ValueError(
+                "nothing to update — supply description, "
+                "transaction_date, and/or notes"
+            )
+        with self.open(readonly=False) as book:
+            transactions = []
+            for g in guids:
+                txn = self._find_transaction(book, g)
+                if not txn:
+                    raise ValueError(f"Transaction not found: {g}")
+                if any(_is_voided(sp) for sp in txn.splits):
+                    raise ValueError(
+                        f"Transaction {g} is voided. Use "
+                        f"unvoid_transaction first, then update."
+                    )
+                if trans_date is not None \
+                        and _post_date_as_date(txn) != trans_date:
+                    self._require_force_for_reconciled(
+                        txn, force, "Moving its posting date",
+                    )
+                transactions.append(txn)
+
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for t in transactions
+                ],
+            })
+
+            for txn in transactions:
+                if description is not None:
+                    txn.description = description
+                if notes is not None:
+                    txn.notes = notes if notes else None
+                if trans_date is not None:
+                    txn.post_date = trans_date
+
+            book.save()
+
+            for txn in transactions:
+                self._verify_transaction_state(
+                    book, txn,
+                    expected_description=description,
+                    expected_date=trans_date,
+                    expected_notes=notes,
+                )
+
+            all_guids = [t.guid for t in book.transactions]
+            return {
+                "status": "updated",
+                "count": len(transactions),
+                "transactions": [
+                    {
+                        "guid": _unique_prefix(t.guid, all_guids),
+                        "description": t.description,
+                    }
+                    for t in transactions
+                ],
+            }
+
+    def update_transactions(
+        self,
+        updates: list[dict],
+        on_error: str = "abort",
+        force: bool = False,
+    ) -> dict:
+        """Per-row transaction updates in one book-open / one save.
+
+        Each entry: ``{guid, description (optional), notes
+        (optional), date (optional, datetime.date)}`` — absent keys
+        leave the field unchanged (the TSV's empty cells). Clearing
+        a field is deliberately single-tool territory
+        (``update_transaction`` with ``notes=""``) so a sparse batch
+        can never mass-erase.
+
+        ``on_error="abort"`` (default) sinks the batch on any bad
+        row; ``"skip"`` keeps the good rows. ``force`` allows date
+        moves on transactions with reconciled splits (rejected per
+        row otherwise — same gate as ``update_transaction``).
+        Returns ``{"results": TSV}`` keyed by the input guid.
+        """
+        if on_error not in ("abort", "skip"):
+            raise ValueError("on_error must be 'abort' or 'skip'")
+        keys = [u["guid"] for u in updates]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "duplicate guid in batch — each transaction may "
+                "appear once"
+            )
+
+        by_key: dict = {}
+        with self.open(readonly=False) as book:
+            prepared = []
+            for u in updates:
+                key = u["guid"]
+                try:
+                    if not any(
+                        f in u for f in ("description", "notes", "date")
+                    ):
+                        raise ValueError(
+                            "row changes nothing — every cell empty"
+                        )
+                    txn = self._find_transaction(book, key)
+                    if not txn:
+                        raise ValueError(f"Transaction not found: {key}")
+                    if any(_is_voided(sp) for sp in txn.splits):
+                        raise ValueError(
+                            f"Transaction {key} is voided. Use "
+                            f"unvoid_transaction first, then update."
+                        )
+                    if "date" in u \
+                            and _post_date_as_date(txn) != u["date"]:
+                        self._require_force_for_reconciled(
+                            txn, force, "Moving its posting date",
+                        )
+                    prepared.append((u, txn))
+                except (ValueError, KeyError) as e:
+                    by_key[key] = {
+                        "guid": key, "status": "rejected",
+                        "reason": str(e),
+                    }
+
+            if by_key and on_error == "abort":
+                for u, _txn in prepared:
+                    by_key[u["guid"]] = {
+                        "guid": u["guid"], "status": "rejected",
+                        "reason": "batch_aborted",
+                    }
+                return self._updates_envelope(updates, by_key)
+
+            self._stage_audit_before({
+                "transactions": [
+                    _transaction_to_dict(t) for _u, t in prepared
+                ],
+            })
+
+            for u, txn in prepared:
+                if "description" in u:
+                    txn.description = u["description"]
+                if "notes" in u:
+                    txn.notes = u["notes"] or None
+                if "date" in u:
+                    txn.post_date = u["date"]
+
+            if prepared:
+                book.save()
+
+            for u, txn in prepared:
+                self._verify_transaction_state(
+                    book, txn,
+                    expected_description=u.get("description"),
+                    expected_date=u.get("date"),
+                    expected_notes=u.get("notes"),
+                )
+                by_key[u["guid"]] = {
+                    "guid": u["guid"], "status": "updated",
+                    "description": txn.description,
+                }
+
+            return self._updates_envelope(updates, by_key)
+
+    @staticmethod
+    def _updates_envelope(updates: list[dict], by_key: dict) -> dict:
+        lines = ["guid\tstatus\tdescription\treason"]
+        for u in updates:
+            r = by_key.get(u["guid"], {})
+            lines.append(
+                f"{u['guid']}\t{r.get('status', '')}\t"
+                f"{r.get('description', '')}\t{r.get('reason', '')}"
+            )
+        return {"results": "\n".join(lines)}
+
+    @staticmethod
+    def _require_force_for_reconciled(
+        transaction, force: bool, action: str,
+    ) -> None:
+        """Raise unless ``force`` when the transaction has reconciled
+        ('y') splits — the shared gate for every edit that would
+        damage reconciliation (split changes AND posting-date moves;
+        a date move relocates the transaction across statement
+        periods while its splits stay 'y'). ``action`` names the
+        change in the error message."""
+        if force:
+            return
+        reconciled = [
+            s for s in transaction.splits if s.reconcile_state == "y"
+        ]
+        if not reconciled:
+            return
+        acct_names = ", ".join(
+            s.account.fullname for s in reconciled
+        )
+        raise ValueError(
+            f"Transaction has reconciled splits in: {acct_names}. "
+            f"{action} will break reconciliation. "
+            f"Use force=true to override."
+        )
+
+    def update_transaction(
+        self,
+        guid: str | list[str],
+        description: str | None = None,
+        trans_date: date | None = None,
+        splits: list[dict] | None = None,
+        notes: str | None = None,
+        force: bool = False,
+    ) -> dict:
+        """Update an existing transaction — or broadcast one change
+        to several.
 
         Args:
+            guid: One GUID, or a LIST of them: the supplied field
+                values apply to EVERY listed transaction (one book
+                open, one save, all-or-nothing). The batch-annotation
+                case — same note on 35 related entries — in one call.
+                ``splits`` is single-transaction only.
             description / trans_date / notes: Optional; ``notes=""``
                 clears.
             splits: Optional split updates matched to existing splits
@@ -4192,13 +4716,20 @@ class CoreMixin:
                 when splits change).
 
         Returns:
-            Thin dict: {guid, date, description, status}.
+            Thin dict: {guid, date, description, status}; for a
+            list, ``{status, count, transactions: [{guid,
+            description}]}``.
 
         Raises:
             ValueError: not found, voided, imbalance, account not in
                 transaction, missing quantity, or reconciled without
                 force.
         """
+        if isinstance(guid, list):
+            return self._update_transactions_broadcast(
+                guid, description=description, trans_date=trans_date,
+                splits=splits, notes=notes, force=force,
+            )
         with self.open(readonly=False) as book:
             transaction = self._find_transaction(book, guid)
             if not transaction:
@@ -4217,18 +4748,19 @@ class CoreMixin:
 
             # Check for reconciled splits when modifying splits
             if splits is not None:
-                reconciled = [
-                    s for s in transaction.splits if s.reconcile_state == "y"
-                ]
-                if reconciled and not force:
-                    acct_names = ", ".join(
-                        s.account.fullname for s in reconciled
-                    )
-                    raise ValueError(
-                        f"Transaction has reconciled splits in: {acct_names}. "
-                        f"Modifying will break reconciliation. "
-                        f"Use force=true to override."
-                    )
+                self._require_force_for_reconciled(
+                    transaction, force, "Modifying",
+                )
+
+            # A date move relocates the transaction across statement
+            # / reporting periods while its splits stay 'y' — same
+            # reconciliation damage as editing the splits, so the
+            # same force gate. Same-date is a no-op and passes.
+            if trans_date is not None \
+                    and _post_date_as_date(transaction) != trans_date:
+                self._require_force_for_reconciled(
+                    transaction, force, "Moving its posting date",
+                )
 
             # Stage pre-update state for the audit log.
             self._stage_audit_before(_transaction_to_dict(transaction))
@@ -4331,11 +4863,19 @@ class CoreMixin:
         Currency, description, date, and notes are preserved; the
         new splits must balance to zero.
 
+        A new split that reproduces an existing one (same account,
+        value, and quantity) is treated as an UNCHANGED leg: it
+        keeps the old split's memo (a caller-supplied memo wins)
+        and its reconcile state — recategorizing one leg doesn't
+        destroy the other leg's provenance or reconciliation.
+
         Args:
             splits: Complete new set — 'account', 'amount', optional
                 'quantity' (cross-currency) and 'memo'.
-            force: Required if existing splits are reconciled or
-                assigned to lots.
+            force: Required if the replacement would CHANGE a
+                reconciled split, or remove splits from lots.
+                Unchanged reconciled legs are preserved and need no
+                override.
 
         Returns:
             Thin dict with guid, status, previous_splits (audit
@@ -4381,11 +4921,11 @@ class CoreMixin:
                 account_name = split_data["account"]
                 account = self._resolve_account(book, account_name)
                 if not account:
-                    raise ValueError(f"Account not found: {account_name}")
-                if account.placeholder:
-                    raise ValueError(
-                        f"Cannot use placeholder account: {account_name}"
+                    raise self._account_not_found_error(
+                        book, account_name,
                     )
+                if account.placeholder:
+                    raise self._placeholder_error(account)
                 resolved_accounts.append((account, split_data))
 
             # 4a. Voided transactions are immutable — same
@@ -4396,18 +4936,79 @@ class CoreMixin:
                     f"unvoid_transaction first, then replace splits."
                 )
 
-            # 4. Check reconciled splits
-            reconciled = [
-                s for s in transaction.splits if s.reconcile_state == "y"
+            # 4. Carry-forward snapshot: a new split that reproduces
+            # an old one (same account, value, and quantity) is an
+            # UNCHANGED leg — recategorizing one side of a
+            # transaction must not destroy the other side's
+            # provenance memo or knock it out of reconciliation.
+            # Greedy one-to-one claim so same-account same-amount
+            # twins each match once.
+            carryover = [
+                {
+                    "account_guid": s.account.guid,
+                    "value": s.value,
+                    "quantity": s.quantity,
+                    "memo": s.memo or "",
+                    "action": s.action or "",
+                    "state": s.reconcile_state,
+                    "rdate": s.reconcile_date,
+                    "claimed": False,
+                }
+                for s in transaction.splits
             ]
-            if reconciled and not force:
-                names = ", ".join(s.account.fullname for s in reconciled)
+
+            def _new_split_quantity(account, split_data):
+                """Quantity a new split would carry, or None when a
+                required cross-commodity quantity is absent (step 7
+                rejects that row; the pre-pass just skips it)."""
+                amount = _to_decimal(split_data["amount"])
+                if account.commodity == transaction.currency:
+                    return amount
+                if "quantity" in split_data:
+                    return _to_decimal(split_data["quantity"])
+                return None
+
+            def _claim(pool, account_guid, value, quantity):
+                for c in pool:
+                    if (
+                        not c["claimed"]
+                        and c["account_guid"] == account_guid
+                        and c["value"] == value
+                        and c["quantity"] == quantity
+                    ):
+                        c["claimed"] = True
+                        return c
+                return None
+
+            # Pre-pair on a scratch copy so the force gate applies
+            # only to reconciled legs the replacement would CHANGE —
+            # an unchanged reconciled leg is preserved verbatim and
+            # needs no override.
+            scratch = [dict(c) for c in carryover]
+            for account, split_data in resolved_accounts:
+                quantity = _new_split_quantity(account, split_data)
+                if quantity is not None:
+                    _claim(
+                        scratch, account.guid,
+                        _to_decimal(split_data["amount"]), quantity,
+                    )
+            reconciled_changed = [
+                s for s, c in zip(transaction.splits, scratch)
+                if s.reconcile_state == "y" and not c["claimed"]
+            ]
+            if reconciled_changed and not force:
+                names = ", ".join(
+                    s.account.fullname for s in reconciled_changed
+                )
                 raise ValueError(
-                    f"Transaction has reconciled splits in: {names}. "
+                    f"Transaction has reconciled splits in: {names} "
+                    f"that this replacement would change. "
                     f"Use force=true to override."
                 )
-            if reconciled:
-                names = ", ".join(s.account.fullname for s in reconciled)
+            if reconciled_changed:
+                names = ", ".join(
+                    s.account.fullname for s in reconciled_changed
+                )
                 warnings.append(f"Replaced reconciled splits in: {names}")
 
             # 5. Check lot assignments
@@ -4459,13 +5060,28 @@ class CoreMixin:
                 fx_check_splits.append({
                     "account": account, "value": amount, "quantity": quantity,
                 })
-                piecash.Split(
+                # Unchanged leg: keep its memo and action (caller-
+                # supplied values win) and its reconciliation,
+                # verbatim.
+                match = _claim(carryover, account.guid, amount, quantity)
+                new_split = piecash.Split(
                     account=account,
                     value=amount,
                     quantity=quantity,
-                    memo=split_data.get("memo", ""),
+                    memo=(
+                        split_data.get("memo")
+                        or (match["memo"] if match else "")
+                    ),
+                    action=(
+                        split_data.get("action")
+                        or (match["action"] if match else "")
+                    ),
                     transaction=transaction,
                 )
+                if match and match["state"] in ("y", "c"):
+                    new_split.reconcile_state = match["state"]
+                    if match["rdate"] is not None:
+                        new_split.reconcile_date = match["rdate"]
 
             # Cross-commodity implied-rate sanity (non-blocking) — this
             # path's warnings are plain strings, so emit messages.

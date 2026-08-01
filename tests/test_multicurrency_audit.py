@@ -416,3 +416,116 @@ class TestSameDatePriceTieBreak:
             )
             rates = gc._rates_as_of(book, d)
             assert rates[eur.guid] == Decimal("1.10")
+
+
+class TestPriceLookupMemo:
+    """_find_prices memoizes each (commodity_guid, currency_guid)
+    lookup on the open book: the first request queries, repeats are
+    dict hits. The memoized result must match a fresh query exactly,
+    including the same-date tie-break (bookkeeper finding F3, see
+    TestSameDatePriceTieBreak above) — a memo sorted on date alone
+    would put same-date ties back to depending on row order, which
+    is the bug F3 fixed."""
+
+    def test_repeat_lookups_agree_and_are_memoized(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="user:market-data")
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+                        source="user:price")
+
+        with gc.open(readonly=True) as book:
+            eur = book.commodities(mnemonic="EUR")
+            usd = book.default_currency
+
+            first = gc._find_prices(book, commodity_guid=eur.guid,
+                                    currency_guid=usd.guid)
+            # The pair is memoized now; the repeat is a dict hit.
+            memo = getattr(book, gc._PRICE_LOOKUPS_ATTR)
+            assert (eur.guid, usd.guid) in memo
+            repeat = gc._find_prices(book, commodity_guid=eur.guid,
+                                     currency_guid=usd.guid)
+
+            assert [p.guid for p in first] == [p.guid for p in repeat], (
+                "memoized lookups must return the same prices "
+                "in the same order as the first query"
+            )
+            # The manual quote wins the same-date tie on both.
+            assert first[0].value == Decimal("1.10")
+            assert repeat[0].value == Decimal("1.10")
+
+    def test_price_written_mid_call_is_visible_after_invalidation(
+        self, multi_currency_book,
+    ):
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 4, 30)
+
+        with gc.open(readonly=False) as book:
+            eur = book.commodities(mnemonic="EUR")
+            usd = book.default_currency
+
+            # Memoize the pair, so a later read would be served
+            # from the memo.
+            before = gc._find_prices(book, commodity_guid=eur.guid,
+                                     currency_guid=usd.guid)
+
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd, date=d,
+                value=Decimal("1.42"), source="user:price",
+            ))
+            book.save()
+            gc._invalidate_price_caches(book)
+
+            after = gc._find_prices(book, commodity_guid=eur.guid,
+                                    currency_guid=usd.guid)
+            assert len(after) == len(before) + 1
+            assert after[0].value == Decimal("1.42"), (
+                "a price added mid-call must be visible once the "
+                "caches are invalidated"
+            )
+
+    def test_every_price_write_path_invalidates_the_memo(
+        self, multi_currency_book, monkeypatch,
+    ):
+        """The cache-safety argument rests on one invariant: every
+        path that adds or removes a Price row invalidates the memo
+        after its save. create_price and delete_price were the only
+        write paths when the memo landed; bulk create_prices shipped
+        separately and silently fell outside the claim. This test
+        turns the invariant into a contract over all three."""
+        gc = GnuCashBook(str(multi_currency_book))
+        cls = type(gc)
+        calls: list[bool] = []
+        real = cls._invalidate_price_caches
+
+        def spy(book):
+            calls.append(True)
+            real(book)
+
+        monkeypatch.setattr(
+            cls, "_invalidate_price_caches", staticmethod(spy),
+        )
+
+        gc.create_price("EUR", "CURRENCY", "1.31",
+                        price_date=date(2026, 5, 1),
+                        source="user:price")
+        assert calls, "create_price must invalidate after its save"
+
+        calls.clear()
+        gc.create_prices([{
+            "ref": "r1", "commodity": "EUR",
+            "namespace": "CURRENCY", "date": date(2026, 5, 2),
+            "value": "1.32",
+        }])
+        assert calls, (
+            "bulk create_prices must invalidate after its save"
+        )
+
+        calls.clear()
+        gc.delete_price("EUR", "CURRENCY",
+                        price_date=date(2026, 5, 2),
+                        source="user:price")
+        assert calls, "delete_price must invalidate after its save"

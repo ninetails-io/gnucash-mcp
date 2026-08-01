@@ -11,11 +11,18 @@ Your data stays on your machine. Your audit log stays on your
 machine. Nothing is uploaded anywhere — the AI reads and writes
 your local GnuCash file, and that's it.
 
-Two real, populated sample books ship in this repo so you can
-try it before you commit anything. They're realistic — full
+Three real, populated sample books ship in this repo so you
+can try it before you commit anything. They're realistic — full
 years of activity, mixed currencies, customers, invoices,
 budgets, the works. Walk through one in five minutes; if it
 clicks, point the server at your own book and you're done.
+
+The samples are frozen snapshots, not living books — expect the
+dashboard to flag stale prices and pending scheduled transactions
+that have accumulated since their last regeneration. That's
+realistic too (it's what a book looks like after a vacation). To
+rebuild them fresh through today, run the deterministic generators
+in `scripts/synthetic_book/` (phase scripts, in order).
 
 ---
 
@@ -106,7 +113,7 @@ You don't need to be a developer. You need:
 
 ## Try it without risking anything
 
-The repo ships two sample books — fully-populated synthetic
+The repo ships three sample books — fully-populated synthetic
 ledgers you can talk to without touching your real data. Pick
 one, point the server at it, and start asking questions.
 
@@ -129,8 +136,17 @@ on rate moves, domestic Chinese investments (茅台, 宁德时代,
 ETFs), an LPR-based mortgage, mixed payment rails (checking +
 Alipay + WeChat Pay).
 
-Both books are fictional. See [samples/README.md](samples/README.md)
-for the full breakdown of what's in each.
+### `samples/sabine-brenner.gnucash` — German freelancer, SKR03 chart
+
+A Munich-based freelance consultant. EUR-default, on a German
+SKR03 chart of accounts — every account name in German. ~110
+accounts, ~1,500 transactions. This is the i18n oracle: if a
+feature secretly assumes English account names or USD, Sabine's
+book is where it breaks.
+
+All three books are fictional. See
+[samples/README.md](samples/README.md) for the full breakdown of
+what's in each.
 
 ---
 
@@ -194,7 +210,7 @@ cloned, and `GNUCASH_BOOK_PATH` with your book's path:
 
 `uv run --directory` runs the server straight from the clone,
 resyncing dependencies each launch — so a `git pull` is all it
-takes to update. `--modules=all` loads every tool (107 of them)
+takes to update. `--modules=all` loads every tool (111 of them)
 so you can poke at anything. Once you know what you actually use,
 narrow it — see [choosing a module set](#choosing-a-module-set)
 below.
@@ -270,7 +286,11 @@ Desktop clients:
   This writes a project `.gemini/settings.json` with the server
   registered; run `/mcp list` inside Gemini to confirm it shows
   `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
-  a SQLite3 export, see the `libdbd-sqlite3` note above.)
+  a SQLite3 export, see the `libdbd-sqlite3` note above. The Gemini
+  walkthrough and the Linux driver fix both come from
+  [@hpuri](https://github.com/hpuri)'s testing in
+  [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
+  thanks.)
 - **Anything else**: set `GNUCASH_BOOK_PATH` and run `uv run
   --directory /path/to/gnucash-mcp gnucash-mcp`. Any client that
   can spawn a command and speak MCP over stdio will work.
@@ -451,6 +471,36 @@ args.
 
 ---
 
+## What's new in v1.4.2
+
+One call wide, every surface honest — every entry traces to a
+named moment of live friction:
+
+- **The bulk grammar is complete** — `update_transactions`
+  (per-row TSV edits), broadcast updates (one change, many GUIDs),
+  `create_prices` (batch quotes + a stale-price work list), and a
+  `cur` column so foreign-denominated transactions batch-enter
+  like everything else.
+- **Reconciliation kept honest** — `reconcile_all` honors its
+  statement-date bound; a new `get_reconciliation_status` tool
+  drills down behind the dashboard's counts; statement-less
+  accounts opt out of nagging with the `no_reconcile` slot; paid-off
+  dormant cards stop warning forever.
+- **The dashboard hands each session its vocabulary** — your top
+  accounts by recent posting frequency, in short-GUID form, so the
+  AI reaches for compact refs from the first call.
+- **First outside code contribution** — @bhbrunt's price-lookup
+  memoization and split-graph preload took a 33k-split book's
+  summary from never-completing to under 10 seconds (and made
+  small books ~45% faster too).
+- **Audit trail hardened** — user text is escaped before it
+  reaches the audit log (no forged entries, no smuggled
+  instructions), price dry-runs agree with live execution, and
+  moving the date of a reconciled transaction now requires
+  `force=true` (behavior change).
+
+**Tests:** 1,954 passing.
+
 ## What's new in v1.4.1
 
 Batch entry grows up, driven by the bookkeeper's daily workflow:
@@ -483,7 +533,8 @@ Batch entry grows up, driven by the bookkeeper's daily workflow:
 
 ## What's in v1.4.0
 
-The first widely-promoted release. v1.3 finished the business
+The release where batch transaction entry entered the scene.
+v1.3 finished the business
 module; v1.4 makes the server work correctly on non-English books,
 adds bulk and multi-book workflows, and lands a second
 multi-currency correctness pass.
@@ -602,7 +653,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,856 tests as of v1.4.1
+uv run pytest                       # 1,954 tests as of v1.4.2
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```

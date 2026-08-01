@@ -127,6 +127,69 @@ class ReconciliationMixin:
                 "status": "updated",
             }
 
+    def get_reconciliation_status(
+        self, compact: bool = True, limit: int = 50, offset: int = 0,
+    ) -> dict | str:
+        """Per-account reconciliation table behind the dashboard's
+        aggregate counts — the drill-down that answers "WHICH five
+        accounts are never reconciled?"
+
+        One row per reconcilable account with activity, bucketed by
+        the same classification the dashboard uses (agree-by-
+        construction): ``behind`` (most-behind first), ``never``,
+        ``current``, ``dormant`` ($0, fully reconciled, idle), and
+        ``excluded`` (the account's ``no_reconcile`` slot — set via
+        set_account_slot — opts it out of dashboard warnings;
+        loans and escrow payables with no statement to reconcile).
+
+        Args:
+            compact: One TSV line per account (default) or the
+                verbose envelope.
+            limit: Page size (default 50, max 250). 0 = count only.
+            offset: 0-indexed first row to return.
+        """
+        with self.open(readonly=True) as book:
+            accounts = list(book.accounts)
+            rows = self._account_reconciliation_status(book, accounts)
+            for r in rows:
+                r["bucket"] = self._classify_reconciliation(r)
+            bucket_rank = {
+                "behind": 0, "never": 1, "current": 2,
+                "dormant": 3, "excluded": 4,
+            }
+            rows.sort(key=lambda r: (
+                bucket_rank[r["bucket"]],
+                -(r["days_behind"] or 0),
+                r["account"],
+            ))
+
+            page, indicator = _paginate(
+                rows, offset=offset, limit=limit,
+                entity_name="accounts",
+            )
+            if compact:
+                lines = [indicator]
+                for r in page:
+                    cells = [r["account"], r["bucket"], r["status"]]
+                    n = r["unreconciled_count"]
+                    if n:
+                        cell = f"{n} unreconciled"
+                        if r.get("oldest_unreconciled_date"):
+                            cell += (
+                                f" (oldest: "
+                                f"{r['oldest_unreconciled_date']})"
+                            )
+                        cells.append(cell)
+                    lines.append("\t".join(cells))
+                return "\n".join(lines)
+            return {
+                "showing": indicator,
+                "total": len(rows),
+                "offset": offset,
+                "count": len(page),
+                "accounts": page,
+            }
+
     def get_unreconciled_splits(
         self,
         account_name: str,
@@ -259,13 +322,19 @@ class ReconciliationMixin:
         - **Targeted** (``split_guids=[...]``): reconcile exactly
           the listed splits.
         - **Bulk** (``reconcile_all=True``): reconcile every
-          unreconciled split on the account — the OFX-import common
-          case. ``through_date`` optionally bounds the sweep; the
-          default is NO date filter (defaulting to statement_date
-          would silently exclude payments dated after the
-          statement). ``except_guids`` excludes named splits ("the
-          statement covers everything except this pending ACH");
-          non-resolving prefixes are silently ignored.
+          unreconciled split on the account dated on or before
+          ``through_date``, which DEFAULTS TO ``statement_date`` —
+          a statement reconciliation is bounded by the statement.
+          (The old no-filter default made multi-month entry
+          unreconcilable in bulk: later months broke the balance
+          tie, forcing a targeted GUID-picking dance per statement
+          — live bookkeeper finding, 2026-07-24. Nothing is
+          silently excluded either way: the tie check rejects with
+          the discrepancy when the window and the statement
+          disagree.) Pass a later ``through_date`` explicitly to
+          widen the sweep. ``except_guids`` excludes named splits
+          ("the statement covers everything except this pending
+          ACH"); non-resolving prefixes are silently ignored.
 
         The two modes are mutually exclusive, and both verify the
         resulting reconciled balance ties to ``statement_balance``
@@ -292,6 +361,9 @@ class ReconciliationMixin:
                 "Use either bulk mode (reconcile_all=True) or targeted "
                 "mode (split_guids=[...]), not both."
             )
+        if reconcile_all and through_date is None:
+            through_date = statement_date
+
         if not reconcile_all and not split_guids:
             raise ValueError(
                 "Must provide split_guids for targeted reconciliation, "
@@ -385,10 +457,18 @@ class ReconciliationMixin:
                 reconciled_balance + reconciling_total
             ).quantize(quantum)
             if new_balance != expected_q:
+                hint = ""
+                if reconcile_all:
+                    hint = (
+                        " Bulk mode swept splits through "
+                        f"{through_date.isoformat()}; if the statement "
+                        "includes later-dated items (e.g. a payoff "
+                        "payment), pass through_date past them."
+                    )
                 raise ValueError(
                     f"Balance mismatch: reconciled balance would be {new_balance}, "
                     f"but statement balance is {expected_q}. "
-                    f"Difference: {expected_q - new_balance}"
+                    f"Difference: {expected_q - new_balance}.{hint}"
                 )
 
             # Audit before-state in the multi-split shape the
@@ -404,8 +484,9 @@ class ReconciliationMixin:
 
             book.save()
 
-            # Computed info only — the audit log reads the inputs
-            # from tool params.
+            # Computed info only — the audit log reads the statement
+            # inputs from tool params and the reconciled-split list
+            # from the staged before-state above.
             return {
                 "splits_reconciled": len(splits_to_reconcile),
                 "new_reconciled_balance": str(new_balance),

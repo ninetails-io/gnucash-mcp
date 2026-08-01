@@ -24,6 +24,8 @@ def register(mcp, get_book) -> None:
         frequency: str,
         end_date: str | None = None,
         enabled: bool = True,
+        notes: str | None = None,
+        currency: str | None = None,
     ) -> str:
         """Create a recurring transaction template.
 
@@ -32,12 +34,23 @@ def register(mcp, get_book) -> None:
             description: Transaction description at instantiation.
             splits: Same format as create_transaction, e.g.
                 ``[{"account": "Expenses:Rent", "amount": "1850.00"}, ...]``.
-                ``amount`` / ``quantity`` must be decimal strings.
+                ``amount`` / ``quantity`` must be decimal strings;
+                ``quantity`` is required when an account's commodity
+                differs from the template's transaction currency.
             start_date: First occurrence (YYYY-MM-DD).
             frequency: "weekly", "biweekly" (2w), "monthly",
                 "bimonthly" (2mo), "quarterly" (3mo), or "yearly".
             end_date: Optional last occurrence (YYYY-MM-DD).
             enabled: Active. Default True.
+            notes: Transaction notes applied to every instantiated
+                transaction (what the payment is — visible in
+                GnuCash's double-line register view).
+            currency: ISO code denominating every instantiated
+                transaction; defaults to the book default. Use when
+                no leg is in the book currency (a USD-to-USD card
+                payment scheduled inside a CNY book) so amounts are
+                the foreign currency's own numbers. Not updatable
+                after creation — delete and recreate to change it.
         """
         book = get_book()
         result = book.create_scheduled_transaction(
@@ -48,6 +61,8 @@ def register(mcp, get_book) -> None:
             frequency=frequency,
             end_date=end_date,
             enabled=enabled,
+            notes=notes,
+            currency=currency,
         )
         return _json(result)
 
@@ -144,6 +159,7 @@ def register(mcp, get_book) -> None:
         guid: ScheduledTransactionGuid,
         enabled: bool | None = None,
         end_date: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Update a scheduled transaction.
 
@@ -162,12 +178,18 @@ def register(mcp, get_book) -> None:
                 distinct value from "no change supplied" — both
                 arrive as Python ``None``. Empty-string is the
                 explicit "clear it" signal.
+            notes: Instantiation notes applied to transactions
+                created from this schedule going forward (existing
+                transactions untouched). Same three-state
+                convention as end_date: text to set, ``""`` to
+                clear, omit to leave unchanged.
         """
         book = get_book()
         result = book.update_scheduled_transaction(
             guid=guid,
             enabled=enabled,
             end_date=end_date,
+            notes=notes,
         )
         return _json(result)
 

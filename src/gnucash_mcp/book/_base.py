@@ -357,6 +357,35 @@ _DEFAULT_TYPES = {
 }
 
 
+_SLOT_BOOL_TRUE = frozenset({"1", "true", "yes", "y", "on"})
+_SLOT_BOOL_FALSE = frozenset({"0", "false", "no", "n", "off", ""})
+
+
+def _slot_bool(entity, key: str) -> bool | None:
+    """Tri-state boolean slot read: True, False, or None (absent /
+    unrecognized).
+
+    THE convention for boolean slots — extracted per the standing
+    backlog note when the third boolean slot (``no_reconcile``)
+    arrived: ``credit-note`` parsed strictly (== "1") while
+    ``is_retirement`` parsed leniently, and a third private
+    convention was the trigger to consolidate. Lenient wins because
+    slot values are user-typed through set_account_slot; an
+    unrecognized value returns None so each caller keeps its own
+    fallback semantics instead of this helper guessing.
+    """
+    try:
+        raw = entity[key]
+    except KeyError:
+        return None
+    val = (_slot_value_str(raw) or "").strip().lower()
+    if val in _SLOT_BOOL_TRUE:
+        return True
+    if val in _SLOT_BOOL_FALSE:
+        return False
+    return None
+
+
 def _account_to_compact_line(account: piecash.Account) -> str:
     """Convert a piecash Account to a compact one-line string.
 
@@ -417,6 +446,7 @@ def _split_to_dict(
         "value": str(split.value),
         "quantity": str(split.quantity),
         "memo": split.memo or "",
+        "action": split.action or "",
         "reconcile_state": split.reconcile_state,
         "reconcile_date": rec_date.isoformat() if rec_date else None,
         "lot_guid": lot_guid,
@@ -498,6 +528,11 @@ def _commodity_to_compact_line(namespace: str, entry: dict) -> str:
     lp = entry.get("latest_price")
     if lp:
         parts.append(f"{lp['value']} {lp['currency']} ({lp['date']})")
+    # Work-list markers, present only under the stale_days filter.
+    if entry.get("no_price"):
+        parts.append("no price on file")
+    elif entry.get("days_stale") is not None:
+        parts.append(f"{entry['days_stale']}d stale")
     return "\t".join(parts)
 
 
@@ -704,6 +739,10 @@ def _upcoming_to_compact_line(
     occ_date = entry["occurrence_date"]
     days = entry["days_until"]
     amount = entry["amount"]
+    # Foreign-currency templates label their amount — an unlabeled
+    # "2000" from an HKD schedule reads as the book currency.
+    if entry.get("currency"):
+        amount = f"{amount} {entry['currency']}"
     return f"{short}\t{name}\t{occ_date}\t{days} days\t{amount}"
 
 
@@ -1638,6 +1677,110 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         self._collect_descendants(rt, descendants)
         guids.update(a.guid for a in descendants)
         return guids
+
+    def _account_suggestions(
+        self, book: piecash.Book, ref: str, limit: int = 3,
+    ) -> list[str]:
+        """Closest real account fullnames to a failed ref.
+
+        Prefix/substring hits rank first — the common near-miss is
+        the right branch with a wrong or truncated leaf
+        ("Expenses:Insurance:Auto" for
+        "Expenses:Insurance:Auto Insurance") — then difflib
+        similarity for typos. Error-path only: costs nothing on
+        successful resolution.
+        """
+        import difflib
+
+        template_guids = self._template_account_guids(book)
+        names = [
+            a.fullname for a in book.accounts
+            if a.guid not in template_guids
+        ]
+        ref_l = ref.lower()
+        subs = [
+            n for n in names
+            if n.lower().startswith(ref_l) or ref_l in n.lower()
+        ]
+        close = difflib.get_close_matches(ref, names, n=limit, cutoff=0.6)
+        out: list[str] = []
+        for n in subs + close:
+            if n not in out:
+                out.append(n)
+        return out[:limit]
+
+    def _account_not_found_error(
+        self, book: piecash.Book, ref: str,
+    ) -> ValueError:
+        """`Account not found` with did-you-mean suggestions.
+
+        Every wrong path guess in a batch is a rejected row and a
+        retry round-trip (live bookkeeper friction, 2026-07-24);
+        three candidates turn the retry into a one-shot correction.
+        """
+        msg = f"Account not found: {ref}"
+        suggestions = self._account_suggestions(book, ref)
+        if suggestions:
+            listed = ", ".join(f"'{s}'" for s in suggestions)
+            msg += (
+                f". Did you mean: {listed}? "
+                f"(list_accounts(query=...) to browse.)"
+            )
+        return ValueError(msg)
+
+    @staticmethod
+    def _placeholder_error(account) -> ValueError:
+        """Placeholder rejection that names postable children."""
+        kids = [
+            c.fullname for c in account.children if not c.placeholder
+        ]
+        msg = (
+            f"Account '{account.fullname}' is a placeholder and "
+            f"cannot receive splits"
+        )
+        if kids:
+            shown = ", ".join(f"'{k}'" for k in kids[:3])
+            more = f" (+{len(kids) - 3} more)" if len(kids) > 3 else ""
+            msg += f" — post to one of its children: {shown}{more}"
+        return ValueError(msg)
+
+    @staticmethod
+    def _preload_split_graph(book) -> None:
+        """Bulk-load accounts, transactions and their split collections,
+        so that later traversals of ``txn.splits``, ``split.transaction``
+        and ``split.account`` resolve in memory instead of lazy-loading
+        per row. Intended for whole-book reports; a single-account lookup
+        would load rows it never touches.
+
+        The loaded rows are parked on the book deliberately: SQLAlchemy's
+        identity map holds them only weakly, so without a strong
+        reference they would be collected immediately and every traversal
+        would query again. The reference lives as long as the book, i.e.
+        one ``open()`` context.
+
+        Deliberate tradeoff: the whole split graph is held in memory
+        for the duration of the call — tens of MB on a tens-of-
+        thousands-of-splits book. That is the price of the report
+        completing at all at that scale (lazy loading was a query per
+        transaction), and the biggest books are exactly the ones that
+        need it, so there is no size cutoff.
+        """
+        from piecash.core.account import Account
+        from piecash.core.transaction import Transaction
+        from sqlalchemy.orm import selectinload
+
+        if getattr(book, "_gnucash_mcp_split_graph", None) is not None:
+            return
+
+        accounts = (
+            book.session.query(Account).options(selectinload(Account.splits)).all()
+        )
+        transactions = (
+            book.session.query(Transaction)
+            .options(selectinload(Transaction.splits))
+            .all()
+        )
+        book._gnucash_mcp_split_graph = (accounts, transactions)
 
     @staticmethod
     def _is_template_transaction(txn, template_guids: set) -> bool:

@@ -9,6 +9,7 @@ Logs are stored alongside the GnuCash book file:
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -369,10 +370,15 @@ def setup_logging(
         except OSError:
             pass
 
-        # Write header if needed
+        # Write header if needed. The trailing "\n" (plus the
+        # logger's own newline) leaves a blank line after the
+        # banner — get_audit_log splits entries on blank lines, so
+        # without it the day's first entry glues to the header
+        # block: excluded from the count, rendered on every page,
+        # and leaked through limit=0.
         if write_header:
             header = _format_text_header(today, book_path, tz_name)
-            audit_logger.info(header)
+            audit_logger.info(header + "\n")
             _flush_logger(audit_logger)
     else:
         # Disable audit logging
@@ -452,6 +458,8 @@ def _format_splits_text(splits: list[dict], indent: str = "          ") -> str:
         short_name = account.split(":")[-1]
         amount = _format_amount(split.get("amount") or split.get("value"))
         line = f"{indent}{short_name:<{max_name_len}}  {amount:>12}"
+        if split.get("action"):
+            line += f"  [{split['action']}]"
         if split.get("memo"):
             line += f"  {split['memo']}"
         lines.append(line)
@@ -532,6 +540,10 @@ def _fmt_transaction_create(entry: dict) -> list[str]:
     date_str = after.get("date") or params.get("transaction_date", "")
     lines.append(f'{_INDENT}"{desc}" ({date_str})')
 
+    notes = after.get("notes") or params.get("notes") or ""
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
+
     # after_state preferred; fall back to params (thin-response case)
     splits = after.get("splits") or params.get("splits") or []
     if splits:
@@ -604,8 +616,12 @@ def _parse_batch_submission(tsv: str) -> dict:
     except ValueError:
         # Malformed extension header — the write path rejected the
         # whole submission; render rows in the legacy shape.
-        layout = {"has_notes": False, "group": _BATCH_LEGACY_GROUP}
-    fixed = 4 if layout["has_notes"] else 3
+        layout = {
+            "has_notes": False, "has_cur": False,
+            "notes_idx": None, "cur_idx": None, "fixed": 3,
+            "group": _BATCH_LEGACY_GROUP,
+        }
+    fixed = layout["fixed"]
     for ln in lines[1:]:
         if not ln.strip():
             continue
@@ -619,8 +635,12 @@ def _parse_batch_submission(tsv: str) -> dict:
         entry = {
             "description": f[2], "date": f[1].strip(), "splits": splits,
         }
-        if layout["has_notes"] and len(f) > 3 and f[3].strip():
-            entry["notes"] = f[3].strip()
+        ni = layout["notes_idx"]
+        if ni is not None and len(f) > ni and f[ni].strip():
+            entry["notes"] = f[ni].strip()
+        ci = layout["cur_idx"]
+        if ci is not None and len(f) > ci and f[ci].strip():
+            entry["currency"] = f[ci].strip().upper()
         out[f[0].strip()] = entry
     return out
 
@@ -648,8 +668,11 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
         guid = r.get("txn_guid", "")
         desc = src.get("description", "")
         date_str = src.get("date", "")
+        when = date_str
+        if src.get("currency"):
+            when = f"{date_str}, {src['currency']}"
         lines.append(
-            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({date_str})'
+            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
         )
         if src.get("notes"):
             lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
@@ -667,10 +690,87 @@ def _fmt_transaction_create_batch(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_transaction_update_batch(entry: dict) -> list[str]:
+    """``update_transactions`` (TSV, per-row values) — old→new per
+    touched field, old values from the staged before-state, new
+    from the submitted TSV re-parsed through the SAME parser the
+    tool used (no display drift)."""
+    from gnucash_mcp._format import _parse_update_tsv
+
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    befores = {
+        (t.get("guid") or ""): t
+        for t in before.get("transactions") or []
+    }
+    try:
+        rows = _parse_update_tsv(params.get("updates") or "")
+    except ValueError:
+        rows = []
+    lines = [
+        f"{time_part}  UPDATE TRANSACTIONS (batch)  {len(rows)} rows"
+    ]
+    for r in rows[:15]:
+        key = r["guid"]
+        old = next(
+            (
+                b for g, b in befores.items()
+                if g.startswith(key) or key.startswith(g[:8])
+            ),
+            {},
+        )
+        parts = [f"guid:{key}"]
+        if "description" in r:
+            old_d = old.get("description", "")
+            parts.append(f'"{old_d}" → "{r["description"]}"')
+        if "notes" in r:
+            old_n = old.get("notes") or "(none)"
+            parts.append(f"Notes: {old_n} → {r['notes']}")
+        if "date" in r:
+            old_dt = old.get("date", "")
+            parts.append(f"Date: {old_dt} → {r['date']}")
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    if len(rows) > 15:
+        lines.append(f"{_INDENT}... and {len(rows) - 15} more")
+    return lines
+
+
 def _fmt_transaction_update(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     before = entry.get("before_state")
     guid = _transaction_guid(entry)
+
+    # Broadcast form (guid list): one entry, shared values once,
+    # then the touched transactions. Same dispatch key as single
+    # update — the staged shape is the discriminator, mirroring
+    # batch delete.
+    if before and "transactions" in before:
+        params = entry.get("params") or {}
+        touched = before.get("transactions") or []
+        lines = [
+            f"{time_part}  UPDATE TRANSACTIONS (broadcast)  "
+            f"{len(touched)} updated"
+        ]
+        if params.get("description") is not None:
+            lines.append(
+                f'{_INDENT}Description → "{params["description"]}"'
+            )
+        if params.get("transaction_date"):
+            lines.append(
+                f"{_INDENT}Date → {params['transaction_date']}"
+            )
+        if params.get("notes") is not None:
+            new = params["notes"] or "(cleared)"
+            lines.append(f"{_INDENT}Notes → {new}")
+        for t in touched[:10]:
+            lines.append(
+                f'{_INDENT}  guid:{(t.get("guid") or "")[:8]}  '
+                f'"{t.get("description", "")}"'
+            )
+        if len(touched) > 10:
+            lines.append(f"{_INDENT}  ... and {len(touched) - 10} more")
+        return lines
 
     lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
     if not before:
@@ -698,6 +798,19 @@ def _fmt_transaction_update(entry: dict) -> list[str]:
         lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
     else:
         lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    # Notes are three-state at the tool boundary (text / "" clears /
+    # absent leaves unchanged) — render only when the call carried
+    # the field. Without this, a notes-only update logs as a no-op
+    # entry: every field it DID print marked "(unchanged)".
+    params = entry.get("params") or {}
+    if "notes" in params and params["notes"] is not None:
+        old_notes = before.get("notes") or None
+        new_notes = params["notes"] or None
+        if old_notes != new_notes:
+            old_str = f'"{old_notes}"' if old_notes else "(none)"
+            new_str = f'"{new_notes}"' if new_notes else "(cleared)"
+            lines.append(f"{_INDENT}Notes: {old_str} → {new_str}")
 
     if old_splits != new_splits:
         lines.append(f"{_INDENT}Splits (before):")
@@ -911,37 +1024,49 @@ def _fmt_split_reconcile(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     before = entry.get("before_state")
     split_details = (before or {}).get("splits", []) if before else []
-    split_guids = params.get("split_guids", []) or []
+
+    # The staged before-state lists the splits ACTUALLY reconciled —
+    # the only source in bulk mode, where reconcile_all=true sends no
+    # split_guids at all (reading only the param rendered
+    # "Splits reconciled (0):" on a 51-split sweep). Params remain the
+    # fallback for entries logged without a before-state.
+    if split_details:
+        reconciled = split_details
+    else:
+        reconciled = [{"guid": g} for g in (params.get("split_guids") or [])]
 
     lines = [
         f"{time_part}  RECONCILE  {params.get('account', '')}",
         f"{_INDENT}Statement date: {params.get('statement_date', '')}",
         f"{_INDENT}Statement balance: {_format_amount(params.get('statement_balance'))}",
-        f"{_INDENT}Splits reconciled ({len(split_guids)}):",
     ]
+    if params.get("reconcile_all"):
+        mode = "bulk (reconcile_all)"
+        if params.get("through_date"):
+            mode += f", through {params['through_date']}"
+        lines.append(f"{_INDENT}Mode: {mode}")
+    lines.append(f"{_INDENT}Splits reconciled ({len(reconciled)}):")
 
-    # First 10 splits with context. GUID matching tolerates prefix
-    # vs full forms (params may carry prefixes; before_state full).
-    for guid in split_guids[:10]:
-        split_info = next(
-            (
-                s for s in split_details
-                if s and (
-                    s.get("guid") == guid
-                    or s.get("guid", "").startswith(guid)
-                    or guid.startswith(s.get("guid", ""))
-                )
-            ),
-            None,
-        )
-        if split_info:
-            desc = split_info.get("transaction_description", "")
+    for split_info in reconciled[:10]:
+        guid = split_info.get("guid", "")
+        desc = split_info.get("transaction_description")
+        if desc is None:
+            lines.append(f"{_INDENT}  guid:{guid}")
+        else:
             amount = _format_amount(split_info.get("amount"))
             lines.append(f'{_INDENT}  guid:{guid}  "{desc}"  {amount:>10}')
-        else:
-            lines.append(f"{_INDENT}  guid:{guid}")
-    if len(split_guids) > 10:
-        lines.append(f"{_INDENT}  ... and {len(split_guids) - 10} more")
+    if len(reconciled) > 10:
+        lines.append(f"{_INDENT}  ... and {len(reconciled) - 10} more")
+
+    # Exclusions are part of "what happened": a bulk sweep that
+    # skipped a pending ACH should say so. Rendered as the caller
+    # supplied them (prefixes that didn't resolve were ignored).
+    excluded = params.get("except_guids") or []
+    if excluded:
+        lines.append(
+            f"{_INDENT}Excluded ({len(excluded)}): "
+            + ", ".join(f"guid:{g}" for g in excluded)
+        )
     return lines
 
 
@@ -1351,6 +1476,37 @@ def _fmt_commodity_create(entry: dict) -> list[str]:
     fraction = after.get("fraction", params.get("fraction"))
     if fraction is not None:
         lines.append(f"{_INDENT}fraction: {fraction}")
+    return lines
+
+
+def _fmt_price_create_batch(entry: dict) -> list[str]:
+    """Batch price entry — one line per row from the results TSV
+    (which is self-contained: status, commodity, date, value,
+    currency), headlined by the created/updated/rejected counts."""
+    time_part = _extract_time(entry)
+    after = entry.get("after_state") or {}
+    rows = _parse_audit_tsv_rows(after.get("results") or "")
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r.get("status", "")] = counts.get(r.get("status", ""), 0) + 1
+    headline = ", ".join(
+        f"{n} {status}" for status, n in sorted(counts.items())
+    ) or "no rows"
+    lines = [f"{time_part}  CREATE PRICES (batch)  {headline}"]
+    for r in rows:
+        status = r.get("status", "")
+        if status in ("rejected",):
+            lines.append(
+                f"{_INDENT}{r.get('ref', '')}  rejected: "
+                f"{r.get('reason', '')}"
+            )
+        else:
+            cur = r.get("currency", "")
+            lines.append(
+                f"{_INDENT}{r.get('commodity', ''):<8}  "
+                f"{r.get('value', ''):>12} {cur}  "
+                f"({r.get('date', '')})  {status}"
+            )
     return lines
 
 
@@ -1823,6 +1979,12 @@ def _fmt_scheduled_transaction_create(entry: dict) -> list[str]:
     description = params.get("description", "")
     if description and description != name:
         lines.append(f"{_INDENT}description: {description}")
+    notes = params.get("notes", "")
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
+    sx_currency = params.get("currency", "")
+    if sx_currency:
+        lines.append(f"{_INDENT}currency: {sx_currency}")
     freq = after.get("frequency", params.get("frequency", ""))
     start = params.get("start_date", "")
     end = params.get("end_date", "")
@@ -1861,6 +2023,13 @@ def _fmt_scheduled_transaction_update(entry: dict) -> list[str]:
         new_str = new or "(cleared)"
         if old != new:
             lines.append(f"{_INDENT}end_date: {old_str} → {new_str}")
+    if "notes" in params and params["notes"] is not None:
+        old = before.get("notes")
+        new = params["notes"] if params["notes"] != "" else None
+        old_str = old or "(none)"
+        new_str = new or "(cleared)"
+        if old != new:
+            lines.append(f"{_INDENT}notes: {old_str} → {new_str}")
     return lines
 
 
@@ -1893,6 +2062,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("transaction", "CREATE_FROM_SCHEDULED"):
         _fmt_transaction_create_from_scheduled,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
+    ("transaction", "UPDATE_BATCH"): _fmt_transaction_update_batch,
     ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,
     ("transaction", "UNVOID"): _fmt_transaction_unvoid,
@@ -1948,6 +2118,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("entry", "CREATE"): _fmt_entry_create,
     ("commodity", "CREATE"): _fmt_commodity_create,
     ("price", "CREATE"): _fmt_price_create,
+    ("price", "CREATE_BATCH"): _fmt_price_create_batch,
     ("price", "DELETE"): _fmt_price_delete,
     ("lot", "CREATE"): _fmt_lot_create,
     ("lot", "UPDATE"): _fmt_lot_update,
@@ -2017,6 +2188,106 @@ def _normalize_account_refs_for_audit(
     )
 
 
+# The audit file's record boundary is a blank line, and its reader
+# (get_audit_log) splits on "\n\n" — so a raw newline inside a
+# user-controlled value (description, memo, notes, payee text from an
+# imported statement) could forge an apparent entry, corrupt entry
+# counts, or smuggle instructions to the LLM reading the log. Every
+# string that reaches the audit file must pass through
+# _escape_audit_value; entries go through the recursive walk at the
+# _format_audit_entry_text chokepoint, and the decorator's error line
+# escapes str(e) directly.
+_AUDIT_UNSAFE_RE = re.compile(
+    "[\\\\\\x00-\\x1f\\x7f"      # backslash + C0 controls + DEL
+    "\\u2028\\u2029"              # line/paragraph separators
+    "\\u200e\\u200f"              # LRM / RLM
+    "\\u202a-\\u202e"             # bidi embedding/override controls
+    "\\u2066-\\u2069]"            # bidi isolate controls
+)
+
+_AUDIT_MNEMONIC_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\r": "\\r",
+                           "\t": "\\t"}
+
+
+def _escape_audit_value(text: str) -> str:
+    """Visibly escape control and direction-override characters.
+
+    Backslash doubles first so the escaping is injective — a value
+    that literally contained the two characters ``\\n`` stays
+    distinguishable from one that contained a newline. Clean strings
+    (the overwhelmingly common case) return unchanged, same object.
+    """
+    if not _AUDIT_UNSAFE_RE.search(text):
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        ch = m.group(0)
+        mnemonic = _AUDIT_MNEMONIC_ESCAPES.get(ch)
+        if mnemonic is not None:
+            return mnemonic
+        cp = ord(ch)
+        return f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}"
+
+    return _AUDIT_UNSAFE_RE.sub(_sub, text)
+
+
+# TSV blobs embedded in entries (batch submissions and results) are
+# structural strings the handlers RE-PARSE — their tabs and newlines
+# are separators, not user text, so the full escape would break the
+# parse. Exempting them is sound for boundary forging: a cell cannot
+# contain a raw newline or tab (it would have been a separator at
+# tool-parse time). They get the TSV-preserving escape instead, which
+# still neutralizes \r, stray C0 controls, and bidi overrides that
+# could survive inside a cell.
+_AUDIT_TSV_KEYS = frozenset({"transactions", "updates", "results",
+                             "prices"})
+
+_AUDIT_UNSAFE_TSV_RE = re.compile(
+    "[\\\\\\x00-\\x08\\x0b-\\x1f\\x7f"  # C0 minus \t \n, + DEL
+    "\\u2028\\u2029"
+    "\\u200e\\u200f"
+    "\\u202a-\\u202e"
+    "\\u2066-\\u2069]"
+)
+
+
+def _escape_audit_tsv(text: str) -> str:
+    """The cell-safe escape: preserves the structural tab/newline
+    separators, escapes everything else unsafe."""
+    if not _AUDIT_UNSAFE_TSV_RE.search(text):
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        ch = m.group(0)
+        mnemonic = _AUDIT_MNEMONIC_ESCAPES.get(ch)
+        if mnemonic is not None:
+            return mnemonic
+        cp = ord(ch)
+        return f"\\x{cp:02x}" if cp < 0x100 else f"\\u{cp:04x}"
+
+    return _AUDIT_UNSAFE_TSV_RE.sub(_sub, text)
+
+
+def _escape_audit_strings(value):
+    """Recursively escape every string in an entry's data (values
+    only — keys are schema-fixed, never user text). String values
+    under _AUDIT_TSV_KEYS keep their structural separators."""
+    if isinstance(value, str):
+        return _escape_audit_value(value)
+    if isinstance(value, dict):
+        return {
+            k: (
+                _escape_audit_tsv(v)
+                if k in _AUDIT_TSV_KEYS and isinstance(v, str)
+                else _escape_audit_strings(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_escape_audit_strings(v) for v in value]
+    return value
+
+
 def _format_audit_entry_text(entry: dict) -> str:
     """Format an audit entry as human-readable text.
 
@@ -2053,8 +2324,18 @@ def _format_audit_entry_text(entry: dict) -> str:
     if normalized_params is not (entry.get("params") or {}):
         entry = {**entry, "params": normalized_params}
 
+    # After normalization so resolved account names are covered too.
+    # Escaping here, at the single dispatch chokepoint, covers every
+    # handler and every field a handler might render.
+    entry = _escape_audit_strings(entry)
+
     lines = handler(entry)
-    return "\n".join(lines) if lines else ""
+    if not lines:
+        return ""
+    # Belt to the escaping's suspenders: a blank line inside an
+    # entry IS the record boundary, so none may survive whatever a
+    # handler emits. Render any as a visible marker instead.
+    return "\n".join(ln if ln.strip() else "\\n" for ln in lines)
 
 
 def _normalize_for_audit(value):
@@ -2098,7 +2379,7 @@ def _extract_after_state(result: str, entity_type: str | None) -> dict | None:
             return data
 
         # reconcile_account returns a summary
-        if "reconciled_splits" in data:
+        if "splits_reconciled" in data:
             return data
 
         return data if data else None
@@ -2287,9 +2568,16 @@ def audit_log(
                     f"elapsed={elapsed_ms:.0f}ms error={e}"
                 )
 
-                # Log a simple error line
+                # Log a simple error line. Exception text embeds
+                # user-controlled values (account names, descriptions
+                # echoed by validators), so it passes the same escape
+                # as formatted entries — a raw newline here could
+                # forge an entry boundary just as well.
                 time_part = timestamp.split("T")[1][:8] if "T" in timestamp else timestamp[:8]
-                error_text = f"{time_part}  ERROR  {func.__name__}: {e}"
+                error_text = (
+                    f"{time_part}  ERROR  {func.__name__}: "
+                    f"{_escape_audit_value(str(e))}"
+                )
                 logger.info(error_text)
                 logger.info("")
                 _flush_logger(logger)

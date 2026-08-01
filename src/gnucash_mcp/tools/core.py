@@ -8,7 +8,11 @@ way (pure lazy-load orchestration, no hardcoded imports).
 
 from datetime import date
 
-from gnucash_mcp._format import _batch_row_splits, _batch_tsv_layout
+from gnucash_mcp._format import (
+    _batch_row_splits,
+    _batch_tsv_layout,
+    _parse_update_tsv,
+)
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     SplitInput,
@@ -42,7 +46,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         )
     layout = _batch_tsv_layout(lines[0])
     group = layout["group"]
-    fixed = 4 if layout["has_notes"] else 3
+    fixed = layout["fixed"]
     out: list[dict] = []
     for i, ln in enumerate(lines[1:], start=1):
         fields = ln.split("\t")
@@ -75,8 +79,12 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
             "description": desc,
             "splits": splits,
         }
-        if layout["has_notes"] and len(fields) > 3 and fields[3].strip():
-            txn["notes"] = fields[3].strip()
+        ni = layout["notes_idx"]
+        if ni is not None and len(fields) > ni and fields[ni].strip():
+            txn["notes"] = fields[ni].strip()
+        ci = layout["cur_idx"]
+        if ci is not None and len(fields) > ci and fields[ci].strip():
+            txn["currency"] = fields[ci].strip().upper()
         out.append(txn)
     return out
 
@@ -282,16 +290,36 @@ def register(mcp, get_book) -> None:
         Each split: ``account`` (full path, required), ``amount``
         (required, in transaction currency), ``quantity`` (required
         when account commodity differs from transaction currency),
-        ``memo`` (optional). ``amount`` and ``quantity`` are decimal
-        strings (e.g. "94.87") — never raw JSON numbers, which would
-        lose precision on non-dyadic decimals.
+        ``memo`` (optional), ``action`` (optional). ``amount`` and
+        ``quantity`` are decimal strings (e.g. "94.87") — never raw
+        JSON numbers, which would lose precision on non-dyadic
+        decimals.
+
+        FIELD TARGETING — the annotation fields, one job each, in
+        GnuCash-register visibility order:
+
+        - ``description``: the clean name ("Chevron 0090706
+          Portland"). Always visible.
+        - ``notes``: what the purchase WAS, when the description
+          alone doesn't say ("Fuel, road trip to Portland").
+          Visible in the register's double-line view — this is the
+          annotation humans read. Interpret; don't transcribe.
+        - split ``memo`` (bank/card leg): the RAW statement line as
+          provenance ("Withdrawal ACH TRAVELERS TYPE: PER INSUR…").
+          Visible only in expanded split view — evidence, not
+          narrative.
+        - split ``action``: the typed KIND of movement, one word.
+          Matters most on investment legs, where desktop convention
+          (and the Advanced Portfolio report) expects "Buy" /
+          "Sell" / "Dividend"; bank legs may use "Wire" / "ATM" /
+          "Interest". Skip it for ordinary spending.
 
         When duplicate detection surfaces candidates (either rejecting
         the write with ``status: "rejected"`` or returning alongside a
         successful create), ``duplicates`` in the response is a
         newline-separated TSV string, not a list of dicts. Columns::
 
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>description<TAB>signals
+            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
 
         Confidence is ``HIGH`` (all three signals match) or ``MEDIUM``
         (two of three). Signals is a three-char code: position 0
@@ -304,7 +332,7 @@ def register(mcp, get_book) -> None:
                 from the most recent matching-description transaction.
             transaction_date: ISO date (YYYY-MM-DD). Defaults to today.
             currency: ISO currency code. Defaults to book's default.
-            notes: Optional free-text annotation.
+            notes: What the purchase was (see FIELD TARGETING above).
             check_duplicates: Run duplicate detection. Default True.
             force_create: Create even if HIGH-confidence duplicates found.
             dry_run: Validate + dupe check only; don't write.
@@ -363,6 +391,30 @@ def register(mcp, get_book) -> None:
 
               ref<TAB>date<TAB>description<TAB>notes<TAB>amt1<TAB>acct1...
 
+          FIELD TARGETING for statement entry: ``description`` is
+          the clean name; ``notes`` is what the purchase WAS —
+          interpreted, not transcribed — and is what humans see in
+          GnuCash's double-line register; the bank leg's ``memo``
+          is where the RAW statement line goes (provenance, visible
+          only in expanded split view). Prefer filling ``notes``
+          whenever the description alone doesn't tell the story.
+
+        - PER-TRANSACTION CURRENCY — declare a ``cur`` column after
+          ``description`` (before or after ``notes``); an ISO code
+          cell sets THAT ROW's transaction currency, an empty cell
+          keeps the book default::
+
+              ref<TAB>date<TAB>description<TAB>cur<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2
+              1<TAB>2026-07-15<TAB>USD Card Payment<TAB>USD<TAB>-500<TAB>Assets:USD Checking<TAB>500<TAB>Liabilities:USD Card
+
+          With ``cur``, the row's ``amt`` cells are in that
+          currency and must balance in it. Use it when NO leg is in
+          the book's default currency (a USD-to-USD transfer inside
+          a CNY book needs no invented CNY values and no qty).
+          Splits on accounts of any OTHER commodity still need
+          ``qty``. The currency must already exist in the book, and
+          ``cur`` cannot combine with an auto-fill row.
+
         - PER-SPLIT QUANTITY — declare ``qty`` split columns for
           splits whose ACCOUNT commodity differs from the book
           default (investment shares, foreign-currency accounts)::
@@ -376,6 +428,12 @@ def register(mcp, get_book) -> None:
           cell means the account uses the default currency
           (quantity == amount). A non-default-commodity account with
           an empty qty rejects that row.
+
+        - PER-SPLIT ACTION — declare ``act`` split columns for
+          GnuCash's typed movement tag ("Buy"/"Sell"/"Dividend" on
+          investment legs — desktop convention; "Wire"/"ATM" on
+          bank legs). Same group mechanics as ``memo``/``qty``;
+          empty cells skip it. Rarely needed for plain spending.
 
         All extensions combine; when several split fields are
         declared, the header's FIRST group fixes their order (e.g.
@@ -395,7 +453,10 @@ def register(mcp, get_book) -> None:
         matches nothing rejects ("no matching transaction to
         auto-fill from"). Use ``dry_run=true`` to preview what a
         batch of auto-fills would book. Perfect for recurring
-        monthly entries.
+        monthly entries. Transaction ``notes`` are NOT copied from
+        the source (notes are often time-bound — "first
+        appearance, investigate" must not replicate); supply a
+        notes cell when the new instance needs one.
 
         - ``ref``: YOUR correlation key per row (e.g. 1, 2, 3), unique
           within the batch. It is echoed back so you can match results
@@ -620,17 +681,24 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="transaction")
     def update_transaction(
-        guid: TransactionGuid,
+        guid: TransactionGuid | list[TransactionGuid],
         description: str | None = None,
         transaction_date: str | None = None,
         splits: list[SplitInput] | None = None,
         notes: str | None = None,
         force: bool = False,
     ) -> str:
-        """Update an existing transaction.
+        """Update an existing transaction — or broadcast to several.
+
+        Pass a LIST of GUIDs to apply the SAME supplied values to
+        every listed transaction in one book open / one save
+        (all-or-nothing) — the batch-annotation case: one note
+        across 35 related entries, one call. ``splits`` stays
+        single-transaction. For per-row DIFFERENT values, use
+        ``update_transactions``.
 
         Args:
-            guid: Transaction GUID to update (32-character hex string, or 8+ char prefix)
+            guid: Transaction GUID (32-character hex string, or 8+ char prefix), or a list of them
             description: New transaction description (optional)
             transaction_date: New date in ISO format YYYY-MM-DD (optional)
             splits: List of split updates with 'account' and 'amount' (optional).
@@ -639,7 +707,10 @@ def register(mcp, get_book) -> None:
                     Include 'memo' to set that split's memo (omit to leave it unchanged).
                     ``amount``/``quantity`` are decimal strings (e.g. "94.87").
             notes: New transaction notes (optional). Pass empty string to clear.
-            force: Allow modifying transactions with reconciled splits
+            force: Allow modifying transactions with reconciled splits —
+                required for split changes AND for moving the date of a
+                transaction with reconciled splits (a date move shifts
+                it out of its reconciled statement period).
         """
         book = get_book()
         trans_date = _parse_iso_date(transaction_date)
@@ -650,6 +721,51 @@ def register(mcp, get_book) -> None:
             splits=_splits_to_dicts(splits),
             notes=notes,
             force=force,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="update_batch",
+        entity_type="transaction",
+    )
+    def update_transactions(
+        updates: str,
+        on_error: str = "abort",
+        force: bool = False,
+    ) -> str:
+        """Update MANY transactions with per-row values (bulk edit).
+
+        INPUT — ``updates`` is a TSV block: header ``guid`` plus any
+        of ``description``, ``notes``, ``date`` (at least one), then
+        one row per transaction::
+
+            guid<TAB>description<TAB>notes
+            56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
+            7f0fc117<TAB><TAB>Netflix subscription, $22.10/mo
+
+        An EMPTY cell leaves that field UNCHANGED — this batch can
+        annotate but never clear (clearing is ``update_transaction``
+        with ``notes=""``, deliberately single-transaction). Splits
+        and memos are not updatable here (``replace_splits``).
+
+        One book open, one save; ``on_error="abort"`` (default)
+        sinks the batch on any bad row, ``"skip"`` keeps good rows.
+        Date moves on transactions with reconciled splits are
+        rejected per row unless ``force=true`` (they shift the
+        transaction out of its reconciled statement period).
+        Returns a results TSV keyed by your input guids. For the
+        SAME value across many transactions, ``update_transaction``
+        with a guid list is cheaper than repeating rows.
+        """
+        book = get_book()
+        rows = _parse_update_tsv(updates)
+        for r in rows:
+            if "date" in r:
+                r["date"] = date.fromisoformat(r["date"])
+        result = book.update_transactions(
+            updates=rows, on_error=on_error, force=force,
         )
         return _json(result)
 
@@ -667,6 +783,13 @@ def register(mcp, get_book) -> None:
         The transaction's currency, description, date, and notes are preserved.
         New splits must balance to zero.
 
+        A new split that reproduces an existing one (same account,
+        amount, and quantity) is an UNCHANGED leg: it keeps the old
+        split's memo (supply a memo to override) and its reconcile
+        state. So recategorizing the expense leg of a reconciled
+        bank transaction is safe — resubmit the bank leg as-is and
+        only the changed leg resets.
+
         Args:
             guid: Transaction GUID (32-character hex string, or 8+ char prefix)
             splits: Complete new set of splits. Each split needs:
@@ -675,7 +798,9 @@ def register(mcp, get_book) -> None:
                 - 'quantity' (optional): Amount in account's commodity, as a decimal string.
                   Required if account commodity differs from transaction currency.
                 - 'memo' (optional): Split memo
-            force: Allow replacing reconciled splits or splits in lots
+            force: Required only when the replacement would CHANGE a
+                reconciled split (or remove splits from lots) —
+                unchanged reconciled legs are preserved without it.
         """
         book = get_book()
         result = book.replace_splits(

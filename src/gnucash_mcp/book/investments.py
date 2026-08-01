@@ -39,11 +39,13 @@ class InvestmentsMixin:
 
     def list_commodities(
         self, compact: bool = True, limit: int = 50, offset: int = 0,
+        stale_days: int | None = None, held_only: bool = False,
     ) -> dict | str:
         """List all commodities in the book with latest prices.
 
         Leads with a ``Showing X-Y of Z commodities`` indicator; page
-        with ``offset``.
+        with ``offset``. With no filter arguments the output is the
+        complete list, unchanged — filters are opt-in and AND-combine.
 
         Args:
             compact: If True (default), return compact one-line-per-commodity
@@ -51,6 +53,15 @@ class InvestmentsMixin:
                      commodities grouped by namespace.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return.
+            stale_days: Only commodities whose latest market price is
+                at least this many days old — INCLUDING commodities
+                with no price at all (undefined staleness is maximal
+                staleness), EXCLUDING the book default currency
+                (its price is trivially 1). Rows gain a staleness
+                marker. The price-update work list is
+                ``stale_days=30, held_only=True``.
+            held_only: Only commodities some real (non-template)
+                account is denominated in.
 
         Returns:
             If compact: indicator + newline-separated commodity lines.
@@ -75,11 +86,41 @@ class InvestmentsMixin:
                 if existing is None or p_date > existing[0]:
                     latest_market[key] = (p_date, p)
 
+            today = date.today()
+            default_commodity = self._require_default_currency(book)
+            in_use_accounts: set | None = None
+            if held_only:
+                # Same in-use definition as the dashboard's stale-
+                # price warning: any non-ROOT, non-template account
+                # denominated in the commodity.
+                template_guids = self._template_account_guids(book)
+                in_use_accounts = {
+                    a.commodity.guid for a in book.accounts
+                    if a.type != "ROOT" and a.guid not in template_guids
+                }
+
             for commodity in book.commodities:
                 ns = commodity.namespace
                 # 'template' = GnuCash's SX-scaffolding pseudo-commodity.
                 if ns.lower() == "template":
                     continue
+                if (
+                    in_use_accounts is not None
+                    and commodity.guid not in in_use_accounts
+                ):
+                    continue
+                days_stale: int | None = None
+                no_price = False
+                if stale_days is not None:
+                    if commodity == default_commodity:
+                        continue
+                    latest = latest_market.get(commodity.guid)
+                    if latest is None:
+                        no_price = True
+                    else:
+                        days_stale = (today - latest[0]).days
+                        if days_stale < stale_days:
+                            continue
                 if ns not in by_namespace:
                     by_namespace[ns] = []
 
@@ -96,6 +137,12 @@ class InvestmentsMixin:
                         "currency": price.currency.mnemonic,
                         "date": _to_date(price.date).isoformat(),
                     }
+                # Staleness markers only under the filter — the
+                # unfiltered listing's shape is unchanged.
+                if days_stale is not None:
+                    entry["days_stale"] = days_stale
+                if no_price:
+                    entry["no_price"] = True
 
                 by_namespace[ns].append(entry)
 
@@ -222,6 +269,245 @@ class InvestmentsMixin:
                 "status": "created",
             }
 
+    @staticmethod
+    def _upsert_price(
+        book, comm, resolved_currency, price_date,
+        value: str, price_type: str, source: str,
+    ) -> str:
+        """Create or update-in-place one price row; NO save.
+
+        Single chokepoint for the same-(commodity, currency, date,
+        source)-updates-in-place semantic, shared by ``create_price``
+        and ``create_prices`` so single and batch entry can't
+        diverge. The caller owns ``book.save()`` — batch saves once
+        for the whole set.
+
+        Returns ``"updated"`` or ``"created"``.
+        """
+        # Indexed query, not a full book.prices walk.
+        candidates = book.session.query(Price).filter_by(
+            commodity_guid=comm.guid,
+            currency_guid=resolved_currency.guid,
+            source=source,
+        ).all()
+        existing = None
+        for p in candidates:
+            if _to_date(p.date) == price_date:
+                existing = p
+                break
+
+        if existing:
+            existing.value = _to_decimal(value)
+            existing.type = price_type
+            return "updated"
+        # piecash expects datetime.date, not datetime.datetime
+        piecash.Price(
+            commodity=comm,
+            currency=resolved_currency,
+            date=price_date,
+            value=_to_decimal(value),
+            type=price_type,
+            source=source,
+        )
+        return "created"
+
+    def _resolve_price_commodity(self, book, mnemonic: str,
+                                 namespace: str | None):
+        """Resolve a batch price row's commodity.
+
+        With ``namespace``: exact lookup. Without: search across
+        namespaces (excluding GnuCash's ``template`` pseudo-
+        commodity); exactly one match resolves, zero or several
+        raise naming the fix — most books have unambiguous
+        mnemonics, so the ns column stays optional.
+        """
+        if namespace:
+            comm = self._find_commodity(book, mnemonic, namespace)
+            if not comm:
+                raise ValueError(
+                    f"Commodity not found: {namespace}:{mnemonic}"
+                )
+            return comm
+        matches = [
+            c for c in book.commodities
+            if c.mnemonic == mnemonic
+            and c.namespace.lower() != "template"
+        ]
+        if not matches:
+            raise ValueError(f"Commodity not found: {mnemonic}")
+        if len(matches) > 1:
+            namespaces = ", ".join(sorted(c.namespace for c in matches))
+            raise ValueError(
+                f"Commodity '{mnemonic}' is ambiguous across "
+                f"namespaces ({namespaces}) — supply the ns column"
+            )
+        return matches[0]
+
+    def create_prices(
+        self,
+        prices: list[dict],
+        on_error: str = "abort",
+        dry_run: bool = False,
+    ) -> dict:
+        """Record MANY prices in one book-open / one save.
+
+        Each entry: ``{ref, commodity, date (date), value,
+        namespace (optional), currency (optional — quote currency,
+        defaults to the book default), source (optional, default
+        "user:price"), price_type (optional, default "nav")}``.
+
+        Per-row semantics are ``create_price``'s exactly (shared
+        upsert chokepoint): same (commodity, currency, date,
+        source) updates in place → ``status: updated``; otherwise
+        ``created``. ``on_error="abort"`` (default) sinks the whole
+        batch on any invalid row; ``"skip"`` keeps the good rows.
+        ``dry_run`` reports ``would_create`` / ``would_update``
+        without writing.
+
+        Returns ``{"results": TSV}`` — columns
+        ``ref, status, commodity, date, value, currency, reason``.
+        """
+        if on_error not in ("abort", "skip"):
+            raise ValueError("on_error must be 'abort' or 'skip'")
+        refs = [p["ref"] for p in prices]
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                "duplicate ref in batch — each ref must be unique"
+            )
+
+        readonly = dry_run
+        by_ref: dict = {}
+        with self.open(readonly=readonly) as book:
+            prepared = []
+            for p in prices:
+                ref = p["ref"]
+                try:
+                    comm = self._resolve_price_commodity(
+                        book, p["commodity"], p.get("namespace"),
+                    )
+                    cur_code = p.get("currency")
+                    if cur_code is None:
+                        resolved_currency = (
+                            self._require_default_currency(book)
+                        )
+                    elif readonly:
+                        resolved_currency = self._find_commodity(
+                            book, cur_code, "CURRENCY",
+                        )
+                        if not resolved_currency:
+                            raise ValueError(
+                                f"Currency '{cur_code}' not found "
+                                f"in book. Dry run cannot create "
+                                f"new currencies."
+                            )
+                    else:
+                        resolved_currency = (
+                            self._get_or_create_currency(book, cur_code)
+                        )
+                    value = p["value"]
+                    _to_decimal(value)  # reject non-decimal early
+                    prepared.append({
+                        "ref": ref,
+                        "comm": comm,
+                        "currency": resolved_currency,
+                        "date": p["date"],
+                        "value": str(value),
+                        "type": p.get("price_type") or "nav",
+                        "source": p.get("source") or "user:price",
+                    })
+                except (ValueError, KeyError, ArithmeticError) as e:
+                    by_ref[ref] = {
+                        "ref": ref, "status": "rejected",
+                        "reason": str(e),
+                    }
+
+            # Two rows sharing one canonical price identity
+            # (commodity, currency, date, source) would race the
+            # upsert against piecash's commit-time uniqueness
+            # validation: the second row creates a duplicate the
+            # save then rejects with an internals-leaking error,
+            # while dry_run (each row checked against the original
+            # book state) reports both as would_create. Rejecting
+            # the duplicate up front keeps dry-run and live
+            # agreeing and turns the failure into a per-row reason.
+            seen_identity: dict = {}
+            deduped = []
+            for row in prepared:
+                identity = (
+                    row["comm"].guid, row["currency"].guid,
+                    row["date"], row["source"],
+                )
+                first_ref = seen_identity.get(identity)
+                if first_ref is not None:
+                    by_ref[row["ref"]] = {
+                        "ref": row["ref"], "status": "rejected",
+                        "reason": (
+                            f"duplicate price identity — same "
+                            f"commodity/currency/date/source as "
+                            f"ref '{first_ref}'"
+                        ),
+                    }
+                    continue
+                seen_identity[identity] = row["ref"]
+                deduped.append(row)
+            prepared = deduped
+
+            if by_ref and on_error == "abort":
+                for row in prepared:
+                    by_ref[row["ref"]] = {
+                        "ref": row["ref"], "status": "rejected",
+                        "reason": "batch_aborted",
+                    }
+                return self._prices_envelope(prices, by_ref)
+
+            wrote = False
+            for row in prepared:
+                if dry_run:
+                    # Same detection as the upsert, no mutation.
+                    candidates = book.session.query(Price).filter_by(
+                        commodity_guid=row["comm"].guid,
+                        currency_guid=row["currency"].guid,
+                        source=row["source"],
+                    ).all()
+                    exists = any(
+                        _to_date(c.date) == row["date"]
+                        for c in candidates
+                    )
+                    status = "would_update" if exists else "would_create"
+                else:
+                    status = self._upsert_price(
+                        book, row["comm"], row["currency"],
+                        row["date"], row["value"], row["type"],
+                        row["source"],
+                    )
+                    wrote = True
+                by_ref[row["ref"]] = {
+                    "ref": row["ref"], "status": status,
+                    "commodity": row["comm"].mnemonic,
+                    "date": row["date"].isoformat(),
+                    "value": row["value"],
+                    "currency": row["currency"].mnemonic,
+                }
+
+            if wrote:
+                book.save()
+                self._invalidate_price_caches(book)
+            return self._prices_envelope(prices, by_ref)
+
+    @staticmethod
+    def _prices_envelope(prices: list[dict], by_ref: dict) -> dict:
+        """Results TSV in submission order, one row per input ref."""
+        lines = ["ref\tstatus\tcommodity\tdate\tvalue\tcurrency\treason"]
+        for p in prices:
+            r = by_ref.get(p["ref"], {})
+            lines.append(
+                f"{r.get('ref', p['ref'])}\t{r.get('status', '')}\t"
+                f"{r.get('commodity', '')}\t{r.get('date', '')}\t"
+                f"{r.get('value', '')}\t{r.get('currency', '')}\t"
+                f"{r.get('reason', '')}"
+            )
+        return {"results": "\n".join(lines)}
+
     def create_price(
         self,
         commodity: str,
@@ -276,34 +562,14 @@ class InvestmentsMixin:
                     book, currency,
                 )
 
-            # Same commodity/currency/date/source → update in place.
-            # Indexed query, not a full book.prices walk.
-            candidates = book.session.query(Price).filter_by(
-                commodity_guid=comm.guid,
-                currency_guid=resolved_currency.guid,
-                source=source,
-            ).all()
-            existing = None
-            for p in candidates:
-                if _to_date(p.date) == price_date:
-                    existing = p
-                    break
-
-            if existing:
-                existing.value = _to_decimal(value)
-                existing.type = price_type
-            else:
-                # piecash expects datetime.date, not datetime.datetime
-                piecash.Price(
-                    commodity=comm,
-                    currency=resolved_currency,
-                    date=price_date,
-                    value=_to_decimal(value),
-                    type=price_type,
-                    source=source,
-                )
+            status = self._upsert_price(
+                book, comm, resolved_currency, price_date,
+                value, price_type, source,
+            )
+            existing = status == "updated"
 
             book.save()
+            self._invalidate_price_caches(book)
 
             result = {
                 "commodity": commodity,
@@ -399,6 +665,7 @@ class InvestmentsMixin:
 
             book.session.delete(target)
             book.save()
+            self._invalidate_price_caches(book)
 
             return result
 

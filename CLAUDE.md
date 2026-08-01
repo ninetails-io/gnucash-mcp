@@ -207,6 +207,58 @@ module contributes zero tools to the MCP surface.
     which is what makes localized created-account names (§6.3) safe. A
     stale slot falls through to the lower layers and is rewritten.
 
+### The chokepoint pattern
+
+The invariants above stay true because each one lives in exactly ONE
+helper, with every caller routed through it. This is the codebase's
+core bug-class strategy, adopted during the v1.3 review arc after the
+dominant finding shape turned out to be "an invariant exists but is
+enforced at only some sites." The fix for that class is never to patch
+the divergent sites — it's to consolidate the rule into a single
+helper, convert every site into a caller, and lock the convergence
+with a test that fails when a new site skips the helper.
+
+Established chokepoints and the rule each one owns:
+
+- `_find_prices` — price-history access (market-price filter,
+  same-date tie-break, and since #126 the per-pair memo).
+- `_rates_as_of` / `_monthly_conversion_factors` /
+  `_account_conversion_factors` — which FX rate a report may use
+  (as-of is mandatory; flow vs. stock semantics pick the factory).
+- `_resolve_account` / `_resolve_guid` — every inbound account/GUID
+  ref, template-filtered, before any comparison or lookup.
+- `_is_voided` / `_is_unreconciled` — split-state predicates shared
+  by dashboards and detail tools so counts agree by construction.
+- `_slot_bool` — tri-state boolean slot parsing (the third private
+  parsing convention was the trigger to consolidate).
+- `_upsert_price` — single/batch price writes can't diverge.
+- `_classify_reconciliation` — dashboard aggregates and the
+  drill-down table bucket rows identically.
+- `_parse_owner_type`, `_commodity_quantum`, `_is_market_price`,
+  `_effective_owner_type` — same story, smaller surface.
+
+Working rules:
+
+1. **Second duplicate is a smell; third is the trigger.** When you
+   find yourself writing a rule that exists elsewhere — even in a
+   slightly different private form — consolidate before extending.
+2. **Fix a bug at its chokepoint, then grep for siblings.** A bug of
+   the form "the check and the act disagree" almost always has
+   relatives enforcing the same invariant elsewhere by hand.
+3. **Lock it.** A chokepoint without a contract test is a
+   convention; with one it's an invariant. See
+   `TestToolFileVsModulesMapping`, `TestWriteVerificationCoverage`,
+   `TestModeAgreement`, `TestShortGuidRoundTripClosure`, and the
+   price-invalidation and preload SQL-count tests for the house
+   styles: set-equality, grep-the-source, output-agreement, and
+   count-the-queries all work.
+4. **The payoff is legibility, not just correctness.** PR #126 — an
+   outside contributor fixing a never-completes pathology on a
+   33k-split book — was possible as a small, safe diff because every
+   rate lookup already flowed through one function. Keep it that
+   way: new code that bypasses a chokepoint makes the next
+   contributor's change bigger than it should be.
+
 ### Data model conventions
 
 - Dates as `datetime.date` internally; ISO strings (`YYYY-MM-DD`) at
@@ -292,7 +344,13 @@ existed.
   `for x in book.x:` for finders. `_find_transaction`, `_find_split`,
   etc. use the indexed form.
 - **Never sum num/denom in SQL** — float precision is wrong for
-  money. Fetch rows and aggregate in Python with `Decimal`.
+  money. Fetch rows and aggregate in Python with `Decimal`. The
+  input-side twin of this rule — floats decimalize via
+  `Decimal(str(value))`, never `Decimal(float)` — was first
+  demonstrated in a 2026 fork by Junaid Saeed Uppal
+  ([@uppaljs](https://github.com/uppaljs)), whose
+  `Decimal(22167.58) == 22167.579999...` example became
+  `_to_decimal`.
 - **Voided splits are zombies, not gone.** GnuCash's void operation
   preserves the split with zeroed values and `reconcile_state='v'`
   for audit-trail purposes. Code that asks "does this lot/account
@@ -454,6 +512,39 @@ For live verification against a personal GnuCash book, ensure
   `develop`.
 - Docs-only changes can go directly to `develop`.
 - Release: open PR `develop` → `main` only after tester signoff.
+
+### Release checklist (in order)
+
+1. **CHANGELOG entry** — the release's story for external readers,
+   written before the bump so the diff review can check it against
+   what actually shipped.
+2. **README refresh** — version references, and feature coverage:
+   a first-time visitor's click lands here, so the headline
+   workflow must reflect the current release, not the one before
+   it.
+3. **Sample books are NOT regenerated per release** (policy since
+   v1.4.2 — each committed regeneration permanently grows every
+   future clone, and stable books are better byte-identity
+   oracles). They ship as frozen demos; stale-price warnings and
+   pending scheduled transactions accumulating between
+   regenerations is expected. Regenerate
+   (`scripts/synthetic_book/phase_<N>.py`, in order) only when
+   phase scripts gain coverage for new features, or when
+   date-decay warrants it — and treat it as a deliberate,
+   capture-rig-invalidating event. For before/after report
+   verification, capture against the committed books at HEAD (or
+   generate locally and capture both sides same-machine).
+4. Tester/bookkeeper signoff on develop.
+5. **Version bump LAST** — one commit: `pyproject.toml`,
+   `__init__.py`, and a fresh `uv lock` staging `uv.lock`. The
+   lockfile records the project's own version; a bump without the
+   re-lock ships a lockfile that contradicts the release (v1.4.1
+   did; it breaks `uv sync --locked`/`--frozen` consumers such as
+   CI and bundle builds). Version numbering and timing are the
+   maintainer's call.
+6. Release PR `develop` → `main`; merge on the maintainer's go.
+7. Annotated tag, push verified with `git ls-remote` (never trust
+   a piped push).
 
 ---
 

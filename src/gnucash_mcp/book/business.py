@@ -3663,11 +3663,10 @@ class BusinessMixin:
     @staticmethod
     def _get_is_credit_note(invoice) -> bool:
         """Read the GnuCash ``credit-note`` slot. True iff value=1."""
-        try:
-            raw = invoice[BusinessMixin._CREDIT_NOTE_SLOT_KEY]
-        except KeyError:
-            return False
-        return _slot_value_str(raw) == "1"
+        from gnucash_mcp.book._base import _slot_bool
+        return _slot_bool(
+            invoice, BusinessMixin._CREDIT_NOTE_SLOT_KEY,
+        ) is True
 
     @staticmethod
     def _set_is_credit_note(invoice, value: bool = True) -> None:

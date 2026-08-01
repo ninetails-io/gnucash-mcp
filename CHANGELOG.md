@@ -1,5 +1,116 @@
 # Changelog
 
+## v1.4.2 - One call wide, every surface honest
+
+Every entry in this release traces to a named moment of live
+friction — nothing speculative shipped. The bulk grammar that
+v1.4.1 grew up is now complete: updates, prices, currency, and
+reconciliation are all one call wide. Braided through it: surfaces
+that tell the truth harder (audit entries that render what
+happened, errors that teach, a dashboard that defines its numbers),
+the project's first outside code contribution, and an
+injection-hardening pass on the audit trail.
+
+**Bulk grammar completed.**
+
+- `update_transactions` - per-row bulk edits via TSV (description,
+  notes, date), one book open, one save, abort/skip semantics.
+  `update_transaction` takes a guid LIST to broadcast the same
+  change across many transactions (#145).
+- `create_prices` - batch quote entry with `create_price`'s exact
+  upsert semantics via a shared chokepoint, plus a stale-price work
+  list so the model knows which quotes need refreshing (#143).
+- Per-transaction currency: a `cur` column in batch entry and
+  scheduled-transaction templates - foreign-denominated
+  transactions no longer need the single-entry path (#141).
+- Split `action` field on every transaction create path (#142).
+
+**Reconciliation kept honest.**
+
+- `reconcile_all` now honors the statement-date bound its docstring
+  always promised - splits after the statement date stay
+  unreconciled instead of silently sweeping in. Found by asking the
+  bookkeeper what they had been routing around (#144).
+- Bulk-reconcile audit entries render what actually happened, and
+  reconcile errors teach: did-you-mean account suggestions,
+  `through_date` hints, placeholder-children warnings (#137, #144).
+- NEW tool `get_reconciliation_status`: the per-account drill-down
+  behind the dashboard's aggregate counts - behind (most-behind
+  first), never, current, dormant, excluded - bucketed by the same
+  classification the dashboard uses, so counts agree by
+  construction (#146).
+- `no_reconcile` account slot opts statement-less accounts (loans,
+  escrow, cash wallets) out of dashboard nagging. Reporting-only;
+  reconcile tools still work; the drill-down keeps opted-out
+  accounts visible (#146).
+- Dormant accounts stop warning forever: $0, fully-reconciled,
+  idle accounts collapse into one aggregate line instead of
+  wearing a permanent orange badge. A carried balance with months
+  of silence stays individually warned - interest posts monthly,
+  so silence there means missing entries (#146).
+
+**Session vocabulary.**
+
+- `get_book_summary` hands each session its working set: the top
+  15 accounts by posting frequency (last 180 days) in
+  `list_accounts`' exact `%short-GUID` format. Short GUIDs went
+  unused in live bookkeeping because they were never in context at
+  the moment the model's account vocabulary formed; now they are
+  (#146).
+- Five dashboard clarity fixes from live review, and a notes
+  convention pass: template notes, audit truth, leg preservation
+  (#138, #139).
+
+**First outside code contribution.**
+
+- @bhbrunt profiled a 33k-split, 10-commodity GBP book where
+  `get_book_summary` never completed, and sent the fix: price
+  lookups memoized per commodity pair on the open book, and the
+  split graph bulk-loaded for whole-book reports. That book now
+  summarizes in under 10 seconds; small books get ~45% faster
+  summaries as a side effect (#126).
+- Follow-ups lock it down: bulk `create_prices` invalidates the
+  price memo (the one write path newer than the PR's base), a
+  SQL-count regression test guards the preload's deliberately
+  parked strong reference, and a final `guid` sort key makes the
+  price tie-break fully deterministic (#147).
+
+**Audit trail hardened.**
+
+- User-controlled text (descriptions, memos, payee strings from
+  imported statements) is escaped before it reaches the audit
+  file. A crafted newline pair could previously forge an apparent
+  audit entry, corrupt entry counts, or smuggle instructions to
+  the LLM reading `get_audit_log`. Escaping is injective
+  (backslash doubles first) and covers the error path; batch TSV
+  blobs keep their structural separators (#148).
+- `create_prices` dry-run and live execution now agree on
+  duplicate identities: two rows sharing one canonical
+  (commodity, currency, date, source) reject up front with a
+  per-row reason instead of dry-run promising `would_create` while
+  the live batch died on a piecash internals error (#148).
+- **Behavior change:** moving the posting date of a transaction
+  with reconciled splits now requires `force=true` - on the single,
+  broadcast, and batch update paths. A date move relocates the
+  transaction out of its reconciled statement period; it gets the
+  same gate as editing reconciled splits. Same-date resubmission
+  and description/notes edits stay force-free (#148).
+
+**Docs & credits.**
+
+- The chokepoint pattern - this codebase's core bug-class strategy -
+  is now documented in the contributor guide, with the established
+  chokepoints named and the working rules spelled out.
+- Late attribution: @hpuri (the README's Gemini CLI and
+  `libdbd-sqlite3` guidance, from issue #89) and @uppaljs (whose
+  2026 fork demonstrated the `Decimal(str(value))` rule that became
+  `_to_decimal`).
+- Release policy: sample books are no longer regenerated per
+  release. They ship as frozen demo books and regenerate on demand
+  via `scripts/synthetic_book/`; expect stale-price warnings and
+  pending scheduled transactions to accumulate between
+  regenerations.
+
 ## v1.4.1 - Batch entry grows up; every annotation field reachable
 
 v1.4.0 introduced batch transaction entry; v1.4.1 is the release

@@ -80,8 +80,9 @@ def _parse_duplicates(tsv: str) -> list[dict]:
             "guid": parts[1],
             "date": parts[2],
             "amount": parts[3],
-            "description": parts[4],
-            "signals": parts[5],
+            "cur": parts[4],
+            "description": parts[5],
+            "signals": parts[6],
         })
     return rows
 
@@ -1329,7 +1330,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        assert "Monthly net (last 6 months):" in result
+        assert "Monthly net (income - expenses, last 6 months):" in result
 
     def test_six_months_emitted_oldest_to_newest(
         self, test_book: Path,
@@ -1339,7 +1340,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # Section runs until the next non-indented line.
         rows = []
         for line in section.split("\n"):
@@ -1362,7 +1363,7 @@ class TestGetBookSummaryMonthlyNet:
         gc = GnuCashBook(str(test_book))
         self._seed_income(gc, "1000", date.today())
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "(MTD)" in first_row
 
@@ -1375,7 +1376,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "1000", date.today())
         # No activity 3 months ago.
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         three_ago_label = self._months_ago(3).strftime("%b %Y")
         three_ago_row = next(
             line for line in section.split("\n")
@@ -1397,7 +1398,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "300", one_ago_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         rows = section.split("\n")[:6]
 
         # Current month: +1500
@@ -1420,7 +1421,7 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_expense(gc, "200", d, "groceries 2")
         # Net: 6000 - 1700 = 4300
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         first_row = section.split("\n", 1)[0]
         assert "+4,300" in first_row
 
@@ -1439,10 +1440,69 @@ class TestGetBookSummaryMonthlyNet:
         self._seed_income(gc, "999999", old_mid)
 
         result = gc.get_book_summary()
-        section = result.split("Monthly net (last 6 months):\n", 1)[1]
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
         # No row should contain the old amount.
         rows = section.split("\n")[:6]
         assert not any("999,999" in r for r in rows)
+
+    @staticmethod
+    def _prior_month_last_day() -> int:
+        """Length of last month in days."""
+        first_of_current = date.today().replace(day=1)
+        return (first_of_current - timedelta(days=1)).day
+
+    def test_mtd_row_carries_prior_month_comparable(
+        self, test_book: Path,
+    ):
+        """The MTD row shows the prior month's net over the same
+        day window: '(vs <Mon> 1-<day>: <net>)'."""
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        mtd_row = section.split("\n", 1)[0]
+        cutoff = min(date.today().day, self._prior_month_last_day())
+        expected = (
+            f"(vs {prior_first.strftime('%b')} 1-{cutoff}: +700)"
+        )
+        assert expected in mtd_row
+
+    def test_comparable_excludes_prior_month_tail(
+        self, test_book: Path,
+    ):
+        """Activity after the cutoff day counts toward the prior
+        month's full-month row but not the MTD comparable."""
+        prior_len = self._prior_month_last_day()
+        if date.today().day >= prior_len:
+            pytest.skip(
+                "run-date is past the prior month's length — "
+                "no tail exists to exclude"
+            )
+        gc = GnuCashBook(str(test_book))
+        self._seed_income(gc, "1000", date.today())
+        prior_first = self._months_ago(1)
+        self._seed_income(gc, "700", prior_first)
+        # Tail: last day of prior month, beyond today's day-of-month.
+        tail_day = date(
+            prior_first.year, prior_first.month, prior_len,
+        )
+        self._seed_income(gc, "111", tail_day)
+
+        result = gc.get_book_summary()
+        section = result.split("Monthly net (income - expenses, last 6 months):\n", 1)[1]
+        rows = section.split("\n")[:6]
+        mtd_row = rows[0]
+        # Comparable holds only the in-window 700.
+        assert ": +700)" in mtd_row
+        # Full prior-month row still carries the whole 811.
+        prior_row = next(
+            r for r in rows
+            if prior_first.strftime("%b %Y") in r
+        )
+        assert "+811" in prior_row
 
 
 class TestGetBookSummaryRunway:
@@ -1509,6 +1569,9 @@ class TestGetBookSummaryRunway:
         assert "USD" in runway_line
         assert "liquid" in runway_line
         assert "/day burn" in runway_line
+        # Burn-averaging window is disclosed (book-age clamped,
+        # so the exact day count varies with the fixture's age).
+        assert "-day avg)" in runway_line
         # Comma-separated for the liquid (2,670).
         assert "2,670" in runway_line
         # No decimals.
@@ -3122,6 +3185,64 @@ class TestGetBookSummaryUpcomingScheduled:
             or "none due in next 7 days" in sched_line
         )
 
+    def test_scheduled_line_carries_overdue_count(
+        self, scheduled_book: Path,
+    ):
+        """An overdue SX shows on the Scheduled line as
+        "N overdue ⚠", and the count agrees with the number of
+        Overdue-scheduled entries in Warnings — pre-fix the line
+        could say "none due in next 7 days" while Warnings showed
+        10 overdue, a flat contradiction."""
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Overdue Rent",
+            description="Rent",
+            splits=[
+                {"account": "Expenses:Rent", "amount": "1850.00"},
+                {"account": "Assets:Checking", "amount": "-1850.00"},
+            ],
+            start_date=(date.today() - timedelta(days=400)).isoformat(),
+            frequency="monthly",
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        warning_count = sum(
+            1 for l in result.splitlines()
+            if "Overdue scheduled:" in l
+        )
+        assert warning_count >= 1
+        assert f"{warning_count} overdue ⚠" in sched_line
+
+    def test_scheduled_line_omits_overdue_when_none(
+        self, scheduled_book: Path,
+    ):
+        """No overdue SX → no overdue bucket on the line
+        (absence-as-signal, matching the section conventions)."""
+        from datetime import date as _date, timedelta as _td
+        gc = GnuCashBook(str(scheduled_book))
+        gc.create_scheduled_transaction(
+            name="Far Future Yearly",
+            description="Yearly",
+            start_date=(
+                _date.today() + _td(days=180)
+            ).isoformat(),
+            frequency="yearly",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Rent", "amount": "100"},
+            ],
+        )
+        result = gc.get_book_summary()
+        sched_line = next(
+            l for l in result.splitlines()
+            if l.startswith("Scheduled:")
+        )
+        if "Overdue scheduled:" not in result:
+            assert "overdue" not in sched_line
+
 
 class TestGetBookSummaryReconciliationSplitCount:
     """Stale reconciliation lines carry "47 splits unreconciled
@@ -3346,6 +3467,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 invoice" in recv
         assert "1 overdue" in recv
+        assert "included in Assets total" in recv
 
     def test_payables_signal_shows_open_count(
         self, business_book: Path,
@@ -3359,6 +3481,7 @@ class TestGetBookSummaryBusinessSignals:
         )
         assert "1 bill" in pay
         assert "0 overdue" in pay
+        assert "included in Liabilities total" in pay
 
     def test_jobs_line_present_when_active(
         self, business_book: Path,
@@ -5131,9 +5254,10 @@ class TestDuplicatesTsvShape:
         assert "{" not in result["duplicates"]
 
     def test_tsv_columns_and_order(self, test_book: Path):
-        """Each row is six tab-separated columns in the documented
-        order. The first row is the one with the strongest match
-        (HIGH confidence when all three signals hit)."""
+        """Each row is seven tab-separated columns in the documented
+        order (``cur`` is empty for book-default candidates). The
+        first row is the one with the strongest match (HIGH
+        confidence when all three signals hit)."""
         gc_book = GnuCashBook(str(test_book))
         result = gc_book.create_transaction(
             description="Weekly Groceries",
@@ -5145,14 +5269,15 @@ class TestDuplicatesTsvShape:
         )
         first_line = result["duplicates"].split("\n")[0]
         cols = first_line.split("\t")
-        assert len(cols) == 6
-        confidence, guid, dt, amount, description, signals = cols
+        assert len(cols) == 7
+        confidence, guid, dt, amount, cur, description, signals = cols
         assert confidence == "HIGH"
         assert len(guid) >= 8  # short prefix, never a raw 32-char guid
         assert dt == "2024-01-20"
         # piecash's GncNumeric strips trailing zeros (150, not 150.00),
         # so compare numerically rather than asserting exact text.
         assert Decimal(amount) == Decimal("150")
+        assert cur == ""  # book-default candidate: empty cell
         assert description == "Weekly Groceries"
         assert signals == "DAD"
 
@@ -6934,7 +7059,9 @@ class TestUpdateTransaction:
         assert result["status"] == "updated"
 
     def test_update_description_on_reconciled_ok(self, test_book: Path):
-        """Should allow description/date/notes changes without force on reconciled."""
+        """Description/notes changes stay force-free on reconciled
+        transactions — they don't move money or periods. Date moves
+        DO need force (see the date-move tests below)."""
         gc_book = GnuCashBook(str(test_book))
 
         transactions = gc_book.search_transactions("Groceries", compact=False)["transactions"]
@@ -6948,6 +7075,108 @@ class TestUpdateTransaction:
         )
         assert result["status"] == "updated"
         assert result["description"] == "Updated Groceries"
+
+    def test_date_move_on_reconciled_requires_force(
+        self, test_book: Path,
+    ):
+        """A date move relocates the transaction across statement /
+        reporting periods while its splits stay 'y' — same
+        reconciliation damage as editing splits, same force gate."""
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+
+        with pytest.raises(ValueError, match="posting date"):
+            gc_book.update_transaction(
+                guid=tx["guid"],
+                trans_date=date.fromisoformat(tx["date"])
+                + timedelta(days=40),
+            )
+
+    def test_date_move_on_reconciled_with_force(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+        new_date = date.fromisoformat(tx["date"]) + timedelta(days=40)
+
+        result = gc_book.update_transaction(
+            guid=tx["guid"], trans_date=new_date, force=True,
+        )
+        assert result["status"] == "updated"
+        assert result["date"] == new_date.isoformat()
+
+    def test_same_date_on_reconciled_needs_no_force(
+        self, test_book: Path,
+    ):
+        """Re-submitting the current date is a no-op, not a move."""
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+
+        result = gc_book.update_transaction(
+            guid=tx["guid"],
+            trans_date=date.fromisoformat(tx["date"]),
+        )
+        assert result["status"] == "updated"
+
+    def test_broadcast_date_move_on_reconciled_requires_force(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        tx = gc_book.search_transactions(
+            "Groceries", compact=False,
+        )["transactions"][0]
+        gc_book.set_reconcile_state(tx["splits"][0]["guid"], "y")
+        moved = date.fromisoformat(tx["date"]) + timedelta(days=40)
+
+        with pytest.raises(ValueError, match="posting date"):
+            gc_book.update_transaction(
+                guid=[tx["guid"]], trans_date=moved,
+            )
+        result = gc_book.update_transaction(
+            guid=[tx["guid"]], trans_date=moved, force=True,
+        )
+        assert result["status"] == "updated"
+
+    def test_batch_date_move_on_reconciled_rejected_per_row(
+        self, test_book: Path,
+    ):
+        """update_transactions rejects the date-moving row (skip
+        mode keeps siblings); force=True lets it through — same
+        gate, batch semantics."""
+        gc_book = GnuCashBook(str(test_book))
+        txns = gc_book.search_transactions(
+            "", compact=False,
+        )["transactions"]
+        rec, other = txns[0], txns[1]
+        gc_book.set_reconcile_state(rec["splits"][0]["guid"], "y")
+        moved = (
+            date.fromisoformat(rec["date"]) + timedelta(days=40)
+        )
+
+        env = gc_book.update_transactions([
+            {"guid": rec["guid"], "date": moved},
+            {"guid": other["guid"], "description": "Renamed"},
+        ], on_error="skip")
+        rows = {
+            r["guid"]: r
+            for r in _parse_results_tsv(env["results"])
+        }
+        assert rows[rec["guid"]]["status"] == "rejected"
+        assert "reconciled splits" in rows[rec["guid"]]["reason"]
+        assert rows[other["guid"]]["status"] == "updated"
+
+        env = gc_book.update_transactions([
+            {"guid": rec["guid"], "date": moved},
+        ], force=True)
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "updated"
 
     def test_update_splits_validates_before_mutating(
         self, multi_currency_book: Path,
@@ -7259,7 +7488,7 @@ class TestReplaceSplits:
         guid = transactions[0]["guid"]
 
         # Expenses is a placeholder in test_book
-        with pytest.raises(ValueError, match="placeholder account"):
+        with pytest.raises(ValueError, match="is a placeholder.*post to one of its children"):
             gc_book.replace_splits(
                 guid=guid,
                 splits=[
@@ -7282,7 +7511,12 @@ class TestReplaceSplits:
             )
 
     def test_reconciled_requires_force(self, test_book: Path):
-        """Should reject recategorizing reconciled splits without force."""
+        """Should reject CHANGING reconciled splits without force.
+
+        The amounts differ from the originals so the reconciled leg
+        actually changes — an identical resubmission is an unchanged
+        leg and is preserved without force (covered in
+        TestReplaceSplitsPreservation)."""
         gc_book = GnuCashBook(str(test_book))
 
         # Get a transaction and reconcile one of its splits
@@ -7295,8 +7529,8 @@ class TestReplaceSplits:
             gc_book.replace_splits(
                 guid=guid,
                 splits=[
-                    {"account": "Expenses:Groceries", "amount": "150.00"},
-                    {"account": "Assets:Checking", "amount": "-150.00"},
+                    {"account": "Expenses:Groceries", "amount": "151.00"},
+                    {"account": "Assets:Checking", "amount": "-151.00"},
                 ],
             )
 
@@ -7897,48 +8131,102 @@ class TestReconcileAccount:
         )
         assert unreconciled_after["splits"] == []
 
-    def test_reconcile_all_no_default_date_filter(self, test_book: Path):
-        """Bulk mode must NOT default to a date filter — the
-        bookkeeper's CareCredit payoff scenario had payment splits
-        dated AFTER the statement_date, and the test fixture's
-        analogue is splits across Jan 1 / 15 / 20 reconciled against
-        a Jan 10 statement. Pre-fix the default ``through_date =
-        statement_date`` excluded Jan 15 and Jan 20 splits silently;
-        post-fix every unreconciled split is included regardless of
-        date when no ``through_date`` is passed.
+    def test_bulk_default_bounded_by_statement_date(self, test_book: Path):
+        """Bulk mode defaults ``through_date`` to ``statement_date``.
+
+        This default has now flipped once in each direction — read
+        both incidents before flipping it a third time:
+
+        - **CareCredit payoff (2026-05, shaped the original
+          no-filter default):** a final statement plus a payoff
+          payment dated AFTER the statement date needed one sweep.
+          Under the bounded default that flow passes an explicit
+          later ``through_date`` (see
+          ``test_reconcile_all_respects_through_date``), and the
+          bulk balance-mismatch error hints exactly that.
+        - **Multi-month catch-up (2026-07, flipped it to bounded):**
+          enter several months of card transactions, reconcile each
+          statement in turn. Under no-filter, every statement but
+          the last broke the balance tie, forcing a per-statement
+          GUID-picking dance (live bookkeeper finding, four cards
+          in one night). Statement reconciliation is definitionally
+          bounded by the statement; the frequent case wins the
+          default and the rare payoff case pays one parameter.
+
+        Fixture has splits on 2024-01-01, 01-15, 01-20: the Jan-10
+        statement sweeps only Jan 1; the Jan-31 statement then
+        sweeps the rest — two bare calls, no GUIDs.
         """
         gc_book = GnuCashBook(str(test_book))
 
         unreconciled_all = gc_book.get_unreconciled_splits(
             "Assets:Checking", compact=False,
         )
-        total = sum(
-            (Decimal(s["amount"]) for s in unreconciled_all["splits"]),
-            Decimal("0"),
-        )
-        expected_count = len(unreconciled_all["splits"])
-        # The test fixture has at least one split AFTER the early
-        # statement date; if not, this assertion documents the gap.
-        early_cutoff = date(2024, 1, 10)
-        after_cutoff = [
-            s for s in unreconciled_all["splits"]
-            if date.fromisoformat(s["date"]) > early_cutoff
+        all_splits = unreconciled_all["splits"]
+        cutoff = date(2024, 1, 10)
+        early = [
+            s for s in all_splits
+            if date.fromisoformat(s["date"]) <= cutoff
         ]
-        assert after_cutoff, (
-            "Test setup: expected at least one split after the "
-            "early statement date to exercise the no-default-filter "
-            "behavior."
+        late = [
+            s for s in all_splits
+            if date.fromisoformat(s["date"]) > cutoff
+        ]
+        assert early and late, (
+            "Test setup: need splits on both sides of the early "
+            "statement date."
+        )
+        early_total = sum(
+            (Decimal(s["amount"]) for s in early), Decimal("0"),
         )
 
-        # statement_date is BEFORE some splits, but no through_date
-        # is passed — every unreconciled split must be included.
+        # Statement 1: bare bulk call sweeps ONLY through Jan 10.
         result = gc_book.reconcile_account(
             account_name="Assets:Checking",
-            statement_date=early_cutoff,
-            statement_balance=str(total),
+            statement_date=cutoff,
+            statement_balance=str(early_total),
             reconcile_all=True,
         )
-        assert result["splits_reconciled"] == expected_count
+        assert result["splits_reconciled"] == len(early)
+        remaining = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        assert len(remaining) == len(late)
+
+        # Statement 2: the next bare call finishes the catch-up.
+        full_total = sum(
+            (Decimal(s["amount"]) for s in all_splits), Decimal("0"),
+        )
+        result = gc_book.reconcile_account(
+            account_name="Assets:Checking",
+            statement_date=date(2024, 1, 31),
+            statement_balance=str(full_total),
+            reconcile_all=True,
+        )
+        assert result["splits_reconciled"] == len(late)
+
+    def test_bulk_mismatch_error_hints_through_date(
+        self, test_book: Path,
+    ):
+        """The payoff shape fails the tie loudly WITH the fix named:
+        the bulk mismatch error tells the caller to widen
+        through_date."""
+        gc_book = GnuCashBook(str(test_book))
+        all_splits = gc_book.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        full_total = sum(
+            (Decimal(s["amount"]) for s in all_splits), Decimal("0"),
+        )
+        # Statement balance includes post-statement items, but the
+        # bounded sweep can't reach them.
+        with pytest.raises(ValueError, match="pass through_date"):
+            gc_book.reconcile_account(
+                account_name="Assets:Checking",
+                statement_date=date(2024, 1, 10),
+                statement_balance=str(full_total),
+                reconcile_all=True,
+            )
 
     def test_reconcile_all_respects_through_date(self, test_book: Path):
         """When ``through_date`` is set, ``reconcile_all`` only touches
@@ -11856,3 +12144,970 @@ class TestIssue94IntermediateCurrencyChain:
             assert by_mnem["UKFUND"] == "via GBP→USD"      # C
             assert by_mnem["LOCALFUND"] is None            # D direct
             assert by_mnem["ORPHANFUND"] is None           # E unreachable
+
+
+class TestReplaceSplitsPreservation:
+    """Unchanged legs survive replace_splits intact.
+
+    A new split reproducing an old one (account, value, quantity)
+    keeps the old memo and reconcile state, and no longer trips the
+    force gate — recategorizing one leg of a reconciled bank
+    transaction must not destroy the other leg's provenance or its
+    reconciliation (found live: five reconciled checking splits,
+    including a $2,243.71 deposit, knocked to 'n' with their
+    statement memos erased by routine recategorization)."""
+
+    PROVENANCE = "Withdrawal ACH PAYPAL TYPE: INST XFER CO: PAYPAL"
+
+    def _make_reconciled(self, gc_book):
+        """Fresh 2-split transaction, checking leg memo'd + reconciled."""
+        gc_book.create_account(
+            name="Dining", account_type="EXPENSE", parent="Expenses",
+        )
+        result = gc_book.create_transaction(
+            description="PayPal Instant Transfer",
+            splits=[
+                {
+                    "account": "Assets:Checking",
+                    "amount": "-250.00",
+                    "memo": self.PROVENANCE,
+                },
+                {"account": "Expenses:Groceries", "amount": "250.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        from datetime import date as _date
+        gc_book.set_reconcile_state(
+            chk["guid"], "y", reconcile_date=_date(2026, 7, 15),
+        )
+        return result["guid"]
+
+    def test_unchanged_leg_keeps_memo_and_reconciliation(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        # Recategorize the expense leg only; resubmit the bank leg
+        # as-is, memo-less, and WITHOUT force.
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-250.00"},
+                {"account": "Expenses:Dining", "amount": "250.00"},
+            ],
+        )
+        assert result["status"] == "splits_replaced"
+        assert not any(
+            "reconciled" in w.lower()
+            for w in result.get("warnings", [])
+        )
+
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        exp = next(
+            s for s in txn["splits"]
+            if s["account"] == "Expenses:Dining"
+        )
+        assert chk["memo"] == self.PROVENANCE
+        assert chk["reconcile_state"] == "y"
+        assert chk["reconcile_date"].startswith("2026-07-15")
+        assert exp["reconcile_state"] == "n"
+
+    def test_caller_supplied_memo_wins(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {
+                    "account": "Assets:Checking",
+                    "amount": "-250.00",
+                    "memo": "corrected memo",
+                },
+                {"account": "Expenses:Dining", "amount": "250.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["memo"] == "corrected memo"
+        assert chk["reconcile_state"] == "y"
+
+    def test_changed_reconciled_leg_still_gated_and_reset(
+        self, test_book: Path,
+    ):
+        gc_book = GnuCashBook(str(test_book))
+        guid = self._make_reconciled(gc_book)
+
+        with pytest.raises(ValueError, match="force=true"):
+            gc_book.replace_splits(
+                guid=guid,
+                splits=[
+                    {"account": "Assets:Checking", "amount": "-260.00"},
+                    {"account": "Expenses:Dining", "amount": "260.00"},
+                ],
+            )
+
+        result = gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Assets:Checking", "amount": "-260.00"},
+                {"account": "Expenses:Dining", "amount": "260.00"},
+            ],
+            force=True,
+        )
+        assert any(
+            "reconciled" in w.lower() for w in result["warnings"]
+        )
+        txn = gc_book.get_transaction(guid)
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["reconcile_state"] == "n"
+        assert not chk.get("memo")
+
+    def test_twin_splits_each_claim_their_own_memo(
+        self, test_book: Path,
+    ):
+        """Two same-account same-amount legs: greedy one-to-one
+        matching preserves both memos (as a multiset)."""
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Split lunch",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00",
+                 "memo": "first twin"},
+                {"account": "Expenses:Groceries", "amount": "10.00",
+                 "memo": "second twin"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+        )
+        guid = result["guid"]
+        gc_book.replace_splits(
+            guid=guid,
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-20.00"},
+            ],
+        )
+        txn = gc_book.get_transaction(guid)
+        memos = sorted(
+            s.get("memo", "") for s in txn["splits"]
+            if s["account"] == "Expenses:Groceries"
+        )
+        assert memos == ["first twin", "second twin"]
+
+
+def _parse_results_tsv(tsv: str) -> list[dict]:
+    """Header-bearing TSV → list of dicts (batch results tables)."""
+    lines = tsv.split("\n")
+    header = lines[0].split("\t")
+    return [dict(zip(header, ln.split("\t"))) for ln in lines[1:]]
+
+
+class TestBatchPrices:
+    """create_prices: many quotes, one book-open, one save, with
+    create_price's exact upsert semantics via the shared chokepoint."""
+
+    def _setup(self, gc):
+        gc.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_commodity(mnemonic="VFIFX", fullname="Vanguard 2050",
+                            namespace="FUND")
+
+    def test_creates_then_updates_in_place(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        rows = [
+            {"ref": "1", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+            {"ref": "2", "commodity": "VFIFX",
+             "date": date(2026, 7, 20), "value": "66.10"},
+        ]
+        env = gc.create_prices(rows)
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["1"]["status"] == "created"
+        assert parsed["2"]["status"] == "created"
+
+        # Same commodity/date/source, new value → updated, not doubled.
+        rows[0]["value"] = "149.01"
+        env = gc.create_prices([rows[0]])
+        assert _parse_results_tsv(env["results"])[0]["status"] == "updated"
+        latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
+        assert latest["value"] == "149.01"
+
+    def test_abort_sinks_batch_on_bad_row(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "NOPE",
+             "date": date(2026, 7, 20), "value": "1.00"},
+            {"ref": "2", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert "not found" in parsed["1"]["reason"]
+        assert parsed["2"]["reason"] == "batch_aborted"
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_skip_keeps_good_rows(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "NOPE",
+             "date": date(2026, 7, 20), "value": "1.00"},
+            {"ref": "2", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ], on_error="skip")
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["1"]["status"] == "rejected"
+        assert parsed["2"]["status"] == "created"
+
+    def test_dry_run_writes_nothing(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "VTSAX",
+             "date": date(2026, 7, 20), "value": "148.32"},
+        ], dry_run=True)
+        assert _parse_results_tsv(env["results"])[0]["status"] == "would_create"
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_duplicate_identity_dry_run_and_live_agree(
+        self, test_book: Path,
+    ):
+        """Two rows sharing one canonical identity (commodity,
+        currency, date, source) are rejected up front — identically
+        in dry_run and live. Pre-fix, dry_run promised would_create
+        for both while live crashed at piecash's commit-time
+        uniqueness validation with an internals-leaking error."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        rows = [
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ]
+
+        env = gc.create_prices(rows, on_error="skip", dry_run=True)
+        dry = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert dry["a"]["status"] == "would_create"
+        assert dry["b"]["status"] == "rejected"
+        assert "duplicate price identity" in dry["b"]["reason"]
+
+        env = gc.create_prices(rows, on_error="skip")
+        live = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert live["a"]["status"] == "created"
+        assert live["b"]["status"] == "rejected"
+        assert "duplicate price identity" in live["b"]["reason"]
+
+        # First row won; exactly one price landed.
+        latest = gc.get_latest_price(commodity="VTSAX", namespace="FUND")
+        assert latest["value"] == "100"
+
+    def test_duplicate_identity_aborts_batch_by_default(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "110"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["reason"] == "batch_aborted"
+        assert "duplicate price identity" in parsed["b"]["reason"]
+        assert gc.get_latest_price(
+            commodity="VTSAX", namespace="FUND",
+        ) is None
+
+    def test_distinct_source_is_not_a_duplicate(self, test_book: Path):
+        """Identity includes source — a feed quote and a manual
+        quote on the same date are both legitimate."""
+        gc = GnuCashBook(str(test_book))
+        self._setup(gc)
+        env = gc.create_prices([
+            {"ref": "a", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "100"},
+            {"ref": "b", "commodity": "VTSAX",
+             "date": date(2026, 7, 21), "value": "101",
+             "source": "user:market_data"},
+        ])
+        parsed = {r["ref"]: r for r in _parse_results_tsv(env["results"])}
+        assert parsed["a"]["status"] == "created"
+        assert parsed["b"]["status"] == "created"
+
+    def test_ambiguous_symbol_requires_ns(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        gc.create_commodity(mnemonic="DUP", fullname="Dup Fund",
+                            namespace="FUND")
+        gc.create_commodity(mnemonic="DUP", fullname="Dup Stock",
+                            namespace="NASDAQ")
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "DUP",
+             "date": date(2026, 7, 20), "value": "10.00"},
+        ], on_error="skip")
+        assert "ambiguous" in _parse_results_tsv(env["results"])[0]["reason"]
+        env = gc.create_prices([
+            {"ref": "1", "commodity": "DUP", "namespace": "FUND",
+             "date": date(2026, 7, 20), "value": "10.00"},
+        ])
+        assert _parse_results_tsv(env["results"])[0]["status"] == "created"
+
+
+class TestPricesTsvParser:
+    def test_minimal_and_extended_headers(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        rows = _parse_prices_tsv(
+            "ref\tcommodity\tdate\tvalue\n"
+            "1\tVTSAX\t2026-07-21\t148.32"
+        )
+        assert rows[0] == {
+            "ref": "1", "commodity": "VTSAX",
+            "date": date(2026, 7, 21), "value": "148.32",
+        }
+        rows = _parse_prices_tsv(
+            "ref\tcommodity\tdate\tvalue\tns\tcur\tsource\n"
+            "1\tEUR\t2026-07-21\t1.0845\tCURRENCY\tusd\tweb:ecb\n"
+            "2\tVTSAX\t2026-07-21\t148.32"
+        )
+        assert rows[0]["currency"] == "USD"
+        assert rows[0]["source"] == "web:ecb"
+        assert "currency" not in rows[1]  # row ended early
+
+    def test_misplaced_or_unknown_column_rejects_by_name(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        with pytest.raises(ValueError, match="'source'"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalue\tsource\tcur\n"
+                "1\tVTSAX\t2026-07-21\t148.32\tx\ty"
+            )
+        with pytest.raises(ValueError, match="'valu'"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalu\n1\tV\t2026-07-21\t1"
+            )
+
+    def test_bad_date_names_the_row(self):
+        from gnucash_mcp.tools.investments import _parse_prices_tsv
+
+        with pytest.raises(ValueError, match="row 1"):
+            _parse_prices_tsv(
+                "ref\tcommodity\tdate\tvalue\n1\tVTSAX\tJuly 21\t1"
+            )
+
+
+class TestListCommoditiesStaleFilter:
+    def test_work_list_filters_and_markers(self, multi_currency_book):
+        from datetime import timedelta
+
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_commodity(mnemonic="VTSAX", fullname="Vanguard Total",
+                            namespace="FUND")
+        gc.create_price(
+            commodity="VTSAX", namespace="FUND", value="120.00",
+            price_date=date.today() - timedelta(days=200),
+        )
+
+        # Unfiltered: unchanged shape, no staleness markers.
+        full = gc.list_commodities(compact=True, limit=0)
+        assert "stale" not in full and "no price on file" not in full
+
+        # Stale filter: old VTSAX marked with its age; EUR (only a
+        # piecash transaction-type placeholder price from the
+        # fixture's transfer) counts as no market price; USD (book
+        # default) excluded.
+        stale = gc.list_commodities(compact=True, stale_days=30)
+        assert "VTSAX" in stale and "200d stale" in stale
+        assert "EUR" in stale and "no price on file" in stale
+        assert "\tUSD\t" not in stale
+
+        # held_only: VTSAX has no account; EUR does.
+        work = gc.list_commodities(
+            compact=True, stale_days=30, held_only=True,
+        )
+        assert "EUR" in work
+        assert "VTSAX" not in work
+
+        # Fresh price falls off the stale list.
+        gc.create_price(
+            commodity="VTSAX", namespace="FUND", value="148.00",
+        )
+        stale = gc.list_commodities(compact=True, stale_days=30)
+        assert "VTSAX" not in stale
+
+
+class TestSplitAction:
+    """Split ``action`` — native splits.action column, exposed on
+    the create paths and preserved through replace_splits."""
+
+    def test_create_and_read_back(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        result = gc.create_transaction(
+            description="Interest posting",
+            splits=[
+                {"account": "Assets:Checking", "amount": "1.23",
+                 "action": "Interest"},
+                {"account": "Income:Salary", "amount": "-1.23"},
+            ],
+        )
+        txn = gc.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["action"] == "Interest"
+
+    def test_replace_splits_preserves_action_on_unchanged_leg(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Dining", account_type="EXPENSE", parent="Expenses",
+        )
+        result = gc.create_transaction(
+            description="Wire out",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00",
+                 "action": "Wire"},
+                {"account": "Expenses:Groceries", "amount": "90.00"},
+            ],
+        )
+        gc.replace_splits(
+            guid=result["guid"],
+            splits=[
+                {"account": "Assets:Checking", "amount": "-90.00"},
+                {"account": "Expenses:Dining", "amount": "90.00"},
+            ],
+        )
+        txn = gc.get_transaction(result["guid"])
+        chk = next(
+            s for s in txn["splits"]
+            if s["account"] == "Assets:Checking"
+        )
+        assert chk["action"] == "Wire"
+
+
+class TestAccountErrorSuggestions:
+    """Account-resolution failures teach instead of just rejecting.
+
+    Every wrong path guess in a batch was a rejected row and a
+    retry round-trip (bookkeeper friction, 2026-07-24): near-miss
+    paths get did-you-mean candidates, placeholder rejections name
+    postable children. Error-path only — success costs nothing."""
+
+    def test_truncated_leaf_suggests_full_path(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.create_transaction(
+                description="x",
+                splits=[
+                    {"account": "Expenses:Grocer", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            )
+        assert "Did you mean" in str(e.value)
+        assert "Expenses:Groceries" in str(e.value)
+
+    def test_nonsense_ref_stays_plain(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        with pytest.raises(ValueError) as e:
+            gc.get_balance("Zzz:Qqqqq:Wwww")
+        assert "Account not found" in str(e.value)
+        assert "Did you mean" not in str(e.value)
+
+    def test_placeholder_rejection_names_children(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        gc.create_account(
+            name="Utilities", account_type="EXPENSE",
+            parent="Expenses", placeholder=True,
+        )
+        gc.create_account(
+            name="Water", account_type="EXPENSE",
+            parent="Expenses:Utilities",
+        )
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "Water bill",
+            "splits": [
+                {"account": "Expenses:Utilities", "amount": "50.00"},
+                {"account": "Assets:Checking", "amount": "-50.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "placeholder" in rows[0]["reason"]
+        assert "Expenses:Utilities:Water" in rows[0]["reason"]
+
+    def test_batch_row_rejection_carries_suggestion(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([{
+            "ref": "1", "date": date(2026, 7, 1),
+            "description": "x",
+            "splits": [
+                {"account": "Expenses:Grocery", "amount": "5.00"},
+                {"account": "Assets:Checking", "amount": "-5.00"},
+            ],
+        }], on_error="skip")
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "Did you mean" in rows[0]["reason"]
+        assert "Expenses:Groceries" in rows[0]["reason"]
+
+
+class TestUpdateTransactionBroadcast:
+    """guid-list broadcast: same values to N transactions, one save.
+
+    The 44-identical-notes annotation pass that previously burned
+    three turns of tool-call budget (bookkeeper finding)."""
+
+    def _three(self, gc):
+        guids = []
+        for i in range(3):
+            r = gc.create_transaction(
+                description=f"HoopFest Doughnut {i}",
+                splits=[
+                    {"account": "Assets:Checking", "amount": f"{10 + i}.00"},
+                    {"account": "Income:Salary", "amount": f"-{10 + i}.00"},
+                ],
+            )
+            guids.append(r["guid"])
+        return guids
+
+    def test_broadcast_notes(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        result = gc.update_transaction(
+            guid=guids, notes="HoopFest 2026 — liability, not income.",
+        )
+        assert result["status"] == "updated"
+        assert result["count"] == 3
+        for g in guids:
+            txn = gc.get_transaction(g)
+            assert txn["notes"] == "HoopFest 2026 — liability, not income."
+            assert txn["description"].startswith("HoopFest Doughnut")
+
+    def test_all_or_nothing_on_bad_guid(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="not found"):
+            gc.update_transaction(
+                guid=[guids[0], "deadbeef00000000"], notes="x",
+            )
+        assert not gc.get_transaction(guids[0]).get("notes")
+
+    def test_splits_rejected_with_list(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="single-transaction only"):
+            gc.update_transaction(
+                guid=guids,
+                splits=[{"account": "Assets:Checking", "amount": "1"}],
+            )
+
+    def test_empty_field_set_rejected(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guids = self._three(gc)
+        with pytest.raises(ValueError, match="nothing to update"):
+            gc.update_transaction(guid=guids)
+
+
+class TestUpdateTransactionsTsv:
+    """Per-row bulk edit: empty cells leave fields unchanged; the
+    batch can annotate but never clear."""
+
+    def _two(self, gc):
+        a = gc.create_transaction(
+            description="PayPal Instant Transfer (investigate)",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-250.00"},
+                {"account": "Expenses:Groceries", "amount": "250.00"},
+            ],
+        )["guid"]
+        b = gc.create_transaction(
+            description="PayPal Purchase (investigate)",
+            notes="original note",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-22.10"},
+                {"account": "Expenses:Groceries", "amount": "22.10"},
+            ],
+        )["guid"]
+        return a, b
+
+    def test_per_row_values_and_empty_cells(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, b = self._two(gc)
+        env = gc.update_transactions([
+            {"guid": a, "description": "PayPal Credit Payment",
+             "notes": "Resolved — card payment"},
+            {"guid": b, "description": "Netflix via PayPal"},
+        ])
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["status"] == "updated"
+        assert rows[b]["status"] == "updated"
+        ta, tb = gc.get_transaction(a), gc.get_transaction(b)
+        assert ta["description"] == "PayPal Credit Payment"
+        assert ta["notes"] == "Resolved — card payment"
+        assert tb["description"] == "Netflix via PayPal"
+        # Empty cell left the existing note untouched — never cleared.
+        assert tb["notes"] == "original note"
+
+    def test_abort_and_skip(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, _b = self._two(gc)
+        bad = {"guid": "deadbeef00000000", "notes": "x"}
+        good = {"guid": a, "notes": "kept"}
+        env = gc.update_transactions([bad, good])
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["reason"] == "batch_aborted"
+        assert not gc.get_transaction(a).get("notes")
+        env = gc.update_transactions([bad, good], on_error="skip")
+        rows = {r["guid"]: r for r in _parse_results_tsv(env["results"])}
+        assert rows[a]["status"] == "updated"
+        assert gc.get_transaction(a)["notes"] == "kept"
+
+    def test_row_changing_nothing_rejects(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        a, _b = self._two(gc)
+        env = gc.update_transactions(
+            [{"guid": a}], on_error="skip",
+        )
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert "changes nothing" in rows[0]["reason"]
+
+    def test_update_tsv_parser_contract(self):
+        from gnucash_mcp._format import _parse_update_tsv
+
+        with pytest.raises(ValueError, match="unrecognized column 'payee'"):
+            _parse_update_tsv("guid\tpayee\nabc\tX")
+        with pytest.raises(ValueError, match="at least one field"):
+            _parse_update_tsv("guid\nabc")
+        rows = _parse_update_tsv(
+            "guid\tdescription\tnotes\nabc123\t\tonly notes"
+        )
+        assert rows[0] == {"guid": "abc123", "notes": "only notes"}
+
+
+class TestFrequentAccounts:
+    """get_book_summary hands each session its working vocabulary:
+    top accounts by recent posting frequency, in list_accounts'
+    exact %short-GUID line format (bookkeeper finding: short GUIDs
+    went unused because they were never in context when the
+    model's account vocabulary formed)."""
+
+    def test_section_present_ordered_and_reusable(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        # Groceries gets three recent postings, Salary one.
+        for i in range(3):
+            gc.create_transaction(
+                description=f"G{i}",
+                splits=[
+                    {"account": "Expenses:Groceries", "amount": "5.00"},
+                    {"account": "Assets:Checking", "amount": "-5.00"},
+                ],
+            )
+        summary = gc.get_book_summary()
+        assert "Frequently used accounts (last 180 days):" in summary
+        section = summary.split("Frequently used accounts")[1]
+        lines = [
+            ln.strip() for ln in section.split("\n")[1:]
+            if ln.strip().startswith("%")
+        ]
+        assert lines, "expected %short-GUID vocabulary lines"
+        # list_accounts line format: %short<TAB>fullname [TYPE].
+        first = lines[0]
+        assert "\t" in first
+        short, rest = first.split("\t", 1)
+        assert short.startswith("%") and len(short) >= 8
+        # Ordering: the two most-posted are checking + groceries.
+        top_two = {ln.split("\t", 1)[1].split(" [")[0] for ln in lines[:2]}
+        assert top_two == {"Assets:Checking", "Expenses:Groceries"}
+        # The emitted short ref actually resolves (book-layer
+        # get_balance returns a bare Decimal; an unresolvable ref
+        # raises).
+        assert isinstance(gc.get_balance(short), Decimal)
+
+    def test_old_activity_outside_window_excluded(
+        self, test_book: Path,
+    ):
+        """The fixture's 2024 transactions are outside the 180-day
+        window; with no recent activity the section is absent
+        rather than rendering stale vocabulary."""
+        gc = GnuCashBook(str(test_book))
+        summary = gc.get_book_summary()
+        assert "Frequently used accounts" not in summary
+
+
+class TestReconciliationDormancy:
+    """A $0, fully-reconciled, long-idle account is DORMANT — an
+    aggregate line, no orange badge. A CARRIED balance with months
+    of silence stays individually warned: interest posts monthly,
+    so silence means missing entries. (Bookkeeper finding: stamped
+    dormant cards warned forever because a 0-split sweep can't
+    advance the last-reconciled-split date.)"""
+
+    def _card_with_history(self, gc, name, pay_off: bool):
+        from datetime import timedelta as _td
+        gc.create_account(
+            name=name, account_type="CREDIT", parent="Liabilities",
+        )
+        old = date.today() - _td(days=150)
+        r = gc.create_transaction(
+            description=f"{name} purchase",
+            splits=[
+                {"account": f"Liabilities:{name}", "amount": "-500.00"},
+                {"account": "Expenses:Groceries", "amount": "500.00"},
+            ],
+            trans_date=old,
+        )
+        guids = [r["guid"]]
+        if pay_off:
+            r2 = gc.create_transaction(
+                description=f"{name} payoff",
+                splits=[
+                    {"account": f"Liabilities:{name}", "amount": "500.00"},
+                    {"account": "Assets:Checking", "amount": "-500.00"},
+                ],
+                trans_date=old,
+            )
+            guids.append(r2["guid"])
+        # Reconcile every card split (dated 150 days ago).
+        for g in guids:
+            txn = gc.get_transaction(g)
+            for s in txn["splits"]:
+                if name in s["account"]:
+                    gc.set_reconcile_state(s["guid"], "y", reconcile_date=old)
+
+    def test_dormant_zero_card_aggregates_without_warning(
+        self, test_book: Path,
+    ):
+        gc = GnuCashBook(str(test_book))
+        self._card_with_history(gc, "Old Apple Card", pay_off=True)
+        summary = gc.get_book_summary()
+        assert "1 account dormant ($0, fully reconciled)" in summary
+        assert "Old Apple Card" not in summary.split("Reconciliation:")[1]
+
+    def test_carried_balance_stays_warned(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._card_with_history(gc, "Care Credit", pay_off=False)
+        summary = gc.get_book_summary()
+        recon = summary.split("Reconciliation:")[1]
+        assert "Care Credit" in recon
+        assert "⚠" in [
+            ln for ln in recon.split("\n") if "Care Credit" in ln
+        ][0]
+        assert "dormant" not in recon
+
+
+class TestNoReconcileSlot:
+    """The ``no_reconcile`` slot: user-declared 'this account has no
+    statement to reconcile against' (loans, escrow payables). The
+    dashboard drops flagged accounts from warnings and counts;
+    reconciliation TOOLS still work on them (reporting-only flag).
+    Also the third boolean slot — the trigger that consolidated
+    _slot_bool per the standing backlog note."""
+
+    def _never_reconciled_loan(self, gc):
+        # Stamp the fixture's Checking splits first so the loan is
+        # the SOLE never-reconciled account and the aggregate line's
+        # presence/absence is attributable to the flag under test.
+        pending = gc.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        for sp in pending:
+            gc.set_reconcile_state(sp["guid"], "y")
+        gc.create_account(
+            name="Navient", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest",
+            splits=[
+                {"account": "Liabilities:Navient", "amount": "-55.00"},
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+            ],
+        )
+
+    def test_flag_removes_from_dashboard(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        before = gc.get_book_summary()
+        assert "never reconciled ⚠" in before
+
+        gc.set_account_slot("Liabilities:Navient", "no_reconcile", "1")
+        after = gc.get_book_summary()
+        recon = after.split("Reconciliation:")[1].split("Net worth")[0]
+        assert "Navient" not in recon
+        # The loan was the only never-reconciled account; its
+        # aggregate line vanishes with it.
+        assert "never reconciled" not in recon
+
+    def test_flag_is_reporting_only(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        gc.set_account_slot("Liabilities:Navient", "no_reconcile", "1")
+        d = gc.get_unreconciled_splits(
+            "Liabilities:Navient", compact=False,
+        )
+        assert d["count"] == 1  # tools unaffected by the flag
+
+    def test_slot_bool_convention(self, test_book: Path):
+        """Lenient parse, tri-state: unrecognized values read as
+        absent so callers keep their own fallbacks."""
+        from gnucash_mcp.book._base import _slot_bool
+
+        gc = GnuCashBook(str(test_book))
+        self._never_reconciled_loan(gc)
+        for raw, expected_hidden in (
+            ("yes", True), ("TRUE", True), ("on", True),
+            ("0", False), ("no", False), ("garbage", False),
+        ):
+            gc.set_account_slot(
+                "Liabilities:Navient", "no_reconcile", raw,
+            )
+            summary = gc.get_book_summary()
+            recon = summary.split("Reconciliation:")[1]
+            hidden = "never reconciled" not in recon
+            assert hidden is expected_hidden, (raw, expected_hidden)
+
+
+class TestGetReconciliationStatus:
+    """The drill-down behind the dashboard aggregates: WHICH
+    accounts are behind / never reconciled / dormant / excluded,
+    bucketed by the same classification the dashboard uses."""
+
+    def test_buckets_named_and_ordered(self, test_book: Path):
+        from datetime import timedelta as _td
+
+        gc = GnuCashBook(str(test_book))
+        # never: a loan with activity, no stamps.
+        gc.create_account(
+            name="Navient", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest",
+            splits=[
+                {"account": "Liabilities:Navient", "amount": "-55.00"},
+                {"account": "Expenses:Groceries", "amount": "55.00"},
+            ],
+        )
+        # excluded: same shape, flagged.
+        gc.create_account(
+            name="MOHELA", account_type="LIABILITY",
+            parent="Liabilities",
+        )
+        gc.create_transaction(
+            description="Loan interest 2",
+            splits=[
+                {"account": "Liabilities:MOHELA", "amount": "-10.00"},
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+            ],
+        )
+        gc.set_account_slot("Liabilities:MOHELA", "no_reconcile", "1")
+        # behind: stamp ONE Checking split so the account has
+        # reconcile history plus pending 2024-dated work.
+        pending = gc.get_unreconciled_splits(
+            "Assets:Checking", compact=False,
+        )["splits"]
+        gc.set_reconcile_state(pending[0]["guid"], "y")
+
+        out = gc.get_reconciliation_status(compact=True)
+        lines = out.split("\n")[1:]
+        by_account = {ln.split("\t")[0]: ln for ln in lines}
+        assert "never" in by_account["Liabilities:Navient"]
+        assert "excluded" in by_account["Liabilities:MOHELA"]
+        # Checking: reconciled once, years of pending work — behind,
+        # sorted first with its scope of work.
+        assert lines[0].startswith("Assets:Checking")
+        assert "behind" in lines[0]
+        assert "unreconciled" in lines[0]
+        # Excluded sorts last.
+        assert "excluded" in lines[-1]
+
+    def test_dashboard_and_drilldown_agree(self, test_book: Path):
+        """Aggregate counts in the summary equal the bucket counts
+        in the drill-down — agree-by-construction check."""
+        gc = GnuCashBook(str(test_book))
+        out = gc.get_reconciliation_status(compact=False)
+        buckets: dict = {}
+        for r in out["accounts"]:
+            buckets[r["bucket"]] = buckets.get(r["bucket"], 0) + 1
+        summary = gc.get_book_summary()
+        recon = summary.split("Reconciliation:")[1].split("Net worth")[0]
+        import re
+        m = re.search(r"(\d+) accounts? never reconciled", recon)
+        assert (int(m.group(1)) if m else 0) == buckets.get("never", 0)
+
+
+class TestSplitGraphPreload:
+    """_preload_split_graph exists so whole-book reports traverse
+    splits from memory instead of lazy-loading per row — on a large
+    book that is the difference between finishing and hanging. The
+    parked strong reference (``book._gnucash_mcp_split_graph``) looks
+    like dead code but is load-bearing: SQLAlchemy's identity map
+    holds instances only weakly, so deleting it silently restores the
+    per-row queries. This test makes that regression loud instead."""
+
+    def test_preloaded_traversal_issues_no_sql(self, test_book):
+        from sqlalchemy import event
+
+        gc = GnuCashBook(str(test_book))
+        with gc.open(readonly=True) as book:
+            gc._preload_split_graph(book)
+            # Snapshot the object lists BEFORE counting: fetching
+            # them is allowed to query; traversing them is not.
+            accounts = list(book.accounts)
+            transactions = list(book.transactions)
+
+            statements: list[str] = []
+            engine = book.session.get_bind()
+
+            def _record(conn, cursor, statement, parameters,
+                        context, executemany):
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", _record)
+            try:
+                for acct in accounts:
+                    for s in acct.splits:
+                        _ = s.transaction
+                for txn in transactions:
+                    for s in txn.splits:
+                        _ = s.account
+            finally:
+                event.remove(engine, "before_cursor_execute", _record)
+
+            assert statements == [], (
+                f"split traversal after preload issued "
+                f"{len(statements)} SQL statements — the preload's "
+                f"strong reference has been lost"
+            )

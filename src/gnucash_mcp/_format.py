@@ -211,6 +211,7 @@ _BATCH_SPLIT_TOKENS = {
     "acct": "account", "account": "account", "acc": "account",
     "memo": "memo",
     "qty": "quantity", "quantity": "quantity",
+    "act": "action", "action": "action",
 }
 
 # Fallback shape for the audit log's display parser when a stored
@@ -236,9 +237,12 @@ def _batch_tsv_layout(header_line: str) -> dict:
     decimal error on whatever landed in an amount slot (bookkeeper
     finding, 1.4.1 validation round).
 
-    Returns ``{"has_notes": bool, "group": tuple[str, ...]}`` with
-    ``group`` in canonical names (``amount`` / ``account`` /
-    ``memo`` / ``quantity``).
+    Returns ``{"has_notes": bool, "has_cur": bool, "notes_idx":
+    int | None, "cur_idx": int | None, "fixed": int, "group":
+    tuple[str, ...]}`` with ``group`` in canonical names
+    (``amount`` / ``account`` / ``memo`` / ``quantity``).
+    ``fixed`` is the count of fixed-prefix columns; split cells
+    start there.
 
     Raises ValueError naming the offending column on any unknown
     token, a wrong fixed prefix, or a first group missing
@@ -256,8 +260,36 @@ def _batch_tsv_layout(header_line: str) -> dict:
             "batch header must start with ref, date, description "
             f"— got {', '.join(raw_tokens[:3]) or '(empty header)'}"
         )
-    has_notes = len(tokens) > 3 and tokens[3] == "notes"
-    start = 4 if has_notes else 3
+    # Optional per-transaction fixed columns after description, in
+    # either order: ``notes`` and ``cur`` (row's transaction
+    # currency). Exactly ``cur`` — "currency" stays an unknown
+    # token so the typo'd-split-column rejection story
+    # ("currency2") is unchanged.
+    notes_idx: int | None = None
+    cur_idx: int | None = None
+    start = 3
+    while start < len(tokens) and tokens[start] in ("notes", "cur"):
+        name = tokens[start]
+        if (name == "notes" and notes_idx is not None) or (
+            name == "cur" and cur_idx is not None
+        ):
+            raise ValueError(
+                f"duplicate {name!r} column in batch header"
+            )
+        if name == "notes":
+            notes_idx = start
+        else:
+            cur_idx = start
+        start += 1
+    has_notes = notes_idx is not None
+
+    layout_fixed = {
+        "has_notes": has_notes,
+        "has_cur": cur_idx is not None,
+        "notes_idx": notes_idx,
+        "cur_idx": cur_idx,
+        "fixed": start,
+    }
 
     canonical: list[str] = []
     for raw, token in zip(raw_tokens[start:], tokens[start:]):
@@ -265,8 +297,8 @@ def _batch_tsv_layout(header_line: str) -> dict:
         if name is None:
             raise ValueError(
                 f"unrecognized column {raw!r} in batch header — "
-                f"columns are ref, date, description, notes, then "
-                f"amt, acct, memo, qty split groups"
+                f"columns are ref, date, description, notes, cur, "
+                f"then amt, acct, memo, qty split groups"
             )
         canonical.append(name)
 
@@ -274,7 +306,7 @@ def _batch_tsv_layout(header_line: str) -> dict:
         # No split columns declared at all — the natural header for
         # an all-auto-fill batch (``ref, date, description``). Rows
         # that do carry splits chunk as legacy pairs.
-        return {"has_notes": has_notes, "group": _BATCH_LEGACY_GROUP}
+        return layout_fixed | {"group": _BATCH_LEGACY_GROUP}
 
     # The first group runs until a field repeats; later groups are
     # not order-checked (rows are chunked by the first group's
@@ -289,7 +321,7 @@ def _batch_tsv_layout(header_line: str) -> dict:
             "split columns must include both an amount and an "
             "account column"
         )
-    return {"has_notes": has_notes, "group": tuple(group)}
+    return layout_fixed | {"group": tuple(group)}
 
 
 def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
@@ -594,3 +626,60 @@ def _paginate(
         f"{entity_name}{cap_note}{_range_suffix(page, date_key)}"
     )
     return page, indicator
+
+
+# ── Batch transaction-update TSV ──────────────────────────────────
+
+_UPDATE_TSV_FIELDS = ("description", "notes", "date")
+
+
+def _parse_update_tsv(tsv: str) -> list[dict]:
+    """``update_transactions`` TSV → row dicts.
+
+    Header: ``guid`` then any of ``description``, ``notes``,
+    ``date`` (at least one, any order, no repeats); unknown tokens
+    reject by name. An EMPTY cell leaves that field unchanged — the
+    key is simply absent from the row dict. ``date`` stays an ISO
+    string here (the tool layer parses; the audit display reuses
+    this parser and wants text). Shared with the audit formatter so
+    the display parse can't drift from the tool parse.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "updates TSV needs a header row and at least one data row"
+        )
+    tokens = [t.strip().lower() for t in lines[0].split("\t")]
+    while tokens and not tokens[-1]:
+        tokens.pop()
+    if not tokens or tokens[0] != "guid":
+        raise ValueError("updates header must start with guid")
+    fields = tokens[1:]
+    if not fields:
+        raise ValueError(
+            "updates header needs at least one field column "
+            "(description, notes, date)"
+        )
+    seen: set = set()
+    for tok in fields:
+        if tok not in _UPDATE_TSV_FIELDS:
+            raise ValueError(
+                f"unrecognized column {tok!r} in updates header — "
+                f"columns are guid, then description, notes, date"
+            )
+        if tok in seen:
+            raise ValueError(f"duplicate {tok!r} column in updates header")
+        seen.add(tok)
+
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        cells = ln.split("\t")
+        guid = cells[0].strip() if cells else ""
+        if not guid:
+            raise ValueError(f"row {i}: empty guid")
+        row: dict = {"guid": guid}
+        for j, tok in enumerate(fields, start=1):
+            if j < len(cells) and cells[j].strip():
+                row[tok] = cells[j].strip()
+        out.append(row)
+    return out

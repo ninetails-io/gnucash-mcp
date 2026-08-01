@@ -170,6 +170,31 @@ class CurrencyMixin:
     the reporting mixin is absent.
     """
 
+    # These caches are hung on the piecash Book as plain Python
+    # attributes. They are not mapped columns, so they are never
+    # persisted. A Book instance only exists for the duration of a
+    # single ``open()`` context — one tool call — so a cache cannot
+    # go stale across calls; ``_invalidate_price_caches`` covers the
+    # paths that mutate prices mid-call.
+    _PRICE_LOOKUPS_ATTR = "_gnucash_mcp_price_lookups"
+    _PRICE_COMMODITIES_ATTR = "_gnucash_mcp_price_commodities"
+
+    @staticmethod
+    def _invalidate_price_caches(book: piecash.Book) -> None:
+        """Drop the memoized price lookups. Every path that adds or
+        removes a Price row must call this after its save so a later
+        lookup in the same call sees the change — today that is
+        create_price, create_prices, and delete_price. (piecash's
+        auto-created ``type='transaction'`` placeholders on
+        cross-currency saves skip this deliberately: every consumer
+        filters them out via ``market_only``.)"""
+        for attr in (
+            CurrencyMixin._PRICE_LOOKUPS_ATTR,
+            CurrencyMixin._PRICE_COMMODITIES_ATTR,
+        ):
+            if hasattr(book, attr):
+                delattr(book, attr)
+
     @staticmethod
     def _find_prices(
         book: piecash.Book,
@@ -184,24 +209,54 @@ class CurrencyMixin:
         ``commodity_guid`` filters the held instrument,
         ``currency_guid`` the quote side; ``market_only`` (default)
         skips ``type='transaction'`` auto-placeholders.
-        """
-        from piecash.core.commodity import Price
 
-        q = book.session.query(Price)
-        if commodity_guid is not None:
-            q = q.filter(Price.commodity_guid == commodity_guid)
-        if currency_guid is not None:
-            q = q.filter(Price.currency_guid == currency_guid)
-        q = q.order_by(Price.date.desc())
-        prices = list(q)
+        Memoized per ``(commodity_guid, currency_guid)`` on the open
+        book: the first request for a pair runs one indexed query,
+        and every repeat is served from memory (``market_only``
+        re-filters the memoized list per call — cheap, since a
+        pair's list is small). The pivot search requests the
+        same handful of pairs once per candidate leg per commodity,
+        so without the memo a whole-book report re-runs identical
+        queries thousands of times; with it the query count is
+        bounded by the number of DISTINCT pairs requested, not by the
+        number of calls. Empty results are memoized too — most
+        candidate pivot legs have no prices, and re-discovering that
+        per leg is most of the repetition. A one-shot caller still
+        costs exactly one indexed query.
+        """
+        lookups = getattr(book, CurrencyMixin._PRICE_LOOKUPS_ATTR, None)
+        if lookups is None:
+            lookups = {}
+            setattr(book, CurrencyMixin._PRICE_LOOKUPS_ATTR, lookups)
+
+        key = (commodity_guid, currency_guid)
+        prices = lookups.get(key)
+        if prices is None:
+            from piecash.core.commodity import Price
+
+            q = book.session.query(Price)
+            if commodity_guid is not None:
+                q = q.filter(Price.commodity_guid == commodity_guid)
+            if currency_guid is not None:
+                q = q.filter(Price.currency_guid == currency_guid)
+            prices = list(q)
+            # Newest first, with same-date ties resolved by
+            # _price_tie_rank rather than row order (see its
+            # docstring for the rule), and full-key ties by guid so
+            # the ordering never falls through to arbitrary DB row
+            # order. Sorted once, at memoization time, so every
+            # consumer sees the same ordering.
+            prices.sort(
+                key=lambda p: (
+                    _to_date(p.date), _price_tie_rank(p), p.guid,
+                ),
+                reverse=True,
+            )
+            lookups[key] = prices
+
         if market_only:
-            prices = [p for p in prices if _is_market_price(p)]
-        # Same-date ties resolve by _price_tie_rank, not row order.
-        prices.sort(
-            key=lambda p: (_to_date(p.date), _price_tie_rank(p)),
-            reverse=True,
-        )
-        return prices
+            return [p for p in prices if _is_market_price(p)]
+        return list(prices)
 
     @staticmethod
     def _anchor_for_as_of(as_of: date) -> date:
@@ -308,16 +363,25 @@ class CurrencyMixin:
         and still needs chaining. Returned in a stable order (by
         namespace then mnemonic) so the chain pass is deterministic.
         """
+        cached = getattr(book, CurrencyMixin._PRICE_COMMODITIES_ATTR, None)
+        if cached is not None:
+            return cached
+
         seen: dict[str, piecash.Commodity] = {}
         for p in book.prices:
             if not _is_market_price(p):
                 continue
             for c in (p.commodity, p.currency):
                 seen.setdefault(c.guid, c)
-        return sorted(
+        result = sorted(
             seen.values(),
             key=lambda c: (c.namespace or "", c.mnemonic or ""),
         )
+        # Memoized because the pivot search would otherwise recompute
+        # this full-price-walk once per candidate leg, and the result
+        # only depends on the book.
+        setattr(book, CurrencyMixin._PRICE_COMMODITIES_ATTR, result)
+        return result
 
     def _pivot_currencies(
         self,
@@ -822,42 +886,56 @@ class CurrencyMixin:
                 return days < best[0]
             return rank > best[1]
 
-        for p in book.prices:
-            if not _is_market_price(p):
-                continue
+        # Only prices quoting this exact pair can match, so fetch
+        # just the two pair lists (direct, then inverse) rather than
+        # walking every price in the book: the pivot search calls
+        # this once per candidate leg, and a full walk here would
+        # re-read the whole price table per leg.
+        for p in CurrencyMixin._find_prices(
+            book,
+            commodity_guid=from_commodity.guid,
+            currency_guid=to_commodity.guid,
+            market_only=True,  # load-bearing: skips FX placeholders
+        ):
             p_date = _to_date(p.date)
-            if p.commodity == from_commodity and p.currency == to_commodity:
-                days = (as_of - p_date).days
-                if days < 0 and not allow_after:
-                    continue
-                if cap_enabled and abs(days) > cap:
-                    continue
-                rate = Decimal(str(p.value))
-                if rate <= 0:
-                    continue
-                rank = _price_tie_rank(p)
-                if days >= 0:
-                    if _better(days, rank, best_before_direct):
-                        best_before_direct = (days, rank, rate, p_date)
-                else:
-                    if _better(-days, rank, best_after_direct):
-                        best_after_direct = (-days, rank, rate, p_date)
-            elif p.commodity == to_commodity and p.currency == from_commodity:
-                days = (as_of - p_date).days
-                if days < 0 and not allow_after:
-                    continue
-                if cap_enabled and abs(days) > cap:
-                    continue
-                if Decimal(str(p.value)) <= 0:
-                    continue
-                rate = Decimal("1") / Decimal(str(p.value))
-                rank = _price_tie_rank(p)
-                if days >= 0:
-                    if _better(days, rank, best_before_inverse):
-                        best_before_inverse = (days, rank, rate, p_date)
-                else:
-                    if _better(-days, rank, best_after_inverse):
-                        best_after_inverse = (-days, rank, rate, p_date)
+            days = (as_of - p_date).days
+            if days < 0 and not allow_after:
+                continue
+            if cap_enabled and abs(days) > cap:
+                continue
+            rate = Decimal(str(p.value))
+            if rate <= 0:
+                continue
+            rank = _price_tie_rank(p)
+            if days >= 0:
+                if _better(days, rank, best_before_direct):
+                    best_before_direct = (days, rank, rate, p_date)
+            else:
+                if _better(-days, rank, best_after_direct):
+                    best_after_direct = (-days, rank, rate, p_date)
+
+        for p in CurrencyMixin._find_prices(
+            book,
+            commodity_guid=to_commodity.guid,
+            currency_guid=from_commodity.guid,
+            market_only=True,  # load-bearing: skips FX placeholders
+        ):
+            p_date = _to_date(p.date)
+            days = (as_of - p_date).days
+            if days < 0 and not allow_after:
+                continue
+            if cap_enabled and abs(days) > cap:
+                continue
+            if Decimal(str(p.value)) <= 0:
+                continue
+            rate = Decimal("1") / Decimal(str(p.value))
+            rank = _price_tie_rank(p)
+            if days >= 0:
+                if _better(days, rank, best_before_inverse):
+                    best_before_inverse = (days, rank, rate, p_date)
+            else:
+                if _better(-days, rank, best_after_inverse):
+                    best_after_inverse = (-days, rank, rate, p_date)
 
         for candidate in (
             best_before_direct,
