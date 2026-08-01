@@ -533,7 +533,8 @@ Batch entry grows up, driven by the bookkeeper's daily workflow:
 
 ## What's in v1.4.0
 
-The first widely-promoted release. v1.3 finished the business
+The release where batch transaction entry entered the scene.
+v1.3 finished the business
 module; v1.4 makes the server work correctly on non-English books,
 adds bulk and multi-book workflows, and lands a second
 multi-currency correctness pass.
