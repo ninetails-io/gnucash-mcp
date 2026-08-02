@@ -422,6 +422,20 @@ def is_module_enabled(name: str) -> bool:
     return name in _LOADED_MODULES
 
 
+def _module_tool_count(name: str) -> int:
+    """Tool count for a module or group name — display/help only.
+
+    ``"all"`` counts every mapped tool. Group names expand via
+    MODULE_GROUPS; leaf names count their own TOOL_MODULES entry.
+    Inline conditional tools (switch_book) are not included — they
+    exist outside the module partition.
+    """
+    if name == "all":
+        return sum(len(tools) for tools in TOOL_MODULES.values())
+    members = MODULE_GROUPS.get(name, [name])
+    return len({t for m in members for t in TOOL_MODULES.get(m, [])})
+
+
 def _apply_module_filter(modules_str: str | None) -> list[str]:
     """Enable the requested modules and remove tools not in that set.
 
@@ -1054,52 +1068,67 @@ def switch_book(
 # ============== Main ==============
 
 
-def main() -> None:
-    """Run the MCP server."""
-    # Handle --help
-    if "--help" in sys.argv or "-h" in sys.argv:
-        print("""GnuCash MCP Server
+def _build_help_text() -> str:
+    """Render ``--help`` output.
+
+    Tool counts derive from TOOL_MODULES / MODULE_GROUPS at call
+    time so this text cannot drift from the registry (the counts
+    were literals once and went stale: "107 tools" shipped while
+    the server served 110).
+    """
+    core = _module_tool_count("core")
+    bookkeeper = _module_tool_count("bookkeeper")
+    investor = _module_tool_count("investor")
+    freelancer = _module_tool_count("freelancer")
+    business = _module_tool_count("business")
+    total = _module_tool_count("all")
+    n_core = len(MODULE_GROUPS["core"])
+    n_bookkeeper = len(MODULE_GROUPS["bookkeeper"])
+    n_investor = len(MODULE_GROUPS["investor"])
+    n_business = len(MODULE_GROUPS["business"])
+    return f"""GnuCash MCP Server
 
 Usage: gnucash-mcp [OPTIONS]
 
 Options:
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (30 tools, always-on). Use "all"
-                       for every module (107 tools).
+                       Default: core ({core} tools, always-on). Use "all"
+                       for every module ({total} tools; configuring
+                       multiple books adds switch_book on top).
 
                        Role-based selections (group aliases that
                        expand to underlying modules — start here):
                          core         Ledger primitives + reconciliation.
-                                      Always on regardless. 30 tools.
+                                      Always on regardless. {core} tools.
                          bookkeeper   Reporting + budgets + scheduling.
-                                      17 tools.
+                                      {bookkeeper} tools.
                          investor     tax_lots + portfolio (cost basis
-                                      + prices). 12 tools.
+                                      + prices). {investor} tools.
                          freelancer   Customer invoicing + sales tax,
                                       plus billterms (payment terms),
                                       jobs (per-project P&L), and
                                       credit notes (customer refunds).
                                       The full solo-consultant
-                                      toolkit. 31 tools.
+                                      toolkit. {freelancer} tools.
                          business     Full small-business package:
                                       freelancer (invoicing) +
                                       business_complete (vendors,
                                       employees, bills, vouchers,
-                                      vendor reports). 48 tools.
+                                      vendor reports). {business} tools.
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
 
-                       Core sub-modules (9): summary, accounts,
+                       Core sub-modules ({n_core}): summary, accounts,
                        transactions, slots, audit, backup,
                        balance_sheet, diagnostic, reconciliation.
 
-                       Bookkeeper members (3): reporting, budgets,
+                       Bookkeeper members ({n_bookkeeper}): reporting, budgets,
                        scheduling.
 
-                       Investor members (2): tax_lots, portfolio.
+                       Investor members ({n_investor}): tax_lots, portfolio.
 
-                       Business members (2): freelancer,
+                       Business members ({n_business}): freelancer,
                        business_complete.
 
                        Example: --modules=freelancer for a solo
@@ -1127,8 +1156,8 @@ Environment variables:
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
   GNUCASH_LOG_DIR            Relocate .mcp storage (audit, debug, backups).
                              Each book gets its own subdirectory:
-                             {GNUCASH_LOG_DIR}/{book}.mcp
-                             Default location: {book_path}.mcp
+                             {{GNUCASH_LOG_DIR}}/{{book}}.mcp
+                             Default location: {{book_path}}.mcp
   GNUCASH_REDACT_PATHS=1     Collapse absolute paths to basenames in tool
                              responses and error messages (safe to share)
   GNUCASH_FX_GUARD_DAYS      Refuse a cross-currency invoice/bill post or pay
@@ -1145,10 +1174,16 @@ Environment variables:
 
 Logs and backups live under the .mcp directory — beside the book file by
 default, or per-book under GNUCASH_LOG_DIR if set:
-  {book_path}.mcp/audit/YYYY-MM-DD.txt
-  {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
-  {book_path}.mcp/backups/               (auto + manual snapshots)
-""")
+  {{book_path}}.mcp/audit/YYYY-MM-DD.txt
+  {{book_path}}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
+  {{book_path}}.mcp/backups/               (auto + manual snapshots)
+"""
+
+
+def main() -> None:
+    """Run the MCP server."""
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(_build_help_text())
         sys.exit(0)
 
     global _book_paths, _current_path, _logging_debug, _logging_audit
@@ -1170,21 +1205,39 @@ default, or per-book under GNUCASH_LOG_DIR if set:
     else:
         book_path = None
 
-    # Parse CLI flags
-    debug_flag = "--debug" in sys.argv
-    noaudit_flag = "--noaudit" in sys.argv
+    # Parse CLI flags. Unrecognized tokens are fatal: a silently
+    # ignored flag means the server runs with the wrong tool surface
+    # (``--modules all`` once passed unnoticed and served core-only
+    # while looking configured). Same fail-fast principle as the
+    # unknown-module-NAME check in _apply_module_filter and
+    # ``extra="forbid"`` on tool kwargs.
+    debug_flag = False
+    noaudit_flag = False
     modules_value = None
-
-    # Parse --key=value flags
-    for arg in sys.argv[:]:
-        if arg.startswith("--modules="):
+    unknown_args: list[str] = []
+    for arg in sys.argv[1:]:
+        if arg == "--debug":
+            debug_flag = True
+        elif arg == "--noaudit":
+            noaudit_flag = True
+        elif arg.startswith("--modules="):
             modules_value = arg.split("=", 1)[1]
-            sys.argv.remove(arg)
-
-    if "--debug" in sys.argv:
-        sys.argv.remove("--debug")
-    if "--noaudit" in sys.argv:
-        sys.argv.remove("--noaudit")
+        else:
+            unknown_args.append(arg)
+    if unknown_args:
+        lines = [f"Unrecognized argument(s): {' '.join(unknown_args)}"]
+        if "--modules" in unknown_args:
+            lines.append(
+                'The module list must be attached with "=", '
+                "e.g. --modules=all or --modules=core,reporting."
+            )
+        lines.append(
+            "Accepted options: --modules=MODULES, --debug, "
+            "--noaudit, --help"
+        )
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(2)
+    del sys.argv[1:]
 
     # Env var fallback for modules (CLI flag takes precedence)
     if modules_value is None:
