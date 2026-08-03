@@ -171,10 +171,18 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="budget")
     def delete_budget(name: str) -> str:
-        """Delete a budget.
+        """Delete a budget and every per-period amount set on it.
+
+        Permanent — there is no undo and no archive state. Only the
+        plan is removed: transactions and account balances are
+        untouched (budgets are plans, not postings). Errors, changing
+        nothing, if the name matches no budget — list_budgets shows
+        what exists, exact and case-sensitive. To retire a budget
+        while keeping its numbers readable, simply stop reporting on
+        it instead of deleting.
 
         Args:
-            name: Budget name.
+            name: Budget name (exact, case-sensitive).
         """
         book = get_book()
         result = book.delete_budget(name=name)

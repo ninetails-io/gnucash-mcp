@@ -375,10 +375,17 @@ def register(mcp, get_book) -> None:
         title: str,
         notes: str = "",
     ) -> str:
-        """Create a new lot for cost basis tracking.
+        """Create a new, empty lot for cost basis tracking.
 
-        Lots group investment purchases for tracking cost basis and
-        calculating capital gains when selling.
+        Additive: the lot starts open with no splits attached, and
+        nothing else in the book changes. A lot groups one purchase
+        with its later sales so cost basis and capital gain compute
+        per purchase. The full flow: create_lot → create_transaction
+        (the buy) → assign_split_to_lot → calculate_lot_gain; the
+        lot auto-closes when its assigned splits net to zero shares.
+        Errors if the account ref matches nothing. Skip this tool
+        when you only want a valuation — get_book_summary and
+        balance_sheet price holdings without lots.
 
         Args:
             account: Account ref for the investment account: full path (e.g., "Assets:Investments:VTSAX"), %short GUID, or full 32-char GUID.

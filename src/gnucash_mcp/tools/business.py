@@ -101,7 +101,14 @@ def register(mcp, get_book) -> None:
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a new vendor.
+        """Create a new vendor (a party you buy from and owe).
+
+        Additive: each call creates a fresh vendor — names are NOT
+        checked for duplicates, so list_vendors first when unsure.
+        Returns the assigned vendor ID (e.g., "000001"), the handle
+        every later call wants (create_bill, update_vendor,
+        vendor_spending_report). Counterpart: create_customer for
+        parties who pay you.
 
         Args:
             name: Vendor name (e.g., "Office Depot").
@@ -174,10 +181,14 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a new employee.
+        """Create a new employee (for expense-voucher workflows).
 
-        Employee has no ``notes`` field (unlike Customer and Vendor).
-        Address shape is identical.
+        Additive: each call creates a fresh employee — names are NOT
+        checked for duplicates, so list_employees first when unsure.
+        Returns the assigned employee ID (e.g., "000001"), used by
+        update_employee, delete_employee, and create_voucher.
+        Employee has no ``notes`` field (unlike Customer and Vendor);
+        the address shape is identical.
 
         Args:
             name: Employee name (e.g., "Jane Smith").
@@ -291,17 +302,26 @@ def register(mcp, get_book) -> None:
         active: bool | None = None,
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Update an existing vendor.
+        """Update an existing vendor in place.
 
-        Same semantics as ``update_customer``.
+        Only fields you pass change; omitted fields keep their
+        current values. Overwrites are permanent at the book level
+        (the audit log keeps the before-state). Errors, changing
+        nothing, if the ID matches no vendor. Deactivating via
+        ``active=false`` is the safe alternative to delete_vendor —
+        history and bills stay intact, and the vendor drops out of
+        default listings.
 
         Args:
-            id: Vendor ID (e.g., "000001").
+            id: Vendor ID (e.g., "000001") from create_vendor or list_vendors.
             name: New display name.
             currency: New default ISO currency code.
             notes: New notes. Pass "" to clear.
             active: ``false`` to deactivate; ``true`` to reactivate.
-            address: Partial address dict (see ``update_customer``).
+            address: Partial address dict — any of: name, addr1,
+                     addr2, addr3, addr4, phone, fax, email (each
+                     capped at 1024 characters). Only the keys you
+                     pass change; others persist.
         """
         book = get_book()
         result = book.update_vendor(
@@ -1340,10 +1360,13 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="employee")
     def delete_employee(employee_id: str) -> str:
-        """Delete an employee.
+        """Delete an employee record.
 
-        Employees in the 1.3.0 release have no associated documents;
-        the delete proceeds unconditionally after slot cleanup.
+        Permanent, and unconditional: employees carry no associated
+        documents in this release, so nothing blocks the delete and
+        nothing else is removed with it. Errors, changing nothing,
+        if the ID matches no employee. To retire someone while
+        keeping the record, prefer ``update_employee(active=false)``.
 
         Args:
             employee_id: Employee ID (e.g., "000001").

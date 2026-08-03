@@ -126,9 +126,18 @@ def register(mcp, get_book) -> None:
         start_date: str | None = None,
         interval: str | None = None,
     ) -> str:
-        """Calculate net worth (assets minus liabilities).
+        """Calculate net worth (assets minus liabilities), as one
+        value or a trajectory.
 
-        Can calculate a single point-in-time value or a time series.
+        Read-only. Valuation is as-of: each date values holdings at
+        the latest market rate on or before it, in the book's default
+        currency; voided transactions are excluded. end_date alone
+        gives one number; add start_date + interval for a series
+        (one value per interval step from start_date, end_date
+        always included as the last row). For the full A = L + E statement
+        with per-account detail, use balance_sheet; this tool is the
+        headline number and its trend. The dashboard's trajectory
+        section is this same calculation.
 
         Args:
             end_date: Calculate net worth as of this date (YYYY-MM-DD)

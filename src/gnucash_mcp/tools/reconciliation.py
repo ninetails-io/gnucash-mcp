@@ -259,9 +259,16 @@ def register(mcp, get_book) -> None:
     def unvoid_transaction(
         guid: TransactionGuid,
     ) -> str:
-        """Restore a voided transaction.
+        """Restore a voided transaction to its pre-void amounts.
 
-        Restores original split values and removes void markers.
+        The inverse of void_transaction: original split values come
+        back from the slots the void stored, and the void markers
+        and reason are cleared. All-or-nothing — if any split's
+        stored void data is missing, the tool errors and restores
+        nothing (no partial resurrection). Errors too if the
+        transaction isn't found or isn't voided. Restored splits
+        return as UNreconciled ('n'), so a previously reconciled
+        transaction needs reconciling again afterward.
 
         Args:
             guid: Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)
