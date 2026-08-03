@@ -1381,3 +1381,95 @@ class TestMultiBook:
         _apply_module_filter("all")
         summary = mcp._tool_manager._tools["get_book_summary"].fn()
         assert summary.split("\n", 1)[0].startswith("Book: alex.gnucash")
+
+
+class TestToolAnnotations:
+    """Every registered tool carries derived MCP ToolAnnotations.
+
+    The behavior hints are derived from each tool's @audit_log
+    declaration at the _apply_module_filter chokepoint — this class
+    is the loud gate for a tool that reaches the registry without a
+    derivable classification (which would ship annotations=None and
+    push the full behavioral burden back onto its description).
+    """
+
+    @pytest.fixture(autouse=True)
+    def save_and_restore_tools(self):
+        original = dict(mcp._tool_manager._tools)
+        original_loaded = set(_loaded_tool_files)
+        yield
+        mcp._tool_manager._tools.clear()
+        mcp._tool_manager._tools.update(original)
+        _reset_lazy_load_state()
+        _loaded_tool_files.update(original_loaded)
+
+    def test_every_tool_annotated_closed_world(self):
+        _apply_module_filter("all")
+        missing = [
+            n for n, t in mcp._tool_manager._tools.items()
+            if t.annotations is None
+        ]
+        assert missing == [], f"tools without annotations: {missing}"
+        open_world = [
+            n for n, t in mcp._tool_manager._tools.items()
+            if t.annotations.openWorldHint is not False
+        ]
+        # Local book, no network: openWorldHint must be False on all.
+        assert open_world == []
+
+    def test_read_only_hint_agrees_with_audit_classification(self):
+        _apply_module_filter("all")
+        for name, tool in mcp._tool_manager._tools.items():
+            meta = getattr(tool.fn, "__audit_meta__", None)
+            if meta is None:
+                continue  # inline tools, covered by the table test
+            expected = meta["classification"] == "read"
+            assert tool.annotations.readOnlyHint is expected, (
+                f"{name}: readOnlyHint disagrees with "
+                f"audit classification {meta['classification']!r}"
+            )
+
+    def test_every_write_verb_has_explicit_hints(self):
+        """A new operation verb must get a _WRITE_VERB_HINTS row —
+        otherwise it silently ships the safest-default hints."""
+        from gnucash_mcp.server import _WRITE_VERB_HINTS
+        _apply_module_filter("all")
+        verbs = {
+            meta["operation"]
+            for tool in mcp._tool_manager._tools.values()
+            if (meta := getattr(tool.fn, "__audit_meta__", None))
+            and meta["classification"] == "write"
+        }
+        unmapped = verbs - set(_WRITE_VERB_HINTS)
+        assert unmapped == set(), (
+            f"write verbs without explicit hints: {sorted(unmapped)}"
+        )
+
+    def test_inline_tools_have_table_entries(self):
+        """get_server_config and switch_book register without
+        @audit_log; both must be in _INLINE_TOOL_ANNOTATIONS
+        (switch_book is filtered out in single-book runs, so the
+        registry sweep above never checks it)."""
+        from gnucash_mcp.server import (
+            _INLINE_TOOL_ANNOTATIONS,
+            _INLINE_UNMAPPED_TOOLS,
+            _derive_tool_annotations,
+        )
+        assert "get_server_config" in _INLINE_TOOL_ANNOTATIONS
+        assert _INLINE_UNMAPPED_TOOLS <= set(_INLINE_TOOL_ANNOTATIONS)
+        ann = _derive_tool_annotations("switch_book", None)
+        assert ann is not None and ann.readOnlyHint is False
+
+    def test_hint_spot_checks(self):
+        _apply_module_filter("all")
+        tools = mcp._tool_manager._tools
+        a = tools["delete_budget"].annotations
+        assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint) == (
+            False, True, True,
+        )
+        a = tools["create_transaction"].annotations
+        assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint) == (
+            False, False, False,
+        )
+        a = tools["list_accounts"].annotations
+        assert a.readOnlyHint is True
