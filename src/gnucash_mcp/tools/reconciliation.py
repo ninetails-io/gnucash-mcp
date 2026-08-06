@@ -65,7 +65,10 @@ def register(mcp, get_book) -> None:
         work on excluded accounts).
 
         Args:
-            verbose: Full JSON rows instead of compact TSV lines.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return.
         """
@@ -95,13 +98,16 @@ def register(mcp, get_book) -> None:
         lines are clipped). Page with ``offset``; ``limit=0`` returns
         the count only.
 
-        Use verbose=true for full JSON with split GUIDs, amounts, totals,
+        Use verbose=true for structured JSON with split GUIDs, amounts, totals,
         and the ``showing`` indicator as a structured field.
 
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
-            verbose: If true, return full JSON details. Default compact one-line format.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """

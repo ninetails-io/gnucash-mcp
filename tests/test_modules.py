@@ -1473,3 +1473,41 @@ class TestToolAnnotations:
         )
         a = tools["list_accounts"].annotations
         assert a.readOnlyHint is True
+
+
+class TestVerboseDocstringConvention:
+    """Every ``verbose:`` Args entry across tools/*.py uses the one
+    canonical sentence (default named first, compact framed as
+    token-efficient, JSON gated to machine-readable needs).
+
+    Bug class: verbose-first phrasings like "If true, return full
+    JSON details" read as an upgrade — a cross-model test showed a
+    foreign LLM flipping verbose=true on every call because "full"
+    implies the default is lossy. The convention is prose, so the
+    lock is a source grep: a new tool's verbose doc either matches
+    the canonical opening or this fails.
+    """
+
+    CANONICAL = (
+        "verbose: If false (default), compact text output — optimized"
+    )
+
+    def test_every_verbose_arg_entry_is_canonical(self):
+        import glob, os
+        tools_dir = os.path.join(
+            os.path.dirname(__file__), "..", "src", "gnucash_mcp", "tools",
+        )
+        offenders = []
+        for path in sorted(glob.glob(os.path.join(tools_dir, "*.py"))):
+            for n, line in enumerate(open(path), 1):
+                stripped = line.strip()
+                if stripped.startswith("verbose: ") and \
+                        not stripped.startswith("verbose: bool"):
+                    if not stripped.startswith(self.CANONICAL):
+                        offenders.append(
+                            f"{os.path.basename(path)}:{n}: {stripped[:60]}"
+                        )
+        assert offenders == [], (
+            "non-canonical verbose docstring entries (see class "
+            f"docstring for the required sentence): {offenders}"
+        )

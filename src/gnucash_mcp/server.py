@@ -61,6 +61,7 @@ DOUBLE-ENTRY SIGN CONVENTION:
 - Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
 INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
 SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+OUTPUT: every tool's compact default is complete — verbose=true adds structure (JSON), not information. Compact is cheaper; prefer it unless you need machine-readable fields.
 SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,
 )

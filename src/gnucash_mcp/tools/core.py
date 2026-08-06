@@ -145,7 +145,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
-            verbose: If true, return full JSON details for each account.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             query: Case-insensitive substring filter on account
@@ -250,7 +253,10 @@ def register(mcp, get_book) -> None:
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         start = _parse_iso_date(start_date)
@@ -532,7 +538,10 @@ def register(mcp, get_book) -> None:
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.search_transactions(

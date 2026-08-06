@@ -23,7 +23,10 @@ def register(mcp, get_book) -> None:
         JSON envelope.
 
         Args:
-            verbose: If true, return the full JSON envelope.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -48,7 +51,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             name: Budget name.
-            verbose: If true, return the full structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.get_budget(name=name, compact=not verbose)
@@ -153,7 +159,10 @@ def register(mcp, get_book) -> None:
                 - "all": All periods
             account: Optional filter to specific account or parent account.
             include_children: If True and account specified, include child accounts.
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.get_budget_report(
