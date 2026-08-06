@@ -12,6 +12,7 @@ from typing import Annotated
 from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 # Strict tool-argument validation: reject unknown kwargs at the MCP
 # boundary instead of silently ignoring them.
@@ -60,6 +61,7 @@ DOUBLE-ENTRY SIGN CONVENTION:
 - Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
 INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
 SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+OUTPUT: every tool's compact default is complete — verbose=true adds structure (JSON), not information. Compact is cheaper; prefer it unless you need machine-readable fields.
 SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,
 )
@@ -569,7 +571,90 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         if set(members) <= enabled_modules:
             _LOADED_MODULES.add(group_name)
 
+    _apply_tool_annotations()
+
     return sorted(enabled_modules)
+
+
+# ---------------------------------------------------------------------------
+# MCP ToolAnnotations — derived from the @audit_log declaration each
+# tool already carries, not from a second per-tool table that could
+# drift. classification="read" → readOnlyHint; write operations map
+# through _WRITE_VERB_HINTS. openWorldHint is False across the board:
+# every tool operates on a closed local book, never the network.
+# ---------------------------------------------------------------------------
+
+# operation verb → (destructiveHint, idempotentHint).
+# destructive means "modifies or removes EXISTING book data";
+# purely additive writes (new entities, new transactions) are False.
+# idempotent means "repeating the same call adds nothing further":
+# overwrites and removals converge, additions accumulate.
+_WRITE_VERB_HINTS: dict[str, tuple[bool, bool]] = {
+    "create": (False, False),
+    "create_batch": (False, False),
+    "create_from_scheduled": (False, False),
+    "delete": (True, True),
+    "delete_slot": (True, True),
+    "set_slot": (True, True),
+    "update_batch": (True, True),
+    "update": (True, True),
+    "void": (True, True),
+    "unvoid": (True, True),
+    "unpost": (True, True),        # removes the posting transaction
+    "set_state": (True, True),
+    "replace_splits": (True, True),
+    "reconcile": (True, True),
+    "post": (False, True),         # additive; re-post errors, adds nothing
+    "pay": (False, False),         # paying twice records two payments
+    "apply": (False, False),
+}
+
+# Inline tools registered without @audit_log. switch_book mutates
+# server state (the active book), not book data.
+_INLINE_TOOL_ANNOTATIONS: dict[str, ToolAnnotations] = {
+    "get_server_config": ToolAnnotations(
+        readOnlyHint=True, openWorldHint=False,
+    ),
+    "switch_book": ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
+}
+
+
+def _derive_tool_annotations(name: str, fn) -> "ToolAnnotations | None":
+    """Annotations for one registered tool, or None if underivable."""
+    if name in _INLINE_TOOL_ANNOTATIONS:
+        return _INLINE_TOOL_ANNOTATIONS[name]
+    meta = getattr(fn, "__audit_meta__", None)
+    if meta is None:
+        return None
+    if meta["classification"] == "read":
+        return ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+    destructive, idempotent = _WRITE_VERB_HINTS.get(
+        meta["operation"] or "", (True, False),  # unknown verb: safest hints
+    )
+    return ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=False,
+    )
+
+
+def _apply_tool_annotations() -> None:
+    """Set ToolAnnotations on every registered tool.
+
+    Runs at the end of _apply_module_filter — the chokepoint every
+    enabled tool passes through — so lazy-loaded and inline tools
+    alike are annotated before any client lists them. Tools without
+    a derivable classification are left as-is; the contract test
+    (TestToolAnnotations) is the loud gate for that.
+    """
+    for name, tool in mcp._tool_manager._tools.items():
+        ann = _derive_tool_annotations(name, tool.fn)
+        if ann is not None:
+            tool.annotations = ann
 
 
 # Runtime server state — populated by main(), read by get_server_config tool
