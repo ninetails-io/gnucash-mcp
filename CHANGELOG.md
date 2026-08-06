@@ -102,9 +102,10 @@ injection-hardening pass on the audit trail.
   is now documented in the contributor guide, with the established
   chokepoints named and the working rules spelled out.
 - Late attribution: @hpuri (the README's Gemini CLI and
-  `libdbd-sqlite3` guidance, from issue #89) and @uppaljs (whose
+  `libdbd-sqlite3` guidance, from issue #89), @uppaljs (whose
   2026 fork demonstrated the `Decimal(str(value))` rule that became
-  `_to_decimal`).
+  `_to_decimal`), and @alhosani-abdulla (whose issue #94 drove
+  v1.3.1's intermediate-currency chain valuation).
 - Release policy: sample books are no longer regenerated per
   release. They ship as frozen demo books and regenerate on demand
   via `scripts/synthetic_book/`; expect stale-price warnings and
@@ -626,7 +627,9 @@ books and the bookkeeper's real-book pass.
 - **Intermediate-currency valuation.** A holding priced only through
   a pivot currency (e.g. a fund quoted in USD inside a CNY book) now
   values via the chain, with provenance noting the derived path
-  (`via USD`).
+  (`via USD`). Reported by Abdulla Alhosani (@alhosani-abdulla,
+  issue #94), who also pinned the `type='transaction'` rate leak in
+  the chain path.
 - **FX staleness cap.** Market-rate lookups exclude quotes more than
   a configurable window (`GNUCASH_FX_STALENESS_DAYS`, default 90)
   from the report date; invoice/bill post & pay raise a clear

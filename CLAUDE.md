@@ -415,6 +415,14 @@ accounts of different commodities:
   `_account_conversion_factors(book, as_of)`. Pick by report kind,
   not convenience — see the flow-vs-stock invariant above.
 - Skip `type='transaction'` prices (auto-defaults).
+- A commodity priced only through a pivot currency values via a
+  one-hop chain (provenance notes the path, e.g. `via USD`) — and
+  the chain legs obey the same market-price filter as direct
+  lookups; a `type='transaction'` rate inside the chain leaks
+  fee-laden implied rates into valuations. Both halves of this
+  rule come from Abdulla Alhosani's
+  ([@alhosani-abdulla](https://github.com/alhosani-abdulla))
+  report in issue #94.
 - Fall back to `split.value` when no market rate is on file —
   that's the transaction-currency amount, which equals cost basis
   for default-currency-denominated investment purchases and degrades
