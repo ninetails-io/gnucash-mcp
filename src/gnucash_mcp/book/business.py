@@ -1624,6 +1624,10 @@ class BusinessMixin:
         # ``applies_to`` further requires the link to be set —
         # floating credit notes are unusual but valid.
         if BusinessMixin._get_is_credit_note(invoice):
+            # ``type`` must agree with the delete/unpost responses,
+            # which already report credit notes as their own type —
+            # owner_type alone can't see the slot.
+            result["type"] = "credit_note"
             result["is_credit_note"] = True
             if applies_to:
                 result["applies_to"] = applies_to
@@ -4218,7 +4222,12 @@ class BusinessMixin:
                         f"dangling owner reference — can't verify "
                         f"it belongs to {owner_id}."
                     )
-                if source_owner.id != owner_id:
+                # Compare effective type AND id — ids alone are
+                # per-type sequences, so customer 000005 vs vendor
+                # 000005 would false-pass an id-only check.
+                if (self._effective_owner_type(book, source)
+                        != int_owner_type
+                        or source_owner.id != owner_id):
                     raise ValueError(
                         f"Source "
                         f"{self._doc_label_for(int_owner_type).lower()} "
@@ -5146,7 +5155,8 @@ class BusinessMixin:
             post_date: ISO date (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction.
-            owner_type: 'customer' or 'vendor' for disambiguation.
+            owner_type: 'customer', 'vendor', or 'employee' (vouchers)
+                for disambiguation.
 
         Returns:
             Dict with invoice details, total, transaction_guid, lot_guid.
@@ -5174,6 +5184,7 @@ class BusinessMixin:
             # owner_type, infer it from the post account's type:
             # RECEIVABLE → customer invoice, PAYABLE → vendor bill
             # (the same predicate the later validation uses).
+            inferred = False
             if ot is None:
                 pa = self._resolve_account(book, post_account)
                 if pa is not None:
@@ -5181,11 +5192,21 @@ class BusinessMixin:
                         ot = 2
                     elif pa.type == "PAYABLE":
                         ot = 4
+                        inferred = True
 
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv and inferred:
+                # PAYABLE inference can't distinguish vendor bills
+                # from employee vouchers — both post to A/P. Retry
+                # the voucher side before declaring not-found (an
+                # EXPLICIT owner_type never falls through here).
+                inv = self._find_invoice(book, invoice_id, owner_type=5)
             if not inv:
                 raise ValueError(
-                    f"Document not found: {invoice_id}"
+                    f"Document not found: {invoice_id}. If the ID "
+                    f"is shared across document types, pass "
+                    f"owner_type ('customer', 'vendor', or "
+                    f"'employee' for vouchers) explicitly."
                 )
 
             # ``_is_invoice_posted`` treats None/"" as not-posted —
@@ -5394,7 +5415,8 @@ class BusinessMixin:
         invoice_id: str,
         owner_type: str | None = None,
     ) -> dict:
-        """Unpost a previously-posted invoice or bill.
+        """Unpost a previously-posted document (invoice, bill,
+        voucher, or credit note).
 
         Reverses ``post_invoice``: deletes the posting transaction
         and lot, clears the posted-state metadata. The document
@@ -5500,6 +5522,7 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             inv_id_snapshot = inv.id
             owner_type_snapshot = inv.owner_type
+            inv_guid_snapshot = inv.guid
 
             # The transaction delete cascades its splits; the lot is
             # empty now that the posted-state pointers are cleared.
@@ -5507,6 +5530,31 @@ class BusinessMixin:
                 book.session.delete(txn)
             if lot is not None:
                 book.session.delete(lot)
+
+            if is_credit_note:
+                # Deleting the posting transaction sweeps the
+                # invoice's OWN slots along with the txn's: the
+                # txn carries a ``gncInvoice`` GUID slot, and
+                # piecash's overlapping slot-hierarchy relationship
+                # treats every slot on the referenced invoice as
+                # that slot's child frame, cascading them away.
+                # Restore the identity flag or this document comes
+                # back from unpost as a plain invoice.
+                from sqlalchemy import text
+                book.flush()
+                book.session.execute(text(
+                    "INSERT INTO slots (obj_guid, name, slot_type, "
+                    "int64_val) VALUES (:g, 'credit-note', 1, 1)"
+                ), {"g": inv_guid_snapshot})
+                restored = book.session.execute(text(
+                    "SELECT COUNT(*) FROM slots WHERE obj_guid = :g "
+                    "AND name = 'credit-note'"
+                ), {"g": inv_guid_snapshot}).scalar()
+                if restored != 1:
+                    raise RuntimeError(
+                        f"credit-note flag restore failed for "
+                        f"{inv_id_snapshot} (rows: {restored})"
+                    )
 
             book.save()
 
@@ -6170,11 +6218,21 @@ class BusinessMixin:
                 target_owner = self._find_invoice_owner_by_guid(
                     book, target.owner_type, target.owner_guid,
                 )
+                # Owner IDs are per-type sequences: customer 000005
+                # and vendor 000005 are different entities with the
+                # same ID string. Without the type words this error
+                # can read "belongs to '000005' but target belongs
+                # to '000005'" — a contradiction.
+                _kind = {2: "customer", 4: "vendor", 5: "employee"}
                 raise ValueError(
                     f"Credit note belongs to "
-                    f"{cn_owner.id if cn_owner else '?'!r} but "
-                    f"target belongs to "
-                    f"{target_owner.id if target_owner else '?'!r}. "
+                    f"{_kind.get(cn.owner_type, 'owner')} "
+                    f"{(cn_owner.id if cn_owner else '?')!r}"
+                    f"{f' ({cn_owner.name})' if cn_owner else ''} "
+                    f"but target belongs to "
+                    f"{_kind.get(target.owner_type, 'owner')} "
+                    f"{(target_owner.id if target_owner else '?')!r}"
+                    f"{f' ({target_owner.name})' if target_owner else ''}. "
                     f"Credit notes can only net against documents "
                     f"from the same customer/vendor."
                 )

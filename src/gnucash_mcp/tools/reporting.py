@@ -25,8 +25,10 @@ def register(mcp, get_book) -> None:
         for the structured dict (programmatic consumers, plotting).
 
         Args:
-            start_date: Start of period (YYYY-MM-DD)
-            end_date: End of period (YYYY-MM-DD)
+            start_date: Start of period (YYYY-MM-DD), inclusive. No
+                calendar snapping — for calendar-month figures pass
+                full month boundaries (e.g. 2026-05-01 to 2026-07-31).
+            end_date: End of period (YYYY-MM-DD), inclusive.
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
             verbose: If false (default), compact text output — optimized
                 for reading and token efficiency. If true, structured

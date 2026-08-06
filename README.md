@@ -152,17 +152,20 @@ what's in each.
 
 ## Quick Start (5 minutes)
 
-### 1. Download
+### 1. Download and install
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
+uv tool install -e ./gnucash-mcp
 ```
 
-That's the whole install — there's no build or install step. The
-client launches the server with `uv run` (next step), which syncs
-dependencies from the lockfile automatically on every start. To
-update later, just `git pull` inside the repo; the next launch
-picks up new code *and* new dependencies with nothing else to do.
+The second command gives you a `gnucash-mcp` command (in
+`~/.local/bin`) with its dependencies in a private environment —
+your other Python projects never see them. The `-e` makes it an
+*updatable* install: the command runs whatever code is in your
+clone, so updating is `git pull` plus a server restart. The one
+exception: if an update changes *dependencies*, run
+`uv tool install -e ./gnucash-mcp --reinstall` once.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
@@ -185,21 +188,14 @@ Find your Claude Desktop config:
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this — replace `/path/to/gnucash-mcp` with the repo you just
-cloned, and `GNUCASH_BOOK_PATH` with your book's path:
+Add this — replace `yourname` in both paths:
 
 ```json
 {
   "mcpServers": {
     "gnucash": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/gnucash-mcp",
-        "gnucash-mcp",
-        "--modules=all"
-      ],
+      "command": "/Users/yourname/.local/bin/gnucash-mcp",
+      "args": ["--modules=all"],
       "env": {
         "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
@@ -208,12 +204,13 @@ cloned, and `GNUCASH_BOOK_PATH` with your book's path:
 }
 ```
 
-`uv run --directory` runs the server straight from the clone,
-resyncing dependencies each launch — so a `git pull` is all it
-takes to update. `--modules=all` loads every tool (111 of them)
-so you can poke at anything. Once you know what you actually use,
-narrow it — see [choosing a module set](#choosing-a-module-set)
-below.
+Use the **full path** to the command: GUI apps launch without
+your shell's PATH, so a bare `gnucash-mcp` may not resolve even
+though it works in your terminal. (`uv tool dir --bin` prints
+the right directory if yours differs.) `--modules=all` loads
+every tool (111 of them) so you can poke at anything. Once you
+know what you actually use, narrow it — see
+[choosing a module set](#choosing-a-module-set) below.
 
 Quit Claude Desktop completely (not just close the window —
 quit) and reopen it. Look for the hammer 🔨 icon next to the
@@ -276,13 +273,20 @@ point at your own SQLite-format book. Restart Claude Desktop.
 ### Other AI clients
 
 This is an [MCP](https://modelcontextprotocol.io/) server, so
-it works with any client that speaks MCP. Notes for non–Claude
-Desktop clients:
+it works with any client that speaks MCP. Everywhere below,
+`gnucash-mcp` means the full path from the install step
+(`/Users/yourname/.local/bin/gnucash-mcp`; `uv tool dir --bin`
+prints yours).
 
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","gnucash-mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
-- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash uv run --directory /path/to/gnucash-mcp gnucash-mcp --modules=all`
+- **ChatGPT (desktop app / Codex)**: Settings → Connectors →
+  Add MCP server. Name it `gnucash-mcp`, type **STDIO**,
+  "Command to launch" = the full `gnucash-mcp` path, one
+  argument `--modules=all`, and an environment variable
+  `GNUCASH_BOOK_PATH` = your book's path.
+- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash /Users/yourname/.local/bin/gnucash-mcp --modules=all`
   This writes a project `.gemini/settings.json` with the server
   registered; run `/mcp list` inside Gemini to confirm it shows
   `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
@@ -291,15 +295,18 @@ Desktop clients:
   [@hpuri](https://github.com/hpuri)'s testing in
   [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
   thanks.)
-- **Anything else**: set `GNUCASH_BOOK_PATH` and run `uv run
-  --directory /path/to/gnucash-mcp gnucash-mcp`. Any client that
-  can spawn a command and speak MCP over stdio will work.
+- **Anything else**: set `GNUCASH_BOOK_PATH` and run
+  `gnucash-mcp`. No install at all? `uv run --directory
+  /path/to/gnucash-mcp gnucash-mcp` and
+  `python -m gnucash_mcp` (with the repo on the path) both
+  still work. Any client that can spawn a command and speak
+  MCP over stdio will do.
 
 ---
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 107 of them.
+`--modules=all` is the easy default — every tool, 111 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
@@ -658,11 +665,13 @@ uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
 
-The `uv run --directory PATH ...` form the Quick Start uses is
-also how you point a client at a specific worktree — swap the
-directory and you're running that checkout, no reinstall. If you
-prefer a `gnucash-mcp` binary on your PATH instead, `uv tool
-install -e ./gnucash-mcp` still works and tracks your source.
+The installed `gnucash-mcp` command tracks your clone live: it
+serves whatever branch the checkout is on, so switching branches
+switches the served code at the next restart — handy for testing,
+worth remembering when you forget you're mid-branch. To run a
+DIFFERENT checkout (a second worktree) without touching the
+install, `uv run --directory PATH gnucash-mcp` still runs any
+directory you point it at.
 
 The server is built on
 [piecash](https://github.com/sdementen/piecash) (Python

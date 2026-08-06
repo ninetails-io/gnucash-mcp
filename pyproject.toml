@@ -9,7 +9,9 @@ authors = [
     { name = "Stephen", email = "stephen@ninetails.io" }
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # <2: mcp 2.0.0 moved/removed mcp.server.fastmcp, and the
+    # strict-kwargs patch reaches into 1.x FastMCP internals.
+    "mcp[cli]>=1.0.0,<2",
     "piecash>=1.2.0",
     "python-dateutil>=2.8.0",
 ]

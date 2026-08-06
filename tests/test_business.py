@@ -4856,7 +4856,8 @@ class TestCreateCreditNote:
         # Round-trip via get_invoice confirms the slot was set.
         full = gb.get_invoice(result["id"], owner_type="customer")
         assert full["is_credit_note"] is True
-        assert full["type"] == "invoice"  # owner-type-driven; flag is separate
+        assert full["type"] == "credit_note"  # slot-driven since the
+        # Codex findings fix: type agrees with delete/unpost responses
 
     def test_vendor_credit_note_basic(self, business_book):
         """Symmetric — vendor side credit note. Response keys
@@ -11154,3 +11155,93 @@ class TestDeleteCreditNoteSlotCleanup:
                 {"g": cn_guid},
             ).scalar()
         assert n_after == 0, "credit-note slot rows orphaned"
+
+
+class TestCodexCrossModelFindings:
+    """Regression locks for the 2026-08-05 ChatGPT Codex battery
+    (specs/v1.5/CODEX_TEST_FINDINGS.md): credit-note identity across
+    the document lifecycle, the self-contradictory owner-mismatch
+    error, and voucher posting via inferred owner_type."""
+
+    def _credit_note(self, gb) -> str:
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(owner_id="000001", owner_type="customer")
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="credit", quantity="1", price="100.00",
+        )
+        return cn["id"]
+
+    def test_get_invoice_type_is_credit_note(self, business_book):
+        """The slot, not owner_type, decides ``type`` — get_invoice
+        must agree with the delete/unpost responses."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._credit_note(gb)
+        assert gb.get_invoice(cn_id)["type"] == "credit_note"
+
+    def test_credit_note_identity_survives_unpost(self, business_book):
+        """Deleting the posting transaction sweeps the invoice's own
+        slots (piecash slot-hierarchy overlap); unpost must restore
+        the credit-note flag so a FRESH session still sees it."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.unpost_invoice(invoice_id=cn_id, owner_type="customer")
+        fresh = GnuCashBook(str(business_book))
+        assert fresh.get_invoice(cn_id)["type"] == "credit_note"
+        result = fresh.delete_credit_note(cn_id)
+        assert result["type"] == "credit_note"
+
+    def test_apply_mismatch_error_names_owner_kinds(self, business_book):
+        """Owner IDs are per-type sequences; the mismatch error must
+        name the owner KIND so 'belongs to 000001 but target belongs
+        to 000001' can't read as a contradiction."""
+        gb = GnuCashBook(str(business_book))
+        cn_id = self._credit_note(gb)
+        gb.post_invoice(
+            invoice_id=cn_id,
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        gb.create_customer(name="Beta LLC")  # 000002
+        inv = gb.create_invoice(customer_id="000002")
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="w", quantity="1", price="200.00",
+        )
+        gb.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(ValueError) as excinfo:
+            gb.apply_credit_note(
+                credit_note_id=cn_id,
+                applies_to_invoice_id=inv["id"],
+                owner_type="customer",
+            )
+        msg = str(excinfo.value)
+        assert "customer" in msg
+        assert "'000001'" in msg and "'000002'" in msg
+        assert "Acme Co" in msg  # names disambiguate colliding IDs
+
+    def test_post_voucher_without_owner_type(self, business_book):
+        """PAYABLE inference must reach vouchers: bills and vouchers
+        both post to A/P, so the inferred-vendor miss retries the
+        employee side before declaring not-found."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_employee(name="Jane Smith")
+        v = gb.create_voucher(employee_id="000001")
+        gb.add_voucher_entry(
+            voucher_id=v["id"], account="Expenses:Office Supplies",
+            description="travel", quantity="1", price="50.00",
+        )
+        result = gb.post_invoice(
+            invoice_id=v["id"],
+            post_account="Liabilities:Accounts Payable",
+        )
+        assert result["status"] == "posted"
