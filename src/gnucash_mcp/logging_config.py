@@ -2583,6 +2583,16 @@ def audit_log(
                 _flush_logger(logger)
                 raise
 
+        # Expose the declared classification/operation on the wrapper.
+        # @wraps copies __dict__ outward through later decorator layers
+        # (safe_tool), so the registration layer can read this off the
+        # function FastMCP stores and derive MCP ToolAnnotations
+        # (readOnlyHint/destructiveHint/idempotentHint) from the same
+        # declaration the audit log trusts — one source, no drift.
+        wrapper.__audit_meta__ = {
+            "classification": classification,
+            "operation": operation,
+        }
         return wrapper
 
     return decorator
