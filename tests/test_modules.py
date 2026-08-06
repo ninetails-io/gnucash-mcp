@@ -83,7 +83,7 @@ class TestToolModulesMapping:
                 assert tool not in seen, f"{tool} appears in multiple modules"
                 seen.add(tool)
 
-    def test_core_group_resolves_to_29_tools(self):
+    def test_core_group_resolves_to_32_tools(self):
         """The ``core`` group expands to 32 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 11 + slots
         3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
@@ -1511,3 +1511,86 @@ class TestVerboseDocstringConvention:
             "non-canonical verbose docstring entries (see class "
             f"docstring for the required sentence): {offenders}"
         )
+class TestCliArgStrictness:
+    """main() must fail fast on unrecognized argv tokens.
+
+    A silently ignored flag means the server runs with the wrong
+    tool surface — ``--modules all`` (space-separated) once passed
+    unnoticed and served core-only while looking fully configured.
+    Same principle as the unknown-module-NAME check and
+    ``extra="forbid"`` on tool kwargs.
+    """
+
+    def _run_main(self, monkeypatch, argv):
+        import sys as _sys
+        from gnucash_mcp.server import main
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        monkeypatch.setattr(_sys, "argv", ["gnucash-mcp", *argv])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        return excinfo.value.code
+
+    def test_space_separated_modules_fails_fast(self, monkeypatch, capsys):
+        code = self._run_main(monkeypatch, ["--modules", "all"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "Unrecognized argument(s): --modules all" in err
+        assert "--modules=all" in err  # the corrective hint
+
+    def test_unknown_flag_fails_fast(self, monkeypatch, capsys):
+        code = self._run_main(monkeypatch, ["--modlues=all"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "--modlues=all" in err
+        assert "Accepted options" in err
+
+    def test_stray_positional_fails_fast(self, monkeypatch, capsys):
+        code = self._run_main(monkeypatch, ["all"])
+        assert code == 2
+        assert "all" in capsys.readouterr().err
+
+    def test_help_still_exits_zero(self, monkeypatch, capsys):
+        code = self._run_main(monkeypatch, ["--help"])
+        assert code == 0
+        assert "GnuCash MCP Server" in capsys.readouterr().out
+
+
+class TestHelpTextCounts:
+    """--help tool counts derive from the registry, so they can
+    never again drift the way the hardcoded "107 tools" did while
+    the server served 110."""
+
+    def test_module_tool_count_agrees_with_registry(self):
+        from gnucash_mcp.server import _module_tool_count
+        assert _module_tool_count("all") == sum(
+            len(tools) for tools in TOOL_MODULES.values()
+        )
+        assert _module_tool_count("core") == len(_core_tool_names())
+        for group, members in MODULE_GROUPS.items():
+            assert _module_tool_count(group) == len(
+                {t for m in members for t in TOOL_MODULES[m]}
+            )
+
+    def test_help_text_embeds_derived_counts(self):
+        from gnucash_mcp.server import _build_help_text, _module_tool_count
+        text = _build_help_text()
+        assert f"core ({_module_tool_count('core')} tools" in text
+        assert f"({_module_tool_count('all')} tools" in text
+        for group in ("bookkeeper", "investor", "freelancer", "business"):
+            assert f"{_module_tool_count(group)} tools." in text
+
+    def test_help_text_mentions_conditional_switch_book(self):
+        """switch_book sits outside the module partition (inline,
+        multi-book only), so the total line must flag it rather
+        than fold it into the count."""
+        from gnucash_mcp.server import _build_help_text
+        assert "switch_book" in _build_help_text()
+
+    def test_help_text_has_no_unrendered_placeholders(self):
+        """The help block is an f-string with literal {book_path}
+        examples that must stay doubled — a missed brace renders
+        as a stray Python expression or eats the example."""
+        from gnucash_mcp.server import _build_help_text
+        text = _build_help_text()
+        assert "{book_path}.mcp" in text
+        assert "{GNUCASH_LOG_DIR}" in text
