@@ -23,7 +23,10 @@ def register(mcp, get_book) -> None:
         JSON envelope.
 
         Args:
-            verbose: If true, return the full JSON envelope.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -48,7 +51,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             name: Budget name.
-            verbose: If true, return the full structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.get_budget(name=name, compact=not verbose)
@@ -153,7 +159,10 @@ def register(mcp, get_book) -> None:
                 - "all": All periods
             account: Optional filter to specific account or parent account.
             include_children: If True and account specified, include child accounts.
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.get_budget_report(
@@ -171,10 +180,18 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="budget")
     def delete_budget(name: str) -> str:
-        """Delete a budget.
+        """Delete a budget and every per-period amount set on it.
+
+        Permanent — there is no undo and no archive state. Only the
+        plan is removed: transactions and account balances are
+        untouched (budgets are plans, not postings). Errors, changing
+        nothing, if the name matches no budget — list_budgets shows
+        what exists, exact and case-sensitive. To retire a budget
+        while keeping its numbers readable, simply stop reporting on
+        it instead of deleting.
 
         Args:
-            name: Budget name.
+            name: Budget name (exact, case-sensitive).
         """
         book = get_book()
         result = book.delete_budget(name=name)

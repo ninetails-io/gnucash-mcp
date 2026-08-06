@@ -89,7 +89,14 @@ def register(mcp, get_book) -> None:
         account: str,
         key: str,
     ) -> str:
-        """Remove a custom metadata slot from an account.
+        """Remove one custom metadata slot from an account.
+
+        Permanent, and surgical: only the named key is deleted —
+        other slots, the account, and its transactions are untouched.
+        Errors, changing nothing, if the account ref or key doesn't
+        exist, or if the key contains '/' (reserved for internal
+        hierarchical slots; user slots are flat). get_account_slots
+        lists the removable keys; set_account_slot re-creates one.
 
         Args:
             account: Account ref: full path (e.g., "Liabilities:Credit Cards:Capital One"), %short GUID, or full 32-char GUID.

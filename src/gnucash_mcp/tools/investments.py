@@ -104,7 +104,7 @@ def register(mcp, get_book) -> None:
         Leads with a ``Showing X-Y of Z commodities`` line, then a
         compact one-line-per-commodity format by default. Page with
         ``offset``; ``limit=0`` returns the count only. Use verbose=true
-        for full JSON with fraction, latest prices, etc.
+        for structured JSON with fraction, latest prices, etc.
 
         THE PRICE-UPDATE WORK LIST: ``stale_days=30, held_only=true``
         returns exactly the commodities needing fresh quotes, each
@@ -112,7 +112,10 @@ def register(mcp, get_book) -> None:
         up, then record them all in one ``create_prices`` call.
 
         Args:
-            verbose: If true, return full JSON details for each commodity.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             stale_days: Only commodities whose latest market price is
@@ -317,7 +320,10 @@ def register(mcp, get_book) -> None:
             end_date: Optional end date filter (YYYY-MM-DD).
             currency: Optional currency filter (e.g., "USD").
             limit: Page size (default 50, max 250). 0 = count only.
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
@@ -375,10 +381,17 @@ def register(mcp, get_book) -> None:
         title: str,
         notes: str = "",
     ) -> str:
-        """Create a new lot for cost basis tracking.
+        """Create a new, empty lot for cost basis tracking.
 
-        Lots group investment purchases for tracking cost basis and
-        calculating capital gains when selling.
+        Additive: the lot starts open with no splits attached, and
+        nothing else in the book changes. A lot groups one purchase
+        with its later sales so cost basis and capital gain compute
+        per purchase. The full flow: create_lot → create_transaction
+        (the buy) → assign_split_to_lot → calculate_lot_gain; the
+        lot auto-closes when its assigned splits net to zero shares.
+        Errors if the account ref matches nothing. Skip this tool
+        when you only want a valuation — get_book_summary and
+        balance_sheet price holdings without lots.
 
         Args:
             account: Account ref for the investment account: full path (e.g., "Assets:Investments:VTSAX"), %short GUID, or full 32-char GUID.
@@ -409,7 +422,10 @@ def register(mcp, get_book) -> None:
         Args:
             account: Account ref (full path, %short GUID, or full 32-char GUID).
             include_closed: If True, include fully-sold lots. Default False.
-            verbose: If true, return full JSON details for each lot.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """

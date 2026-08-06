@@ -63,7 +63,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             active_only: If True, only show active customers. Default True.
-            verbose: If true, return full JSON details for each customer.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -101,7 +104,14 @@ def register(mcp, get_book) -> None:
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a new vendor.
+        """Create a new vendor (a party you buy from and owe).
+
+        Additive: each call creates a fresh vendor — names are NOT
+        checked for duplicates, so list_vendors first when unsure.
+        Returns the assigned vendor ID (e.g., "000001"), the handle
+        every later call wants (create_bill, update_vendor,
+        vendor_spending_report). Counterpart: create_customer for
+        parties who pay you.
 
         Args:
             name: Vendor name (e.g., "Office Depot").
@@ -137,7 +147,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             active_only: If True, only show active vendors. Default True.
-            verbose: If true, return full JSON details for each vendor.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -174,10 +187,14 @@ def register(mcp, get_book) -> None:
         currency: str | None = None,
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a new employee.
+        """Create a new employee (for expense-voucher workflows).
 
-        Employee has no ``notes`` field (unlike Customer and Vendor).
-        Address shape is identical.
+        Additive: each call creates a fresh employee — names are NOT
+        checked for duplicates, so list_employees first when unsure.
+        Returns the assigned employee ID (e.g., "000001"), used by
+        update_employee, delete_employee, and create_voucher.
+        Employee has no ``notes`` field (unlike Customer and Vendor);
+        the address shape is identical.
 
         Args:
             name: Employee name (e.g., "Jane Smith").
@@ -212,7 +229,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             active_only: If True, only show active employees. Default True.
-            verbose: If true, return full JSON details for each employee.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -291,17 +311,26 @@ def register(mcp, get_book) -> None:
         active: bool | None = None,
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Update an existing vendor.
+        """Update an existing vendor in place.
 
-        Same semantics as ``update_customer``.
+        Only fields you pass change; omitted fields keep their
+        current values. Overwrites are permanent at the book level
+        (the audit log keeps the before-state). Errors, changing
+        nothing, if the ID matches no vendor. Deactivating via
+        ``active=false`` is the safe alternative to delete_vendor —
+        history and bills stay intact, and the vendor drops out of
+        default listings.
 
         Args:
-            id: Vendor ID (e.g., "000001").
+            id: Vendor ID (e.g., "000001") from create_vendor or list_vendors.
             name: New display name.
             currency: New default ISO currency code.
             notes: New notes. Pass "" to clear.
             active: ``false`` to deactivate; ``true`` to reactivate.
-            address: Partial address dict (see ``update_customer``).
+            address: Partial address dict — any of: name, addr1,
+                     addr2, addr3, addr4, phone, fax, email (each
+                     capped at 1024 characters). Only the keys you
+                     pass change; others persist.
         """
         book = get_book()
         result = book.update_vendor(
@@ -383,7 +412,10 @@ def register(mcp, get_book) -> None:
         JSON with guid, discount details, etc.
 
         Args:
-            verbose: If true, return full JSON details for each billing term.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -451,11 +483,14 @@ def register(mcp, get_book) -> None:
         Leads with a ``Showing X-Y of Z taxtables`` line. Compact format
         (default): one line per taxtable with name, entry count, and
         per-entry rate→account routing. Page with ``offset``; ``limit=0``
-        returns the count only. Verbose: full JSON with resolved account
+        returns the count only. Verbose: structured JSON with resolved account
         paths and refcount.
 
         Args:
-            verbose: If true, return full JSON for each taxtable.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -1032,13 +1067,16 @@ def register(mcp, get_book) -> None:
         Leads with a ``Showing X-Y of Z invoices (date range)`` line,
         then a compact one-line-per-invoice format by default. Page with
         ``offset``; ``limit=0`` returns the count only. Use verbose=true
-        for full JSON with GUIDs, dates, notes, etc.
+        for structured JSON with GUIDs, dates, notes, etc.
 
         Args:
             owner_type: Filter by type: "customer" for invoices,
                         "vendor" for bills, or omit for all.
             status: Filter by status: "posted" or "open", or omit for all.
-            verbose: If true, return full JSON details.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             job_id: Filter to invoices grouped under a specific
                 job — useful for the "what's part of this
@@ -1340,10 +1378,13 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="delete", entity_type="employee")
     def delete_employee(employee_id: str) -> str:
-        """Delete an employee.
+        """Delete an employee record.
 
-        Employees in the 1.3.0 release have no associated documents;
-        the delete proceeds unconditionally after slot cleanup.
+        Permanent, and unconditional: employees carry no associated
+        documents in this release, so nothing blocks the delete and
+        nothing else is removed with it. Errors, changing nothing,
+        if the ID matches no employee. To retire someone while
+        keeping the record, prefer ``update_employee(active=false)``.
 
         Args:
             employee_id: Employee ID (e.g., "000001").
@@ -1418,8 +1459,10 @@ def register(mcp, get_book) -> None:
             owner_id: Filter by specific customer or vendor ID
                 (requires owner_type).
             active_only: If True (default), exclude inactive jobs.
-            verbose: If True, return full JSON dicts; otherwise
-                compact tab-separated rows.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -1554,7 +1597,7 @@ def register(mcp, get_book) -> None:
         items at the top. Page with ``offset``; ``limit=0`` returns the
         count only.
 
-        Use verbose=true for full JSON with ``original_amount`` /
+        Use verbose=true for structured JSON with ``original_amount`` /
         ``amount_paid`` / ``amount_due`` breakdown — the shape
         ``pay_invoice`` workflows expect.
 
@@ -1562,7 +1605,10 @@ def register(mcp, get_book) -> None:
             owner_type: Filter by "customer" or "vendor". Omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
-            verbose: If true, return full JSON details.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -1613,13 +1659,16 @@ def register(mcp, get_book) -> None:
         and outstanding amounts per vendor.
 
         Returns a compact aligned text table by default. Use verbose=true
-        for the full structured dict (programmatic consumers).
+        for the structured dict (programmatic consumers).
 
         Args:
             start_date: Start of period (YYYY-MM-DD).
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to a specific vendor.
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             group_by: Optional "month", "quarter", or "year" — split the
                 range into sub-period columns of total billed per vendor
                 and return a multi-period TSV table. Overrides verbose.

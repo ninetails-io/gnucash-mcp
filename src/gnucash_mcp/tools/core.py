@@ -145,7 +145,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
-            verbose: If true, return full JSON details for each account.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             query: Case-insensitive substring filter on account
@@ -164,7 +167,14 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def get_account(name: str) -> str:
-        """Get details for a specific account by name.
+        """Get details for one account: type, commodity, description,
+        placeholder flag, GUID, and hierarchy position.
+
+        Read-only. Returns ``{"error": "Account not found: ..."}``
+        when the ref matches nothing — nothing raises. Use
+        list_accounts to discover refs in bulk, get_balance when you
+        only need a number, get_account_slots for custom metadata
+        (APR, credit_limit, ...).
 
         Args:
             name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
@@ -243,7 +253,10 @@ def register(mcp, get_book) -> None:
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         start = _parse_iso_date(start_date)
@@ -525,7 +538,10 @@ def register(mcp, get_book) -> None:
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.search_transactions(
@@ -620,7 +636,17 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="account")
     def move_account(name: str, new_parent: str) -> str:
-        """Move an account to a new parent in the hierarchy.
+        """Move an account — children and balances ride along — under
+        a new parent in the hierarchy.
+
+        No transaction data changes: only the account's position
+        (and therefore every descendant's full path) is rewritten.
+        Errors, changing nothing, if either ref matches no account,
+        if the move would create a cycle (new parent is the account
+        itself or one of its descendants), or if the new parent
+        already has a child of the same name. %short GUIDs survive
+        the move; saved full paths do not. Use update_account to
+        rename in place instead of moving.
 
         Args:
             name: Account ref to move (full path e.g. "Expenses:Old:Account", %short GUID, or full 32-char GUID)

@@ -1,0 +1,12 @@
+# Keep the image build context small: only what the Dockerfile COPYs matters.
+.git
+.venv
+tests
+specs
+docs
+scripts
+samples/*.generated.gnucash*
+samples/*.mcp
+samples/scratch.gnucash.mcp
+__pycache__
+*.pyc

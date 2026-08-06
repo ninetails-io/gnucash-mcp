@@ -65,7 +65,10 @@ def register(mcp, get_book) -> None:
         work on excluded accounts).
 
         Args:
-            verbose: Full JSON rows instead of compact TSV lines.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return.
         """
@@ -95,13 +98,16 @@ def register(mcp, get_book) -> None:
         lines are clipped). Page with ``offset``; ``limit=0`` returns
         the count only.
 
-        Use verbose=true for full JSON with split GUIDs, amounts, totals,
+        Use verbose=true for structured JSON with split GUIDs, amounts, totals,
         and the ``showing`` indicator as a structured field.
 
         Args:
             account: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
             as_of_date: Only include splits on or before this date (YYYY-MM-DD)
-            verbose: If true, return full JSON details. Default compact one-line format.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -259,9 +265,16 @@ def register(mcp, get_book) -> None:
     def unvoid_transaction(
         guid: TransactionGuid,
     ) -> str:
-        """Restore a voided transaction.
+        """Restore a voided transaction to its pre-void amounts.
 
-        Restores original split values and removes void markers.
+        The inverse of void_transaction: original split values come
+        back from the slots the void stored, and the void markers
+        and reason are cleared. All-or-nothing — if any split's
+        stored void data is missing, the tool errors and restores
+        nothing (no partial resurrection). Errors too if the
+        transaction isn't found or isn't voided. Restored splits
+        return as UNreconciled ('n'), so a previously reconciled
+        transaction needs reconciling again afterward.
 
         Args:
             guid: Transaction GUID to unvoid (32-character hex string, or 8+ char prefix)
