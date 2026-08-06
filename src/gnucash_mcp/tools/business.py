@@ -1116,7 +1116,7 @@ def register(mcp, get_book) -> None:
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
-            owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+            owner_type: "customer", "vendor", or "employee" (vouchers) for disambiguation when IDs collide.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
         """
