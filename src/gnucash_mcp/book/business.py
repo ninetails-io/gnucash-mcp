@@ -5415,7 +5415,8 @@ class BusinessMixin:
         invoice_id: str,
         owner_type: str | None = None,
     ) -> dict:
-        """Unpost a previously-posted invoice or bill.
+        """Unpost a previously-posted document (invoice, bill,
+        voucher, or credit note).
 
         Reverses ``post_invoice``: deletes the posting transaction
         and lot, clears the posted-state metadata. The document

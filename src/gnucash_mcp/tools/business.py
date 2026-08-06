@@ -1106,8 +1106,10 @@ def register(mcp, get_book) -> None:
     ) -> str:
         """Get full details for an invoice or bill, including line items.
 
-        Works for both customer invoices and vendor bills. Returns all
-        entries with quantities, prices, and totals.
+        Works for every document in the family: customer invoices,
+        vendor bills, employee vouchers, and credit notes (reported
+        as type='credit_note'). Returns all entries with quantities,
+        prices, and totals.
 
         Args:
             id: Invoice or bill ID (e.g., "000001"). This is the
@@ -1178,7 +1180,8 @@ def register(mcp, get_book) -> None:
         id: str,
         owner_type: str | None = None,
     ) -> str:
-        """Reverse a posted invoice or bill.
+        """Reverse a posted document: invoice, bill, voucher, or
+        credit note (each keeps its type through the round-trip).
 
         Deletes the posting transaction and lot, and clears the
         invoice's posted-state metadata. The invoice returns to
