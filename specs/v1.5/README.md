@@ -119,10 +119,14 @@ The rest of this section remains unscheduled.
   Closes the dashboard's stale-price warning loop. First live
   network call in the server → own sprint for failure handling.
   ~500–700 LOC. _Spec: [PRICE_UPDATE_SPEC.md](../v1.4/features/PRICE_UPDATE_SPEC.md)._
-- **i18n output localization (Tier D)** — render reports, errors,
-  and audit lines in the book's locale; number-format policy
-  (decimal separator per locale). The largest remaining i18n
-  lift. _Spec: [I18N_ACCOUNT_RESOLUTION_SPEC.md](../v1.4/i18n/I18N_ACCOUNT_RESOLUTION_SPEC.md) Tier D / §9._
+- **i18n output localization (Tier D)** — render reports, warnings,
+  and audit lines in the book's locale. Full inventory swept
+  2026-07-19; targets GnuCash's 61 po-catalog languages; errors and
+  wire enums declared out of scope (LLM translates); number
+  formatting recommended non-localized. Four open questions await
+  ruling. _Spec: [I18N_OUTPUT_SPEC.md](I18N_OUTPUT_SPEC.md)
+  (supersedes the Tier D / §9 stub in
+  [I18N_ACCOUNT_RESOLUTION_SPEC.md](../v1.4/i18n/I18N_ACCOUNT_RESOLUTION_SPEC.md))._
 - **Taxtable default cascade + `tax_override`** — customer/vendor
   default taxtable with an explicit override gate; ~80 LOC, the
   posting-math seam already accepts inherited taxtables. _Spec:
