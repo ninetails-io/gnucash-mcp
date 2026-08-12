@@ -543,15 +543,26 @@ For live verification against a personal GnuCash book, ensure
    verification, capture against the committed books at HEAD (or
    generate locally and capture both sides same-machine).
 4. Tester/bookkeeper signoff on develop.
-5. **Version bump LAST** — one commit: `pyproject.toml`,
+5. **Satisfy Dependabot** — Dependabot scans only the default
+   branch, so open alerts persist until a release lands; clearing
+   them mid-cycle is invisible, clearing them here makes the
+   release ship with a clean scan. Check
+   `gh api repos/ninetails-io/gnucash-mcp/dependabot/alerts?state=open`,
+   upgrade flagged packages in the lockfile
+   (`uv lock --upgrade-package <name>`), and run the test suite
+   against the refreshed lock. Most alerts here are transitive
+   and unexploitable (stdio server, no network surface) — fix
+   them anyway; the badge on a financial tool's repo costs more
+   than the bump.
+6. **Version bump LAST** — one commit: `pyproject.toml`,
    `__init__.py`, and a fresh `uv lock` staging `uv.lock`. The
    lockfile records the project's own version; a bump without the
    re-lock ships a lockfile that contradicts the release (v1.4.1
    did; it breaks `uv sync --locked`/`--frozen` consumers such as
    CI and bundle builds). Version numbering and timing are the
    maintainer's call.
-6. Release PR `develop` → `main`; merge on the maintainer's go.
-7. Annotated tag, push verified with `git ls-remote` (never trust
+7. Release PR `develop` → `main`; merge on the maintainer's go.
+8. Annotated tag, push verified with `git ls-remote` (never trust
    a piped push).
 
 ---
