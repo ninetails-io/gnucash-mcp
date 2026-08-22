@@ -1555,6 +1555,212 @@ class TestCliArgStrictness:
         assert "GnuCash MCP Server" in capsys.readouterr().out
 
 
+class TestBookCliArg:
+    """--book CLI argument — the MCPB bundle's book interface.
+
+    Multi-value (``--book A B``, the shape a manifest multi-file
+    picker expands to), repeatable, ``--book=PATH``. Args win over
+    GNUCASH_BOOK_PATH, and both interfaces share the
+    _validate_book_paths chokepoint so validation cannot diverge.
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_book_state(self):
+        import gnucash_mcp.server as srv
+        import gnucash_mcp.logging_config as logcfg
+
+        saved = (
+            srv._book, list(srv._book_paths), srv._current_path,
+            dict(srv._book_registry),
+        )
+        log_saved = (
+            logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
+        )
+        yield
+        srv._book, srv._book_paths, srv._current_path = saved[:3]
+        srv._book_registry = saved[3]
+        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
+
+    # ── _parse_cli_argv ────────────────────────────────────────────
+
+    def test_multi_value_form(self):
+        from gnucash_mcp.server import _parse_cli_argv
+        books, debug, noaudit, modules = _parse_cli_argv(
+            ["--book", "/a.gnucash", "/b.gnucash", "--debug"]
+        )
+        assert books == ["/a.gnucash", "/b.gnucash"]
+        assert debug is True
+        assert noaudit is False
+        assert modules is None
+
+    def test_repeat_and_equals_forms(self):
+        from gnucash_mcp.server import _parse_cli_argv
+        books, *_ = _parse_cli_argv(["--book=/a", "--book", "/b"])
+        assert books == ["/a", "/b"]
+
+    def test_book_without_value_fails(self):
+        from gnucash_mcp.server import _CliParseError, _parse_cli_argv
+        with pytest.raises(_CliParseError, match="--book requires"):
+            _parse_cli_argv(["--book", "--debug"])
+
+    def test_unknown_flag_still_fails(self):
+        from gnucash_mcp.server import _CliParseError, _parse_cli_argv
+        with pytest.raises(_CliParseError, match="Unrecognized"):
+            _parse_cli_argv(["--books=/a"])
+
+    # ── _apply_book_args ───────────────────────────────────────────
+
+    def test_apply_overrides_env_and_mirrors_it(self, tmp_path, monkeypatch):
+        import gnucash_mcp.server as srv
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        beast = _make_min_book(tmp_path / "beast-man.gnucash")
+        other = _make_min_book(tmp_path / "other.gnucash")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(other))
+        srv._apply_book_args([str(alex), str(beast)])
+        assert srv._book_paths == [alex.resolve(), beast.resolve()]
+        assert srv._current_path == alex.resolve()
+        # Mirrored into the env: get_book() re-reads it on reset.
+        assert os.environ["GNUCASH_BOOK_PATH"] == os.pathsep.join(
+            [str(alex.resolve()), str(beast.resolve())]
+        )
+        assert srv._book is None
+
+    def test_apply_missing_file_names_the_flag(self, tmp_path):
+        import gnucash_mcp.server as srv
+        with pytest.raises(srv._BookPathError, match=r"Invalid --book"):
+            srv._apply_book_args([str(tmp_path / "nope.gnucash")])
+
+    # ── main() integration (failure exits before the module filter,
+    #    so the tool registry is untouched) ─────────────────────────
+
+    def test_main_book_flag_missing_file_fails_fast(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import sys as _sys
+        from gnucash_mcp.server import main
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        monkeypatch.setattr(
+            _sys, "argv",
+            ["gnucash-mcp", "--book", str(tmp_path / "nope.gnucash")],
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 2
+        assert "Invalid --book" in capsys.readouterr().err
+
+
+class TestEnvModuleToggles:
+    """GNUCASH_ENABLE_* booleans — the MCPB manifest's checkbox
+    interface. Composed only when at least one toggle var is present;
+    --modules / GNUCASH_MCP_MODULES win in main()."""
+
+    @pytest.fixture(autouse=True)
+    def clear_toggles(self, monkeypatch):
+        from gnucash_mcp.server import _ENV_MODULE_TOGGLES
+        for var in _ENV_MODULE_TOGGLES:
+            monkeypatch.delenv(var, raising=False)
+
+    def test_absent_returns_none(self):
+        from gnucash_mcp.server import _modules_from_env_toggles
+        assert _modules_from_env_toggles() is None
+
+    def test_planning_only(self, monkeypatch):
+        from gnucash_mcp.server import _modules_from_env_toggles
+        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "true")
+        assert _modules_from_env_toggles() == "reporting,budgets,scheduling"
+
+    def test_all_false_still_gets_reporting(self, monkeypatch):
+        from gnucash_mcp.server import (
+            _ENV_MODULE_TOGGLES, _modules_from_env_toggles,
+        )
+        for var in _ENV_MODULE_TOGGLES:
+            monkeypatch.setenv(var, "false")
+        assert _modules_from_env_toggles() == "reporting"
+
+    def test_mcpb_style_selection(self, monkeypatch):
+        from gnucash_mcp.server import _modules_from_env_toggles
+        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "false")
+        monkeypatch.setenv("GNUCASH_ENABLE_INVESTMENTS", "true")
+        monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "false")
+        monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "true")
+        assert _modules_from_env_toggles() == "reporting,investor,business"
+
+    def test_invalid_value_fails_fast(self, monkeypatch):
+        from gnucash_mcp.server import _modules_from_env_toggles
+        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "ture")
+        with pytest.raises(ValueError, match="GNUCASH_ENABLE_PLANNING"):
+            _modules_from_env_toggles()
+
+    def test_toggle_targets_exist_in_registry(self):
+        """Contract lock: every toggle target (and the always-on
+        ``reporting``) must be a real module or group name, so a
+        module rename cannot silently strand the bundle's checkboxes
+        on an unknown-module startup error."""
+        from gnucash_mcp.server import _ENV_MODULE_TOGGLES
+        valid = set(TOOL_MODULES) | set(MODULE_GROUPS)
+        assert "reporting" in valid
+        for modules in _ENV_MODULE_TOGGLES.values():
+            for name in modules:
+                assert name in valid, name
+
+
+class TestBookFormatSniff:
+    """Startup rejects non-SQLite books with a message a
+    non-developer can act on (the XML-format file-picker mistake)."""
+
+    @pytest.fixture(autouse=True)
+    def restore_book_state(self):
+        import gnucash_mcp.server as srv
+        saved = (srv._book, list(srv._book_paths), srv._current_path)
+        yield
+        srv._book, srv._book_paths, srv._current_path = saved
+
+    def test_sqlite_book_passes(self, tmp_path):
+        from gnucash_mcp.server import _book_format_error
+        book = _make_min_book(tmp_path / "ok.gnucash")
+        assert _book_format_error(book) is None
+
+    def test_xml_book_gets_save_as_message(self, tmp_path):
+        from gnucash_mcp.server import _book_format_error
+        p = tmp_path / "old.gnucash"
+        p.write_bytes(b'<?xml version="1.0" encoding="utf-8" ?>\n<gnc-v2>')
+        msg = _book_format_error(p)
+        assert msg is not None
+        assert "XML format" in msg
+        assert "Save As" in msg
+        assert "old.gnucash" in msg
+
+    def test_gzipped_xml_book_gets_save_as_message(self, tmp_path):
+        import gzip
+        from gnucash_mcp.server import _book_format_error
+        p = tmp_path / "compressed.gnucash"
+        p.write_bytes(gzip.compress(b'<?xml version="1.0"?><gnc-v2>'))
+        msg = _book_format_error(p)
+        assert msg is not None
+        assert "XML format" in msg
+
+    def test_unrecognized_header_gets_generic_message(self, tmp_path):
+        from gnucash_mcp.server import _book_format_error
+        p = tmp_path / "mystery.gnucash"
+        p.write_bytes(b"\x00\x01 definitely not a book")
+        msg = _book_format_error(p)
+        assert msg is not None
+        assert "does not look like" in msg
+        assert "sqlite3" in msg
+
+    def test_main_xml_book_fails_fast(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+        from gnucash_mcp.server import main
+        p = tmp_path / "old.gnucash"
+        p.write_bytes(b'<?xml version="1.0"?>\n<gnc-v2>')
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(p))
+        monkeypatch.setattr(_sys, "argv", ["gnucash-mcp"])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 2
+        assert "XML format" in capsys.readouterr().err
+
+
 class TestHelpTextCounts:
     """--help tool counts derive from the registry, so they can
     never again drift the way the hardcoded "107 tools" did while

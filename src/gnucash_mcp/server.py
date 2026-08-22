@@ -752,7 +752,20 @@ def _parse_book_paths(value: str | None) -> list[Path]:
             "Invalid GNUCASH_BOOK_PATH: contains only separators, "
             "no paths"
         )
+    return _validate_book_paths(raw)
 
+
+def _validate_book_paths(
+    raw: list[str], *, source: str = "GNUCASH_BOOK_PATH"
+) -> list[Path]:
+    """Resolve and validate a list of book path strings.
+
+    The single chokepoint for inbound book lists — both the
+    GNUCASH_BOOK_PATH env var (via _parse_book_paths) and the --book
+    CLI argument land here, so existence, regular-file, and
+    filename-stem uniqueness rules cannot diverge between the two
+    interfaces. ``source`` names the interface in error messages.
+    """
     paths: list[Path] = []
     errors: list[str] = []
     for p in raw:
@@ -791,9 +804,65 @@ def _parse_book_paths(value: str | None) -> list[Path]:
 
     if errors:
         raise _BookPathError(
-            "Invalid GNUCASH_BOOK_PATH:\n" + "\n".join(errors)
+            f"Invalid {source}:\n" + "\n".join(errors)
         )
     return paths
+
+
+def _apply_book_args(book_args: list[str]) -> None:
+    """Install --book CLI paths as the active book list.
+
+    Args win over GNUCASH_BOOK_PATH. The resolved list is mirrored
+    back into the env var (os.pathsep-joined) because get_book()
+    re-reads the env whenever ``_book`` is reset — without the
+    mirror, a test-style reset would silently fall back to the
+    env's books. Logging is (re-)pointed here too: when the books
+    arrive via CLI only, the import-time logging block never ran
+    (it reads the env, which was unset at import).
+    """
+    global _book_paths, _current_path, _book
+    _book_paths = _validate_book_paths(book_args, source="--book")
+    _current_path = _book_paths[0]
+    _book = None
+    os.environ["GNUCASH_BOOK_PATH"] = os.pathsep.join(
+        str(p) for p in _book_paths
+    )
+    _activate_logging(_current_path)
+
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _book_format_error(path: Path) -> str | None:
+    """Detect a non-SQLite book at startup; return a message a
+    non-developer can act on, or None when the header looks right.
+
+    The #1 predictable mistake in the bundle's file picker is a book
+    saved in GnuCash's XML format (uncompressed ``<?xml`` or the
+    gzip default) — piecash would otherwise fail on it at first tool
+    call with a DatabaseError a non-developer can't decode.
+    Unreadable files return None: the real open surfaces its own
+    error with the existing error_type contract.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_MAGIC))
+    except OSError:
+        return None
+    if head.startswith(_SQLITE_MAGIC):
+        return None
+    if head.startswith(b"\x1f\x8b") or head.lstrip().startswith(b"<?xml"):
+        return (
+            f"{path.name} is in GnuCash's XML format. Open it in "
+            "GnuCash and use File > Save As with the sqlite3 format, "
+            "then pick the new file."
+        )
+    return (
+        f"{path.name} does not look like a GnuCash book in SQLite "
+        "format (unrecognized file header). In GnuCash, use "
+        "File > Save As with the sqlite3 format, then pick the "
+        "new file."
+    )
 
 
 def _book_for(path: Path) -> GnuCashBook:
@@ -1153,6 +1222,116 @@ def switch_book(
 # ============== Main ==============
 
 
+class _CliParseError(ValueError):
+    """Unusable command line. The message is the complete user-facing
+    text; main() prints it and exits 2."""
+
+
+def _parse_cli_argv(
+    argv: list[str],
+) -> tuple[list[str], bool, bool, str | None]:
+    """Parse CLI arguments: (book_args, debug, noaudit, modules_value).
+
+    ``--book`` consumes every following token up to the next option
+    (the MCPB manifest expands a multi-file picker to ``--book A B``);
+    it also repeats, and accepts the ``--book=PATH`` form. Unrecognized
+    tokens are fatal: a silently ignored flag means the server runs
+    with the wrong tool surface (``--modules all`` once passed
+    unnoticed and served core-only while looking configured). Same
+    fail-fast principle as the unknown-module-NAME check in
+    _apply_module_filter and ``extra="forbid"`` on tool kwargs.
+    """
+    debug_flag = False
+    noaudit_flag = False
+    modules_value: str | None = None
+    book_args: list[str] = []
+    unknown_args: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--debug":
+            debug_flag = True
+        elif arg == "--noaudit":
+            noaudit_flag = True
+        elif arg.startswith("--modules="):
+            modules_value = arg.split("=", 1)[1]
+        elif arg.startswith("--book="):
+            book_args.append(arg.split("=", 1)[1])
+        elif arg == "--book":
+            j = i + 1
+            while j < len(argv) and not argv[j].startswith("--"):
+                book_args.append(argv[j])
+                j += 1
+            if j == i + 1:
+                raise _CliParseError(
+                    "--book requires at least one path, e.g. "
+                    "--book /path/to/ledger.gnucash"
+                )
+            i = j
+            continue
+        else:
+            unknown_args.append(arg)
+        i += 1
+    if unknown_args:
+        lines = [f"Unrecognized argument(s): {' '.join(unknown_args)}"]
+        if "--modules" in unknown_args:
+            lines.append(
+                'The module list must be attached with "=", '
+                "e.g. --modules=all or --modules=core,reporting."
+            )
+        lines.append(
+            "Accepted options: --modules=MODULES, --book PATH ..., "
+            "--debug, --noaudit, --help"
+        )
+        raise _CliParseError("\n".join(lines))
+    return book_args, debug_flag, noaudit_flag, modules_value
+
+
+# The MCPB bundle's only module interface: each manifest checkbox
+# lands as one of these env vars, rendered "true"/"false" by the
+# host app. Values map to module/group names in TOOL_MODULES /
+# MODULE_GROUPS ("planning" spans two leaf modules).
+_ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
+    "GNUCASH_ENABLE_PLANNING": ("budgets", "scheduling"),
+    "GNUCASH_ENABLE_INVESTMENTS": ("investor",),
+    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
+    "GNUCASH_ENABLE_BUSINESS": ("business",),
+}
+_TOGGLE_TRUE = frozenset({"true", "1", "yes", "on"})
+_TOGGLE_FALSE = frozenset({"false", "0", "no", "off", ""})
+
+
+def _modules_from_env_toggles() -> str | None:
+    """Compose a --modules value from the GNUCASH_ENABLE_* booleans.
+
+    Returns None when no toggle variable is present at all, so CLI
+    and GNUCASH_MCP_MODULES users (and the core-only default) are
+    untouched. When any toggle is present, the selection is
+    ``reporting`` plus every enabled toggle's modules — core is
+    force-added downstream by _apply_module_filter, matching the
+    bundle design where core + reporting are always on.
+
+    Raises ValueError on an unparseable value: a typo'd toggle must
+    not silently serve the wrong tool surface.
+    """
+    if not any(v in os.environ for v in _ENV_MODULE_TOGGLES):
+        return None
+    selected: list[str] = ["reporting"]
+    for var, modules in _ENV_MODULE_TOGGLES.items():
+        raw = os.environ.get(var)
+        if raw is None:
+            continue
+        norm = raw.strip().lower()
+        if norm in _TOGGLE_TRUE:
+            selected.extend(modules)
+        elif norm not in _TOGGLE_FALSE:
+            raise ValueError(
+                f"Invalid {var}={raw!r}: expected true/false "
+                "(also accepted: 1/0, yes/no, on/off)"
+            )
+    return ",".join(selected)
+
+
 def _build_help_text() -> str:
     """Render ``--help`` output.
 
@@ -1176,6 +1355,12 @@ def _build_help_text() -> str:
 Usage: gnucash-mcp [OPTIONS]
 
 Options:
+  --book PATH [PATH ...]
+                       GnuCash SQLite book(s) to serve. Overrides
+                       GNUCASH_BOOK_PATH; repeatable, and multiple
+                       paths may follow one flag. Two or more books
+                       add the switch_book tool. Filename stems must
+                       be unique (switch_book matches by name).
   --modules=MODULES    Tool modules to load (comma-separated).
                        Default: core ({core} tools, always-on). Use "all"
                        for every module ({total} tools; configuring
@@ -1237,6 +1422,13 @@ Environment variables:
                              (switch_book matches by name).
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
+  GNUCASH_ENABLE_PLANNING    Boolean module toggles (true/false) — the
+  GNUCASH_ENABLE_INVESTMENTS interface the MCPB bundle's checkboxes use.
+  GNUCASH_ENABLE_FREELANCER  When any is set, modules = core + reporting
+  GNUCASH_ENABLE_BUSINESS    plus each enabled toggle's modules (planning
+                             = budgets + scheduling; investments =
+                             investor; business supersedes freelancer).
+                             --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
   GNUCASH_LOG_DIR            Relocate .mcp storage (audit, debug, backups).
@@ -1274,59 +1466,60 @@ def main() -> None:
     global _book_paths, _current_path, _logging_debug, _logging_audit
     global _book_class
 
-    # GNUCASH_BOOK_PATH: one path or an os.pathsep-separated list. Fail fast
-    # on any invalid/duplicate entry (unset is tolerated — tools error
-    # at call time, matching the prior behavior). ``book_path`` below
-    # is the CURRENT book, used for logging / health / display.
+    # Parse CLI flags first — --book must win over GNUCASH_BOOK_PATH
+    # below. Fail-fast rationale lives on _parse_cli_argv.
+    try:
+        book_args, debug_flag, noaudit_flag, modules_value = (
+            _parse_cli_argv(sys.argv[1:])
+        )
+    except _CliParseError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
+    del sys.argv[1:]
+
+    # Resolve the book list: --book args win; otherwise
+    # GNUCASH_BOOK_PATH (one path or an os.pathsep-separated list).
+    # Fail fast on any invalid/duplicate entry (neither set is
+    # tolerated — tools error at call time, matching the prior
+    # behavior). ``book_path`` below is the CURRENT book, used for
+    # logging / health / display.
     raw_book_path = os.environ.get("GNUCASH_BOOK_PATH")
-    if raw_book_path and raw_book_path.strip():
+    if book_args or (raw_book_path and raw_book_path.strip()):
         try:
-            _book_paths = _parse_book_paths(raw_book_path)
+            if book_args:
+                _apply_book_args(book_args)
+            else:
+                _book_paths = _parse_book_paths(raw_book_path)
+                _current_path = _book_paths[0]
         except _BookPathError as exc:
             print(str(exc), file=sys.stderr)
-            raise SystemExit(2)
-        _current_path = _book_paths[0]
+            raise SystemExit(2) from None
         book_path = str(_current_path)
+
+        # Startup format check: an XML-format book (the #1
+        # predictable file-picker mistake) fails here with a message
+        # a non-developer can act on, instead of a piecash
+        # DatabaseError at first tool call.
+        format_errors = [
+            msg for p in _book_paths
+            if (msg := _book_format_error(p)) is not None
+        ]
+        if format_errors:
+            print("\n".join(format_errors), file=sys.stderr)
+            raise SystemExit(2)
     else:
         book_path = None
 
-    # Parse CLI flags. Unrecognized tokens are fatal: a silently
-    # ignored flag means the server runs with the wrong tool surface
-    # (``--modules all`` once passed unnoticed and served core-only
-    # while looking configured). Same fail-fast principle as the
-    # unknown-module-NAME check in _apply_module_filter and
-    # ``extra="forbid"`` on tool kwargs.
-    debug_flag = False
-    noaudit_flag = False
-    modules_value = None
-    unknown_args: list[str] = []
-    for arg in sys.argv[1:]:
-        if arg == "--debug":
-            debug_flag = True
-        elif arg == "--noaudit":
-            noaudit_flag = True
-        elif arg.startswith("--modules="):
-            modules_value = arg.split("=", 1)[1]
-        else:
-            unknown_args.append(arg)
-    if unknown_args:
-        lines = [f"Unrecognized argument(s): {' '.join(unknown_args)}"]
-        if "--modules" in unknown_args:
-            lines.append(
-                'The module list must be attached with "=", '
-                "e.g. --modules=all or --modules=core,reporting."
-            )
-        lines.append(
-            "Accepted options: --modules=MODULES, --debug, "
-            "--noaudit, --help"
-        )
-        print("\n".join(lines), file=sys.stderr)
-        raise SystemExit(2)
-    del sys.argv[1:]
-
-    # Env var fallback for modules (CLI flag takes precedence)
+    # Module selection precedence: --modules, then GNUCASH_MCP_MODULES,
+    # then the MCPB bundle's GNUCASH_ENABLE_* checkbox toggles.
     if modules_value is None:
         modules_value = os.environ.get("GNUCASH_MCP_MODULES")
+    if modules_value is None:
+        try:
+            modules_value = _modules_from_env_toggles()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from None
 
     # Re-init logging if CLI flags override env vars. Update the
     # effective-mode globals so switch_book repoints with the same
