@@ -1,0 +1,33 @@
+# Bundle contents are manifest.json, src/, pyproject.toml, uv.lock,
+# README.md, CHANGELOG.md, LICENSE — everything else stays out
+# (specs/v1.5/MCPB_SPEC.md). CLAUDE.local.md may hold personal notes
+# and must never ship; samples/ carries megabytes of demo books plus
+# their .mcp audit/backup state.
+.git
+.github
+.idea
+.claude
+.venv
+.pytest_cache
+.ruff_cache
+.DS_Store
+.mcp.json
+.dockerignore
+.gitignore
+.git-blame-ignore-revs
+.mcpbignore
+CLAUDE.md
+CLAUDE.local.md
+Dockerfile
+ERROR_TESTING.md
+glama.json
+test.sh
+docs/
+samples/
+scripts/
+specs/
+tests/
+dist/
+__pycache__/
+*.pyc
+*.mcpb
