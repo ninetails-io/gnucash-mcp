@@ -82,14 +82,14 @@
       "type": "boolean",
       "default": true,
       "title": "Include demo books",
-      "description": "Add three explorable sample books alongside yours: Alex (USD freelancer), Lin Wei (Chinese, multi-currency), and Sabine (German, EUR). Say 'switch to the alex book' to explore risk-free."
+      "description": "Adds three sample books to explore — say 'switch to the alex book'."
     },
     "advanced": {
       "type": "string",
       "required": false,
       "default": "",
       "title": "Advanced options",
-      "description": "Leave empty unless you know you need it. Space-separated GNUCASH_*=value settings, e.g. GNUCASH_MCP_DEBUG=1 GNUCASH_LOG_DIR=\"/path/with spaces\" — run the server with --help (or see the README) for the full list."
+      "description": "Leave empty unless you need it. Space-separated GNUCASH_*=value settings — see the README."
     }
   },
   "compatibility": {
