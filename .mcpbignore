@@ -1,8 +1,9 @@
 # Bundle contents are manifest.json, src/, pyproject.toml, uv.lock,
-# README.md, CHANGELOG.md, LICENSE — everything else stays out
-# (specs/v1.5/MCPB_SPEC.md). CLAUDE.local.md may hold personal notes
-# and must never ship; samples/ carries megabytes of demo books plus
-# their .mcp audit/backup state.
+# README.md, CHANGELOG.md, LICENSE, and the Alex demo book — everything
+# else stays out (specs/v1.5/MCPB_SPEC.md). CLAUDE.local.md may hold
+# personal notes and must never ship; samples/ is excluded per-entry
+# (not as a directory) so the negation below can re-include the one
+# demo book the manifest appends to --book.
 .git
 .github
 .idea
@@ -23,7 +24,8 @@ ERROR_TESTING.md
 glama.json
 test.sh
 docs/
-samples/
+samples/*
+!samples/alex-chen-morales.gnucash
 scripts/
 specs/
 tests/

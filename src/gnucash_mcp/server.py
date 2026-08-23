@@ -765,7 +765,15 @@ def _validate_book_paths(
     CLI argument land here, so existence, regular-file, and
     filename-stem uniqueness rules cannot diverge between the two
     interfaces. ``source`` names the interface in error messages.
+
+    Empty entries are dropped rather than resolved — an MCPB host
+    expanding an unset multi-file config could hand --book an empty
+    string, and ``Path("").resolve(strict=True)`` would otherwise
+    "find" the working directory.
     """
+    raw = [p for p in (s.strip() for s in raw) if p]
+    if not raw:
+        raise _BookPathError(f"Invalid {source}: no paths given")
     paths: list[Path] = []
     errors: list[str] = []
     for p in raw:

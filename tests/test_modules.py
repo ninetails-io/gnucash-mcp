@@ -1630,6 +1630,18 @@ class TestBookCliArg:
         with pytest.raises(srv._BookPathError, match=r"Invalid --book"):
             srv._apply_book_args([str(tmp_path / "nope.gnucash")])
 
+    def test_empty_entries_dropped_not_resolved(self, tmp_path):
+        """An MCPB host expanding an unset multi-file config can hand
+        --book an empty string; it must be dropped, never resolved
+        (Path("").resolve(strict=True) "finds" the cwd)."""
+        import gnucash_mcp.server as srv
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        assert srv._validate_book_paths(
+            ["", str(alex), "  "], source="--book"
+        ) == [alex.resolve()]
+        with pytest.raises(srv._BookPathError, match="no paths given"):
+            srv._validate_book_paths(["", "  "], source="--book")
+
     # ── main() integration (failure exits before the module filter,
     #    so the tool registry is untouched) ─────────────────────────
 
