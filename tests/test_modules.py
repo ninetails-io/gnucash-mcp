@@ -1716,6 +1716,114 @@ class TestEnvModuleToggles:
                 assert name in valid, name
 
 
+class TestDemoBooks:
+    """GNUCASH_DEMO_BOOKS / GNUCASH_DEMO_DIR — the MCPB "Include demo
+    books" checkbox. Demos append after the user's books (their first
+    pick stays the startup default), collide softly instead of
+    tripping the stem fail-fast, and serve alone when no user books
+    are configured."""
+
+    @pytest.fixture(autouse=True)
+    def restore_book_state(self, monkeypatch):
+        import gnucash_mcp.server as srv
+        import gnucash_mcp.logging_config as logcfg
+        monkeypatch.delenv("GNUCASH_DEMO_BOOKS", raising=False)
+        monkeypatch.delenv("GNUCASH_DEMO_DIR", raising=False)
+        saved = (srv._book, list(srv._book_paths), srv._current_path)
+        log_saved = (
+            logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
+        )
+        yield
+        srv._book, srv._book_paths, srv._current_path = saved
+        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
+
+    @pytest.fixture
+    def demo_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / "samples"
+        d.mkdir()
+        _make_min_book(d / "beta-demo.gnucash")
+        _make_min_book(d / "alpha-demo.gnucash")
+        monkeypatch.setenv("GNUCASH_DEMO_DIR", str(d))
+        return d
+
+    def test_toggle_unset_yields_nothing(self, demo_dir):
+        from gnucash_mcp.server import _demo_book_paths
+        assert _demo_book_paths() == []
+
+    def test_toggle_false_yields_nothing(self, demo_dir, monkeypatch):
+        from gnucash_mcp.server import _demo_book_paths
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "false")
+        assert _demo_book_paths() == []
+
+    def test_toggle_true_yields_sorted_books(self, demo_dir, monkeypatch):
+        from gnucash_mcp.server import _demo_book_paths
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        names = [p.name for p in _demo_book_paths()]
+        assert names == ["alpha-demo.gnucash", "beta-demo.gnucash"]
+
+    def test_invalid_toggle_raises(self, demo_dir, monkeypatch):
+        from gnucash_mcp.server import _demo_book_paths
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "ture")
+        with pytest.raises(ValueError, match="GNUCASH_DEMO_BOOKS"):
+            _demo_book_paths()
+
+    def test_missing_dir_degrades_to_nothing(self, tmp_path, monkeypatch, capsys):
+        from gnucash_mcp.server import _demo_book_paths
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        monkeypatch.setenv("GNUCASH_DEMO_DIR", str(tmp_path / "gone"))
+        assert _demo_book_paths() == []
+        assert "continuing without" in capsys.readouterr().err
+
+    def test_demos_append_after_user_books(
+        self, demo_dir, tmp_path, monkeypatch
+    ):
+        import gnucash_mcp.server as srv
+        mine = _make_min_book(tmp_path / "mine.gnucash")
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(mine))
+        srv._book_paths = [mine.resolve()]
+        srv._current_path = mine.resolve()
+        srv._append_demo_books()
+        assert [p.name for p in srv._book_paths] == [
+            "mine.gnucash", "alpha-demo.gnucash", "beta-demo.gnucash",
+        ]
+        # User's pick stays the startup default; env mirror composed.
+        assert srv._current_path == mine.resolve()
+        assert os.environ["GNUCASH_BOOK_PATH"] == os.pathsep.join(
+            str(p) for p in srv._book_paths
+        )
+
+    def test_demo_only_mode_when_no_user_books(self, demo_dir, monkeypatch):
+        import gnucash_mcp.server as srv
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", "placeholder")
+        srv._book_paths = []
+        srv._current_path = None
+        srv._append_demo_books()
+        assert [p.name for p in srv._book_paths] == [
+            "alpha-demo.gnucash", "beta-demo.gnucash",
+        ]
+        assert srv._current_path == srv._book_paths[0]
+
+    def test_stem_collision_skips_demo_softly(
+        self, demo_dir, tmp_path, monkeypatch, capsys
+    ):
+        """A user book named like a demo must not brick startup —
+        the colliding demo is skipped with a note; the rest serve."""
+        import gnucash_mcp.server as srv
+        mine = _make_min_book(tmp_path / "alpha-demo.gnucash")
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(mine))
+        srv._book_paths = [mine.resolve()]
+        srv._current_path = mine.resolve()
+        srv._append_demo_books()
+        assert [p.name for p in srv._book_paths] == [
+            "alpha-demo.gnucash", "beta-demo.gnucash",
+        ]
+        assert srv._book_paths[0] == mine.resolve()
+        assert "skipped" in capsys.readouterr().err
+
+
 class TestAdvancedEnvPassthrough:
     """GNUCASH_MCP_ADVANCED — the MCPB "Advanced options" field.
 

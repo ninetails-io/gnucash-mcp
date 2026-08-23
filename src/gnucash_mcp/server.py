@@ -889,6 +889,88 @@ def _apply_book_args(book_args: list[str]) -> None:
     _activate_logging(_current_path)
 
 
+def _demo_book_paths() -> list[Path]:
+    """Bundled demo books to serve alongside the user's own.
+
+    The MCPB manifest sets GNUCASH_DEMO_DIR to the bundle's samples/
+    directory and maps the "Include demo books" checkbox onto
+    GNUCASH_DEMO_BOOKS. Returns the directory's *.gnucash files in
+    sorted order (Alex first, alphabetically) when the toggle is
+    truthy; [] when the toggle is absent/false or the directory is
+    unset or missing — a broken demo must degrade, never brick the
+    user's real books.
+
+    Raises ValueError on an unparseable toggle value (fail fast,
+    same contract as the GNUCASH_ENABLE_* toggles).
+    """
+    raw = os.environ.get("GNUCASH_DEMO_BOOKS")
+    if raw is None:
+        return []
+    norm = raw.strip().lower()
+    if norm in _TOGGLE_FALSE:
+        return []
+    if norm not in _TOGGLE_TRUE:
+        raise ValueError(
+            f"Invalid GNUCASH_DEMO_BOOKS={raw!r}: expected true/false "
+            "(also accepted: 1/0, yes/no, on/off)"
+        )
+    demo_dir = os.environ.get("GNUCASH_DEMO_DIR")
+    if not demo_dir or not demo_dir.strip():
+        return []
+    d = Path(demo_dir).expanduser()
+    if not d.is_dir():
+        print(
+            f"Note: demo books enabled but {d} is not a directory; "
+            "continuing without them.",
+            file=sys.stderr,
+        )
+        return []
+    return sorted(
+        p.resolve() for p in d.glob("*.gnucash") if p.is_file()
+    )
+
+
+def _append_demo_books() -> None:
+    """Append bundled demo books to the active book list.
+
+    Demos always follow the user's own books, so the user's first
+    pick stays the startup default. A demo whose filename stem
+    collides with a configured book is skipped with a stderr note
+    rather than tripping the stem-uniqueness fail-fast — the demo is
+    an optional extra and must not brick startup over a name. When
+    no user books are configured at all, the demos alone become the
+    book list (pure demo mode) and logging activates on the first.
+    The composed list is mirrored into GNUCASH_BOOK_PATH because
+    get_book() re-reads the env whenever ``_book`` is reset.
+    """
+    global _book_paths, _current_path
+    demos = _demo_book_paths()
+    if not demos:
+        return
+    seen = {p.stem.lower() for p in _book_paths}
+    added: list[Path] = []
+    for p in demos:
+        if p.stem.lower() in seen:
+            print(
+                f"Note: bundled demo book {p.name} skipped — a "
+                "configured book shares its filename.",
+                file=sys.stderr,
+            )
+            continue
+        seen.add(p.stem.lower())
+        added.append(p)
+    if not added:
+        return
+    demo_only = not _book_paths
+    _book_paths = _book_paths + added
+    if demo_only:
+        _current_path = _book_paths[0]
+        _activate_logging(_current_path)
+    os.environ["GNUCASH_BOOK_PATH"] = os.pathsep.join(
+        str(p) for p in _book_paths
+    )
+
+
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
@@ -1490,6 +1572,11 @@ Environment variables:
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_DEMO_BOOKS         true/false — serve the demo books found in
+                             GNUCASH_DEMO_DIR (*.gnucash, sorted) after
+                             the user's own books. The MCPB bundle's
+                             "Include demo books" checkbox; with no other
+                             books configured, the demos serve alone.
   GNUCASH_MCP_ADVANCED       Shell-style GNUCASH_*=value pairs applied to
                              the environment before any other setting is
                              read (quoted values may contain spaces). The
@@ -1565,21 +1652,30 @@ def main() -> None:
         except _BookPathError as exc:
             print(str(exc), file=sys.stderr)
             raise SystemExit(2) from None
-        book_path = str(_current_path)
 
-        # Startup format check: an XML-format book (the #1
-        # predictable file-picker mistake) fails here with a message
-        # a non-developer can act on, instead of a piecash
-        # DatabaseError at first tool call.
-        format_errors = [
-            msg for p in _book_paths
-            if (msg := _book_format_error(p)) is not None
-        ]
-        if format_errors:
-            print("\n".join(format_errors), file=sys.stderr)
-            raise SystemExit(2)
-    else:
-        book_path = None
+    # Bundled demo books (MCPB "Include demo books" checkbox) append
+    # AFTER the user's own, so their first pick stays the startup
+    # default; with no user books configured, the demos alone serve
+    # (pure demo mode).
+    try:
+        _append_demo_books()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
+
+    book_path = str(_current_path) if _book_paths else None
+
+    # Startup format check: an XML-format book (the #1 predictable
+    # file-picker mistake) fails here with a message a non-developer
+    # can act on, instead of a piecash DatabaseError at first tool
+    # call.
+    format_errors = [
+        msg for p in _book_paths
+        if (msg := _book_format_error(p)) is not None
+    ]
+    if format_errors:
+        print("\n".join(format_errors), file=sys.stderr)
+        raise SystemExit(2)
 
     # Module selection precedence: --modules, then GNUCASH_MCP_MODULES,
     # then the MCPB bundle's GNUCASH_ENABLE_* checkbox toggles.

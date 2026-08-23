@@ -4,7 +4,7 @@
   "display_name": "GnuCash for Claude",
   "version": "1.4.2",
   "description": "Your GnuCash book in chat: transactions, reports, budgets, reconciliation, invoicing.",
-  "long_description": "Connects Claude to a GnuCash book saved in SQLite format. Enter and categorize transactions (including whole statements in one call), reconcile accounts, run reports (balance sheet, net worth, cash flow, spending), manage budgets and scheduled transactions, and optionally run client invoicing, a full small-business suite, or investment lot tracking. Every write is audit-logged beside the book, and automatic backups are taken before the first write of the day. A demo book (Alex, a freelance developer with clients, investments, and a mortgage) ships in the bundle — say 'switch to the alex book' to explore risk-free; it resets on extension update. First launch needs a network connection while uv downloads Python and dependencies (cached afterward).",
+  "long_description": "Connects Claude to a GnuCash book saved in SQLite format. Enter and categorize transactions (including whole statements in one call), reconcile accounts, run reports (balance sheet, net worth, cash flow, spending), manage budgets and scheduled transactions, and optionally run client invoicing, a full small-business suite, or investment lot tracking. Every write is audit-logged beside the book, and automatic backups are taken before the first write of the day. Three demo books ship in the bundle (toggleable): Alex, a USD freelancer with clients, investments, and a mortgage; Lin Wei, a Chinese multi-currency household; and Sabine, a German EUR book — say 'switch to the alex book' to explore risk-free; they reset on extension update. First launch needs a network connection while uv downloads Python and dependencies (cached afterward).",
   "author": {
     "name": "Stephen",
     "email": "stephen@ninetails.io",
@@ -32,14 +32,15 @@
         "-m",
         "gnucash_mcp",
         "--book",
-        "${user_config.books}",
-        "${__dirname}/samples/alex-chen-morales.gnucash"
+        "${user_config.books}"
       ],
       "env": {
         "GNUCASH_ENABLE_PLANNING": "${user_config.planning}",
         "GNUCASH_ENABLE_INVESTMENTS": "${user_config.investments}",
         "GNUCASH_ENABLE_FREELANCER": "${user_config.freelancer}",
         "GNUCASH_ENABLE_BUSINESS": "${user_config.business}",
+        "GNUCASH_DEMO_BOOKS": "${user_config.demo_books}",
+        "GNUCASH_DEMO_DIR": "${__dirname}/samples",
         "GNUCASH_MCP_ADVANCED": "${user_config.advanced}",
         "GNUCASH_REDACT_PATHS": "1"
       }
@@ -76,6 +77,12 @@
       "default": false,
       "title": "Full business suite",
       "description": "Everything in Client invoicing, plus vendors, bills, and employee expenses"
+    },
+    "demo_books": {
+      "type": "boolean",
+      "default": true,
+      "title": "Include demo books",
+      "description": "Add three explorable sample books alongside yours: Alex (USD freelancer), Lin Wei (Chinese, multi-currency), and Sabine (German, EUR). Say 'switch to the alex book' to explore risk-free."
     },
     "advanced": {
       "type": "string",
