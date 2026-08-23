@@ -32,6 +32,57 @@ ArgModelBase.model_config = {
     "extra": "forbid",
 }
 
+# ── Advanced-options passthrough ────────────────────────────────────
+# GNUCASH_MCP_ADVANCED holds shell-style KEY=VALUE pairs (shlex
+# rules, so quoted values may contain spaces) applied into the
+# process environment before ANY other configuration is read. This
+# is the MCPB bundle's escape hatch: the manifest maps one optional
+# "Advanced options" text field onto this variable, giving bundle
+# users the entire GNUCASH_* env surface (debug, audit, log/backup
+# location, redaction, FX guards, rate limits) without a checkbox
+# per knob. Keys are restricted to the GNUCASH_* namespace — this is
+# a server-options field, not a general environment editor — and the
+# pairs OVERRIDE existing values, since the manifest itself sets
+# GNUCASH_REDACT_PATHS=1 and the box must be able to turn that off.
+# Applied here, before the module-level debug/audit/book seeds below
+# and before sibling modules import; malformed input is recorded and
+# fail-fasted in main() (import must stay side-effect-safe for
+# tests and inspection tooling).
+_advanced_env_errors: list[str] = []
+
+
+def _apply_advanced_env() -> None:
+    """Parse GNUCASH_MCP_ADVANCED into environment overrides."""
+    raw = os.environ.get("GNUCASH_MCP_ADVANCED")
+    if not raw or not raw.strip():
+        return
+    import re
+    import shlex
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        _advanced_env_errors.append(
+            f"Invalid advanced options (GNUCASH_MCP_ADVANCED): {exc}"
+        )
+        return
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if (
+            not sep
+            or not re.fullmatch(r"GNUCASH_[A-Z0-9_]+", key)
+            or key == "GNUCASH_MCP_ADVANCED"
+        ):
+            _advanced_env_errors.append(
+                f"Invalid advanced option {token!r}: expected "
+                "GNUCASH_*=value pairs, e.g. GNUCASH_MCP_DEBUG=1 "
+                'GNUCASH_LOG_DIR="/path/with spaces"'
+            )
+            continue
+        os.environ[key] = value
+
+
+_apply_advanced_env()
+
 from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
 from gnucash_mcp.tools._helpers import _json, safe_tool
@@ -1439,6 +1490,11 @@ Environment variables:
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=1        Enable debug logging
   GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_MCP_ADVANCED       Shell-style GNUCASH_*=value pairs applied to
+                             the environment before any other setting is
+                             read (quoted values may contain spaces). The
+                             MCPB bundle's "Advanced options" field maps
+                             here; pairs override already-set variables.
   GNUCASH_LOG_DIR            Relocate .mcp storage (audit, debug, backups).
                              Each book gets its own subdirectory:
                              {{GNUCASH_LOG_DIR}}/{{book}}.mcp
@@ -1473,6 +1529,13 @@ def main() -> None:
 
     global _book_paths, _current_path, _logging_debug, _logging_audit
     global _book_class
+
+    # Advanced-options errors surfaced first: the pairs were applied
+    # (or rejected) at import, but a typo'd option must kill startup
+    # loudly, not silently run with the default it meant to change.
+    if _advanced_env_errors:
+        print("\n".join(_advanced_env_errors), file=sys.stderr)
+        raise SystemExit(2)
 
     # Parse CLI flags first — --book must win over GNUCASH_BOOK_PATH
     # below. Fail-fast rationale lives on _parse_cli_argv.
@@ -1598,7 +1661,10 @@ def main() -> None:
         "book_path": book_path or "not set",
         "book_paths": [p.name for p in _book_paths],
         "current_book": _current_path.name if _current_path else None,
-        "debug": debug_flag,
+        # Effective mode, not just the CLI flag — debug enabled via
+        # GNUCASH_MCP_DEBUG (or the advanced-options box) must not
+        # display as "Debug mode: false".
+        "debug": _logging_debug,
         "default_currency_ok": currency_ok,
     })
 

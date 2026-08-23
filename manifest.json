@@ -40,6 +40,7 @@
         "GNUCASH_ENABLE_INVESTMENTS": "${user_config.investments}",
         "GNUCASH_ENABLE_FREELANCER": "${user_config.freelancer}",
         "GNUCASH_ENABLE_BUSINESS": "${user_config.business}",
+        "GNUCASH_MCP_ADVANCED": "${user_config.advanced}",
         "GNUCASH_REDACT_PATHS": "1"
       }
     }
@@ -75,6 +76,13 @@
       "default": false,
       "title": "Full business suite",
       "description": "Everything in Client invoicing, plus vendors, bills, and employee expenses"
+    },
+    "advanced": {
+      "type": "string",
+      "required": false,
+      "default": "",
+      "title": "Advanced options",
+      "description": "Leave empty unless you know you need it. Space-separated GNUCASH_*=value settings, e.g. GNUCASH_MCP_DEBUG=1 GNUCASH_LOG_DIR=\"/path/with spaces\" — run the server with --help (or see the README) for the full list."
     }
   },
   "compatibility": {

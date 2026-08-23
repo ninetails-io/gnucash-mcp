@@ -1716,6 +1716,90 @@ class TestEnvModuleToggles:
                 assert name in valid, name
 
 
+class TestAdvancedEnvPassthrough:
+    """GNUCASH_MCP_ADVANCED — the MCPB "Advanced options" field.
+
+    Shell-style GNUCASH_*=value pairs applied into the environment at
+    import time, overriding already-set variables (the manifest sets
+    GNUCASH_REDACT_PATHS=1; the box must be able to turn it off).
+    Malformed input is recorded in _advanced_env_errors and
+    fail-fasted by main().
+    """
+
+    @pytest.fixture(autouse=True)
+    def restore_env_and_errors(self):
+        import gnucash_mcp.server as srv
+        saved_errors = list(srv._advanced_env_errors)
+        saved_env = {
+            k: v for k, v in os.environ.items() if k.startswith("GNUCASH")
+        }
+        yield
+        srv._advanced_env_errors[:] = saved_errors
+        for k in [k for k in os.environ if k.startswith("GNUCASH")]:
+            if k not in saved_env:
+                del os.environ[k]
+        os.environ.update(saved_env)
+
+    def _run(self, value):
+        import gnucash_mcp.server as srv
+        srv._advanced_env_errors.clear()
+        os.environ["GNUCASH_MCP_ADVANCED"] = value
+        srv._apply_advanced_env()
+        return srv._advanced_env_errors
+
+    def test_pairs_applied_and_override_existing(self):
+        os.environ["GNUCASH_REDACT_PATHS"] = "1"
+        errors = self._run(
+            "GNUCASH_MCP_DEBUG=1 GNUCASH_REDACT_PATHS=0"
+        )
+        assert errors == []
+        assert os.environ["GNUCASH_MCP_DEBUG"] == "1"
+        assert os.environ["GNUCASH_REDACT_PATHS"] == "0"
+
+    def test_quoted_value_keeps_spaces(self):
+        errors = self._run('GNUCASH_LOG_DIR="/Volumes/My Backups"')
+        assert errors == []
+        assert os.environ["GNUCASH_LOG_DIR"] == "/Volumes/My Backups"
+
+    def test_empty_value_is_a_noop(self):
+        import gnucash_mcp.server as srv
+        srv._advanced_env_errors.clear()
+        os.environ["GNUCASH_MCP_ADVANCED"] = "   "
+        srv._apply_advanced_env()
+        assert srv._advanced_env_errors == []
+
+    def test_non_gnucash_key_rejected_valid_pairs_still_apply(self):
+        errors = self._run("PATH=/tmp GNUCASH_FX_GUARD_DAYS=14")
+        assert len(errors) == 1
+        assert "PATH=/tmp" in errors[0]
+        assert os.environ["GNUCASH_FX_GUARD_DAYS"] == "14"
+        assert os.environ["PATH"] != "/tmp"
+
+    def test_bare_token_without_equals_rejected(self):
+        errors = self._run("GNUCASH_MCP_DEBUG")
+        assert len(errors) == 1
+        assert "GNUCASH_MCP_DEBUG" in errors[0]
+
+    def test_self_reference_rejected(self):
+        errors = self._run("GNUCASH_MCP_ADVANCED=recursion")
+        assert len(errors) == 1
+
+    def test_main_fails_fast_on_recorded_errors(
+        self, monkeypatch, capsys
+    ):
+        import sys as _sys
+        import gnucash_mcp.server as srv
+        monkeypatch.setattr(
+            srv, "_advanced_env_errors", ["Invalid advanced option 'x'"]
+        )
+        monkeypatch.setattr(_sys, "argv", ["gnucash-mcp"])
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        with pytest.raises(SystemExit) as excinfo:
+            srv.main()
+        assert excinfo.value.code == 2
+        assert "Invalid advanced option" in capsys.readouterr().err
+
+
 class TestBookFormatSniff:
     """Startup rejects non-SQLite books with a message a
     non-developer can act on (the XML-format file-picker mistake)."""
