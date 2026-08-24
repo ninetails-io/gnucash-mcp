@@ -1,0 +1,56 @@
+# First CI for gnucash-mcp. Two jobs:
+#
+#   test    — the full pytest suite against the LOCKED dependency set,
+#             on the oldest supported Python (3.10 — the GDATE
+#             date.fromisoformat class of bug only bites there) and a
+#             current one. `uv sync --locked` fails if uv.lock is out
+#             of date with pyproject.toml, which is exactly the
+#             stale-lockfile mistake v1.4.1 shipped with.
+#
+#   bundle  — validates manifest.json and packs the MCPB via the same
+#             script humans run (scripts/build_bundle.sh), then
+#             uploads the .mcpb as a build artifact: every PR gets a
+#             downloadable bundle from the Actions run page.
+#
+# Triggers: every PR, and pushes to the two long-lived branches.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install dependencies (locked)
+        run: uv sync --locked --python ${{ matrix.python }}
+      - name: Run test suite
+        run: uv run --python ${{ matrix.python }} pytest -q
+
+  bundle:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build the MCPB bundle
+        run: bash scripts/build_bundle.sh
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnucash-mcp-bundle
+          path: dist/*.mcpb
+          if-no-files-found: error
