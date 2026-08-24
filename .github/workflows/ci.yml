@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.0.1
       # --extra dev: pytest lives in [project.optional-dependencies],
       # and uv installs extras only when asked (first CI run failed
       # with "Failed to spawn: pytest" — the local venv had the extra
@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.0.1
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
