@@ -28,9 +28,9 @@ jobs:
       matrix:
         python: ["3.10", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10
       # --extra dev: pytest lives in [project.optional-dependencies],
       # and uv installs extras only when asked (first CI run failed
       # with "Failed to spawn: pytest" — the local venv had the extra
@@ -44,16 +44,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-node@v4
+        uses: astral-sh/setup-uv@v10
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Build the MCPB bundle
         run: bash scripts/build_bundle.sh
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gnucash-mcp-bundle
           path: dist/*.mcpb
