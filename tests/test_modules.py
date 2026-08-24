@@ -919,6 +919,32 @@ def _make_min_book(path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def book_state_guard():
+    """Snapshot/restore every global the book-list paths touch.
+
+    One superset guard shared by every class that pokes book state —
+    per-class subsets drifted (one saved the registry, one skipped
+    logging_config) and a test touching an unsaved global would leak
+    order-dependent state into whichever class runs next.
+    """
+    import gnucash_mcp.logging_config as logcfg
+    import gnucash_mcp.server as srv
+    saved = (
+        srv._book, list(srv._book_paths), srv._current_path,
+        srv._book_paths_source, dict(srv._book_registry),
+        srv._logging_debug, srv._logging_audit,
+    )
+    log_saved = (
+        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
+    )
+    yield
+    (srv._book, srv._book_paths, srv._current_path,
+     srv._book_paths_source, srv._book_registry,
+     srv._logging_debug, srv._logging_audit) = saved
+    logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
+
+
 class TestMultiBook:
     """Comma-separated GNUCASH_BOOK_PATH, the switch_book tool, and the
     current-book surfacing in get_server_config / get_book_summary."""
@@ -940,6 +966,7 @@ class TestMultiBook:
             "_book": srv._book,
             "_book_paths": list(srv._book_paths),
             "_current_path": srv._current_path,
+            "_book_paths_source": srv._book_paths_source,
             "_book_registry": dict(srv._book_registry),
             "_logging_debug": srv._logging_debug,
             "_logging_audit": srv._logging_audit,
@@ -954,6 +981,7 @@ class TestMultiBook:
         srv._book = saved["_book"]
         srv._book_paths = saved["_book_paths"]
         srv._current_path = saved["_current_path"]
+        srv._book_paths_source = saved["_book_paths_source"]
         srv._book_registry = saved["_book_registry"]
         srv._logging_debug = saved["_logging_debug"]
         srv._logging_audit = saved["_logging_audit"]
@@ -1565,21 +1593,8 @@ class TestBookCliArg:
     """
 
     @pytest.fixture(autouse=True)
-    def restore_book_state(self):
-        import gnucash_mcp.server as srv
-        import gnucash_mcp.logging_config as logcfg
-
-        saved = (
-            srv._book, list(srv._book_paths), srv._current_path,
-            dict(srv._book_registry),
-        )
-        log_saved = (
-            logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
-        )
-        yield
-        srv._book, srv._book_paths, srv._current_path = saved[:3]
-        srv._book_registry = saved[3]
-        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
+    def _state(self, book_state_guard):
+        pass
 
     # ── _parse_cli_argv ────────────────────────────────────────────
 
@@ -1629,6 +1644,62 @@ class TestBookCliArg:
         import gnucash_mcp.server as srv
         with pytest.raises(srv._BookPathError, match=r"Invalid --book"):
             srv._apply_book_args([str(tmp_path / "nope.gnucash")])
+
+    def test_get_book_skips_reparse_of_own_mirror(
+        self, tmp_path, monkeypatch
+    ):
+        """After --book install, a _book=None reset must reuse the
+        validated list instead of re-splitting the mirrored env value
+        — re-parsing would shatter a path containing os.pathsep and
+        re-stat every book (PR #153 review, mirror-corruption bug)."""
+        import gnucash_mcp.server as srv
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        srv._apply_book_args([str(alex)])
+        srv._book = None
+
+        def _boom(value):
+            raise AssertionError("mirror was re-parsed")
+
+        monkeypatch.setattr(srv, "_parse_book_paths", _boom)
+        assert srv.get_book() is not None
+        assert srv._current_path == alex.resolve()
+
+    def test_get_book_reparses_on_genuine_env_swap(
+        self, tmp_path, monkeypatch
+    ):
+        """The test-contract half of the same coin: a genuinely
+        swapped GNUCASH_BOOK_PATH plus a _book reset still re-reads
+        the env."""
+        import gnucash_mcp.server as srv
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        beast = _make_min_book(tmp_path / "beast-man.gnucash")
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        srv._apply_book_args([str(alex)])
+        srv._book = None
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(beast))
+        srv.get_book()
+        assert srv._current_path == beast.resolve()
+
+    def test_noaudit_modes_tear_down_logging_on_install(
+        self, tmp_path, monkeypatch
+    ):
+        """With both logging modes off (main's --noaudit merge runs
+        BEFORE book install), installing books must clear/disable the
+        audit logger, not skip activation — setup_logging is the only
+        handler-clearing path (PR #153 review, --noaudit ordering)."""
+        import logging as _logging
+
+        import gnucash_mcp.server as srv
+        from gnucash_mcp.logging_config import AUDIT_LOGGER_NAME
+        alex = _make_min_book(tmp_path / "alex.gnucash")
+        monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)
+        srv._logging_debug = False
+        srv._logging_audit = False
+        srv._apply_book_args([str(alex)])
+        audit_logger = _logging.getLogger(AUDIT_LOGGER_NAME)
+        assert audit_logger.handlers == []
+        assert audit_logger.level > _logging.CRITICAL
 
     def test_empty_entries_dropped_not_resolved(self, tmp_path):
         """An MCPB host expanding an unset multi-file config can hand
@@ -1724,18 +1795,9 @@ class TestDemoBooks:
     are configured."""
 
     @pytest.fixture(autouse=True)
-    def restore_book_state(self, monkeypatch):
-        import gnucash_mcp.server as srv
-        import gnucash_mcp.logging_config as logcfg
+    def _state(self, book_state_guard, monkeypatch):
         monkeypatch.delenv("GNUCASH_DEMO_BOOKS", raising=False)
         monkeypatch.delenv("GNUCASH_DEMO_DIR", raising=False)
-        saved = (srv._book, list(srv._book_paths), srv._current_path)
-        log_saved = (
-            logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func,
-        )
-        yield
-        srv._book, srv._book_paths, srv._current_path = saved
-        logcfg._book_path_str, logcfg._log_dir, logcfg._get_book_func = log_saved
 
     @pytest.fixture
     def demo_dir(self, tmp_path, monkeypatch):
@@ -1913,11 +1975,8 @@ class TestBookFormatSniff:
     non-developer can act on (the XML-format file-picker mistake)."""
 
     @pytest.fixture(autouse=True)
-    def restore_book_state(self):
-        import gnucash_mcp.server as srv
-        saved = (srv._book, list(srv._book_paths), srv._current_path)
-        yield
-        srv._book, srv._book_paths, srv._current_path = saved
+    def _state(self, book_state_guard):
+        pass
 
     def test_sqlite_book_passes(self, tmp_path):
         from gnucash_mcp.server import _book_format_error

@@ -741,6 +741,11 @@ _book_paths: list[Path] = []
 _current_path: Path | None = None
 _book_registry: dict[str, GnuCashBook] = {}
 _book = None
+# The exact GNUCASH_BOOK_PATH string _book_paths was derived from (or
+# mirrored into). get_book() re-parses the env ONLY when the live value
+# differs from this — re-splitting our own mirror would corrupt any
+# validated path containing os.pathsep and re-stat every book.
+_book_paths_source: str | None = None
 
 # Effective logging mode. Seeded from env at import; main() may widen
 # it via the --debug / --noaudit CLI flags. switch_book reads these to
@@ -868,25 +873,57 @@ def _validate_book_paths(
     return paths
 
 
+def _install_book_list(paths: list[Path], *, activate: bool) -> None:
+    """Install ``paths`` as the active book list.
+
+    The single owner of the book-list invariant triple — the
+    ``_book_paths``/``_current_path`` globals, the GNUCASH_BOOK_PATH
+    env mirror, and (when ``activate``) logging activation. Every
+    composition site (--book args, the env var, demo append, and any
+    future source) must route here rather than hand-sync the triple.
+
+    The mirror exists because get_book() re-reads the env whenever
+    ``_book`` is reset; the mirrored string is also cached in
+    ``_book_paths_source`` so get_book() can tell "the value I
+    mirrored" from a genuinely swapped one — re-splitting our own
+    mirror on os.pathsep would shatter a validated path that happens
+    to contain the separator (a ``Budget: 2026.gnucash`` picked in
+    the bundle's file dialog).
+
+    ``_current_path`` survives when it appears in the new list (demo
+    append behind an active book); otherwise it resets to the first
+    entry and the cached ``_book`` instance is dropped.
+
+    Pass ``activate=True`` when this install is the moment logging
+    should (re-)point at the current book: books arriving via CLI
+    (the import-time logging block never saw them), pure demo mode,
+    or CLI logging flags changing the effective modes.
+    """
+    global _book_paths, _current_path, _book, _book_paths_source
+    _book_paths = list(paths)
+    if _current_path not in _book_paths:
+        _current_path = _book_paths[0]
+        _book = None
+    mirrored = os.pathsep.join(str(p) for p in _book_paths)
+    os.environ["GNUCASH_BOOK_PATH"] = mirrored
+    _book_paths_source = mirrored
+    if activate:
+        _activate_logging(_current_path)
+
+
 def _apply_book_args(book_args: list[str]) -> None:
     """Install --book CLI paths as the active book list.
 
-    Args win over GNUCASH_BOOK_PATH. The resolved list is mirrored
-    back into the env var (os.pathsep-joined) because get_book()
-    re-reads the env whenever ``_book`` is reset — without the
-    mirror, a test-style reset would silently fall back to the
-    env's books. Logging is (re-)pointed here too: when the books
-    arrive via CLI only, the import-time logging block never ran
-    (it reads the env, which was unset at import).
+    Args win over GNUCASH_BOOK_PATH. Always activates logging: when
+    the books arrive via CLI, the import-time logging block never ran
+    (it reads the env, which was unset or different at import) — and
+    main() folds CLI logging flags into the effective modes before
+    calling here, so the activation sees the final debug/audit state.
     """
-    global _book_paths, _current_path, _book
-    _book_paths = _validate_book_paths(book_args, source="--book")
-    _current_path = _book_paths[0]
-    _book = None
-    os.environ["GNUCASH_BOOK_PATH"] = os.pathsep.join(
-        str(p) for p in _book_paths
+    _install_book_list(
+        _validate_book_paths(book_args, source="--book"),
+        activate=True,
     )
-    _activate_logging(_current_path)
 
 
 def _demo_book_paths() -> list[Path]:
@@ -940,10 +977,9 @@ def _append_demo_books() -> None:
     an optional extra and must not brick startup over a name. When
     no user books are configured at all, the demos alone become the
     book list (pure demo mode) and logging activates on the first.
-    The composed list is mirrored into GNUCASH_BOOK_PATH because
-    get_book() re-reads the env whenever ``_book`` is reset.
+    List installation (globals, env mirror, activation) is
+    _install_book_list's job.
     """
-    global _book_paths, _current_path
     demos = _demo_book_paths()
     if not demos:
         return
@@ -962,13 +998,7 @@ def _append_demo_books() -> None:
     if not added:
         return
     demo_only = not _book_paths
-    _book_paths = _book_paths + added
-    if demo_only:
-        _current_path = _book_paths[0]
-        _activate_logging(_current_path)
-    os.environ["GNUCASH_BOOK_PATH"] = os.pathsep.join(
-        str(p) for p in _book_paths
-    )
+    _install_book_list(_book_paths + added, activate=demo_only)
 
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -1035,11 +1065,17 @@ def get_book():
     forces re-initialization from the environment — the reset point
     tests rely on.
     """
-    global _book, _current_path, _book_paths
+    global _book, _current_path, _book_paths, _book_paths_source
     if _book is None:
         # Re-read the env so a test that swapped GNUCASH_BOOK_PATH and
-        # reset _book picks up the new value.
-        _book_paths = _parse_book_paths(os.environ.get("GNUCASH_BOOK_PATH"))
+        # reset _book picks up the new value — but ONLY when the value
+        # actually differs from the one _book_paths came from.
+        # Re-splitting our own mirror would corrupt a validated path
+        # containing os.pathsep and re-stat every book per reset.
+        env_val = os.environ.get("GNUCASH_BOOK_PATH")
+        if not _book_paths or env_val != _book_paths_source:
+            _book_paths = _parse_book_paths(env_val)
+            _book_paths_source = env_val
         if _current_path not in _book_paths:
             _current_path = _book_paths[0]
         _book = _book_for(_current_path)
@@ -1051,15 +1087,17 @@ def _activate_logging(path: Path) -> None:
 
     Used on book switch so each book's writes land in its own
     .mcp/audit trail. setup_logging clears its handlers on every call,
-    so repeated invocations don't stack handlers.
+    so repeated invocations don't stack handlers — and with both
+    modes off it clears WITHOUT reinstalling, which is why this call
+    is unconditional: a --noaudit startup must tear down handlers the
+    import-time block already installed, not skip past them.
     """
-    if _logging_audit or _logging_debug:
-        setup_logging(
-            book_path=str(path),
-            debug=_logging_debug,
-            audit=_logging_audit,
-            get_book=get_book,
-        )
+    setup_logging(
+        book_path=str(path),
+        debug=_logging_debug,
+        audit=_logging_audit,
+        get_book=get_book,
+    )
 
 
 def _book_orientation(book_instance) -> str:
@@ -1614,8 +1652,7 @@ def main() -> None:
         print(_build_help_text())
         sys.exit(0)
 
-    global _book_paths, _current_path, _logging_debug, _logging_audit
-    global _book_class
+    global _logging_debug, _logging_audit, _book_class
 
     # Advanced-options errors surfaced first: the pairs were applied
     # (or rejected) at import, but a typo'd option must kill startup
@@ -1635,6 +1672,16 @@ def main() -> None:
         raise SystemExit(2) from None
     del sys.argv[1:]
 
+    # Fold CLI logging flags into the effective modes BEFORE any book
+    # installation can activate logging — activation must see the
+    # final debug/audit state. (Activating first and re-initializing
+    # later left --noaudit's teardown unreachable: the old re-init
+    # guard skipped setup_logging when both modes were off, and
+    # setup_logging is the only handler-clearing path.)
+    if debug_flag or noaudit_flag:
+        _logging_debug = debug_flag or _debug_mode
+        _logging_audit = (not noaudit_flag) and _audit_mode
+
     # Resolve the book list: --book args win; otherwise
     # GNUCASH_BOOK_PATH (one path or an os.pathsep-separated list).
     # Fail fast on any invalid/duplicate entry (neither set is
@@ -1647,8 +1694,13 @@ def main() -> None:
             if book_args:
                 _apply_book_args(book_args)
             else:
-                _book_paths = _parse_book_paths(raw_book_path)
-                _current_path = _book_paths[0]
+                # Env-configured books: import-time logging already
+                # points at the first one, so re-activate only when
+                # the CLI flags changed the effective modes.
+                _install_book_list(
+                    _parse_book_paths(raw_book_path),
+                    activate=debug_flag or noaudit_flag,
+                )
         except _BookPathError as exc:
             print(str(exc), file=sys.stderr)
             raise SystemExit(2) from None
@@ -1688,23 +1740,14 @@ def main() -> None:
             print(str(exc), file=sys.stderr)
             raise SystemExit(2) from None
 
-    # Re-init logging if CLI flags override env vars. Update the
-    # effective-mode globals so switch_book repoints with the same
-    # debug/audit settings.
-    if debug_flag or noaudit_flag:
-        audit_enabled = not noaudit_flag
-        _logging_debug = debug_flag or _debug_mode
-        _logging_audit = audit_enabled and _audit_mode
-        if book_path and (_logging_audit or _logging_debug):
-            setup_logging(
-                book_path=book_path,
-                debug=_logging_debug,
-                audit=_logging_audit,
-                get_book=get_book,
-            )
-            if _logging_debug:
-                debug_log(f"Server starting via CLI. Book: {book_path}")
-                debug_log(f"Debug logging enabled, audit={'enabled' if _logging_audit else 'disabled'}")
+    # Logging was activated (or torn down) by the book-list install
+    # above with the flag-merged modes; only the breadcrumbs remain.
+    if book_path and _logging_debug:
+        debug_log(f"Server starting via CLI. Book: {book_path}")
+        debug_log(
+            "Debug logging enabled, audit="
+            f"{'enabled' if _logging_audit else 'disabled'}"
+        )
 
     # Validate and apply module filter (also lazy-loads extracted modules)
     _validate_module_groups()
