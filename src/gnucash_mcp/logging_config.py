@@ -16,6 +16,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable
 
+from gnucash_mcp._env import _TOGGLE_TRUE
+
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
 DEBUG_LOGGER_NAME = "gnucash_mcp.debug"
 
@@ -145,7 +147,9 @@ def redact_paths(text: str) -> str:
     bit. POSIX and Windows absolute paths match; relative paths
     pass through (they don't leak layout).
     """
-    if os.environ.get("GNUCASH_REDACT_PATHS") != "1":
+    # Full toggle vocabulary, not just "1" — the MCPB Advanced box
+    # renders booleans as "true", and =="1" made that a silent no-op.
+    if os.environ.get("GNUCASH_REDACT_PATHS", "").strip().lower() not in _TOGGLE_TRUE:
         return text
 
     import re

@@ -1935,19 +1935,19 @@ class TestAdvancedEnvPassthrough:
     Shell-style GNUCASH_*=value pairs applied into the environment at
     import time, overriding already-set variables (the manifest sets
     GNUCASH_REDACT_PATHS=1; the box must be able to turn it off).
-    Malformed input is recorded in _advanced_env_errors and
+    Malformed input is recorded in _env_errors and
     fail-fasted by main().
     """
 
     @pytest.fixture(autouse=True)
     def restore_env_and_errors(self):
         import gnucash_mcp.server as srv
-        saved_errors = list(srv._advanced_env_errors)
+        saved_errors = list(srv._env_errors)
         saved_env = {
             k: v for k, v in os.environ.items() if k.startswith("GNUCASH")
         }
         yield
-        srv._advanced_env_errors[:] = saved_errors
+        srv._env_errors[:] = saved_errors
         for k in [k for k in os.environ if k.startswith("GNUCASH")]:
             if k not in saved_env:
                 del os.environ[k]
@@ -1955,10 +1955,10 @@ class TestAdvancedEnvPassthrough:
 
     def _run(self, value):
         import gnucash_mcp.server as srv
-        srv._advanced_env_errors.clear()
+        srv._env_errors.clear()
         os.environ["GNUCASH_MCP_ADVANCED"] = value
         srv._apply_advanced_env()
-        return srv._advanced_env_errors
+        return srv._env_errors
 
     def test_pairs_applied_and_override_existing(self):
         os.environ["GNUCASH_REDACT_PATHS"] = "1"
@@ -1976,10 +1976,10 @@ class TestAdvancedEnvPassthrough:
 
     def test_empty_value_is_a_noop(self):
         import gnucash_mcp.server as srv
-        srv._advanced_env_errors.clear()
+        srv._env_errors.clear()
         os.environ["GNUCASH_MCP_ADVANCED"] = "   "
         srv._apply_advanced_env()
-        assert srv._advanced_env_errors == []
+        assert srv._env_errors == []
 
     def test_non_gnucash_key_rejected_valid_pairs_still_apply(self):
         errors = self._run("PATH=/tmp GNUCASH_FX_GUARD_DAYS=14")
@@ -1997,13 +1997,49 @@ class TestAdvancedEnvPassthrough:
         errors = self._run("GNUCASH_MCP_ADVANCED=recursion")
         assert len(errors) == 1
 
+    def test_book_path_rejected_with_picker_pointer(self):
+        """GNUCASH_BOOK_PATH would be silently clobbered by the
+        --book mirror — the box must refuse it loudly instead
+        (PR #153 review)."""
+        errors = self._run("GNUCASH_BOOK_PATH=/x.gnucash")
+        assert len(errors) == 1
+        assert "book picker" in errors[0]
+
+    def test_windows_backslash_path_survives(self):
+        r"""POSIX shlex escapes ate unquoted backslashes
+        (C:\Temp -> C:Temp) and applied the mangled value silently;
+        escaping is disabled now (PR #153 review)."""
+        errors = self._run(r"GNUCASH_LOG_DIR=C:\Temp\gnclogs")
+        assert errors == []
+        assert os.environ["GNUCASH_LOG_DIR"] == r"C:\Temp\gnclogs"
+
+    def test_legacy_debug_vocab_accepts_true(self):
+        """GNUCASH_MCP_DEBUG=true (the vocabulary every checkbox in
+        the same dialog uses) must parse as ON via the shared toggle
+        parser, not silently fail an =='1' check."""
+        import gnucash_mcp.server as srv
+        os.environ["GNUCASH_MCP_DEBUG"] = "true"
+        assert srv._seed_toggle("GNUCASH_MCP_DEBUG", default=False) is True
+        os.environ["GNUCASH_MCP_DEBUG"] = "1"
+        assert srv._seed_toggle("GNUCASH_MCP_DEBUG", default=False) is True
+
+    def test_seed_toggle_records_garbage_for_main(self):
+        """A garbage value can't raise at import; it lands in
+        _env_errors for main() to fail-fast on."""
+        import gnucash_mcp.server as srv
+        srv._env_errors.clear()
+        os.environ["GNUCASH_MCP_DEBUG"] = "maybe"
+        assert srv._seed_toggle("GNUCASH_MCP_DEBUG", default=False) is False
+        assert len(srv._env_errors) == 1
+        assert "GNUCASH_MCP_DEBUG" in srv._env_errors[0]
+
     def test_main_fails_fast_on_recorded_errors(
         self, monkeypatch, capsys
     ):
         import sys as _sys
         import gnucash_mcp.server as srv
         monkeypatch.setattr(
-            srv, "_advanced_env_errors", ["Invalid advanced option 'x'"]
+            srv, "_env_errors", ["Invalid advanced option 'x'"]
         )
         monkeypatch.setattr(_sys, "argv", ["gnucash-mcp"])
         monkeypatch.delenv("GNUCASH_BOOK_PATH", raising=False)

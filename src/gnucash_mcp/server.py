@@ -32,56 +32,17 @@ ArgModelBase.model_config = {
     "extra": "forbid",
 }
 
-# ── Advanced-options passthrough ────────────────────────────────────
-# GNUCASH_MCP_ADVANCED holds shell-style KEY=VALUE pairs (shlex
-# rules, so quoted values may contain spaces) applied into the
-# process environment before ANY other configuration is read. This
-# is the MCPB bundle's escape hatch: the manifest maps one optional
-# "Advanced options" text field onto this variable, giving bundle
-# users the entire GNUCASH_* env surface (debug, audit, log/backup
-# location, redaction, FX guards, rate limits) without a checkbox
-# per knob. Keys are restricted to the GNUCASH_* namespace — this is
-# a server-options field, not a general environment editor — and the
-# pairs OVERRIDE existing values, since the manifest itself sets
-# GNUCASH_REDACT_PATHS=1 and the box must be able to turn that off.
-# Applied here, before the module-level debug/audit/book seeds below
-# and before sibling modules import; malformed input is recorded and
-# fail-fasted in main() (import must stay side-effect-safe for
-# tests and inspection tooling).
-_advanced_env_errors: list[str] = []
-
-
-def _apply_advanced_env() -> None:
-    """Parse GNUCASH_MCP_ADVANCED into environment overrides."""
-    raw = os.environ.get("GNUCASH_MCP_ADVANCED")
-    if not raw or not raw.strip():
-        return
-    import re
-    import shlex
-    try:
-        tokens = shlex.split(raw)
-    except ValueError as exc:
-        _advanced_env_errors.append(
-            f"Invalid advanced options (GNUCASH_MCP_ADVANCED): {exc}"
-        )
-        return
-    for token in tokens:
-        key, sep, value = token.partition("=")
-        if (
-            not sep
-            or not re.fullmatch(r"GNUCASH_[A-Z0-9_]+", key)
-            or key == "GNUCASH_MCP_ADVANCED"
-        ):
-            _advanced_env_errors.append(
-                f"Invalid advanced option {token!r}: expected "
-                "GNUCASH_*=value pairs, e.g. GNUCASH_MCP_DEBUG=1 "
-                'GNUCASH_LOG_DIR="/path/with spaces"'
-            )
-            continue
-        os.environ[key] = value
-
-
-_apply_advanced_env()
+# The advanced-options passthrough (GNUCASH_MCP_ADVANCED) lives in
+# gnucash_mcp/_env.py and is applied at the top of the package
+# __init__ — before this module or any sibling imports — so the
+# seeds below already see its overrides. main() fail-fasts on any
+# recorded _env_errors; harnesses that bypass main() (mcp dev,
+# pytest) still see them on stderr at import.
+from gnucash_mcp._env import (
+    _apply_advanced_env,
+    _env_errors,
+    _parse_env_toggle,
+)
 
 from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
@@ -940,17 +901,8 @@ def _demo_book_paths() -> list[Path]:
     Raises ValueError on an unparseable toggle value (fail fast,
     same contract as the GNUCASH_ENABLE_* toggles).
     """
-    raw = os.environ.get("GNUCASH_DEMO_BOOKS")
-    if raw is None:
+    if not _parse_env_toggle("GNUCASH_DEMO_BOOKS"):
         return []
-    norm = raw.strip().lower()
-    if norm in _TOGGLE_FALSE:
-        return []
-    if norm not in _TOGGLE_TRUE:
-        raise ValueError(
-            f"Invalid GNUCASH_DEMO_BOOKS={raw!r}: expected true/false "
-            "(also accepted: 1/0, yes/no, on/off)"
-        )
     demo_dir = os.environ.get("GNUCASH_DEMO_DIR")
     if not demo_dir or not demo_dir.strip():
         return []
@@ -1283,8 +1235,22 @@ def _switch_book_impl(name: str) -> str:
 # Use GNUCASH_MCP_DEBUG=1 env var to enable debug logging
 # Use GNUCASH_MCP_NOAUDIT=1 env var to disable audit logging
 # Logs are stored alongside the book file: {book_path}.mcp/audit/ and {book_path}.mcp/debug/
-_debug_mode = os.environ.get("GNUCASH_MCP_DEBUG") == "1"
-_audit_mode = os.environ.get("GNUCASH_MCP_NOAUDIT") != "1"
+def _seed_toggle(var: str, *, default: bool) -> bool:
+    """Import-time toggle read. Accepts the full toggle vocabulary
+    (so GNUCASH_MCP_DEBUG=true from the Advanced box works, not just
+    =1). Import must not raise, so a garbage value is recorded in
+    _env_errors — main() fail-fasts on it — and the default applies
+    meanwhile."""
+    try:
+        value = _parse_env_toggle(var)
+    except ValueError as exc:
+        _env_errors.append(str(exc))
+        return default
+    return default if value is None else value
+
+
+_debug_mode = _seed_toggle("GNUCASH_MCP_DEBUG", default=False)
+_audit_mode = not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
 _logging_debug = _debug_mode
 _logging_audit = _audit_mode
 # Initial logging points at the first valid book. Best-effort at
@@ -1500,8 +1466,6 @@ _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
     "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
     "GNUCASH_ENABLE_BUSINESS": ("business",),
 }
-_TOGGLE_TRUE = frozenset({"true", "1", "yes", "on"})
-_TOGGLE_FALSE = frozenset({"false", "0", "no", "off", ""})
 
 
 def _modules_from_env_toggles() -> str | None:
@@ -1521,17 +1485,8 @@ def _modules_from_env_toggles() -> str | None:
         return None
     selected: list[str] = ["reporting"]
     for var, modules in _ENV_MODULE_TOGGLES.items():
-        raw = os.environ.get(var)
-        if raw is None:
-            continue
-        norm = raw.strip().lower()
-        if norm in _TOGGLE_TRUE:
+        if _parse_env_toggle(var):
             selected.extend(modules)
-        elif norm not in _TOGGLE_FALSE:
-            raise ValueError(
-                f"Invalid {var}={raw!r}: expected true/false "
-                "(also accepted: 1/0, yes/no, on/off)"
-            )
     return ",".join(selected)
 
 
@@ -1632,8 +1587,8 @@ Environment variables:
                              = budgets + scheduling; investments =
                              investor; business supersedes freelancer).
                              --modules / GNUCASH_MCP_MODULES win when set.
-  GNUCASH_MCP_DEBUG=1        Enable debug logging
-  GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
+  GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)
   GNUCASH_DEMO_BOOKS         true/false — serve the demo books found in
                              GNUCASH_DEMO_DIR (*.gnucash, sorted) after
                              the user's own books. The MCPB bundle's
@@ -1648,7 +1603,7 @@ Environment variables:
                              Each book gets its own subdirectory:
                              {{GNUCASH_LOG_DIR}}/{{book}}.mcp
                              Default location: {{book_path}}.mcp
-  GNUCASH_REDACT_PATHS=1     Collapse absolute paths to basenames in tool
+  GNUCASH_REDACT_PATHS=true  Collapse absolute paths to basenames in tool
                              responses and error messages (safe to share)
   GNUCASH_FX_GUARD_DAYS      Refuse a cross-currency invoice/bill post or pay
                              when the chosen rate is this many days from the
@@ -1678,11 +1633,12 @@ def main() -> None:
 
     global _logging_debug, _logging_audit, _book_class
 
-    # Advanced-options errors surfaced first: the pairs were applied
-    # (or rejected) at import, but a typo'd option must kill startup
-    # loudly, not silently run with the default it meant to change.
-    if _advanced_env_errors:
-        print("\n".join(_advanced_env_errors), file=sys.stderr)
+    # Env-configuration errors surfaced first: advanced-option pairs
+    # and toggle seeds were applied (or rejected) at import, but a
+    # typo'd option must kill startup loudly, not silently run with
+    # the default it meant to change.
+    if _env_errors:
+        print("\n".join(_env_errors), file=sys.stderr)
         raise SystemExit(2)
 
     # Parse CLI flags first — --book must win over GNUCASH_BOOK_PATH
