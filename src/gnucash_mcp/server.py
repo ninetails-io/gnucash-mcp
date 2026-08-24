@@ -962,8 +962,13 @@ def _demo_book_paths() -> list[Path]:
             file=sys.stderr,
         )
         return []
+    # A single ".gnucash" only: opening a demo in GnuCash writes
+    # timestamped backups (x.gnucash.20260823120000.gnucash) beside
+    # it, which match the glob and would balloon the roster with
+    # near-identical books and make switch_book prefixes ambiguous.
     return sorted(
-        p.resolve() for p in d.glob("*.gnucash") if p.is_file()
+        p.resolve() for p in d.glob("*.gnucash")
+        if p.is_file() and p.name.count(".gnucash") == 1
     )
 
 
@@ -990,6 +995,17 @@ def _append_demo_books() -> None:
             print(
                 f"Note: bundled demo book {p.name} skipped — a "
                 "configured book shares its filename.",
+                file=sys.stderr,
+            )
+            continue
+        # Same degrade rule for format: a corrupted or XML demo
+        # (truncated extension update, stray file in the demo dir)
+        # is skipped, never fatal — main()'s fatal format check runs
+        # on USER books only, before demos are appended.
+        if _book_format_error(p) is not None:
+            print(
+                f"Note: bundled demo book {p.name} skipped — not a "
+                "readable SQLite book.",
                 file=sys.stderr,
             )
             continue
@@ -1435,11 +1451,19 @@ def _parse_cli_argv(
         elif arg.startswith("--modules="):
             modules_value = arg.split("=", 1)[1]
         elif arg.startswith("--book="):
-            book_args.append(arg.split("=", 1)[1])
+            value = arg.split("=", 1)[1]
+            if value.strip():
+                book_args.append(value)
         elif arg == "--book":
+            # Empty tokens are consumed but dropped: an MCPB host
+            # expanding an unset multi-file config to --book "" must
+            # fall through to the env var / demo books, not brick
+            # startup. A bare --book with NO following token stays a
+            # loud error — that's a human's CLI typo.
             j = i + 1
             while j < len(argv) and not argv[j].startswith("--"):
-                book_args.append(argv[j])
+                if argv[j].strip():
+                    book_args.append(argv[j])
                 j += 1
             if j == i + 1:
                 raise _CliParseError(
@@ -1705,6 +1729,21 @@ def main() -> None:
             print(str(exc), file=sys.stderr)
             raise SystemExit(2) from None
 
+    # Startup format check on the USER's books: an XML-format book
+    # (the #1 predictable file-picker mistake) fails here with a
+    # message a non-developer can act on, instead of a piecash
+    # DatabaseError at first tool call. Runs BEFORE demos append —
+    # demo books get the soft skip inside _append_demo_books instead,
+    # because a broken demo must degrade, never brick the user's
+    # real books.
+    format_errors = [
+        msg for p in _book_paths
+        if (msg := _book_format_error(p)) is not None
+    ]
+    if format_errors:
+        print("\n".join(format_errors), file=sys.stderr)
+        raise SystemExit(2)
+
     # Bundled demo books (MCPB "Include demo books" checkbox) append
     # AFTER the user's own, so their first pick stays the startup
     # default; with no user books configured, the demos alone serve
@@ -1716,18 +1755,6 @@ def main() -> None:
         raise SystemExit(2) from None
 
     book_path = str(_current_path) if _book_paths else None
-
-    # Startup format check: an XML-format book (the #1 predictable
-    # file-picker mistake) fails here with a message a non-developer
-    # can act on, instead of a piecash DatabaseError at first tool
-    # call.
-    format_errors = [
-        msg for p in _book_paths
-        if (msg := _book_format_error(p)) is not None
-    ]
-    if format_errors:
-        print("\n".join(format_errors), file=sys.stderr)
-        raise SystemExit(2)
 
     # Module selection precedence: --modules, then GNUCASH_MCP_MODULES,
     # then the MCPB bundle's GNUCASH_ENABLE_* checkbox toggles.

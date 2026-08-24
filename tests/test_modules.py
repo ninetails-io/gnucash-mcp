@@ -1618,6 +1618,16 @@ class TestBookCliArg:
         with pytest.raises(_CliParseError, match="--book requires"):
             _parse_cli_argv(["--book", "--debug"])
 
+    def test_book_with_empty_value_falls_through(self):
+        """--book "" (an MCPB host expanding an unset picker) must
+        yield NO books — env/demo fallback — not a startup error."""
+        from gnucash_mcp.server import _parse_cli_argv
+        assert _parse_cli_argv(["--book", ""])[0] == []
+        assert _parse_cli_argv(["--book="])[0] == []
+        assert _parse_cli_argv(["--book", "", "/a.gnucash"])[0] == [
+            "/a.gnucash"
+        ]
+
     def test_unknown_flag_still_fails(self):
         from gnucash_mcp.server import _CliParseError, _parse_cli_argv
         with pytest.raises(_CliParseError, match="Unrecognized"):
@@ -1866,6 +1876,39 @@ class TestDemoBooks:
             "alpha-demo.gnucash", "beta-demo.gnucash",
         ]
         assert srv._current_path == srv._book_paths[0]
+
+    def test_glob_skips_gnucash_backup_files(self, demo_dir, monkeypatch):
+        """Opening a demo in GnuCash writes x.gnucash.TIMESTAMP.gnucash
+        backups beside it; they match *.gnucash and must not serve."""
+        from gnucash_mcp.server import _demo_book_paths
+        (demo_dir / "alpha-demo.gnucash.20260824120000.gnucash").write_bytes(
+            b"SQLite format 3\x00 backup"
+        )
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        names = [p.name for p in _demo_book_paths()]
+        assert names == ["alpha-demo.gnucash", "beta-demo.gnucash"]
+
+    def test_unreadable_demo_skipped_softly(
+        self, demo_dir, tmp_path, monkeypatch, capsys
+    ):
+        """A corrupted/XML demo must be skipped with a note, never
+        fatal — the demo-degrade contract (PR #153 review)."""
+        import gnucash_mcp.server as srv
+        (demo_dir / "aa-broken.gnucash").write_bytes(
+            b'<?xml version="1.0"?><gnc-v2>'
+        )
+        mine = _make_min_book(tmp_path / "mine.gnucash")
+        monkeypatch.setenv("GNUCASH_DEMO_BOOKS", "true")
+        monkeypatch.setenv("GNUCASH_BOOK_PATH", str(mine))
+        srv._book_paths = [mine.resolve()]
+        srv._current_path = mine.resolve()
+        srv._append_demo_books()
+        assert [p.name for p in srv._book_paths] == [
+            "mine.gnucash", "alpha-demo.gnucash", "beta-demo.gnucash",
+        ]
+        err = capsys.readouterr().err
+        assert "aa-broken.gnucash" in err
+        assert "skipped" in err
 
     def test_stem_collision_skips_demo_softly(
         self, demo_dir, tmp_path, monkeypatch, capsys
