@@ -14,6 +14,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from gnucash_mcp.book._base import (
+    _commodity_quantum,
     _guid_prefix_map,
     _is_unreconciled,
     _is_voided,
@@ -448,10 +449,7 @@ class ReconciliationMixin:
             # smallest fraction before comparing — otherwise
             # "1234.567" against a 2-decimal book is a perpetual
             # 0.007 mismatch even when the books agree at the cent.
-            fraction = getattr(account.commodity, "fraction", 100)
-            quantum = (
-                Decimal(1) / Decimal(fraction) if fraction > 1 else Decimal(1)
-            )
+            quantum = _commodity_quantum(account.commodity)
             expected_q = expected_balance.quantize(quantum)
             new_balance = (
                 reconciled_balance + reconciling_total
