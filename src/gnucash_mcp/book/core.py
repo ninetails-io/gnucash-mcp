@@ -29,6 +29,7 @@ from gnucash_mcp.book._base import (
     _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
+    _commodity_quantum,
     _guid_prefix_map,
     _is_market_price,
     _is_unreconciled,
@@ -3652,6 +3653,698 @@ class CoreMixin:
                 f"{d['description']}\t{d['signals']}"
             )
         return "\n".join(lines)
+
+    # ── Statement entry ────────────────────────────────────────────
+
+    # Statement-native sign transform, keyed by GNCAccountType (never
+    # by name — i18n invariant). Asset-class statements print amounts
+    # in the split convention already; liability-class statements
+    # print charges positive and balances as amount-owed, so both
+    # negate. The model transcribes verbatim; the server flips.
+    _STATEMENT_SIGNS = {
+        "BANK": 1, "CASH": 1, "ASSET": 1,
+        "CREDIT": -1, "LIABILITY": -1,
+    }
+
+    def enter_statement(
+        self,
+        account_name: str,
+        statement_date: date,
+        opening_balance: str,
+        closing_balance: str,
+        lines: list[dict],
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> dict:
+        """One-shot statement entry: enter, claim, and reconcile a
+        complete bank/card statement in one atomic open/save.
+
+        Spec: specs/v1.5/ENTER_STATEMENT_SPEC.md. Each line dict is
+        ``{ref, date (date), amount (statement-native string),
+        description?, notes?, raw?, match?, splits}``.
+
+        ``dry_run=True`` (the default) classifies every line —
+        NEW / MATCH / OVERLAP / AMBIGUOUS — against the account's
+        existing splits and projects the balance tie; nothing is
+        written. ``dry_run=False`` creates NEW rows, claims ``match``
+        rows, reconciles every statement-touched split at
+        ``statement_date``, and saves once — or refuses wholesale.
+
+        ``force=True`` means "I know the base doesn't tie — land the
+        statement anyway": it clears the opening-balance precondition
+        AND downgrades a failed closing tie from refusal to a
+        recorded discrepancy. Without it, both refuse.
+        """
+        refs = [ln["ref"] for ln in lines]
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                "duplicate ref in statement — each line needs a "
+                "unique ref"
+            )
+        opening = _to_decimal(opening_balance)
+        closing = _to_decimal(closing_balance)
+
+        with self.open(readonly=dry_run) as book:
+            default_currency = self._require_default_currency(book)
+            account = self._resolve_account(book, account_name)
+            if not account:
+                raise self._account_not_found_error(book, account_name)
+            sign = self._STATEMENT_SIGNS.get(account.type)
+            if sign is None:
+                raise ValueError(
+                    f"enter_statement needs a balance-carrying "
+                    f"statement account (BANK, CASH, ASSET, CREDIT, "
+                    f"or LIABILITY); '{account.fullname}' is "
+                    f"{account.type}"
+                )
+            if account.commodity != default_currency:
+                raise ValueError(
+                    f"'{account.fullname}' is denominated in "
+                    f"{account.commodity.mnemonic}, not the book "
+                    f"default {default_currency.mnemonic} — "
+                    f"foreign-currency statements are a planned "
+                    f"follow-up; enter this one via "
+                    f"create_transactions + reconcile_account"
+                )
+            quantum = _commodity_quantum(account.commodity)
+
+            amounts: dict[str, Decimal] = {}
+            for ln in lines:
+                try:
+                    amounts[ln["ref"]] = _to_decimal(ln["amount"])
+                except (InvalidOperation, ValueError):
+                    raise ValueError(
+                        f"line {ln['ref']}: amount "
+                        f"{ln['amount']!r} is not a decimal"
+                    )
+
+            # Self-consistency gate — statement-native signs, before
+            # any transform: the statement must not contradict itself.
+            line_sum = sum(amounts.values(), Decimal("0"))
+            if (opening + line_sum).quantize(quantum) != \
+                    closing.quantize(quantum):
+                raise ValueError(
+                    f"statement does not self-check: opening "
+                    f"{opening} + line sum {line_sum} = "
+                    f"{opening + line_sum}, but closing is {closing} "
+                    f"(difference "
+                    f"{closing - (opening + line_sum)}). A missed or "
+                    f"doubled line, or a sign slip — re-check the "
+                    f"transcription before trusting any "
+                    f"classification."
+                )
+
+            # Opening precondition: the base the statement lands on.
+            reconciled_balance = Decimal("0")
+            for s in account.splits:
+                if s.reconcile_state == "y":
+                    reconciled_balance += s.quantity
+            opening_book = (sign * opening).quantize(quantum)
+            opening_gap = (
+                reconciled_balance.quantize(quantum) - opening_book
+            )
+            warn_rows: list[tuple[str, str]] = []
+            if opening_gap != 0:
+                gap_msg = (
+                    f"account's reconciled balance "
+                    f"{reconciled_balance} does not tie to the "
+                    f"statement's opening balance ({opening} as "
+                    f"printed → {opening_book} in book convention); "
+                    f"difference {opening_gap}. A prior statement "
+                    f"may be unentered."
+                )
+                if dry_run:
+                    warn_rows.append(("*", gap_msg))
+                elif not force:
+                    raise ValueError(
+                        gap_msg + " Commit refuses on an untied "
+                        "base — enter the prior statement first, or "
+                        "pass force=true to land this one anyway "
+                        "(the resulting reconciled state is only as "
+                        "good as the base)."
+                    )
+
+            split_prefixes = self._split_prefix_map(book)
+
+            # Candidate universe: this account's splits within the
+            # match window of any line. Ruling 1: window 31 days —
+            # one day wider than the duplicate screen, so a monthly
+            # pattern (June 30 "July rent" vs a July 31 line)
+            # SURFACES for judgment. Candidate noise is the feature.
+            window = timedelta(days=31)
+            lo = min(ln["date"] for ln in lines) - window
+            hi = max(ln["date"] for ln in lines) + window
+            acct_splits = []
+            for s in account.splits:
+                pd = s.transaction.post_date
+                if pd is None or _is_voided(s):
+                    continue
+                if lo <= pd <= hi:
+                    acct_splits.append(s)
+
+            def _book_amount(ln) -> Decimal:
+                return (sign * amounts[ln["ref"]]).quantize(quantum)
+
+            def _candidates_for(ln) -> list[dict]:
+                """DAD-style scoring against the account's own
+                splits. A candidate needs the amount signal alone
+                (the universe is narrow enough that an amount match
+                is meaningful — and the rent case has ONLY that), or
+                desc+date without amount (the fix-the-book-typo
+                case)."""
+                target = _book_amount(ln)
+                probe = (
+                    ln.get("description") or ln.get("raw") or ""
+                ).lower().strip()
+                cands = []
+                for s in acct_splits:
+                    pd = s.transaction.post_date
+                    if abs((pd - ln["date"]).days) > 31:
+                        continue
+                    amount_match = (
+                        abs(s.quantity - target) <= Decimal("1.00")
+                    )
+                    date_match = abs((pd - ln["date"]).days) <= 2
+                    tdesc = (
+                        s.transaction.description or ""
+                    ).lower().strip()
+                    desc_match = (
+                        bool(probe) and bool(tdesc)
+                        and (probe in tdesc or tdesc in probe)
+                    )
+                    if not (
+                        amount_match or (desc_match and date_match)
+                    ):
+                        continue
+                    cands.append({
+                        "split": s,
+                        "signals": (
+                            ("D" if desc_match else "-")
+                            + ("A" if amount_match else "-")
+                            + ("D" if date_match else "-")
+                        ),
+                    })
+                return cands
+
+            if dry_run:
+                return self._statement_dry_run(
+                    book, account, lines, amounts, sign, quantum,
+                    _book_amount, _candidates_for, split_prefixes,
+                    reconciled_balance, closing, warn_rows,
+                )
+            return self._statement_commit(
+                book, account, lines, amounts, sign, quantum,
+                statement_date, _book_amount, _candidates_for,
+                split_prefixes, reconciled_balance, closing, force,
+                default_currency,
+            )
+
+    def _statement_prep_create(
+        self, book, account, ln, book_amount, default_currency,
+    ) -> tuple[list[dict], dict | None]:
+        """Validate one would-be-created statement line into resolved
+        splits (bank leg synthesized first, counter legs from the
+        row or a 2-split auto-fill precedent). Returns
+        ``(validated, auto_fill_source | None)``; raises ValueError
+        with the row-level problem."""
+        if not (ln.get("description") or ln.get("raw")):
+            raise ValueError(
+                "a created line needs a description (or at least "
+                "a raw cell to fall back on)"
+            )
+        bank: dict = {
+            "account": account.fullname, "amount": str(book_amount),
+        }
+        if ln.get("raw"):
+            bank["memo"] = ln["raw"]
+
+        counters = ln.get("splits") or []
+        src = None
+        if not counters:
+            probe = ln.get("description") or ln.get("raw") or ""
+            sig = self._collect_create_signals(
+                book, probe, ln["date"], [],
+                want_auto_fill=True, want_stability=False,
+                want_duplicates=False, want_recent=False,
+            )
+            if sig.auto_fill is None:
+                raise ValueError(
+                    "no matching transaction to auto-fill from — "
+                    "supply explicit counter-splits"
+                )
+            filled, src = sig.auto_fill
+            if len(filled) != 2:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} has "
+                    f"{len(filled)} splits — statement auto-fill "
+                    f"only adapts 2-split precedents to the line "
+                    f"amount; supply explicit counter-splits"
+                )
+            counter = next(
+                (
+                    f for f in filled
+                    if f["account"] != account.fullname
+                ),
+                None,
+            )
+            if counter is None or "quantity" in counter:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} doesn't "
+                    f"adapt cleanly (same-account or "
+                    f"cross-commodity leg) — supply explicit "
+                    f"counter-splits"
+                )
+            counters = [{
+                "account": counter["account"],
+                "amount": str(-book_amount),
+                **(
+                    {"memo": counter["memo"]}
+                    if counter.get("memo") else {}
+                ),
+            }]
+
+        validated = self._validate_transaction_splits(
+            book, [bank] + counters, default_currency,
+        )
+        for v in validated:
+            if v["account"].placeholder:
+                raise self._placeholder_error(v["account"])
+        return validated, src
+
+    def _statement_resolve_claim(
+        self, book, account, ln, book_amount, quantum,
+    ):
+        """Resolve and vet one ``match`` cell. Returns
+        ``(split, "claim" | "overlap")`` — overlap means the split
+        is already reconciled and the row is an idempotent no-op.
+        Raises ValueError on any claim that would lie."""
+        if ln.get("splits"):
+            raise ValueError(
+                "a match row claims an existing split — it cannot "
+                "also carry counter-splits"
+            )
+        s = self._find_split(book, ln["match"])
+        if s is None:
+            raise ValueError(f"match split not found: {ln['match']}")
+        if s.account.guid != account.guid:
+            raise ValueError(
+                f"match split {ln['match']} is on "
+                f"'{s.account.fullname}', not the statement account"
+            )
+        if _is_voided(s):
+            raise ValueError(
+                f"match split {ln['match']} is voided — voided "
+                f"splits cannot be claimed; unvoid_transaction "
+                f"first"
+            )
+        if s.reconcile_state == "y":
+            return s, "overlap"
+        if s.quantity.quantize(quantum) != book_amount:
+            raise ValueError(
+                f"match split {ln['match']} has amount "
+                f"{s.quantity}, but the line says {ln['amount']} "
+                f"as printed ({book_amount} in book convention) — "
+                f"fix the book entry first (update_transaction), "
+                f"then claim it"
+            )
+        return s, "claim"
+
+    def _statement_dry_run(
+        self, book, account, lines, amounts, sign, quantum,
+        _book_amount, _candidates_for, split_prefixes,
+        reconciled_balance, closing, warn_rows,
+    ) -> dict:
+        """The rehearsal: classify every line, validate everything a
+        commit would validate, and project the balance tie."""
+        default_currency = self._require_default_currency(book)
+        counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
+        line_rows: list[tuple] = []
+        cand_rows: list[tuple] = []
+        projected = reconciled_balance.quantize(quantum)
+
+        for ln in lines:
+            cands = _candidates_for(ln)
+            unrec = [
+                c for c in cands if _is_unreconciled(c["split"])
+            ]
+            rec = [
+                c for c in cands
+                if c["split"].reconcile_state == "y"
+            ]
+            note = ""
+            if unrec:
+                cls = "MATCH" if len(unrec) == 1 else "AMBIGUOUS"
+                listed = unrec + rec
+            elif rec:
+                cls = "OVERLAP"
+                listed = rec
+                note = (
+                    "already reconciled — commit skips this line "
+                    "(drop it, or keep it as a match row: no-op)"
+                )
+            else:
+                cls = "NEW"
+                listed = []
+                if not ln.get("splits") and not ln.get("match"):
+                    note = self._statement_predict(
+                        book, account, ln, _book_amount(ln),
+                    )
+
+            # Full rehearsal: anything commit would validate,
+            # validate now — a dry-run that ties is a commit that
+            # will tie.
+            try:
+                if ln.get("match"):
+                    _, kind = self._statement_resolve_claim(
+                        book, account, ln, _book_amount(ln), quantum,
+                    )
+                    if kind == "overlap":
+                        cls = "OVERLAP"
+                        note = "match names a reconciled split — no-op"
+                elif ln.get("splits"):
+                    self._statement_prep_create(
+                        book, account, ln, _book_amount(ln),
+                        default_currency,
+                    )
+            except ValueError as e:
+                warn_rows.append((ln["ref"], str(e)))
+
+            counts[cls] += 1
+            if cls != "OVERLAP":
+                projected += _book_amount(ln)
+            for c in listed:
+                s = c["split"]
+                txn = s.transaction
+                cand_rows.append((
+                    ln["ref"], split_prefixes[s.guid],
+                    s.reconcile_state,
+                    txn.post_date.isoformat(), str(s.quantity),
+                    txn.description or "", txn.notes or "",
+                    s.memo or "", c["signals"],
+                ))
+            line_rows.append((ln["ref"], cls, len(listed), note))
+
+        # Summary header — counts are facts and may headline;
+        # clearance verdicts over unadjudicated rows may not (the
+        # clearance principle, spec §4).
+        n_judge = counts["MATCH"] + counts["AMBIGUOUS"]
+        header = (
+            f"Dry run: {len(lines)} lines — {counts['NEW']} NEW, "
+            f"{counts['MATCH']} MATCH, {counts['OVERLAP']} OVERLAP, "
+            f"{counts['AMBIGUOUS']} AMBIGUOUS."
+        )
+        if n_judge:
+            header += (
+                f"\n{n_judge} rows need adjudication — rule each "
+                f"MATCH/AMBIGUOUS against the candidates table "
+                f"before committing."
+            )
+        else:
+            header += "\nNo existing-split candidates on any line."
+
+        closing_book = (sign * closing).quantize(quantum)
+        projected = projected.quantize(quantum)
+        if projected == closing_book:
+            tie = (
+                f"Projected reconciled balance after commit: "
+                f"{projected} — ties to the statement closing "
+                f"({closing} as printed)."
+            )
+        else:
+            tie = (
+                f"Projected reconciled balance after commit: "
+                f"{projected} vs statement closing {closing_book} "
+                f"({closing} as printed) — DISCREPANCY "
+                f"{closing_book - projected}."
+            )
+
+        lines_tsv = ["ref\tclass\tcands\tnote"]
+        for r in line_rows:
+            lines_tsv.append(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}")
+        cands_tsv = ""
+        if cand_rows:
+            out = [
+                "ref\tsplit_guid\tstate\tdate\tamount\t"
+                "description\tnotes\tmemo\tsignals"
+            ]
+            for r in cand_rows:
+                out.append("\t".join(str(x) for x in r))
+            cands_tsv = "\n".join(out)
+
+        return {
+            "summary": header,
+            "lines": "\n".join(lines_tsv),
+            "candidates": cands_tsv,
+            "warnings": self._batch_warnings_to_tsv(warn_rows),
+            "tie": tie,
+        }
+
+    def _statement_predict(
+        self, book, account, ln, book_amount,
+    ) -> str:
+        """Auto-fill prediction note for a splitless NEW line — the
+        evidence the judgment pass adapts, never something the
+        dry-run enters."""
+        probe = ln.get("description") or ln.get("raw") or ""
+        if not probe.strip():
+            return ""
+        sig = self._collect_create_signals(
+            book, probe, ln["date"], [],
+            want_auto_fill=True, want_stability=False,
+            want_duplicates=False, want_recent=False,
+        )
+        if sig.auto_fill is None:
+            return "no auto-fill precedent — supply counter-splits"
+        filled, src = sig.auto_fill
+        if len(filled) != 2:
+            return (
+                f"precedent {src['guid']} has {len(filled)} "
+                f"splits — supply explicit counter-splits"
+            )
+        counter = next(
+            (f for f in filled if f["account"] != account.fullname),
+            None,
+        )
+        if counter is None or "quantity" in counter:
+            return (
+                f"precedent {src['guid']} doesn't adapt cleanly — "
+                f"supply explicit counter-splits"
+            )
+        return (
+            f"would create {book_amount} → {counter['account']} "
+            f"(auto_filled_from:{src['guid']})"
+        )
+
+    def _statement_commit(
+        self, book, account, lines, amounts, sign, quantum,
+        statement_date, _book_amount, _candidates_for,
+        split_prefixes, reconciled_balance, closing, force,
+        default_currency,
+    ) -> dict:
+        """The landing: validate every row, check the tie, then — and
+        only then — mutate and save once."""
+        prepared: list[tuple] = []   # (ln, validated, src)
+        claims: list[tuple] = []     # (ln, split)
+        skipped: list[tuple] = []    # (ln, split)  overlap no-ops
+        errors: list[tuple[str, str]] = []
+        claimed_guids: set[str] = set()
+
+        for ln in lines:
+            try:
+                if ln.get("match"):
+                    s, kind = self._statement_resolve_claim(
+                        book, account, ln, _book_amount(ln), quantum,
+                    )
+                    if kind == "overlap":
+                        skipped.append((ln, s))
+                    else:
+                        if s.guid in claimed_guids:
+                            raise ValueError(
+                                "split already claimed by another "
+                                "row in this statement"
+                            )
+                        claimed_guids.add(s.guid)
+                        claims.append((ln, s))
+                else:
+                    validated, src = self._statement_prep_create(
+                        book, account, ln, _book_amount(ln),
+                        default_currency,
+                    )
+                    prepared.append((ln, validated, src))
+            except ValueError as e:
+                errors.append((ln["ref"], str(e)))
+
+        # Statement-duplicate guard: a created line that exactly
+        # matches an unreconciled, unclaimed split on this account
+        # would double-enter — and the tie would still hold, because
+        # only the new split reconciles. Judgment overrides with
+        # force (it saw the MATCH table and ruled NEW).
+        if not force:
+            for ln, _validated, _src in prepared:
+                target = _book_amount(ln)
+                for c in _candidates_for(ln):
+                    s = c["split"]
+                    if s.guid in claimed_guids:
+                        continue
+                    if not _is_unreconciled(s):
+                        continue
+                    pd = s.transaction.post_date
+                    if abs((pd - ln["date"]).days) > 2:
+                        continue
+                    if s.quantity.quantize(quantum) == target:
+                        errors.append((
+                            ln["ref"],
+                            f"unreconciled split "
+                            f"{split_prefixes[s.guid]} on this "
+                            f"account matches this line exactly "
+                            f"(amount + date) and no row claims it "
+                            f"— claim it with "
+                            f"match={split_prefixes[s.guid]}, or "
+                            f"force=true to create anyway",
+                        ))
+                        break
+
+        if errors:
+            errored = {ref for ref, _ in errors}
+            rows = []
+            for ln in lines:
+                status = (
+                    "rejected" if ln["ref"] in errored
+                    else "statement_aborted"
+                )
+                rows.append(f"{ln['ref']}\t{status}\t\t")
+            return {
+                "summary": (
+                    f"Statement REJECTED — {len(errors)} row "
+                    f"error(s); nothing was written."
+                ),
+                "results": "ref\tstatus\tguid\tnote\n"
+                + "\n".join(rows),
+                "warnings": self._batch_warnings_to_tsv(errors),
+            }
+
+        # The tie, BEFORE any mutation. Claim amounts equal line
+        # amounts by the exactness rule, so both dispositions
+        # contribute the transformed line amount.
+        new_reconciled = reconciled_balance
+        for ln, _s in claims:
+            new_reconciled += _book_amount(ln)
+        for ln, _v, _src in prepared:
+            new_reconciled += _book_amount(ln)
+        new_reconciled = new_reconciled.quantize(quantum)
+        closing_book = (sign * closing).quantize(quantum)
+        if new_reconciled == closing_book:
+            tie = (
+                f"reconciled balance {new_reconciled} ties to the "
+                f"statement closing ({closing} as printed)"
+            )
+        elif force:
+            tie = (
+                f"DISCREPANCY {closing_book - new_reconciled}: "
+                f"reconciled balance {new_reconciled} vs statement "
+                f"closing {closing_book} ({closing} as printed) — "
+                f"landed under force"
+            )
+        else:
+            raise ValueError(
+                f"balance tie failed: the reconciled balance would "
+                f"be {new_reconciled}, but the statement closes at "
+                f"{closing_book} ({closing} as printed); difference "
+                f"{closing_book - new_reconciled}. Nothing was "
+                f"written."
+            )
+
+        # Audit before-state: the claimed splits' prior annotations
+        # and states, for the ENTER formatter's diffs.
+        self._stage_audit_before({
+            "account": account.fullname,
+            "claims": [
+                {
+                    "guid": s.guid,
+                    "state": s.reconcile_state,
+                    "memo": s.memo or "",
+                    "notes": s.transaction.notes or "",
+                    "description": s.transaction.description or "",
+                    "date": s.transaction.post_date.isoformat(),
+                }
+                for _ln, s in claims
+            ],
+        })
+
+        # Mutate: claims first (annotations + state), then builds.
+        rec_dt = datetime.combine(
+            statement_date, datetime.min.time()
+        )
+        for ln, s in claims:
+            if ln.get("raw"):
+                s.memo = ln["raw"]
+            if ln.get("notes"):
+                s.transaction.notes = ln["notes"]
+            s.reconcile_state = "y"
+            s.reconcile_date = rec_dt
+
+        built = []
+        for ln, validated, src in prepared:
+            piecash_splits = [
+                piecash.Split(
+                    account=v["account"], value=v["value"],
+                    quantity=v["quantity"], memo=v["memo"] or "",
+                    action=v["action"] or "",
+                )
+                for v in validated
+            ]
+            txn_obj = piecash.Transaction(
+                currency=default_currency,
+                description=(
+                    ln.get("description") or ln.get("raw") or ""
+                ),
+                notes=ln.get("notes") or None,
+                post_date=ln["date"],
+                splits=piecash_splits,
+            )
+            # The bank leg is validated[0] by construction; it is
+            # part of the statement, so it lands reconciled.
+            piecash_splits[0].reconcile_state = "y"
+            piecash_splits[0].reconcile_date = rec_dt
+            built.append((ln, txn_obj, src))
+
+        book.save()
+
+        all_guids = [t.guid for t in book.transactions]
+        rows = ["ref\tstatus\tguid\tnote"]
+        by_ref: dict[str, str] = {}
+        for ln, txn_obj, src in built:
+            note = (
+                f"auto_filled_from:{src['guid']}" if src else ""
+            )
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tcreated\t"
+                f"{_unique_prefix(txn_obj.guid, all_guids)}\t{note}"
+            )
+        for ln, s in claims:
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tclaimed\t{split_prefixes[s.guid]}\t"
+            )
+        for ln, s in skipped:
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tskipped_overlap\t"
+                f"{split_prefixes[s.guid]}\talready reconciled"
+            )
+        for ln in lines:
+            rows.append(by_ref[ln["ref"]])
+
+        n_touched = len(built) + len(claims)
+        return {
+            "summary": (
+                f"Statement entered: {len(built)} created, "
+                f"{len(claims)} claimed, {len(skipped)} skipped "
+                f"(already reconciled); {n_touched} splits "
+                f"reconciled at {statement_date.isoformat()}."
+            ),
+            "results": "\n".join(rows),
+            "new_reconciled_balance": str(new_reconciled),
+            "tie": tie,
+        }
 
     def search_transactions(
         self,

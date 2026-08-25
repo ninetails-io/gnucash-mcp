@@ -162,6 +162,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_transaction",
         "create_transaction",
         "create_transactions",
+        "enter_statement",
         "update_transaction",
         "update_transactions",
         "delete_transaction",
@@ -616,6 +617,11 @@ _WRITE_VERB_HINTS: dict[str, tuple[bool, bool]] = {
     "set_state": (True, True),
     "replace_splits": (True, True),
     "reconcile": (True, True),
+    # Statement entry adds transactions but also claims and
+    # reconciles EXISTING splits (annotations + state) — destructive.
+    # Repeating the same commit refuses on the opening precondition
+    # (the base moved), adding nothing further.
+    "enter": (True, True),
     "post": (False, True),         # additive; re-post errors, adds nothing
     "pay": (False, False),         # paying twice records two payments
     "apply": (False, False),

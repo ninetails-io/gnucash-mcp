@@ -2055,6 +2055,106 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_statement_enter(entry: dict) -> list[str]:
+    """``enter_statement`` audits as ONE document event — the
+    statement landing (or rehearsing) as a whole, not N disconnected
+    CREATE lines. Created rows render with their interpreted
+    description; claimed rows render their annotation diffs from the
+    staged before-state (a claim is a write to an existing
+    transaction)."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    before = entry.get("before_state") or {}
+
+    account = params.get("account", "")
+    stmt_date = params.get("statement_date", "")
+    opening = params.get("opening_balance", "")
+    closing = params.get("closing_balance", "")
+    dry = params.get("dry_run", True)
+
+    verb = "ENTER STATEMENT (dry run)" if dry else "ENTER STATEMENT"
+    lines = [
+        f"{time_part}  {verb}  {account}  {stmt_date}  "
+        f"opening {opening} → closing {closing}"
+    ]
+    summary = (after.get("summary") or "").replace("\n", " ")
+    if summary:
+        lines.append(f"{_INDENT}{summary}")
+    tie = after.get("tie") or ""
+    if tie and not dry:
+        lines.append(f"{_INDENT}{tie}")
+    if dry:
+        return lines
+
+    # Re-parse the submitted lines through the SAME parser the tool
+    # used (no display drift); tolerate malformed input — the write
+    # path already rejected it.
+    from gnucash_mcp._format import _parse_statement_tsv
+
+    try:
+        submitted = {
+            r["ref"]: r
+            for r in _parse_statement_tsv(params.get("lines") or "")
+        }
+    except ValueError:
+        submitted = {}
+    results = _parse_audit_tsv_rows(after.get("results") or "")
+    befores = {c.get("guid", ""): c for c in before.get("claims") or []}
+
+    for r in results:
+        ref = r.get("ref", "")
+        src = submitted.get(ref, {})
+        status = r.get("status", "")
+        guid = r.get("guid", "")
+        if status == "created":
+            desc = src.get("description") or src.get("raw") or ""
+            lines.append(
+                f'{_INDENT}CREATE  guid:{guid}  "{desc}" '
+                f'({src.get("date", "")}, {src.get("amount", "")})'
+            )
+            if src.get("notes"):
+                lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+            note = r.get("note", "")
+            if note.startswith("auto_filled_from:"):
+                lines.append(
+                    f"{_INDENT_SPLITS}auto-filled from "
+                    f"guid:{note.split(':', 1)[1]}"
+                )
+        elif status == "claimed":
+            old = next(
+                (
+                    b for g, b in befores.items()
+                    if g.startswith(guid) or guid.startswith(g[:8])
+                ),
+                {},
+            )
+            desc = old.get("description", "")
+            lines.append(
+                f'{_INDENT}CLAIM  split:{guid}  "{desc}" '
+                f'({old.get("date", "")})  '
+                f'state: {old.get("state", "")} → y'
+            )
+            new_memo = src.get("raw", "")
+            if new_memo and new_memo != old.get("memo", ""):
+                lines.append(
+                    f"{_INDENT_SPLITS}memo: "
+                    f"{old.get('memo', '') or '(empty)'} → {new_memo}"
+                )
+            new_notes = src.get("notes", "")
+            if new_notes and new_notes != old.get("notes", ""):
+                lines.append(
+                    f"{_INDENT_SPLITS}notes: "
+                    f"{old.get('notes', '') or '(empty)'} → "
+                    f"{new_notes}"
+                )
+        elif status == "skipped_overlap":
+            lines.append(
+                f"{_INDENT}SKIP  split:{guid}  already reconciled"
+            )
+    return lines
+
+
 # ── Dispatch table ────────────────────────────────────────────────
 #
 # Key shape: (entity_type, operation). Both in their canonical forms —
@@ -2077,6 +2177,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("account", "MOVE"): _fmt_account_move,
     ("account", "DELETE"): _fmt_account_delete,
     ("split", "RECONCILE"): _fmt_split_reconcile,
+    ("statement", "ENTER"): _fmt_statement_enter,
     ("split", "SET_STATE"): _fmt_split_set_state,
     ("account_slot", "SET_SLOT"): _fmt_account_slot_set,
     ("account_slot", "DELETE_SLOT"): _fmt_account_slot_delete,

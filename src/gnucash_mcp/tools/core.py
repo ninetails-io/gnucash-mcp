@@ -11,6 +11,7 @@ from datetime import date
 from gnucash_mcp._format import (
     _batch_row_splits,
     _batch_tsv_layout,
+    _parse_statement_tsv,
     _parse_update_tsv,
 )
 from gnucash_mcp.logging_config import audit_log
@@ -511,6 +512,126 @@ def register(mcp, get_book) -> None:
         parsed = _parse_transactions_tsv(transactions)
         result = book.create_transactions(
             parsed, force=force, dry_run=dry_run, on_error=on_error,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="enter",
+        entity_type="statement",
+    )
+    def enter_statement(
+        account: str,
+        statement_date: str,
+        opening_balance: str,
+        closing_balance: str,
+        lines: str,
+        dry_run: bool = True,
+        force: bool = False,
+    ) -> str:
+        """Enter a COMPLETE bank/card statement in one atomic call:
+        create the new lines, claim the ones already in the book,
+        and reconcile everything against the closing balance — all
+        in one save, or nothing at all.
+
+        THE WORKFLOW (two calls around your judgment):
+
+        1. ``dry_run=true`` (the DEFAULT) — transcribe the statement
+           and get back a classification of every line: NEW (not in
+           the book), MATCH (an existing unreconciled split
+           corresponds), OVERLAP (already reconciled), AMBIGUOUS
+           (several candidates). MATCH/AMBIGUOUS rows come with the
+           candidate's full annotation (date, amount, description,
+           notes, memo, short GUID) so you can adjudicate each one.
+        2. Rule every MATCH/AMBIGUOUS row yourself, adapt
+           annotations, confirm with the user.
+        3. ``dry_run=false`` — NEW rows now carry interpreted
+           description/notes and counter-splits; MATCH rows carry
+           ``match=<split guid>`` claims. The server enters, claims,
+           reconciles every statement-touched split at
+           ``statement_date``, and saves once.
+
+        TRANSCRIBE, DON'T INTERPRET (dry-run): amounts and balances
+        go in EXACTLY as the statement prints them — for credit
+        cards too (charges positive, balance as amount owed). The
+        server applies the sign convention from the account's type;
+        you never flip a sign. The gate
+        ``opening + sum(lines) == closing`` must hold or the call
+        rejects: transcribe every line.
+
+        INPUT — ``lines`` is a TSV block. Header: ``ref, date``
+        first, then any order of ``description``, ``notes``,
+        ``raw``, ``match``, ``amount`` (required), then optional
+        ``amt, acct, memo, qty`` counter-split groups (batch
+        grammar). The statement account's own leg is SYNTHESIZED —
+        never a column. Dry-run typically needs only::
+
+            ref<TAB>date<TAB>raw<TAB>amount
+            1<TAB>2026-07-03<TAB>POS DEBIT WHOLEFDS #123<TAB>-87.12
+
+        - ``raw`` = the verbatim statement line; it lands on the
+          bank leg's memo (provenance). ``description``/``notes``
+          are your interpretation (commit).
+        - ``match`` = the split GUID this line claims instead of
+          creating (from the dry-run candidates table). Claim rows
+          may also carry ``raw`` (updates the claimed split's memo)
+          and ``notes`` (updates the transaction's notes). The
+          claimed amount must equal the line amount exactly — fix
+          the book first if they disagree.
+        - A commit row with no counter-splits auto-fills from the
+          most recent same-description 2-split transaction, adapted
+          to the line amount (marked ``auto_filled_from:<guid>``).
+
+        SAFETY: the account's reconciled balance must tie to
+        ``opening_balance`` (a prior unentered statement blocks
+        commit), every created-vs-existing exact overlap must be
+        explicitly claimed or forced, and the projected closing tie
+        is verified BEFORE anything is written. ``force=true``
+        means "land it anyway" for the base/tie checks; it never
+        bypasses the statement's own self-check.
+
+        OUTPUT (dry-run): ``summary`` (class counts), ``lines``
+        (ref, class, cands, note), ``candidates`` (per-candidate
+        annotation, FK ref), ``warnings``, and ``tie`` — the
+        projected reconciled balance vs the closing. The tie is the
+        only verdict; MATCH/AMBIGUOUS rows are yours to rule.
+        OUTPUT (commit): ``results`` (ref, status
+        created|claimed|skipped_overlap, guid), the new reconciled
+        balance, and the tie.
+
+        Args:
+            account: Statement account ref (path, %short, or GUID).
+                BANK/CASH/ASSET/CREDIT/LIABILITY only.
+            statement_date: The statement's closing date
+                (YYYY-MM-DD); every touched split reconciles at it.
+            opening_balance: Opening balance, exactly as printed.
+            closing_balance: Closing balance, exactly as printed.
+            lines: The TSV block described above.
+            dry_run: DEFAULT TRUE — the rehearsal is the workflow.
+            force: Land despite an untied opening base / closing
+                discrepancy, and create past exact unclaimed
+                overlaps.
+        """
+        book = get_book()
+        stmt_date = _parse_iso_date(statement_date)
+        if stmt_date is None:
+            raise ValueError(
+                f"statement_date {statement_date!r} is not a valid "
+                f"YYYY-MM-DD date"
+            )
+        parsed = _parse_statement_tsv(lines)
+        for row in parsed:
+            d = _parse_iso_date(row["date"])
+            if d is None:
+                raise ValueError(
+                    f"line {row['ref']}: date {row['date']!r} is "
+                    f"not a valid YYYY-MM-DD date"
+                )
+            row["date"] = d
+        result = book.enter_statement(
+            account, stmt_date, opening_balance, closing_balance,
+            parsed, dry_run=dry_run, force=force,
         )
         return _json(result)
 
