@@ -13,6 +13,7 @@ from gnucash_mcp._format import (
     _batch_tsv_layout,
     _parse_statement_tsv,
     _parse_update_tsv,
+    _tsv_lines,
 )
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
@@ -40,7 +41,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     missing header, too-few columns, or a split count that doesn't
     match the declared shape.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the transactions TSV")
     if len(lines) < 2:
         raise ValueError(
             "transactions TSV needs a header row and at least one data row"
@@ -597,9 +598,10 @@ def register(mcp, get_book) -> None:
         - ``match`` = the split GUID this line claims instead of
           creating (from the dry-run candidates table). Claim rows
           may also carry ``raw`` (updates the claimed split's memo)
-          and ``notes`` (updates the transaction's notes). The
-          claimed amount must equal the line amount exactly — fix
-          the book first if they disagree.
+          and ``notes`` (updates the transaction's notes), and END
+          at their last fixed column — they take no split cells.
+          The claimed amount must equal the line amount exactly —
+          fix the book first if they disagree.
         - A commit row with no counter-splits auto-fills from the
           most recent same-description 2-split transaction, adapted
           to the line amount (marked ``auto_filled_from:<guid>``).

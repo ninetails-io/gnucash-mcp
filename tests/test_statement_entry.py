@@ -799,6 +799,79 @@ class TestStatementReviewFindings:
         assert "exact twin" in notes["1"]
 
 
+class TestMaidenVoyageFindings:
+    """Locks for the bookkeeper's maiden-flight findings
+    (2026-08-24, Alex demo book, 15-line fabricated statement)."""
+
+    def test_exotic_separator_rejects_by_name(self):
+        """THE open bug: an invisible U+2028 inside a cell made
+        str.splitlines shatter the row — the mid-group error
+        truthfully blamed row 1 while unable to name the invisible
+        byte, and every retyped reduction exorcised it. Four
+        deterministic failures, one night of bisection. Now the
+        artifact is rejected loudly, by name, with a row number."""
+        tsv = (
+            "ref\tdate\traw\tamount\n"
+            "1\t2025-04-01\tRAW\t-10.00\u2028more\t10"
+        )
+        with pytest.raises(ValueError, match="U\\+2028 LINE SEPARATOR"):
+            _parse_statement_tsv(tsv)
+        # The diagnosis names the row, not a downstream symptom.
+        with pytest.raises(ValueError, match="row 1"):
+            _parse_statement_tsv(tsv)
+
+    def test_exotic_separator_rejects_in_batch_too(self):
+        from gnucash_mcp.tools.core import _parse_transactions_tsv
+        with pytest.raises(ValueError, match="U\\+000B VERTICAL TAB"):
+            _parse_transactions_tsv(
+                "ref\tdate\tdescription\tamt\tacct\n"
+                "1\t2025-04-01\tDesc\x0bX\t-10\tA\t10\tB"
+            )
+
+    def test_real_newlines_still_split(self):
+        rows = _parse_statement_tsv(
+            "ref\tdate\traw\tamount\r\n"
+            "1\t2025-04-01\tRAW\t-10.00\r\n"
+            "2\t2025-04-02\tRAW2\t-5.00"
+        )
+        assert [r["ref"] for r in rows] == ["1", "2"]
+
+    def test_claim_row_with_stray_cells_gets_named_error(self):
+        """Finding 1: a claim row carrying anything beyond the
+        fixed columns used to fall into the group chunker and
+        surface as a mid-group miscount. Now it says what it
+        means."""
+        with pytest.raises(
+            ValueError, match="claim row .* takes no split cells"
+        ):
+            _parse_statement_tsv(
+                "ref\tdate\traw\tmatch\tamount\tamt\tacct\n"
+                "1\t2025-04-01\tRAW\tdeadbeef\t-10.00\tstray"
+            )
+
+    def test_low_only_candidates_lean_NEW(self, statement_book):
+        """Finding 2: the invented-ATM case — a line whose only
+        candidates are amount-only LOWs classifies NEW (with the
+        candidates still listed as evidence), not MATCH."""
+        gc = GnuCashBook(str(statement_book))
+        # -800 line 20 days from July Rent: amount signal only
+        # (raw probe matches nothing, date gap > 2).
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 7, 21), "-800.00",
+                   raw="ATM WITHDRAWAL 0042",
+                   splits=[{"account": "Expenses:Groceries",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert _classes(res)["1"] == "NEW"
+        cands = _cands(res)["1"]
+        assert len(cands) == 1
+        assert cands[0]["confidence"] == "LOW"
+        assert cands[0]["signals"] == "-A-"
+
+
 # ── Sign transform (credit card) ───────────────────────────────────
 
 

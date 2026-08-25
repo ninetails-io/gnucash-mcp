@@ -4214,11 +4214,21 @@ class CoreMixin:
                 c for c in cands
                 if c["split"].reconcile_state == "y"
             ]
+            # MATCH/AMBIGUOUS demand adjudication, so the class is
+            # gated on MEDIUM+ correspondence (>=2 signals). An
+            # amount-only LOW still SURFACES as a candidate row —
+            # ruling 1's superset — but classifies NEW: three weak
+            # lookalikes must not adopt a genuinely new line
+            # (bookkeeper finding, maiden flight).
+            strong = [
+                c for c in unrec
+                if sum(1 for ch in c["signals"] if ch != "-") >= 2
+            ]
             note = ""
-            if unrec:
-                cls = "MATCH" if len(unrec) == 1 else "AMBIGUOUS"
+            if strong:
+                cls = "MATCH" if len(strong) == 1 else "AMBIGUOUS"
                 listed = unrec + rec
-                if any(c["exact"] for c in unrec):
+                if any(c["exact"] for c in strong):
                     note = (
                         "exact twin — commit refuses a bare create "
                         "here (claim it, or force)"
@@ -4240,12 +4250,12 @@ class CoreMixin:
                 )
             else:
                 cls = "NEW"
-                # Reconciled fuzzy candidates stay listed: the
-                # spec's own annotation-adaptation case (June 30
-                # "July rent" vs a July 31 line) needs the prior
-                # instance's annotation shipped as evidence even
-                # when it is already reconciled.
-                listed = rec
+                # Weak (LOW) and reconciled fuzzy candidates stay
+                # listed: the spec's annotation-adaptation case
+                # (June 30 "July rent" vs a July 31 line) needs the
+                # prior instance's annotation shipped as evidence
+                # even when it doesn't drive the class.
+                listed = unrec + rec
 
             # Full rehearsal: run exactly what commit would run on
             # this row — a dry-run that ties is a commit that will

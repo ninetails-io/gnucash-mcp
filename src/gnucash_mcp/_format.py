@@ -376,6 +376,42 @@ def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
     return splits
 
 
+# Characters str.splitlines() treats as line breaks but no TSV cell
+# legitimately contains: Unicode LINE/PARAGRAPH SEPARATOR, NEL,
+# vertical tab, form feed. Models and copy/paste occasionally emit
+# them invisibly; splitting on one SHATTERS a row mid-cell, and the
+# resulting structural error truthfully blames the row while being
+# unable to name the invisible byte — a bookkeeper lost a night's
+# bisection to exactly that. Reject them loudly by name instead.
+_EXOTIC_SEPARATORS = {
+    "\u2028": "U+2028 LINE SEPARATOR",
+    "\u2029": "U+2029 PARAGRAPH SEPARATOR",
+    "\x85": "U+0085 NEXT LINE",
+    "\x0b": "U+000B VERTICAL TAB",
+    "\x0c": "U+000C FORM FEED",
+}
+
+
+def _tsv_lines(tsv: str, what: str) -> list[str]:
+    """Split a TSV block on REAL newlines only, rejecting the
+    invisible separator characters ``str.splitlines`` would have
+    silently split on. Shared by every TSV parser — one splitting
+    discipline, one diagnosis."""
+    for ch, name in _EXOTIC_SEPARATORS.items():
+        if ch in tsv:
+            before = tsv[: tsv.index(ch)]
+            row = before.count("\n")  # 0 = header line
+            where = f"row {row}" if row else "the header"
+            raise ValueError(
+                f"invisible {name} character inside {what} at "
+                f"{where} — a copy/paste or generation artifact "
+                f"that would silently shatter the row; re-emit it "
+                f"with plain newlines and tabs"
+            )
+    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
+    return [ln for ln in text.split("\n") if ln.strip()]
+
+
 # Statement-dialect fixed columns (``enter_statement``). The batch
 # grammar's fixed prefix is positional (ref, date, description,
 # [notes], [cur]); a statement header instead declares an
@@ -488,7 +524,7 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
     ``_batch_row_splits`` — the same group mechanics as batch, so
     the two grammars can't drift.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the statement lines TSV")
     if len(lines) < 2:
         raise ValueError(
             "statement lines TSV needs a header row and at least one "
@@ -518,6 +554,16 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
             )
         if len(fields) <= fixed:
             row["splits"] = []
+        elif row.get("match"):
+            # A claim row takes no split cells — say so BEFORE the
+            # group chunker turns the stray cells into a confusing
+            # mid-group miscount (bookkeeper finding, maiden
+            # flight).
+            raise ValueError(
+                f"row {i} (ref {ref!r}): a claim row (match cell "
+                f"set) takes no split cells — end the row at its "
+                f"last fixed column"
+            )
         else:
             try:
                 row["splits"] = _batch_row_splits(
@@ -895,7 +941,7 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     this parser and wants text). Shared with the audit formatter so
     the display parse can't drift from the tool parse.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the updates TSV")
     if len(lines) < 2:
         raise ValueError(
             "updates TSV needs a header row and at least one data row"
