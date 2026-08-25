@@ -21,7 +21,12 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
-from gnucash_mcp._format import _dry_run_summary, _paginate
+from gnucash_mcp._format import (
+    _candidate_comparison_tsv,
+    _dry_run_summary,
+    _paginate,
+    _split_match_verdict,
+)
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
@@ -2892,11 +2897,26 @@ class CoreMixin:
                         + ("A" if amount_match else "-")
                         + ("D" if date_match else "-")
                     )
+                    # Category (non-funding) legs, for the ruling-9
+                    # self-contained comparison; all legs when
+                    # filtering leaves nothing (transfers), same
+                    # fallback as _extract_account_pattern.
+                    cat_legs = [
+                        (s.account.fullname, str(abs(s.value)))
+                        for s in txn.splits
+                        if s.account.type
+                        not in CoreMixin._FUNDING_ACCOUNT_TYPES
+                    ] or [
+                        (s.account.fullname, str(abs(s.value)))
+                        for s in txn.splits
+                    ]
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
+                        "notes": txn.notes or "",
+                        "categories": cat_legs,
                         "amount": str(primary_amount),
                         # Labeling non-default candidates lets the
                         # caller interpret a cross-currency MEDIUM
@@ -3512,8 +3532,29 @@ class CoreMixin:
                     trans_currency=p["currency"].mnemonic,
                 )
                 dups = signals.duplicates
-                for d in dups:
-                    dup_rows.append((p["ref"], d))
+                if dups:
+                    # Proposal-side context for the ruling-9
+                    # comparison rows — computed once per row.
+                    p_cats = [
+                        (v["account"].fullname, str(abs(v["value"])))
+                        for v in p["validated"]
+                        if v["account"].type
+                        not in self._FUNDING_ACCOUNT_TYPES
+                    ] or [
+                        (v["account"].fullname, str(abs(v["value"])))
+                        for v in p["validated"]
+                    ]
+                    proposal = {
+                        "desc": p["description"],
+                        "date": p["trans_date"],
+                        "amount": (
+                            max(p["proposed_amounts"])
+                            if p["proposed_amounts"] else Decimal("0")
+                        ),
+                        "cats": p_cats,
+                    }
+                    for d in dups:
+                        dup_rows.append((p["ref"], d, proposal))
                 # Duplicates arrive HIGH-first, so [0] is the max —
                 # the results-table shortcut that saves the
                 # two-table join for the common decision.
@@ -3555,9 +3596,19 @@ class CoreMixin:
 
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
+                # Ruling 8: a projected-action label must not
+                # masquerade as clearance. would_create stays only
+                # on candidate-free rows (there it is an honest,
+                # verified clearance); any row with >=1 candidate
+                # reports review_required. HIGH blocks stay
+                # rejected + reason.
                 for p, dup_count, max_conf in accepted:
                     by_ref[p["ref"]] = {
-                        "ref": p["ref"], "status": "would_create",
+                        "ref": p["ref"],
+                        "status": (
+                            "review_required" if dup_count
+                            else "would_create"
+                        ),
                         "dup_count": dup_count,
                         "max_confidence": max_conf,
                         **_fill_marker(p),
@@ -3570,12 +3621,22 @@ class CoreMixin:
                 # per-account effects footer — the rehearsal-
                 # completeness principle, minus the tie (batches
                 # assert no closing balance).
-                n_would = len(accepted)
-                n_rejected = len(transactions) - n_would
+                n_review = sum(
+                    1 for r in by_ref.values()
+                    if r["status"] == "review_required"
+                )
+                n_would = len(accepted) - n_review
+                n_rejected = len(transactions) - len(accepted)
                 with_cands = sum(
                     1 for r in by_ref.values() if r.get("dup_count")
                 )
-                if with_cands:
+                if n_review:
+                    homework = (
+                        f"{n_review} rows are review_required — "
+                        f"rule each against the duplicates table "
+                        f"before committing."
+                    )
+                elif with_cands:
                     homework = (
                         f"{with_cands} rows have duplicate "
                         f"candidates — review the duplicates table "
@@ -3586,6 +3647,7 @@ class CoreMixin:
                 summary = _dry_run_summary(
                     len(transactions), "rows",
                     [("would create", n_would),
+                     ("review_required", n_review),
                      ("rejected", n_rejected)],
                     homework,
                 )
@@ -3695,22 +3757,49 @@ class CoreMixin:
         return "\n".join(lines)
 
     @staticmethod
+    def _cats_str(cats: list[tuple[str, str]]) -> str:
+        """Render category legs as ``account=amount`` pipe-joined."""
+        return "|".join(f"{a}={v}" for a, v in sorted(cats))
+
+    @staticmethod
     def _batch_duplicates_to_tsv(dup_rows: list) -> str:
-        """DUPLICATES table: single-entry's column order with ``ref``
-        prepended as the FK. Empty string when no row has a match."""
-        if not dup_rows:
-            return ""
-        lines = [
-            "ref\tconfidence\tguid\tdate\tamount\tcur\t"
-            "description\tsignals"
-        ]
-        for ref, d in dup_rows:
-            lines.append(
-                f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-                f"{d['amount']}\t{d.get('currency', '')}\t"
-                f"{d['description']}\t{d['signals']}"
-            )
-        return "\n".join(lines)
+        """DUPLICATES table in the shared ruling-9 comparison shape:
+        proposed + existing values AND deltas, category legs,
+        split_match — the caller never joins back to its own input.
+        Empty string when no row has a match. ``amt_delta`` renders
+        blank on cross-currency candidates (the ``cur`` column
+        labels them): 188 HKD − 188 CNY is not a number."""
+        rows = []
+        for ref, d, prop in dup_rows:
+            date_old = date.fromisoformat(d["date"])
+            cross_frame = bool(d.get("currency"))
+            rows.append({
+                "ref": ref,
+                "candidate_guid": d["guid"],
+                "confidence": d["confidence"],
+                "date_new": prop["date"].isoformat(),
+                "date_old": d["date"],
+                "date_delta_days": (date_old - prop["date"]).days,
+                "amt_new": str(prop["amount"]),
+                "amt_old": d["amount"],
+                "amt_delta": (
+                    "" if cross_frame
+                    else str(_to_decimal(d["amount"]) - prop["amount"])
+                ),
+                "cur": d.get("currency", ""),
+                "desc_new": prop["desc"],
+                "desc_old": d["description"],
+                "notes_old": d.get("notes", ""),
+                "cat_new": CoreMixin._cats_str(prop["cats"]),
+                "cat_old": CoreMixin._cats_str(
+                    d.get("categories", [])
+                ),
+                "split_match": _split_match_verdict(
+                    prop["cats"], d.get("categories", []),
+                ),
+                "signals": d["signals"],
+            })
+        return _candidate_comparison_tsv(rows)
 
     # ── Statement entry ────────────────────────────────────────────
 
@@ -4091,7 +4180,7 @@ class CoreMixin:
         default_currency = self._require_default_currency(book)
         counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
         line_rows: list[tuple] = []
-        cand_rows: list[tuple] = []
+        cand_rows: list[dict] = []
         projected = reconciled_balance.quantize(quantum)
 
         seen_claims: set[str] = set()
@@ -4140,6 +4229,7 @@ class CoreMixin:
             # Full rehearsal: run exactly what commit would run on
             # this row — a dry-run that ties is a commit that will
             # tie, and a row commit would reject must say so now.
+            proposal_cats = None
             try:
                 if ln.get("match"):
                     s, kind = self._statement_resolve_claim(
@@ -4160,6 +4250,11 @@ class CoreMixin:
                         book, account, ln, _book_amount(ln),
                         default_currency,
                     )
+                    proposal_cats = [
+                        (v["account"].fullname, str(abs(v["value"])))
+                        for v in validated
+                        if v["account"].guid != account.guid
+                    ]
                     if cls == "NEW" and not ln.get("splits"):
                         counter_names = ", ".join(
                             v["account"].fullname
@@ -4182,13 +4277,45 @@ class CoreMixin:
             for c in listed:
                 s = c["split"]
                 txn = s.transaction
-                cand_rows.append((
-                    ln["ref"], split_prefixes[s.guid],
-                    s.reconcile_state,
-                    txn.post_date.isoformat(), str(s.quantity),
-                    txn.description or "", txn.notes or "",
-                    s.memo or "", c["signals"],
-                ))
+                cat_old = [
+                    (s2.account.fullname, str(abs(s2.value)))
+                    for s2 in txn.splits
+                    if s2.account.guid != account.guid
+                ]
+                risk = sum(1 for ch in c["signals"] if ch != "-")
+                cand_rows.append({
+                    "ref": ln["ref"],
+                    "candidate_guid": split_prefixes[s.guid],
+                    "confidence": {
+                        3: "HIGH", 2: "MEDIUM", 1: "LOW",
+                    }.get(risk, ""),
+                    "state": s.reconcile_state,
+                    "date_new": ln["date"].isoformat(),
+                    "date_old": txn.post_date.isoformat(),
+                    "date_delta_days": (
+                        txn.post_date - ln["date"]
+                    ).days,
+                    "amt_new": str(_book_amount(ln)),
+                    "amt_old": str(s.quantity),
+                    "amt_delta": str(
+                        s.quantity - _book_amount(ln)
+                    ),
+                    "desc_new": (
+                        ln.get("description") or ln.get("raw") or ""
+                    ),
+                    "desc_old": txn.description or "",
+                    "notes_old": txn.notes or "",
+                    "memo_old": s.memo or "",
+                    "cat_new": (
+                        self._cats_str(proposal_cats)
+                        if proposal_cats is not None else ""
+                    ),
+                    "cat_old": self._cats_str(cat_old),
+                    "split_match": _split_match_verdict(
+                        proposal_cats, cat_old,
+                    ),
+                    "signals": c["signals"],
+                })
             line_rows.append((ln["ref"], cls, len(listed), note))
 
         # Summary header via the shared rehearsal renderer — counts
@@ -4238,20 +4365,11 @@ class CoreMixin:
         lines_tsv = ["ref\tclass\tcands\tnote"]
         for r in line_rows:
             lines_tsv.append(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}")
-        cands_tsv = ""
-        if cand_rows:
-            out = [
-                "ref\tsplit_guid\tstate\tdate\tamount\t"
-                "description\tnotes\tmemo\tsignals"
-            ]
-            for r in cand_rows:
-                out.append("\t".join(str(x) for x in r))
-            cands_tsv = "\n".join(out)
 
         return {
             "summary": header,
             "lines": "\n".join(lines_tsv),
-            "candidates": cands_tsv,
+            "candidates": _candidate_comparison_tsv(cand_rows),
             "warnings": self._batch_warnings_to_tsv(warn_rows),
             "tie": tie,
         }
@@ -4366,10 +4484,14 @@ class CoreMixin:
             new_reconciled += _book_amount(ln)
         new_reconciled = new_reconciled.quantize(quantum)
         closing_book = (sign * closing).quantize(quantum)
+        n_touched = len(prepared) + len(claims)
+        cur = account.commodity.mnemonic
         if new_reconciled == closing_book:
             tie = (
-                f"reconciled balance {new_reconciled} ties to the "
-                f"statement closing ({closing} as printed)"
+                f"Reconciled: {n_touched} splits @ "
+                f"{statement_date.isoformat()}; closing balance "
+                f"{cur} {new_reconciled} ({closing} as printed) — "
+                f"tied."
             )
         elif force:
             tie = (
@@ -4463,19 +4585,18 @@ class CoreMixin:
             )
         for ln, s in skipped:
             by_ref[ln["ref"]] = (
-                f"{ln['ref']}\tskipped_overlap\t"
+                f"{ln['ref']}\tskipped_duplicate\t"
                 f"{split_prefixes[s.guid]}\talready reconciled"
             )
         for ln in lines:
             rows.append(by_ref[ln["ref"]])
 
-        n_touched = len(built) + len(claims)
         return {
             "summary": (
-                f"Statement entered: {len(built)} created, "
-                f"{len(claims)} claimed, {len(skipped)} skipped "
-                f"(already reconciled); {n_touched} splits "
-                f"reconciled at {statement_date.isoformat()}."
+                f"Statement entered on {account.fullname} through "
+                f"{statement_date.isoformat()}: {len(built)} "
+                f"created, {len(claims)} claimed, {len(skipped)} "
+                f"skipped (already reconciled)."
             ),
             "results": "\n".join(rows),
             "new_reconciled_balance": str(new_reconciled),

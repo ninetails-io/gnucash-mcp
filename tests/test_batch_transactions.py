@@ -576,7 +576,8 @@ class TestBatchDryRunUpgrades:
             dry_run=True,
         )
         assert "Dry run: 2 rows — " in env["summary"]
-        assert "1 would create, 1 rejected" in env["summary"]
+        assert "1 would create, 0 review_required, 1 rejected" in \
+            env["summary"]
         assert "duplicate candidates" in env["summary"]
         # The clearance principle: no verdict vocabulary.
         assert "safe" not in env["summary"].lower()
@@ -633,6 +634,61 @@ class TestBatchDryRunUpgrades:
         env = gc.create_transactions([_txn(1, "A", "10.00")])
         assert "summary" not in env
         assert "effects" not in env
+
+    def test_review_required_status(self, test_book):
+        """Ruling 8: a non-blocking (MEDIUM) candidate turns
+        would_create into review_required — a projected-action
+        label must not masquerade as clearance."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        # Same description + date, amount off by > $1: desc+date
+        # MEDIUM, non-blocking.
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1700", d=date(2026, 5, 21))],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "review_required"
+        assert rows[0]["max_confidence"] == "MEDIUM"
+        assert "1 rows are review_required" in env["summary"]
+
+    def test_duplicates_table_is_self_contained(self, test_book):
+        """Ruling 9: the candidate row carries proposed + existing
+        values, deltas, category legs, and a split_match verdict —
+        no join back to the caller's input."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1700", d=date(2026, 5, 21))],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["desc_new"] == "Rent"
+        assert row["desc_old"] == "Rent"
+        assert row["date_delta_days"] == "-1"
+        assert row["amt_new"] == "1700"
+        assert row["amt_old"] == "1800"
+        assert row["amt_delta"] == "100"
+        assert row["cat_new"] == "Expenses:Groceries=1700"
+        assert row["cat_old"] == "Expenses:Groceries=1800"
+        assert row["split_match"] == "partial"
+
+    def test_split_match_none_on_distinct_categories(
+        self, test_book
+    ):
+        """The Chewy/fuel case: MEDIUM on date+amount, decisively
+        distinct on category."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1799.50", d=date(2026, 5, 21),
+                  acct_to="Income:Salary")],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["split_match"] == "none"
 
 
 class TestBatchCurColumn:

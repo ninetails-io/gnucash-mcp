@@ -529,6 +529,71 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
     return out
 
 
+# Ruling 9 (statement spec §10): candidate rows are SELF-CONTAINED
+# comparisons — proposed + existing values AND deltas, category
+# legs, a split_match verdict. The caller never joins back to its
+# own input to reconstruct either side. One column set for both
+# rehearsal surfaces (batch duplicates, statement candidates);
+# cells a surface can't fill render blank.
+_CANDIDATE_COMPARISON_COLUMNS = (
+    "ref", "candidate_guid", "confidence", "state",
+    "date_new", "date_old", "date_delta_days",
+    "amt_new", "amt_old", "amt_delta", "cur",
+    "desc_new", "desc_old", "notes_old", "memo_old",
+    "cat_new", "cat_old", "split_match", "signals",
+)
+
+
+def _candidate_risk(row: dict) -> int:
+    """Correspondence strength = lit signal count."""
+    return sum(1 for ch in str(row.get("signals", "")) if ch != "-")
+
+
+def _candidate_comparison_tsv(rows: list[dict]) -> str:
+    """Render candidate-comparison dicts as the shared TSV, sorted
+    by descending risk with a stable (ref, candidate_guid)
+    tie-break — the reader's model of the list must not form on
+    the harmless entries. Empty input renders "" (dropped by
+    _strip_noise)."""
+    if not rows:
+        return ""
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            -_candidate_risk(r),
+            str(r.get("ref", "")), str(r.get("candidate_guid", "")),
+        ),
+    )
+    lines = ["\t".join(_CANDIDATE_COMPARISON_COLUMNS)]
+    for r in ordered:
+        lines.append(
+            "\t".join(
+                str(r.get(c, "")) for c in
+                _CANDIDATE_COMPARISON_COLUMNS
+            )
+        )
+    return "\n".join(lines)
+
+
+def _split_match_verdict(
+    cat_new: list[tuple[str, str]] | None,
+    cat_old: list[tuple[str, str]],
+) -> str:
+    """``exact`` / ``partial`` / ``none`` over the category
+    (non-payment) split sets — the payment account is shared by
+    construction and carries no signal. exact = same accounts and
+    amounts; partial = any account overlap; none = disjoint.
+    Unknown proposal side renders blank."""
+    if cat_new is None:
+        return ""
+    new_set, old_set = set(cat_new), set(cat_old)
+    if new_set == old_set:
+        return "exact"
+    if {a for a, _ in new_set} & {a for a, _ in old_set}:
+        return "partial"
+    return "none"
+
+
 def _dry_run_summary(
     total: int, noun: str, counts: list[tuple[str, int]],
     homework: str = "",

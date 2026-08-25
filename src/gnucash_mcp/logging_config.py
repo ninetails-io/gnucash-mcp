@@ -2148,7 +2148,7 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
                     f"{old.get('notes', '') or '(empty)'} → "
                     f"{new_notes}"
                 )
-        elif status == "skipped_overlap":
+        elif status == "skipped_duplicate":
             lines.append(
                 f"{_INDENT}SKIP  split:{guid}  already reconciled"
             )

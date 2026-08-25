@@ -162,8 +162,8 @@ def _commit(gc, statement_book, **kw):
     """Run the standard dry-run → claim → commit flow."""
     res = _dry(gc)
     cands = _cands(res)
-    rent_guid = cands["1"][0]["split_guid"]
-    coffee_guid = cands["3"][0]["split_guid"]
+    rent_guid = cands["1"][0]["candidate_guid"]
+    coffee_guid = cands["3"][0]["candidate_guid"]
     return gc.enter_statement(
         "Assets:Checking", date(2026, 7, 31), _OPEN, _CLOSE,
         _checking_lines(rent_guid, coffee_guid),
@@ -331,19 +331,28 @@ class TestStatementDryRun:
         assert "2 rows need adjudication" in res["summary"]
 
     def test_match_carries_full_annotation(self, statement_book):
-        """Ruling: the MATCH row ships the evidence — description,
-        notes, memo, post date, short GUID — so the judgment pass
-        can adapt annotations the server can't infer."""
+        """Rulings 2 + 9: the MATCH row is a self-contained
+        comparison — the candidate's complete annotation AND the
+        proposed side with deltas, so the judgment pass never joins
+        back to its own input."""
         gc = GnuCashBook(str(statement_book))
         cand = _cands(_dry(gc))["1"][0]
-        assert cand["description"] == "July Rent"
-        assert cand["notes"] == "rent note"
-        assert cand["date"] == "2026-07-01"
+        assert cand["desc_old"] == "July Rent"
+        assert cand["notes_old"] == "rent note"
+        assert cand["date_old"] == "2026-07-01"
         assert cand["state"] == "n"
         # The probe is the raw cell ("ACH RENT PAYMENT"), which does
         # NOT desc-match "July Rent" — amount + date carry it.
         assert cand["signals"] == "-AD"
-        assert len(cand["split_guid"]) >= 8
+        assert len(cand["candidate_guid"]) >= 8
+        # Proposed side + computed deltas (ruling 9).
+        assert cand["desc_new"] == "ACH RENT PAYMENT"
+        assert cand["date_new"] == "2026-07-01"
+        assert cand["date_delta_days"] == "0"
+        assert cand["amt_new"] == "-800.00"
+        assert cand["amt_old"] == "-800"
+        assert cand["amt_delta"] == "0.00"
+        assert cand["cat_old"] == "Expenses:Rent=800"
 
     def test_amount_only_candidate_surfaces(self, statement_book):
         """Ruling 1's rent case: a line 31 days from a same-amount
@@ -357,8 +366,10 @@ class TestStatementDryRun:
             dry_run=True,
         )
         cand = _cands(res)["1"][0]
-        assert cand["description"] == "July Rent"
+        assert cand["desc_old"] == "July Rent"
         assert cand["signals"] == "-A-"
+        assert cand["confidence"] == "LOW"
+        assert cand["date_delta_days"] == "-31"
 
     def test_prediction_note_for_new(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -405,8 +416,10 @@ class TestStatementCommit:
         gc = GnuCashBook(str(statement_book))
         res = _commit(gc, statement_book)
         assert "2 created, 2 claimed, 0 skipped" in res["summary"]
+        assert "Assets:Checking through 2026-07-31" in res["summary"]
         assert res["new_reconciled_balance"] == "2107.38"
-        assert "ties" in res["tie"]
+        assert "Reconciled: 4 splits @ 2026-07-31" in res["tie"]
+        assert "tied." in res["tie"]
         statuses = {
             f[0]: f[1] for f in
             (ln.split("\t") for ln in
@@ -454,7 +467,7 @@ class TestStatementCommit:
     def test_claim_amount_mismatch_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
         cands = _cands(_dry(gc))
-        rent_guid = cands["1"][0]["split_guid"]
+        rent_guid = cands["1"][0]["candidate_guid"]
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
             "1000.00", "200.50",
@@ -467,7 +480,7 @@ class TestStatementCommit:
 
     def test_match_row_with_splits_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
-        rent_guid = _cands(_dry(gc))["1"][0]["split_guid"]
+        rent_guid = _cands(_dry(gc))["1"][0]["candidate_guid"]
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
             "1000.00", "200.00",
@@ -481,7 +494,7 @@ class TestStatementCommit:
 
     def test_double_claim_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
-        rent_guid = _cands(_dry(gc))["1"][0]["split_guid"]
+        rent_guid = _cands(_dry(gc))["1"][0]["candidate_guid"]
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
             "1000.00", "-600.00",
@@ -578,7 +591,7 @@ class TestStatementCommit:
                    raw="ACH RENT", match=guid)],
             dry_run=False, force=True,
         )
-        assert "skipped_overlap" in res["results"]
+        assert "skipped_duplicate" in res["results"]
         assert "1 skipped" in res["summary"]
 
     def test_multi_split_precedent_rejects_autofill(
@@ -753,7 +766,7 @@ class TestStatementReviewFindings:
 
     def test_dry_run_detects_double_claim(self, statement_book):
         gc = GnuCashBook(str(statement_book))
-        rent_guid = _cands(_dry(gc))["1"][0]["split_guid"]
+        rent_guid = _cands(_dry(gc))["1"][0]["candidate_guid"]
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
             "1000.00", "-600.00",
@@ -797,7 +810,8 @@ class TestStatementSignTransform:
         )
         assert "1 created" in res["summary"]
         assert res["new_reconciled_balance"] == "-42.00"
-        assert "ties" in res["tie"]
+        assert "USD -42.00" in res["tie"]
+        assert "tied." in res["tie"]
         assert gc.get_balance("Visa") == Decimal("-42")
 
     def test_payment_line_on_card(self, statement_book):
@@ -833,7 +847,7 @@ class TestStatementRoundTrip:
         """The dry-run candidates table's split_guid short form is
         valid match input — output hands look like input hands."""
         gc = GnuCashBook(str(statement_book))
-        guid = _cands(_dry(gc))["1"][0]["split_guid"]
+        guid = _cands(_dry(gc))["1"][0]["candidate_guid"]
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
             "1000.00", "200.00",

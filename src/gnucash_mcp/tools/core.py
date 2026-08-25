@@ -495,19 +495,33 @@ def register(mcp, get_book) -> None:
         OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
         - ``results`` (always): ``ref, status, txn_guid, dup_count,
           max_confidence, reason``. status is ``created`` |
-          ``rejected`` | ``would_create`` (dry_run); reason is a
-          code like ``duplicate_detected`` or the validation
-          message. ``max_confidence`` (HIGH/MEDIUM/blank) is the
-          row's top duplicate candidate — enough for the common
-          keep/drop call without the join.
-        - ``duplicates`` (only when matches exist): ``ref, confidence,
-          guid, date, amount, description, signals`` — the columns
-          ``create_transaction`` emits, keyed back to the offending
-          ``ref``. Σ(dup_count) equals the duplicates row count.
+          ``rejected`` | ``would_create`` (dry_run, candidate-free
+          rows only) | ``review_required`` (dry_run rows with >=1
+          duplicate candidate — rule each against the duplicates
+          table before committing); reason is a code like
+          ``duplicate_detected`` or the validation message.
+          ``max_confidence`` (HIGH/MEDIUM/blank) is the row's top
+          duplicate candidate — enough for the common keep/drop
+          call without the join.
+        - ``duplicates`` (only when matches exist): SELF-CONTAINED
+          comparison rows, sorted strongest-correspondence first —
+          ``ref, candidate_guid, confidence, state, date_new,
+          date_old, date_delta_days, amt_new, amt_old, amt_delta,
+          cur, desc_new, desc_old, notes_old, memo_old, cat_new,
+          cat_old, split_match, signals``. ``_new`` = your proposed
+          row, ``_old`` = the existing transaction; ``cat_*`` are
+          the category (non-payment) legs as
+          ``account=amount|...``; ``split_match``
+          (exact/partial/none) compares them — MEDIUM on
+          date+amount but ``none`` on category is usually a
+          distinct purchase. ``amt_delta`` is blank on
+          cross-currency candidates (see ``cur``). Never re-read
+          your own input — both sides are in the row.
+          Σ(dup_count) equals the duplicates row count.
         - Dry runs additionally lead with ``summary`` (would-create/
-          rejected counts + which rows have candidates to review)
+          review-required/rejected counts + the homework line)
           and close with ``effects`` — the projected per-account
-          balance deltas of the would-create rows.
+          balance deltas of the rows that would land.
 
         Args:
             transactions: The TSV block described above.
@@ -599,12 +613,18 @@ def register(mcp, get_book) -> None:
         bypasses the statement's own self-check.
 
         OUTPUT (dry-run): ``summary`` (class counts), ``lines``
-        (ref, class, cands, note), ``candidates`` (per-candidate
-        annotation, FK ref), ``warnings``, and ``tie`` — the
-        projected reconciled balance vs the closing. The tie is the
-        only verdict; MATCH/AMBIGUOUS rows are yours to rule.
+        (ref, class, cands, note), ``candidates`` — SELF-CONTAINED
+        comparison rows sorted strongest-correspondence first
+        (``ref, candidate_guid, confidence, state, date_new/old +
+        delta, amt_new/old + delta, desc_new/old, notes_old,
+        memo_old, cat_new/old, split_match, signals``; ``_new`` =
+        the statement line in book convention, ``_old`` = the
+        existing split — never re-read your own input), plus
+        ``warnings`` and ``tie`` — the projected reconciled balance
+        vs the closing. The tie is the only verdict;
+        MATCH/AMBIGUOUS rows are yours to rule.
         OUTPUT (commit): ``results`` (ref, status
-        created|claimed|skipped_overlap, guid), the new reconciled
+        created|claimed|skipped_duplicate, guid), the new reconciled
         balance, and the tie.
 
         Args:
