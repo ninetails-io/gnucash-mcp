@@ -117,6 +117,19 @@ class _SummaryData:
     expense_total: int = 0
 
 
+# Shared correspondence thresholds — the ONE definition both
+# matchers (the duplicate screen in _collect_create_signals and the
+# statement candidate scan in enter_statement) read, so the A/D
+# signal semantics can't drift between the two surfaces. The
+# ADMISSION rules deliberately differ (documented at each site):
+# the book-wide duplicate screen demands >=2 signals; the
+# account-scoped statement scan admits the amount signal alone,
+# because its narrow universe makes an amount match meaningful —
+# and the spec's own monthly-rent case carries only that signal.
+_MATCH_AMOUNT_TOLERANCE = Decimal("1.00")
+_MATCH_DATE_TIGHT_DAYS = 2
+
+
 def _post_date_as_date(transaction) -> date | None:
     """Transaction post_date normalized to a bare date — piecash
     stores it with a neutral-time datetime component."""
@@ -2881,13 +2894,17 @@ class CoreMixin:
                     or txn.currency.mnemonic == trans_currency
                 )
                 amount_match = same_frame and (
-                    abs(proposed_primary - primary_amount) <= Decimal("1.00")
+                    abs(proposed_primary - primary_amount)
+                    <= _MATCH_AMOUNT_TOLERANCE
                 )
 
                 # Signal 3: date within ±2 days of trans_date (tighter
                 # than the window filter — window is for "worth
                 # considering at all").
-                date_match = abs((txn.post_date - trans_date).days) <= 2
+                date_match = (
+                    abs((txn.post_date - trans_date).days)
+                    <= _MATCH_DATE_TIGHT_DAYS
+                )
 
                 signals = sum([desc_match, amount_match, date_match])
                 if signals >= 2:
@@ -3997,9 +4014,13 @@ class CoreMixin:
                     if abs((pd - ln["date"]).days) > 31:
                         continue
                     amount_match = (
-                        abs(s.quantity - target) <= Decimal("1.00")
+                        abs(s.quantity - target)
+                        <= _MATCH_AMOUNT_TOLERANCE
                     )
-                    date_match = abs((pd - ln["date"]).days) <= 2
+                    date_match = (
+                        abs((pd - ln["date"]).days)
+                        <= _MATCH_DATE_TIGHT_DAYS
+                    )
                     tdesc = (
                         s.transaction.description or ""
                     ).lower().strip()

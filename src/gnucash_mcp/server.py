@@ -60,6 +60,9 @@ ORIENTATION:
 - Use list_accounts to get exact paths and short GUIDs before writing.
 - Use search_transactions before creating to avoid duplicates.
 - Every transaction has splits that MUST sum to zero.
+STATEMENT ENTRY (the headline workflow):
+- For a COMPLETE bank/card statement, use enter_statement — not create_transactions + reconcile_account. Dry-run (default) classifies every line against the book and projects the balance tie; commit enters, claims, and reconciles atomically against the closing balance.
+- Transcribe amounts and balances EXACTLY as the statement prints them (credit cards included) — the server applies the sign convention. Your judgment pass between dry-run and commit is the one step the server cannot do.
 ACCOUNT REFERENCES:
 - Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%xxxxxxx" form), or full 32-char GUIDs.
 - list_accounts emits short GUIDs at line start: "%xxxxxxx\\tAssets:Savings [BANK]" (x's are a placeholder — copy real GUIDs from list_accounts output). Reuse them — ~80% smaller than paths.
