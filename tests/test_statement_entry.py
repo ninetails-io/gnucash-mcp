@@ -739,6 +739,25 @@ class TestStatementAuditFormatter:
         assert len(out) == 2
         assert "(dry run)" in out[0]
 
+    def test_render_through_the_escape_chokepoint(self):
+        """The full production path — _format_audit_entry_text
+        escapes params BEFORE dispatch, and 'lines' must be in
+        _AUDIT_TSV_KEYS or the TSV's tabs get escaped to literal
+        text and every CREATE row renders empty (found by review;
+        the direct-call tests above bypass the chokepoint)."""
+        from gnucash_mcp.logging_config import (
+            _format_audit_entry_text,
+        )
+        entry = self._entry(False)
+        entry["classification"] = "write"
+        entry["operation"] = "enter"
+        entry["entity_type"] = "statement"
+        entry["tool"] = "enter_statement"
+        out = _format_audit_entry_text(entry)
+        assert '"Whole Foods" (2026-07-03, -87.12)' in out
+        assert "memo: (empty) → ACH RENT" in out
+        assert "notes: groceries" in out
+
 
 # ── Tool wrapper ───────────────────────────────────────────────────
 

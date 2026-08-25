@@ -720,7 +720,7 @@ def _fmt_transaction_update_batch(entry: dict) -> list[str]:
         old = next(
             (
                 b for g, b in befores.items()
-                if g.startswith(key) or key.startswith(g[:8])
+                if g.startswith(key)
             ),
             {},
         )
@@ -2125,7 +2125,7 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
             old = next(
                 (
                     b for g, b in befores.items()
-                    if g.startswith(guid) or guid.startswith(g[:8])
+                    if g.startswith(guid)
                 ),
                 {},
             )
@@ -2345,7 +2345,7 @@ def _escape_audit_value(text: str) -> str:
 # still neutralizes \r, stray C0 controls, and bidi overrides that
 # could survive inside a cell.
 _AUDIT_TSV_KEYS = frozenset({"transactions", "updates", "results",
-                             "prices"})
+                             "prices", "lines"})
 
 _AUDIT_UNSAFE_TSV_RE = re.compile(
     "[\\\\\\x00-\\x08\\x0b-\\x1f\\x7f"  # C0 minus \t \n, + DEL
