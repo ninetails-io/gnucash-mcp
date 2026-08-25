@@ -21,7 +21,7 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import _dry_run_summary, _paginate
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
@@ -3514,19 +3514,25 @@ class CoreMixin:
                 dups = signals.duplicates
                 for d in dups:
                     dup_rows.append((p["ref"], d))
+                # Duplicates arrive HIGH-first, so [0] is the max —
+                # the results-table shortcut that saves the
+                # two-table join for the common decision.
+                max_conf = dups[0]["confidence"] if dups else ""
                 if signals.has_high_duplicate and not force:
                     by_ref[p["ref"]] = {
                         "ref": p["ref"], "status": "rejected",
-                        "reason": "duplicate_detected", "dup_count": len(dups),
+                        "reason": "duplicate_detected",
+                        "dup_count": len(dups),
+                        "max_confidence": max_conf,
                     }
                 else:
-                    accepted.append((p, len(dups)))
+                    accepted.append((p, len(dups), max_conf))
 
             # Cross-commodity implied-rate sanity per accepted row
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
-            for p, _dc in accepted:
+            for p, _dc, _mc in accepted:
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -3549,18 +3555,62 @@ class CoreMixin:
 
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
-                for p, dup_count in accepted:
+                for p, dup_count, max_conf in accepted:
                     by_ref[p["ref"]] = {
                         "ref": p["ref"], "status": "would_create",
                         "dup_count": dup_count,
+                        "max_confidence": max_conf,
                         **_fill_marker(p),
                     }
-                return self._batch_envelope(
+                envelope = self._batch_envelope(
                     transactions, by_ref, dup_rows, warn_rows,
                 )
+                # Ruling 7 upgrades: shared rehearsal header (counts
+                # + homework, never a clearance) and the projected
+                # per-account effects footer — the rehearsal-
+                # completeness principle, minus the tie (batches
+                # assert no closing balance).
+                n_would = len(accepted)
+                n_rejected = len(transactions) - n_would
+                with_cands = sum(
+                    1 for r in by_ref.values() if r.get("dup_count")
+                )
+                if with_cands:
+                    homework = (
+                        f"{with_cands} rows have duplicate "
+                        f"candidates — review the duplicates table "
+                        f"before committing."
+                    )
+                else:
+                    homework = "No duplicate candidates."
+                summary = _dry_run_summary(
+                    len(transactions), "rows",
+                    [("would create", n_would),
+                     ("rejected", n_rejected)],
+                    homework,
+                )
+                effects: dict[str, Decimal] = {}
+                for p, _dc, _mc in accepted:
+                    for v in p["validated"]:
+                        key = v["account"].fullname
+                        effects[key] = (
+                            effects.get(key, Decimal("0"))
+                            + v["quantity"]
+                        )
+                effects_tsv = ""
+                if effects:
+                    out = ["account\tdelta"]
+                    for name in sorted(effects):
+                        out.append(f"{name}\t{effects[name]}")
+                    effects_tsv = "\n".join(out)
+                return {
+                    "summary": summary,
+                    **envelope,
+                    "effects": effects_tsv,
+                }
 
             built = []
-            for p, dup_count in accepted:
+            for p, dup_count, _max_conf in accepted:
                 piecash_splits = [
                     piecash.Split(
                         account=v["account"], value=v["value"],
@@ -3576,7 +3626,7 @@ class CoreMixin:
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
-                built.append((p, txn_obj, dup_count))
+                built.append((p, txn_obj, dup_count, _max_conf))
 
             # Single flush for the whole batch — per the "don't flush
             # mid-build" rule, every Transaction is fully constructed
@@ -3584,11 +3634,12 @@ class CoreMixin:
             book.save()
 
             all_guids = [t.guid for t in book.transactions]
-            for p, txn_obj, dup_count in built:
+            for p, txn_obj, dup_count, max_conf in built:
                 by_ref[p["ref"]] = {
                     "ref": p["ref"], "status": "created",
                     "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
                     "dup_count": dup_count,
+                    "max_confidence": max_conf,
                     **_fill_marker(p),
                 }
 
@@ -3624,15 +3675,22 @@ class CoreMixin:
     @staticmethod
     def _batch_results_to_tsv(rows: list[dict]) -> str:
         """RESULTS table: header + one row per input transaction.
-        Blank cells for fields a given status doesn't carry; ``dup_count``
-        of 0 renders as "0", absent renders blank."""
-        header = "ref\tstatus\ttxn_guid\tdup_count\treason"
+        Blank cells for fields a given status doesn't carry;
+        ``dup_count`` of 0 renders as "0", absent renders blank.
+        ``max_confidence`` (HIGH/MEDIUM/blank) is the row's top
+        duplicate candidate — the shortcut that saves the two-table
+        join for the common keep/drop decision; the duplicates
+        table remains for the real one."""
+        header = (
+            "ref\tstatus\ttxn_guid\tdup_count\tmax_confidence\treason"
+        )
         lines = [header]
         for r in rows:
             dup = r["dup_count"] if "dup_count" in r else ""
             lines.append(
                 f"{r['ref']}\t{r['status']}\t{r.get('txn_guid', '')}\t"
-                f"{dup}\t{r.get('reason', '')}"
+                f"{dup}\t{r.get('max_confidence', '')}\t"
+                f"{r.get('reason', '')}"
             )
         return "\n".join(lines)
 
@@ -4044,23 +4102,25 @@ class CoreMixin:
                 ))
             line_rows.append((ln["ref"], cls, len(listed), note))
 
-        # Summary header — counts are facts and may headline;
-        # clearance verdicts over unadjudicated rows may not (the
-        # clearance principle, spec §4).
+        # Summary header via the shared rehearsal renderer — counts
+        # are facts and may headline; clearance verdicts over
+        # unadjudicated rows may not (the clearance principle,
+        # spec §4).
         n_judge = counts["MATCH"] + counts["AMBIGUOUS"]
-        header = (
-            f"Dry run: {len(lines)} lines — {counts['NEW']} NEW, "
-            f"{counts['MATCH']} MATCH, {counts['OVERLAP']} OVERLAP, "
-            f"{counts['AMBIGUOUS']} AMBIGUOUS."
-        )
         if n_judge:
-            header += (
-                f"\n{n_judge} rows need adjudication — rule each "
+            homework = (
+                f"{n_judge} rows need adjudication — rule each "
                 f"MATCH/AMBIGUOUS against the candidates table "
                 f"before committing."
             )
         else:
-            header += "\nNo existing-split candidates on any line."
+            homework = "No existing-split candidates on any line."
+        header = _dry_run_summary(
+            len(lines), "lines",
+            [(c, counts[c]) for c in
+             ("NEW", "MATCH", "OVERLAP", "AMBIGUOUS")],
+            homework,
+        )
 
         closing_book = (sign * closing).quantize(quantum)
         projected = projected.quantize(quantum)

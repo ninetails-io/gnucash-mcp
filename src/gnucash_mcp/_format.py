@@ -529,6 +529,27 @@ def _parse_statement_tsv(tsv: str) -> list[dict]:
     return out
 
 
+def _dry_run_summary(
+    total: int, noun: str, counts: list[tuple[str, int]],
+    homework: str = "",
+) -> str:
+    """Shared dry-run summary header for the two rehearsal surfaces
+    (``enter_statement`` and ``create_transactions`` dry-runs) —
+    divergence between them is a bug, same as the grammars.
+
+    The clearance principle (statement spec §4): counts are facts
+    and may headline; "safe to commit" / "0 blocking" style verdicts
+    over rows the judgment pass hasn't ruled are banned vocabulary.
+    ``homework`` assigns the work ("K rows need adjudication…") or
+    states a verified empty ("no duplicate candidates") — never a
+    clearance."""
+    parts = ", ".join(f"{n} {label}" for label, n in counts)
+    out = f"Dry run: {total} {noun} — {parts}."
+    if homework:
+        out += f"\n{homework}"
+    return out
+
+
 # ── Numeric formatting ─────────────────────────────────────────────
 
 

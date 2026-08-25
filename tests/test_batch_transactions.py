@@ -561,6 +561,80 @@ class TestBatchCreate:
             gc.create_transactions([_txn(1, "x", "1")], on_error="bad")
 
 
+class TestBatchDryRunUpgrades:
+    """Ruling 7 (statement spec §9): the batch dry-run inherits the
+    rehearsal surface — summary header (counts + homework, never a
+    clearance), max_confidence results column, per-account effects
+    footer."""
+
+    def test_summary_counts_and_homework(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20)),
+             _txn(2, "Fresh Thing", "10.00")],
+            dry_run=True,
+        )
+        assert "Dry run: 2 rows — " in env["summary"]
+        assert "1 would create, 1 rejected" in env["summary"]
+        assert "duplicate candidates" in env["summary"]
+        # The clearance principle: no verdict vocabulary.
+        assert "safe" not in env["summary"].lower()
+        assert "blocking" not in env["summary"].lower()
+
+    def test_summary_verified_empty(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions(
+            [_txn(1, "Fresh Thing", "10.00")], dry_run=True,
+        )
+        assert "No duplicate candidates." in env["summary"]
+
+    def test_max_confidence_column(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20)),
+             _txn(2, "Fresh Thing", "10.00")],
+            dry_run=True,
+        )
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["1"]["max_confidence"] == "HIGH"
+        assert rows["2"]["max_confidence"] == ""
+
+    def test_max_confidence_on_commit_rows_too(self, test_book):
+        """One results shape across modes — the column isn't
+        dry-run-only."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20))],
+            force=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        assert rows[0]["max_confidence"] == "HIGH"
+
+    def test_effects_footer(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions(
+            [_txn(1, "A", "10.00"), _txn(2, "B", "5.50")],
+            dry_run=True,
+        )
+        effects = {
+            f[0]: f[1] for f in
+            (ln.split("\t") for ln in
+             env["effects"].splitlines()[1:])
+        }
+        assert effects["Assets:Checking"] == "-15.50"
+        assert effects["Expenses:Groceries"] == "15.50"
+
+    def test_commit_has_no_summary_or_effects(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([_txn(1, "A", "10.00")])
+        assert "summary" not in env
+        assert "effects" not in env
+
+
 class TestBatchCurColumn:
     """The ``cur`` column sets a ROW's transaction currency.
 

@@ -494,13 +494,20 @@ def register(mcp, get_book) -> None:
 
         OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
         - ``results`` (always): ``ref, status, txn_guid, dup_count,
-          reason``. status is ``created`` | ``rejected`` |
-          ``would_create`` (dry_run); reason is a code like
-          ``duplicate_detected`` or the validation message.
+          max_confidence, reason``. status is ``created`` |
+          ``rejected`` | ``would_create`` (dry_run); reason is a
+          code like ``duplicate_detected`` or the validation
+          message. ``max_confidence`` (HIGH/MEDIUM/blank) is the
+          row's top duplicate candidate — enough for the common
+          keep/drop call without the join.
         - ``duplicates`` (only when matches exist): ``ref, confidence,
           guid, date, amount, description, signals`` — the columns
           ``create_transaction`` emits, keyed back to the offending
           ``ref``. Σ(dup_count) equals the duplicates row count.
+        - Dry runs additionally lead with ``summary`` (would-create/
+          rejected counts + which rows have candidates to review)
+          and close with ``effects`` — the projected per-account
+          balance deltas of the would-create rows.
 
         Args:
             transactions: The TSV block described above.
