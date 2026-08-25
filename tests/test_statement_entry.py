@@ -353,6 +353,13 @@ class TestStatementDryRun:
         assert cand["amt_old"] == "-800"
         assert cand["amt_delta"] == "0.00"
         assert cand["cat_old"] == "Expenses:Rent=800"
+        # Line 1 carries raw only and has no auto-fill precedent,
+        # so its proposal side is unknown — split_match blank.
+        assert cand["split_match"] == ""
+        # Line 3 auto-fills, so its comparison is complete — and
+        # Decimal-normalized: "5.50" vs "5.5" is the SAME leg.
+        cand3 = _cands(_dry(gc))["3"][0]
+        assert cand3["split_match"] == "exact"
 
     def test_amount_only_candidate_surfaces(self, statement_book):
         """Ruling 1's rent case: a line 31 days from a same-amount

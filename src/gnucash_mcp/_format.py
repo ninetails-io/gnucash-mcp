@@ -586,7 +586,19 @@ def _split_match_verdict(
     Unknown proposal side renders blank."""
     if cat_new is None:
         return ""
-    new_set, old_set = set(cat_new), set(cat_old)
+
+    def norm(cats):
+        # Amounts compare as numbers — "800.00" IS "800"; the raw
+        # strings come from different layers with different scales.
+        out = set()
+        for a, v in cats:
+            try:
+                out.add((a, Decimal(v)))
+            except InvalidOperation:
+                out.add((a, v))
+        return out
+
+    new_set, old_set = norm(cat_new), norm(cat_old)
     if new_set == old_set:
         return "exact"
     if {a for a, _ in new_set} & {a for a, _ in old_set}:
