@@ -597,16 +597,26 @@ def _candidate_risk(row: dict) -> int:
 
 def _candidate_comparison_tsv(rows: list[dict]) -> str:
     """Render candidate-comparison dicts as the shared TSV, sorted
-    by descending risk with a stable (ref, candidate_guid)
-    tie-break — the reader's model of the list must not form on
-    the harmless entries. Empty input renders "" (dropped by
-    _strip_noise)."""
+    by descending risk, then |amt_delta| and |date_delta| ascending
+    (nearest correspondence first within a tier — bookkeeper
+    ruling), then the stable (ref, candidate_guid) tie-break — the
+    reader's model of the list must not form on the harmless
+    entries. Empty input renders "" (dropped by _strip_noise)."""
     if not rows:
         return ""
+
+    def _abs_or_inf(value) -> Decimal:
+        try:
+            return abs(Decimal(str(value)))
+        except InvalidOperation:
+            return Decimal("Infinity")
+
     ordered = sorted(
         rows,
         key=lambda r: (
             -_candidate_risk(r),
+            _abs_or_inf(r.get("amt_delta", "")),
+            _abs_or_inf(r.get("date_delta_days", "")),
             str(r.get("ref", "")), str(r.get("candidate_guid", "")),
         ),
     )

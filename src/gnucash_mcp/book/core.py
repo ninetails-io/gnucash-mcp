@@ -129,6 +129,17 @@ class _SummaryData:
 _MATCH_AMOUNT_TOLERANCE = Decimal("1.00")
 _MATCH_DATE_TIGHT_DAYS = 2
 
+# Statement classification: desc + amount matching at roughly a
+# month's remove is the RECURRING-PAYMENT signature (last month's
+# rent), not same-event correspondence — such candidates ship as
+# evidence but never drive MATCH/AMBIGUOUS (bookkeeper T6, the
+# third specimen of the near-match family). Three weeks: beyond
+# realistic clearing drift, comfortably inside monthly cadence.
+# Biweekly patterns (14d paychecks) stay below it deliberately —
+# a slow check clearing two weeks late is still a plausible match,
+# and judgment rules those with the evidence in hand.
+_RECURRENCE_MIN_DAYS = 21
+
 
 def _post_date_as_date(transaction) -> date | None:
     """Transaction post_date normalized to a bare date — piecash
@@ -2927,9 +2938,20 @@ class CoreMixin:
                         (s.account.fullname, str(abs(s.value)))
                         for s in txn.splits
                     ]
+                    # Most-anchored split state: a reconciled
+                    # candidate is definitely entered AND tied —
+                    # decisive for the duplicate call (bookkeeper
+                    # T7: the shared table's state column must not
+                    # sit empty on the batch surface).
+                    states = {s.reconcile_state for s in txn.splits}
+                    txn_state = (
+                        "y" if "y" in states
+                        else "c" if "c" in states else "n"
+                    )
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
+                        "state": txn_state,
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "notes": txn.notes or "",
@@ -3794,6 +3816,7 @@ class CoreMixin:
                 "ref": ref,
                 "candidate_guid": d["guid"],
                 "confidence": d["confidence"],
+                "state": d.get("state", ""),
                 "date_new": prop["date"].isoformat(),
                 "date_old": d["date"],
                 "date_delta_days": (date_old - prop["date"]).days,
@@ -3839,6 +3862,7 @@ class CoreMixin:
         lines: list[dict],
         dry_run: bool = True,
         force: bool = False,
+        show_all: bool = False,
     ) -> dict:
         """One-shot statement entry: enter, claim, and reconcile a
         complete bank/card statement in one atomic open/save.
@@ -4048,6 +4072,15 @@ class CoreMixin:
                             and s.quantity.quantize(quantum)
                             == target
                         ),
+                        # Recurring signature: same name, same
+                        # amount, a month away — evidence for the
+                        # annotation-adaptation case, never a
+                        # class driver.
+                        "recurring": (
+                            desc_match and amount_match
+                            and abs((pd - ln["date"]).days)
+                            >= _RECURRENCE_MIN_DAYS
+                        ),
                     })
                 return cands
 
@@ -4056,6 +4089,7 @@ class CoreMixin:
                     book, account, lines, amounts, sign, quantum,
                     _book_amount, _candidates_for, split_prefixes,
                     reconciled_balance, closing, warn_rows,
+                    show_all,
                 )
             return self._statement_commit(
                 book, account, lines, amounts, sign, quantum,
@@ -4194,7 +4228,7 @@ class CoreMixin:
     def _statement_dry_run(
         self, book, account, lines, amounts, sign, quantum,
         _book_amount, _candidates_for, split_prefixes,
-        reconciled_balance, closing, warn_rows,
+        reconciled_balance, closing, warn_rows, show_all,
     ) -> dict:
         """The rehearsal: classify every line, validate everything a
         commit would validate, and project the balance tie."""
@@ -4215,14 +4249,17 @@ class CoreMixin:
                 if c["split"].reconcile_state == "y"
             ]
             # MATCH/AMBIGUOUS demand adjudication, so the class is
-            # gated on MEDIUM+ correspondence (>=2 signals). An
-            # amount-only LOW still SURFACES as a candidate row —
-            # ruling 1's superset — but classifies NEW: three weak
-            # lookalikes must not adopt a genuinely new line
-            # (bookkeeper finding, maiden flight).
+            # gated on MEDIUM+ correspondence (>=2 signals) that
+            # is NOT the recurring-payment signature. Weak and
+            # recurring candidates still SURFACE as evidence —
+            # ruling 1's superset — but classify NEW: three weak
+            # lookalikes must not adopt a genuinely new line, and
+            # last month's rent is a precedent, not a twin
+            # (bookkeeper findings, maiden flight + T6).
             strong = [
                 c for c in unrec
                 if sum(1 for ch in c["signals"] if ch != "-") >= 2
+                and not c["recurring"]
             ]
             note = ""
             if strong:
@@ -4305,7 +4342,32 @@ class CoreMixin:
             counts[cls] += 1
             if cls != "OVERLAP":
                 projected += _book_amount(ln)
-            for c in listed:
+
+            # Best-evidence-only display (bookkeeper ruling,
+            # 2026-08-24): a line with MEDIUM/HIGH candidates
+            # suppresses its LOW amount-coincidences — redundant
+            # next to the real evidence, and dense-recurrence
+            # cards make the token weight real (19 LOWs on one
+            # $4.99 line). A line whose ONLY evidence is LOW keeps
+            # it: ruling 1's rent case is load-bearing. The
+            # suppression leaves a breadcrumb in the cands column;
+            # show_all=true is the escape hatch.
+            kept = listed
+            n_suppressed = 0
+            if not show_all:
+                strong_listed = [
+                    c for c in listed
+                    if sum(1 for ch in c["signals"] if ch != "-")
+                    >= 2
+                ]
+                if strong_listed and len(strong_listed) < len(listed):
+                    n_suppressed = len(listed) - len(strong_listed)
+                    kept = strong_listed
+            cands_cell = str(len(kept))
+            if n_suppressed:
+                cands_cell += f" (+{n_suppressed} LOW suppressed)"
+
+            for c in kept:
                 s = c["split"]
                 txn = s.transaction
                 cat_old = [
@@ -4347,7 +4409,7 @@ class CoreMixin:
                     ),
                     "signals": c["signals"],
                 })
-            line_rows.append((ln["ref"], cls, len(listed), note))
+            line_rows.append((ln["ref"], cls, cands_cell, note))
 
         # Summary header via the shared rehearsal renderer — counts
         # are facts and may headline; clearance verdicts over
@@ -4487,22 +4549,26 @@ class CoreMixin:
                     break
 
         if errors:
-            errored = {ref for ref, _ in errors}
+            # The row's error rides the note column INLINE — the
+            # results table is the primary read, and a rejection
+            # whose coaching ("claim it with match=…, or force")
+            # lives elsewhere strands the operator at exactly the
+            # moment they need the next move (bookkeeper T5b).
+            error_by_ref = {}
+            for ref, msg in errors:
+                error_by_ref.setdefault(ref, msg)
             rows = []
             for ln in lines:
-                status = (
-                    "rejected" if ln["ref"] in errored
-                    else "statement_aborted"
-                )
-                rows.append(f"{ln['ref']}\t{status}\t\t")
+                msg = error_by_ref.get(ln["ref"], "")
+                status = "rejected" if msg else "statement_aborted"
+                rows.append(f"{ln['ref']}\t{status}\t\t{msg}")
             return {
                 "summary": (
-                    f"Statement REJECTED — {len(errors)} row "
+                    f"Statement REJECTED — {len(error_by_ref)} row "
                     f"error(s); nothing was written."
                 ),
                 "results": "ref\tstatus\tguid\tnote\n"
                 + "\n".join(rows),
-                "warnings": self._batch_warnings_to_tsv(errors),
             }
 
         # The tie, BEFORE any mutation. Claim amounts equal line

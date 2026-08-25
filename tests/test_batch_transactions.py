@@ -673,6 +673,10 @@ class TestBatchDryRunUpgrades:
         assert row["cat_new"] == "Expenses:Groceries=1700"
         assert row["cat_old"] == "Expenses:Groceries=1800"
         assert row["split_match"] == "partial"
+        # T7 (statement round): the shared table's state column is
+        # populated on the batch surface too — most-anchored split
+        # state of the candidate transaction.
+        assert row["state"] == "n"
 
     def test_split_match_none_on_distinct_categories(
         self, test_book

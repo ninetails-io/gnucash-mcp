@@ -551,6 +551,7 @@ def register(mcp, get_book) -> None:
         lines: str,
         dry_run: bool = True,
         force: bool = False,
+        show_all: bool = False,
     ) -> str:
         """Enter a COMPLETE bank/card statement in one atomic call:
         create the new lines, claim the ones already in the book,
@@ -641,6 +642,10 @@ def register(mcp, get_book) -> None:
             force: Land despite an untied opening base / closing
                 discrepancy, and create past exact unclaimed
                 overlaps.
+            show_all: Dry-run only. Lines with MEDIUM/HIGH
+                candidates suppress their LOW amount-coincidences
+                (the cands column notes "+N LOW suppressed");
+                show_all=true lists everything.
         """
         book = get_book()
         stmt_date = _parse_iso_date(statement_date)
@@ -660,7 +665,7 @@ def register(mcp, get_book) -> None:
             row["date"] = d
         result = book.enter_statement(
             account, stmt_date, opening_balance, closing_balance,
-            parsed, dry_run=dry_run, force=force,
+            parsed, dry_run=dry_run, force=force, show_all=show_all,
         )
         return _json(result)
 

@@ -483,7 +483,7 @@ class TestStatementCommit:
             dry_run=False,
         )
         assert "REJECTED" in res["summary"]
-        assert "fix the book entry first" in res["warnings"]
+        assert "fix the book entry first" in res["results"]
 
     def test_match_row_with_splits_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -497,7 +497,7 @@ class TestStatementCommit:
                             "amount": "800.00"}])],
             dry_run=False,
         )
-        assert "cannot also carry counter-splits" in res["warnings"]
+        assert "cannot also carry counter-splits" in res["results"]
 
     def test_double_claim_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -511,7 +511,7 @@ class TestStatementCommit:
                    raw="ACH RENT AGAIN", match=rent_guid)],
             dry_run=False,
         )
-        assert "already claimed by another row" in res["warnings"]
+        assert "already claimed by another row" in res["results"]
 
     def test_duplicate_guard(self, statement_book):
         """A created line exactly matching an unclaimed unreconciled
@@ -526,7 +526,7 @@ class TestStatementCommit:
             dry_run=False,
         )
         assert "REJECTED" in res["summary"]
-        assert "claim it with match=" in res["warnings"]
+        assert "claim it with match=" in res["results"]
 
     def test_tie_failure_refuses_wholesale(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -625,7 +625,7 @@ class TestStatementCommit:
             dry_run=False,
         )
         assert "REJECTED" in res["summary"]
-        assert "supply explicit counter-splits" in res["warnings"]
+        assert "supply explicit counter-splits" in res["results"]
 
 
 class TestStatementReviewFindings:
@@ -699,7 +699,7 @@ class TestStatementReviewFindings:
             "200.00", "-600.00", [line], dry_run=False,
         )
         assert "REJECTED" in res["summary"]
-        assert "landed by a prior statement" in res["warnings"]
+        assert "landed by a prior statement" in res["results"]
 
     def test_autofill_precedent_must_touch_account(
         self, statement_book
@@ -716,7 +716,7 @@ class TestStatementReviewFindings:
         )
         assert "REJECTED" in res["summary"]
         assert "doesn't touch this statement account" in \
-            res["warnings"]
+            res["results"]
 
     def test_overlap_claim_wrong_amount_rejects(
         self, statement_book
@@ -734,7 +734,7 @@ class TestStatementReviewFindings:
             dry_run=False,
         )
         assert "REJECTED" in res["summary"]
-        assert "wrong split" in res["warnings"]
+        assert "wrong split" in res["results"]
 
     def test_sub_quantum_amount_rejects(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -870,6 +870,126 @@ class TestMaidenVoyageFindings:
         assert len(cands) == 1
         assert cands[0]["confidence"] == "LOW"
         assert cands[0]["signals"] == "-A-"
+
+
+class TestPlanRoundFindings:
+    """Locks for the bookkeeper's full test-plan round
+    (2026-08-24 late): T5b, T6, T7, and the LOW-display ruling."""
+
+    def _add_txn(self, statement_book, dt, desc, amt):
+        import piecash as pc
+        b = pc.open_book(str(statement_book), readonly=False,
+                         do_backup=False)
+        checking = [a for a in b.accounts if a.name == "Checking"][0]
+        groceries = [
+            a for a in b.accounts if a.name == "Groceries"
+        ][0]
+        pc.Transaction(
+            currency=b.default_currency, description=desc,
+            post_date=dt,
+            splits=[
+                pc.Split(account=checking, value=Decimal(amt)),
+                pc.Split(account=groceries, value=-Decimal(amt)),
+            ],
+        )
+        b.save()
+        b.close()
+
+    def test_recurring_signature_leans_NEW(self, statement_book):
+        """T6: desc + amount a month away is the recurring-payment
+        signature (the HOA case) — evidence, not a MATCH."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 8, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 8, 1), "-800.00",
+                   description="July Rent",
+                   splits=[{"account": "Expenses:Rent",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert _classes(res)["1"] == "NEW"
+        cand = _cands(res)["1"][0]
+        assert cand["signals"] == "DA-"
+        assert cand["date_delta_days"] == "-31"
+
+    def test_short_date_drift_still_matches(self, statement_book):
+        """The other side of T6's line: a few days of clearing
+        drift with desc+amount is still a MATCH — the maiden
+        flight's date-drift claims must keep working."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 7, 6), "-800.00",
+                   description="July Rent")],
+            dry_run=True,
+        )
+        assert _classes(res)["1"] == "MATCH"
+
+    def test_low_suppression_breadcrumb_and_show_all(
+        self, statement_book
+    ):
+        """Ruling: best-evidence-only. A line with a MEDIUM/HIGH
+        candidate suppresses its LOW amount-coincidences, leaving
+        the breadcrumb; show_all lists everything."""
+        self._add_txn(statement_book, date(2026, 7, 20),
+                      "Garden Depot", "-800.00")
+        self._add_txn(statement_book, date(2026, 7, 22),
+                      "Pet Palace", "-800.00")
+        gc = GnuCashBook(str(statement_book))
+        lines = [_line("1", date(2026, 7, 2), "-800.00",
+                       raw="ACH RENT JUL")]
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00", lines, dry_run=True,
+        )
+        row = res["lines"].splitlines()[1].split("\t")
+        assert row[2] == "1 (+2 LOW suppressed)"
+        assert len(_cands(res)["1"]) == 1
+        res_all = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00", lines, dry_run=True,
+            show_all=True,
+        )
+        assert len(_cands(res_all)["1"]) == 3
+
+    def test_low_only_line_keeps_its_evidence(self, statement_book):
+        """The rent case is load-bearing: a line whose ONLY
+        evidence is LOW keeps it — suppression needs something
+        better to stand on."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 8, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 8, 1), "-800.00",
+                   raw="ACH RENT AUG",
+                   splits=[{"account": "Expenses:Rent",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert len(_cands(res)["1"]) == 1
+        row = res["lines"].splitlines()[1].split("\t")
+        assert row[2] == "1"
+
+    def test_commit_rejection_coaching_is_inline(
+        self, statement_book
+    ):
+        """T5b: the rejection's next move rides the results note
+        column — the operator is never stranded in a second
+        table."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 7, 1), "-800.00",
+                   description="July Rent", raw="ACH RENT")],
+            dry_run=False,
+        )
+        rejected_row = res["results"].splitlines()[1]
+        assert "rejected" in rejected_row
+        assert "claim it with match=" in rejected_row
+        assert "warnings" not in res
 
 
 # ── Sign transform (credit card) ───────────────────────────────────
