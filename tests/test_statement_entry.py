@@ -608,6 +608,177 @@ class TestStatementCommit:
         assert "supply explicit counter-splits" in res["warnings"]
 
 
+class TestStatementReviewFindings:
+    """Regression locks for the adversarial-review findings on the
+    first implementation — each of these demonstrated a live defect
+    before its fix."""
+
+    def _reconcile_rent(self, statement_book):
+        """Mark the July rent split reconciled, returning its guid."""
+        import piecash as pc
+        b = pc.open_book(str(statement_book), readonly=False,
+                         do_backup=False)
+        guid = None
+        for txn in b.transactions:
+            if txn.description == "July Rent":
+                for s in txn.splits:
+                    if s.account.name == "Checking":
+                        s.reconcile_state = "y"
+                        guid = s.guid
+        b.save()
+        b.close()
+        return guid
+
+    def test_monthly_pattern_vs_reconciled_prior_is_NEW(
+        self, statement_book
+    ):
+        """The August rent line, 31 days after the RECONCILED July
+        rent of the same amount, is a genuine NEW line: it must
+        count in the projection (old code classed it OVERLAP,
+        skipped it, and reported a false discrepancy)."""
+        gc = GnuCashBook(str(statement_book))
+        self._reconcile_rent(statement_book)
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 8, 31),
+            "200.00", "-600.00",
+            [_line("1", date(2026, 8, 1), "-800.00",
+                   raw="ACH RENT AUG",
+                   splits=[{"account": "Expenses:Rent",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert _classes(res)["1"] == "NEW"
+        # The reconciled July candidate still ships as adaptation
+        # evidence.
+        assert _cands(res)["1"][0]["state"] == "y"
+        assert "ties" in res["tie"]
+
+    def test_reconciled_exact_twin_is_OVERLAP_and_guarded(
+        self, statement_book
+    ):
+        """A line whose exact twin (amount + tight date) is already
+        reconciled: dry-run classes OVERLAP; a bare-create commit
+        refuses (old code silently double-entered under force)."""
+        gc = GnuCashBook(str(statement_book))
+        guid = self._reconcile_rent(statement_book)
+        assert guid is not None
+        # Post-reconcile base is 200 (1000 anchor − 800 rent); a
+        # re-transcription of the rent line on a tied base is the
+        # double-entry trap the guard exists for.
+        line = _line("1", date(2026, 7, 1), "-800.00",
+                     raw="ACH RENT JULY",
+                     splits=[{"account": "Expenses:Rent",
+                              "amount": "800.00"}])
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "200.00", "-600.00", [line], dry_run=True,
+        )
+        assert _classes(res)["1"] == "OVERLAP"
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "200.00", "-600.00", [line], dry_run=False,
+        )
+        assert "REJECTED" in res["summary"]
+        assert "landed by a prior statement" in res["warnings"]
+
+    def test_autofill_precedent_must_touch_account(
+        self, statement_book
+    ):
+        """A description-matched precedent paid from a DIFFERENT
+        account must not auto-fill (old code picked an arbitrary
+        leg and could fabricate an inter-bank transfer)."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Visa", date(2026, 7, 31), "0.00", "60.00",
+            [_line("1", date(2026, 7, 20), "60.00",
+                   description="Whole Foods")],
+            dry_run=False,
+        )
+        assert "REJECTED" in res["summary"]
+        assert "doesn't touch this statement account" in \
+            res["warnings"]
+
+    def test_overlap_claim_wrong_amount_rejects(
+        self, statement_book
+    ):
+        """Claim exactness has no reconciled-split exemption: a
+        wrong-GUID paste naming a reconciled split of a different
+        amount diagnoses at the row (old code silently no-op'd)."""
+        gc = GnuCashBook(str(statement_book))
+        guid = self._reconcile_rent(statement_book)
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "200.00", "150.00",
+            [_line("1", date(2026, 7, 2), "-50.00",
+                   raw="SOMETHING ELSE", match=guid)],
+            dry_run=False,
+        )
+        assert "REJECTED" in res["summary"]
+        assert "wrong split" in res["warnings"]
+
+    def test_sub_quantum_amount_rejects(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        with pytest.raises(ValueError, match="finer precision"):
+            gc.enter_statement(
+                "Assets:Checking", date(2026, 7, 31),
+                "1000.00", "1000.004",
+                [_line("1", date(2026, 7, 3), "0.004", raw="X")],
+            )
+
+    def test_empty_lines_reject(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        with pytest.raises(ValueError, match="no lines"):
+            gc.enter_statement(
+                "Assets:Checking", date(2026, 7, 31),
+                "1000.00", "1000.00", [],
+            )
+
+    def test_rehearsal_surfaces_autofill_failure(
+        self, statement_book
+    ):
+        """A splitless line commit would reject (no precedent) must
+        warn in the dry run — the old predictor noted it but a row
+        with empty description AND raw said nothing at all."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "990.00",
+            [_line("1", date(2026, 7, 3), "-10.00",
+                   description="Utterly Unprecedented")],
+            dry_run=True,
+        )
+        assert "no matching transaction to auto-fill" in \
+            res["warnings"]
+        assert "warning(s) outstanding" in res["tie"]
+
+    def test_dry_run_detects_double_claim(self, statement_book):
+        gc = GnuCashBook(str(statement_book))
+        rent_guid = _cands(_dry(gc))["1"][0]["split_guid"]
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "-600.00",
+            [_line("1", date(2026, 7, 1), "-800.00",
+                   raw="ACH RENT", match=rent_guid),
+             _line("2", date(2026, 7, 1), "-800.00",
+                   raw="ACH RENT AGAIN", match=rent_guid)],
+            dry_run=True,
+        )
+        assert "already claimed by another row" in res["warnings"]
+
+    def test_exact_match_note_flags_commit_refusal(
+        self, statement_book
+    ):
+        """A MATCH line with an exact unreconciled twin says in its
+        note what commit will do with a bare create."""
+        gc = GnuCashBook(str(statement_book))
+        res = _dry(gc)
+        notes = {
+            f[0]: f[3] for f in
+            (ln.split("\t") for ln in res["lines"].splitlines()[1:])
+        }
+        assert "exact twin" in notes["1"]
+
+
 # ── Sign transform (credit card) ───────────────────────────────────
 
 

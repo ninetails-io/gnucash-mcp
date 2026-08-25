@@ -3753,6 +3753,12 @@ class CoreMixin:
         AND downgrades a failed closing tie from refusal to a
         recorded discrepancy. Without it, both refuse.
         """
+        if not lines:
+            raise ValueError(
+                "statement has no lines — for a no-activity "
+                "statement, reconcile_account covers the balance "
+                "tie on its own"
+            )
         refs = [ln["ref"] for ln in lines]
         if len(set(refs)) != len(refs):
             raise ValueError(
@@ -3789,11 +3795,33 @@ class CoreMixin:
             amounts: dict[str, Decimal] = {}
             for ln in lines:
                 try:
-                    amounts[ln["ref"]] = _to_decimal(ln["amount"])
+                    amt = _to_decimal(ln["amount"])
                 except (InvalidOperation, ValueError):
                     raise ValueError(
                         f"line {ln['ref']}: amount "
                         f"{ln['amount']!r} is not a decimal"
+                    )
+                # Sub-quantum precision is a transcription error,
+                # not a rounding job — and rounding here would let
+                # the self-check gate and the tie compute different
+                # sums for the same statement.
+                if amt != amt.quantize(quantum):
+                    raise ValueError(
+                        f"line {ln['ref']}: amount {ln['amount']} "
+                        f"carries finer precision than "
+                        f"{account.commodity.mnemonic} — re-check "
+                        f"the transcription"
+                    )
+                amounts[ln["ref"]] = amt
+            for label, bal in (
+                ("opening_balance", opening),
+                ("closing_balance", closing),
+            ):
+                if bal != bal.quantize(quantum):
+                    raise ValueError(
+                        f"{label} {bal} carries finer precision "
+                        f"than {account.commodity.mnemonic} — "
+                        f"re-check the transcription"
                     )
 
             # Self-consistency gate — statement-native signs, before
@@ -3901,6 +3929,15 @@ class CoreMixin:
                             + ("A" if amount_match else "-")
                             + ("D" if date_match else "-")
                         ),
+                        # Exact = the same event, not the monthly
+                        # pattern: amount to the quantum AND date
+                        # within the tight window. Drives the
+                        # OVERLAP class and the commit guard.
+                        "exact": (
+                            date_match
+                            and s.quantity.quantize(quantum)
+                            == target
+                        ),
                     })
                 return cands
 
@@ -3958,18 +3995,31 @@ class CoreMixin:
                     f"only adapts 2-split precedents to the line "
                     f"amount; supply explicit counter-splits"
                 )
-            counter = next(
-                (
-                    f for f in filled
-                    if f["account"] != account.fullname
-                ),
-                None,
-            )
-            if counter is None or "quantity" in counter:
+            # The precedent must have a leg ON the statement account
+            # — that's what makes "the other leg is the counter"
+            # well-defined. A description match paid from a
+            # DIFFERENT account would otherwise pick an arbitrary
+            # leg (split iteration order) and could fabricate an
+            # inter-bank transfer instead of the expense (review
+            # finding).
+            on_account = [
+                f for f in filled
+                if f["account"] == account.fullname
+            ]
+            if len(on_account) != 1:
                 raise ValueError(
                     f"auto-fill precedent {src['guid']} doesn't "
-                    f"adapt cleanly (same-account or "
-                    f"cross-commodity leg) — supply explicit "
+                    f"touch this statement account — supply "
+                    f"explicit counter-splits"
+                )
+            counter = next(
+                f for f in filled
+                if f["account"] != account.fullname
+            )
+            if "quantity" in counter:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} has a "
+                    f"cross-commodity leg — supply explicit "
                     f"counter-splits"
                 )
             counters = [{
@@ -4015,16 +4065,20 @@ class CoreMixin:
                 f"splits cannot be claimed; unvoid_transaction "
                 f"first"
             )
-        if s.reconcile_state == "y":
-            return s, "overlap"
+        # Exactness has no reconciled-split exemption: a wrong-GUID
+        # paste naming a reconciled split of a different amount must
+        # diagnose at the row, not silently no-op and surface as a
+        # generic tie discrepancy (review finding).
         if s.quantity.quantize(quantum) != book_amount:
             raise ValueError(
                 f"match split {ln['match']} has amount "
                 f"{s.quantity}, but the line says {ln['amount']} "
                 f"as printed ({book_amount} in book convention) — "
-                f"fix the book entry first (update_transaction), "
-                f"then claim it"
+                f"wrong split, or fix the book entry first "
+                f"(update_transaction), then claim it"
             )
+        if s.reconcile_state == "y":
+            return s, "overlap"
         return s, "claim"
 
     def _statement_dry_run(
@@ -4040,6 +4094,7 @@ class CoreMixin:
         cand_rows: list[tuple] = []
         projected = reconciled_balance.quantize(quantum)
 
+        seen_claims: set[str] = set()
         for ln in lines:
             cands = _candidates_for(ln)
             unrec = [
@@ -4053,37 +4108,71 @@ class CoreMixin:
             if unrec:
                 cls = "MATCH" if len(unrec) == 1 else "AMBIGUOUS"
                 listed = unrec + rec
-            elif rec:
+                if any(c["exact"] for c in unrec):
+                    note = (
+                        "exact twin — commit refuses a bare create "
+                        "here (claim it, or force)"
+                    )
+            elif any(c["exact"] for c in rec):
+                # OVERLAP means THE SAME EVENT already landed and
+                # tied — exact amount, tight date. A fuzzy
+                # reconciled candidate (last month's rent, 31 days
+                # out) is evidence for a NEW line, not an overlap
+                # (review finding: the old amount-fuzz class
+                # skipped genuine lines from the projection).
                 cls = "OVERLAP"
                 listed = rec
                 note = (
-                    "already reconciled — commit skips this line "
-                    "(drop it, or keep it as a match row: no-op)"
+                    "already reconciled (exact twin) — keep this "
+                    "line as a match row naming the twin (no-op); "
+                    "commit refuses a bare create here without "
+                    "force"
                 )
             else:
                 cls = "NEW"
-                listed = []
-                if not ln.get("splits") and not ln.get("match"):
-                    note = self._statement_predict(
-                        book, account, ln, _book_amount(ln),
-                    )
+                # Reconciled fuzzy candidates stay listed: the
+                # spec's own annotation-adaptation case (June 30
+                # "July rent" vs a July 31 line) needs the prior
+                # instance's annotation shipped as evidence even
+                # when it is already reconciled.
+                listed = rec
 
-            # Full rehearsal: anything commit would validate,
-            # validate now — a dry-run that ties is a commit that
-            # will tie.
+            # Full rehearsal: run exactly what commit would run on
+            # this row — a dry-run that ties is a commit that will
+            # tie, and a row commit would reject must say so now.
             try:
                 if ln.get("match"):
-                    _, kind = self._statement_resolve_claim(
+                    s, kind = self._statement_resolve_claim(
                         book, account, ln, _book_amount(ln), quantum,
                     )
                     if kind == "overlap":
                         cls = "OVERLAP"
                         note = "match names a reconciled split — no-op"
-                elif ln.get("splits"):
-                    self._statement_prep_create(
+                    elif s.guid in seen_claims:
+                        raise ValueError(
+                            "split already claimed by another row "
+                            "in this statement"
+                        )
+                    else:
+                        seen_claims.add(s.guid)
+                elif cls != "OVERLAP":
+                    validated, src = self._statement_prep_create(
                         book, account, ln, _book_amount(ln),
                         default_currency,
                     )
+                    if cls == "NEW" and not ln.get("splits"):
+                        counter_names = ", ".join(
+                            v["account"].fullname
+                            for v in validated[1:]
+                        )
+                        note = (
+                            f"would create {_book_amount(ln)} → "
+                            f"{counter_names}"
+                        )
+                        if src:
+                            note += (
+                                f" (auto_filled_from:{src['guid']})"
+                            )
             except ValueError as e:
                 warn_rows.append((ln["ref"], str(e)))
 
@@ -4137,6 +4226,14 @@ class CoreMixin:
                 f"({closing} as printed) — DISCREPANCY "
                 f"{closing_book - projected}."
             )
+        if warn_rows:
+            # The projection assumes every warned row still lands;
+            # a commit repeating those rows refuses instead. Facts,
+            # not clearance.
+            tie += (
+                f" {len(warn_rows)} warning(s) outstanding — a "
+                f"commit that repeats them will refuse."
+            )
 
         lines_tsv = ["ref\tclass\tcands\tnote"]
         for r in line_rows:
@@ -4158,42 +4255,6 @@ class CoreMixin:
             "warnings": self._batch_warnings_to_tsv(warn_rows),
             "tie": tie,
         }
-
-    def _statement_predict(
-        self, book, account, ln, book_amount,
-    ) -> str:
-        """Auto-fill prediction note for a splitless NEW line — the
-        evidence the judgment pass adapts, never something the
-        dry-run enters."""
-        probe = ln.get("description") or ln.get("raw") or ""
-        if not probe.strip():
-            return ""
-        sig = self._collect_create_signals(
-            book, probe, ln["date"], [],
-            want_auto_fill=True, want_stability=False,
-            want_duplicates=False, want_recent=False,
-        )
-        if sig.auto_fill is None:
-            return "no auto-fill precedent — supply counter-splits"
-        filled, src = sig.auto_fill
-        if len(filled) != 2:
-            return (
-                f"precedent {src['guid']} has {len(filled)} "
-                f"splits — supply explicit counter-splits"
-            )
-        counter = next(
-            (f for f in filled if f["account"] != account.fullname),
-            None,
-        )
-        if counter is None or "quantity" in counter:
-            return (
-                f"precedent {src['guid']} doesn't adapt cleanly — "
-                f"supply explicit counter-splits"
-            )
-        return (
-            f"would create {book_amount} → {counter['account']} "
-            f"(auto_filled_from:{src['guid']})"
-        )
 
     def _statement_commit(
         self, book, account, lines, amounts, sign, quantum,
@@ -4235,23 +4296,23 @@ class CoreMixin:
                 errors.append((ln["ref"], str(e)))
 
         # Statement-duplicate guard: a created line that exactly
-        # matches an unreconciled, unclaimed split on this account
-        # would double-enter — and the tie would still hold, because
-        # only the new split reconciles. Judgment overrides with
-        # force (it saw the MATCH table and ruled NEW).
+        # matches an unclaimed split on this account would
+        # double-enter. Unreconciled twin: the tie would still hold
+        # (only the new split reconciles) — silent. Reconciled
+        # twin: this line already landed via a prior statement —
+        # the tie catches it unforced, but under force it would
+        # double-enter with both copies reconciled. Judgment
+        # overrides with force (it saw the MATCH table and ruled
+        # NEW).
         if not force:
             for ln, _validated, _src in prepared:
-                target = _book_amount(ln)
                 for c in _candidates_for(ln):
                     s = c["split"]
                     if s.guid in claimed_guids:
                         continue
-                    if not _is_unreconciled(s):
+                    if not c["exact"]:
                         continue
-                    pd = s.transaction.post_date
-                    if abs((pd - ln["date"]).days) > 2:
-                        continue
-                    if s.quantity.quantize(quantum) == target:
+                    if _is_unreconciled(s):
                         errors.append((
                             ln["ref"],
                             f"unreconciled split "
@@ -4262,7 +4323,19 @@ class CoreMixin:
                             f"match={split_prefixes[s.guid]}, or "
                             f"force=true to create anyway",
                         ))
-                        break
+                    else:
+                        errors.append((
+                            ln["ref"],
+                            f"reconciled split "
+                            f"{split_prefixes[s.guid]} matches "
+                            f"this line exactly — it looks landed "
+                            f"by a prior statement; keep the line "
+                            f"as a match row "
+                            f"(match={split_prefixes[s.guid]}, a "
+                            f"no-op skip), or force=true to "
+                            f"create anyway",
+                        ))
+                    break
 
         if errors:
             errored = {ref for ref, _ in errors}
@@ -4325,7 +4398,10 @@ class CoreMixin:
                     "memo": s.memo or "",
                     "notes": s.transaction.notes or "",
                     "description": s.transaction.description or "",
-                    "date": s.transaction.post_date.isoformat(),
+                    "date": (
+                        s.transaction.post_date.isoformat()
+                        if s.transaction.post_date else ""
+                    ),
                 }
                 for _ln, s in claims
             ],
