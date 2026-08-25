@@ -376,6 +376,159 @@ def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
     return splits
 
 
+# Statement-dialect fixed columns (``enter_statement``). The batch
+# grammar's fixed prefix is positional (ref, date, description,
+# [notes], [cur]); a statement header instead declares an
+# ANY-ORDER set of per-line columns after ``ref, date``. ``cur``
+# is deliberately absent — foreign-currency statements are a
+# deferred follow-up (spec ruling 3), so the token stays unknown
+# and rejects loudly rather than parsing and half-working.
+_STATEMENT_FIXED_TOKENS = {
+    "description": "description", "desc": "description",
+    "notes": "notes",
+    "raw": "raw",
+    "match": "match",
+    "amount": "amount", "amt": "amount",
+}
+
+
+def _statement_tsv_layout(header_line: str) -> dict:
+    """Column layout of an ``enter_statement`` lines TSV.
+
+    Same header-is-the-schema contract as ``_batch_tsv_layout``, with
+    the statement dialect's fixed columns: ``ref, date`` first, then
+    any order of ``description``/``desc``, ``notes``, ``raw``,
+    ``match``, ``amount`` (required — the self-consistency gate sums
+    it), then optional split-group columns for the COUNTER-side of
+    created rows (``amt, acct, memo, qty, act`` — the statement
+    account's own leg is synthesized by the server, never a column).
+
+    ``amount``/``amt`` is claimed by the fixed section at most once;
+    a second amount-ish token starts the split groups, so the
+    canonical spelling — fixed ``amount``, group ``amt1`` — and the
+    lazy one both parse. Every token is validated; unknown or typo'd
+    names reject on the format, same as batch.
+
+    Returns ``{"fixed_idx": {name: column}, "fixed": int,
+    "group": tuple[str, ...]}``.
+    """
+    raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
+    while raw_tokens and not raw_tokens[-1]:
+        raw_tokens.pop()
+    tokens = [t.rstrip("0123456789") for t in raw_tokens]
+
+    if len(tokens) < 3 or tokens[0] != "ref" or tokens[1] != "date":
+        raise ValueError(
+            "statement header must start with ref, date — got "
+            f"{', '.join(raw_tokens[:2]) or '(empty header)'}"
+        )
+
+    fixed_idx: dict[str, int] = {}
+    start = 2
+    while start < len(tokens):
+        name = _STATEMENT_FIXED_TOKENS.get(tokens[start])
+        if name is None or name in fixed_idx:
+            break
+        fixed_idx[name] = start
+        start += 1
+
+    if "amount" not in fixed_idx:
+        raise ValueError(
+            "statement header needs an amount column — every line "
+            "carries the amount the statement prints"
+        )
+    if "description" not in fixed_idx and "raw" not in fixed_idx:
+        raise ValueError(
+            "statement header needs a description or raw column — "
+            "something has to identify each line"
+        )
+
+    canonical: list[str] = []
+    for raw, token in zip(raw_tokens[start:], tokens[start:]):
+        name = _BATCH_SPLIT_TOKENS.get(token)
+        if name is None:
+            raise ValueError(
+                f"unrecognized column {raw!r} in statement header — "
+                f"columns are ref, date, then "
+                f"description/notes/raw/match/amount in any order, "
+                f"then amt, acct, memo, qty counter-split groups "
+                f"(the statement account's own leg is synthesized — "
+                f"never a column)"
+            )
+        canonical.append(name)
+
+    layout = {"fixed_idx": fixed_idx, "fixed": start}
+    if not canonical:
+        return layout | {"group": _BATCH_LEGACY_GROUP}
+    group: list[str] = []
+    for name in canonical:
+        if name in group:
+            break
+        group.append(name)
+    if "amount" not in group or "account" not in group:
+        raise ValueError(
+            "counter-split columns must include both an amount and "
+            "an account column (or declare none at all)"
+        )
+    return layout | {"group": tuple(group)}
+
+
+def _parse_statement_tsv(tsv: str) -> list[dict]:
+    """Parse an ``enter_statement`` lines TSV into row dicts.
+
+    Row shape: ``{ref, date (ISO string — the caller converts),
+    amount (string), description?, notes?, raw?, match?, splits}``.
+    Optional fixed cells appear only when non-empty. ``date`` and
+    ``amount`` cells are REQUIRED per row — a statement line without
+    either isn't a transcription, and defaulting a date (as batch
+    does) would silently corrupt the date signal every
+    classification leans on.
+
+    Split cells beyond the fixed columns chunk through
+    ``_batch_row_splits`` — the same group mechanics as batch, so
+    the two grammars can't drift.
+    """
+    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise ValueError(
+            "statement lines TSV needs a header row and at least one "
+            "data row"
+        )
+    layout = _statement_tsv_layout(lines[0])
+    fixed_idx = layout["fixed_idx"]
+    fixed = layout["fixed"]
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        fields = ln.split("\t")
+        while fields and not fields[-1].strip():
+            fields.pop()
+        ref = fields[0].strip() if fields else ""
+        if not ref:
+            raise ValueError(f"row {i}: empty ref (each row needs a key)")
+        if len(fields) < 2 or not fields[1].strip():
+            raise ValueError(f"row {i} (ref {ref!r}): missing date")
+        row: dict = {"ref": ref, "date": fields[1].strip()}
+        for name, idx in fixed_idx.items():
+            if len(fields) > idx and fields[idx].strip():
+                row[name] = fields[idx].strip()
+        if "amount" not in row:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): missing amount — transcribe "
+                f"the amount exactly as the statement prints it"
+            )
+        if len(fields) <= fixed:
+            row["splits"] = []
+        else:
+            try:
+                row["splits"] = _batch_row_splits(
+                    fields[fixed:], layout["group"]
+                )
+            except ValueError as e:
+                raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        out.append(row)
+    return out
+
+
 # ── Numeric formatting ─────────────────────────────────────────────
 
 
