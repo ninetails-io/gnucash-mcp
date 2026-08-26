@@ -678,6 +678,29 @@ class TestBatchDryRunUpgrades:
         # state of the candidate transaction.
         assert row["state"] == "n"
 
+    def test_reconciled_candidate_shows_state_y(self, test_book):
+        """The bookkeeper's fourth verification probe: a reconciled
+        duplicate candidate reads y — entered AND tied, decisive."""
+        import piecash as pc
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        b = pc.open_book(str(test_book), readonly=False,
+                         do_backup=False)
+        for txn in b.transactions:
+            if txn.description == "Rent":
+                for s in txn.splits:
+                    if s.account.name == "Checking":
+                        s.reconcile_state = "y"
+        b.save()
+        b.close()
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20))],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["state"] == "y"
+
     def test_split_match_none_on_distinct_categories(
         self, test_book
     ):
