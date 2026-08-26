@@ -83,8 +83,9 @@ complete" from an assumption into a checkable claim.
 A second precondition check compares `opening_balance` against the
 account's current reconciled balance. Mismatch is a WARNING in
 dry-run (prior statement may be unentered — a legitimate state),
-and blocks commit unless `force=true` (reconciling onto a base
-that doesn't tie produces a `y` state that means nothing).
+and blocks commit unless `force_base=true` (reconciling onto a
+base that doesn't tie produces a `y` state that means nothing;
+the twin guard stays on — §11.21).
 
 ## 3. Line grammar
 
