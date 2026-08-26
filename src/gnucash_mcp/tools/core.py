@@ -554,7 +554,8 @@ def register(mcp, get_book) -> None:
         closing_balance: str,
         lines: str,
         dry_run: bool = True,
-        force: bool = False,
+        force_base: bool = False,
+        force_duplicates: bool = False,
         show_all: bool = False,
     ) -> str:
         """Enter a COMPLETE bank/card statement in one atomic call:
@@ -620,9 +621,14 @@ def register(mcp, get_book) -> None:
         ``opening_balance`` (a prior unentered statement blocks
         commit), every created-vs-existing exact overlap must be
         explicitly claimed or forced, and the projected closing tie
-        is verified BEFORE anything is written. ``force=true``
-        means "land it anyway" for the base/tie checks; it never
-        bypasses the statement's own self-check.
+        is verified BEFORE anything is written. The two force
+        flags are INDEPENDENT: ``force_base=true`` lands onto an
+        untied opening base (the consequent tie discrepancy is
+        recorded, and duplicate detection STAYS ON);
+        ``force_duplicates=true`` creates past exact twins you
+        have adjudicated as distinct. Neither bypasses the
+        statement's own self-check. After the save, the reconciled
+        balance is read back and verified against the tie.
 
         OUTPUT (dry-run): ``summary`` (class counts), ``lines``
         (ref, class, cands, note — the note is the resolved
@@ -659,9 +665,10 @@ def register(mcp, get_book) -> None:
             closing_balance: Closing balance, exactly as printed.
             lines: The TSV block described above.
             dry_run: DEFAULT TRUE — the rehearsal is the workflow.
-            force: Land despite an untied opening base / closing
-                discrepancy, and create past exact unclaimed
-                overlaps.
+            force_base: Land onto an untied opening base; the tie
+                discrepancy is recorded, twin detection stays on.
+            force_duplicates: Create past exact unclaimed twins
+                (you adjudicated them as distinct charges).
             show_all: Dry-run only. Lines with MEDIUM/HIGH
                 candidates suppress their LOW amount-coincidences
                 (the cands column notes "+N LOW suppressed");
@@ -685,7 +692,8 @@ def register(mcp, get_book) -> None:
             row["date"] = d
         result = book.enter_statement(
             account, stmt_date, opening_balance, closing_balance,
-            parsed, dry_run=dry_run, force=force, show_all=show_all,
+            parsed, dry_run=dry_run, force_base=force_base,
+            force_duplicates=force_duplicates, show_all=show_all,
         )
         return _json(result)
 

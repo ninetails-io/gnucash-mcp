@@ -634,13 +634,24 @@ refuted) drove a structural rework, all test-locked:
     are one-per-row like claims, and both are exempt from the
     guard.
 
-**Open ruling for the maintainer (round-two HIGH, not
-implemented):** `force` remains ONE flag over three safeties
-(opening base, closing tie, twin guard), and the opening gate's
-refusal text coaches it in exactly the partial-re-entry scenario
-where the guard matters most. The reviewer's proposed fix —
-splitting it (`force_base` vs `force_duplicates`) — is an API
-change awaiting a ruling.
+21. **`force` split (RULED 2026-08-24, implemented same day).**
+    `force_base` clears the opening precondition (its consequent
+    tie failure records as a discrepancy) and `force_duplicates`
+    disables the twin guard — independently. The trap the single
+    flag set — the opening gate coaching a force that silently
+    disabled duplicate detection in exactly the partial-re-entry
+    scenario — is closed and locked in both directions
+    (force_base keeps the guard on; force_duplicates keeps the
+    base gate on). Clean break, no compat alias: the LLM-facing
+    API adapts.
+22. **Round-two MEDIUMs**, same pass: the evidence-only homework
+    line no longer names a confidence tier its own table can
+    contradict; the effects footer carries a commodity column and
+    remains review_required-exclusive; and the closing tie is now
+    a POST-WRITE VERIFICATION — the reconciled balance is read
+    back from the saved splits and a mismatch raises
+    (`post-write verification failed`), the `_verify_write`
+    doctrine applied to arithmetic.
 
 Standing residuals (documented, adjudication-contained,
 non-blocking, per the signoff): (a) a ±$1 nonzero-amt_delta

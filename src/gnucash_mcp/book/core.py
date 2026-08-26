@@ -3714,7 +3714,7 @@ class CoreMixin:
                      ("rejected", n_rejected)],
                     homework,
                 )
-                effects: dict[str, Decimal] = {}
+                effects: dict[str, list] = {}
                 for p, _dc, _mc in accepted:
                     if _dc:
                         # review_required rows are homework, not a
@@ -3724,16 +3724,23 @@ class CoreMixin:
                         continue
                     for v in p["validated"]:
                         key = v["account"].fullname
-                        effects[key] = (
-                            effects.get(key, Decimal("0"))
-                            + v["quantity"]
+                        entry = effects.setdefault(
+                            key,
+                            [Decimal("0"),
+                             v["account"].commodity.mnemonic],
                         )
+                        entry[0] += v["quantity"]
                 effects_tsv = ""
                 if effects:
-                    out = ["account\tdelta"]
+                    # Deltas are in each account's OWN commodity —
+                    # the commodity column keeps a mixed batch
+                    # legible under one heading.
+                    out = ["account\tdelta\tcommodity"]
                     for name in sorted(effects):
+                        delta, mnemonic = effects[name]
                         out.append(
-                            f"{_tsv_cell(name)}\t{effects[name]}"
+                            f"{_tsv_cell(name)}\t{delta}\t"
+                            f"{mnemonic}"
                         )
                     effects_tsv = "\n".join(out)
                 return {
@@ -3910,7 +3917,8 @@ class CoreMixin:
         closing_balance: str,
         lines: list[dict],
         dry_run: bool = True,
-        force: bool = False,
+        force_base: bool = False,
+        force_duplicates: bool = False,
         show_all: bool = False,
     ) -> dict:
         """One-shot statement entry: enter, claim, and reconcile a
@@ -3927,10 +3935,15 @@ class CoreMixin:
         rows, reconciles every statement-touched split at
         ``statement_date``, and saves once — or refuses wholesale.
 
-        ``force=True`` means "I know the base doesn't tie — land the
-        statement anyway": it clears the opening-balance precondition
-        AND downgrades a failed closing tie from refusal to a
-        recorded discrepancy. Without it, both refuse.
+        The two force flags are INDEPENDENT safeties (maintainer
+        ruling after the round-two review found one flag coaching
+        itself into the exact scenario its other half guards):
+        ``force_base=True`` clears the opening-balance precondition
+        and downgrades the consequent closing-tie failure to a
+        recorded discrepancy; ``force_duplicates=True`` disables
+        the exact-twin guard on create rows. Forcing the base
+        never silently disables duplicate detection, and vice
+        versa.
         """
         if not lines:
             raise ValueError(
@@ -4040,13 +4053,14 @@ class CoreMixin:
                 )
                 if dry_run:
                     warn_rows.append(("*", gap_msg))
-                elif not force:
+                elif not force_base:
                     raise ValueError(
                         gap_msg + " Commit refuses on an untied "
-                        "base — enter the prior statement first, or "
-                        "pass force=true to land this one anyway "
-                        "(the resulting reconciled state is only as "
-                        "good as the base)."
+                        "base — enter the prior statement first, "
+                        "or pass force_base=true to land this one "
+                        "anyway (the resulting reconciled state is "
+                        "only as good as the base; duplicate "
+                        "detection stays on)."
                     )
 
             split_prefixes = self._split_prefix_map(book)
@@ -4138,13 +4152,13 @@ class CoreMixin:
                     book, account, lines, amounts, sign, quantum,
                     _book_amount, _candidates_for, split_prefixes,
                     reconciled_balance, closing, warn_rows,
-                    show_all, force,
+                    show_all, force_duplicates,
                 )
             return self._statement_commit(
                 book, account, lines, amounts, sign, quantum,
                 statement_date, _book_amount, _candidates_for,
-                split_prefixes, reconciled_balance, closing, force,
-                default_currency,
+                split_prefixes, reconciled_balance, closing,
+                force_base, force_duplicates, default_currency,
             )
 
     def _statement_prep_create(
@@ -4290,7 +4304,8 @@ class CoreMixin:
     def _statement_dry_run(
         self, book, account, lines, amounts, sign, quantum,
         _book_amount, _candidates_for, split_prefixes,
-        reconciled_balance, closing, warn_rows, show_all, force,
+        reconciled_balance, closing, warn_rows, show_all,
+        force_duplicates,
     ) -> dict:
         """The rehearsal: run the SAME disposition resolution commit
         runs (the chokepoint), classify every line as evidence, and
@@ -4301,7 +4316,8 @@ class CoreMixin:
         default_currency = self._require_default_currency(book)
         phase_a = self._statement_dispositions(
             book, account, lines, _book_amount, _candidates_for,
-            quantum, default_currency, force, split_prefixes,
+            quantum, default_currency, force_duplicates,
+            split_prefixes,
         )
         by_ref = phase_a["by_ref"]
         for ref, msg in phase_a["errors"]:
@@ -4486,13 +4502,16 @@ class CoreMixin:
                 f"before committing."
             )
         elif cand_rows:
-            # Verified-empty phrasing must not contradict visible
-            # evidence rows (bookkeeper signoff, copy quibble): the
-            # claim is about CLAIMABLE candidates, and the listed
-            # rows are context, not work.
+            # Verified-empty phrasing must not contradict the
+            # visible table (bookkeeper copy quibble + round-two
+            # R6: a recurring candidate labels MEDIUM in the
+            # confidence column, so "no MEDIUM+ candidates" argued
+            # with its own table). State what is true: no row
+            # needs adjudication; the listed rows are evidence.
             homework = (
-                "No claimable (MEDIUM+) candidates — the listed "
-                "rows are evidence only."
+                "No rows need adjudication — the listed candidates "
+                "are evidence only (recurring patterns or "
+                "already-reconciled)."
             )
         else:
             homework = "No existing-split candidates on any line."
@@ -4547,7 +4566,7 @@ class CoreMixin:
 
     def _statement_dispositions(
         self, book, account, lines, _book_amount, _candidates_for,
-        quantum, default_currency, force, split_prefixes,
+        quantum, default_currency, force_duplicates, split_prefixes,
     ) -> dict:
         """Phase A — THE disposition chokepoint both modes run.
 
@@ -4557,9 +4576,9 @@ class CoreMixin:
         impossible by construction. Claims resolve first (the
         guard's exemption set), then each create row runs the twin
         guard BEFORE counter-split/auto-fill prep (bookkeeper
-        signoff, carried item). ``force`` disables the guard here —
-        for BOTH modes, so a forced rehearsal rehearses the forced
-        landing.
+        signoff, carried item). ``force_duplicates`` disables the
+        guard here — for BOTH modes, so a forced rehearsal
+        rehearses the forced landing.
 
         Returns ``{"by_ref": {ref: {"kind": claim|overlap|create|
         guard|error, ...}}, "claims": [(ln, split)], "skipped":
@@ -4633,20 +4652,21 @@ class CoreMixin:
                         f"matches this line exactly (amount + "
                         f"date) and no row claims it — claim it "
                         f"with match={split_prefixes[s.guid]}, or "
-                        f"force=true to create anyway"
+                        f"force_duplicates=true to create "
+                        f"anyway"
                     ), False
                 return (
                     f"reconciled split {split_prefixes[s.guid]} "
                     f"matches this line exactly — it looks landed "
                     f"by a prior statement; keep the line as a "
                     f"match row (match={split_prefixes[s.guid]}, "
-                    f"a no-op skip), or force=true to create "
-                    f"anyway"
+                    f"a no-op skip), or force_duplicates=true "
+                    f"to create anyway"
                 ), True
             return None
 
         for ln in create_rows:
-            if not force:
+            if not force_duplicates:
                 hit = _twin_guard(ln)
                 if hit is not None:
                     msg, twin_reconciled = hit
@@ -4678,14 +4698,15 @@ class CoreMixin:
     def _statement_commit(
         self, book, account, lines, amounts, sign, quantum,
         statement_date, _book_amount, _candidates_for,
-        split_prefixes, reconciled_balance, closing, force,
-        default_currency,
+        split_prefixes, reconciled_balance, closing, force_base,
+        force_duplicates, default_currency,
     ) -> dict:
         """The landing: resolve dispositions (the shared chokepoint),
         check the tie, then — and only then — mutate and save once."""
         phase_a = self._statement_dispositions(
             book, account, lines, _book_amount, _candidates_for,
-            quantum, default_currency, force, split_prefixes,
+            quantum, default_currency, force_duplicates,
+            split_prefixes,
         )
         prepared = phase_a["prepared"]
         claims = phase_a["claims"]
@@ -4740,12 +4761,16 @@ class CoreMixin:
                 f"{cur} {new_reconciled} ({closing} as printed) — "
                 f"tied."
             )
-        elif force:
+        elif force_base:
+            # Only a forced base can produce a discrepancy — the
+            # self-check and opening gates make the unforced tie
+            # an identity, and forced duplicates still contribute
+            # their own line amounts.
             tie = (
                 f"DISCREPANCY {closing_book - new_reconciled}: "
                 f"reconciled balance {new_reconciled} vs statement "
                 f"closing {closing_book} ({closing} as printed) — "
-                f"landed under force"
+                f"landed under force_base"
             )
         else:
             raise ValueError(
@@ -4815,6 +4840,24 @@ class CoreMixin:
 
         book.save()
 
+        # Post-write verification (round-two finding: the pre-save
+        # tie is an arithmetic identity over the operator's own
+        # inputs). Read the reconciled balance BACK from the saved
+        # splits; a mismatch means the write did not land as
+        # computed and must surface loudly, never as a clean
+        # summary. Same doctrine as _verify_write for raw SQL.
+        readback = Decimal("0")
+        for s in account.splits:
+            if s.reconcile_state == "y":
+                readback += s.quantity
+        if readback.quantize(quantum) != new_reconciled:
+            raise ValueError(
+                f"post-write verification failed: the account's "
+                f"reconciled balance reads {readback}, expected "
+                f"{new_reconciled}. The statement WAS saved — "
+                f"inspect the account before retrying."
+            )
+
         all_guids = [t.guid for t in book.transactions]
         rows = ["ref\tstatus\tguid\tnote"]
         by_ref: dict[str, str] = {}
@@ -4845,8 +4888,15 @@ class CoreMixin:
                 f"created, {len(claims)} claimed, {len(skipped)} "
                 f"skipped (already reconciled)."
                 + (
-                    " LANDED UNDER FORCE — base and twin guards "
-                    "were bypassed." if force else ""
+                    " LANDED UNDER FORCE ("
+                    + ", ".join(
+                        n for n, on in (
+                            ("base", force_base),
+                            ("duplicates", force_duplicates),
+                        ) if on
+                    )
+                    + ") — the named guard(s) were bypassed."
+                    if (force_base or force_duplicates) else ""
                 )
             ),
             "results": "\n".join(rows),

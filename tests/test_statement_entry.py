@@ -556,10 +556,10 @@ class TestStatementCommit:
                    description="Deposit",
                    splits=[{"account": "Income",
                             "amount": "-100.00"}])],
-            dry_run=False, force=True,
+            dry_run=False, force_base=True,
         )
         assert "DISCREPANCY" in res["tie"]
-        assert "under force" in res["tie"]
+        assert "under force_base" in res["tie"]
 
     def test_atomicity_on_row_error(self, statement_book):
         """One bad row → nothing written, good rows report
@@ -609,7 +609,7 @@ class TestStatementCommit:
             "2907.38", "2107.38",
             [_line("1", date(2026, 7, 1), "-800.00",
                    raw="ACH RENT", match=guid)],
-            dry_run=False, force=True,
+            dry_run=False, force_base=True,
         )
         assert "skipped_duplicate" in res["results"]
         assert "1 skipped" in res["summary"]
@@ -1194,13 +1194,13 @@ class TestDispositionChokepoint:
                               "amount": "50.00"}])
         res = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
-            "950.00", "900.00", [line], dry_run=True, force=True,
+            "950.00", "900.00", [line], dry_run=True, force_duplicates=True,
         )
         assert "ties to the statement closing" in res["tie"]
         assert "would refuse" not in res["tie"]
         commit = gc.enter_statement(
             "Assets:Checking", date(2026, 7, 31),
-            "950.00", "900.00", [line], dry_run=False, force=True,
+            "950.00", "900.00", [line], dry_run=False, force_duplicates=True,
         )
         assert "1 created" in commit["summary"]
         assert "LANDED UNDER FORCE" in commit["summary"]
@@ -1292,6 +1292,52 @@ class TestDispositionChokepoint:
         assert "must not name the statement account" in \
             res["results"]
 
+    def test_force_base_keeps_twin_guard_on(self, statement_book):
+        """THE ruling's point: re-entering a partially-landed
+        statement requires force_base — which must NOT disable the
+        twin guard, the mechanism that detects the already-landed
+        lines. Old single-flag force produced three reconciled
+        charges for two printed lines here."""
+        self._seed(statement_book, date(2026, 7, 10),
+                   "Gym", "-50.00", state="y")
+        gc = GnuCashBook(str(statement_book))
+        # Statement re-prints the landed gym charge plus a new one;
+        # opening (900) deliberately mismatches the base (950).
+        lines = [
+            _line("1", date(2026, 7, 10), "-50.00",
+                  description="Gym",
+                  splits=[{"account": "Expenses:Groceries",
+                           "amount": "50.00"}]),
+            _line("2", date(2026, 7, 12), "-25.00",
+                  description="New Charge",
+                  splits=[{"account": "Expenses:Groceries",
+                           "amount": "25.00"}]),
+        ]
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "900.00", "825.00", lines,
+            dry_run=False, force_base=True,
+        )
+        assert "REJECTED" in res["summary"]
+        assert "landed by a prior statement" in res["results"]
+
+    def test_force_duplicates_keeps_base_gate_on(
+        self, statement_book
+    ):
+        """The inverse independence: force_duplicates does not
+        bypass the opening-balance precondition."""
+        gc = GnuCashBook(str(statement_book))
+        with pytest.raises(ValueError, match="untied base"):
+            gc.enter_statement(
+                "Assets:Checking", date(2026, 7, 31),
+                "900.00", "800.00",
+                [_line("1", date(2026, 7, 20), "-100.00",
+                       description="Thing",
+                       splits=[{"account": "Expenses:Groceries",
+                                "amount": "100.00"}])],
+                dry_run=False, force_duplicates=True,
+            )
+
     def test_forced_landing_is_recorded(self, statement_book):
         """A tie-holding forced commit must not be byte-identical
         to a clean one — summary and audit both say FORCED."""
@@ -1302,9 +1348,9 @@ class TestDispositionChokepoint:
                    description="Trader Joes",
                    splits=[{"account": "Expenses:Groceries",
                             "amount": "42.00"}])],
-            dry_run=False, force=True,
+            dry_run=False, force_duplicates=True,
         )
-        assert "LANDED UNDER FORCE" in res["summary"]
+        assert "LANDED UNDER FORCE (duplicates)" in res["summary"]
         from gnucash_mcp.logging_config import _fmt_statement_enter
         out = "\n".join(_fmt_statement_enter({
             "timestamp": "2026-08-24T22:00:00-07:00",
@@ -1313,11 +1359,11 @@ class TestDispositionChokepoint:
                        "opening_balance": "0.00",
                        "closing_balance": "42.00",
                        "lines": "", "dry_run": False,
-                       "force": True},
+                       "force_duplicates": True},
             "after_state": {"summary": res["summary"],
                             "tie": res["tie"]},
         }))
-        assert "(FORCED)" in out
+        assert "(FORCED: duplicates)" in out
 
 
 class TestRoundTwoLockGaps:
