@@ -667,9 +667,11 @@ class TestBatchDryRunUpgrades:
         assert row["desc_new"] == "Rent"
         assert row["desc_old"] == "Rent"
         assert row["date_delta_days"] == "-1"
-        assert row["amt_new"] == "-1700"
-        assert row["amt_old"] == "-1800"
-        assert row["amt_delta"] == "-100"
+        # Amounts anchor to the SIGNED CATEGORY primary (R3 P5):
+        # the expense leg, +1700 vs +1800.
+        assert row["amt_new"] == "1700"
+        assert row["amt_old"] == "1800"
+        assert row["amt_delta"] == "100"
         assert row["cat_new"] == "Expenses:Groceries=1700"
         assert row["cat_old"] == "Expenses:Groceries=1800"
         assert row["split_match"] == "partial"
@@ -706,6 +708,82 @@ class TestBatchDryRunUpgrades:
         row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
         assert row["cur"] == "EUR"
         assert row["amt_delta"] == ""
+
+    def test_refund_is_not_the_payments_twin(self, test_book):
+        """R3 P5 (blocker-class): signed amounts must live in the
+        SCORER, not just the display. A +104 refund was HIGH-
+        blocked as a duplicate of the -104 payment, with
+        split_match 'exact' on inverted legs. The direction anchor
+        is the signed CATEGORY primary — a balanced transaction
+        always carries both signs, so the funding leg can't carry
+        the signal."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transaction(
+            description="Amazon",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-104.00"},
+                {"account": "Expenses:Groceries",
+                 "amount": "104.00"},
+            ],
+            trans_date=date(2026, 5, 20),
+        )
+        env = gc.create_transactions(
+            [{
+                "ref": "1", "date": date(2026, 5, 21),
+                "description": "Amazon Refund",
+                "splits": [
+                    {"account": "Assets:Checking",
+                     "amount": "104.00"},
+                    {"account": "Expenses:Groceries",
+                     "amount": "-104.00"},
+                ],
+            }],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        # Surfaced for review (desc+date), never HIGH-blocked.
+        assert rows[0]["status"] == "review_required"
+        assert rows[0]["max_confidence"] == "MEDIUM"
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert "A" not in row["signals"]
+        assert Decimal(row["amt_new"]) == Decimal("-104")
+        assert Decimal(row["amt_old"]) == Decimal("104")
+        assert Decimal(row["amt_delta"]) == Decimal("208")
+        assert row["split_match"] == "partial"
+
+    def test_transfer_duplicates_still_match_on_magnitude(
+        self, test_book
+    ):
+        """The fallback: transfer-shaped rows (no category leg)
+        keep magnitude comparison, so a true transfer duplicate
+        still blocks."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transaction(
+            description="Card Payment",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-500.00"},
+                {"account": "Equity:Opening Balance",
+                 "amount": "500.00"},
+            ],
+            trans_date=date(2026, 5, 20),
+        )
+        env = gc.create_transactions(
+            [{
+                "ref": "1", "date": date(2026, 5, 20),
+                "description": "Card Payment",
+                "splits": [
+                    {"account": "Assets:Checking",
+                     "amount": "-500.00"},
+                    {"account": "Equity:Opening Balance",
+                     "amount": "500.00"},
+                ],
+            }],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert rows[0]["max_confidence"] == "HIGH"
 
     def test_reconciled_candidate_shows_state_y(self, test_book):
         """The bookkeeper's fourth verification probe: a reconciled

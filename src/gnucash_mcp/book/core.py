@@ -2721,6 +2721,28 @@ class CoreMixin:
         )
         return categorization if categorization else all_names
 
+    def _proposal_category_primary(
+        self, book, splits: list[dict],
+    ) -> Decimal | None:
+        """Signed max-abs value among the proposal's category
+        (non-funding) legs — the direction anchor for the duplicate
+        amount signal (R3 P5). None when any ref fails to resolve
+        or no category leg exists (transfers) — the signal then
+        falls back to magnitude comparison."""
+        legs = []
+        for sp in splits:
+            acct = self._resolve_account(book, sp["account"])
+            if acct is None:
+                return None
+            if acct.type not in self._FUNDING_ACCOUNT_TYPES:
+                try:
+                    legs.append(_to_decimal(sp["amount"]))
+                except (InvalidOperation, ValueError):
+                    return None
+        if not legs:
+            return None
+        return max(legs, key=abs)
+
     def _collect_create_signals(
         self,
         book: piecash.Book,
@@ -2728,6 +2750,7 @@ class CoreMixin:
         trans_date: date,
         proposed_amounts: list[Decimal],
         *,
+        proposed_category_primary: Decimal | None = None,
         want_auto_fill: bool,
         want_stability: bool,
         want_duplicates: bool,
@@ -2798,7 +2821,15 @@ class CoreMixin:
 
         # Proposed primary = headline amount (max abs split value)
         # for the duplicate amount-signal; zero when the caller
-        # passed [] (that branch never runs then).
+        # passed [] (that branch never runs then). When BOTH sides
+        # have a category anchor (proposed_category_primary + the
+        # candidate's), the signal compares SIGNED category
+        # primaries instead — a +104 refund is not a -104
+        # payment's twin, and the direction lives in the category
+        # legs because a balanced transaction always carries both
+        # signs (bookkeeper R3 P5, blocker-class). Magnitude
+        # comparison remains the fallback for transfer-shaped
+        # rows with no category leg.
         proposed_primary = max(proposed_amounts) if proposed_amounts else Decimal("0")
 
         # Local accumulators — each bucket is independent. We finalize
@@ -2892,6 +2923,15 @@ class CoreMixin:
                 # kills the noise without losing real duplicates
                 # (paycheck-vs-paycheck still matches on gross).
                 primary_amount = max(abs(s.value) for s in txn.splits)
+                cand_cat_values = [
+                    s.value for s in txn.splits
+                    if s.account.type
+                    not in CoreMixin._FUNDING_ACCOUNT_TYPES
+                ]
+                cand_cat_primary = (
+                    max(cand_cat_values, key=abs)
+                    if cand_cat_values else None
+                )
                 # Amounts only compare within the same currency
                 # frame: 188 HKD and 188 CNY are not the same money,
                 # and the cross-frame version of a true duplicate
@@ -2905,10 +2945,23 @@ class CoreMixin:
                     trans_currency is None
                     or txn.currency.mnemonic == trans_currency
                 )
-                amount_match = same_frame and (
-                    abs(proposed_primary - primary_amount)
-                    <= _MATCH_AMOUNT_TOLERANCE
-                )
+                if (
+                    same_frame
+                    and proposed_category_primary is not None
+                    and cand_cat_primary is not None
+                ):
+                    amount_match = (
+                        abs(
+                            proposed_category_primary
+                            - cand_cat_primary
+                        )
+                        <= _MATCH_AMOUNT_TOLERANCE
+                    )
+                else:
+                    amount_match = same_frame and (
+                        abs(proposed_primary - primary_amount)
+                        <= _MATCH_AMOUNT_TOLERANCE
+                    )
 
                 # Signal 3: date within ±2 days of trans_date (tighter
                 # than the window filter — window is for "worth
@@ -2930,13 +2983,16 @@ class CoreMixin:
                     # self-contained comparison; all legs when
                     # filtering leaves nothing (transfers), same
                     # fallback as _extract_account_pattern.
+                    # SIGNED legs: a refund's inverted categories
+                    # must not read exact against the purchase's
+                    # (R3 P5).
                     cat_legs = [
-                        (s.account.fullname, str(abs(s.value)))
+                        (s.account.fullname, str(s.value))
                         for s in txn.splits
                         if s.account.type
                         not in CoreMixin._FUNDING_ACCOUNT_TYPES
                     ] or [
-                        (s.account.fullname, str(abs(s.value)))
+                        (s.account.fullname, str(s.value))
                         for s in txn.splits
                     ]
                     # Most-anchored split state: a reconciled
@@ -2950,8 +3006,12 @@ class CoreMixin:
                         else "c" if "c" in states
                         else "f" if "f" in states else "n"
                     )
-                    primary_signed = max(
-                        (s.value for s in txn.splits), key=abs,
+                    primary_signed = (
+                        cand_cat_primary
+                        if cand_cat_primary is not None
+                        else max(
+                            (s.value for s in txn.splits), key=abs,
+                        )
                     )
                     duplicates.append({
                         "confidence": confidence,
@@ -3294,6 +3354,9 @@ class CoreMixin:
                 description,
                 trans_date,
                 proposed_amounts,
+                proposed_category_primary=(
+                    self._proposal_category_primary(book, splits)
+                ),
                 want_auto_fill=False,
                 want_stability=False,
                 want_duplicates=check_duplicates,
@@ -3579,9 +3642,19 @@ class CoreMixin:
             # --- Phase 2: duplicate screen (against existing book) ---
             accepted = []
             for p in prepared:
+                p_cat_values = [
+                    v["value"] for v in p["validated"]
+                    if v["account"].type
+                    not in self._FUNDING_ACCOUNT_TYPES
+                ]
+                p_cat_primary = (
+                    max(p_cat_values, key=abs)
+                    if p_cat_values else None
+                )
                 signals = self._collect_create_signals(
                     book, p["description"], p["trans_date"],
                     p["proposed_amounts"],
+                    proposed_category_primary=p_cat_primary,
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
@@ -3591,12 +3664,12 @@ class CoreMixin:
                     # Proposal-side context for the ruling-9
                     # comparison rows — computed once per row.
                     p_cats = [
-                        (v["account"].fullname, str(abs(v["value"])))
+                        (v["account"].fullname, str(v["value"]))
                         for v in p["validated"]
                         if v["account"].type
                         not in self._FUNDING_ACCOUNT_TYPES
                     ] or [
-                        (v["account"].fullname, str(abs(v["value"])))
+                        (v["account"].fullname, str(v["value"]))
                         for v in p["validated"]
                     ]
                     proposal = {
@@ -3608,7 +3681,9 @@ class CoreMixin:
                         # deposit and a -50 payment never render
                         # as a perfect twin (review finding).
                         "amount": (
-                            max(
+                            p_cat_primary
+                            if p_cat_primary is not None
+                            else max(
                                 (v["value"] for v in p["validated"]),
                                 key=abs,
                             )
@@ -4397,7 +4472,7 @@ class CoreMixin:
             elif d["kind"] == "create":
                 validated = d["validated"]
                 proposal_cats = [
-                    (v["account"].fullname, str(abs(v["value"])))
+                    (v["account"].fullname, str(v["value"]))
                     for v in validated
                     if v["account"].guid != account.guid
                 ]
@@ -4450,7 +4525,7 @@ class CoreMixin:
                 s = c["split"]
                 txn = s.transaction
                 cat_old = [
-                    (s2.account.fullname, str(abs(s2.value)))
+                    (s2.account.fullname, str(s2.value))
                     for s2 in txn.splits
                     if s2.account.guid != account.guid
                 ]

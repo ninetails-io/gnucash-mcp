@@ -654,6 +654,20 @@ refuted) drove a structural rework, all test-locked:
     (`post-write verification failed`), the `_verify_write`
     doctrine applied to arithmetic.
 
+23. **Signed amounts reach the SCORER (R3 P5, blocker-class,
+    fixed same day).** Round two put direction in the display
+    only; a +104 refund still HIGH-blocked as the -104 payment's
+    twin, with split_match "exact" on inverted legs. The
+    direction anchor is the signed CATEGORY primary — a balanced
+    transaction always carries both signs, so the funding leg
+    cannot carry the signal. Both the amount signal and the
+    comparison columns now anchor there (proposal side resolved
+    pre-signal via `_proposal_category_primary`); category legs
+    render signed; magnitude comparison survives as the
+    transfer-shaped fallback (no category leg on either side),
+    locked in both directions (refund never blocks; true transfer
+    duplicate still does).
+
 Standing residuals (documented, adjudication-contained,
 non-blocking, per the signoff): (a) a ±$1 nonzero-amt_delta
 candidate can still reach MEDIUM → MATCH on a genuinely-new line
