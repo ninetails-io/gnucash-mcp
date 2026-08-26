@@ -153,7 +153,8 @@ any. The rehearsal is a FULL rehearsal — a dry-run that ties is a
 commit that will tie.
 
 When any MATCH/AMBIGUOUS/OVERLAP rows exist, the envelope also
-carries a `review_token` (ruling 10): a content-derived hash
+carries a `review_token` (ruling 10 — DEFERRED, not on the
+implementation branch; see the §10 phasing note): a content-derived hash
 binding book identity, the normalized statement (balances +
 lines), the candidate set (GUIDs + comparison data), detector
 version, and the deterministic ordering. Stateless by design —
@@ -201,7 +202,8 @@ commit representation; a dry-run MATCH/AMBIGUOUS `ref` that is
 simply absent from the commit lines (rather than dropped-as-
 OVERLAP or resolved) rejects before any write.
 
-When the dry-run emitted a `review_token`, commit requires it.
+When the dry-run emitted a `review_token` (ruling 10 —
+deferred, phase 2), commit requires it.
 The server re-runs classification against CURRENT book state and
 recomputes the token; mismatch → `review_stale` plus a refreshed
 classification table, **no write** — a candidate that appeared
@@ -597,6 +599,48 @@ ruling.
     evidence rows exist but nothing is MEDIUM+, the homework line
     reads "No claimable (MEDIUM+) candidates — the listed rows are
     evidence only" rather than contradicting the visible table.
+
+### Round-two adversarial review (2026-08-24, five-agent panel)
+
+A second review of the post-review delta (nine verified HIGHs, none
+refuted) drove a structural rework, all test-locked:
+
+17. **The disposition chokepoint.** Rehearsal and commit now run
+    ONE phase-A resolver (`_statement_dispositions`: claims first,
+    twin guard, then prep — force-aware in both modes). The
+    dry-run's notes carry the guard's coaching verbatim, the
+    projection derives from resolved dispositions (not the
+    evidence class), and the tie footer counts the rows the exact
+    payload would refuse. The five verified rehearsal/commit
+    divergences (reconciled twin behind a fuzzy MATCH, OVERLAP
+    rows carrying claims, force never reaching the rehearsal,
+    false refusal notes, guard/prep ordering) die by construction.
+18. **Output escape chokepoint** (`_tsv_cell` + `_cats_str`
+    escaping): book free text can no longer shatter response TSVs
+    — the output mirror of §11.8, which itself now covers all
+    ten `str.splitlines` boundaries and the prices parser, with
+    row numbers computed post-normalization.
+19. **Comparison-table honesty:** cross-frame detection keys on
+    candidate-vs-PROPOSAL currency (cur names the candidate's
+    currency exactly when frames differ; deltas blank only then);
+    amounts are SIGNED on both surfaces; withheld deltas sort at
+    the head of their tier; the effects footer excludes
+    review_required rows; batch state ranking preserves `f`.
+20. **Force is recorded** unconditionally: the commit summary and
+    the audit header both say FORCED on any forced landing, tie
+    held or not. Counter-splits naming the statement account
+    reject (the tie is an identity over inputs and cannot see the
+    account move by more than the line). Reconciled no-op splits
+    are one-per-row like claims, and both are exempt from the
+    guard.
+
+**Open ruling for the maintainer (round-two HIGH, not
+implemented):** `force` remains ONE flag over three safeties
+(opening base, closing tie, twin guard), and the opening gate's
+refusal text coaches it in exactly the partial-re-entry scenario
+where the guard matters most. The reviewer's proposed fix —
+splitting it (`force_base` vs `force_duplicates`) — is an API
+change awaiting a ruling.
 
 Standing residuals (documented, adjudication-contained,
 non-blocking, per the signoff): (a) a ±$1 nonzero-amt_delta

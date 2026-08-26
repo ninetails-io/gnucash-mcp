@@ -576,7 +576,7 @@ class TestBatchDryRunUpgrades:
             dry_run=True,
         )
         assert "Dry run: 2 rows — " in env["summary"]
-        assert "1 would create, 0 review_required, 1 rejected" in \
+        assert "1 would_create, 0 review_required, 1 rejected" in \
             env["summary"]
         assert "duplicate candidates" in env["summary"]
         # The clearance principle: no verdict vocabulary.
@@ -667,9 +667,9 @@ class TestBatchDryRunUpgrades:
         assert row["desc_new"] == "Rent"
         assert row["desc_old"] == "Rent"
         assert row["date_delta_days"] == "-1"
-        assert row["amt_new"] == "1700"
-        assert row["amt_old"] == "1800"
-        assert row["amt_delta"] == "100"
+        assert row["amt_new"] == "-1700"
+        assert row["amt_old"] == "-1800"
+        assert row["amt_delta"] == "-100"
         assert row["cat_new"] == "Expenses:Groceries=1700"
         assert row["cat_old"] == "Expenses:Groceries=1800"
         assert row["split_match"] == "partial"
@@ -677,6 +677,35 @@ class TestBatchDryRunUpgrades:
         # populated on the batch surface too — most-anchored split
         # state of the candidate transaction.
         assert row["state"] == "n"
+
+    def test_cross_frame_blanks_delta_and_names_currency(
+        self, multi_currency_book
+    ):
+        """Round-two renderer finding: comparability is
+        candidate-vs-PROPOSAL currency. A default-currency proposal
+        against an EUR candidate must blank amt_delta and name EUR
+        in cur — 100 EUR vs 100 USD is not a twin."""
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_transaction(
+            description="Consulting Invoice",
+            currency="EUR",
+            splits=[
+                {"account": "Assets:Euro Savings",
+                 "amount": "-100.00"},
+                {"account": "Expenses:Groceries",
+                 "amount": "100.00", "quantity": "108.00"},
+            ],
+            trans_date=date(2026, 5, 21),
+            check_duplicates=False,
+        )
+        env = gc.create_transactions(
+            [_txn(1, "Consulting Invoice", "100.00")],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["cur"] == "EUR"
+        assert row["amt_delta"] == ""
 
     def test_reconciled_candidate_shows_state_y(self, test_book):
         """The bookkeeper's fourth verification probe: a reconciled

@@ -2074,6 +2074,12 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
     dry = params.get("dry_run", True)
 
     verb = "ENTER STATEMENT (dry run)" if dry else "ENTER STATEMENT"
+    if params.get("force") and not dry:
+        # A forced landing bypassed the base and twin guards — the
+        # permanent record says so even when the tie held (review:
+        # a forced commit's audit entry was byte-identical to a
+        # clean one).
+        verb += " (FORCED)"
     lines = [
         f"{time_part}  {verb}  {account}  {stmt_date}  "
         f"opening {opening} → closing {closing}"

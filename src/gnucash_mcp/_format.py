@@ -389,6 +389,15 @@ _EXOTIC_SEPARATORS = {
     "\x85": "U+0085 NEXT LINE",
     "\x0b": "U+000B VERTICAL TAB",
     "\x0c": "U+000C FORM FEED",
+    # The other three str.splitlines boundaries — without them the
+    # shatter class was only HALF-fixed: the byte flowed silently
+    # into a cell and died later as a bare ConversionSyntax naming
+    # no character (review finding). splitlines breaks on exactly
+    # ten characters; \n and \r are the real newlines, these are
+    # the other eight.
+    "\x1c": "U+001C FILE SEPARATOR",
+    "\x1d": "U+001D GROUP SEPARATOR",
+    "\x1e": "U+001E RECORD SEPARATOR",
 }
 
 
@@ -397,10 +406,15 @@ def _tsv_lines(tsv: str, what: str) -> list[str]:
     invisible separator characters ``str.splitlines`` would have
     silently split on. Shared by every TSV parser — one splitting
     discipline, one diagnosis."""
+    # Normalize BEFORE locating, or a bare-\r file reports every
+    # exotic as "the header" (review finding); and number the same
+    # blank-filtered rows the parse loops number, so this
+    # diagnosis and every other row error agree about a line.
+    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
     for ch, name in _EXOTIC_SEPARATORS.items():
-        if ch in tsv:
-            before = tsv[: tsv.index(ch)]
-            row = before.count("\n")  # 0 = header line
+        if ch in text:
+            prior = text[: text.index(ch)].split("\n")[:-1]
+            row = sum(1 for ln in prior if ln.strip())
             where = f"row {row}" if row else "the header"
             raise ValueError(
                 f"invisible {name} character inside {what} at "
@@ -408,7 +422,6 @@ def _tsv_lines(tsv: str, what: str) -> list[str]:
                 f"that would silently shatter the row; re-emit it "
                 f"with plain newlines and tabs"
             )
-    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
     return [ln for ln in text.split("\n") if ln.strip()]
 
 
@@ -462,23 +475,21 @@ def _statement_tsv_layout(header_line: str) -> dict:
     fixed_idx: dict[str, int] = {}
     start = 2
     while start < len(tokens):
-        name = _STATEMENT_FIXED_TOKENS.get(tokens[start])
+        # Match on the RAW token: a digit-suffixed spelling (amt1)
+        # is always a split-group column, never the per-line fixed
+        # amount — the docstring's "lazy spelling" promise depends
+        # on this (review finding: the digit-stripped token was
+        # getting swallowed as fixed, inverting the group order).
+        name = _STATEMENT_FIXED_TOKENS.get(raw_tokens[start])
         if name is None or name in fixed_idx:
             break
         fixed_idx[name] = start
         start += 1
 
-    if "amount" not in fixed_idx:
-        raise ValueError(
-            "statement header needs an amount column — every line "
-            "carries the amount the statement prints"
-        )
-    if "description" not in fixed_idx and "raw" not in fixed_idx:
-        raise ValueError(
-            "statement header needs a description or raw column — "
-            "something has to identify each line"
-        )
-
+    # Validate the remaining tokens BEFORE the presence checks: a
+    # typo'd fixed column ("descrption") must error by NAME, not as
+    # a bogus "missing amount" about a column visibly present
+    # (review finding).
     canonical: list[str] = []
     for raw, token in zip(raw_tokens[start:], tokens[start:]):
         name = _BATCH_SPLIT_TOKENS.get(token)
@@ -492,6 +503,17 @@ def _statement_tsv_layout(header_line: str) -> dict:
                 f"never a column)"
             )
         canonical.append(name)
+
+    if "amount" not in fixed_idx:
+        raise ValueError(
+            "statement header needs an amount column — every line "
+            "carries the amount the statement prints"
+        )
+    if "description" not in fixed_idx and "raw" not in fixed_idx:
+        raise ValueError(
+            "statement header needs a description or raw column — "
+            "something has to identify each line"
+        )
 
     layout = {"fixed_idx": fixed_idx, "fixed": start}
     if not canonical:
@@ -590,6 +612,33 @@ _CANDIDATE_COMPARISON_COLUMNS = (
 )
 
 
+def _tsv_cell(value) -> str:
+    """Escape one response-TSV cell — the OUTPUT mirror of
+    ``_tsv_lines``. Book-sourced free text (notes, memos,
+    descriptions, account names) is routinely multi-line in
+    OFX-imported books; written raw into a TSV it shatters the row
+    into phantom rows exactly like the input-side bug this branch
+    already fixed (review finding: a two-line note became a
+    candidate row for a ref that didn't exist). Structural
+    characters render as visible escapes; the invisible separator
+    exotics render as spaces. ``None`` renders empty — never the
+    string "None"."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return ""
+    s = (
+        s.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    for ch in _EXOTIC_SEPARATORS:
+        s = s.replace(ch, " ")
+    return s
+
+
 def _candidate_risk(row: dict) -> int:
     """Correspondence strength = lit signal count."""
     return sum(1 for ch in str(row.get("signals", "")) if ch != "-")
@@ -605,18 +654,25 @@ def _candidate_comparison_tsv(rows: list[dict]) -> str:
     if not rows:
         return ""
 
-    def _abs_or_inf(value) -> Decimal:
+    def _abs_or_zero(value) -> Decimal:
+        # Blank deltas are WITHHELD comparisons (cross-currency),
+        # not distant ones — sorting them last would demote exactly
+        # the rows that need manual eyes (review finding). They
+        # sort at the head of their risk tier instead. NaN would
+        # escape the constructor guard and blow up inside sorted();
+        # it lands with the blanks.
         try:
-            return abs(Decimal(str(value)))
+            d = abs(Decimal(str(value)))
         except InvalidOperation:
-            return Decimal("Infinity")
+            return Decimal(0)
+        return Decimal(0) if d.is_nan() else d
 
     ordered = sorted(
         rows,
         key=lambda r: (
             -_candidate_risk(r),
-            _abs_or_inf(r.get("amt_delta", "")),
-            _abs_or_inf(r.get("date_delta_days", "")),
+            _abs_or_zero(r.get("amt_delta", "")),
+            _abs_or_zero(r.get("date_delta_days", "")),
             str(r.get("ref", "")), str(r.get("candidate_guid", "")),
         ),
     )
@@ -624,7 +680,7 @@ def _candidate_comparison_tsv(rows: list[dict]) -> str:
     for r in ordered:
         lines.append(
             "\t".join(
-                str(r.get(c, "")) for c in
+                _tsv_cell(r.get(c)) for c in
                 _CANDIDATE_COMPARISON_COLUMNS
             )
         )

@@ -356,10 +356,23 @@ class TestStatementDryRun:
         # Line 1 carries raw only and has no auto-fill precedent,
         # so its proposal side is unknown — split_match blank.
         assert cand["split_match"] == ""
-        # Line 3 auto-fills, so its comparison is complete — and
-        # Decimal-normalized: "5.50" vs "5.5" is the SAME leg.
+        # Line 3 has an exact twin, so the guard short-circuits
+        # prep (mirroring commit) and its proposal side is unknown.
         cand3 = _cands(_dry(gc))["3"][0]
-        assert cand3["split_match"] == "exact"
+        assert cand3["split_match"] == ""
+        # A strong-but-not-exact MATCH does run prep: equal
+        # amounts at 20 days' drift — Decimal-normalized, "800.00"
+        # vs "800" is the SAME leg.
+        res20 = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 7, 21), "-800.00",
+                   description="July Rent",
+                   splits=[{"account": "Expenses:Rent",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert _cands(res20)["1"][0]["split_match"] == "exact"
 
     def test_amount_only_candidate_surfaces(self, statement_book):
         """Ruling 1's rent case: a line 31 days from a same-amount
@@ -511,7 +524,7 @@ class TestStatementCommit:
                    raw="ACH RENT AGAIN", match=rent_guid)],
             dry_run=False,
         )
-        assert "already claimed by another row" in res["results"]
+        assert "already used by another row" in res["results"]
 
     def test_duplicate_guard(self, statement_book):
         """A created line exactly matching an unclaimed unreconciled
@@ -769,7 +782,7 @@ class TestStatementReviewFindings:
         )
         assert "no matching transaction to auto-fill" in \
             res["warnings"]
-        assert "warning(s) outstanding" in res["tie"]
+        assert "would refuse at commit" in res["tie"]
 
     def test_dry_run_detects_double_claim(self, statement_book):
         gc = GnuCashBook(str(statement_book))
@@ -783,20 +796,22 @@ class TestStatementReviewFindings:
                    raw="ACH RENT AGAIN", match=rent_guid)],
             dry_run=True,
         )
-        assert "already claimed by another row" in res["warnings"]
+        assert "already used by another row" in res["warnings"]
 
     def test_exact_match_note_flags_commit_refusal(
         self, statement_book
     ):
-        """A MATCH line with an exact unreconciled twin says in its
-        note what commit will do with a bare create."""
+        """A MATCH line with an exact unreconciled twin carries the
+        guard's coaching VERBATIM in its note — the same text the
+        commit rejection would say (disposition chokepoint)."""
         gc = GnuCashBook(str(statement_book))
         res = _dry(gc)
         notes = {
             f[0]: f[3] for f in
             (ln.split("\t") for ln in res["lines"].splitlines()[1:])
         }
-        assert "exact twin" in notes["1"]
+        assert "claim it with match=" in notes["1"]
+        assert "would refuse at commit" in res["tie"]
 
 
 class TestMaidenVoyageFindings:
@@ -827,6 +842,46 @@ class TestMaidenVoyageFindings:
                 "ref\tdate\tdescription\tamt\tacct\n"
                 "1\t2025-04-01\tDesc\x0bX\t-10\tA\t10\tB"
             )
+
+    def test_remaining_splitlines_exotics_reject(self):
+        """Round two: \\x1c/\\x1d/\\x1e are the other three
+        splitlines boundaries — without them the shatter class was
+        half-fixed and the byte flowed silently into a cell."""
+        for ch, name in (("\x1c", "FILE"), ("\x1d", "GROUP"),
+                         ("\x1e", "RECORD")):
+            with pytest.raises(ValueError, match=f"{name} SEPARATOR"):
+                _parse_statement_tsv(
+                    f"ref\tdate\traw\tamount\n"
+                    f"1\t2026-07-01\tSTAR{ch}BUCKS\t-5.00"
+                )
+
+    def test_exotic_row_number_on_bare_cr_input(self):
+        """Row numbering normalizes \\r first — a classic-Mac file
+        must not blame 'the header' for a data-row artifact."""
+        tsv = ("ref\tdate\traw\tamount\r"
+               "1\t2026-07-01\tOK\t-5.00\r"
+               "2\t2026-07-02\tBAD\u2028X"
+               "\t-5.00")
+        with pytest.raises(ValueError, match="row 2"):
+            _parse_statement_tsv(tsv)
+
+    def test_lazy_amt1_spelling_parses(self):
+        """The docstring's promise, now true: fixed 'amount' AND
+        group 'amt1' both parse — a digit-suffixed token is never
+        swallowed by the fixed section."""
+        rows = _parse_statement_tsv(
+            "ref\tdate\tdesc\tamount\tamt1\tacct1\n"
+            "1\t2026-07-01\tX\t-5.00\t5.00\tExpenses:Groceries"
+        )
+        assert rows[0]["amount"] == "-5.00"
+        assert rows[0]["splits"][0]["account"] == \
+            "Expenses:Groceries"
+
+    def test_fixed_typo_errors_by_name(self):
+        with pytest.raises(
+            ValueError, match="unrecognized column 'descrption'"
+        ):
+            _statement_tsv_layout("ref\tdate\tdescrption\tamount")
 
     def test_real_newlines_still_split(self):
         rows = _parse_statement_tsv(
@@ -1030,6 +1085,346 @@ class TestPlanRoundFindings:
         assert "rejected" in rejected_row
         assert "claim it with match=" in rejected_row
         assert "warnings" not in res
+
+
+class TestDispositionChokepoint:
+    """Locks for the opus adversarial round (round two): the
+    rehearsal runs the SAME disposition procedure commit runs —
+    the scenarios here are the five verified divergences."""
+
+    def _seed(self, statement_book, dt, desc, amt, state=None,
+              memo=""):
+        import piecash as pc
+        b = pc.open_book(str(statement_book), readonly=False,
+                         do_backup=False)
+        checking = [a for a in b.accounts if a.name == "Checking"][0]
+        groceries = [
+            a for a in b.accounts if a.name == "Groceries"
+        ][0]
+        t = pc.Transaction(
+            currency=b.default_currency, description=desc,
+            post_date=dt,
+            splits=[
+                pc.Split(account=checking, value=Decimal(amt),
+                         memo=memo),
+                pc.Split(account=groceries, value=-Decimal(amt)),
+            ],
+        )
+        b.save()
+        guid = None
+        for s in t.splits:
+            if s.account == checking:
+                guid = s.guid
+                if state:
+                    s.reconcile_state = state
+        b.save()
+        b.close()
+        return guid
+
+    def test_reconciled_twin_behind_fuzzy_match_rehearses_refusal(
+        self, statement_book
+    ):
+        """Scenario A: fuzzy unreconciled MATCH + exact RECONCILED
+        twin — the old rehearsal showed a clean tie and commit
+        rejected wholesale. Now the note carries the guard's
+        coaching and the tie counts the refusal."""
+        self._seed(statement_book, date(2026, 7, 11),
+                   "Coffee Shop Downtown", "-4.50")     # fuzzy n
+        self._seed(statement_book, date(2026, 7, 10),
+                   "Starbucks", "-5.00", state="y")     # exact y
+        gc = GnuCashBook(str(statement_book))
+        line = _line("1", date(2026, 7, 10), "-5.00",
+                     description="Coffee Shop",
+                     splits=[{"account": "Expenses:Groceries",
+                              "amount": "5.00"}])
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "995.00", "990.00", [line], dry_run=True,
+        )
+        notes = res["lines"].splitlines()[1].split("\t")[3]
+        assert "landed by a prior statement" in notes
+        assert "would refuse at commit" in res["tie"]
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "995.00", "990.00", [line], dry_run=False,
+        )
+        assert "REJECTED" in commit["summary"]
+        # Same coaching text, both modes — the chokepoint.
+        assert "landed by a prior statement" in commit["results"]
+
+    def test_overlap_class_with_claim_projects_the_claim(
+        self, statement_book
+    ):
+        """Scenario D: an OVERLAP-classified row whose match cell
+        claims a DIFFERENT unreconciled split — projection must
+        contribute the claim's amount, exactly like commit."""
+        self._seed(statement_book, date(2026, 7, 10),
+                   "Gym", "-50.00", state="y")           # exact y
+        z = self._seed(statement_book, date(2026, 7, 22),
+                       "Jim", "-50.00")                  # LOW n
+        gc = GnuCashBook(str(statement_book))
+        line = _line("1", date(2026, 7, 10), "-50.00",
+                     raw="GYM MEMBERSHIP", match=z)
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "900.00", [line], dry_run=True,
+        )
+        assert _classes(res)["1"] == "MATCH"
+        assert "will claim" in res["lines"].splitlines()[1]
+        assert "ties to the statement closing" in res["tie"]
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "900.00", [line], dry_run=False,
+        )
+        assert "1 claimed" in commit["summary"]
+        assert "tied." in commit["tie"]
+
+    def test_forced_dry_run_rehearses_the_forced_commit(
+        self, statement_book
+    ):
+        """Scenario E: under force the guard is off in BOTH modes —
+        a bare line whose exact twin is reconciled projects a
+        create, matching what the forced commit does."""
+        self._seed(statement_book, date(2026, 7, 10),
+                   "Gym", "-50.00", state="y")
+        gc = GnuCashBook(str(statement_book))
+        line = _line("1", date(2026, 7, 10), "-50.00",
+                     description="Gym",
+                     splits=[{"account": "Expenses:Groceries",
+                              "amount": "50.00"}])
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "900.00", [line], dry_run=True, force=True,
+        )
+        assert "ties to the statement closing" in res["tie"]
+        assert "would refuse" not in res["tie"]
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "900.00", [line], dry_run=False, force=True,
+        )
+        assert "1 created" in commit["summary"]
+        assert "LANDED UNDER FORCE" in commit["summary"]
+
+    def test_sibling_claims_exempt_twins_from_guard(
+        self, statement_book
+    ):
+        """Scenario C: three identical charges on the statement,
+        two existing twins both claimed by sibling rows — the
+        third row's create must NOT be guarded (every twin is
+        accounted for; the third is a genuine new charge)."""
+        gc = GnuCashBook(str(statement_book))
+        cands = _cands(_dry(gc))["3"]
+        c1, c2 = (
+            cands[0]["candidate_guid"], cands[1]["candidate_guid"],
+        )
+        lines = [
+            _line("1", date(2026, 7, 10), "-5.50",
+                  raw="BLUE BOTTLE A", match=c1),
+            _line("2", date(2026, 7, 10), "-5.50",
+                  raw="BLUE BOTTLE B", match=c2),
+            _line("3", date(2026, 7, 10), "-5.50",
+                  description="Blue Bottle",
+                  splits=[{"account": "Expenses:Groceries",
+                           "amount": "5.50"}]),
+        ]
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "983.50", lines, dry_run=True,
+        )
+        rows = {
+            f[0]: f for f in
+            (ln.split("\t") for ln in res["lines"].splitlines()[1:])
+        }
+        assert "will claim" in rows["1"][3]
+        assert "claim it with match=" not in rows["3"][3]
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "983.50", lines, dry_run=False,
+        )
+        assert "1 created, 2 claimed" in commit["summary"]
+
+    def test_overlap_double_claim_rejects_both_modes(
+        self, statement_book
+    ):
+        """Two rows no-opping ONE reconciled split report two
+        handled lines for one — now an error in both modes."""
+        g = self._seed(statement_book, date(2026, 7, 10),
+                       "Gym", "-50.00", state="y")
+        gc = GnuCashBook(str(statement_book))
+        lines = [
+            _line("1", date(2026, 7, 10), "-50.00",
+                  raw="GYM", match=g),
+            _line("2", date(2026, 7, 10), "-50.00",
+                  raw="GYM AGAIN", match=g),
+        ]
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "850.00", lines, dry_run=True,
+        )
+        assert "already used by another row" in res["warnings"]
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "950.00", "850.00", lines, dry_run=False,
+        )
+        assert "REJECTED" in commit["summary"]
+
+    def test_counter_split_may_not_name_statement_account(
+        self, statement_book
+    ):
+        """The tie is an identity over inputs — a counter-split
+        naming the statement account would move the account by
+        more than the printed line while reporting tied."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "900.00",
+            [_line("1", date(2026, 7, 20), "-100.00",
+                   description="Combined",
+                   splits=[
+                       {"account": "Assets:Checking",
+                        "amount": "-50.00"},
+                       {"account": "Expenses:Groceries",
+                        "amount": "150.00"},
+                   ])],
+            dry_run=False,
+        )
+        assert "REJECTED" in res["summary"]
+        assert "must not name the statement account" in \
+            res["results"]
+
+    def test_forced_landing_is_recorded(self, statement_book):
+        """A tie-holding forced commit must not be byte-identical
+        to a clean one — summary and audit both say FORCED."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Visa", date(2026, 7, 31), "0.00", "42.00",
+            [_line("1", date(2026, 7, 20), "42.00",
+                   description="Trader Joes",
+                   splits=[{"account": "Expenses:Groceries",
+                            "amount": "42.00"}])],
+            dry_run=False, force=True,
+        )
+        assert "LANDED UNDER FORCE" in res["summary"]
+        from gnucash_mcp.logging_config import _fmt_statement_enter
+        out = "\n".join(_fmt_statement_enter({
+            "timestamp": "2026-08-24T22:00:00-07:00",
+            "params": {"account": "Visa",
+                       "statement_date": "2026-07-31",
+                       "opening_balance": "0.00",
+                       "closing_balance": "42.00",
+                       "lines": "", "dry_run": False,
+                       "force": True},
+            "after_state": {"summary": res["summary"],
+                            "tie": res["tie"]},
+        }))
+        assert "(FORCED)" in out
+
+
+class TestRoundTwoLockGaps:
+    """The fifth agent's mutation testing found two conventions
+    posing as invariants; these make them invariants."""
+
+    def test_exact_requires_amount_to_the_quantum(
+        self, statement_book
+    ):
+        """A -799.50 line against the -800 rent split is a MATCH
+        candidate (amount within $1) but NOT an exact twin — the
+        guard must not fire and a judged create must land. With
+        ±$1 'exact' fuzz this commit would reject with wrong
+        coaching."""
+        gc = GnuCashBook(str(statement_book))
+        line = _line("1", date(2026, 7, 1), "-799.50",
+                     description="July Rent Adjusted",
+                     splits=[{"account": "Expenses:Rent",
+                              "amount": "799.50"}])
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.50", [line], dry_run=True,
+        )
+        assert _classes(res)["1"] == "MATCH"
+        notes = res["lines"].splitlines()[1].split("\t")[3]
+        assert "claim it with match=" not in notes
+        commit = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.50", [line], dry_run=False,
+        )
+        assert "1 created" in commit["summary"]
+
+    def test_candidate_sort_orders_by_delta_within_tier(
+        self, statement_book
+    ):
+        """§11.13's ordering, locked: same risk tier, nearer
+        amt_delta first."""
+        import piecash as pc
+        b = pc.open_book(str(statement_book), readonly=False,
+                         do_backup=False)
+        checking = [a for a in b.accounts if a.name == "Checking"][0]
+        groceries = [
+            a for a in b.accounts if a.name == "Groceries"
+        ][0]
+        for amt in ("-99.10", "-99.90"):
+            pc.Transaction(
+                currency=b.default_currency, description="Utility",
+                post_date=date(2026, 7, 18),
+                splits=[
+                    pc.Split(account=checking, value=Decimal(amt)),
+                    pc.Split(account=groceries,
+                             value=-Decimal(amt)),
+                ],
+            )
+        b.save()
+        b.close()
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "900.00",
+            [_line("1", date(2026, 7, 18), "-100.00",
+                   raw="UTILITY CO")],
+            dry_run=True, show_all=True,
+        )
+        cands = _cands(res)["1"]
+        deltas = [abs(Decimal(c["amt_delta"])) for c in cands
+                  if c["amt_delta"]]
+        assert deltas == sorted(deltas)
+
+
+class TestOutputEscaping:
+    """The output mirror of the shatter bug: book free text must
+    not splinter response TSVs."""
+
+    def test_multiline_note_stays_one_candidate_row(
+        self, statement_book
+    ):
+        import piecash as pc
+        b = pc.open_book(str(statement_book), readonly=False,
+                         do_backup=False)
+        checking = [a for a in b.accounts if a.name == "Checking"][0]
+        groceries = [
+            a for a in b.accounts if a.name == "Groceries"
+        ][0]
+        pc.Transaction(
+            currency=b.default_currency, description="OFX Import",
+            post_date=date(2026, 7, 18),
+            notes="line1\nline2\tcol2",
+            splits=[
+                pc.Split(account=checking, value=Decimal("-33.00"),
+                         memo="memo\nsecond"),
+                pc.Split(account=groceries, value=Decimal("33.00")),
+            ],
+        )
+        b.save()
+        b.close()
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "967.00",
+            [_line("1", date(2026, 7, 18), "-33.00",
+                   raw="OFX THING")],
+            dry_run=True,
+        )
+        cands = res["candidates"].splitlines()
+        assert len(cands) == 2  # header + ONE row
+        assert "\\n" in res["candidates"]
 
 
 # ── Sign transform (credit card) ───────────────────────────────────

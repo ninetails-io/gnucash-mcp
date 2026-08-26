@@ -515,9 +515,13 @@ def register(mcp, get_book) -> None:
           ``account=amount|...``; ``split_match``
           (exact/partial/none) compares them — MEDIUM on
           date+amount but ``none`` on category is usually a
-          distinct purchase. ``amt_delta`` is blank on
-          cross-currency candidates (see ``cur``). Never re-read
-          your own input — both sides are in the row.
+          distinct purchase. Amounts are SIGNED (direction
+          matters: a deposit is not a payment's twin).
+          ``amt_delta`` is blank on cross-currency candidates
+          (``cur`` names the candidate's currency exactly when
+          the frames differ); ``memo_old`` and ``state`` blanks
+          mean this surface can't fill them. Never re-read your
+          own input — both sides are in the row.
           Σ(dup_count) equals the duplicates row count.
         - Dry runs additionally lead with ``summary`` (would-create/
           review-required/rejected counts + the homework line)
@@ -606,6 +610,11 @@ def register(mcp, get_book) -> None:
         - A commit row with no counter-splits auto-fills from the
           most recent same-description 2-split transaction, adapted
           to the line amount (marked ``auto_filled_from:<guid>``).
+          The precedent must have exactly one leg on the statement
+          account and no cross-commodity leg — anything else
+          rejects with "supply explicit counter-splits". Explicit
+          counter-splits must not name the statement account (its
+          leg is synthesized).
 
         SAFETY: the account's reconciled balance must tie to
         ``opening_balance`` (a prior unentered statement blocks
@@ -616,19 +625,30 @@ def register(mcp, get_book) -> None:
         bypasses the statement's own self-check.
 
         OUTPUT (dry-run): ``summary`` (class counts), ``lines``
-        (ref, class, cands, note), ``candidates`` — SELF-CONTAINED
-        comparison rows sorted strongest-correspondence first
-        (``ref, candidate_guid, confidence, state, date_new/old +
-        delta, amt_new/old + delta, desc_new/old, notes_old,
-        memo_old, cat_new/old, split_match, signals``; ``_new`` =
-        the statement line in book convention, ``_old`` = the
-        existing split — never re-read your own input), plus
-        ``warnings`` and ``tie`` — the projected reconciled balance
-        vs the closing. The tie is the only verdict;
+        (ref, class, cands, note — the note is the resolved
+        disposition: the guard's refusal coaching verbatim, the
+        auto-fill prediction, or "will claim …"), ``candidates`` —
+        SELF-CONTAINED comparison rows sorted
+        strongest-correspondence first (``ref, candidate_guid,
+        confidence, state, date_new/old + delta, amt_new/old +
+        delta, cur, desc_new/old, notes_old, memo_old, cat_new/old,
+        split_match, signals``; ``_new`` = the statement line in
+        book convention, ``_old`` = the existing split — never
+        re-read your own input; ``cur`` is structurally blank on
+        this surface), plus ``warnings`` (only when present;
+        ``candidates`` likewise) and ``tie`` — the projected
+        reconciled balance vs the closing, with a count of rows
+        this exact payload would refuse at commit. The dry-run
+        rehearses the SAME disposition procedure commit runs —
+        force included. The tie is the only verdict;
         MATCH/AMBIGUOUS rows are yours to rule.
-        OUTPUT (commit): ``results`` (ref, status
-        created|claimed|skipped_duplicate, guid), the new reconciled
-        balance, and the tie.
+        OUTPUT (commit): ``results`` (``ref, status, guid, note``;
+        status is created | claimed | skipped_duplicate, or on a
+        refused statement rejected | statement_aborted — the note
+        column carries the row's coaching and
+        ``auto_filled_from:<guid>`` markers), plus, on success
+        only, the new reconciled balance and the tie (a refusal
+        returns just ``summary`` + ``results``).
 
         Args:
             account: Statement account ref (path, %short, or GUID).

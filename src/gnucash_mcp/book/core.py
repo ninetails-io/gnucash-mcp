@@ -26,6 +26,7 @@ from gnucash_mcp._format import (
     _dry_run_summary,
     _paginate,
     _split_match_verdict,
+    _tsv_cell,
 )
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
@@ -2946,17 +2947,32 @@ class CoreMixin:
                     states = {s.reconcile_state for s in txn.splits}
                     txn_state = (
                         "y" if "y" in states
-                        else "c" if "c" in states else "n"
+                        else "c" if "c" in states
+                        else "f" if "f" in states else "n"
+                    )
+                    primary_signed = max(
+                        (s.value for s in txn.splits), key=abs,
                     )
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
                         "state": txn_state,
+                        # The frame predicate the amount signal
+                        # actually used — comparability is
+                        # candidate-vs-PROPOSAL currency, not
+                        # candidate-vs-book-default (review
+                        # finding: 100 EUR vs 100 USD rendered as
+                        # a perfect twin). currency_code is always
+                        # present so the cur label can name the
+                        # frame either way.
+                        "same_frame": same_frame,
+                        "currency_code": txn.currency.mnemonic,
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
                         "notes": txn.notes or "",
                         "categories": cat_legs,
                         "amount": str(primary_amount),
+                        "primary_signed": str(primary_signed),
                         # Labeling non-default candidates lets the
                         # caller interpret a cross-currency MEDIUM
                         # (desc+date) without a follow-up read —
@@ -3586,9 +3602,17 @@ class CoreMixin:
                     proposal = {
                         "desc": p["description"],
                         "date": p["trans_date"],
+                        # SIGNED primary (max-abs split's value) —
+                        # the comparison table reads sign as
+                        # direction on both surfaces, so a +50
+                        # deposit and a -50 payment never render
+                        # as a perfect twin (review finding).
                         "amount": (
-                            max(p["proposed_amounts"])
-                            if p["proposed_amounts"] else Decimal("0")
+                            max(
+                                (v["value"] for v in p["validated"]),
+                                key=abs,
+                            )
+                            if p["validated"] else Decimal("0")
                         ),
                         "cats": p_cats,
                     }
@@ -3685,13 +3709,19 @@ class CoreMixin:
                     homework = "No duplicate candidates."
                 summary = _dry_run_summary(
                     len(transactions), "rows",
-                    [("would create", n_would),
+                    [("would_create", n_would),
                      ("review_required", n_review),
                      ("rejected", n_rejected)],
                     homework,
                 )
                 effects: dict[str, Decimal] = {}
                 for p, _dc, _mc in accepted:
+                    if _dc:
+                        # review_required rows are homework, not a
+                        # settled projection — including them would
+                        # let the footer masquerade as clearance
+                        # (review finding; worst under force).
+                        continue
                     for v in p["validated"]:
                         key = v["account"].fullname
                         effects[key] = (
@@ -3702,7 +3732,9 @@ class CoreMixin:
                 if effects:
                     out = ["account\tdelta"]
                     for name in sorted(effects):
-                        out.append(f"{name}\t{effects[name]}")
+                        out.append(
+                            f"{_tsv_cell(name)}\t{effects[name]}"
+                        )
                     effects_tsv = "\n".join(out)
                 return {
                     "summary": summary,
@@ -3770,7 +3802,7 @@ class CoreMixin:
             return ""
         lines = ["ref\tmessage"]
         for ref, message in warn_rows:
-            lines.append(f"{ref}\t{message}")
+            lines.append(f"{_tsv_cell(ref)}\t{_tsv_cell(message)}")
         return "\n".join(lines)
 
     @staticmethod
@@ -3797,8 +3829,17 @@ class CoreMixin:
 
     @staticmethod
     def _cats_str(cats: list[tuple[str, str]]) -> str:
-        """Render category legs as ``account=amount`` pipe-joined."""
-        return "|".join(f"{a}={v}" for a, v in sorted(cats))
+        """Render category legs as ``account=amount`` pipe-joined.
+        The mini-grammar's own separators are escaped inside
+        account names so an account containing ``|`` or ``=``
+        can't corrupt the cell or flip split_match's reading."""
+        def esc(a: str) -> str:
+            return (
+                a.replace("\\", "\\\\")
+                .replace("=", "\\=")
+                .replace("|", "\\|")
+            )
+        return "|".join(f"{esc(a)}={v}" for a, v in sorted(cats))
 
     @staticmethod
     def _batch_duplicates_to_tsv(dup_rows: list) -> str:
@@ -3811,7 +3852,7 @@ class CoreMixin:
         rows = []
         for ref, d, prop in dup_rows:
             date_old = date.fromisoformat(d["date"])
-            cross_frame = bool(d.get("currency"))
+            cross_frame = not d.get("same_frame", True)
             rows.append({
                 "ref": ref,
                 "candidate_guid": d["guid"],
@@ -3821,12 +3862,20 @@ class CoreMixin:
                 "date_old": d["date"],
                 "date_delta_days": (date_old - prop["date"]).days,
                 "amt_new": str(prop["amount"]),
-                "amt_old": d["amount"],
+                "amt_old": d.get("primary_signed", d["amount"]),
                 "amt_delta": (
                     "" if cross_frame
-                    else str(_to_decimal(d["amount"]) - prop["amount"])
+                    else str(
+                        _to_decimal(
+                            d.get("primary_signed", d["amount"])
+                        )
+                        - prop["amount"]
+                    )
                 ),
-                "cur": d.get("currency", ""),
+                "cur": (
+                    d.get("currency_code", "") if cross_frame
+                    else ""
+                ),
                 "desc_new": prop["desc"],
                 "desc_old": d["description"],
                 "notes_old": d.get("notes", ""),
@@ -4089,7 +4138,7 @@ class CoreMixin:
                     book, account, lines, amounts, sign, quantum,
                     _book_amount, _candidates_for, split_prefixes,
                     reconciled_balance, closing, warn_rows,
-                    show_all,
+                    show_all, force,
                 )
             return self._statement_commit(
                 book, account, lines, amounts, sign, quantum,
@@ -4181,6 +4230,19 @@ class CoreMixin:
         for v in validated:
             if v["account"].placeholder:
                 raise self._placeholder_error(v["account"])
+        # The statement account's leg is SYNTHESIZED from the line
+        # amount; a counter-split resolving back to it would move
+        # the account by more than the printed line while the tie
+        # — an identity over the inputs — still reports success,
+        # and the stray unreconciled split breaks NEXT month's
+        # opening gate (review finding).
+        for v in validated[1:]:
+            if v["account"].guid == account.guid:
+                raise ValueError(
+                    f"counter-splits must not name the statement "
+                    f"account ('{account.fullname}') — its leg is "
+                    f"synthesized from the line amount"
+                )
         return validated, src
 
     def _statement_resolve_claim(
@@ -4228,17 +4290,29 @@ class CoreMixin:
     def _statement_dry_run(
         self, book, account, lines, amounts, sign, quantum,
         _book_amount, _candidates_for, split_prefixes,
-        reconciled_balance, closing, warn_rows, show_all,
+        reconciled_balance, closing, warn_rows, show_all, force,
     ) -> dict:
-        """The rehearsal: classify every line, validate everything a
-        commit would validate, and project the balance tie."""
+        """The rehearsal: run the SAME disposition resolution commit
+        runs (the chokepoint), classify every line as evidence, and
+        project the balance tie from the resolved dispositions —
+        never from the classification (the adversarial round's
+        root-cause finding: an approximated projection diverged
+        from the landing in both directions)."""
         default_currency = self._require_default_currency(book)
+        phase_a = self._statement_dispositions(
+            book, account, lines, _book_amount, _candidates_for,
+            quantum, default_currency, force, split_prefixes,
+        )
+        by_ref = phase_a["by_ref"]
+        for ref, msg in phase_a["errors"]:
+            warn_rows.append((ref, msg))
+        n_refuse = len(phase_a["errors"]) + len(phase_a["guards"])
+
         counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
         line_rows: list[tuple] = []
         cand_rows: list[dict] = []
         projected = reconciled_balance.quantize(quantum)
 
-        seen_claims: set[str] = set()
         for ln in lines:
             cands = _candidates_for(ln)
             unrec = [
@@ -4261,87 +4335,76 @@ class CoreMixin:
                 if sum(1 for ch in c["signals"] if ch != "-") >= 2
                 and not c["recurring"]
             ]
-            note = ""
             if strong:
                 cls = "MATCH" if len(strong) == 1 else "AMBIGUOUS"
                 listed = unrec + rec
-                if any(c["exact"] for c in strong):
-                    note = (
-                        "exact twin — commit refuses a bare create "
-                        "here (claim it, or force)"
-                    )
             elif any(c["exact"] for c in rec):
                 # OVERLAP means THE SAME EVENT already landed and
-                # tied — exact amount, tight date. A fuzzy
-                # reconciled candidate (last month's rent, 31 days
-                # out) is evidence for a NEW line, not an overlap
-                # (review finding: the old amount-fuzz class
-                # skipped genuine lines from the projection).
+                # tied — exact amount, tight date; fuzzier
+                # reconciled candidates are evidence for a NEW
+                # line, not an overlap.
                 cls = "OVERLAP"
                 listed = rec
-                note = (
-                    "already reconciled (exact twin) — keep this "
-                    "line as a match row naming the twin (no-op); "
-                    "commit refuses a bare create here without "
-                    "force"
-                )
             else:
                 cls = "NEW"
                 # Weak (LOW) and reconciled fuzzy candidates stay
                 # listed: the spec's annotation-adaptation case
-                # (June 30 "July rent" vs a July 31 line) needs the
-                # prior instance's annotation shipped as evidence
-                # even when it doesn't drive the class.
+                # needs the prior instance's annotation shipped as
+                # evidence even when it doesn't drive the class.
                 listed = unrec + rec
 
-            # Full rehearsal: run exactly what commit would run on
-            # this row — a dry-run that ties is a commit that will
-            # tie, and a row commit would reject must say so now.
+            # Note, class overrides, and projection all come from
+            # the RESOLVED DISPOSITION — what commit will actually
+            # do with this row — not from the evidence class.
+            d = by_ref[ln["ref"]]
+            note = ""
             proposal_cats = None
-            try:
-                if ln.get("match"):
-                    s, kind = self._statement_resolve_claim(
-                        book, account, ln, _book_amount(ln), quantum,
+            if d["kind"] == "claim":
+                cls = "MATCH"
+                note = (
+                    f"will claim "
+                    f"{split_prefixes[d['split'].guid]}"
+                )
+                projected += _book_amount(ln)
+            elif d["kind"] == "overlap":
+                cls = "OVERLAP"
+                note = "match names a reconciled split — no-op"
+            elif d["kind"] == "guard":
+                # The guard's coaching verbatim — the same text the
+                # commit rejection would carry.
+                note = d["message"]
+                if not d["twin_reconciled"]:
+                    # Resolution (claim, or forced create) lands
+                    # the amount either way; a reconciled twin
+                    # resolves to a no-op.
+                    projected += _book_amount(ln)
+            elif d["kind"] == "create":
+                validated = d["validated"]
+                proposal_cats = [
+                    (v["account"].fullname, str(abs(v["value"])))
+                    for v in validated
+                    if v["account"].guid != account.guid
+                ]
+                if cls == "NEW" and not ln.get("splits"):
+                    counter_names = ", ".join(
+                        v["account"].fullname
+                        for v in validated[1:]
                     )
-                    if kind == "overlap":
-                        cls = "OVERLAP"
-                        note = "match names a reconciled split — no-op"
-                    elif s.guid in seen_claims:
-                        raise ValueError(
-                            "split already claimed by another row "
-                            "in this statement"
-                        )
-                    else:
-                        seen_claims.add(s.guid)
-                elif cls != "OVERLAP":
-                    validated, src = self._statement_prep_create(
-                        book, account, ln, _book_amount(ln),
-                        default_currency,
+                    note = (
+                        f"would create {_book_amount(ln)} → "
+                        f"{counter_names}"
                     )
-                    proposal_cats = [
-                        (v["account"].fullname, str(abs(v["value"])))
-                        for v in validated
-                        if v["account"].guid != account.guid
-                    ]
-                    if cls == "NEW" and not ln.get("splits"):
-                        counter_names = ", ".join(
-                            v["account"].fullname
-                            for v in validated[1:]
+                    if d["src"]:
+                        note += (
+                            f" (auto_filled_from:"
+                            f"{d['src']['guid']})"
                         )
-                        note = (
-                            f"would create {_book_amount(ln)} → "
-                            f"{counter_names}"
-                        )
-                        if src:
-                            note += (
-                                f" (auto_filled_from:{src['guid']})"
-                            )
-            except ValueError as e:
-                warn_rows.append((ln["ref"], str(e)))
+                projected += _book_amount(ln)
+            else:  # error — assume the operator fixes the row and
+                # it lands; the caveat counts it either way.
+                projected += _book_amount(ln)
 
             counts[cls] += 1
-            if cls != "OVERLAP":
-                projected += _book_amount(ln)
 
             # Best-evidence-only display (bookkeeper ruling,
             # 2026-08-24): a line with MEDIUM/HIGH candidates
@@ -4455,18 +4518,24 @@ class CoreMixin:
                 f"({closing} as printed) — DISCREPANCY "
                 f"{closing_book - projected}."
             )
-        if warn_rows:
-            # The projection assumes every warned row still lands;
-            # a commit repeating those rows refuses instead. Facts,
-            # not clearance.
+        if n_refuse:
+            # Counts the rows the SAME payload would refuse at
+            # commit — resolved dispositions, not a warning-count
+            # proxy (the old proxy was wrong in both directions:
+            # guard hits raised no warning, and under force the
+            # opening-gap warning implied a refusal that wouldn't
+            # happen). Facts, not clearance.
             tie += (
-                f" {len(warn_rows)} warning(s) outstanding — a "
-                f"commit that repeats them will refuse."
+                f" {n_refuse} row(s) this payload would refuse at "
+                f"commit — resolve the notes/warnings first."
             )
 
         lines_tsv = ["ref\tclass\tcands\tnote"]
         for r in line_rows:
-            lines_tsv.append(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}")
+            lines_tsv.append(
+                f"{_tsv_cell(r[0])}\t{r[1]}\t{r[2]}\t"
+                f"{_tsv_cell(r[3])}"
+            )
 
         return {
             "summary": header,
@@ -4476,22 +4545,37 @@ class CoreMixin:
             "tie": tie,
         }
 
-    def _statement_commit(
-        self, book, account, lines, amounts, sign, quantum,
-        statement_date, _book_amount, _candidates_for,
-        split_prefixes, reconciled_balance, closing, force,
-        default_currency,
+    def _statement_dispositions(
+        self, book, account, lines, _book_amount, _candidates_for,
+        quantum, default_currency, force, split_prefixes,
     ) -> dict:
-        """The landing: validate every row, check the tie, then — and
-        only then — mutate and save once."""
-        prepared: list[tuple] = []   # (ln, validated, src)
-        claims: list[tuple] = []     # (ln, split)
-        skipped: list[tuple] = []    # (ln, split)  overlap no-ops
-        errors: list[tuple[str, str]] = []
-        claimed_guids: set[str] = set()
+        """Phase A — THE disposition chokepoint both modes run.
 
-        # Pass 1 — claims only, so the guard below can exempt every
-        # split a row in THIS statement claims.
+        The adversarial round found the rehearsal approximating this
+        procedure and drifting from it in five distinct ways; the
+        fix is structural: one resolver, two consumers, divergence
+        impossible by construction. Claims resolve first (the
+        guard's exemption set), then each create row runs the twin
+        guard BEFORE counter-split/auto-fill prep (bookkeeper
+        signoff, carried item). ``force`` disables the guard here —
+        for BOTH modes, so a forced rehearsal rehearses the forced
+        landing.
+
+        Returns ``{"by_ref": {ref: {"kind": claim|overlap|create|
+        guard|error, ...}}, "claims": [(ln, split)], "skipped":
+        [(ln, split)], "prepared": [(ln, validated, src)],
+        "errors": [(ref, msg)], "guards": [(ref, msg,
+        twin_reconciled)]}``. Pure read — no mutation on any path.
+        """
+        by_ref: dict[str, dict] = {}
+        prepared: list[tuple] = []
+        claims: list[tuple] = []
+        skipped: list[tuple] = []
+        errors: list[tuple[str, str]] = []
+        guards: list[tuple[str, str, bool]] = []
+        claimed_guids: set[str] = set()
+        overlap_guids: set[str] = set()
+
         create_rows = []
         for ln in lines:
             if not ln.get("match"):
@@ -4501,31 +4585,46 @@ class CoreMixin:
                 s, kind = self._statement_resolve_claim(
                     book, account, ln, _book_amount(ln), quantum,
                 )
+                if s.guid in claimed_guids or (
+                    kind == "overlap" and s.guid in overlap_guids
+                ):
+                    # One split, one row — reconciled no-ops
+                    # included: two lines both no-opping one split
+                    # would report two handled lines for one
+                    # (review finding).
+                    raise ValueError(
+                        "split already used by another row in "
+                        "this statement"
+                    )
                 if kind == "overlap":
+                    overlap_guids.add(s.guid)
                     skipped.append((ln, s))
+                    by_ref[ln["ref"]] = {"kind": "overlap", "split": s}
                 else:
-                    if s.guid in claimed_guids:
-                        raise ValueError(
-                            "split already claimed by another "
-                            "row in this statement"
-                        )
                     claimed_guids.add(s.guid)
                     claims.append((ln, s))
+                    by_ref[ln["ref"]] = {"kind": "claim", "split": s}
             except ValueError as e:
                 errors.append((ln["ref"], str(e)))
+                by_ref[ln["ref"]] = {"kind": "error", "message": str(e)}
 
-        def _twin_guard_error(ln) -> str | None:
+        def _twin_guard(ln) -> tuple[str, bool] | None:
             """Statement-duplicate guard: a created line that
             exactly matches an unclaimed split on this account
             would double-enter. Unreconciled twin: the tie would
             still hold (only the new split reconciles) — silent.
-            Reconciled twin: already landed via a prior statement
-            — the tie catches it unforced, but under force both
-            copies would sit reconciled. Judgment overrides with
-            force (it saw the MATCH table and ruled NEW)."""
+            Reconciled twin: already landed via a prior statement.
+            Splits claimed OR no-op'd by other rows in this
+            statement are exempt — their lines are accounted for,
+            so an exact-matching create is a genuine second
+            charge."""
             for c in _candidates_for(ln):
                 s = c["split"]
-                if s.guid in claimed_guids or not c["exact"]:
+                if (
+                    s.guid in claimed_guids
+                    or s.guid in overlap_guids
+                    or not c["exact"]
+                ):
                     continue
                 if _is_unreconciled(s):
                     return (
@@ -4535,7 +4634,7 @@ class CoreMixin:
                         f"date) and no row claims it — claim it "
                         f"with match={split_prefixes[s.guid]}, or "
                         f"force=true to create anyway"
-                    )
+                    ), False
                 return (
                     f"reconciled split {split_prefixes[s.guid]} "
                     f"matches this line exactly — it looks landed "
@@ -4543,19 +4642,19 @@ class CoreMixin:
                     f"match row (match={split_prefixes[s.guid]}, "
                     f"a no-op skip), or force=true to create "
                     f"anyway"
-                )
+                ), True
             return None
 
-        # Pass 2 — create rows: the twin guard runs BEFORE
-        # counter-split/auto-fill validation, so a bare raw line
-        # whose twin exists gets the claim coaching, not an
-        # auto-fill complaint about a row that shouldn't be
-        # created at all (bookkeeper signoff, carried item).
         for ln in create_rows:
             if not force:
-                guard_msg = _twin_guard_error(ln)
-                if guard_msg is not None:
-                    errors.append((ln["ref"], guard_msg))
+                hit = _twin_guard(ln)
+                if hit is not None:
+                    msg, twin_reconciled = hit
+                    guards.append((ln["ref"], msg, twin_reconciled))
+                    by_ref[ln["ref"]] = {
+                        "kind": "guard", "message": msg,
+                        "twin_reconciled": twin_reconciled,
+                    }
                     continue
             try:
                 validated, src = self._statement_prep_create(
@@ -4563,8 +4662,38 @@ class CoreMixin:
                     default_currency,
                 )
                 prepared.append((ln, validated, src))
+                by_ref[ln["ref"]] = {
+                    "kind": "create", "validated": validated,
+                    "src": src,
+                }
             except ValueError as e:
                 errors.append((ln["ref"], str(e)))
+                by_ref[ln["ref"]] = {"kind": "error", "message": str(e)}
+
+        return {
+            "by_ref": by_ref, "claims": claims, "skipped": skipped,
+            "prepared": prepared, "errors": errors, "guards": guards,
+        }
+
+    def _statement_commit(
+        self, book, account, lines, amounts, sign, quantum,
+        statement_date, _book_amount, _candidates_for,
+        split_prefixes, reconciled_balance, closing, force,
+        default_currency,
+    ) -> dict:
+        """The landing: resolve dispositions (the shared chokepoint),
+        check the tie, then — and only then — mutate and save once."""
+        phase_a = self._statement_dispositions(
+            book, account, lines, _book_amount, _candidates_for,
+            quantum, default_currency, force, split_prefixes,
+        )
+        prepared = phase_a["prepared"]
+        claims = phase_a["claims"]
+        skipped = phase_a["skipped"]
+        # Guard hits are row errors at commit time.
+        errors = phase_a["errors"] + [
+            (ref, msg) for ref, msg, _rec in phase_a["guards"]
+        ]
 
         if errors:
             # The row's error rides the note column INLINE — the
@@ -4579,7 +4708,10 @@ class CoreMixin:
             for ln in lines:
                 msg = error_by_ref.get(ln["ref"], "")
                 status = "rejected" if msg else "statement_aborted"
-                rows.append(f"{ln['ref']}\t{status}\t\t{msg}")
+                rows.append(
+                    f"{_tsv_cell(ln['ref'])}\t{status}\t\t"
+                    f"{_tsv_cell(msg)}"
+                )
             return {
                 "summary": (
                     f"Statement REJECTED — {len(error_by_ref)} row "
@@ -4712,6 +4844,10 @@ class CoreMixin:
                 f"{statement_date.isoformat()}: {len(built)} "
                 f"created, {len(claims)} claimed, {len(skipped)} "
                 f"skipped (already reconciled)."
+                + (
+                    " LANDED UNDER FORCE — base and twin guards "
+                    "were bypassed." if force else ""
+                )
             ),
             "results": "\n".join(rows),
             "new_reconciled_balance": str(new_reconciled),
