@@ -972,6 +972,46 @@ class TestPlanRoundFindings:
         row = res["lines"].splitlines()[1].split("\t")
         assert row[2] == "1"
 
+    def test_twin_guard_precedes_countersplit_validation(
+        self, statement_book
+    ):
+        """Signoff carried item: a bare raw line (the stranger's
+        natural shape) whose exact twin exists gets the claim
+        coaching — NOT an auto-fill complaint about a row that
+        shouldn't be created at all."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31),
+            "1000.00", "200.00",
+            # raw-only: no description, no splits, no auto-fill
+            # precedent ("ACH RENT" matches no book description).
+            [_line("1", date(2026, 7, 1), "-800.00",
+                   raw="ACH RENT")],
+            dry_run=False,
+        )
+        rejected = res["results"].splitlines()[1]
+        assert "claim it with match=" in rejected
+        assert "auto-fill" not in rejected
+
+    def test_evidence_only_homework_phrasing(self, statement_book):
+        """Signoff copy quibble: the verified-empty line must not
+        contradict visible evidence rows — it counts claimable
+        candidates, and says what the listed rows are."""
+        gc = GnuCashBook(str(statement_book))
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 8, 31),
+            "1000.00", "200.00",
+            [_line("1", date(2026, 8, 1), "-800.00",
+                   description="July Rent",
+                   splits=[{"account": "Expenses:Rent",
+                            "amount": "800.00"}])],
+            dry_run=True,
+        )
+        assert _classes(res)["1"] == "NEW"
+        assert len(_cands(res)["1"]) == 1
+        assert "evidence only" in res["summary"]
+        assert "No existing-split candidates" not in res["summary"]
+
     def test_commit_rejection_coaching_is_inline(
         self, statement_book
     ):

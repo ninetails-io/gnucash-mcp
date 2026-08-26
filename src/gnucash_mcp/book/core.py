@@ -4422,6 +4422,15 @@ class CoreMixin:
                 f"MATCH/AMBIGUOUS against the candidates table "
                 f"before committing."
             )
+        elif cand_rows:
+            # Verified-empty phrasing must not contradict visible
+            # evidence rows (bookkeeper signoff, copy quibble): the
+            # claim is about CLAIMABLE candidates, and the listed
+            # rows are context, not work.
+            homework = (
+                "No claimable (MEDIUM+) candidates — the listed "
+                "rows are evidence only."
+            )
         else:
             homework = "No existing-split candidates on any line."
         header = _dry_run_summary(
@@ -4481,72 +4490,81 @@ class CoreMixin:
         errors: list[tuple[str, str]] = []
         claimed_guids: set[str] = set()
 
+        # Pass 1 — claims only, so the guard below can exempt every
+        # split a row in THIS statement claims.
+        create_rows = []
         for ln in lines:
+            if not ln.get("match"):
+                create_rows.append(ln)
+                continue
             try:
-                if ln.get("match"):
-                    s, kind = self._statement_resolve_claim(
-                        book, account, ln, _book_amount(ln), quantum,
-                    )
-                    if kind == "overlap":
-                        skipped.append((ln, s))
-                    else:
-                        if s.guid in claimed_guids:
-                            raise ValueError(
-                                "split already claimed by another "
-                                "row in this statement"
-                            )
-                        claimed_guids.add(s.guid)
-                        claims.append((ln, s))
+                s, kind = self._statement_resolve_claim(
+                    book, account, ln, _book_amount(ln), quantum,
+                )
+                if kind == "overlap":
+                    skipped.append((ln, s))
                 else:
-                    validated, src = self._statement_prep_create(
-                        book, account, ln, _book_amount(ln),
-                        default_currency,
-                    )
-                    prepared.append((ln, validated, src))
+                    if s.guid in claimed_guids:
+                        raise ValueError(
+                            "split already claimed by another "
+                            "row in this statement"
+                        )
+                    claimed_guids.add(s.guid)
+                    claims.append((ln, s))
             except ValueError as e:
                 errors.append((ln["ref"], str(e)))
 
-        # Statement-duplicate guard: a created line that exactly
-        # matches an unclaimed split on this account would
-        # double-enter. Unreconciled twin: the tie would still hold
-        # (only the new split reconciles) — silent. Reconciled
-        # twin: this line already landed via a prior statement —
-        # the tie catches it unforced, but under force it would
-        # double-enter with both copies reconciled. Judgment
-        # overrides with force (it saw the MATCH table and ruled
-        # NEW).
-        if not force:
-            for ln, _validated, _src in prepared:
-                for c in _candidates_for(ln):
-                    s = c["split"]
-                    if s.guid in claimed_guids:
-                        continue
-                    if not c["exact"]:
-                        continue
-                    if _is_unreconciled(s):
-                        errors.append((
-                            ln["ref"],
-                            f"unreconciled split "
-                            f"{split_prefixes[s.guid]} on this "
-                            f"account matches this line exactly "
-                            f"(amount + date) and no row claims it "
-                            f"— claim it with "
-                            f"match={split_prefixes[s.guid]}, or "
-                            f"force=true to create anyway",
-                        ))
-                    else:
-                        errors.append((
-                            ln["ref"],
-                            f"reconciled split "
-                            f"{split_prefixes[s.guid]} matches "
-                            f"this line exactly — it looks landed "
-                            f"by a prior statement; keep the line "
-                            f"as a match row "
-                            f"(match={split_prefixes[s.guid]}, a "
-                            f"no-op skip), or force=true to "
-                            f"create anyway",
-                        ))
-                    break
+        def _twin_guard_error(ln) -> str | None:
+            """Statement-duplicate guard: a created line that
+            exactly matches an unclaimed split on this account
+            would double-enter. Unreconciled twin: the tie would
+            still hold (only the new split reconciles) — silent.
+            Reconciled twin: already landed via a prior statement
+            — the tie catches it unforced, but under force both
+            copies would sit reconciled. Judgment overrides with
+            force (it saw the MATCH table and ruled NEW)."""
+            for c in _candidates_for(ln):
+                s = c["split"]
+                if s.guid in claimed_guids or not c["exact"]:
+                    continue
+                if _is_unreconciled(s):
+                    return (
+                        f"unreconciled split "
+                        f"{split_prefixes[s.guid]} on this account "
+                        f"matches this line exactly (amount + "
+                        f"date) and no row claims it — claim it "
+                        f"with match={split_prefixes[s.guid]}, or "
+                        f"force=true to create anyway"
+                    )
+                return (
+                    f"reconciled split {split_prefixes[s.guid]} "
+                    f"matches this line exactly — it looks landed "
+                    f"by a prior statement; keep the line as a "
+                    f"match row (match={split_prefixes[s.guid]}, "
+                    f"a no-op skip), or force=true to create "
+                    f"anyway"
+                )
+            return None
+
+        # Pass 2 — create rows: the twin guard runs BEFORE
+        # counter-split/auto-fill validation, so a bare raw line
+        # whose twin exists gets the claim coaching, not an
+        # auto-fill complaint about a row that shouldn't be
+        # created at all (bookkeeper signoff, carried item).
+        for ln in create_rows:
+            if not force:
+                guard_msg = _twin_guard_error(ln)
+                if guard_msg is not None:
+                    errors.append((ln["ref"], guard_msg))
+                    continue
+            try:
+                validated, src = self._statement_prep_create(
+                    book, account, ln, _book_amount(ln),
+                    default_currency,
+                )
+                prepared.append((ln, validated, src))
+            except ValueError as e:
+                errors.append((ln["ref"], str(e)))
 
         if errors:
             # The row's error rides the note column INLINE — the
