@@ -22,7 +22,7 @@ def _parse_prices_tsv(tsv: str) -> list[dict]:
     cells take defaults. Dates parse here — the book layer works in
     ``datetime.date``.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the prices TSV")
     if len(lines) < 2:
         raise ValueError(
             "prices TSV needs a header row and at least one data row"
@@ -77,6 +77,7 @@ def _parse_prices_tsv(tsv: str) -> list[dict]:
         out.append(entry)
     return out
 
+from gnucash_mcp._format import _tsv_lines
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
     LotGuid,

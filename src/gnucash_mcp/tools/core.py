@@ -11,7 +11,9 @@ from datetime import date
 from gnucash_mcp._format import (
     _batch_row_splits,
     _batch_tsv_layout,
+    _parse_statement_tsv,
     _parse_update_tsv,
+    _tsv_lines,
 )
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
@@ -39,7 +41,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     missing header, too-few columns, or a split count that doesn't
     match the declared shape.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the transactions TSV")
     if len(lines) < 2:
         raise ValueError(
             "transactions TSV needs a header row and at least one data row"
@@ -493,13 +495,38 @@ def register(mcp, get_book) -> None:
 
         OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
         - ``results`` (always): ``ref, status, txn_guid, dup_count,
-          reason``. status is ``created`` | ``rejected`` |
-          ``would_create`` (dry_run); reason is a code like
+          max_confidence, reason``. status is ``created`` |
+          ``rejected`` | ``would_create`` (dry_run, candidate-free
+          rows only) | ``review_required`` (dry_run rows with >=1
+          duplicate candidate — rule each against the duplicates
+          table before committing); reason is a code like
           ``duplicate_detected`` or the validation message.
-        - ``duplicates`` (only when matches exist): ``ref, confidence,
-          guid, date, amount, description, signals`` — the columns
-          ``create_transaction`` emits, keyed back to the offending
-          ``ref``. Σ(dup_count) equals the duplicates row count.
+          ``max_confidence`` (HIGH/MEDIUM/blank) is the row's top
+          duplicate candidate — enough for the common keep/drop
+          call without the join.
+        - ``duplicates`` (only when matches exist): SELF-CONTAINED
+          comparison rows, sorted strongest-correspondence first —
+          ``ref, candidate_guid, confidence, state, date_new,
+          date_old, date_delta_days, amt_new, amt_old, amt_delta,
+          cur, desc_new, desc_old, notes_old, memo_old, cat_new,
+          cat_old, split_match, signals``. ``_new`` = your proposed
+          row, ``_old`` = the existing transaction; ``cat_*`` are
+          the category (non-payment) legs as
+          ``account=amount|...``; ``split_match``
+          (exact/partial/none) compares them — MEDIUM on
+          date+amount but ``none`` on category is usually a
+          distinct purchase. Amounts are SIGNED (direction
+          matters: a deposit is not a payment's twin).
+          ``amt_delta`` is blank on cross-currency candidates
+          (``cur`` names the candidate's currency exactly when
+          the frames differ); ``memo_old`` and ``state`` blanks
+          mean this surface can't fill them. Never re-read your
+          own input — both sides are in the row.
+          Σ(dup_count) equals the duplicates row count.
+        - Dry runs additionally lead with ``summary`` (would-create/
+          review-required/rejected counts + the homework line)
+          and close with ``effects`` — the projected per-account
+          balance deltas of the rows that would land.
 
         Args:
             transactions: The TSV block described above.
@@ -511,6 +538,162 @@ def register(mcp, get_book) -> None:
         parsed = _parse_transactions_tsv(transactions)
         result = book.create_transactions(
             parsed, force=force, dry_run=dry_run, on_error=on_error,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="enter",
+        entity_type="statement",
+    )
+    def enter_statement(
+        account: str,
+        statement_date: str,
+        opening_balance: str,
+        closing_balance: str,
+        lines: str,
+        dry_run: bool = True,
+        force_base: bool = False,
+        force_duplicates: bool = False,
+        show_all: bool = False,
+    ) -> str:
+        """Enter a COMPLETE bank/card statement in one atomic call:
+        create the new lines, claim the ones already in the book,
+        and reconcile everything against the closing balance — all
+        in one save, or nothing at all.
+
+        THE WORKFLOW (two calls around your judgment):
+
+        1. ``dry_run=true`` (the DEFAULT) — transcribe the statement
+           and get back a classification of every line: NEW (not in
+           the book), MATCH (an existing unreconciled split
+           corresponds), OVERLAP (already reconciled), AMBIGUOUS
+           (several candidates). MATCH/AMBIGUOUS rows come with the
+           candidate's full annotation (date, amount, description,
+           notes, memo, short GUID) so you can adjudicate each one.
+        2. Rule every MATCH/AMBIGUOUS row yourself, adapt
+           annotations, confirm with the user.
+        3. ``dry_run=false`` — NEW rows now carry interpreted
+           description/notes and counter-splits; MATCH rows carry
+           ``match=<split guid>`` claims. The server enters, claims,
+           reconciles every statement-touched split at
+           ``statement_date``, and saves once.
+
+        TRANSCRIBE, DON'T INTERPRET (dry-run): amounts and balances
+        go in EXACTLY as the statement prints them — for credit
+        cards too (charges positive, balance as amount owed). The
+        server applies the sign convention from the account's type;
+        you never flip a sign. The gate
+        ``opening + sum(lines) == closing`` must hold or the call
+        rejects: transcribe every line.
+
+        INPUT — ``lines`` is a TSV block. Header: ``ref, date``
+        first, then any order of ``description``, ``notes``,
+        ``raw``, ``match``, ``amount`` (required), then optional
+        ``amt, acct, memo, qty`` counter-split groups (batch
+        grammar). The statement account's own leg is SYNTHESIZED —
+        never a column. Dry-run typically needs only::
+
+            ref<TAB>date<TAB>raw<TAB>amount
+            1<TAB>2026-07-03<TAB>POS DEBIT WHOLEFDS #123<TAB>-87.12
+
+        - ``raw`` = the verbatim statement line; it lands on the
+          bank leg's memo (provenance). ``description``/``notes``
+          are your interpretation (commit).
+        - ``match`` = the split GUID this line claims instead of
+          creating (from the dry-run candidates table). Claim rows
+          may also carry ``raw`` (updates the claimed split's memo)
+          and ``notes`` (updates the transaction's notes), and END
+          at their last fixed column — they take no split cells.
+          The claimed amount must equal the line amount exactly —
+          fix the book first if they disagree.
+        - A commit row with no counter-splits auto-fills from the
+          most recent same-description 2-split transaction, adapted
+          to the line amount (marked ``auto_filled_from:<guid>``).
+          The precedent must have exactly one leg on the statement
+          account and no cross-commodity leg — anything else
+          rejects with "supply explicit counter-splits". Explicit
+          counter-splits must not name the statement account (its
+          leg is synthesized).
+
+        SAFETY: the account's reconciled balance must tie to
+        ``opening_balance`` (a prior unentered statement blocks
+        commit), every created-vs-existing exact overlap must be
+        explicitly claimed or forced, and the projected closing tie
+        is verified BEFORE anything is written. The two force
+        flags are INDEPENDENT: ``force_base=true`` lands onto an
+        untied opening base (the consequent tie discrepancy is
+        recorded, and duplicate detection STAYS ON);
+        ``force_duplicates=true`` creates past exact twins you
+        have adjudicated as distinct. Neither bypasses the
+        statement's own self-check. After the save, the reconciled
+        balance is read back and verified against the tie.
+
+        OUTPUT (dry-run): ``summary`` (class counts), ``lines``
+        (ref, class, cands, note — the note is the resolved
+        disposition: the guard's refusal coaching verbatim, the
+        auto-fill prediction, or "will claim …"), ``candidates`` —
+        SELF-CONTAINED comparison rows sorted
+        strongest-correspondence first (``ref, candidate_guid,
+        confidence, state, date_new/old + delta, amt_new/old +
+        delta, cur, desc_new/old, notes_old, memo_old, cat_new/old,
+        split_match, signals``; ``_new`` = the statement line in
+        book convention, ``_old`` = the existing split — never
+        re-read your own input; ``cur`` is structurally blank on
+        this surface), plus ``warnings`` (only when present;
+        ``candidates`` likewise) and ``tie`` — the projected
+        reconciled balance vs the closing, with a count of rows
+        this exact payload would refuse at commit. The dry-run
+        rehearses the SAME disposition procedure commit runs —
+        force included. The tie is the only verdict;
+        MATCH/AMBIGUOUS rows are yours to rule.
+        OUTPUT (commit): ``results`` (``ref, status, guid, note``;
+        status is created | claimed | skipped_duplicate, or on a
+        refused statement rejected | statement_aborted — the note
+        column carries the row's coaching and
+        ``auto_filled_from:<guid>`` markers), plus, on success
+        only, the new reconciled balance and the tie (a refusal
+        returns just ``summary`` + ``results``).
+
+        Args:
+            account: Statement account ref (path, %short, or GUID).
+                BANK/CASH/ASSET/CREDIT/LIABILITY only.
+            statement_date: The statement's closing date
+                (YYYY-MM-DD); every touched split reconciles at it.
+            opening_balance: Opening balance, exactly as printed.
+            closing_balance: Closing balance, exactly as printed.
+            lines: The TSV block described above.
+            dry_run: DEFAULT TRUE — the rehearsal is the workflow.
+            force_base: Land onto an untied opening base; the tie
+                discrepancy is recorded, twin detection stays on.
+            force_duplicates: Create past exact unclaimed twins
+                (you adjudicated them as distinct charges).
+            show_all: Dry-run only. Lines with MEDIUM/HIGH
+                candidates suppress their LOW amount-coincidences
+                (the cands column notes "+N LOW suppressed");
+                show_all=true lists everything.
+        """
+        book = get_book()
+        stmt_date = _parse_iso_date(statement_date)
+        if stmt_date is None:
+            raise ValueError(
+                f"statement_date {statement_date!r} is not a valid "
+                f"YYYY-MM-DD date"
+            )
+        parsed = _parse_statement_tsv(lines)
+        for row in parsed:
+            d = _parse_iso_date(row["date"])
+            if d is None:
+                raise ValueError(
+                    f"line {row['ref']}: date {row['date']!r} is "
+                    f"not a valid YYYY-MM-DD date"
+                )
+            row["date"] = d
+        result = book.enter_statement(
+            account, stmt_date, opening_balance, closing_balance,
+            parsed, dry_run=dry_run, force_base=force_base,
+            force_duplicates=force_duplicates, show_all=show_all,
         )
         return _json(result)
 

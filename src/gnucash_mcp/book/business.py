@@ -21,6 +21,7 @@ from decimal import Decimal
 import piecash
 
 from gnucash_mcp.book._base import (
+    _commodity_quantum,
     _slot_value_str,
     _to_decimal,
     _unique_prefix,
@@ -38,20 +39,6 @@ from gnucash_mcp._format import (
 
 
 debug_logger = logging.getLogger("gnucash_mcp.debug")
-
-
-def _commodity_quantum(commodity) -> Decimal:
-    """Smallest representable unit of a commodity, as a Decimal quantum.
-
-    Derived from ``commodity.fraction`` (piecash stores 100 for USD,
-    1 for JPY, 1000 for BHD, 10000 for shares). A hardcoded
-    ``Decimal("0.01")`` would silently corrupt non-2-decimal
-    currencies — half-yen amounts on JPY, lost mils on BHD/KWD.
-    """
-    fraction = getattr(commodity, "fraction", 100)
-    if fraction <= 1:
-        return Decimal(1)
-    return Decimal(1) / Decimal(fraction)
 
 
 def _safe_invoice_date(inv, attr: str):

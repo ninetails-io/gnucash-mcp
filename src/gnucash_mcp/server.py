@@ -60,6 +60,9 @@ ORIENTATION:
 - Use list_accounts to get exact paths and short GUIDs before writing.
 - Use search_transactions before creating to avoid duplicates.
 - Every transaction has splits that MUST sum to zero.
+STATEMENT ENTRY (the headline workflow):
+- For a COMPLETE bank/card statement, use enter_statement — not create_transactions + reconcile_account. Dry-run (default) classifies every line against the book and projects the balance tie; commit enters, claims, and reconciles atomically against the closing balance.
+- Transcribe amounts and balances EXACTLY as the statement prints them (credit cards included) — the server applies the sign convention. Your judgment pass between dry-run and commit is the one step the server cannot do.
 ACCOUNT REFERENCES:
 - Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%xxxxxxx" form), or full 32-char GUIDs.
 - list_accounts emits short GUIDs at line start: "%xxxxxxx\\tAssets:Savings [BANK]" (x's are a placeholder — copy real GUIDs from list_accounts output). Reuse them — ~80% smaller than paths.
@@ -162,6 +165,7 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_transaction",
         "create_transaction",
         "create_transactions",
+        "enter_statement",
         "update_transaction",
         "update_transactions",
         "delete_transaction",
@@ -616,6 +620,11 @@ _WRITE_VERB_HINTS: dict[str, tuple[bool, bool]] = {
     "set_state": (True, True),
     "replace_splits": (True, True),
     "reconcile": (True, True),
+    # Statement entry adds transactions but also claims and
+    # reconciles EXISTING splits (annotations + state) — destructive.
+    # Repeating the same commit refuses on the opening precondition
+    # (the base moved), adding nothing further.
+    "enter": (True, True),
     "post": (False, True),         # additive; re-post errors, adds nothing
     "pay": (False, False),         # paying twice records two payments
     "apply": (False, False),

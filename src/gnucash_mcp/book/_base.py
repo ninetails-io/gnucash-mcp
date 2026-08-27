@@ -62,6 +62,20 @@ def _slot_value_str(value) -> str:
     return str(value)
 
 
+def _commodity_quantum(commodity) -> Decimal:
+    """Smallest representable unit of a commodity, as a Decimal quantum.
+
+    Derived from ``commodity.fraction`` (piecash stores 100 for USD,
+    1 for JPY, 1000 for BHD, 10000 for shares). A hardcoded
+    ``Decimal("0.01")`` would silently corrupt non-2-decimal
+    currencies — half-yen amounts on JPY, lost mils on BHD/KWD.
+    """
+    fraction = getattr(commodity, "fraction", 100)
+    if fraction <= 1:
+        return Decimal(1)
+    return Decimal(1) / Decimal(fraction)
+
+
 def _is_voided(split) -> bool:
     """True iff ``split`` carries GnuCash's voided marker.
 

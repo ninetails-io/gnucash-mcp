@@ -94,6 +94,23 @@ The rest of this section remains unscheduled.
   `cur`, never a same-release deletion — deprecation notice first,
   removal a release later.
 
+- **`enter_statement` — one-shot statement entry** — a complete
+  statement (opening/closing balances + lines) enters, claims
+  matches, and reconciles in one atomic open/save; dry-run is a
+  full rehearsal including the balance tie. Collapses the current
+  four-step workflow around the one irreducible step (the LLM/user
+  judgment pass), which its classification table is designed to
+  serve. Design complete — five questions ruled 2026-08-11; two
+  dry-run response rulings (summary header + the clearance
+  principle, `create_transactions` inheritance) added 2026-08-21;
+  three duplicate-review rulings (`review_required` status,
+  self-contained candidate comparisons, stateless disposition
+  acknowledgment protocol) added 2026-08-24 — the last gated on a
+  bookkeeper ruling for its `force` tightening and sequenced
+  after the batch signal hoist.
+  **Retargeted to v1.4.4** as the bulk-ops line's headliner; it
+  leaves this list when the 1.4.4 release ships it.
+  _Spec: [ENTER_STATEMENT_SPEC.md](ENTER_STATEMENT_SPEC.md)._
 - **Custom period alignment (`periods` parameter)** — the three
   breakdown reports (`spending_by_category`, `income_by_source`,
   `cash_flow`) accept an explicit list of caller-supplied boundary
