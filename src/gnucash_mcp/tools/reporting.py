@@ -222,6 +222,17 @@ def register(mcp, get_book) -> None:
         Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
         Set APRs via set_account_slot (e.g., set_account_slot("Liabilities:Visa", "apr", "23.49")).
 
+        Assumptions the schedule is computed under: interest
+        compounds monthly at apr/12 on the running balance; one
+        payment per debt per month starting this month; extra budget
+        beyond the minimums goes to the highest-APR debt first
+        (avalanche); balances are as of today in the book default
+        currency; amounts round to 0.01. Debts the plan cannot
+        include are CONFESSED in ⚠ lines, never silently dropped:
+        foreign-currency debts with no FX rate, loans with no
+        minimum_payment/loan_term_months to estimate a payment from,
+        and balance-carrying debts with no 'apr' slot.
+
         Returns a compact text summary by default — kill order with
         balances/APRs/payoff months, YETI line, totals, debt-free date.
         Use verbose=true for the structured dict (per-account
