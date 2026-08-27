@@ -1217,11 +1217,21 @@ def register(mcp, get_book) -> None:
         discount_account: str | None = None,
         force: bool = False,
         memo: str = "",
+        dry_run: bool = False,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction from the specified bank/cash account
         to the invoice's A/R or A/P account. Partial payments are supported.
+
+        ``dry_run=true`` rehearses the payment without booking it:
+        the full validation, conversion, discount, and FX pipeline
+        runs and the response shows the proposed splits, the
+        remaining balance after, whether the invoice would settle in
+        full, and any account the real call would auto-create. Same
+        inputs, same code path — a rehearsal that succeeds is a
+        payment that will book. Recommended before complex payments
+        (cross-currency, discounts, credit-note refunds).
 
         For cross-currency payments where the rate moved between
         post-date and pay-date, a realized FX gain/loss split is
@@ -1277,6 +1287,9 @@ def register(mcp, get_book) -> None:
                 check number or wire reference). ``description``
                 names the whole transaction; ``memo`` annotates the
                 cash movement.
+            dry_run: When True, rehearse without writing — returns
+                the proposed splits and projected outcome instead of
+                booking. Default False.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1292,6 +1305,7 @@ def register(mcp, get_book) -> None:
             discount_account=discount_account,
             force=force,
             memo=memo,
+            dry_run=dry_run,
         )
         return _json(result)
 
