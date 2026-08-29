@@ -13111,3 +13111,70 @@ class TestSplitGraphPreload:
                 f"{len(statements)} SQL statements — the preload's "
                 f"strong reference has been lost"
             )
+
+
+class TestUpdateClearColumn:
+    """The TSV ``clear`` column — the explicit opt-in that
+    empty-cell-means-unchanged deliberately forecloses. Parser
+    produces ``""`` values; the book layer already treats empty as
+    clear (notes → None, verified by _verify_transaction_state's
+    None↔"" normalization)."""
+
+    def _one(self, gc):
+        return gc.create_transaction(
+            description="Netflix via PayPal",
+            notes="investigate this",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-22.10"},
+                {"account": "Expenses:Groceries", "amount": "22.10"},
+            ],
+        )["guid"]
+
+    def test_parser_clear_emits_empty_values(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        rows = _parse_update_tsv(
+            "guid\tnotes\tclear\n"
+            "aaaa1111\tkeep me\t\n"
+            "bbbb2222\t\tnotes\n"
+            "cccc3333\t\tdescription, notes\n"
+        )
+        assert "notes" not in rows[0] or rows[0]["notes"] == "keep me"
+        assert rows[1]["notes"] == ""
+        assert rows[2]["description"] == ""
+        assert rows[2]["notes"] == ""
+
+    def test_parser_clear_only_header_is_valid(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        rows = _parse_update_tsv(
+            "guid\tclear\naaaa1111\tnotes\n"
+        )
+        assert rows[0]["notes"] == ""
+
+    def test_parser_set_and_clear_conflict_rejects(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="sets AND clears"):
+            _parse_update_tsv(
+                "guid\tnotes\tclear\naaaa1111\tnew note\tnotes\n"
+            )
+
+    def test_parser_date_not_clearable(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="not clearable"):
+            _parse_update_tsv(
+                "guid\tclear\naaaa1111\tdate\n"
+            )
+
+    def test_parser_unknown_clear_field_rejects_by_name(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="'memo'"):
+            _parse_update_tsv(
+                "guid\tclear\naaaa1111\tmemo\n"
+            )
+
+    def test_clear_flows_through_to_the_book(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guid = self._one(gc)
+        env = gc.update_transactions([{"guid": guid, "notes": ""}])
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "updated"
+        assert not gc.get_transaction(guid).get("notes")

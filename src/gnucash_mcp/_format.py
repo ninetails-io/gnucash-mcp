@@ -1000,12 +1000,23 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     """``update_transactions`` TSV → row dicts.
 
     Header: ``guid`` then any of ``description``, ``notes``,
-    ``date`` (at least one, any order, no repeats); unknown tokens
-    reject by name. An EMPTY cell leaves that field unchanged — the
-    key is simply absent from the row dict. ``date`` stays an ISO
-    string here (the tool layer parses; the audit display reuses
-    this parser and wants text). Shared with the audit formatter so
-    the display parse can't drift from the tool parse.
+    ``date`` (at least one, any order, no repeats), plus an
+    optional ``clear`` column; unknown tokens reject by name. An
+    EMPTY cell leaves that field unchanged — the key is simply
+    absent from the row dict.
+
+    ``clear`` is the explicit opt-in that empty-cell-means-
+    unchanged deliberately forecloses: its cell holds
+    comma-separated field names (``description`` and/or ``notes``)
+    to blank on that row, emitted as ``""`` values (the book layer
+    already treats empty as clear). ``date`` is not clearable —
+    transactions must have one. A row that both sets and clears
+    the same field is contradictory and rejects.
+
+    ``date`` stays an ISO string here (the tool layer parses; the
+    audit display reuses this parser and wants text). Shared with
+    the audit formatter so the display parse can't drift from the
+    tool parse.
     """
     lines = _tsv_lines(tsv, "the updates TSV")
     if len(lines) < 2:
@@ -1021,14 +1032,15 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     if not fields:
         raise ValueError(
             "updates header needs at least one field column "
-            "(description, notes, date)"
+            "(description, notes, date) or a clear column"
         )
     seen: set = set()
     for tok in fields:
-        if tok not in _UPDATE_TSV_FIELDS:
+        if tok != "clear" and tok not in _UPDATE_TSV_FIELDS:
             raise ValueError(
                 f"unrecognized column {tok!r} in updates header — "
-                f"columns are guid, then description, notes, date"
+                f"columns are guid, then description, notes, date, "
+                f"and optionally clear"
             )
         if tok in seen:
             raise ValueError(f"duplicate {tok!r} column in updates header")
@@ -1041,8 +1053,31 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
         if not guid:
             raise ValueError(f"row {i}: empty guid")
         row: dict = {"guid": guid}
+        clear_spec = ""
         for j, tok in enumerate(fields, start=1):
-            if j < len(cells) and cells[j].strip():
-                row[tok] = cells[j].strip()
+            cell = cells[j].strip() if j < len(cells) else ""
+            if tok == "clear":
+                clear_spec = cell
+            elif cell:
+                row[tok] = cell
+        for name in (
+            n.strip().lower()
+            for n in clear_spec.split(",") if n.strip()
+        ):
+            if name == "date":
+                raise ValueError(
+                    f"row {i}: 'date' is not clearable — every "
+                    f"transaction needs a posting date"
+                )
+            if name not in ("description", "notes"):
+                raise ValueError(
+                    f"row {i}: unknown field {name!r} in clear cell "
+                    f"— clearable fields are description, notes"
+                )
+            if name in row:
+                raise ValueError(
+                    f"row {i}: sets AND clears {name!r} — pick one"
+                )
+            row[name] = ""
         out.append(row)
     return out
