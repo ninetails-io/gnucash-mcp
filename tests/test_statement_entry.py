@@ -1637,3 +1637,42 @@ class TestStatementToolParse:
             "ref\tdate\traw\tamount\n1\tnot-a-date\tX\t5"
         )
         assert rows[0]["date"] == "not-a-date"
+
+
+class TestSignalSweepAmortization:
+    """Statement twin of the batch lock (see
+    test_batch_transactions.TestSignalSweepAmortization): all of a
+    statement's splitless create rows share ONE table sweep for
+    their auto-fill preflights."""
+
+    @pytest.fixture
+    def sweep_calls(self, monkeypatch):
+        from gnucash_mcp.book.core import CoreMixin
+        calls = {"n": 0}
+        orig = CoreMixin._signal_sweep
+
+        def counting(self, book):
+            calls["n"] += 1
+            return orig(self, book)
+
+        monkeypatch.setattr(CoreMixin, "_signal_sweep", counting)
+        return calls
+
+    def test_statement_creates_sweep_once(
+        self, statement_book, sweep_calls,
+    ):
+        gc = GnuCashBook(str(statement_book))
+        lines = [
+            _line("1", date(2026, 7, 3), "-87.12",
+                  description="Whole Foods", raw="POS WF 1"),
+            _line("2", date(2026, 7, 12), "-42.00",
+                  description="Whole Foods", raw="POS WF 2"),
+        ]
+        sweep_calls["n"] = 0
+        res = gc.enter_statement(
+            "Assets:Checking", date(2026, 7, 31), _OPEN, "870.88",
+            lines, dry_run=True,
+        )
+        classes = _classes(res)
+        assert classes["1"] == classes["2"]  # both prep'd alike
+        assert sweep_calls["n"] == 1
