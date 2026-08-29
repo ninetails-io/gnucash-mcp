@@ -300,7 +300,20 @@ def register(mcp, get_book) -> None:
         force_create: bool = False,
         dry_run: bool = False,
     ) -> str:
-        """Create a new transaction with splits. Splits must balance to zero.
+        """DEPRECATED — use ``create_transactions``. Scheduled for
+        removal in a future release; it still works as documented
+        below through the deprecation window.
+
+        A single transaction is a one-row batch with the same
+        capabilities (``cur``/``qty``/``memo``/``notes``/``action``
+        columns, auto-fill, dry-run, duplicate detection)::
+
+            ref<TAB>date<TAB>description<TAB>amt1<TAB>acct1<TAB>amt2<TAB>acct2
+            1<TAB>2026-08-27<TAB>Gas<TAB>-54.19<TAB>Assets:Checking<TAB>54.19<TAB>Expenses:Auto:Fuel
+
+        ---
+
+        Create a new transaction with splits. Splits must balance to zero.
 
         Each split: ``account`` (full path, required), ``amount``
         (required, in transaction currency), ``quantity`` (required
@@ -378,7 +391,10 @@ def register(mcp, get_book) -> None:
         dry_run: bool = False,
         on_error: str = "abort",
     ) -> str:
-        """Create MANY transactions in one atomic command (bulk entry).
+        """Create transactions in one atomic command (bulk entry) —
+        the canonical entry tool for one transaction or many. A
+        single transaction is a one-row batch; the deprecated
+        ``create_transaction`` redirects here.
 
         INPUT — ``transactions`` is a TSV block: a header row, then one
         row per transaction. The HEADER DECLARES THE LAYOUT. Base form:
