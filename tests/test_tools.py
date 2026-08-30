@@ -1526,3 +1526,142 @@ class TestPaginationCoverage:
         """limit=0 yields a zero-page indicator with the full total."""
         result = server_module.list_transactions(limit=0)
         assert result.startswith("Showing 0 of 3 transactions")
+
+
+class TestConsolidatedBusinessSurface:
+    """Behavior locks for the 48→27 consolidation (v1.5.0): routing
+    correctness, the per-type ID-collision trap, employee-notes
+    rejection, credit-note party_type requirement, the merged read
+    patterns, and a full voucher lifecycle through the new names —
+    the legacy-parity proof that every old workflow is reachable."""
+
+    def test_create_party_routes_and_types(self, setup_book_env):
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Collision Co",
+        ))
+        v = json.loads(server_module.create_party(
+            party_type="vendor", name="Collision Supplies",
+        ))
+        assert c["type"] == "customer" and v["type"] == "vendor"
+        # Per-type counters collide by design — same ID, two parties.
+        assert c["id"] == v["id"]
+        got_c = json.loads(server_module.get_party(
+            party_type="customer", id=c["id"],
+        ))
+        got_v = json.loads(server_module.get_party(
+            party_type="vendor", id=v["id"],
+        ))
+        assert got_c["name"] == "Collision Co"
+        assert got_v["name"] == "Collision Supplies"
+
+    def test_create_party_employee_rejects_notes(self, setup_book_env):
+        result = json.loads(server_module.create_party(
+            party_type="employee", name="Jane Smith",
+            notes="no such field",
+        ))
+        assert "no notes field" in result.get("error", "")
+
+    def test_update_party_employee_rejects_notes(self, setup_book_env):
+        e = json.loads(server_module.create_party(
+            party_type="employee", name="Jan Novak",
+        ))
+        result = json.loads(server_module.update_party(
+            party_type="employee", id=e["id"], notes="nope",
+        ))
+        assert "no notes field" in result.get("error", "")
+
+    def test_create_document_credit_note_requires_party_type(
+        self, setup_book_env,
+    ):
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="CN Customer",
+        ))
+        result = json.loads(server_module.create_document(
+            document_type="credit_note", owner_id=c["id"],
+        ))
+        assert "party_type" in result.get("error", "")
+
+    def test_list_parties_all_three_sections(self, setup_book_env):
+        server_module.create_party(party_type="customer", name="C1")
+        server_module.create_party(party_type="vendor", name="V1")
+        server_module.create_party(party_type="employee", name="E1")
+        out = server_module.list_parties()
+        assert "CUSTOMERS:" in out and "VENDORS:" in out \
+            and "EMPLOYEES:" in out
+
+    def test_list_taxtables_name_lookup(self, setup_book_env):
+        created = json.loads(server_module.create_taxtable(
+            name="Sales Tax",
+            entries=[{"account": "Liabilities",
+                      "amount": "8.5", "type": "percentage"}],
+        ))
+        assert created.get("error") is None, created
+        got = json.loads(server_module.list_taxtables(name="Sales Tax"))
+        assert got["name"] == "Sales Tax"
+
+    def test_voucher_lifecycle_via_new_names(self, setup_book_env):
+        """The legacy-parity ride: employee → voucher → entry →
+        post → rehearse payment → pay → outstanding shows none."""
+        server_module.create_account(
+            name="Accounts Payable", account_type="PAYABLE",
+            parent="Liabilities",
+        )
+        e = json.loads(server_module.create_party(
+            party_type="employee", name="Alex Reimbursee",
+        ))
+        doc = json.loads(server_module.create_document(
+            document_type="voucher", owner_id=e["id"],
+        ))
+        assert doc["type"] == "voucher"
+        entry = json.loads(server_module.add_document_entry(
+            document_type="voucher", id=doc["id"],
+            account="Expenses:Groceries",
+            description="Conference travel", quantity="1",
+            price="240.00",
+        ))
+        assert entry.get("error") is None, entry
+        posted = json.loads(server_module.post_document(
+            id=doc["id"], document_type="voucher",
+            post_account="Liabilities:Accounts Payable",
+        ))
+        assert posted.get("error") is None, posted
+        assert posted["status"] == "posted"
+        rehearsal = json.loads(server_module.pay_document(
+            id=doc["id"], document_type="voucher",
+            payment_account="Assets:Checking", amount="240.00",
+            dry_run=True,
+        ))
+        assert rehearsal["status"] == "would_pay"
+        assert rehearsal["would_close_lot"] is True
+        paid = json.loads(server_module.pay_document(
+            id=doc["id"], document_type="voucher",
+            payment_account="Assets:Checking", amount="240.00",
+        ))
+        assert paid["status"] == "paid"
+        assert float(paid["remaining_balance"]) == 0.0
+
+    def test_delete_document_unposted_invoice(self, setup_book_env):
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Ephemeral LLC",
+        ))
+        doc = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+        ))
+        result = json.loads(server_module.delete_document(
+            document_type="invoice", id=doc["id"],
+        ))
+        assert result["status"] == "deleted"
+
+    def test_list_documents_doc_type_filter(self, setup_book_env):
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Filter Co",
+        ))
+        server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+        )
+        out = server_module.list_documents(
+            document_type="credit_note",
+        )
+        assert "Showing 0" in out.split("\n")[0]
+        out = server_module.list_documents(document_type="invoice")
+        assert "Showing 1-1 of 1" in out.split("\n")[0]

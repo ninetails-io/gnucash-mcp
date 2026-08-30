@@ -523,6 +523,7 @@ def register(mcp, get_book) -> None:
                 notes=notes, currency=currency, term=term,
                 invoice_id=id, job_id=job_id,
             )
+        result["type"] = document_type
         return _json(result)
 
     @mcp.tool()
@@ -631,6 +632,7 @@ def register(mcp, get_book) -> None:
             result = book.delete_voucher(voucher_id=id)
         else:
             result = book.delete_invoice(invoice_id=id)
+        result["type"] = document_type
         return _json(result)
 
     @mcp.tool()
