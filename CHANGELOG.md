@@ -95,6 +95,24 @@ on GitHub — that number belongs to a registry-side rebuild.)
   in `specs/v1.5/BUSINESS_CONSOLIDATION_SPEC.md`, designed by an
   outside audit and ordered by the maintainer.
 
+**Dashboard triage** (from the outside-model dashboard review,
+2026-08-21 — cross-examined findings became rulings, rulings became
+code):
+
+- Warning rollups: past three items, overdue-scheduled and
+  stale-price warnings collapse to one aggregate line each — count,
+  oldest age, leading names, and the tool that lists the rest.
+  Per-item lines survive for small books; one shared chokepoint so
+  the two collapse rules can't drift.
+- Staleness linkage: a book that is itself far behind now says so
+  FIRST — "time-based warnings below may reflect unentered
+  activity, not missed events" — so an unentered month never reads
+  as a missed mortgage payment.
+- Reconciliation materiality: the backlog line carries the net
+  unreconciled amount beside the split count ("990 splits /
+  USD 28,963 net") — a backlog netting to pocket change is a
+  different chore than one netting to a statement's worth.
+
 **Under the hood.**
 
 - Batch entry runs one signal sweep per batch instead of up to two

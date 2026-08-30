@@ -3313,7 +3313,7 @@ class TestGetBookSummaryReconciliationSplitCount:
             f"got summary:\n{result}"
         )
         # Count appears in the line.
-        assert "splits unreconciled" in recon_line
+        assert "unreconciled" in recon_line and "net" in recon_line
         assert "oldest:" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
@@ -13208,3 +13208,73 @@ class TestUpdateClearColumn:
         rows = _parse_results_tsv(env["results"])
         assert rows[0]["status"] == "updated"
         assert not gc.get_transaction(guid).get("notes")
+
+
+class TestDashboardTriageRollups:
+    """The 2026-08-21 outside-model dashboard review's adopted
+    findings: warning rollups past the threshold, itemization at or
+    below it, reconciliation materiality, and the staleness-linkage
+    framing line. Counts must agree with the Scheduled line by
+    construction (shared list)."""
+
+    def test_rollup_helper_itemizes_small_lists(self):
+        msgs = ["a", "b", "c"]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=["A", "B", "C"], oldest_days=9,
+            noun="transactions", aggregate_prefix="Overdue scheduled",
+            escape_hatch="hatch",
+        )
+        assert out == msgs
+
+    def test_rollup_helper_aggregates_large_lists(self):
+        msgs = [f"m{i}" for i in range(14)]
+        names = [f"Name{i}" for i in range(14)]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=names, oldest_days=36,
+            noun="transactions", aggregate_prefix="Overdue scheduled",
+            escape_hatch="list_scheduled_transactions for all",
+        )
+        assert len(out) == 1
+        line = out[0]
+        assert "14 transactions" in line
+        assert "oldest 36 days" in line
+        assert "Name0, Name1, Name2, +11 more" in line
+        assert "list_scheduled_transactions" in line
+        # Clearance principle: homework, never a verdict.
+        assert "safe" not in line.lower()
+
+    def test_rollup_no_price_qualifier(self):
+        msgs = [f"m{i}" for i in range(5)]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=list("ABCDE"), oldest_days=40,
+            noun="commodities", aggregate_prefix="Stale prices",
+            escape_hatch="refresh", no_data_count=2,
+        )
+        assert "2 with no price on file" in out[0]
+
+    def test_staleness_note_frames_time_warnings(self, test_book: Path):
+        """A book far behind gets the linkage line FIRST, and only
+        when time-based warnings exist to frame."""
+        gc = GnuCashBook(str(test_book))
+        # Create an old scheduled transaction so an overdue warning
+        # exists, and no recent entries so the book reads behind.
+        gc.create_transaction(
+            description="Anchor",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1.00"},
+                {"account": "Expenses:Groceries", "amount": "1.00"},
+            ],
+            trans_date=date(2024, 1, 15),
+        )
+        gc.create_scheduled_transaction(
+            name="Old Rent", description="Rent",
+            frequency="monthly", start_date="2024-02-01",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Groceries", "amount": "100"},
+            ],
+        )
+        summary = gc.get_book_summary()
+        w = [l for l in summary.splitlines() if "days behind — " in l]
+        assert w, summary
+        assert "unentered activity" in w[0]
