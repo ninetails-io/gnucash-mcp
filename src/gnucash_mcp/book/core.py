@@ -24,6 +24,7 @@ from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
 from gnucash_mcp._format import (
     _candidate_comparison_tsv,
     _dry_run_summary,
+    _format_number,
     _paginate,
     _split_match_verdict,
     _tsv_cell,
@@ -365,6 +366,7 @@ class CoreMixin:
             has_yc = False
             any_splits = False
             unreconciled_count = 0
+            unreconciled_value = Decimal("0")
             oldest_unreconciled_date = None
             balance = Decimal("0")
             for s in account.splits:
@@ -386,6 +388,7 @@ class CoreMixin:
                         latest_y_date = pd
                 if _is_unreconciled(s):
                     unreconciled_count += 1
+                    unreconciled_value += s.quantity
                     pd = s.transaction.post_date
                     # Null post_date (an old-book artifact) still
                     # counts as backlog; it just can't anchor the
@@ -426,6 +429,8 @@ class CoreMixin:
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
+                        "unreconciled_value": str(unreconciled_value),
+                        "commodity": account.commodity.mnemonic,
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
                             oldest_unreconciled_date.isoformat(),
@@ -647,8 +652,10 @@ class CoreMixin:
 
     def _overdue_scheduled_warnings(
         self, book: piecash.Book, today: date,
-    ) -> list[str]:
-        """Overdue-scheduled warning strings, most overdue first.
+    ) -> list[dict]:
+        """Overdue-scheduled entries, most overdue first — each
+        ``{days, name, msg}``; ``len()`` still feeds the Scheduled
+        line's overdue count.
 
         Requires SchedulingMixin's helpers (_next_occurrence,
         RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
@@ -697,13 +704,19 @@ class CoreMixin:
                         days_overdue = (today - next_occ).days
                         overdue_entries.append((
                             days_overdue,
+                            sx.name,
                             f"Overdue scheduled: {sx.name} "
                             f"due {next_occ.isoformat()}",
                         ))
                 except Exception:
                     continue
-            overdue_entries.sort(reverse=True)
-            return [msg for _, msg in overdue_entries]
+            overdue_entries.sort(
+                key=lambda e: e[0], reverse=True,
+            )
+            return [
+                {"days": d, "name": n, "msg": m}
+                for d, n, m in overdue_entries
+            ]
         except Exception:
             return []
 
@@ -712,7 +725,8 @@ class CoreMixin:
         book: piecash.Book,
         transactions: list,
         accounts: list,
-        overdue_scheduled: list[str] | None = None,
+        overdue_scheduled: list[dict] | None = None,
+        last_entry_days_behind: int | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -1002,7 +1016,7 @@ class CoreMixin:
 
             # (sort_key, message) — no-price entries sort to the
             # top as most stale.
-            stale_entries: list[tuple[int, str]] = []
+            stale_entries: list[tuple[int, str, str]] = []
             for commodity in book.commodities:
                 if commodity == default_currency:
                     continue
@@ -1012,17 +1026,33 @@ class CoreMixin:
                 if latest is None:
                     stale_entries.append((
                         10**9,  # arbitrary large sort key — top
+                        commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} no price on file",
                     ))
                 elif latest < cutoff:
                     days_old = (today - latest).days
                     stale_entries.append((
                         days_old,
+                        commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} "
                         f"last updated {days_old} days ago",
                     ))
-            stale_entries.sort(reverse=True)
-            stale_prices = [msg for _, msg in stale_entries]
+            stale_entries.sort(key=lambda e: e[0], reverse=True)
+            stale_prices = self._rollup_warnings(
+                [m for _, _, m in stale_entries],
+                names=[n for _, n, m in stale_entries],
+                oldest_days=(
+                    None if not stale_entries
+                    or stale_entries[0][0] >= 10**9
+                    else stale_entries[0][0]
+                ),
+                noun="commodities",
+                aggregate_prefix="Stale prices",
+                no_data_count=sum(
+                    1 for d, _, _ in stale_entries if d >= 10**9
+                ),
+                escape_hatch="get_prices / create_prices to refresh",
+            )
         except Exception:
             # Per spec: skip failed checks, emit the rest.
             pass
@@ -1065,14 +1095,94 @@ class CoreMixin:
             except Exception:
                 pass
 
+        # Overdue-scheduled rollup: small lists stay itemized;
+        # beyond the threshold, one aggregate line carries count,
+        # oldest, leading names, and the escape hatch. Framed as
+        # homework, not verdict — an overdue schedule means "not
+        # entered", which may be unentered activity rather than a
+        # missed payment.
+        overdue_sched_lines = self._rollup_warnings(
+            [e["msg"] for e in overdue_scheduled],
+            names=[e["name"] for e in overdue_scheduled],
+            oldest_days=(
+                overdue_scheduled[0]["days"]
+                if overdue_scheduled else None
+            ),
+            noun="transactions",
+            aggregate_prefix="Overdue scheduled",
+            escape_hatch=(
+                "list_scheduled_transactions for all; verify "
+                "entered vs missed"
+            ),
+        )
+
+        # Staleness linkage: when the book itself is far behind,
+        # time-based warnings describe the gap, not events — say so
+        # FIRST, where it frames everything below it.
+        staleness_note: list[str] = []
+        if (
+            last_entry_days_behind is not None
+            and last_entry_days_behind > self._LAST_ENTRY_WARN_DAYS
+            and (overdue_scheduled or overdue_invoices)
+        ):
+            staleness_note.append(
+                f"Book is {last_entry_days_behind} days behind — "
+                f"time-based warnings below may reflect unentered "
+                f"activity, not missed events"
+            )
+
         return (
-            integrity
+            staleness_note
+            + integrity
             + backup_health
             + low_cash
             + overdue_invoices
-            + overdue_scheduled
+            + overdue_sched_lines
             + stale_prices
         )
+
+    # Itemize-vs-aggregate threshold for the Warnings rollups: at or
+    # below this, per-item lines carry more signal than a summary;
+    # above it, the list is noise burying the other warnings.
+    _WARNING_ROLLUP_THRESHOLD = 3
+
+    @classmethod
+    def _rollup_warnings(
+        cls,
+        messages: list[str],
+        *,
+        names: list[str],
+        oldest_days: int | None,
+        noun: str,
+        aggregate_prefix: str,
+        escape_hatch: str,
+        no_data_count: int = 0,
+    ) -> list[str]:
+        """Collapse a per-item warning list into one aggregate line
+        past the threshold (chokepoint shared by the scheduled and
+        stale-price rollups — the two collapse rules can't drift).
+
+        The aggregate keeps the decision signal (count, oldest age,
+        leading names) and points at the tool that lists the rest;
+        per the clearance principle it assigns homework, never a
+        verdict.
+        """
+        if len(messages) <= cls._WARNING_ROLLUP_THRESHOLD:
+            return list(messages)
+        shown = ", ".join(names[:3])
+        more = len(names) - min(3, len(names))
+        if more > 0:
+            shown += f", +{more} more"
+        qualifiers = []
+        if oldest_days is not None:
+            qualifiers.append(f"oldest {oldest_days} days")
+        if no_data_count:
+            qualifiers.append(f"{no_data_count} with no price on file")
+        qual = f", {'; '.join(qualifiers)}" if qualifiers else ""
+        return [
+            f"{aggregate_prefix}: {len(messages)} {noun}"
+            f"{qual} ({shown}) — {escape_hatch}"
+        ]
 
     def _budget_headline(
         self,
@@ -1624,9 +1734,21 @@ class CoreMixin:
                 lag_inner = self._format_reconciliation_lag(
                     entry["days_behind"], with_parens=False,
                 )
+                # Materiality: the net unreconciled amount sits
+                # beside the split count — a 174-split backlog
+                # netting to 40 units is a different chore than
+                # one netting to 12,000 (from the outside-model
+                # dashboard review, 2026-08-21).
+                value_part = ""
+                if "unreconciled_value" in entry:
+                    amt = Decimal(entry["unreconciled_value"])
+                    value_part = (
+                        f" / {entry['commodity']} "
+                        f"{_format_number(abs(amt))} net"
+                    )
                 out.append(
-                    f"  {leaf}: {n} split{plural} unreconciled "
-                    f"({lag_inner}, oldest: {oldest}) ⚠"
+                    f"  {leaf}: {n} split{plural}{value_part} "
+                    f"unreconciled ({lag_inner}, oldest: {oldest}) ⚠"
                 )
             else:
                 out.append(
@@ -2340,9 +2462,14 @@ class CoreMixin:
             overdue_sched = self._overdue_scheduled_warnings(
                 book, date.today(),
             )
+            days_behind_for_warnings = (
+                (date.today() - last_date).days
+                if last_date is not None else None
+            )
             warnings = self._collect_warnings(
                 book, transactions, accounts,
                 overdue_scheduled=overdue_sched,
+                last_entry_days_behind=days_behind_for_warnings,
             )
             if warnings:
                 lines.append("Warnings:")
