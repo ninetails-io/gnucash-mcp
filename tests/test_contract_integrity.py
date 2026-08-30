@@ -207,10 +207,28 @@ class TestAuditLogDispatcherCoverage:
         #    ``_format_audit_entry_text`` when ``new_parent`` is
         #    present in params.
         POLYMORPHIC_TARGETS: set[tuple[str, str]] = set()
+        # Document family: registered as "invoice", swapped to the
+        # response's type for the whole lifecycle (consolidated
+        # create/delete included).
         for entity in ("bill", "voucher", "credit_note"):
-            for op in ("POST", "UNPOST", "PAY"):
+            for op in ("POST", "UNPOST", "PAY", "CREATE", "DELETE"):
+                POLYMORPHIC_TARGETS.add((entity, op))
+        # Party family: registered as "customer", swapped to
+        # vendor/employee from the response's type.
+        for entity in ("vendor", "employee"):
+            for op in ("CREATE", "UPDATE", "DELETE"):
                 POLYMORPHIC_TARGETS.add((entity, op))
         POLYMORPHIC_TARGETS.add(("account", "MOVE"))
+        # Retired-operation renderers: the deprecated singulars'
+        # formatters, retained as the audit-decorator test
+        # harness's vehicles (see the banner in logging_config).
+        # Deleting a name here without porting the harness breaks
+        # tests/test_logging.py — 1.5.x cleanup, together.
+        RETIRED_OP_RENDERERS = {
+            ("transaction", "CREATE"),
+            ("transaction", "UPDATE"),
+        }
+        POLYMORPHIC_TARGETS |= RETIRED_OP_RENDERERS
 
         stale = (
             set(_AUDIT_HANDLERS.keys())

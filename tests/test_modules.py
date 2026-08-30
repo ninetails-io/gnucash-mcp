@@ -83,7 +83,7 @@ class TestToolModulesMapping:
                 assert tool not in seen, f"{tool} appears in multiple modules"
                 seen.add(tool)
 
-    def test_core_group_resolves_to_32_tools(self):
+    def test_core_group_resolves_to_31_tools(self):
         """The ``core`` group expands to 33 tools across its nine
         sub-modules (summary 1 + accounts 7 + transactions 12 + slots
         3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
@@ -91,7 +91,7 @@ class TestToolModulesMapping:
         per the bookkeeper-driven principle that any configuration
         which handles money must include reconciliation.
         """
-        assert len(_core_tool_names()) == 33
+        assert len(_core_tool_names()) == 31
 
     def test_total_tool_count(self):
         """Total tools across all sub-modules should be 111 —
@@ -100,7 +100,7 @@ class TestToolModulesMapping:
         1 get_job_report + 5 taxtable CRUD tools added in v1.3 +
         1 enter_statement added in v1.4.4."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 111
+        assert total == 88
 
     def test_expected_modules_exist(self):
         """All expected leaf-module names should be present.
@@ -264,9 +264,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 111 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report + 5 taxtables + 1 batch prices)."""
+        """--modules=all should keep all 88 tools (the consolidated business surface: 5 parties + 9 documents + 6 reference + 5 jobs + 2 reports, alongside the unchanged modules)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 88
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -298,12 +298,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 88
 
     def test_all_in_list_keeps_everything(self):
         """'all' mixed with other modules should keep all 111 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 88
 
     def test_unknown_module_fails_fast(self, capsys):
         """Unknown module names fail-fast at startup with SystemExit.
@@ -371,8 +371,9 @@ class TestApplyModuleFilter:
         assert "create_job" in remaining
         assert "list_jobs" in remaining
         assert "get_job_report" in remaining
-        # Credit notes (polymorphic; customer refunds usable).
-        assert "create_credit_note" in remaining
+        # Credit notes ride the consolidated document tools
+        # (document_type="credit_note"); apply stays standalone.
+        assert "create_document" in remaining
         assert "apply_credit_note" in remaining
         # Vendor-specific surface must remain absent.
         assert "create_vendor" not in remaining
@@ -950,6 +951,18 @@ class TestMultiBook:
     """Comma-separated GNUCASH_BOOK_PATH, the switch_book tool, and the
     current-book surfacing in get_server_config / get_book_summary."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_inline_tools(self):
+        """Re-seat import-time inline registrations (switch_book,
+        get_server_config) that an earlier same-worker test's
+        single-book filter may have popped — see conftest's
+        PRISTINE_INLINE_TOOLS."""
+        from tests.conftest import PRISTINE_INLINE_TOOLS
+        for name, tool in PRISTINE_INLINE_TOOLS.items():
+            mcp._tool_manager._tools.setdefault(name, tool)
+        yield
+
+
     @pytest.fixture
     def two_books(self, tmp_path: Path):
         """Two distinct-named books: alex.gnucash and beast-man.gnucash."""
@@ -1123,7 +1136,7 @@ class TestMultiBook:
         alex, _ = two_books
         srv._book_paths = [alex.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 111
+        assert len(mcp._tool_manager._tools) == 88
 
     def test_tool_count_multi_book(self, two_books):
         """The lone runtime delta from single-book: switch_book (112).
@@ -1133,7 +1146,7 @@ class TestMultiBook:
         alex, beast = two_books
         srv._book_paths = [alex.resolve(), beast.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 112
+        assert len(mcp._tool_manager._tools) == 89
 
     # ── switch_book matching ───────────────────────────────────────
 
@@ -1496,7 +1509,7 @@ class TestToolAnnotations:
         assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint) == (
             False, True, True,
         )
-        a = tools["create_transaction"].annotations
+        a = tools["create_transactions"].annotations
         assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint) == (
             False, False, False,
         )

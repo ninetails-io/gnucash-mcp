@@ -1,4 +1,13 @@
-# Business-surface consolidation — v1.5 implementation spec
+# Business-surface consolidation — v1.5.0 implementation spec
+
+**AMENDED 2026-08-29** (see §Amendments at bottom): implementation
+begun on the maintainer's directive; the migration ceremony is
+REMOVED from the design — old names exit outright in v1.5.0, no
+`business_legacy` module, per the maintainer's ruling that
+AI-facing surface needs no deprecation cycle (stateless consumers
+re-read the surface every session; only the human-facing contract
+gets warnings). Read the amendments before implementing from the
+body below.
 
 For the next session picking this up cold. Everything you need is
 in this file, `CODEX_TOOL_GUIDE.md` beside it (the full outside
@@ -151,3 +160,61 @@ count error and corrected it.
   (Glama owns that number). This work is v1.5.0 by every plan.
 
 tekeli-li. The letters have the rest.
+
+
+## Amendments (2026-08-29, maintainer rulings from the review week)
+
+1. **No deprecation ceremony; no `business_legacy` module.** The
+   maintainer's ruling: deprecation cycles are human-API practice;
+   this surface's consumers are stateless readers who re-negotiate
+   the contract every session. v1.5.0 ships the consolidated
+   surface with the old names GONE. Supersedes the body's step 4
+   and Codex's one-compatibility-cycle step 5. The removal rides a
+   MINOR version (the human-facing semver signal), and the v1.4.4
+   CHANGELOG carries an announcement ("the business surface
+   consolidates in 1.5 — 48 tools become 25") — an announcement,
+   not a deprecation: no docstring banners on tools whose
+   replacements don't exist yet (a notice pointing at a
+   nonexistent replacement is the docstring lying).
+2. **Removal-time doc sweep replaces the grace period.** At
+   implementation: grep and update everything persistent that
+   names old tools — README + per-client install guides, Glama
+   config/env descriptions and module tool counts, bookkeeper
+   test plans under specs/*/testing/, memory entries, and
+   CODEX_TOOL_GUIDE.md gets a header note that it describes the
+   pre-consolidation surface. Saved AI workflows self-heal on
+   next tool-list read; the docs don't.
+3. **Species-first docstring rule.** Every consolidated tool's
+   FIRST SENTENCE enumerates its species, never just the genus:
+   "Post a customer invoice, vendor bill, employee voucher, or
+   credit note…" — models select on descriptions, and substring
+   consumers grepping "invoice" must still find every relevant
+   tool. The genus name (document/party) appears only where the
+   species list has already landed.
+4. **Sub-rulings (defaults adopted 2026-08-29):**
+   - `list_documents` filters across all four document types
+     (vouchers and credit notes included) via `document_type`,
+     omit for all.
+   - Jobs AND taxtables both adopt the merged read pattern:
+     `get_*` folds into `list_*(id=...)` — one pattern, both
+     families.
+   - Release assignment: v1.5.0, branched after the v1.4.4 tag.
+5. **`pay_document` carries the full `pay_invoice` parameter
+   set** including `dry_run` (the v1.4.4 rehearsal — validated
+   under the old name, inherited by the new; the legacy-parity
+   test must cover parameter-set equality, not just
+   reachability).
+6. **Validation gates unchanged** (suite, wire-surface capture,
+   bookkeeper round, cold cross-model battery) — the battery's
+   no-legacy-exposure premise is now trivially true, since there
+   is no legacy exposure.
+7. **Audit-identity mechanism (implementation finding,
+   2026-08-29):** the decorator ALREADY resolves polymorphic
+   entity types from the response's `type` field (the lifecycle
+   tools register as "invoice" and swap to bill/voucher/
+   credit_note). New document tools register entity_type
+   "invoice" and inherit the swap; party tools register
+   "customer", their wrappers add `type` to mutation responses,
+   and the swap set extends to vendor/employee. Every existing
+   (entity_type, operation) dispatch pair keeps rendering
+   identically — no dispatch-table changes.

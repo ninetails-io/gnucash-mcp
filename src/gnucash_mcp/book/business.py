@@ -4794,6 +4794,7 @@ class BusinessMixin:
         limit: int | None = None,
         job_id: str | None = None,
         offset: int = 0,
+        doc_type: str | None = None,
     ) -> dict | str:
         """List invoices and/or bills.
 
@@ -4844,6 +4845,19 @@ class BusinessMixin:
                 query = query.filter(Invoice.owner_type == ot)
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
+
+            # Document-kind filter (consolidated surface): resolved
+            # per row — credit notes are a slot flag, not a column,
+            # and vouchers are the employee owner side.
+            if doc_type is not None:
+                def _kind(inv) -> str:
+                    eot = self._effective_owner_type(book, inv)
+                    if self._get_is_credit_note(inv):
+                        return "credit_note"
+                    if eot == 5:
+                        return "voucher"
+                    return "bill" if eot == 4 else "invoice"
+                invoices = [i for i in invoices if _kind(i) == doc_type]
 
             if status == "posted":
                 invoices = [i for i in invoices if _is_invoice_posted(i)]

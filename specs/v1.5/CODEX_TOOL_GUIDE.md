@@ -1,3 +1,10 @@
+> **HISTORICAL SURFACE.** This audit catalogs the PRE-consolidation
+> 111-tool surface (2026-08-05). Its consolidation plan SHIPPED on
+> 2026-08-29 (feat/business-consolidation, 48 business tools → 27,
+> total 90); the current registry is TOOL_MODULES in server.py and
+> the capture in testing/WIRE_SURFACE_v1_5_0.md. Tool-by-tool
+> descriptions below refer to retired names.
+
 # GnuCash MCP Tool Guide and Interface Assessment
 
 Assessment target: `/Users/stephen/Projects/gnucash-mcp`, branch

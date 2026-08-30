@@ -87,12 +87,29 @@ The rest of this section remains unscheduled.
   except auto-fill (shipped 1.4.1) and typed-schema ergonomics.
   Multi-currency math on the write path → explicit code review +
   full loop per `feedback_bookkeeper_validates_base_cases`.
-- **Two-tools question** — once `cur` lands and bakes, revisit
-  deprecating the `create_transaction` tool (batch would cover
-  everything; remaining argument is typed-schema vs TSV
-  ergonomics). Ruled 2026-07-16: legitimate conversation AFTER
-  `cur`, never a same-release deletion — deprecation notice first,
-  removal a release later.
+- **Two-tools question — RESOLVED 2026-08-27, notice shipped.**
+  `create_transaction` is deprecated on full capability parity
+  (qty/cur/memo/notes/action columns, auto-fill, dry-run,
+  duplicates all batch-native); the docstring redirects with a
+  one-row-batch example and `create_transactions` is the canonical
+  entry tool. Removal rides v1.5.0.
+
+- **Tool-surface consolidation queue** (ordered by the maintainer,
+  2026-08-29 — the un-blooming, begun at 111 tools):
+  1. **Update pair — notice shipped 2026-08-29** on
+     `feat/update-batch-clear`: the updates TSV gained the opt-in
+     `clear` column (parity first), `update_transaction` carries
+     the deprecation banner, `update_transactions` is canonical.
+  2. **Business consolidation — v1.5.0, implementation begun
+     2026-08-29** on `feat/business-consolidation` per
+     BUSINESS_CONSOLIDATION_SPEC.md (strict annotation-fidelity
+     variant, amended: no legacy module, straight removal).
+  3. **Removals** — both deprecated singulars exit in v1.5.0
+     alongside the consolidation, backed by debug-log call counts.
+  Standing rule: new MCP tools require explicit maintainer
+  sign-off — additions to TOOL_MODULES are a stop-and-ask, in any
+  mode. The bloat's historical author was autonomous sessions
+  adding locally-reasonable tools; the gate is the fix.
 
 - **`enter_statement` — one-shot statement entry** — a complete
   statement (opening/closing balances + lines) enters, claims
