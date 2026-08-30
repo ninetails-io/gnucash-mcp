@@ -291,6 +291,11 @@ existed.
   `book.session.add(acct)` — redundant. And `book.accounts` fullname
   lookups won't find the new account until after flush; in tests,
   keep Python references to the objects you construct.
+- **Lot constructor is OPEN** — `Lot(title=..., account=...,
+  notes=..., is_closed=0)` works directly, unlike the blocked
+  business-object constructors (see "Where the business module
+  differs"). `title`/`notes` are `pure_slot_property` — slot-stored,
+  transparently accessed.
 - **Splits**: `value` is in transaction currency, `quantity` in
   account commodity. Same-currency transactions have
   `value == quantity`. Cross-currency: value on all splits must sum
@@ -335,6 +340,8 @@ existed.
   `DetachedInstanceError`.
 - **`create_transaction()` returns a dict** with `guid` key, not a
   GUID string. `trans_date` expects a `date` object, not a string.
+- **`_split_to_dict()` uses the `"value"` key** for the
+  transaction-currency amount — not `"amount"`.
 - **Attribute names vs column names**: ORM attributes sometimes
   differ from table columns. `Split.transaction_guid` (column is
   `tx_guid`); `Account.type` (column is `account_type`). `dir(Split)`
@@ -497,6 +504,35 @@ For live verification against a personal GnuCash book, ensure
   the PR conversation tab clean. `--dry-run` previews; `--all`
   resolves regardless of author for the rare case a human
   reviewer leaves threads open after agreeing in chat.
+
+### Git safety (added 2026-08-29, paid for twice that same day)
+
+This working tree is dirty BY DESIGN — sample-book drift is never
+staged, and CLAUDE.md may carry uncommitted additions between doc
+commits. The M flags become wallpaper, which is exactly when a
+history operation destroys real work. Rules:
+
+- **Never run `reset --hard`, `restore`, or `checkout` over
+  modified paths without `git stash push` first** (or a verified
+  clean `git status`). No exceptions for "routine" surgery — the
+  two incidents were both routine.
+- **Prefer constructions that never need a reset.** To move a
+  commit between branches: create the new branch at the commit
+  FIRST (`git branch new <sha>`), or `cherry-pick` onto a branch
+  made from the right base — then remove it from the source with
+  the tree stashed. To undo a commit, prefer `revert`.
+- **Commit your own work the moment it exists.** Uncommitted work
+  is the only kind a reset can kill. Docs drafts, spec edits,
+  scratch analyses — commit them to the branch they belong to
+  immediately; reword later with the tree clean.
+- **Recovery, when prevention fails:** `git fsck --unreachable`
+  lists staged-then-lost blobs (`git cat-file blob <sha>` recovers
+  them); session transcripts may hold diff output naming blob
+  hashes; macOS local APFS snapshots
+  (`tmutil listlocalsnapshots /`) live on the internal disk and
+  survive a dead backup target.
+- **Verify pushes with `git ls-remote`**, never a piped push (the
+  pipeline's exit code is the pipe's, not push's).
 
 ### Staging
 
