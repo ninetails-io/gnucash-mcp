@@ -306,7 +306,7 @@ prints yours).
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 111 of them.
+`--modules=all` is the easy default — every tool, 90 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
@@ -317,8 +317,8 @@ the leaves individually for a finer cut.
 | `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
 | `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
 | `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
-| `freelancer` | Customer invoicing + sales tax, plus billterms (payment terms), jobs (per-project P&L rollups), and credit notes (customer refunds). The full solo-consultant toolkit. | 31 |
-| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, vendor reports). | 48 |
+| `freelancer` | Party + document management (polymorphic: customers by default; vendors/employees unlock with `business_complete`), sales tax, billterms, jobs, credit notes. The full solo-consultant toolkit. | 26 |
+| `business` | Full small-business package — group alias: `freelancer`'s tools with the vendor/employee sides unlocked, plus vendor reports. | 27 |
 
 Pick one or more, comma-separated:
 
