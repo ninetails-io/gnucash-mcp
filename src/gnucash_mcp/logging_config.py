@@ -533,28 +533,6 @@ def _transaction_guid(entry: dict) -> str:
 # ── Transaction handlers ──────────────────────────────────────────
 
 
-def _fmt_transaction_create(entry: dict) -> list[str]:
-    time_part = _extract_time(entry)
-    params = entry.get("params") or {}
-    after = entry.get("after_state") or {}
-    guid = _transaction_guid(entry)
-
-    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
-    desc = after.get("description") or params.get("description", "")
-    date_str = after.get("date") or params.get("transaction_date", "")
-    lines.append(f'{_INDENT}"{desc}" ({date_str})')
-
-    notes = after.get("notes") or params.get("notes") or ""
-    if notes:
-        lines.append(f"{_INDENT}notes: {notes}")
-
-    # after_state preferred; fall back to params (thin-response case)
-    splits = after.get("splits") or params.get("splits") or []
-    if splits:
-        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
-    return lines
-
-
 def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
     """SX instantiation — the response carries ``transaction_guid``
     (not ``guid``), so the generic transaction handler would fall
@@ -649,6 +627,123 @@ def _parse_batch_submission(tsv: str) -> dict:
     return out
 
 
+# ── Retired-operation renderers ──────────────────────────────────
+# (transaction, CREATE) and (transaction, UPDATE) lost their last
+# declaring tools when the deprecated singulars were removed
+# (v1.4.4, 2026-08-30). The formatters are retained because the
+# audit-decorator test harness uses them as its canonical
+# single-entity vehicles (tests/test_logging.py); the dispatcher
+# contract test exempts them by name as RETIRED_OP_RENDERERS.
+# Filed for 1.5.x: port the harness vehicles to living operations,
+# then delete these.
+def _fmt_transaction_create(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    guid = _transaction_guid(entry)
+
+    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
+    desc = after.get("description") or params.get("description", "")
+    date_str = after.get("date") or params.get("transaction_date", "")
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    notes = after.get("notes") or params.get("notes") or ""
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
+
+    # after_state preferred; fall back to params (thin-response case)
+    splits = after.get("splits") or params.get("splits") or []
+    if splits:
+        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    return lines
+
+
+
+def _fmt_transaction_update(entry: dict) -> list[str]:
+    time_part = _extract_time(entry)
+    before = entry.get("before_state")
+    guid = _transaction_guid(entry)
+
+    # Broadcast form (guid list): one entry, shared values once,
+    # then the touched transactions. Same dispatch key as single
+    # update — the staged shape is the discriminator, mirroring
+    # batch delete.
+    if before and "transactions" in before:
+        params = entry.get("params") or {}
+        touched = before.get("transactions") or []
+        lines = [
+            f"{time_part}  UPDATE TRANSACTIONS (broadcast)  "
+            f"{len(touched)} updated"
+        ]
+        if params.get("description") is not None:
+            lines.append(
+                f'{_INDENT}Description → "{params["description"]}"'
+            )
+        if params.get("transaction_date"):
+            lines.append(
+                f"{_INDENT}Date → {params['transaction_date']}"
+            )
+        if params.get("notes") is not None:
+            new = params["notes"] or "(cleared)"
+            lines.append(f"{_INDENT}Notes → {new}")
+        for t in touched[:10]:
+            lines.append(
+                f'{_INDENT}  guid:{(t.get("guid") or "")[:8]}  '
+                f'"{t.get("description", "")}"'
+            )
+        if len(touched) > 10:
+            lines.append(f"{_INDENT}  ... and {len(touched) - 10} more")
+        return lines
+
+    lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
+    if not before:
+        return lines
+
+    # update_transaction's response is thin (no description/date/splits
+    # echo). Resolve through after_state → params → before_state so
+    # the text log keeps the full diff readable.
+    old_desc = before.get("description", "")
+    new_desc = _resolve_entry_field(entry, "description") or old_desc
+    old_date = before.get("date", "")
+    new_date = (
+        _resolve_entry_field(entry, "date", params_key="transaction_date")
+        or old_date
+    )
+    old_splits = before.get("splits") or []
+    new_splits = _resolve_entry_field(entry, "splits") or old_splits
+
+    if old_desc != new_desc:
+        lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
+    else:
+        lines.append(f'{_INDENT}Description: "{old_desc}"')
+
+    if old_date != new_date:
+        lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
+    else:
+        lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
+
+    # Notes are three-state at the tool boundary (text / "" clears /
+    # absent leaves unchanged) — render only when the call carried
+    # the field. Without this, a notes-only update logs as a no-op
+    # entry: every field it DID print marked "(unchanged)".
+    params = entry.get("params") or {}
+    if "notes" in params and params["notes"] is not None:
+        old_notes = before.get("notes") or None
+        new_notes = params["notes"] or None
+        if old_notes != new_notes:
+            old_str = f'"{old_notes}"' if old_notes else "(none)"
+            new_str = f'"{new_notes}"' if new_notes else "(cleared)"
+            lines.append(f"{_INDENT}Notes: {old_str} → {new_str}")
+
+    if old_splits != new_splits:
+        lines.append(f"{_INDENT}Splits (before):")
+        lines.append(_format_splits_text(old_splits, _INDENT_SPLITS))
+        lines.append(f"{_INDENT}Splits (after):")
+        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+    return lines
+
+
+
 def _fmt_transaction_create_batch(entry: dict) -> list[str]:
     """Batch create audits as N individual create blocks — one per
     committed transaction, each rendered like a single-entry create.
@@ -737,90 +832,6 @@ def _fmt_transaction_update_batch(entry: dict) -> list[str]:
         lines.append(f"{_INDENT}{'  '.join(parts)}")
     if len(rows) > 15:
         lines.append(f"{_INDENT}... and {len(rows) - 15} more")
-    return lines
-
-
-def _fmt_transaction_update(entry: dict) -> list[str]:
-    time_part = _extract_time(entry)
-    before = entry.get("before_state")
-    guid = _transaction_guid(entry)
-
-    # Broadcast form (guid list): one entry, shared values once,
-    # then the touched transactions. Same dispatch key as single
-    # update — the staged shape is the discriminator, mirroring
-    # batch delete.
-    if before and "transactions" in before:
-        params = entry.get("params") or {}
-        touched = before.get("transactions") or []
-        lines = [
-            f"{time_part}  UPDATE TRANSACTIONS (broadcast)  "
-            f"{len(touched)} updated"
-        ]
-        if params.get("description") is not None:
-            lines.append(
-                f'{_INDENT}Description → "{params["description"]}"'
-            )
-        if params.get("transaction_date"):
-            lines.append(
-                f"{_INDENT}Date → {params['transaction_date']}"
-            )
-        if params.get("notes") is not None:
-            new = params["notes"] or "(cleared)"
-            lines.append(f"{_INDENT}Notes → {new}")
-        for t in touched[:10]:
-            lines.append(
-                f'{_INDENT}  guid:{(t.get("guid") or "")[:8]}  '
-                f'"{t.get("description", "")}"'
-            )
-        if len(touched) > 10:
-            lines.append(f"{_INDENT}  ... and {len(touched) - 10} more")
-        return lines
-
-    lines = [f"{time_part}  UPDATE TRANSACTION  guid:{guid}"]
-    if not before:
-        return lines
-
-    # update_transaction's response is thin (no description/date/splits
-    # echo). Resolve through after_state → params → before_state so
-    # the text log keeps the full diff readable.
-    old_desc = before.get("description", "")
-    new_desc = _resolve_entry_field(entry, "description") or old_desc
-    old_date = before.get("date", "")
-    new_date = (
-        _resolve_entry_field(entry, "date", params_key="transaction_date")
-        or old_date
-    )
-    old_splits = before.get("splits") or []
-    new_splits = _resolve_entry_field(entry, "splits") or old_splits
-
-    if old_desc != new_desc:
-        lines.append(f'{_INDENT}Description: "{old_desc}" → "{new_desc}"')
-    else:
-        lines.append(f'{_INDENT}Description: "{old_desc}"')
-
-    if old_date != new_date:
-        lines.append(f"{_INDENT}Date: {old_date} → {new_date}")
-    else:
-        lines.append(f"{_INDENT}Date: {old_date} (unchanged)")
-
-    # Notes are three-state at the tool boundary (text / "" clears /
-    # absent leaves unchanged) — render only when the call carried
-    # the field. Without this, a notes-only update logs as a no-op
-    # entry: every field it DID print marked "(unchanged)".
-    params = entry.get("params") or {}
-    if "notes" in params and params["notes"] is not None:
-        old_notes = before.get("notes") or None
-        new_notes = params["notes"] or None
-        if old_notes != new_notes:
-            old_str = f'"{old_notes}"' if old_notes else "(none)"
-            new_str = f'"{new_notes}"' if new_notes else "(cleared)"
-            lines.append(f"{_INDENT}Notes: {old_str} → {new_str}")
-
-    if old_splits != new_splits:
-        lines.append(f"{_INDENT}Splits (before):")
-        lines.append(_format_splits_text(old_splits, _INDENT_SPLITS))
-        lines.append(f"{_INDENT}Splits (after):")
-        lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
     return lines
 
 
@@ -2173,12 +2184,12 @@ def _fmt_statement_enter(entry: dict) -> list[str]:
 # is one row here plus one handler function above.
 
 _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
-    ("transaction", "CREATE"): _fmt_transaction_create,
     ("transaction", "CREATE_FROM_SCHEDULED"):
         _fmt_transaction_create_from_scheduled,
+    ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
     ("transaction", "UPDATE_BATCH"): _fmt_transaction_update_batch,
-    ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,
     ("transaction", "UNVOID"): _fmt_transaction_unvoid,
     ("transaction", "DELETE"): _fmt_transaction_delete,

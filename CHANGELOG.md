@@ -82,18 +82,39 @@ on GitHub — that number belongs to a registry-side rebuild.)
   when it defaulted to today (a UTC-hosted deployment is a day
   ahead of a Pacific book every evening).
 
-**The un-blooming begins.**
+**The un-blooming: 111 tools become 88.**
 
-- The tool surface peaked at 111 this release and starts shrinking
-  by design. `create_transaction` and `update_transaction` carry
-  deprecation notices: the batch tools are canonical for one
-  transaction or many, at full capability parity — the updates TSV
-  gained an opt-in `clear` column (explicit per row; a sparse
-  batch still can never mass-erase by accident) to close the last
-  gap first. Removal follows in v1.5.0, which consolidates the
-  business surface from 48 tools to 25 — announced here, specified
-  in `specs/v1.5/BUSINESS_CONSOLIDATION_SPEC.md`, designed by an
-  outside audit and ordered by the maintainer.
+The surface peaked at 111 and shrank in the same release, by
+design — the maintainer's ruling that stateless AI consumers
+re-read the tool contract every session, so a well-described
+replacement needs no deprecation grace period. Two moves:
+
+- **Business surface consolidated, 48 tools → 27** (the Codex
+  audit's annotation-fidelity design): five `*_party` tools
+  replace fifteen (party_type: customer|vendor|employee — ID
+  counters are per type, and every error names the type), nine
+  document tools replace eighteen (`create/add_entry/list/get/
+  post/unpost/pay/delete_document` + standalone
+  `apply_credit_note`, document_type: invoice|bill|voucher|
+  credit_note), jobs and taxtables fold their `get_` into
+  `list_(id=...)`, and `get_outstanding_invoices` is now
+  `get_outstanding_documents`. Pure wrapper routing over the
+  polymorphic book layer; audit entries render identically
+  (POST BILL, PAY BILL, POST CREDIT NOTE — verified live).
+  Docstrings lead with the species, never just the genus.
+- **The deprecated singulars are gone**: `create_transaction`
+  and `update_transaction` were removed after the batch tools
+  reached full capability parity — the updates TSV gained an
+  opt-in `clear` column (explicit per row; a sparse batch still
+  can never mass-erase by accident) to close the last gap first.
+  `create_transactions` and `update_transactions` are canonical
+  for one transaction or many.
+
+Validated by a live bookkeeper-style pass on the sample books:
+full invoice, bill (partial pay), credit-note (apply), and
+voucher lifecycles through the new names, the cross-type ID
+collision handled, and the stale-FX guard firing correctly
+through `pay_document`.
 
 **Dashboard triage** (from the outside-model dashboard review,
 2026-08-21 — cross-examined findings became rulings, rulings became

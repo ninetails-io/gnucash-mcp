@@ -163,10 +163,8 @@ TOOL_MODULES: dict[str, list[str]] = {
     "transactions": [
         "list_transactions",
         "get_transaction",
-        "create_transaction",
         "create_transactions",
         "enter_statement",
-        "update_transaction",
         "update_transactions",
         "delete_transaction",
         "replace_splits",

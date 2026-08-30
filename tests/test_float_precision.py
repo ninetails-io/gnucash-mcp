@@ -393,7 +393,7 @@ class TestAuditLogNormalizesPydanticModels:
         pointed at the given book, then hand back the
         create_transaction callable. Mirrors the production wiring:
         FastMCP → @audit_log → @safe_tool → @mcp.tool-registered
-        function → book.create_transaction.
+        function → book.replace_splits.
         """
         from mcp.server.fastmcp import FastMCP
 
@@ -405,7 +405,7 @@ class TestAuditLogNormalizesPydanticModels:
         # FastMCP stores the registered tools with their wrapped
         # function as ``.fn``. Reach in so we can exercise the full
         # decorator stack without actually speaking MCP.
-        return mcp._tool_manager._tools["create_transaction"].fn
+        return mcp._tool_manager._tools["replace_splits"].fn
 
     def test_create_with_splitinput_instances(self, test_book: Path):
         """SplitInput models from the MCP layer must round-trip
@@ -413,41 +413,54 @@ class TestAuditLogNormalizesPydanticModels:
         and produce a real transaction."""
         import json as _json_lib
 
-        create = self._create_tool(test_book)
-        result_json = create(
+        gc = GnuCashBook(str(test_book))
+        seed = gc.create_transaction(
             description="Non-dyadic via MCP path",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "94.87"},
+                {"account": "Assets:Checking", "amount": "-94.87"},
+            ],
+        )
+        replace = self._create_tool(test_book)
+        result_json = replace(
+            guid=seed["guid"],
             splits=[
                 SplitInput(account="Expenses:Groceries", amount=94.87),
                 SplitInput(account="Assets:Checking", amount=-94.87),
             ],
-            transaction_date="2026-04-23",
-            check_duplicates=False,
         )
         result = _json_lib.loads(result_json)
         # If the pydantic leak regressed, result would carry
         # {"error": "... SplitInput is not JSON serializable"}.
         assert "error" not in result, result
-        assert result["status"] == "created"
+        assert result["status"] == "splits_replaced"
 
-    def test_dry_run_with_splitinput_instances(self, test_book: Path):
-        """The live-test report specifically said dry-run also failed
-        — the crash was upstream of the write. Guard that path too."""
+    def test_error_path_with_splitinput_instances(self, test_book: Path):
+        """The audit decorator's error path also normalizes params —
+        an unbalanced SplitInput set must serialize into the error
+        entry, not crash it (the original live-test crash was
+        upstream of the write; guard the non-write path too)."""
         import json as _json_lib
 
-        create = self._create_tool(test_book)
-        result_json = create(
-            description="Dry run via MCP path",
+        gc = GnuCashBook(str(test_book))
+        seed = gc.create_transaction(
+            description="Error path via MCP",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+        replace = self._create_tool(test_book)
+        result_json = replace(
+            guid=seed["guid"],
             splits=[
                 SplitInput(account="Expenses:Groceries", amount=94.87),
-                SplitInput(account="Assets:Checking", amount=-94.87),
+                SplitInput(account="Assets:Checking", amount=-40.00),
             ],
-            transaction_date="2026-04-23",
-            dry_run=True,
-            check_duplicates=False,
         )
         result = _json_lib.loads(result_json)
-        assert "error" not in result, result
-        assert result.get("dry_run") is True
+        assert "error" in result
+        assert "SplitInput" not in result["error"]
 
 
 class TestScalarAmountsAcceptFloat:

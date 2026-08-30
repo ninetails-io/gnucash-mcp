@@ -219,6 +219,16 @@ class TestAuditLogDispatcherCoverage:
             for op in ("CREATE", "UPDATE", "DELETE"):
                 POLYMORPHIC_TARGETS.add((entity, op))
         POLYMORPHIC_TARGETS.add(("account", "MOVE"))
+        # Retired-operation renderers: the deprecated singulars'
+        # formatters, retained as the audit-decorator test
+        # harness's vehicles (see the banner in logging_config).
+        # Deleting a name here without porting the harness breaks
+        # tests/test_logging.py — 1.5.x cleanup, together.
+        RETIRED_OP_RENDERERS = {
+            ("transaction", "CREATE"),
+            ("transaction", "UPDATE"),
+        }
+        POLYMORPHIC_TARGETS |= RETIRED_OP_RENDERERS
 
         stale = (
             set(_AUDIT_HANDLERS.keys())

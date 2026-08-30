@@ -1386,3 +1386,17 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
         usd_invoice_id=usd_invoice_id,
         eur_invoice_id=eur_invoice_id,
     )
+
+
+# Pristine inline-tool snapshot, captured at conftest import — before
+# any test on this xdist worker has run _apply_module_filter. Inline
+# tools (switch_book, get_server_config) register at server import
+# ONLY; a single-book "all" filter run by an earlier test on the same
+# worker pops switch_book permanently, breaking later multi-book
+# tests by scheduling accident. Tests that need the pristine inline
+# set restore from here.
+import gnucash_mcp.server as _srv_for_snapshot
+PRISTINE_INLINE_TOOLS = {
+    name: tool
+    for name, tool in _srv_for_snapshot.mcp._tool_manager._tools.items()
+}

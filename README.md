@@ -306,7 +306,7 @@ prints yours).
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 90 of them.
+`--modules=all` is the easy default — every tool, 88 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
@@ -516,10 +516,11 @@ its capstone, and rehearsal spreads to every consequential write:
   ToolAnnotations on every tool (read-only says so, destructive
   says so), strict CLI arguments, a defined status vocabulary,
   and a debt plan that names every debt it had to leave out.
-- **The un-blooming begins** — the tool surface peaked at 111 and
-  starts shrinking: the batch tools are now canonical (deprecation
-  notices on the singular create/update), and v1.5 consolidates
-  the business surface from 48 tools to 25.
+- **The un-blooming, completed in one release** — the tool
+  surface peaked at 111 and ships at 88: the business surface
+  consolidated (48 tools → 27, one polymorphic family per verb),
+  and the batch tools are now THE entry/update tools (the
+  singular create/update removed at full capability parity).
 
 **Tests:** 2,100+ passing, parallel by default (full suite < 40s).
 

@@ -251,119 +251,6 @@ class TestGetTransactionTool:
         assert "error" in data
 
 
-class TestCreateTransactionTool:
-    """Tests for create_transaction tool."""
-
-    def test_create_transaction(self, setup_book_env):
-        """Should create a transaction and return GUID."""
-        result = server_module.create_transaction(
-            description="Test Purchase",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "25.00"},
-                {"account": "Assets:Checking", "amount": "-25.00"},
-            ],
-            transaction_date="2024-02-01",
-        )
-
-        data = json.loads(result)
-        assert "guid" in data
-        assert data["status"] == "created"
-        # Response guid is now a short collision-safe prefix (>=8 chars).
-        assert len(data["guid"]) >= 8
-
-    def test_create_unbalanced_transaction(self, setup_book_env):
-        """Should return error for unbalanced splits."""
-        result = server_module.create_transaction(
-            description="Unbalanced",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "50.00"},
-                {"account": "Assets:Checking", "amount": "-40.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "balance" in data["error"].lower()
-
-    def test_create_transaction_placeholder_rejected(self, setup_book_env):
-        """Should reject transaction targeting placeholder account."""
-        result = server_module.create_transaction(
-            description="Bad Transaction",
-            splits=[
-                {"account": "Expenses", "amount": "50.00"},
-                {"account": "Assets:Checking", "amount": "-50.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "placeholder" in data["error"].lower()
-
-    def test_create_transaction_duplicate_rejected(self, setup_book_env):
-        """Should reject HIGH confidence duplicates via server layer."""
-        result = server_module.create_transaction(
-            description="Weekly Groceries",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "150.00"},
-                {"account": "Assets:Checking", "amount": "-150.00"},
-            ],
-            transaction_date="2024-01-20",
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "rejected"
-        assert data["reason"] == "duplicate_detected"
-
-    def test_create_transaction_duplicate_force(self, setup_book_env):
-        """Should create with force_create despite HIGH duplicate."""
-        result = server_module.create_transaction(
-            description="Weekly Groceries",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "150.00"},
-                {"account": "Assets:Checking", "amount": "-150.00"},
-            ],
-            transaction_date="2024-01-20",
-            force_create=True,
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "created"
-        assert "guid" in data
-
-    def test_create_transaction_dry_run(self, setup_book_env):
-        """Should return proposal without writing in dry run mode."""
-        result = server_module.create_transaction(
-            description="Dry Run Server Test",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "75.00"},
-                {"account": "Assets:Checking", "amount": "-75.00"},
-            ],
-            transaction_date="2024-03-01",
-            dry_run=True,
-        )
-
-        data = json.loads(result)
-        # dry_run responses no longer echo the proposal back — the caller
-        # knows what they submitted; response carries only new info
-        # (warnings, duplicates, auto_filled_from).
-        assert data["dry_run"] is True
-        assert "proposed_transaction" not in data
-        assert "guid" not in data  # no transaction was written
-
-    def test_create_transaction_auto_fill(self, setup_book_env):
-        """Should auto-fill splits from matching transaction."""
-        result = server_module.create_transaction(
-            description="Weekly Groceries",
-            transaction_date="2024-03-01",
-            check_duplicates=False,
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "created"
-        assert "auto_filled_from" in data
-        assert data["auto_filled_from"]["description"] == "Weekly Groceries"
-
-
 class TestSearchTransactionsTool:
     """Tests for search_transactions tool."""
 
@@ -570,130 +457,6 @@ class TestDeleteTransactionTool:
         data = json.loads(result)
         assert "error" in data
         assert "not found" in data["error"].lower()
-
-
-class TestUpdateTransactionTool:
-    """Tests for update_transaction tool."""
-
-    def test_update_description(self, setup_book_env):
-        """Should update transaction description."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        guid = transactions[0]["guid"]
-
-        result = server_module.update_transaction(
-            guid=guid,
-            description="Updated Description",
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "updated"
-        assert data["description"] == "Updated Description"
-
-    def test_update_date(self, setup_book_env):
-        """Should update transaction date."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        guid = transactions[0]["guid"]
-
-        result = server_module.update_transaction(
-            guid=guid,
-            transaction_date="2024-06-15",
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "updated"
-        assert data["date"] == "2024-06-15"
-
-    def test_update_splits(self, setup_book_env):
-        """Should update transaction split amounts."""
-        # Find the groceries transaction which has known accounts
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        groceries_trans = next(
-            t for t in transactions if t["description"] == "Weekly Groceries"
-        )
-        guid = groceries_trans["guid"]
-
-        result = server_module.update_transaction(
-            guid=guid,
-            splits=[
-                {"account": "Assets:Checking", "amount": "-200.00"},
-                {"account": "Expenses:Groceries", "amount": "200.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "updated"
-
-    def test_update_nonexistent_transaction(self, setup_book_env):
-        """Should return error for missing transaction."""
-        result = server_module.update_transaction(
-            guid="deadbeef00000000",
-            description="New Description",
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "not found" in data["error"].lower()
-
-    def test_update_unbalanced_splits(self, setup_book_env):
-        """Should return error for unbalanced splits."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        guid = transactions[0]["guid"]
-
-        result = server_module.update_transaction(
-            guid=guid,
-            splits=[
-                {"account": "Assets:Checking", "amount": "-100.00"},
-                {"account": "Expenses:Groceries", "amount": "50.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "balance" in data["error"].lower()
-
-    def test_update_reconciled_splits_rejected(self, setup_book_env):
-        """Should reject updating splits on a reconciled transaction."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        groceries_trans = next(
-            t for t in transactions if t["description"] == "Weekly Groceries"
-        )
-        guid = groceries_trans["guid"]
-        split_guid = groceries_trans["splits"][0]["guid"]
-        server_module.set_reconcile_state(split_guid, "y")
-
-        result = server_module.update_transaction(
-            guid=guid,
-            splits=[
-                {"account": "Assets:Checking", "amount": "-200.00"},
-                {"account": "Expenses:Groceries", "amount": "200.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "reconciled" in data["error"].lower()
-
-    def test_update_reconciled_force(self, setup_book_env):
-        """Should allow updating reconciled splits with force=True."""
-        transactions = json.loads(server_module.list_transactions(verbose=True))["transactions"]
-        groceries_trans = next(
-            t for t in transactions if t["description"] == "Weekly Groceries"
-        )
-        guid = groceries_trans["guid"]
-        split_guid = groceries_trans["splits"][0]["guid"]
-        server_module.set_reconcile_state(split_guid, "y")
-
-        result = server_module.update_transaction(
-            guid=guid,
-            splits=[
-                {"account": "Assets:Checking", "amount": "-200.00"},
-                {"account": "Expenses:Groceries", "amount": "200.00"},
-            ],
-            force=True,
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "updated"
 
 
 class TestReplaceSplitsTool:
@@ -1241,88 +1004,6 @@ class TestCreateAccountWithCommodityTool:
         assert "error" in data
 
 
-class TestCreateTransactionMultiCurrencyTool:
-    """Tests for create_transaction tool with multi-currency support."""
-
-    def test_create_transaction_with_currency(self, setup_book_env):
-        """Should create transaction with explicit currency."""
-        result = server_module.create_transaction(
-            description="USD Transaction",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "25.00"},
-                {"account": "Assets:Checking", "amount": "-25.00"},
-            ],
-            currency="USD",
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "created"
-
-    def test_create_cross_currency_transaction(self, setup_book_env):
-        """Should create cross-currency transaction via tool."""
-        # Create EUR account first
-        server_module.create_account(
-            name="EUR Card",
-            account_type="CREDIT",
-            parent="Liabilities",
-            commodity="EUR",
-        )
-
-        result = server_module.create_transaction(
-            description="Paris Dinner",
-            currency="USD",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "55.00"},
-                {
-                    "account": "Liabilities:EUR Card",
-                    "amount": "-55.00",
-                    "quantity": "-50.00",
-                },
-            ],
-            transaction_date="2024-03-01",
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "created"
-        assert "guid" in data
-
-    def test_create_cross_currency_missing_quantity(self, setup_book_env):
-        """Should return error when quantity missing for cross-currency."""
-        # Create EUR account
-        server_module.create_account(
-            name="EUR Checking",
-            account_type="BANK",
-            parent="Assets",
-            commodity="EUR",
-        )
-
-        result = server_module.create_transaction(
-            description="Missing Quantity",
-            currency="USD",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "50.00"},
-                {"account": "Assets:EUR Checking", "amount": "-50.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert "error" in data
-        assert "quantity" in data["error"].lower()
-
-    def test_create_transaction_backward_compatible(self, setup_book_env):
-        """Should work without currency or quantity (backward compatible)."""
-        result = server_module.create_transaction(
-            description="Old Style",
-            splits=[
-                {"account": "Expenses:Groceries", "amount": "40.00"},
-                {"account": "Assets:Checking", "amount": "-40.00"},
-            ],
-        )
-
-        data = json.loads(result)
-        assert data["status"] == "created"
-
-
 class TestNonAsciiJsonEncoding:
     """Bug 1 from the CNY cousin verification: ``_json`` (the
     serializer every tool wrapper uses) was hitting Python's default
@@ -1430,7 +1111,7 @@ class TestStrictToolKwargs:
         """
         from pydantic import ValidationError
 
-        for tool_name in ("get_balance", "create_transaction", "list_accounts"):
+        for tool_name in ("get_balance", "create_transactions", "list_accounts"):
             arg_model = self._arg_model_for(tool_name)
             assert arg_model.model_config.get("extra") == "forbid", (
                 f"{tool_name} arg model is not strict — extras would be ignored"
@@ -1665,3 +1346,70 @@ class TestConsolidatedBusinessSurface:
         assert "Showing 0" in out.split("\n")[0]
         out = server_module.list_documents(document_type="invoice")
         assert "Showing 1-1 of 1" in out.split("\n")[0]
+
+
+class TestCanonicalBatchToolsWire:
+    """Tool-layer coverage for the canonical entry/update pair,
+    replacing the removed singular tools' wire tests. Logic depth
+    lives at the book layer; these lock the JSON/TSV envelopes."""
+
+    def test_create_transactions_one_row(self, setup_book_env):
+        result = server_module.create_transactions(
+            transactions=(
+                "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+                "1\t2024-02-01\tWire Test\t-25.00\tAssets:Checking"
+                "\t25.00\tExpenses:Groceries\n"
+            ),
+        )
+        data = json.loads(result)
+        rows = data["results"].splitlines()
+        assert rows[0].startswith("ref\t")
+        assert "\tcreated\t" in rows[1]
+
+    def test_create_transactions_dry_run_envelope(self, setup_book_env):
+        result = server_module.create_transactions(
+            transactions=(
+                "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+                "1\t2024-03-01\tRehearsal Row\t-75.00\tAssets:Checking"
+                "\t75.00\tExpenses:Groceries\n"
+            ),
+            dry_run=True,
+        )
+        data = json.loads(result)
+        assert "would_create" in data["results"]
+        assert "summary" in data  # the rehearsal header (ruling 7)
+
+    def test_create_transactions_unbalanced_row_rejects(
+        self, setup_book_env,
+    ):
+        result = server_module.create_transactions(
+            transactions=(
+                "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+                "1\t2024-02-01\tUnbalanced\t-40.00\tAssets:Checking"
+                "\t50.00\tExpenses:Groceries\n"
+            ),
+        )
+        data = json.loads(result)
+        assert "rejected" in data["results"]
+
+    def test_update_transactions_annotates_and_clears(
+        self, setup_book_env,
+    ):
+        created = json.loads(server_module.create_transactions(
+            transactions=(
+                "ref\tdate\tdescription\tamt1\tacct1\tamt2\tacct2\n"
+                "1\t2024-02-02\tAnnotate Me\t-9.00\tAssets:Checking"
+                "\t9.00\tExpenses:Groceries\n"
+            ),
+        ))
+        guid = created["results"].splitlines()[1].split("\t")[2]
+        upd = json.loads(server_module.update_transactions(
+            updates=f"guid\tnotes\n{guid}\ttemp note\n",
+        ))
+        assert "updated" in upd["results"]
+        cleared = json.loads(server_module.update_transactions(
+            updates=f"guid\tclear\n{guid}\tnotes\n",
+        ))
+        assert "updated" in cleared["results"]
+        txn = json.loads(server_module.get_transaction(guid=guid))
+        assert not txn.get("notes")
