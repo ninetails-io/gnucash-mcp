@@ -343,6 +343,20 @@ run `uv run gnucash-mcp --help` from the repo for the full menu.
 A non-exhaustive tour. Phrase any of these naturally — the
 assistant translates.
 
+### Entering a whole statement
+
+> "Here's my August checking statement." *(attach the PDF)*
+>
+> Rehearsed 31 lines against your book: 24 new, 6 already
+> entered (claimed), 1 needs a look — here's the comparison.
+> Confirm and I'll land the month: entered, categorized, and
+> reconciled to the closing balance in one step.
+
+One statement, two calls, a tied book. The dry-run classifies
+every line with evidence before anything is written, and the
+commit refuses wholesale rather than land a month that doesn't
+tie.
+
 ### Recording activity
 
 > "I spent \$47.50 at Safeway today on groceries, paid with my
@@ -477,6 +491,37 @@ environment variable instead of `--modules=...` in the JSON
 args.
 
 ---
+
+## What's new in v1.4.4
+
+The statement is the call — the bulk-operations line closes with
+its capstone, and rehearsal spreads to every consequential write:
+
+- **`enter_statement`** — a complete bank statement (opening
+  balance, closing balance, every line) enters, claims its
+  matches against transactions already in the book, and
+  reconciles in ONE atomic call. Dry-run first by default: every
+  line classified with side-by-side evidence, and a projected
+  balance tie that guarantees a rehearsal that ties is a commit
+  that will tie. No half-landed months, ever.
+- **Rehearsal everywhere** — `pay_invoice` gains `dry_run`
+  (proposed splits, FX and discount treatment, projected balance,
+  zero writes), and batch entry's dry-run shows self-contained
+  duplicate comparisons with a `review_required` status that
+  never masquerades as clearance.
+- **One-click install** — the MCPB bundle: download, double-click,
+  and Claude Desktop runs the server. Built by the project's first
+  CI on every PR.
+- **A surface that tells the truth about itself** — MCP
+  ToolAnnotations on every tool (read-only says so, destructive
+  says so), strict CLI arguments, a defined status vocabulary,
+  and a debt plan that names every debt it had to leave out.
+- **The un-blooming begins** — the tool surface peaked at 111 and
+  starts shrinking: the batch tools are now canonical (deprecation
+  notices on the singular create/update), and v1.5 consolidates
+  the business surface from 48 tools to 25.
+
+**Tests:** 2,100+ passing, parallel by default (full suite < 40s).
 
 ## What's new in v1.4.2
 
@@ -660,7 +705,7 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,954 tests as of v1.4.2
+uv run pytest                       # 2,100+ tests as of v1.4.4, parallel by default
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```

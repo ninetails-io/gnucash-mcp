@@ -1,5 +1,108 @@
 # Changelog
 
+## v1.4.4 - The statement is the call
+
+The bulk-operations line closes with its capstone: a complete bank
+statement — opening balance, closing balance, every line between —
+enters, claims its matches, and reconciles in ONE atomic call. And
+because rehearsal proved itself there, it spread: every consequential
+write in the server now rehearses before it books. Distribution grew
+doors to match — a one-click Claude Desktop bundle, built by the
+project's first CI. Much of this release was designed in public: an
+outside model's live critiques, cross-examined by the maintainer,
+became rulings; the rulings became code. (v1.4.3 was never released
+on GitHub — that number belongs to a registry-side rebuild.)
+
+**The headliner: `enter_statement` (#154).**
+
+- A statement is now first-class input, verified for
+  self-consistency before anything else (opening + Σlines must
+  equal closing — completeness becomes a checkable claim).
+- Dry-run is the default and the workflow: every line classified
+  (NEW / MATCH / OVERLAP / AMBIGUOUS) with self-contained
+  comparisons — both sides, deltas, category legs — so the
+  judgment pass gets evidence, not homework. The projected tie is
+  the only verdict the server offers; adjudication stays with the
+  caller (the clearance principle).
+- Commit is one open, one save, or nothing: creates, claims, and
+  reconciliation land together, the closing tie is verified
+  POST-write from the saved splits, and a reconciled-by-statement
+  `y` now means tied-to-evidence. Amounts transcribe
+  statement-native — the server applies the sign convention per
+  account class, eliminating a transcription-error class.
+- Forged in three live probe rounds: signed amounts reach the
+  duplicate scorer (a refund no longer blocks as its payment's
+  "twin"), invisible Unicode separators reject by name, and
+  `force` split into `force_base` / `force_duplicates` so clearing
+  an opening gap can never silently disable duplicate detection.
+
+**Rehearsal everywhere.**
+
+- `pay_invoice` gains `dry_run` — the most consequence-dense write
+  in the server (FX routing, discount windows, lot selection,
+  partial payments) now rehearses fully: proposed splits, projected
+  remaining balance, FX/discount treatment, and any account the
+  real call would auto-create, with zero writes and one shared
+  computation so the rehearsal cannot diverge from the booking.
+- `create_transactions` dry-run inherits the statement surface:
+  summary header with homework framing, `review_required` status
+  (a projected-action label may not masquerade as clearance),
+  self-contained duplicate comparisons with deltas and split-match
+  verdicts, and reconciled candidates showing their state.
+
+**One-click install (#153).**
+
+- The MCPB bundle: download, double-click, and Claude Desktop runs
+  the server — book file picker, persona checkboxes, demo books
+  behind one checkbox. Built and attached by the project's first CI
+  (locked tests on Python 3.10 and 3.13, bundle artifact on every
+  PR); validated end-to-end through a real Desktop install.
+
+**A surface that tells the truth about itself.**
+
+- MCP ToolAnnotations on every tool, derived from the audit-log
+  classification at a single chokepoint — read-only tools say so,
+  destructive tools say so, and a contract test keeps the
+  derivation honest (#150).
+- CLI arguments reject unknown values instead of silently no-oping
+  (`--modules all` now means what it says) (#151).
+- Business-document lifecycle hardening: credit-note identity
+  survives the piecash slot-sweep on transaction delete,
+  owner-mismatch errors name the per-type ID collision instead of
+  contradicting themselves, and voucher posting is reachable
+  (#152).
+- Invoice/bill status vocabulary defined once (open / posted /
+  paid / outstanding) with `get_outstanding_invoices` named the
+  one-call answer to "what is actually unpaid?"
+- `debt_payoff_plan` confesses balance-carrying debts that lack an
+  `apr` slot — the third exclusion class, alongside its stated
+  assumptions (monthly apr/12 compounding, avalanche order,
+  today's balances).
+- Defaults resolve loudly: `create_transaction` echoes the date
+  when it defaulted to today (a UTC-hosted deployment is a day
+  ahead of a Pacific book every evening).
+
+**The un-blooming begins.**
+
+- The tool surface peaked at 111 this release and starts shrinking
+  by design. `create_transaction` and `update_transaction` carry
+  deprecation notices: the batch tools are canonical for one
+  transaction or many, at full capability parity — the updates TSV
+  gained an opt-in `clear` column (explicit per row; a sparse
+  batch still can never mass-erase by accident) to close the last
+  gap first. Removal follows in v1.5.0, which consolidates the
+  business surface from 48 tools to 25 — announced here, specified
+  in `specs/v1.5/BUSINESS_CONSOLIDATION_SPEC.md`, designed by an
+  outside audit and ordered by the maintainer.
+
+**Under the hood.**
+
+- Batch entry runs one signal sweep per batch instead of up to two
+  per row — the flagship workflow's 7-second p95 tail, retired.
+- The test suite (2,100+ tests) runs parallel by default via
+  pytest-xdist: full suite in under 40 seconds.
+- `cryptography` 49 → 50.0.1 (#155).
+
 ## v1.4.2 - One call wide, every surface honest
 
 Every entry in this release traces to a named moment of live
