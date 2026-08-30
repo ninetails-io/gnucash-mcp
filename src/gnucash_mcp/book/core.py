@@ -2743,6 +2743,61 @@ class CoreMixin:
             return None
         return max(legs, key=abs)
 
+    def _signal_sweep(
+        self, book: piecash.Book,
+    ) -> list[tuple["piecash.Transaction", str]]:
+        """The full-table traversal every signal collection shares:
+        sort ``book.transactions`` recent-first and drop the rows
+        that can never be signal sources. Returns ``(transaction,
+        lowercased_description)`` pairs.
+
+        Batch surfaces (``create_transactions``, ``enter_statement``)
+        call ``_collect_create_signals`` once or twice PER ROW; the
+        sweep is the per-call cost that dominates on large books
+        (the debug log's p95 7s tail). Compute it once per book
+        session and pass it to every ``_collect_create_signals``
+        call whose screening happens against the same pre-write
+        table state.
+
+        **Capture before any of the batch's transactions are
+        committed** — a sweep taken after a write would let the
+        just-created rows shadow themselves as duplicates; a sweep
+        taken before stays honestly pre-write for every row screened
+        against it. The list holds live ORM objects: never let it
+        outlive the ``open()`` session that built it.
+
+        Three argument-independent filters live here so they run
+        once, not once per call:
+
+        - **Template recipes, not events.** GnuCash persists each
+          SX's split template as a real Transaction row whose splits
+          post under ``book.root_template``. A user entering a
+          mortgage payment for the first time would otherwise always
+          see the Mortgage template as a "duplicate" candidate via
+          description + date match, even with a stale template
+          amount that kills the A signal. Filtering at the sweep
+          boundary blocks leakage into every bucket downstream:
+          auto-fill, stability, duplicates, and recent-matches.
+        - **Voided transactions are not signal sources**: the void-
+          and-re-enter workflow makes the voided txn the most recent
+          match, and auto-fill would clone its zeroed splits into a
+          silent $0 transaction.
+        - **Undated rows** can't anchor cadence or duplicate-window
+          math.
+        """
+        template_guids = self._template_account_guids(book)
+        swept = [
+            (txn, txn.description.lower())
+            for txn in book.transactions
+            if txn.post_date is not None
+            and not self._is_template_transaction(txn, template_guids)
+            and not any(_is_voided(s) for s in txn.splits)
+        ]
+        # One sort, descending — recent-first lets the capped
+        # buckets in the collector short-circuit.
+        swept.sort(key=lambda pair: pair[0].post_date, reverse=True)
+        return swept
+
     def _collect_create_signals(
         self,
         book: piecash.Book,
@@ -2756,6 +2811,7 @@ class CoreMixin:
         want_duplicates: bool,
         want_recent: bool,
         trans_currency: str | None = None,
+        sweep: list[tuple["piecash.Transaction", str]] | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
         stability_limit: int = 5,
@@ -2785,6 +2841,10 @@ class CoreMixin:
                 amount, date; emit HIGH/MEDIUM candidates.
             want_recent: Keep top N matches for the post-write
                 split-consistency warning.
+            sweep: A precomputed ``_signal_sweep(book)`` — pass it
+                when calling per-row in a batch so the table
+                traversal amortizes to one; ``None`` computes a
+                fresh sweep (single-call sites).
 
         Returns:
             A ``_CreateSignals`` bundle; untracked signals keep
@@ -2806,19 +2866,6 @@ class CoreMixin:
             else {}
         )
 
-        # Template-account GUID set — used to skip scheduled-transaction
-        # template transactions. GnuCash persists each SX's split
-        # template as a real Transaction row whose splits post to
-        # accounts under book.root_template. Those are recipes, not
-        # events — a user entering a mortgage payment for the first
-        # time would otherwise always see the Mortgage template as a
-        # "duplicate" candidate via description + date match, even
-        # with a stale template amount that kills the A signal.
-        # Filtering at the iteration boundary blocks leakage into
-        # every bucket the collector fills: auto-fill, stability,
-        # duplicates, and recent-matches.
-        template_guids = self._template_account_guids(book)
-
         # Proposed primary = headline amount (max abs split value)
         # for the duplicate amount-signal; zero when the caller
         # passed [] (that branch never runs then). When BOTH sides
@@ -2839,38 +2886,17 @@ class CoreMixin:
         recent_matches: list = []  # list[piecash.Transaction]
         duplicates: list[dict] = []
 
-        # One sort, one iteration, descending — recent-first lets
-        # the capped buckets short-circuit. Null post_date rows sort
-        # oldest and are skipped (every bucket does date math).
-        sorted_txns = sorted(
-            book.transactions,
-            key=lambda t: t.post_date or date.min,
-            reverse=True,
-        )
+        # The sorted, pre-filtered traversal — shared across a
+        # batch's calls when the caller passes it in (see
+        # _signal_sweep for the filters and the pre-write caveat).
+        if sweep is None:
+            sweep = self._signal_sweep(book)
 
-        for txn in sorted_txns:
-            # Template recipes, not events — see the note above.
-            if self._is_template_transaction(txn, template_guids):
-                continue
-
-            # Voided transactions are not signal sources: the void-
-            # and-re-enter workflow makes the voided txn the most
-            # recent match, and auto-fill would clone its zeroed
-            # splits into a silent $0 transaction. Duplicates /
-            # stability skip them too.
-            if any(_is_voided(s) for s in txn.splits):
-                continue
-
-            # Undated rows can't anchor cadence or duplicate-window
-            # math.
-            if txn.post_date is None:
-                continue
-
+        for txn, txn_desc_lower in sweep:
             # Empty descriptions carry no signal: "" substring-matches
             # everything, so an empty-description transaction would
             # desc-match every proposal and auto-fill could clone an
             # unrelated transaction instead of raising "no match".
-            txn_desc_lower = txn.description.lower()
             desc_match = (
                 bool(desc_lower.strip())
                 and bool(txn_desc_lower.strip())
@@ -3296,6 +3322,12 @@ class CoreMixin:
         """
         # Dry runs don't need a writable session; all other paths do.
         readonly = dry_run
+        # Defaults resolve loudly, explicit inputs echo nothing: when
+        # the caller omitted the date, the response says which day
+        # "today" resolved to — server, client, and book can sit in
+        # different time zones (a UTC-hosted deployment is a day
+        # ahead of a Pacific book every evening).
+        date_defaulted = trans_date is None
         if trans_date is None:
             trans_date = date.today()
 
@@ -3309,6 +3341,12 @@ class CoreMixin:
             # pass 2 — a single scan.
             auto_filled_from = None
             auto_fill_warnings: list[dict] = []
+            # Splitless means TWO collector calls (auto-fill
+            # preflight + duplicate scan) — precompute the sweep so
+            # the table traversal happens once. Explicit splits make
+            # one call; let it sweep for itself so error paths
+            # before pass 2 stay cheap.
+            sweep = self._signal_sweep(book) if not splits else None
             if not splits:
                 preflight = self._collect_create_signals(
                     book,
@@ -3319,6 +3357,7 @@ class CoreMixin:
                     want_stability=True,
                     want_duplicates=False,
                     want_recent=False,
+                    sweep=sweep,
                 )
                 if preflight.auto_fill is None:
                     raise ValueError(
@@ -3362,6 +3401,7 @@ class CoreMixin:
                 want_duplicates=check_duplicates,
                 want_recent=True,
                 trans_currency=frame_code,
+                sweep=sweep,
             )
             duplicates = signals.duplicates
 
@@ -3488,6 +3528,8 @@ class CoreMixin:
                 transaction.guid, (t.guid for t in book.transactions)
             )
             result = {"guid": short_guid, "status": "created"}
+            if date_defaulted:
+                result["date"] = trans_date.isoformat()
             if warnings:
                 result["warnings"] = warnings
             if duplicates:
@@ -3553,6 +3595,20 @@ class CoreMixin:
         with self.open(readonly=readonly) as book:
             default_currency = self._require_default_currency(book)
 
+            # One table sweep for the whole batch — phase 1's
+            # auto-fill preflights and phase 2's per-row duplicate
+            # screens all read the same pre-write table state
+            # (writes don't start until phase 3), so sharing the
+            # sweep is behavior-identical and turns O(rows) table
+            # traversals into one. Lazy: an all-explicit batch that
+            # aborts in phase 1 never pays for it.
+            _sweep_memo: list = []
+
+            def _sweep():
+                if not _sweep_memo:
+                    _sweep_memo.append(self._signal_sweep(book))
+                return _sweep_memo[0]
+
             # --- Phase 1: structural validation (every row) ---
             prepared = []
             for txn in transactions:
@@ -3595,6 +3651,7 @@ class CoreMixin:
                             proposed_amounts=[],
                             want_auto_fill=True, want_stability=True,
                             want_duplicates=False, want_recent=False,
+                            sweep=_sweep(),
                         )
                         if preflight.auto_fill is None:
                             raise ValueError(
@@ -3658,6 +3715,7 @@ class CoreMixin:
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
+                    sweep=_sweep(),
                 )
                 dups = signals.duplicates
                 if dups:
@@ -4238,12 +4296,16 @@ class CoreMixin:
 
     def _statement_prep_create(
         self, book, account, ln, book_amount, default_currency,
+        sweep_fn=None,
     ) -> tuple[list[dict], dict | None]:
         """Validate one would-be-created statement line into resolved
         splits (bank leg synthesized first, counter legs from the
         row or a 2-split auto-fill precedent). Returns
         ``(validated, auto_fill_source | None)``; raises ValueError
-        with the row-level problem."""
+        with the row-level problem. ``sweep_fn``, when given, is a
+        zero-arg memoized ``_signal_sweep`` supplier — splitless
+        lines across one statement then share a single table
+        traversal."""
         if not (ln.get("description") or ln.get("raw")):
             raise ValueError(
                 "a created line needs a description (or at least "
@@ -4263,6 +4325,7 @@ class CoreMixin:
                 book, probe, ln["date"], [],
                 want_auto_fill=True, want_stability=False,
                 want_duplicates=False, want_recent=False,
+                sweep=sweep_fn() if sweep_fn is not None else None,
             )
             if sig.auto_fill is None:
                 raise ValueError(
@@ -4670,6 +4733,18 @@ class CoreMixin:
         claimed_guids: set[str] = set()
         overlap_guids: set[str] = set()
 
+        # Shared table sweep for the statement's splitless create
+        # rows — dispositions are a pure read (no mutation on any
+        # path), so every auto-fill preflight screens the same
+        # pre-write table state. Lazy: all-claims and all-explicit
+        # statements never pay for it.
+        _sweep_memo: list = []
+
+        def _sweep():
+            if not _sweep_memo:
+                _sweep_memo.append(self._signal_sweep(book))
+            return _sweep_memo[0]
+
         create_rows = []
         for ln in lines:
             if not ln.get("match"):
@@ -4754,7 +4829,7 @@ class CoreMixin:
             try:
                 validated, src = self._statement_prep_create(
                     book, account, ln, _book_amount(ln),
-                    default_currency,
+                    default_currency, sweep_fn=_sweep,
                 )
                 prepared.append((ln, validated, src))
                 by_ref[ln["ref"]] = {

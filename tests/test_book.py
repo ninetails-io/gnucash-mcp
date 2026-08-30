@@ -13113,6 +13113,36 @@ class TestSplitGraphPreload:
             )
 
 
+class TestDefaultedDateEcho:
+    """Defaults resolve loudly, explicit inputs echo nothing: a
+    create_transaction that let the date default to today learns
+    which day 'today' resolved to; an explicit date echoes nothing
+    (the caller already has it)."""
+
+    def test_defaulted_date_is_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Defaulted date",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+        assert result["date"] == date.today().isoformat()
+
+    def test_explicit_date_is_not_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Explicit date",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+            trans_date=date(2024, 2, 1),
+        )
+        assert "date" not in result
+
+
 class TestUpdateClearColumn:
     """The TSV ``clear`` column — the explicit opt-in that
     empty-cell-means-unchanged deliberately forecloses. Parser

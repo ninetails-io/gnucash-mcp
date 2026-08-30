@@ -1061,3 +1061,57 @@ class TestSplitActionColumn:
             if s["account"] == "Assets:Checking"
         )
         assert chk["action"] == "Wire"
+
+
+class TestSignalSweepAmortization:
+    """The table sweep (sort + filter of every transaction) is the
+    collector's dominant cost on large books; each surface must pay
+    it at most ONCE per call, however many rows it screens — the
+    debug log's create_transactions p95 tail was O(rows) sweeps.
+    Counts real invocations via a wrapping monkeypatch: a new call
+    site that forgets to share the sweep fails here, not in a
+    profiler six months later.
+    """
+
+    @pytest.fixture
+    def sweep_calls(self, monkeypatch):
+        from gnucash_mcp.book.core import CoreMixin
+        calls = {"n": 0}
+        orig = CoreMixin._signal_sweep
+
+        def counting(self, book):
+            calls["n"] += 1
+            return orig(self, book)
+
+        monkeypatch.setattr(CoreMixin, "_signal_sweep", counting)
+        return calls
+
+    def test_batch_sweeps_once(self, test_book, sweep_calls):
+        """Mixed batch — a splitless auto-fill row (phase-1
+        preflight) plus explicit rows (phase-2 screens): one sweep
+        covers all of them."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        sweep_calls["n"] = 0
+        env = gc.create_transactions([
+            {"ref": "1", "date": date(2026, 6, 21),
+             "description": "Rent", "splits": []},
+            _txn(2, "Groceries B", "25.00"),
+            _txn(3, "Groceries C", "30.00"),
+        ])
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["2"]["status"] == "created"
+        assert rows["3"]["status"] == "created"
+        assert sweep_calls["n"] == 1
+
+    def test_single_splitless_sweeps_once(self, test_book, sweep_calls):
+        """Splitless create makes TWO collector calls (auto-fill
+        preflight + duplicate scan); they share one sweep."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        sweep_calls["n"] = 0
+        result = gc.create_transaction(
+            description="Rent", trans_date=date(2026, 6, 21),
+        )
+        assert result["status"] in ("created", "rejected")
+        assert sweep_calls["n"] == 1

@@ -11245,3 +11245,261 @@ class TestCodexCrossModelFindings:
             post_account="Liabilities:Accounts Payable",
         )
         assert result["status"] == "posted"
+
+
+class TestPayInvoiceDryRun:
+    """pay_invoice(dry_run=True) — full rehearsal, zero writes.
+
+    The rehearsal runs the identical validation/conversion/FX
+    pipeline (same code path, sign-factored shared split data), so
+    these tests assert both halves of the contract: the proposal is
+    faithful to what the real call books, and the book is untouched
+    — including the accounts and designation slots the resolvers
+    would otherwise lazily create.
+    """
+
+    def _post_invoice(self, gb, amount="500.00"):
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(customer_id="000001")
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price=amount,
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+        )
+        return "000001"
+
+    def test_dry_run_proposes_and_writes_nothing(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert result["status"] == "would_pay"
+        assert Decimal(result["remaining_balance_after"]) == Decimal("300")
+        assert result["would_close_lot"] is False
+        # Customer receipt: credit A/R, debit bank.
+        by_acct = {
+            s["account"]: s for s in result["proposed_splits"]
+        }
+        assert Decimal(
+            by_acct["Assets:Accounts Receivable"]["value"]
+        ) == Decimal("-200")
+        assert Decimal(
+            by_acct["Assets:Checking"]["value"]
+        ) == Decimal("200")
+        assert by_acct["Assets:Accounts Receivable"]["action"] == "Payment"
+        # Nothing booked: A/R still carries the full invoice.
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("500")
+
+    def test_dry_run_full_settlement_would_close_lot(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+            dry_run=True,
+        )
+        assert result["would_close_lot"] is True
+        assert Decimal(result["remaining_balance_after"]) == Decimal("0")
+        # Rehearsal parity: the identical real call then succeeds.
+        real = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="500",
+        )
+        assert real["status"] == "paid"
+        assert Decimal(real["remaining_balance"]) == Decimal("0")
+
+    def test_dry_run_validation_parity_overpayment(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        with pytest.raises(ValueError, match="exceeds the outstanding"):
+            gb.pay_invoice(
+                invoice_id="000001",
+                payment_account="Assets:Checking",
+                amount="600",
+                dry_run=True,
+            )
+
+    def test_dry_run_vendor_bill_sign_direction(self, business_book):
+        gb = GnuCashBook(str(business_book))
+        gb.create_vendor(name="Office Depot")
+        gb.create_bill(vendor_id="000001")
+        gb.add_bill_entry(
+            bill_id="000001",
+            account="Expenses:Office Supplies",
+            description="Paper",
+            quantity="1",
+            price="50.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Liabilities:Accounts Payable",
+            owner_type="vendor",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="50",
+            owner_type="vendor",
+            dry_run=True,
+        )
+        by_acct = {
+            s["account"]: s for s in result["proposed_splits"]
+        }
+        # Bill payment: debit A/P, credit bank.
+        assert Decimal(
+            by_acct["Liabilities:Accounts Payable"]["value"]
+        ) == Decimal("50")
+        assert Decimal(
+            by_acct["Assets:Checking"]["value"]
+        ) == Decimal("-50")
+
+    def test_dry_run_discount_reports_without_creating_account(
+        self, business_book,
+    ):
+        """apply_discount rehearsal: discount block present, proposed
+        discount split present, and the Sales Discounts account the
+        real run would auto-create does NOT appear."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_billterm(
+            name="2/10 Net 30", due_days=30,
+            discount_days=10, discount_percent="2",
+        )
+        today = date.today()
+        gb.create_invoice(
+            customer_id="000001", term="2/10 Net 30",
+            date_opened=today.isoformat(),
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Consulting",
+            quantity="1",
+            price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date=today.isoformat(),
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="980.00",
+            apply_discount=True,
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert result["discount"]["amount"] == "20.00"
+        assert result["would_close_lot"] is True
+        disc_rows = [
+            s for s in result["proposed_splits"]
+            if s["memo"] == "Early-payment discount"
+        ]
+        assert len(disc_rows) == 1
+        assert Decimal(disc_rows[0]["value"]) == Decimal("20.00")
+        # The auto-create was rehearsed, not performed.
+        assert result["would_create_accounts"] == [
+            "Expenses:Sales Discounts"
+        ]
+        accounts = gb.list_accounts()
+        assert "Sales Discounts" not in str(accounts)
+        # A/R untouched.
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("1000")
+
+    def test_dry_run_cross_currency_fx_projection(self, business_book):
+        """EUR invoice, USD book, rate drift between post and pay:
+        the rehearsal projects the FX gain split and reports the FX
+        account as would-create — and creates nothing."""
+        import piecash
+
+        gb = GnuCashBook(str(business_book))
+        with gb.open(readonly=False) as book:
+            usd = book.default_currency
+            eur = piecash.factories.create_currency_from_ISO("EUR")
+            book.session.add(eur)
+            book.flush()
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2026, 3, 10),
+                value="1.10", source="user:test", type="nav",
+            ))
+            book.session.add(piecash.Price(
+                commodity=eur, currency=usd,
+                date=date(2026, 3, 20),
+                value="1.20", source="user:test", type="nav",
+            ))
+            book.save()
+
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(
+            customer_id="000001", currency="EUR",
+            date_opened="2026-03-10",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Consulting",
+            description="EUR services",
+            quantity="1", price="1000.00",
+        )
+        gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",
+            post_date="2026-03-10",
+        )
+        result = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="1000.00",
+            payment_date="2026-03-20",
+            dry_run=True,
+        )
+        assert Decimal(result["exchange_rate"]) == Decimal("1.20")
+        # €1000 × (1.20 − 1.10) = $100 realized gain, projected.
+        assert result["fx_realized"]["direction"] == "gain"
+        assert Decimal(result["fx_realized"]["amount"]) == Decimal("100")
+        assert result["would_create_accounts"] == [
+            "Income:Foreign Exchange Gain/Loss"
+        ]
+        fx_rows = [
+            s for s in result["proposed_splits"]
+            if s["account"] == "Income:Foreign Exchange Gain/Loss"
+        ]
+        assert len(fx_rows) == 1
+        assert Decimal(fx_rows[0]["value"]) == Decimal("0")
+        # Nothing created, nothing designated, nothing paid.
+        accounts = gb.list_accounts()
+        assert "Foreign Exchange" not in str(accounts)
+        assert gb.get_balance(
+            account_name="Assets:Accounts Receivable"
+        ) == Decimal("1100")
+        # Rehearsal parity: the identical real call books it all.
+        real = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="1000.00",
+            payment_date="2026-03-20",
+        )
+        assert real["status"] == "paid"
+        assert real["fx_realized"]["account"] == (
+            "Income:Foreign Exchange Gain/Loss"
+        )
+        accounts = gb.list_accounts()
+        assert "Foreign Exchange" in str(accounts)

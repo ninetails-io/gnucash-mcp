@@ -813,3 +813,39 @@ class TestDebtPayoffCompactFormat:
         # per account in the old shape. Should appear at most once now
         # (or zero times — we use "total debt impact" wording instead).
         assert result.count("by the time your debt is paid off") <= 1
+
+
+class TestNoAprConfession:
+    """Balance-carrying debts without an APR are confessed, not
+    silently dropped — the third exclusion class, same contract as
+    the FX-unvalued and unestimable confessions."""
+
+    def test_balance_carrying_debt_without_apr_is_confessed(
+        self, debt_book: Path,
+    ):
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.delete_account_slot("Liabilities:Visa", "apr")
+
+        result = gc_book.debt_payoff_plan(
+            compact=False, monthly_budget="1000",
+        )
+
+        names = [d["account"] for d in result["debts"]]
+        assert "Liabilities:Visa" not in names
+        assert result["no_apr"] == ["Liabilities:Visa"]
+        assert any("'apr'" in w for w in result["warnings"])
+        # The other debts still plan.
+        assert "Liabilities:Mastercard" in names
+
+    def test_compact_output_carries_the_confession(
+        self, debt_book: Path,
+    ):
+        gc_book = GnuCashBook(str(debt_book))
+        gc_book.delete_account_slot("Liabilities:Visa", "apr")
+
+        out = gc_book.debt_payoff_plan(
+            compact=True, monthly_budget="1000",
+        )
+        assert "⚠" in out
+        assert "Liabilities:Visa" in out
+        assert "balance-carrying" in out
