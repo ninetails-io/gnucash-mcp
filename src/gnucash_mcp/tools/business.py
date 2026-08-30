@@ -1069,6 +1069,16 @@ def register(mcp, get_book) -> None:
         ``offset``; ``limit=0`` returns the count only. Use verbose=true
         for structured JSON with GUIDs, dates, notes, etc.
 
+        Status vocabulary (shared by every invoice/bill tool):
+        **open** = created and editable, not yet booked to A/R//A/P —
+        not payable. **posted** = booked to A/R//A/P with a lot
+        tracking its balance — payable. **paid** = posted with a zero
+        remaining balance (lot closed). **outstanding** = posted with
+        a remaining balance — the unpaid subset; get it directly from
+        ``get_outstanding_invoices`` rather than deriving it here.
+        The ``status`` filter below covers document state
+        (open/posted) only; settlement state lives on the lot.
+
         Args:
             owner_type: Filter by type: "customer" for invoices,
                         "vendor" for bills, or omit for all.
@@ -1110,6 +1120,11 @@ def register(mcp, get_book) -> None:
         vendor bills, employee vouchers, and credit notes (reported
         as type='credit_note'). Returns all entries with quantities,
         prices, and totals.
+
+        Status vocabulary: open = editable, not yet booked; posted =
+        on the books, payable; paid = remaining balance zero. The
+        full definitions live on ``list_invoices``; the unpaid list
+        is ``get_outstanding_invoices``.
 
         Args:
             id: Invoice or bill ID (e.g., "000001"). This is the
@@ -1217,11 +1232,21 @@ def register(mcp, get_book) -> None:
         discount_account: str | None = None,
         force: bool = False,
         memo: str = "",
+        dry_run: bool = False,
     ) -> str:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction from the specified bank/cash account
         to the invoice's A/R or A/P account. Partial payments are supported.
+
+        ``dry_run=true`` rehearses the payment without booking it:
+        the full validation, conversion, discount, and FX pipeline
+        runs and the response shows the proposed splits, the
+        remaining balance after, whether the invoice would settle in
+        full, and any account the real call would auto-create. Same
+        inputs, same code path — a rehearsal that succeeds is a
+        payment that will book. Recommended before complex payments
+        (cross-currency, discounts, credit-note refunds).
 
         For cross-currency payments where the rate moved between
         post-date and pay-date, a realized FX gain/loss split is
@@ -1277,6 +1302,9 @@ def register(mcp, get_book) -> None:
                 check number or wire reference). ``description``
                 names the whole transaction; ``memo`` annotates the
                 cash movement.
+            dry_run: When True, rehearse without writing — returns
+                the proposed splits and projected outcome instead of
+                booking. Default False.
         """
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
@@ -1292,6 +1320,7 @@ def register(mcp, get_book) -> None:
             discount_account=discount_account,
             force=force,
             memo=memo,
+            dry_run=dry_run,
         )
         return _json(result)
 
@@ -1592,6 +1621,11 @@ def register(mcp, get_book) -> None:
         offset: int = 0,
     ) -> str:
         """Get all posted invoices/bills with outstanding balances.
+
+        This is the authoritative unpaid list: outstanding = posted
+        with a remaining balance > 0. One call answers "what is
+        actually unpaid?" — no need to combine ``list_invoices`` and
+        ``get_invoice`` (full status vocabulary on ``list_invoices``).
 
         Leads with a ``Showing X-Y of Z invoices (date range)`` line,
         then a compact one-line-per-doc format by default with action

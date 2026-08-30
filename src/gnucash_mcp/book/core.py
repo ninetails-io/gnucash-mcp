@@ -3322,6 +3322,12 @@ class CoreMixin:
         """
         # Dry runs don't need a writable session; all other paths do.
         readonly = dry_run
+        # Defaults resolve loudly, explicit inputs echo nothing: when
+        # the caller omitted the date, the response says which day
+        # "today" resolved to — server, client, and book can sit in
+        # different time zones (a UTC-hosted deployment is a day
+        # ahead of a Pacific book every evening).
+        date_defaulted = trans_date is None
         if trans_date is None:
             trans_date = date.today()
 
@@ -3522,6 +3528,8 @@ class CoreMixin:
                 transaction.guid, (t.guid for t in book.transactions)
             )
             result = {"guid": short_guid, "status": "created"}
+            if date_defaulted:
+                result["date"] = trans_date.isoformat()
             if warnings:
                 result["warnings"] = warnings
             if duplicates:

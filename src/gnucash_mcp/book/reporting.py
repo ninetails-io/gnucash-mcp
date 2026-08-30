@@ -1391,6 +1391,11 @@ class ReportingMixin:
             # loan_term_months slot). Omitted from the plan rather than
             # estimated from a guessed term — see the LIABILITY branch.
             unestimable_debts: list[str] = []
+            # Debt-typed accounts CARRYING A BALANCE but lacking a
+            # usable 'apr' slot — the plan can't order or cost them.
+            # Confessed alongside the other two exclusion classes; a
+            # silently partial payoff plan reads as a complete one.
+            no_apr_debts: list[str] = []
             # Counted so the no-debts error distinguishes "no debt
             # accounts at all" from "they exist but lack the apr
             # slot" — the user's next action differs.
@@ -1431,21 +1436,13 @@ class ReportingMixin:
                 # accesses each re-walk the slots collection.
                 slot_by_name = {s.name: s for s in account.slots}
 
-                apr_val = slot_by_name.get("apr")
-                if apr_val is None:
-                    continue
-                try:
-                    apr_str = str(apr_val.value) if hasattr(apr_val, "value") else str(apr_val)
-                    apr = Decimal(apr_str)
-                except InvalidOperation:
-                    continue
-
-                if apr <= 0:
-                    continue
-
-                # Balance in book default, today-capped (a payment
-                # scheduled next week hasn't reduced today's payoff
-                # balance); voided and null-date splits excluded.
+                # Balance FIRST (book default, today-capped — a
+                # payment scheduled next week hasn't reduced today's
+                # payoff balance; voided and null-date splits
+                # excluded), so a missing APR on a balance-carrying
+                # debt is CONFESSED below instead of silently
+                # dropped; zero-balance accounts stay silent either
+                # way — a closed old card is not a gap in the plan.
                 today = date.today()
                 balance = Decimal("0")
                 for split in account.splits:
@@ -1461,6 +1458,18 @@ class ReportingMixin:
 
                 if balance <= 0:
                     continue  # Skip zero or overpaid balances
+
+                apr_val = slot_by_name.get("apr")
+                apr = None
+                if apr_val is not None:
+                    try:
+                        apr_str = str(apr_val.value) if hasattr(apr_val, "value") else str(apr_val)
+                        apr = Decimal(apr_str)
+                    except InvalidOperation:
+                        apr = None
+                if apr is None or apr <= 0:
+                    no_apr_debts.append(account.fullname)
+                    continue
 
                 min_payment = None
 
@@ -1586,6 +1595,18 @@ class ReportingMixin:
                 f"term: {', '.join(sorted(unestimable_debts))}. Set "
                 f"loan_term_months (or minimum_payment) via "
                 f"set_account_slot for payment estimates."
+            )
+
+        # Balance-carrying debts invisible to the plan for lack of an
+        # APR — the third exclusion class, same confession contract.
+        no_apr_warning = None
+        if no_apr_debts:
+            no_apr_warning = (
+                f"{len(no_apr_debts)} balance-carrying debt(s) not in "
+                f"the plan — no 'apr' slot (or APR <= 0): "
+                f"{', '.join(sorted(no_apr_debts))}. Set 'apr' via "
+                f"set_account_slot to include them in the payoff "
+                f"order."
             )
 
         if not debts:
@@ -1714,6 +1735,9 @@ class ReportingMixin:
         if unestimable_warning:
             full["unestimable"] = sorted(unestimable_debts)
             warnings.append(unestimable_warning)
+        if no_apr_warning:
+            full["no_apr"] = sorted(no_apr_debts)
+            warnings.append(no_apr_warning)
         if warnings:
             full["warnings"] = warnings
 
@@ -1737,4 +1761,6 @@ class ReportingMixin:
             compact_out += f"\n⚠ {excluded_warning}"
         if unestimable_warning:
             compact_out += f"\n⚠ {unestimable_warning}"
+        if no_apr_warning:
+            compact_out += f"\n⚠ {no_apr_warning}"
         return compact_out
