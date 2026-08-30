@@ -913,7 +913,23 @@ def register(mcp, get_book) -> None:
         notes: str | None = None,
         force: bool = False,
     ) -> str:
-        """Update an existing transaction — or broadcast to several.
+        """DEPRECATED — use ``update_transactions``. Scheduled for
+        removal in a future release; it still works as documented
+        below through the deprecation window.
+
+        Full parity lives in the batch tool and one specialist:
+        per-row values are TSV rows; clearing a field is the
+        ``clear`` column; same-values-across-N is N repeated rows;
+        split edits are ``replace_splits`` (which preserves
+        unchanged legs' memos and reconcile states)::
+
+            guid<TAB>notes<TAB>clear
+            56926ac2<TAB>Card payment, resolved<TAB>
+            7f0fc117<TAB><TAB>notes
+
+        ---
+
+        Update an existing transaction — or broadcast to several.
 
         Pass a LIST of GUIDs to apply the SAME supplied values to
         every listed transaction in one book open / one save
@@ -970,19 +986,28 @@ def register(mcp, get_book) -> None:
             56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
             7f0fc117<TAB><TAB>Netflix subscription, $22.10/mo
 
-        An EMPTY cell leaves that field UNCHANGED — this batch can
-        annotate but never clear (clearing is ``update_transaction``
-        with ``notes=""``, deliberately single-transaction). Splits
-        and memos are not updatable here (``replace_splits``).
+        An EMPTY cell leaves that field UNCHANGED. To blank a field,
+        opt in with a ``clear`` column: its cell names the fields to
+        clear on that row (``notes`` or ``description,notes``) —
+        explicit per row, so a sparse batch can never mass-erase by
+        accident. ``date`` is not clearable; a row that sets and
+        clears the same field rejects. Splits and memos are not
+        updatable here (``replace_splits``)::
+
+            guid<TAB>notes<TAB>clear
+            56926ac2<TAB>Verified subscription<TAB>
+            7f0fc117<TAB><TAB>notes
 
         One book open, one save; ``on_error="abort"`` (default)
         sinks the batch on any bad row, ``"skip"`` keeps good rows.
         Date moves on transactions with reconciled splits are
         rejected per row unless ``force=true`` (they shift the
         transaction out of its reconciled statement period).
-        Returns a results TSV keyed by your input guids. For the
-        SAME value across many transactions, ``update_transaction``
-        with a guid list is cheaper than repeating rows.
+        Returns a results TSV keyed by your input guids. This is
+        the canonical update tool for one transaction or many; the
+        deprecated ``update_transaction`` redirects here (same
+        value across many transactions = the same cells repeated
+        per row).
         """
         book = get_book()
         rows = _parse_update_tsv(updates)

@@ -5963,10 +5963,10 @@ class CoreMixin:
 
         Each entry: ``{guid, description (optional), notes
         (optional), date (optional, datetime.date)}`` — absent keys
-        leave the field unchanged (the TSV's empty cells). Clearing
-        a field is deliberately single-tool territory
-        (``update_transaction`` with ``notes=""``) so a sparse batch
-        can never mass-erase.
+        leave the field unchanged (the TSV's empty cells), while an
+        explicit ``""`` clears (produced only by the TSV ``clear``
+        column — an opt-in per-row declaration, so a sparse batch
+        still can never mass-erase by accident).
 
         ``on_error="abort"`` (default) sinks the batch on any bad
         row; ``"skip"`` keeps the good rows. ``force`` allows date
