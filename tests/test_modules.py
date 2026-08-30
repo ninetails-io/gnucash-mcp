@@ -100,7 +100,7 @@ class TestToolModulesMapping:
         1 get_job_report + 5 taxtable CRUD tools added in v1.3 +
         1 enter_statement added in v1.4.4."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 111
+        assert total == 90
 
     def test_expected_modules_exist(self):
         """All expected leaf-module names should be present.
@@ -264,9 +264,9 @@ class TestApplyModuleFilter:
         return set(mcp._tool_manager._tools.keys())
 
     def test_all_keeps_everything(self):
-        """--modules=all should keep all 111 tools (88 + 3 vouchers + 4 credit notes + 5 job CRUD + 1 job report + 5 taxtables + 1 batch prices)."""
+        """--modules=all should keep all 90 tools (the consolidated business surface: 5 parties + 9 documents + 6 reference + 5 jobs + 2 reports, alongside the unchanged modules)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 90
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -298,12 +298,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 90
 
     def test_all_in_list_keeps_everything(self):
         """'all' mixed with other modules should keep all 111 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 111
+        assert len(self._tool_names()) == 90
 
     def test_unknown_module_fails_fast(self, capsys):
         """Unknown module names fail-fast at startup with SystemExit.
@@ -371,8 +371,9 @@ class TestApplyModuleFilter:
         assert "create_job" in remaining
         assert "list_jobs" in remaining
         assert "get_job_report" in remaining
-        # Credit notes (polymorphic; customer refunds usable).
-        assert "create_credit_note" in remaining
+        # Credit notes ride the consolidated document tools
+        # (document_type="credit_note"); apply stays standalone.
+        assert "create_document" in remaining
         assert "apply_credit_note" in remaining
         # Vendor-specific surface must remain absent.
         assert "create_vendor" not in remaining
@@ -1123,7 +1124,7 @@ class TestMultiBook:
         alex, _ = two_books
         srv._book_paths = [alex.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 111
+        assert len(mcp._tool_manager._tools) == 90
 
     def test_tool_count_multi_book(self, two_books):
         """The lone runtime delta from single-book: switch_book (112).
@@ -1133,7 +1134,7 @@ class TestMultiBook:
         alex, beast = two_books
         srv._book_paths = [alex.resolve(), beast.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 112
+        assert len(mcp._tool_manager._tools) == 91
 
     # ── switch_book matching ───────────────────────────────────────
 

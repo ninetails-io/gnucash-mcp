@@ -2628,15 +2628,20 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            # The lifecycle tools register as
-                            # entity_type="invoice" but accept all
-                            # four document kinds — the response's
-                            # ``type`` field is the truth; swap so
-                            # the log doesn't mis-categorize.
+                            # Polymorphic tools register under one
+                            # entity_type but accept a family — the
+                            # response's ``type`` field is the truth;
+                            # swap so the log doesn't mis-categorize.
+                            # Document family registers "invoice";
+                            # party family registers "customer".
                             if (
                                 entity_type == "invoice"
                                 and result_data.get("type")
                                 in {"bill", "voucher", "credit_note"}
+                            ) or (
+                                entity_type == "customer"
+                                and result_data.get("type")
+                                in {"vendor", "employee"}
                             ):
                                 entry["entity_type"] = (
                                     result_data["type"]

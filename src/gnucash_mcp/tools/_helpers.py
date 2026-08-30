@@ -9,7 +9,7 @@ import logging
 import traceback
 from datetime import date
 from functools import wraps
-from typing import Annotated, Callable
+from typing import Annotated, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -329,6 +329,63 @@ def _gate_owner_type(owner_type: str | None) -> str | None:
             f"Business module."
         )
     return "customer"
+
+
+# The consolidated business surface's two type axes. Literal types
+# → the enum lands in the JSON schema, so capable clients constrain
+# at decode time and a wrong value never reaches the server.
+PartyType = Literal["customer", "vendor", "employee"]
+DocumentType = Literal["invoice", "bill", "voucher", "credit_note"]
+
+# Which module side each species belongs to. The polymorphic tools
+# live in Freelancer; the vendor/employee species unlock when
+# business_complete is loaded (same split _gate_owner_type enforces
+# for the lifecycle tools).
+_CUSTOMER_SIDE_DOCS = {"invoice"}
+
+
+def _gate_party_type(party_type: str | None) -> str | None:
+    """Enforce the Freelancer/Business split on ``party_type``.
+
+    Freelancer owns the customer side; vendor and employee
+    management requires business_complete. ``None`` (where a tool
+    allows it, e.g. list_parties) coerces to 'customer' without
+    Business and passes through (= all types) with it.
+    """
+    from gnucash_mcp.server import is_module_enabled
+
+    if is_module_enabled("business_complete"):
+        return party_type
+    if party_type in ("vendor", "employee"):
+        raise ValueError(
+            f"party_type={party_type!r} requires the business "
+            f"module. Restart the server with --modules=business "
+            f"(or add business_complete) to manage vendors and "
+            f"employees; Freelancer covers customers."
+        )
+    return "customer"
+
+
+def _gate_document_type(document_type: str | None) -> str | None:
+    """Enforce the Freelancer/Business split on ``document_type``.
+
+    Customer invoices (and credit notes, which carry their own
+    party side) stay Freelancer; vendor bills and employee
+    vouchers require business_complete.
+    """
+    from gnucash_mcp.server import is_module_enabled
+
+    if is_module_enabled("business_complete"):
+        return document_type
+    if document_type in ("bill", "voucher"):
+        raise ValueError(
+            f"document_type={document_type!r} requires the "
+            f"business module. Restart the server with "
+            f"--modules=business (or add business_complete) for "
+            f"vendor bills and employee vouchers; Freelancer "
+            f"covers customer invoices and credit notes."
+        )
+    return document_type if document_type is not None else "invoice"
 
 
 def _resolve_id_alias(

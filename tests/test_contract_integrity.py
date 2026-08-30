@@ -207,8 +207,16 @@ class TestAuditLogDispatcherCoverage:
         #    ``_format_audit_entry_text`` when ``new_parent`` is
         #    present in params.
         POLYMORPHIC_TARGETS: set[tuple[str, str]] = set()
+        # Document family: registered as "invoice", swapped to the
+        # response's type for the whole lifecycle (consolidated
+        # create/delete included).
         for entity in ("bill", "voucher", "credit_note"):
-            for op in ("POST", "UNPOST", "PAY"):
+            for op in ("POST", "UNPOST", "PAY", "CREATE", "DELETE"):
+                POLYMORPHIC_TARGETS.add((entity, op))
+        # Party family: registered as "customer", swapped to
+        # vendor/employee from the response's type.
+        for entity in ("vendor", "employee"):
+            for op in ("CREATE", "UPDATE", "DELETE"):
                 POLYMORPHIC_TARGETS.add((entity, op))
         POLYMORPHIC_TARGETS.add(("account", "MOVE"))
 
