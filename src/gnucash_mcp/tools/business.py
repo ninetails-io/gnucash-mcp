@@ -709,13 +709,11 @@ def register(mcp, get_book) -> None:
         tracking its balance — payable. **paid** = posted with a zero
         remaining balance (lot closed). **outstanding** = posted with
         a remaining balance — the unpaid subset; get it directly from
-        ``get_outstanding_invoices`` rather than deriving it here.
+        ``get_outstanding_documents`` rather than deriving it here.
         The ``status`` filter below covers document state
         (open/posted) only; settlement state lives on the lot.
 
         Args:
-            owner_type: Filter by type: "customer" for invoices,
-                        "vendor" for bills, or omit for all.
             status: Filter by status: "posted" or "open", or omit for all.
             document_type: Filter to one document kind
                 ("invoice", "bill", "voucher", "credit_note").
@@ -767,15 +765,17 @@ def register(mcp, get_book) -> None:
 
         Status vocabulary: open = editable, not yet booked; posted =
         on the books, payable; paid = remaining balance zero. The
-        full definitions live on ``list_invoices``; the unpaid list
-        is ``get_outstanding_invoices``.
+        full definitions live on ``list_documents``; the unpaid list
+        is ``get_outstanding_documents``.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001"). This is the
+            id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
-            owner_type: Filter by type: "customer" for invoices,
-                        "vendor" for bills. Useful when an invoice and
-                        bill share the same ID (independent counters).
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide
+                across per-type counters.
+            party_type: Owner side ("customer"/"vendor") — needed
+                only for credit notes, which exist on both sides.
         """
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
@@ -816,12 +816,14 @@ def register(mcp, get_book) -> None:
         beyond the 90-day staleness cap cannot be forced.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
+            id: Document ID (e.g., "000001").
             post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
-            owner_type: "customer", "vendor", or "employee" (vouchers) for disambiguation when IDs collide.
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
         """
@@ -861,9 +863,10 @@ def register(mcp, get_book) -> None:
         then unpost.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
-            owner_type: "customer" or "vendor" for disambiguation
-                when IDs collide.
+            id: Document ID (e.g., "000001").
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
         """
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",
@@ -936,12 +939,14 @@ def register(mcp, get_book) -> None:
         bill payments).
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
+            id: Document ID (e.g., "000001").
             payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
             amount: Payment amount as decimal string (e.g., "500.00").
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
-            owner_type: "customer" or "vendor" for disambiguation.
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
                 Accepts a full path, %short GUID, or full 32-char GUID.
@@ -1175,8 +1180,8 @@ def register(mcp, get_book) -> None:
 
         This is the authoritative unpaid list: outstanding = posted
         with a remaining balance > 0. One call answers "what is
-        actually unpaid?" — no need to combine ``list_invoices`` and
-        ``get_invoice`` (full status vocabulary on ``list_invoices``).
+        actually unpaid?" — no need to combine ``list_documents`` and
+        ``get_document`` (full status vocabulary on ``list_documents``).
 
         Leads with a ``Showing X-Y of Z invoices (date range)`` line,
         then a compact one-line-per-doc format by default with action
@@ -1187,10 +1192,10 @@ def register(mcp, get_book) -> None:
 
         Use verbose=true for structured JSON with ``original_amount`` /
         ``amount_paid`` / ``amount_due`` breakdown — the shape
-        ``pay_invoice`` workflows expect.
+        ``pay_document`` workflows expect.
 
         Args:
-            owner_type: Filter by "customer" or "vendor". Omit for all.
+            party_type: Filter by "customer" or "vendor". Omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
             verbose: If false (default), compact text output — optimized
