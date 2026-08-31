@@ -90,11 +90,17 @@ class PersonaPolicy:
     # row exists for a cross-currency settlement date. None = persona
     # has no cross-currency documents.
     ensure_rate: Callable[[Path, str, date], None] | None = None
+    # book_repairs(book_path, cutoff, through) -> list[str]: one-shot
+    # persona-specific repairs appended in narrative on first contact
+    # (e.g. Sabine's Ausgleichskonto clearing). Must be idempotent —
+    # check the book before writing.
+    book_repairs: Callable[[Path, date, date], list[str]] | None = None
     # Narrative templates. {month} is "%B %Y" of the statement close.
     desc_statement: str = "{label} — {month} statement payment"
     desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
     desc_sweep: str = "Transfer to savings (monthly surplus sweep)"
     desc_repair_sweep: str = "Transfer to savings — accumulated surplus"
+    desc_topup: str = "Transfer from savings (checking top-up)"
     desc_interest: str = "{label} — interest"
     # A statement payment this many times the trailing month's charges
     # (or larger) gets the repair narrative instead of the routine one.
@@ -284,6 +290,26 @@ def _sweep(book: GnuCashBook, policy: PersonaPolicy, book_path: Path,
     share in cadence months, both bounded by the staging cap."""
     checking = _balance(book, policy.checking, month_end)
     surplus = checking - policy.buffer
+
+    # The corridor's LOW side: a flow account that dipped under half
+    # the buffer gets topped back up from savings (the move a real
+    # person makes when checking runs thin — Sabine's Bankkonto lives
+    # this way). The sweep is the HIGH side of the same corridor.
+    if checking < policy.buffer * D("0.5"):
+        available = _balance(book, policy.savings, month_end)
+        topup = min(policy.buffer - checking, available).quantize(D("0.01"))
+        if topup >= policy.min_sweep:
+            book.create_transaction(
+                description=policy.desc_topup, trans_date=month_end,
+                splits=[
+                    {"account": policy.savings, "amount": str(-topup)},
+                    {"account": policy.checking, "amount": str(topup)},
+                ],
+                check_duplicates=False,
+            )
+            log.append(f"topup←savings: {topup} on {month_end}")
+        return
+
     if surplus < policy.min_sweep:
         return
     sweep_total = min(surplus, policy.max_monthly_sweep)

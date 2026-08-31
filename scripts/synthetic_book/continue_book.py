@@ -88,6 +88,10 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
     for line in settled:
         print(f"   {line}")
 
+    if policy.book_repairs is not None:
+        for line in policy.book_repairs(book_path, cutoff, through):
+            print(f"   repair: {line}")
+
     book = GnuCashBook(str(book_path))
     biz = mod.continue_business(book, through, cutoff)
     print(f"   business: {biz}")
