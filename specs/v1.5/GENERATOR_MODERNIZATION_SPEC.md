@@ -7,9 +7,11 @@ rebuild_all --continue-only, CI bundle step switched to the
 updater). Scratch-verified per persona and soak-tested through
 2026-12-31; full CI rehearsal green on the committed books; suite
 2128 green. §4 records where the implementation extended the spec.
-Post-1.4.4 cargo: RUNNING it on the canonical books is a
-deliberate, capture-invalidating event and feeds the September
-bundle-regeneration + Abe's fresh corpus — not Tuesday's tag.**
+Bookkeeper review closed same day, no carried items
+(testing/BOOKKEEPER_REVIEW_DEMO_GENERATORS.md). RE-SCOPED
+2026-08-31 (maintainer): ships IN v1.4.4 — the earlier
+"post-1.4.4 cargo" hold is retired; the v1.4.4 bundle is the
+first fully generated one.**
 
 ## 1. The disease, diagnosed in the source
 
@@ -183,13 +185,13 @@ this work. The endgame:
   Dockerfile gains the same generate-at-build RUN step,
   validated locally first and shipped with a release it was
   riding anyway (the discipline from the evangelism window).
-- Post-1.4.4-tag work, all of it: Tuesday's bundle ships the
-  committed books one last time; this program lands as one
-  September arc (policy layer → repaired+current books → CI
-  generation → docs), targeting the v1.5.0 bundle as the first
-  fully generated one. (An earlier draft said "untrack" here —
-  retired by the same evening's refined ruling above: the
-  committed blobs stay tracked forever as the permanent prefix.)
+- Sequencing RE-RULED 2026-08-31 (maintainer): the whole program
+  ships IN v1.4.4 — policy layer, repaired+current books, CI
+  generation, docs — making the v1.4.4 bundle the first fully
+  generated one. (Two earlier drafts retired: "untrack" fell to
+  the refined ruling above — the committed blobs stay tracked
+  forever as the permanent prefix — and the "post-1.4.4 / one
+  September arc" hold fell to the release-day re-scope.)
 - Alex first (richest policy surface), then Lin Wei (revolver
   policy), then Sabine (simplest). Verify per-persona.
 - Market data: committed cache; `--skip-refresh` offline
