@@ -59,9 +59,30 @@ emits identical transactions.
    history as a byte-stable prefix).
 2. Emit the deterministic streams for (cutoff, through] —
    recurring, daily/weekly, seasonal, income, business events.
-3. At each month boundary, run the policy pass (2.1) against the
-   book as written so far: card payments, sweeps, investment lots.
-4. Verify (2.4), save.
+   IMPLEMENTATION NOTE (audit finding): the txn-dict streams
+   (`gen_*`) filter trivially by date, but the book-WRITING
+   functions (`run_business`, `run_investments`,
+   `run_vtsax_sweep`) loop over their own date plans and write
+   directly — each gains a `since: date` cutoff parameter and
+   skips events ≤ cutoff, or continuation double-creates the
+   prefix's invoices and lots. Same one-line guard in each loop.
+3. **Advance scheduled-transaction metadata** (audit finding —
+   this is pathology #4): the SX templates' `last_occur` fields
+   are stale on the frozen books, which is exactly why the
+   dashboards scream "14 overdue" — the transactions exist (the
+   recurring stream wrote them) but the templates never learned.
+   Continuation sets each enabled SX's `last_occur` to its
+   latest realized occurrence ≤ through, so a freshly continued
+   book opens with a CLEAN dashboard: no overdue-scheduled
+   noise, no stale-price wall (the cache-priced continuation
+   refreshes prices too). The demo book's first impression is
+   the whole point of the program.
+4. At each month boundary, run the policy pass (2.1) against the
+   book as written so far. Card statement days come from each
+   card's `statement_close_day` slot where set (the existing
+   slot convention), else month-end; payment posts 3–7 seeded
+   days later.
+5. Verify (2.4), save.
 
 Full rebuild = today's prefix build through its cliff date, then
 THE SAME continuation engine for every month after. One code path
