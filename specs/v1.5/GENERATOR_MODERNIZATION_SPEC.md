@@ -115,18 +115,25 @@ job is to be alive and current on first open; "frozen" was the
 testing frame (byte-stable capture fixtures), and it retires with
 this work. The endgame:
 
-- **Books leave the repo entirely.** `git rm --cached
-  samples/*.gnucash` + gitignore; the repo ships GENERATORS plus
-  the committed rates cache (diffable text, kilobytes/year). The
-  32MB already in history is sunk cost; growth stops at zero
-  forever.
-- **MCPBs carry the books.** The CI bundle job generates fresh,
-  current-dated books at build time (`rebuild_all
-  --skip-refresh`, the design settled 2026-08-27) and packs
-  them. Release assets can carry standalone copies for
-  no-bundle users. Clones get a `make books` regeneration path;
-  README's try-it flow points at generated or Release-asset
-  books instead of `samples/` blobs.
+- **Clones carry the frozen state, plus the updater** (refined
+  ruling, same evening). The committed blobs STAY tracked at
+  their current bytes forever — the permanent starting prefix,
+  never re-committed. `continue_book` doubles as the UPDATER: any
+  clone runs it to bring its working copies current through
+  today (working-tree drift, never staged — the drift-by-design
+  policy already covers it). Zero new blob bytes ever enter
+  history.
+- **The rates cache is the one living artifact in git**: a
+  small, textual PR each month extends
+  `market_data_cache.json`'s tail so the updater stays
+  realistic offline. (A natural scheduled ritual once the price
+  auto-updater lands — same data source, opposite direction.)
+- **MCPBs carry CURRENT books.** The CI bundle job runs the SAME
+  updater a clone user runs — frozen prefix + continuation
+  through build date, `--skip-refresh` off the committed cache —
+  and packs the result (design settled 2026-08-27). Release
+  assets can carry standalone copies. The bundle exercising the
+  updater on every build is its own regression test.
 - **Glama consequence, planned not re-litigated:** the sandbox
   Dockerfile gains the same generate-at-build RUN step,
   validated locally first and shipped with a release it was
