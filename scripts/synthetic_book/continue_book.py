@@ -89,16 +89,16 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
         print(f"   {line}")
 
     book = GnuCashBook(str(book_path))
-    biz = mod.run_business(book, through, since=cutoff)
+    biz = mod.continue_business(book, through, cutoff)
     print(f"   business: {biz}")
-    inv = mod.run_investments(book_path, through, since=cutoff)
+    inv = mod.continue_investments(book_path, through, cutoff)
     print(f"   investments: {inv}")
 
     actions = continuation.run_policy(policy, book_path, cutoff, through)
     for line in actions:
         print(f"   policy: {line}")
 
-    sx = mod.set_schedule_state(book_path, through)
+    sx = mod.advance_schedules(book_path, through)
     print(f"   schedules: {sx}")
 
     warnings = continuation.verify_invariants(policy, book_path, cutoff,

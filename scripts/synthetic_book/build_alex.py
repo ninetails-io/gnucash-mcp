@@ -3025,6 +3025,20 @@ def continuation_txns(through: date) -> list[dict]:
             + gen_volume(through))
 
 
+def continue_business(book: GnuCashBook, through: date,
+                      since: date) -> dict:
+    return run_business(book, through, since=since)
+
+
+def continue_investments(out_path: Path, through: date,
+                         since: date) -> dict:
+    return run_investments(out_path, through, since=since)
+
+
+def advance_schedules(out_path: Path, through: date) -> dict:
+    return set_schedule_state(out_path, through)
+
+
 def extend_prices(out_path: Path, since: date, through: date) -> int:
     """Price rows for the continued range: 1st-of-month snapshots, a
     fresh closing point per commodity, and on-date quotes for the new

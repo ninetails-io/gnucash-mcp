@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -1687,59 +1687,102 @@ def gen_contractor_income() -> list[dict]:
 
 # ── Phase 7b: Business module (customers, vendors, invoices, bills)
 
-def run_business(book: GnuCashBook) -> dict:
+def _party_by_name(book: GnuCashBook, name: str) -> dict:
+    """Find an existing customer/vendor row by exact name (continuation
+    mode — entities live in the frozen prefix and are never recreated)."""
+    for lister in (book.list_customers, book.list_vendors):
+        env = lister(compact=False, limit=250)
+        rows = next((v for v in env.values() if isinstance(v, list)), [])
+        for row in rows:
+            if row.get("name") == name:
+                return row
+    raise SystemExit(f"continuation: party {name!r} not found in book")
+
+
+def _job_by_name(book: GnuCashBook, name: str) -> dict:
+    env = book.list_jobs(compact=False, limit=250)
+    rows = next((v for v in env.values() if isinstance(v, list)), [])
+    for row in rows:
+        if row.get("name") == name:
+            return row
+    raise SystemExit(f"continuation: job {name!r} not found in book")
+
+
+def run_business(book: GnuCashBook, since: date | None = None) -> dict:
     """Create billterms, customers, vendors, invoices, and bills.
 
     Returns a small dict of counts plus the JetBrains bill id (for
     verification).
+
+    ``since`` (continuation mode): entities and jobs already exist in
+    the frozen prefix — look them up instead of creating; emit only
+    documents opened AFTER ``since``, and skip a THROUGH-relative
+    "recent open" document while its predecessor is still outstanding.
     """
     counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
               "terms": 0}
 
-    book.create_billterm(name="Net 15", due_days=15,
-                         description="15天内付款")
-    book.create_billterm(name="Net 30", due_days=30,
-                         description="30天内付款")
-    book.create_billterm(name="2/10 Net 30", due_days=30, discount_days=10,
-                         discount_percent="2",
-                         description="10天内付款享2%折扣")
-    counts["terms"] = 3
+    open_owner_names: set[str] = set()
+    if since is None:
+        book.create_billterm(name="Net 15", due_days=15,
+                             description="15天内付款")
+        book.create_billterm(name="Net 30", due_days=30,
+                             description="30天内付款")
+        book.create_billterm(name="2/10 Net 30", due_days=30,
+                             discount_days=10, discount_percent="2",
+                             description="10天内付款享2%折扣")
+        counts["terms"] = 3
 
-    # Customers.
-    shenzhen = book.create_customer(
-        name="深圳跨境电商有限公司", currency="CNY",
-        notes="本地跨境电商客户, Net 30")
-    pacific = book.create_customer(
-        name="Pacific Trade Solutions", currency="USD",
-        notes="美国客户, 移动应用外包, Net 30")
-    munich = book.create_customer(
-        name="Handelskontor München GmbH", currency="EUR",
-        notes="德国客户, ERP 集成项目, Net 30")
-    counts["customers"] = 3
+        # Customers.
+        shenzhen = book.create_customer(
+            name="深圳跨境电商有限公司", currency="CNY",
+            notes="本地跨境电商客户, Net 30")
+        pacific = book.create_customer(
+            name="Pacific Trade Solutions", currency="USD",
+            notes="美国客户, 移动应用外包, Net 30")
+        munich = book.create_customer(
+            name="Handelskontor München GmbH", currency="EUR",
+            notes="德国客户, ERP 集成项目, Net 30")
+        counts["customers"] = 3
 
-    # Vendors.
-    alibaba = book.create_vendor(
-        name="阿里云", currency="CNY", notes="云服务")
-    jetbrains = book.create_vendor(
-        name="JetBrains", currency="USD",
-        notes="IDE 年度订阅")
-    urwork = book.create_vendor(
-        name="优客工场", currency="CNY", notes="联合办公空间")
-    counts["vendors"] = 3
+        # Vendors.
+        alibaba = book.create_vendor(
+            name="阿里云", currency="CNY", notes="云服务")
+        jetbrains = book.create_vendor(
+            name="JetBrains", currency="USD",
+            notes="IDE 年度订阅")
+        urwork = book.create_vendor(
+            name="优客工场", currency="CNY", notes="联合办公空间")
+        counts["vendors"] = 3
 
-    # Jobs — multi-invoice projects (owner_type=job over customers), matching
-    # the prior hand-built book's 3 active jobs. A couple of invoices below
-    # attach to these via job_id so get_job_report has data.
-    job_sz = book.create_job(
-        owner_id=shenzhen["id"], owner_type="customer",
-        name="跨境电商平台改版", reference="SZ-2025-01")
-    job_pacific = book.create_job(
-        owner_id=pacific["id"], owner_type="customer",
-        name="Pacific Mobile App v2", reference="PAC-2025-Q3")
-    job_munich = book.create_job(
-        owner_id=munich["id"], owner_type="customer",
-        name="München ERP-Integration", reference="MUC-2025-11")
-    counts["jobs"] = 3
+        # Jobs — multi-invoice projects (owner_type=job over customers),
+        # matching the prior hand-built book's 3 active jobs. A couple of
+        # invoices below attach to these via job_id so get_job_report has
+        # data.
+        job_sz = book.create_job(
+            owner_id=shenzhen["id"], owner_type="customer",
+            name="跨境电商平台改版", reference="SZ-2025-01")
+        job_pacific = book.create_job(
+            owner_id=pacific["id"], owner_type="customer",
+            name="Pacific Mobile App v2", reference="PAC-2025-Q3")
+        job_munich = book.create_job(
+            owner_id=munich["id"], owner_type="customer",
+            name="München ERP-Integration", reference="MUC-2025-11")
+        counts["jobs"] = 3
+    else:
+        shenzhen = _party_by_name(book, "深圳跨境电商有限公司")
+        pacific = _party_by_name(book, "Pacific Trade Solutions")
+        munich = _party_by_name(book, "Handelskontor München GmbH")
+        alibaba = _party_by_name(book, "阿里云")
+        jetbrains = _party_by_name(book, "JetBrains")
+        urwork = _party_by_name(book, "优客工场")
+        job_sz = _job_by_name(book, "跨境电商平台改版")
+        job_pacific = _job_by_name(book, "Pacific Mobile App v2")
+        job_munich = _job_by_name(book, "München ERP-Integration")
+        env = book.get_outstanding_invoices(compact=False, limit=250)
+        open_owner_names = {
+            doc.get("owner_name") for doc in env.get("invoices", [])
+        }
 
     def run_invoice(customer_id, date_open, date_pay,
                     amount, description, currency, post_account,
@@ -1750,6 +1793,8 @@ def run_business(book: GnuCashBook) -> dict:
         False the invoice is posted but left OUTSTANDING (a receivables
         demo surface). ``job_id`` groups the invoice under a Job.
         """
+        if since is not None and date_open <= since:
+            return None
         inv = book.create_invoice(
             customer_id=customer_id, date_opened=date_open.isoformat(),
             currency=currency, term="Net 30", job_id=job_id,
@@ -1795,15 +1840,17 @@ def run_business(book: GnuCashBook) -> dict:
             job_id=(job_sz["id"] if m in (1, 2) else None),
         )
     # Shenzhen OUTSTANDING (CNY A/R demo surface): one recent + one older
-    # open invoice, both unpaid.
-    run_invoice(
-        shenzhen["id"], recent_open, recent_open, "15000",
-        f"{recent_open.strftime('%Y年%m月')} 平台改版里程碑",
-        "CNY", AR_CNY, pay=False, job_id=job_sz["id"])
-    run_invoice(
-        shenzhen["id"], date(YEAR + 1, 1, 1), date(YEAR + 1, 1, 1), "9000",
-        f"{date(YEAR + 1, 1, 1).strftime('%Y年%m月')} 运维支持",
-        "CNY", AR_CNY, pay=False)
+    # open invoice, both unpaid. Continuation: skipped while a Shenzhen
+    # document is still outstanding (don't stack open invoices).
+    if "深圳跨境电商有限公司" not in open_owner_names:
+        run_invoice(
+            shenzhen["id"], recent_open, recent_open, "15000",
+            f"{recent_open.strftime('%Y年%m月')} 平台改版里程碑",
+            "CNY", AR_CNY, pay=False, job_id=job_sz["id"])
+        run_invoice(
+            shenzhen["id"], date(YEAR + 1, 1, 1), date(YEAR + 1, 1, 1), "9000",
+            f"{date(YEAR + 1, 1, 1).strftime('%Y年%m月')} 运维支持",
+            "CNY", AR_CNY, pay=False)
 
     # Pacific Trade (USD → AR USD): the 2025 plan is PAID cross-currency to
     # CNY (PACIFIC_PLAN shares dates with the price layer). The Q3 batch
@@ -1817,10 +1864,11 @@ def run_business(book: GnuCashBook) -> dict:
             "USD", AR_USD,
             job_id=(job_pacific["id"] if m == 9 else None),
         )
-    run_invoice(
-        pacific["id"], recent_open, recent_open, "5200",
-        f"{recent_open.strftime('%B %Y')} retainer + change requests",
-        "USD", AR_USD, pay=False, job_id=job_pacific["id"])
+    if "Pacific Trade Solutions" not in open_owner_names:
+        run_invoice(
+            pacific["id"], recent_open, recent_open, "5200",
+            f"{recent_open.strftime('%B %Y')} retainer + change requests",
+            "USD", AR_USD, pay=False, job_id=job_pacific["id"])
 
     # Munich (EUR → AR EUR): the 2025 plan is PAID cross-currency to CNY.
     # One older + one recent EUR invoice are left OUTSTANDING.
@@ -1832,20 +1880,23 @@ def run_business(book: GnuCashBook) -> dict:
             "EUR", AR_EUR,
             job_id=(job_munich["id"] if m == 11 else None),
         )
-    run_invoice(
-        munich["id"], prev_open, prev_open, "4100",
-        f"{prev_open.strftime('%B %Y')} ERP-Integration Phase 2",
-        "EUR", AR_EUR, pay=False, job_id=job_munich["id"])
-    run_invoice(
-        munich["id"], recent_open, recent_open, "2800",
-        f"{recent_open.strftime('%B %Y')} Wartung",
-        "EUR", AR_EUR, pay=False)
+    if "Handelskontor München GmbH" not in open_owner_names:
+        run_invoice(
+            munich["id"], prev_open, prev_open, "4100",
+            f"{prev_open.strftime('%B %Y')} ERP-Integration Phase 2",
+            "EUR", AR_EUR, pay=False, job_id=job_munich["id"])
+        run_invoice(
+            munich["id"], recent_open, recent_open, "2800",
+            f"{recent_open.strftime('%B %Y')} Wartung",
+            "EUR", AR_EUR, pay=False)
 
     # Vendor bills.
     def run_bill(vendor_id, date_open, date_pay, amount,
                  description, expense_account, currency,
                  payment_account=CHECKING, pay=True, post_account=AP):
         """Create → post → (optionally) pay a vendor bill. Dates are ``date``."""
+        if since is not None and date_open <= since:
+            return None
         bill = book.create_bill(
             vendor_id=vendor_id, date_opened=date_open.isoformat(),
             currency=currency, term="Net 30",
@@ -1894,11 +1945,13 @@ def run_business(book: GnuCashBook) -> dict:
     # converts off the bill currency regardless of the A/P account commodity,
     # so M2 coverage holds without a USD-denominated A/P account.
     jetbrains_post = recent_open
-    jetbrains_bill_id = run_bill(
-        jetbrains["id"], jetbrains_post, jetbrains_post, "249",
-        "JetBrains All Products Pack (annual subscription)",
-        EXP_SOFTWARE, "USD", pay=False, post_account=AP,
-    )
+    jetbrains_bill_id = None
+    if "JetBrains" not in open_owner_names:
+        jetbrains_bill_id = run_bill(
+            jetbrains["id"], jetbrains_post, jetbrains_post, "249",
+            "JetBrains All Products Pack (annual subscription)",
+            EXP_SOFTWARE, "USD", pay=False, post_account=AP,
+        )
 
     counts["jetbrains_bill_id"] = jetbrains_bill_id
     return counts
@@ -1938,8 +1991,12 @@ def _whole_units(budget: Decimal, price: Decimal, lot: int) -> Decimal:
     return Decimal(units)
 
 
-def run_investments(out_path: Path) -> dict:
-    """Monthly DCA, quarterly trades, and dividends. Direct piecash."""
+def run_investments(out_path: Path, since: date | None = None) -> dict:
+    """Monthly DCA, quarterly trades, and dividends. Direct piecash.
+
+    ``since`` (continuation mode): skip every event dated on or before
+    it — those trades and lots already exist in the frozen prefix."""
+    cut = since or date(YEAR, 1, 1) - timedelta(days=1)
     book = piecash.open_book(str(out_path), readonly=False)
     counts = {"txns": 0, "lots": 0}
     try:
@@ -1961,7 +2018,7 @@ def run_investments(out_path: Path) -> dict:
         dca = [("510300", D("2000")), ("159915", D("1000"))]
         for yy, m in iter_months():
             d = _clamp_day(yy, m, 1)
-            if not _on_or_before_through(d):
+            if not _on_or_before_through(d) or d <= cut:
                 continue
             for sym, budget in dca:
                 price = real_price(sym, d)
@@ -1989,6 +2046,8 @@ def run_investments(out_path: Path) -> dict:
         # price layer wrote), so booked value == shares × real price.
         for m, day, action, sym, shares in INVESTMENT_TRADES:
             d = date(YEAR, m, day)
+            if d <= cut:
+                continue
             price = real_price(sym, d)
             inv_acct = acct[ACCT_BY_SYMBOL[sym]]
             cny_amt = (shares * price).quantize(D("0.01"))
@@ -2043,6 +2102,8 @@ def run_investments(out_path: Path) -> dict:
             (8, 15, "宁德时代 现金分红", D("90")),     # 30 sh × ~¥3
         ]
         for m, day, desc, amt in dividends:
+            if date(YEAR, m, day) <= cut:
+                continue
             piecash.Transaction(
                 currency=cny, description=desc, post_date=date(YEAR, m, day),
                 splits=[
@@ -2733,6 +2794,169 @@ def verify(out_path: Path, business: dict) -> None:
     for r in bs["liabilities"]["accounts"]:
         print(f"    {r}")
     print(f"  TOTAL liabilities: {bs['liabilities']['total']}")
+
+
+# ── Continuation hooks (closed-loop policy layer) ───────────────
+# Persona wiring for scripts/synthetic_book/continue_book.py; policy
+# constants derived from the measured drift in
+# specs/v1.5/DRIFT_ANALYSIS.md. Lin Wei is the DELIBERATE revolver:
+# her 招商 card rides its 50%-utilization bound and her interest
+# burden is load-bearing for the debt-payoff demos.
+
+from continuation import CardPolicy, PersonaPolicy  # noqa: E402
+
+
+def continuation_txns(through: date) -> list[dict]:
+    """The deterministic streams continuation replays (spec §2.2).
+    ``gen_credit_cards`` is deliberately absent — the policy layer
+    derives payments and interest from the book itself; the HSBC HKD
+    card's scripted arc stays prefix history ("leave 汇丰",
+    DRIFT_ANALYSIS)."""
+    global THROUGH
+    THROUGH = through
+    return (gen_recurring() + gen_daily_weekly() + gen_personal_life()
+            + gen_contractor_income() + gen_volume())
+
+
+def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
+    """Real CNY-base quotes for (symbol, date) pairs, skipping any the
+    book already has (the prefix's price table is never touched)."""
+    book = piecash.open_book(str(out_path), readonly=False)
+    count = 0
+    try:
+        cny = book.default_currency
+        comm_by = {c.mnemonic: c for c in book.commodities}
+        seen: set[tuple[str, str]] = set()
+        for p in book.prices:
+            when = p.date.date() if hasattr(p.date, "date") else p.date
+            seen.add((p.commodity.mnemonic, when.isoformat()))
+        for sym, when in pairs:
+            key = (sym, when.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            piecash.Price(
+                commodity=comm_by[sym], currency=cny, date=when,
+                value=real_price(sym, when), type="last",
+                source="user:market-data",
+            )
+            count += 1
+        book.save()
+    finally:
+        book.close()
+    return count
+
+
+def extend_prices(out_path: Path, since: date, through: date) -> int:
+    """Continuation prices: 1st-of-month snapshots in (since, through]
+    plus a fresh closing point per commodity."""
+    global THROUGH
+    THROUGH = through
+    pairs: list[tuple[str, date]] = []
+    for d in price_months():
+        if d <= since:
+            continue
+        pairs += [(sym, d)
+                  for sym in FOREIGN_CURRENCIES + SECURITY_MNEMONICS]
+    for sym in FOREIGN_CURRENCIES:
+        pairs.append((sym, min(through, MD.latest_fx_date(sym, "CNY"))))
+    for sym in SECURITY_MNEMONICS:
+        pairs.append((sym, min(through, MD.latest_security_date(sym))))
+    return _add_price_rows(out_path, pairs)
+
+
+def ensure_rate(out_path: Path, currency: str, when: date) -> None:
+    """Real FX close for a cross-currency settlement date (no-op when
+    a rate for that date is already on file)."""
+    _add_price_rows(out_path, [(currency, when)])
+
+
+def continuation_invest(out_path: Path, when: date, amount: Decimal,
+                        source_path: str) -> None:
+    """Policy-layer 沪深300 purchase: whole round lots at the real
+    close, one lot per purchase, mirroring the DCA lot pattern. Source
+    is 支票账户 (surplus sweep) or 储蓄账户 (pile rebalance)."""
+    _add_price_rows(out_path, [("510300", when)])
+    book = piecash.open_book(str(out_path), readonly=False)
+    try:
+        cny = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        price = real_price("510300", when)
+        units = _whole_units(amount, price, ROUND_LOT["510300"])
+        cost = (units * price).quantize(D("0.01"))
+        kind = "储蓄调仓" if source_path == SAVINGS else "结余投资"
+        lot = piecash.Lot(
+            title=f"510300 {kind} {when.isoformat()}",
+            account=acct[CSI300],
+            notes=f"{kind} {units} 份 @ ¥{price}", is_closed=0)
+        inv_split = piecash.Split(account=acct[CSI300], value=cost,
+                                  quantity=units)
+        cash_split = piecash.Split(account=acct[source_path], value=-cost)
+        piecash.Transaction(
+            currency=cny, description=f"买入 510300（{kind}）",
+            post_date=when, splits=[inv_split, cash_split])
+        inv_split.lot = lot
+        book.save()
+    finally:
+        book.close()
+
+
+def continue_business(book: GnuCashBook, through: date,
+                      since: date) -> dict:
+    global THROUGH
+    THROUGH = through
+    return run_business(book, since=since)
+
+
+def continue_investments(out_path: Path, through: date,
+                         since: date) -> dict:
+    global THROUGH
+    THROUGH = through
+    return run_investments(out_path, since=since)
+
+
+def advance_schedules(out_path: Path, through: date):
+    global THROUGH
+    THROUGH = through
+    return set_schedule_state(out_path)
+
+
+POLICY = PersonaPolicy(
+    key="lin-wei", currency="CNY",
+    checking=CHECKING, savings=SAVINGS,
+    buffer=D("40000"),                 # DRIFT_ANALYSIS: measured floor
+    cards=(
+        # 招商: the deliberate revolver — pays down to 50% of its
+        # ¥80,000 limit on first contact (¥7,817, DRIFT ANALYSIS), then
+        # minimum-plus payments hold it at the bound; interest accrues.
+        CardPolicy(account=CMB_CARD, label="招商银行信用卡", kind="revolver",
+                   close_day_default=25, bound_utilization=D("0.50"),
+                   payment_plus=D("600"), accrue_interest=True,
+                   interest_account=EXP_CC_INT),
+        # 工商: the nobody-pays-this card. max_payment turns the ¥7.2k
+        # arrears into a ¥1,500/month catch-up (DRIFT prescription);
+        # once cleared the floor payment covers each cycle's charges.
+        CardPolicy(account=ICBC_CARD, label="工商银行信用卡", kind="revolver",
+                   close_day_default=20, payment_plus=D("1400"),
+                   max_payment=D("1500"), accrue_interest=True,
+                   interest_account=EXP_CC_INT),
+        # 汇丰 HKD card: left alone by policy (DRIFT: static, scripted
+        # prefix history).
+    ),
+    savings_share=D("0.60"),           # thin sweeps — she stays cash-tight
+    invest_months=(3, 6, 9, 12),
+    savings_target=D("120000"),
+    rebalance_tranche=D("15000"),      # smaller tranches (ruled 2026-08-31)
+    max_monthly_sweep=D("25000"),      # staging cap for the ¥193k pile
+    min_sweep=D("500"),
+    invest=continuation_invest,
+    ensure_rate=ensure_rate,
+    desc_statement="{label} 还款",
+    desc_repair_card="{label} 还款（清理累积欠款）",
+    desc_sweep="转入储蓄账户（月度结余）",
+    desc_repair_sweep="转入储蓄账户（结余归集）",
+    desc_interest="{label} 利息",
+)
 
 
 # ── Driver ──────────────────────────────────────────────────────

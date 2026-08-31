@@ -58,6 +58,7 @@ class CardPolicy:
     # Revolver-only knobs (None on PIF cards):
     bound_utilization: D | None = None  # pay DOWN to this share of limit
     payment_plus: D | None = None       # steady-state payment above interest
+    max_payment: D | None = None        # catch-up cap (gradual paydown)
     accrue_interest: bool = False       # policy books monthly interest
     interest_account: str | None = None  # expense account for accrual
     # Absolute floor for the repair narrative (default: buffer / 2).
@@ -94,8 +95,7 @@ class PersonaPolicy:
     desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
     desc_sweep: str = "Transfer to savings (monthly surplus sweep)"
     desc_repair_sweep: str = "Transfer to savings — accumulated surplus"
-    desc_rebalance: str = "Brokerage transfer — savings rebalance"
-    desc_invest: str = "Surplus sweep to investments"
+    desc_interest: str = "{label} — interest"
     # A statement payment this many times the trailing month's charges
     # (or larger) gets the repair narrative instead of the routine one.
     repair_factor: D = D("3")
@@ -210,7 +210,7 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
             interest = (owed * apr / D("100") / D("12")).quantize(D("0.01"))
             if interest > 0:
                 book.create_transaction(
-                    description=f"{card.label} — interest",
+                    description=policy.desc_interest.format(label=card.label),
                     trans_date=close,
                     splits=[
                         {"account": card.account, "amount": str(-interest)},
@@ -220,15 +220,21 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
                     check_duplicates=False,
                 )
                 owed += interest
-        bound = (limit * (card.bound_utilization or D("1"))).quantize(
-            D("0.01"))
+        # NB: an explicit None-check — Decimal("0") is falsy, so ``or``
+        # would silently turn a pay-to-zero bound into pay-to-limit.
+        bound_util = (card.bound_utilization
+                      if card.bound_utilization is not None else D("1"))
+        bound = (limit * bound_util).quantize(D("0.01"))
         # Pay DOWN to the bound (the deliberate-debt persona keeps her
         # profile), with at least interest+payment_plus so the balance
-        # never ratchets while under the bound.
+        # never ratchets while under the bound. max_payment turns a
+        # large arrears into a gradual catch-up instead of one payoff.
         floor_payment = ((card.payment_plus or D("0"))
                          + (owed * (apr or D("0")) / D("100") / D("12"))
                          ).quantize(D("0.01"))
         payment = max(owed - bound, floor_payment)
+        if card.max_payment is not None:
+            payment = min(payment, card.max_payment)
         payment = min(payment, owed)
     else:
         payment = owed
@@ -444,25 +450,28 @@ def verify_invariants(policy: PersonaPolicy, book_path: Path, cutoff: date,
     warnings: list[str] = []
     book = GnuCashBook(str(book_path))
 
-    for month_end in month_ends(cutoff, through):
+    limits = {card.account: _slot_decimal(book, card.account, "credit_limit")
+              for card in policy.cards}
+    for month_end in list(month_ends(cutoff, through)) + [through]:
         checking = _balance(book, policy.checking, month_end)
         if checking < 0:
             raise SystemExit(
                 f"{policy.key}: OVERDRAFT — checking {checking} at "
                 f"{month_end}")
         lo, hi = policy.buffer * D("0.5"), policy.buffer * D("3")
-        if not (lo <= checking <= hi):
+        if month_end != through and not (lo <= checking <= hi):
             warnings.append(
                 f"buffer band: checking {checking} outside "
                 f"[{lo}, {hi}] at {month_end}")
+        for card in policy.cards:
+            limit = limits[card.account]
+            owed = -_balance(book, card.account, month_end)
+            if limit is not None and owed > limit:
+                raise SystemExit(
+                    f"{policy.key}: {card.label} owes {owed} over limit "
+                    f"{limit} at {month_end}")
 
     for card in policy.cards:
-        owed = -_balance(book, card.account, through)
-        limit = _slot_decimal(book, card.account, "credit_limit")
-        if limit is not None and owed > limit:
-            raise SystemExit(
-                f"{policy.key}: {card.label} owes {owed} over limit "
-                f"{limit} at {through}")
         if card.kind != "pif":
             continue
         # After each statement payment the residual is only the charges
