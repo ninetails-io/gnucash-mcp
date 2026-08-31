@@ -1,10 +1,15 @@
 # Closed-loop generators — continuation, policy, and drift repair
 
 Status: **spec written 2026-08-30 (Stephen's directive, same
-evening); implementation begins on this branch. Post-1.4.4 cargo:
-regenerated books are a deliberate, capture-invalidating event and
-feed the September bundle-regeneration + Abe's fresh corpus — not
-Tuesday's tag.**
+evening); ENGINE + ALL THREE PERSONAS IMPLEMENTED 2026-08-31 on
+this branch (continuation.py, continue_book.py, per-builder wiring,
+rebuild_all --continue-only, CI bundle step switched to the
+updater). Scratch-verified per persona and soak-tested through
+2026-12-31; full CI rehearsal green on the committed books; suite
+2128 green. §4 records where the implementation extended the spec.
+Post-1.4.4 cargo: RUNNING it on the canonical books is a
+deliberate, capture-invalidating event and feeds the September
+bundle-regeneration + Abe's fresh corpus — not Tuesday's tag.**
 
 ## 1. The disease, diagnosed in the source
 
@@ -180,9 +185,11 @@ this work. The endgame:
   riding anyway (the discipline from the evangelism window).
 - Post-1.4.4-tag work, all of it: Tuesday's bundle ships the
   committed books one last time; this program lands as one
-  September arc (policy layer → repaired+current books →
-  untrack → CI generation → docs), targeting the v1.5.0 bundle
-  as the first fully generated one.
+  September arc (policy layer → repaired+current books → CI
+  generation → docs), targeting the v1.5.0 bundle as the first
+  fully generated one. (An earlier draft said "untrack" here —
+  retired by the same evening's refined ruling above: the
+  committed blobs stay tracked forever as the permanent prefix.)
 - Alex first (richest policy surface), then Lin Wei (revolver
   policy), then Sabine (simplest). Verify per-persona.
 - Market data: committed cache; `--skip-refresh` offline
@@ -193,7 +200,47 @@ this work. The endgame:
   cache version, --through date) — determinism replaces
   byte-identity as the oracle property.
 
-## 4. What this is not
+## 4. Implementation notes — where the build extended the spec
+(added 2026-08-31, for maintainer review; each is reversible code
+on this branch, none has touched a canonical book)
+
+- **A/R–A/P settlement pass** (`continuation.settle_documents`).
+  The spec's since-cutoffs stop double-creation but say nothing
+  about the prefix's posted-but-unpaid documents, which every
+  continuation would otherwise age into looks-like-corruption
+  receivables — the A/R twin of the card drift. The pass pays each
+  open document ~28–38 seeded days after posting (never before the
+  cutoff); documents whose settle date falls past the horizon stay
+  open, so the trailing recent-open window is preserved by
+  construction. It runs BEFORE the plan generators so the
+  through-relative "recent open" documents get re-anchored (their
+  still-open predecessors would suppress them via the
+  don't-stack-open-invoices guards).
+- **Staged repair is emergent, not a mode.** `max_monthly_sweep`
+  caps every sweep; on a drifted book the cap binds for 1–3 months
+  (the ruled staging) and in steady state it never binds. While
+  staged, the whole tranche goes to savings; the quarterly
+  rebalance walks savings down to its target.
+- **Corridor top-up** (the sweep's low side). A flow account under
+  half its buffer is topped back up from savings — required for
+  Sabine, whose Bankkonto lives near €600 while Postbank
+  accumulates; a sweep-only policy cannot model her two-account
+  rhythm.
+- **Repair-narrative gating**: the catch-up description requires
+  the payment to be large relative to the trailing cycle AND on
+  the persona's own scale (buffer/2, per-card override), so a
+  routine payment after a quiet cycle never claims a summer of
+  catching up.
+- **`book_repairs` hook** for one-shot persona repairs (Sabine's
+  €48.50 clearing), idempotent by checking the book first.
+- **Boundary-month caveat**: streams whose RNG draws aren't
+  strictly date-ordered (restaurants, Amazon, volume) can fuzz
+  slightly in the month containing a non-month-aligned cutoff —
+  a pick or two more or fewer casual-spend rows. Harmless: rows at
+  or before the cutoff are discarded, and no payment or invariant
+  path depends on them.
+
+## 5. What this is not
 
 - Not a rewrite of the prefix builders — the 2025 narrative
   phases stay as scripted history.
