@@ -6143,7 +6143,7 @@ class TestListInvoices:
     def test_empty_list(self, business_book):
         gb = GnuCashBook(str(business_book))
         result = gb.list_invoices()
-        assert result == "Showing 0 of 0 invoices"
+        assert result == "Showing 0 of 0 documents"
 
     def test_compact_format(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -6170,7 +6170,7 @@ class TestListInvoices:
         assert len(invoices) == 1
         assert invoices[0]["type"] == "invoice"
         assert result["total"] == 1
-        assert result["showing"].startswith("Showing 1-1 of 1 invoices")
+        assert result["showing"].startswith("Showing 1-1 of 1 documents")
 
     def test_filter_by_customer_type(self, business_book):
         gb = GnuCashBook(str(business_book))
@@ -9875,7 +9875,7 @@ class TestPhase3CommsContracts:
         assert result["count"] == 3
         assert result["total"] == 5
         assert result["offset"] == 0
-        assert "Showing 1-3 of 5 invoices" in result["showing"]
+        assert "Showing 1-3 of 5 documents" in result["showing"]
 
 
 # ============== Vendor Spending Report Tests ==============
