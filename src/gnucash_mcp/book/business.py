@@ -4865,11 +4865,19 @@ class BusinessMixin:
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
             total = len(invoices)
+            # The indicator noun follows the doc_type filter — a
+            # voucher listing saying "0 of 0 invoices" reads as the
+            # wrong tool answering (bookkeeper-pass finding,
+            # 2026-08-30). Unfiltered listings span all four kinds,
+            # so the generic noun is the honest one there.
+            entity_noun = (
+                f"{doc_type}s" if doc_type is not None else "documents"
+            )
             page, indicator = _paginate(
                 invoices,
                 offset=offset,
                 limit=limit,
-                entity_name="invoices",
+                entity_name=entity_noun,
                 date_key=lambda i: i.date_opened,
             )
             invoices = page
@@ -7493,7 +7501,7 @@ class BusinessMixin:
                 results,
                 offset=offset,
                 limit=limit,
-                entity_name="invoices",
+                entity_name="documents",
                 date_key=lambda r: r["date_posted"],
             )
             if compact:
