@@ -121,15 +121,16 @@ honestly, in its own language. Measured balances, per-persona
 prescriptions, and the derived policy constants live in
 DRIFT_ANALYSIS.md beside this spec; implementers start there.
 
-OPEN QUESTION (maintainer ruling wanted): does repair extend to
-the SAVINGS piles (Alex $90k, Lin Wei ¥150k — accumulated by the
-same open-loop sweep constants), or does policy govern only
-checking-surplus flows going forward? Options: (a) leave savings
-as-is, policy manages new surplus only (smallest repair); (b) a
-slow rebalance drain (quarterly savings→investment transfers at
-persona-plausible size) until savings hits a target multiple of
-the buffer. (b) reads more like a person, but it is a persona
-call, not an engineering one.
+SAVINGS PILES — RULED 2026-08-31 (maintainer): **slow
+rebalance.** Quarterly savings→investment transfers at
+persona-plausible size until savings reaches a target multiple of
+the buffer (~6 months' expenses), then the policy's steady-state
+split takes over. Reads like a person who got advice; feeds the
+investment demos richer lot history. Alex: quarterly tranches
+toward VTSAX (new lot each, existing sweep path). Lin Wei: smaller
+tranches toward her domestic investments, keeping her deliberately
+cash-tighter profile. Sabine's pile is modest — steady-state
+policy alone suffices.
 
 ### 2.4 Verification (extends rebuild_all's verify step)
 
