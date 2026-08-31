@@ -69,7 +69,15 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
 
     cutoff = continuation.find_cutoff(book_path)
     if cutoff >= through:
-        print(f"{persona}: already current (cutoff {cutoff} ≥ {through}).")
+        # No new transactions to write, but posture maintenance
+        # (reconciliation through the last full month, SX cursors) is
+        # idempotent and keeps a same-day rerun honest.
+        print(f"{persona}: already current (cutoff {cutoff} ≥ {through}); "
+              "refreshing posture.")
+        for line in continuation.reconcile_through(policy, book_path, through):
+            print(f"   {line}")
+        sx = mod.advance_schedules(book_path, through)
+        print(f"   schedules: {sx}")
         return 0
     print(f"── Continuing {persona}: ({cutoff} → {through}] at {book_path}")
 
@@ -101,6 +109,9 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
     actions = continuation.run_policy(policy, book_path, cutoff, through)
     for line in actions:
         print(f"   policy: {line}")
+
+    for line in continuation.reconcile_through(policy, book_path, through):
+        print(f"   {line}")
 
     sx = mod.advance_schedules(book_path, through)
     print(f"   schedules: {sx}")

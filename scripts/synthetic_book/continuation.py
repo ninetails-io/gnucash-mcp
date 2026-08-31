@@ -95,6 +95,11 @@ class PersonaPolicy:
     # (e.g. Sabine's Ausgleichskonto clearing). Must be idempotent —
     # check the book before writing.
     book_repairs: Callable[[Path, date, date], list[str]] | None = None
+    # Accounts stamped with the server's no_reconcile opt-out slot:
+    # loans, VAT clearing — no statement exists to reconcile against
+    # (bookkeeper review §1: they'd otherwise sit forever in the
+    # dashboard's "never reconciled ⚠" count).
+    no_reconcile: tuple[str, ...] = ()
     # Narrative templates. {month} is "%B %Y" of the statement close.
     desc_statement: str = "{label} — {month} statement payment"
     desc_repair_card: str = "{label} — balance payoff (catching up after the summer)"
@@ -464,6 +469,158 @@ def settle_documents(policy: PersonaPolicy, book_path: Path, cutoff: date,
         log.append(f"settle {doc['id']}: {amount} {currency or ''} "
                    f"on {pay_date} (posted {posted})")
     return log
+
+
+# ── Reconciliation posture (bookkeeper review §1) ───────────────
+
+def reconcile_through(policy: PersonaPolicy, book_path: Path,
+                      through: date) -> list[str]:
+    """Reconcile every bank/cash/card account through the last FULL
+    month, leaving the current month open — Abe VI's posture ask
+    (BOOKKEEPER_REVIEW_DEMO_GENERATORS.md §1): the demo household of a
+    reconciliation tool should not be seventeen months behind, and the
+    open month leaves the natural first conversation ("this month's
+    statement is ready to enter").
+
+    Dogfoods ``reconcile_account`` in bulk mode: the statement balance
+    is computed from the book (non-voided split quantities through the
+    statement date), so the server's own tie check verifies the sweep.
+    Idempotent — an account with nothing unreconciled is skipped."""
+    import piecash
+
+    stmt = date(through.year, through.month, 1) - timedelta(days=1)
+    log: list[str] = []
+
+    # Statement-less accounts opt out via the server's no_reconcile
+    # slot (idempotent stamp; the drill-down keeps them visible).
+    book = GnuCashBook(str(book_path))
+    for fullname in policy.no_reconcile:
+        book.set_account_slot(fullname, "no_reconcile", "true")
+
+    # Enumerate reconcilable accounts + compute statement balances in
+    # one readonly pass (Decimal aggregation in Python — never in SQL).
+    targets: list[tuple[str, D, int]] = []
+    gc_book = piecash.open_book(str(book_path), readonly=True,
+                                open_if_lock=True)
+    try:
+        template_root = gc_book.root_template
+        for account in gc_book.accounts:
+            if account.type not in ("BANK", "CASH", "CREDIT"):
+                continue
+            if account.placeholder:
+                continue
+            if account.fullname in policy.no_reconcile:
+                continue
+            root = account
+            while root.parent is not None:
+                root = root.parent
+            if root is template_root:
+                continue
+            balance = D("0")
+            pending = 0
+            for split in account.splits:
+                if split.reconcile_state == "v":
+                    continue
+                post = split.transaction.post_date
+                if post is None or post > stmt:
+                    continue
+                balance += D(str(split.quantity))
+                if split.reconcile_state != "y":
+                    pending += 1
+            targets.append((account.fullname, balance, pending))
+    finally:
+        gc_book.close()
+
+    book = GnuCashBook(str(book_path))
+    for fullname, balance, pending in targets:
+        if pending == 0:
+            continue
+        result = book.reconcile_account(
+            fullname, statement_date=stmt, statement_balance=str(balance),
+            reconcile_all=True,
+        )
+        log.append(f"reconciled {fullname} through {stmt}: "
+                   f"{result.get('splits_reconciled')} splits")
+    return log
+
+
+# ── Scheduled-transaction cursors (bookkeeper review §2) ────────
+
+def advance_sx(book_path: Path, through: date) -> dict:
+    """Stamp every enabled SX's ``last_occur`` so its next occurrence
+    is upcoming — with AT MOST ONE schedule per book left overdue, and
+    only when its missed occurrence fell 3–7 days before ``through``
+    ("just came due", Abe VI's review §2). Books where no schedule
+    lands in that window get zero overdue and rely on the due-soon
+    line as the hook.
+
+    Set directly via piecash: ``last_occur`` is GnuCash desktop's
+    "Since Last Run" cursor, deliberately not exposed by the public
+    update tool."""
+    import piecash
+    from dateutil.relativedelta import relativedelta
+
+    period = {
+        "weekly": timedelta(days=7),
+        "biweekly": timedelta(days=14),
+        "monthly": relativedelta(months=1),
+        "quarterly": relativedelta(months=3),
+        "yearly": relativedelta(years=1),
+    }
+    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
+
+    book = piecash.open_book(str(book_path), readonly=False, do_backup=False)
+    try:
+        rows: list[tuple[object, list[date]]] = []
+        for sx in book.session.query(piecash.ScheduledTransaction).all():
+            rec = sx.recurrence
+            if rec is None:
+                continue
+            mult, ptype = rec.recurrence_mult, rec.recurrence_period_type
+            if ptype == "week" and mult == 2:
+                freq = "biweekly"
+            elif ptype == "week":
+                freq = "weekly"
+            elif ptype == "month" and mult == 3:
+                freq = "quarterly"
+            elif ptype == "year":
+                freq = "yearly"
+            else:
+                freq = "monthly"
+            start = sx.start_date
+            if hasattr(start, "date"):
+                start = start.date()
+            occs, cur = [], start
+            while cur <= through and len(occs) < 5000:
+                occs.append(cur)
+                cur = cur + period[freq]
+            rows.append((sx, occs))
+
+        # The one just-came-due hook: closest miss inside the window,
+        # name as the deterministic tie-break.
+        window = [
+            (sx, occs) for sx, occs in rows
+            if len(occs) >= 2 and 3 <= (through - occs[-1]).days <= 7
+        ]
+        window.sort(key=lambda r: ((through - r[1][-1]).days, r[0].name))
+        overdue_sx = window[0][0] if window else None
+
+        for sx, occs in rows:
+            if not occs:
+                last = None
+            elif sx is overdue_sx:
+                last = occs[-2]
+                info["overdue"] += 1
+            else:
+                last = occs[-1]
+                info["upcoming"] += 1
+            sx.enabled = 1
+            sx.last_occur = last
+            info["enabled"] += 1
+        book.save()
+    finally:
+        book.close()
+    return info
 
 
 # ── Verification (spec §2.4) ────────────────────────────────────

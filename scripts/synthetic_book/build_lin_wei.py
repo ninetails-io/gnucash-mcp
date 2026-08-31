@@ -329,7 +329,7 @@ def add_prices(out_path: Path) -> int:
        reflects the most recent real close rather than forward-filling
        the 1st-of-month value to the end of the horizon.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         cny = book.default_currency
@@ -508,7 +508,7 @@ ACCOUNTS = [
 
 def create_accounts(out_path: Path) -> int:
     """Create the full chart of accounts directly via piecash."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         comm_by_key = {}
@@ -552,6 +552,10 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(HSBC_CARD, "credit_limit", "60000")  # HKD terms
     book.set_account_slot(MORTGAGE, "apr", "3.85")
     book.set_account_slot(AUTO_LOAN, "apr", "4.90")
+    # Loans opt out of the reconciliation surface — no statement
+    # exists to reconcile against (bookkeeper review §1).
+    book.set_account_slot(MORTGAGE, "no_reconcile", "true")
+    book.set_account_slot(AUTO_LOAN, "no_reconcile", "true")
 
 
 # ── Phase 3: Opening balances + investment lots ─────────────────
@@ -583,7 +587,7 @@ OPENING_LOTS = [
 
 def opening_balances(out_path: Path) -> None:
     """Post opening balances (one balanced transaction) + investment lots."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         cny = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -638,7 +642,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
     (account_path, value, quantity) when the account commodity differs
     from the transaction currency. ``currency`` defaults to CNY.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         cny = book.default_currency
@@ -1755,6 +1759,12 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
             name="优客工场", currency="CNY", notes="联合办公空间")
         counts["vendors"] = 3
 
+        # 陈宇 — the part-time assistant behind the 陈宇工资 salary
+        # schedule (bookkeeper review §3: a salary schedule with zero
+        # employees registered read as a phantom).
+        book.create_employee(name="陈宇", currency="CNY")
+        counts["employees"] = 1
+
         # Jobs — multi-invoice projects (owner_type=job over customers),
         # matching the prior hand-built book's 3 active jobs. A couple of
         # invoices below attach to these via job_id so get_job_report has
@@ -1997,7 +2007,7 @@ def run_investments(out_path: Path, since: date | None = None) -> dict:
     ``since`` (continuation mode): skip every event dated on or before
     it — those trades and lots already exist in the frozen prefix."""
     cut = since or date(YEAR, 1, 1) - timedelta(days=1)
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     counts = {"txns": 0, "lots": 0}
     try:
         cny = book.default_currency
@@ -2392,69 +2402,12 @@ def run_reconciliation(book: GnuCashBook) -> None:
 # ── Scheduled-transaction state (kept ENABLED) ──────────────────
 
 def set_schedule_state(out_path: Path) -> None:
-    """Leave every SX ENABLED and stamp a realistic ``last_occur``.
-
-    The hand-built book had 13 active scheduled transactions; emptying the
-    surface (the old behavior disabled them all to dodge GnuCash's "Since
-    Last Run" prompt) removed a whole demo dimension. We keep them enabled
-    and set ``last_occur`` so most have an UPCOMING next occurrence and one
-    or two are OVERDUE — which drives the dashboard's overdue-schedule
-    warnings and the create_transaction_from_scheduled workflow. It's fine
-    if GnuCash's GUI would prompt; this is a demo/test corpus.
-
-    ``last_occur`` is set directly on the row (the public
-    update_scheduled_transaction can't set it).
-    """
-    from piecash.core.transaction import ScheduledTransaction
-
-    today = date.today()
-
-    def _shift_months(d: date, n: int) -> date:
-        y = d.year + (d.month - 1 + n) // 12
-        m = (d.month - 1 + n) % 12 + 1
-        return _clamp_day(y, m, d.day)
-
-    # Exactly two schedules are left OVERDUE (they drive the dashboard's
-    # overdue-schedule warning and the create_transaction_from_scheduled
-    # workflow); every other schedule is CURRENT with its next occurrence in
-    # the future. Both chosen indices are monthly schedules (salary, property
-    # management), so shifting last_occur back one month reliably pushes the
-    # next monthly occurrence into the past. The prior logic anchored
-    # last_occur to a fixed month offset on the schedule's start-day, which —
-    # for the common day-15 monthly schedules — left the next occurrence in
-    # the past too, flooding the summary with ~16 overdue warnings.
-    OVERDUE_IDX = {0, 3}
-
-    book = piecash.open_book(str(out_path), readonly=False)
-    try:
-        sxs = list(book.session.query(ScheduledTransaction).all())
-        for i, sx in enumerate(sxs):
-            sx.enabled = 1
-            start = sx.start_date
-            if hasattr(start, "date"):
-                start = start.date()
-            day = start.day if start else 15
-            # Most recent monthly-cadence occurrence on/before today. For a
-            # monthly schedule this is the true last occurrence, so the next
-            # occurrence is in the future (CURRENT, not overdue). For a
-            # quarterly/yearly schedule it's a conservative anchor ≤ today, so
-            # the real next occurrence (computed from the actual recurrence)
-            # still lands well in the future.
-            this_month = _clamp_day(today.year, today.month, day)
-            last_occ = (
-                this_month if this_month <= today
-                else _shift_months(this_month, -1)
-            )
-            if i in OVERDUE_IDX:
-                # Push the next monthly occurrence into the past → OVERDUE.
-                last_occ = _shift_months(last_occ, -1)
-            # Never set last_occur before the schedule's own start.
-            if start and last_occ < start:
-                last_occ = start
-            sx.last_occur = last_occ
-        book.save()
-    finally:
-        book.close()
+    """Stamp SX cursors via the shared engine rule: everything current,
+    at most ONE schedule overdue and only when it "just came due" (3-7
+    days -- bookkeeper review §2). Replaces the fixed two-overdue-index
+    scheme, whose hooks aged into reading as neglect."""
+    from continuation import advance_sx
+    return advance_sx(out_path, THROUGH)
 
 
 # ── Verification ────────────────────────────────────────────────
@@ -2821,7 +2774,7 @@ def continuation_txns(through: date) -> list[dict]:
 def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
     """Real CNY-base quotes for (symbol, date) pairs, skipping any the
     book already has (the prefix's price table is never touched)."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         cny = book.default_currency
@@ -2877,7 +2830,7 @@ def continuation_invest(out_path: Path, when: date, amount: Decimal,
     close, one lot per purchase, mirroring the DCA lot pattern. Source
     is 支票账户 (surplus sweep) or 储蓄账户 (pile rebalance)."""
     _add_price_rows(out_path, [("510300", when)])
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         cny = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -2901,11 +2854,57 @@ def continuation_invest(out_path: Path, when: date, amount: Decimal,
         book.close()
 
 
+def _ensure_employee(book: GnuCashBook, name: str) -> bool:
+    """Register the employee if missing (idempotent — the 陈宇工资
+    schedule's owner, bookkeeper review §3)."""
+    env = book.list_employees(compact=False, limit=250)
+    rows = next((v for v in env.values() if isinstance(v, list)), [])
+    if any(row.get("name") == name for row in rows):
+        return False
+    book.create_employee(name=name, currency="CNY")
+    return True
+
+
+def hsbc_payoff_repair(out_path: Path, cutoff: date,
+                       through: date) -> list[str]:
+    """Settle the dormant 汇丰 HKD card in narrative and stop using it.
+
+    DEVIATES from DRIFT_ANALYSIS's "leave 汇丰" — deliberately, after
+    the bookkeeper review: a carried balance with months of silence is
+    exactly what the dashboard's carried-balance rule flags as missing
+    entries (no interest ever posts). Paying it off retires the card
+    into the classifier's ``dormant`` bucket honestly; the scripted
+    2025 HKD activity stays as prefix history. Idempotent — a zero
+    balance means a prior continuation already settled it."""
+    book = GnuCashBook(str(out_path))
+    owed_hkd = -Decimal(str(book.get_balance(HSBC_CARD)))
+    if owed_hkd <= 0:
+        return []
+    when = cutoff + timedelta(days=8)
+    if when > through:
+        return []
+    _add_price_rows(out_path, [("HKD", when)])
+    rate = md_fx_cny("HKD", when)
+    owed_cny = (owed_hkd * rate).quantize(D("0.01"))
+    write_bulk(out_path, [{
+        "description": "汇丰 港币卡 结清（销卡）",
+        "date": when,
+        "currency": "HKD",
+        "splits": [
+            (HSBC_CARD, owed_hkd),               # liability to zero (HKD)
+            (CHECKING, -owed_hkd, -owed_cny),    # HKD value / CNY quantity
+        ],
+    }])
+    return [f"汇丰 settled HK${owed_hkd} (¥{owed_cny}) on {when}"]
+
+
 def continue_business(book: GnuCashBook, through: date,
                       since: date) -> dict:
     global THROUGH
     THROUGH = through
-    return run_business(book, since=since)
+    counts = run_business(book, since=since)
+    counts["employees"] = int(_ensure_employee(book, "陈宇"))
+    return counts
 
 
 def continue_investments(out_path: Path, through: date,
@@ -2951,6 +2950,9 @@ POLICY = PersonaPolicy(
     min_sweep=D("500"),
     invest=continuation_invest,
     ensure_rate=ensure_rate,
+    book_repairs=hsbc_payoff_repair,
+    # Loans have no statement to reconcile against (review §1).
+    no_reconcile=(MORTGAGE, AUTO_LOAN),
     desc_statement="{label} 还款",
     desc_repair_card="{label} 还款（清理累积欠款）",
     desc_sweep="转入储蓄账户（月度结余）",

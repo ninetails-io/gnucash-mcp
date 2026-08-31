@@ -255,7 +255,7 @@ def add_prices(out_path: Path) -> int:
     reflects the most recent real close instead of forward-filling the
     1st-of-month value to the end of the horizon.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -306,7 +306,7 @@ def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
     date so cross-currency posts/pays find a fresh rate and lot-gain
     calculations have an on-date market price.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -452,7 +452,7 @@ ACCOUNTS = [
 
 def create_accounts(out_path: Path) -> int:
     """Create the full chart of accounts directly via piecash."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         comm_by_key = {}
@@ -494,6 +494,10 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(AMEX, "statement_close_day", "22")
     book.set_account_slot(MORTGAGE, "apr", "6.25")
     book.set_account_slot(AUTO_LOAN, "apr", "5.49")
+    # Loans opt out of the reconciliation surface — no statement
+    # exists to reconcile against (bookkeeper review §1).
+    book.set_account_slot(MORTGAGE, "no_reconcile", "true")
+    book.set_account_slot(AUTO_LOAN, "no_reconcile", "true")
 
 
 # ── Phase 3: Opening balances + investment lots ─────────────────
@@ -524,7 +528,7 @@ OPENING_LOTS = [
 
 def opening_balances(out_path: Path) -> None:
     """Post opening balances (one balanced transaction) + investment lots."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         usd = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -578,7 +582,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
     (account_path, value, quantity) when the account commodity differs
     from the transaction currency. ``currency`` defaults to USD.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -1517,7 +1521,7 @@ def run_vtsax_sweep(out_path: Path, through: date,
     policy layer (``continuation.PersonaPolicy``) derives sweeps from
     actual surplus instead. ``since`` guards the full-rebuild path.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     counts = {"txns": 0, "lots": 0}
     try:
         usd = book.default_currency
@@ -2045,7 +2049,7 @@ def run_investments(out_path: Path, through: date,
     or before it — those trades and lots already exist in the frozen
     prefix, and re-running them would double-create."""
     cut = since or date(YEAR, 1, 1) - timedelta(days=1)
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     counts = {"txns": 0, "lots": 0}
     try:
         usd = book.default_currency
@@ -2494,96 +2498,14 @@ def run_reconciliation(book: GnuCashBook) -> None:
 
 # ── Scheduled-transaction state (stay ENABLED, realistic timing) ─
 
-# Schedules we deliberately leave OVERDUE (last_occur pushed two periods
-# back so the dashboard surfaces an overdue-scheduled warning) — by name.
-#
-# Only the Estimated Tax Payment stays overdue: it's a believable
-# real-world lapse (a freelancer can genuinely miss a quarterly IRS
-# deadline) and the bookkeeper keeps it as a demo of the overdue-warning
-# surface. The Auto Loan Payment is NOT overdue — missing a car payment
-# hits credit after 30 days, which would be unrealistic; its recurring
-# instantiation is posted current (the monthly amortization in
-# ``gen_recurring`` runs through ``through``) and its SX cursor advances
-# to the latest occurrence below.
-OVERDUE_SX = {"Estimated Tax Payment"}
-
-
 def set_schedule_state(out_path: Path, through: date) -> dict:
-    """Leave SX templates ENABLED with realistic ``last_occur`` timing.
-
-    Most schedules get ``last_occur`` set to their most recent occurrence
-    on/before ``through`` so their next occurrence is upcoming (the
-    dashboard's "due soon" line, and a working
-    ``create_transaction_from_scheduled`` target). A couple in
-    ``OVERDUE_SX`` are pushed two periods back so they read as overdue —
-    driving the overdue-schedule warning.
-
-    We set ``last_occur`` directly via piecash because the public
-    ``update_scheduled_transaction`` tool intentionally doesn't expose it
-    (it's GnuCash desktop's "Since Last Run" cursor, not user-editable).
-    """
-    from dateutil.relativedelta import relativedelta
-
-    period = {
-        "weekly": timedelta(days=7),
-        "biweekly": timedelta(days=14),
-        "monthly": relativedelta(months=1),
-        "quarterly": relativedelta(months=3),
-        "yearly": relativedelta(years=1),
-    }
-    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
-
-    book = piecash.open_book(str(out_path), readonly=False)
-    try:
-        for sx in book.session.query(piecash.ScheduledTransaction).all():
-            rec = sx.recurrence
-            if rec is None:
-                continue
-            mult = rec.recurrence_mult
-            ptype = rec.recurrence_period_type
-            # Map piecash recurrence to a frequency label.
-            if ptype == "week" and mult == 2:
-                freq = "biweekly"
-            elif ptype == "week":
-                freq = "weekly"
-            elif ptype == "month" and mult == 3:
-                freq = "quarterly"
-            elif ptype == "year":
-                freq = "yearly"
-            else:
-                freq = "monthly"
-
-            start = sx.start_date
-            if hasattr(start, "date"):
-                start = start.date()
-
-            # Walk occurrences forward from start, collecting those on or
-            # before ``through``.
-            step = period[freq]
-            occs = []
-            cur = start
-            while cur <= through and len(occs) < 5000:
-                occs.append(cur)
-                cur = cur + step
-
-            if not occs:
-                last_occ = None
-            elif sx.name in OVERDUE_SX and len(occs) >= 2:
-                # Push last_occur back so the next occurrence falls before
-                # today → the dashboard reads it as overdue.
-                last_occ = occs[-2]
-                info["overdue"] += 1
-            else:
-                last_occ = occs[-1]
-                info["upcoming"] += 1
-
-            sx.enabled = 1
-            sx.last_occur = last_occ
-            info["enabled"] += 1
-        book.save()
-    finally:
-        book.close()
-    return info
+    """Stamp SX cursors via the shared engine rule: everything current,
+    at most ONE schedule overdue and only when it "just came due" (3–7
+    days — bookkeeper review §2). The old always-overdue Estimated Tax
+    hook aged into looking like neglect; the due-soon line is Alex's
+    hook now."""
+    from continuation import advance_sx
+    return advance_sx(out_path, through)
 
 
 # ── Verification ────────────────────────────────────────────────
@@ -3076,7 +2998,7 @@ def continuation_invest(out_path: Path, when: date, amount: Decimal,
     see consistent data. Source is Checking (surplus sweep) or Savings
     (pile rebalance — RULED 2026-08-31)."""
     add_event_prices(out_path, [("VTSAX", when)])
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         usd = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -3120,6 +3042,8 @@ POLICY = PersonaPolicy(
     min_sweep=D("200"),
     invest=continuation_invest,
     ensure_rate=ensure_rate,
+    # Loans have no statement to reconcile against (review §1).
+    no_reconcile=(MORTGAGE, AUTO_LOAN),
 )
 
 
