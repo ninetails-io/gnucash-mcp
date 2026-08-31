@@ -107,20 +107,44 @@ range:
 books without prefix rebuild) and runs these invariants either
 way.
 
-## 3. Sequencing and blast radius
+## 3. Sequencing and the endgame (RULED 2026-08-30)
 
-- Post-1.4.4-tag work. Regeneration invalidates capture oracles
-  (standing policy: deliberate event). The repaired books ship to
-  the repo ONCE (frozen-prefix policy: this is a "date-decay +
-  new-coverage" regeneration, the sanctioned kind), then the CI
-  bundle-regeneration picks up `--continue-only` freshness later.
+**They are DEMO BOOKS, not frozen oracles** — the maintainer's
+correction, and it re-scopes the whole program. A demo book's one
+job is to be alive and current on first open; "frozen" was the
+testing frame (byte-stable capture fixtures), and it retires with
+this work. The endgame:
+
+- **Books leave the repo entirely.** `git rm --cached
+  samples/*.gnucash` + gitignore; the repo ships GENERATORS plus
+  the committed rates cache (diffable text, kilobytes/year). The
+  32MB already in history is sunk cost; growth stops at zero
+  forever.
+- **MCPBs carry the books.** The CI bundle job generates fresh,
+  current-dated books at build time (`rebuild_all
+  --skip-refresh`, the design settled 2026-08-27) and packs
+  them. Release assets can carry standalone copies for
+  no-bundle users. Clones get a `make books` regeneration path;
+  README's try-it flow points at generated or Release-asset
+  books instead of `samples/` blobs.
+- **Glama consequence, planned not re-litigated:** the sandbox
+  Dockerfile gains the same generate-at-build RUN step,
+  validated locally first and shipped with a release it was
+  riding anyway (the discipline from the evangelism window).
+- Post-1.4.4-tag work, all of it: Tuesday's bundle ships the
+  committed books one last time; this program lands as one
+  September arc (policy layer → repaired+current books →
+  untrack → CI generation → docs), targeting the v1.5.0 bundle
+  as the first fully generated one.
 - Alex first (richest policy surface), then Lin Wei (revolver
-  policy), then Sabine (simplest). Ship per-persona, verify
-  per-persona.
-- Market data: existing committed cache; `--skip-refresh`
-  offline determinism preserved. Cache tail must cover the
-  continued range — refresh is a separate, network-touching step
-  (existing pipeline).
+  policy), then Sabine (simplest). Verify per-persona.
+- Market data: committed cache; `--skip-refresh` offline
+  determinism preserved. Cache tail must cover the continued
+  range — refresh stays a separate, network-touching step.
+- Capture rigs and test plans that referenced committed books
+  re-anchor on generated output pinned by (generator version,
+  cache version, --through date) — determinism replaces
+  byte-identity as the oracle property.
 
 ## 4. What this is not
 
