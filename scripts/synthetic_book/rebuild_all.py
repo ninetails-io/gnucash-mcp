@@ -206,8 +206,10 @@ def main() -> int:
     # in place; doing that under an active server risks a read
     # landing mid-truncate. Open-per-request keeps the window small,
     # but the safe move is not to race it at all.
+    # Boundary-aware pattern (see continue_book.py): matches a running
+    # server's binary invocation, not this repo's own checkout path.
     probe = subprocess.run(
-        ["pgrep", "-f", "gnucash-mcp"], capture_output=True, text=True,
+        ["pgrep", "-f", "gnucash-mcp( |$)"], capture_output=True, text=True,
     )
     if probe.stdout.strip() and not args.force:
         raise SystemExit(

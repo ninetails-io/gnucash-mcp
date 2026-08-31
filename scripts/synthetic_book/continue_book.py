@@ -147,7 +147,12 @@ def main() -> int:
         raise SystemExit(f"Book not found: {book_path}")
 
     if not args.force:
-        probe = subprocess.run(["pgrep", "-f", "gnucash-mcp"],
+        # Boundary-aware pattern: a real server's command line has the
+        # binary name followed by a space or end-of-line; a path
+        # segment ("…/gnucash-mcp/scripts/…") is always followed by
+        # "/". The bare-substring pattern matched THIS script's own
+        # checkout path on CI runners — the guard vetoed itself.
+        probe = subprocess.run(["pgrep", "-f", "gnucash-mcp( |$)"],
                                capture_output=True, text=True)
         if probe.stdout.strip():
             raise SystemExit(
