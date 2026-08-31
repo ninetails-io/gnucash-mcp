@@ -47,3 +47,13 @@ Sabine carries no scheduled transactions and no budget; Alex and Lin Wei have bo
 - Month-to-month lumpiness (April tax dips, freelancer swings) reads lived-in.
 - Prices current; no stale-price warnings.
 - Previous bookkeeper test litter fully cleared by regeneration.
+
+## Signoff (2026-08-31, same day)
+
+All four items addressed and re-verified on the live books. Abe VI:
+"Balance sheets, trajectories, and the cultural texture all held
+steady through the fixes — surgical changes, nothing sanded off. The
+demo fleet is ship-ready. Three well-kept households, each with a
+fresh month waiting to be entered, each modeling the practice this
+tool exists to teach. Verdict for the cousin: review closed, no
+carried items."
