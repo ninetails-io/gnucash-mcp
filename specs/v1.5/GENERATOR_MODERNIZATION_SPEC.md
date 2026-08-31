@@ -92,6 +92,24 @@ History is never rewritten; the correction is appended story.
 The audit trail reads like a person got their act together,
 because that is the simulation being run.
 
+The repair pass also covers BOOK-QUALITY debts, not just
+financial ones: Sabine's €48.50 Ausgleichskonto imbalance clears
+with a dated reclassification in the repair month ("Korrektur —
+ungeklärte Differenz aufgelöst") — the i18n book loses its one ⚠
+honestly, in its own language. Measured balances, per-persona
+prescriptions, and the derived policy constants live in
+DRIFT_ANALYSIS.md beside this spec; implementers start there.
+
+OPEN QUESTION (maintainer ruling wanted): does repair extend to
+the SAVINGS piles (Alex $90k, Lin Wei ¥150k — accumulated by the
+same open-loop sweep constants), or does policy govern only
+checking-surplus flows going forward? Options: (a) leave savings
+as-is, policy manages new surplus only (smallest repair); (b) a
+slow rebalance drain (quarterly savings→investment transfers at
+persona-plausible size) until savings hits a target multiple of
+the buffer. (b) reads more like a person, but it is a persona
+call, not an engineering one.
+
 ### 2.4 Verification (extends rebuild_all's verify step)
 
 Post-run invariants, per book, month-by-month over the continued

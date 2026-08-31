@@ -1,9 +1,13 @@
 # Drift workup — the three demo books, measured 2026-08-30
 
-Read-only analysis of the committed books (scratch copies), feeding
+Read-only analysis of scratch copies, feeding
 GENERATOR_MODERNIZATION_SPEC's policy constants and repair pass.
 Regenerate: the sqlite workup script in the 2026-08-30 session; all
-figures in account commodity, non-voided splits.
+figures in account commodity, non-voided splits. Provenance:
+Alex and Sabine copies were byte-identical to git HEAD; the
+lin-wei copy was HEAD plus 4 recovered price rows (blob a560ff8,
+the 2026-08-29 restoration) — immaterial here, since prices don't
+affect split quantities.
 
 ## Alex (USD, through 2026-07-18) — the flagship pathology
 
