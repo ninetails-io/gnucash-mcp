@@ -267,8 +267,10 @@ def add_prices(out_path: Path) -> int:
         eur = book.default_currency
         usd = next(c for c in book.commodities if c.mnemonic == "USD")
         etf = next(c for c in book.commodities if c.mnemonic == ETF_MNEMONIC)
-        usd_dates = set(price_months()) | {US_POST, US_PAY}
-        etf_dates = set(price_months()) | {date(YEAR, 1, 1)}
+        # Closing point AT the horizon (bookkeeper review §5): a fresh
+        # build opens without a stale-price warning.
+        usd_dates = set(price_months()) | {US_POST, US_PAY, THROUGH}
+        etf_dates = set(price_months()) | {date(YEAR, 1, 1), THROUGH}
         for when in sorted(usd_dates):
             piecash.Price(commodity=usd, currency=eur, date=when,
                           value=eur_per_usd(when), type="last",
@@ -839,8 +841,11 @@ def extend_prices(out_path: Path, since: date, through: date) -> int:
     THROUGH = through
     pairs = [(sym, d) for d in iter_months() if d > since
              for sym in ("USD", ETF_MNEMONIC)]
-    # The cache stores EUR/USD; eur_per_usd() inverts it per date.
-    pairs.append(("USD", min(through, MD.latest_fx_date("EUR", "USD"))))
+    # §5: closing points dated AT the horizon so a fresh bundle opens
+    # warning-free (values forward-fill the last real close; the ETF
+    # series is synthetic and prices any date natively).
+    pairs.append(("USD", through))
+    pairs.append((ETF_MNEMONIC, through))
     return _add_price_rows(out_path, pairs)
 
 

@@ -287,10 +287,10 @@ def add_prices(out_path: Path) -> int:
         # at the present edge of the book — the actual most-recent close,
         # not the 1st-of-month value carried over.
         for sym, _full, _ns, _frac in SECURITIES:
-            asof = min(THROUGH, MD.latest_security_date(sym))
+            asof = THROUGH  # §5: closing point AT the horizon (value forward-fills)
             _add(sym, asof, MD.security(sym, asof).quantize(_security_quant(sym)))
         for foreign in FOREIGN_CURRENCIES:
-            asof = min(THROUGH, MD.latest_fx_date(foreign, "USD"))
+            asof = THROUGH
             _add(foreign, asof, MD.fx(foreign, "USD", asof).quantize(D("0.0001")))
 
         book.save()
@@ -2975,9 +2975,9 @@ def extend_prices(out_path: Path, since: date, through: date) -> int:
         events += [(sym, d) for sym in syms]
         events += [(fc, d) for fc in FOREIGN_CURRENCIES]
     for sym in syms:
-        events.append((sym, min(through, MD.latest_security_date(sym))))
+        events.append((sym, through))  # §5: dated at the horizon
     for fc in FOREIGN_CURRENCIES:
-        events.append((fc, min(through, MD.latest_fx_date(fc, "USD"))))
+        events.append((fc, through))
     for sym, d in (investment_event_price_dates(through)
                    + business_event_price_dates(through)):
         if d > since:

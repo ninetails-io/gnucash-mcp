@@ -349,9 +349,9 @@ def add_prices(out_path: Path) -> int:
         # Closing point: last available real quote per commodity, never past
         # THROUGH. real_price() returns the actual most-recent close there.
         for sym in FOREIGN_CURRENCIES:
-            wanted[sym].add(min(THROUGH, MD.latest_fx_date(sym, "CNY")))
+            wanted[sym].add(THROUGH)  # §5: closing point AT the horizon
         for sym in SECURITY_MNEMONICS:
-            wanted[sym].add(min(THROUGH, MD.latest_security_date(sym)))
+            wanted[sym].add(THROUGH)
 
         for sym, dates in wanted.items():
             comm = comm_by_mnemonic[sym]
@@ -2812,9 +2812,9 @@ def extend_prices(out_path: Path, since: date, through: date) -> int:
         pairs += [(sym, d)
                   for sym in FOREIGN_CURRENCIES + SECURITY_MNEMONICS]
     for sym in FOREIGN_CURRENCIES:
-        pairs.append((sym, min(through, MD.latest_fx_date(sym, "CNY"))))
+        pairs.append((sym, through))  # §5: dated at the horizon
     for sym in SECURITY_MNEMONICS:
-        pairs.append((sym, min(through, MD.latest_security_date(sym))))
+        pairs.append((sym, through))
     return _add_price_rows(out_path, pairs)
 
 
