@@ -154,12 +154,31 @@ def main() -> int:
         "--no-promote", action="store_true",
         help="Stop after verification; leave the canonical books "
              "untouched (outputs stay at samples/*.generated.gnucash).")
+    parser.add_argument(
+        "--continue-only", action="store_true",
+        help="Skip the prefix rebuild: run the closed-loop updater "
+             "(continue_book.py) on each canonical book IN PLACE — "
+             "repair + extend through --through — then verify. The "
+             "frozen committed prefix is never rewritten.")
     args = parser.parse_args()
 
     through = (
         date.fromisoformat(args.through) if args.through else date.today()
     )
     books = [b for b in BOOKS if args.only in (None, b.key)]
+
+    if args.continue_only:
+        for book in books:
+            cmd = [sys.executable, str(HERE / "continue_book.py"),
+                   book.key, "--through", through.isoformat()]
+            if args.force:
+                cmd.append("--force")
+            subprocess.run(cmd, check=True)
+        for book in books:
+            _verify(book, SAMPLES / book.canonical, through)
+        print("\nDone (continue-only). Canonical books current through "
+              f"{through} — working-tree drift only, never staged.")
+        return 0
 
     if not args.skip_refresh:
         _refresh_cache(through)
