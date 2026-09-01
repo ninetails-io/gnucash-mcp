@@ -117,6 +117,13 @@ def _verify(book: _Book, path: Path, through: date) -> None:
                 f"{path.name}: latest activity {latest} is more than "
                 f"45 days before {through} — timeline didn't extend?"
             )
+        if latest > through:
+            raise SystemExit(
+                f"{path.name}: latest activity {latest} is AFTER "
+                f"{through} — a generator leaked future-dated "
+                f"transactions (month-iterating stream missing its "
+                f"through-clamp?)"
+            )
         print(f"   ok: {count} txns, {cur}, latest activity {latest}")
     finally:
         gc_book.close()
@@ -154,12 +161,31 @@ def main() -> int:
         "--no-promote", action="store_true",
         help="Stop after verification; leave the canonical books "
              "untouched (outputs stay at samples/*.generated.gnucash).")
+    parser.add_argument(
+        "--continue-only", action="store_true",
+        help="Skip the prefix rebuild: run the closed-loop updater "
+             "(continue_book.py) on each canonical book IN PLACE — "
+             "repair + extend through --through — then verify. The "
+             "frozen committed prefix is never rewritten.")
     args = parser.parse_args()
 
     through = (
         date.fromisoformat(args.through) if args.through else date.today()
     )
     books = [b for b in BOOKS if args.only in (None, b.key)]
+
+    if args.continue_only:
+        for book in books:
+            cmd = [sys.executable, str(HERE / "continue_book.py"),
+                   book.key, "--through", through.isoformat()]
+            if args.force:
+                cmd.append("--force")
+            subprocess.run(cmd, check=True)
+        for book in books:
+            _verify(book, SAMPLES / book.canonical, through)
+        print("\nDone (continue-only). Canonical books current through "
+              f"{through} — working-tree drift only, never staged.")
+        return 0
 
     if not args.skip_refresh:
         _refresh_cache(through)
@@ -187,8 +213,10 @@ def main() -> int:
     # in place; doing that under an active server risks a read
     # landing mid-truncate. Open-per-request keeps the window small,
     # but the safe move is not to race it at all.
+    # Boundary-aware pattern (see continue_book.py): matches a running
+    # server's binary invocation, not this repo's own checkout path.
     probe = subprocess.run(
-        ["pgrep", "-f", "gnucash-mcp"], capture_output=True, text=True,
+        ["pgrep", "-f", "gnucash-mcp( |$)"], capture_output=True, text=True,
     )
     if probe.stdout.strip() and not args.force:
         raise SystemExit(

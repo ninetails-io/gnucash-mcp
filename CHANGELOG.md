@@ -147,6 +147,42 @@ code):
   USD 28,963 net") — a backlog netting to pocket change is a
   different chore than one netting to a statement's worth.
 
+**The demo books came alive.**
+
+The three sample personas are no longer frozen snapshots — they are
+living books that pay their own bills. A closed-loop continuation
+engine (`scripts/synthetic_book/continue_book.py`) extends each book
+from its committed history through today, deriving every money flow
+from the book itself instead of constants: card payments from real
+statement balances, sweeps from actual surplus, receivables settled
+on realistic lags. The generators dogfood the server's own reporting
+and write tools — the first consumer of `reconcile_account`'s bulk
+tie check is the fleet itself.
+
+- On first contact with the old drifted books, repair emerged as
+  narrative: Alex paid off a Chase card that had drifted $5,900
+  past its limit ("balance payoff — catching up after the summer"),
+  Lin Wei's revolver paid down to exactly its 50% utilization bound
+  and holds there with honest interest accruing (her debt profile
+  is load-bearing for the payoff demos), and Sabine's €48.50
+  imbalance cleared in German ("Korrektur — ungeklärte Differenz
+  aufgelöst"). History is never rewritten; corrections are appended
+  story.
+- Every book now opens the way a well-kept household should: zero
+  dashboard warnings, every bank and card account reconciled
+  through the last full month, the current month open and waiting —
+  the certified `enter_statement` demo path. Loans and VAT-clearing
+  accounts opt out via the `no_reconcile` slot they were built for.
+- Validated by a full bookkeeper review (all four findings closed,
+  signoff on the record): balance sheets, trajectories, and the
+  three books' distinct financial cultures held steady through the
+  fixes.
+- The CI bundle job now runs the same updater a clone user runs —
+  frozen committed prefix plus continuation through the build date,
+  priced offline from the committed rates cache — so this release's
+  bundle ships demo books current as of the day it was built, and
+  every build regression-tests the updater.
+
 **Under the hood.**
 
 - Batch entry runs one signal sweep per batch instead of up to two

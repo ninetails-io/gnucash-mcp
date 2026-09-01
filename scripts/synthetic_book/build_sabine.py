@@ -23,7 +23,7 @@ import argparse
 import calendar
 import os
 import random
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal as D, ROUND_HALF_UP
 from pathlib import Path
 
@@ -261,14 +261,16 @@ def create_book_file(out_path: Path) -> None:
 
 
 def add_prices(out_path: Path) -> int:
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     n = 0
     try:
         eur = book.default_currency
         usd = next(c for c in book.commodities if c.mnemonic == "USD")
         etf = next(c for c in book.commodities if c.mnemonic == ETF_MNEMONIC)
-        usd_dates = set(price_months()) | {US_POST, US_PAY}
-        etf_dates = set(price_months()) | {date(YEAR, 1, 1)}
+        # Closing point AT the horizon (bookkeeper review §5): a fresh
+        # build opens without a stale-price warning.
+        usd_dates = set(price_months()) | {US_POST, US_PAY, THROUGH}
+        etf_dates = set(price_months()) | {date(YEAR, 1, 1), THROUGH}
         for when in sorted(usd_dates):
             piecash.Price(commodity=usd, currency=eur, date=when,
                           value=eur_per_usd(when), type="last",
@@ -287,7 +289,7 @@ def add_prices(out_path: Path) -> int:
 
 # ── Phase 2: chart ─────────────────────────────────────────────────
 def create_accounts(out_path: Path) -> int:
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     n = 0
     try:
         comm_by = {(c.namespace, c.mnemonic): c for c in book.commodities}
@@ -312,6 +314,11 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(HYPOTHEK, "loan_term_months", "300")
     book.set_account_slot(KFZ_FIN, "apr", "4.49")
     book.set_account_slot(KFZ_FIN, "loan_term_months", "60")
+    # Loans and VAT clearing accounts opt out of the reconciliation
+    # surface — no statement exists to reconcile against (bookkeeper
+    # review §1; USt settles via the monthly USt-VA, not a statement).
+    for acct in (HYPOTHEK, KFZ_FIN, UST19, UST7):
+        book.set_account_slot(acct, "no_reconcile", "true")
 
 
 # ── Phase 3: opening balances + ETF lot ────────────────────────────
@@ -326,11 +333,13 @@ OPENING_BALANCES = [
 ETF_UNITS = D("95")
 
 
-def run_investments(out_path: Path) -> int:
+def run_investments(out_path: Path, since: date | None = None) -> int:
     """Monthly MSCI World ETF Sparplan — invests the freelancer's surplus
     (soaks idle cash) and exercises the investment/lot path. Each buy is
-    its own lot for cost-basis tracking."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    its own lot for cost-basis tracking. ``since`` (continuation mode):
+    skip buys dated on or before it — those lots exist in the prefix."""
+    cut = since or date(YEAR, 1, 1) - timedelta(days=1)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     n = 0
     try:
         eur = book.default_currency
@@ -338,6 +347,9 @@ def run_investments(out_path: Path) -> int:
         etf, bank = acct[ETF], acct[BANKKONTO]
         cost = D("1200.00")
         for first in iter_months():
+            buy_day = day_in(first, 6)
+            if buy_day <= cut or buy_day > THROUGH:
+                continue
             price = etf_price(first)
             units = (cost / price).quantize(D("0.0001"), ROUND_HALF_UP)
             lot = piecash.Lot(title=f"Sparplan {first.isoformat()}", account=etf,
@@ -355,7 +367,7 @@ def run_investments(out_path: Path) -> int:
 
 
 def opening_balances(out_path: Path) -> None:
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         eur = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -711,7 +723,12 @@ def run_edge(out_path: Path) -> None:
 
 
 def write_bulk(out_path: Path, txns: list[dict]) -> int:
-    book = piecash.open_book(str(out_path), readonly=False)
+    # Sabine's generators iterate MONTHS and emit each month whole, so
+    # this is the module's clamp: nothing dated past THROUGH may land
+    # (a through early in a month would otherwise write the rest of
+    # that month as future-dated activity).
+    txns = [t for t in txns if t["date"] <= THROUGH]
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     n = 0
     try:
         eur = book.default_currency
@@ -773,6 +790,256 @@ def verify(out_path: Path) -> None:
 
 
 # ── Orchestration ──────────────────────────────────────────────────
+# ── Continuation hooks (closed-loop policy layer) ───────────────
+# Persona wiring for scripts/synthetic_book/continue_book.py. Sabine
+# is the healthy control (DRIFT_ANALYSIS): no cards, no schedules, a
+# thin Bankkonto that lives off the corridor top-up, and one honest
+# repair — the €48.50 Ausgleichskonto blemish clears in narrative, in
+# German, and the i18n book earns its clean bill of health.
+
+from continuation import PersonaPolicy  # noqa: E402
+
+AUFW_SONSTIGE = "Aufwendungen 2/4:Versicherungsbeiträge:4390 sonstige Ausgaben"
+
+
+def continuation_txns(through: date) -> list[dict]:
+    """The deterministic streams continuation replays (spec §2.2).
+    ``run_edge`` is deliberately absent — the Ausgleichskonto item is
+    prefix history, and the repair below resolves it."""
+    global THROUGH
+    THROUGH = through
+    return (gen_recurring() + gen_variable() + gen_personal()
+            + gen_honorar())
+
+
+def _add_price_rows(out_path: Path, pairs: list[tuple[str, date]]) -> int:
+    """EUR-base quotes for (symbol, date) pairs, skipping any the book
+    already has (the prefix's price table is never touched)."""
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
+    n = 0
+    try:
+        eur = book.default_currency
+        comm_by = {c.mnemonic: c for c in book.commodities}
+        seen: set[tuple[str, str]] = set()
+        for p in book.prices:
+            when = p.date.date() if hasattr(p.date, "date") else p.date
+            seen.add((p.commodity.mnemonic, when.isoformat()))
+        for sym, when in pairs:
+            key = (sym, when.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            value = (eur_per_usd(when) if sym == "USD"
+                     else etf_price(when))
+            piecash.Price(
+                commodity=comm_by[sym], currency=eur, date=when,
+                value=value, type="last", source="user:market-data",
+            )
+            n += 1
+        book.save()
+    finally:
+        book.close()
+    return n
+
+
+def extend_prices(out_path: Path, since: date, through: date) -> int:
+    global THROUGH
+    THROUGH = through
+    pairs = [(sym, d) for d in iter_months() if d > since
+             for sym in ("USD", ETF_MNEMONIC)]
+    # §5: closing points dated AT the horizon so a fresh bundle opens
+    # warning-free (values forward-fill the last real close; the ETF
+    # series is synthetic and prices any date natively).
+    pairs.append(("USD", through))
+    pairs.append((ETF_MNEMONIC, through))
+    return _add_price_rows(out_path, pairs)
+
+
+def ensure_rate(out_path: Path, currency: str, when: date) -> None:
+    _add_price_rows(out_path, [(currency, when)])
+
+
+def continuation_invest(out_path: Path, when: date, amount: D,
+                        source_path: str) -> None:
+    """Policy-layer ETF purchase mirroring the Sparplan lot pattern —
+    the quarterly Postbank skim lands in the same MSCI World depot."""
+    _add_price_rows(out_path, [(ETF_MNEMONIC, when)])
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
+    try:
+        eur = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        price = etf_price(when)
+        units = (amount / price).quantize(D("0.0001"), ROUND_HALF_UP)
+        lot = piecash.Lot(
+            title=f"Sparplan Sonderkauf {when.isoformat()}",
+            account=acct[ETF], notes="MSCI World — Überschussanlage",
+            is_closed=0)
+        isp = piecash.Split(account=acct[ETF], value=amount, quantity=units)
+        bsp = piecash.Split(account=acct[source_path], value=-amount)
+        piecash.Transaction(
+            currency=eur,
+            description="MSCI World ETF Sonderkauf (comdirect)",
+            post_date=when, splits=[isp, bsp])
+        isp.lot = lot
+        book.save()
+    finally:
+        book.close()
+
+
+def ausgleich_repair(out_path: Path, cutoff: date,
+                     through: date) -> list[str]:
+    """Clear the €48.50 Ausgleichskonto blemish with a dated
+    reclassification (spec §2.3) — idempotent: a zero balance means a
+    prior continuation already resolved it."""
+    book = GnuCashBook(str(out_path))
+    balance = D(str(book.get_balance(AUSGLEICH)))
+    if balance == 0:
+        return []
+    when = cutoff + timedelta(days=6)
+    if when > through:
+        return []
+    book.create_transaction(
+        description="Korrektur — ungeklärte Differenz aufgelöst",
+        trans_date=when,
+        splits=[
+            {"account": AUSGLEICH, "amount": str(-balance)},
+            {"account": AUFW_SONSTIGE, "amount": str(balance)},
+        ],
+        check_duplicates=False,
+    )
+    return [f"Ausgleichskonto {balance} EUR aufgelöst on {when}"]
+
+
+def ensure_schedules(book: GnuCashBook) -> int:
+    """Feature parity (bookkeeper review §4): the schedules a German
+    freelancer would actually run — Miete, Krankenkasse, and the ETF
+    Sparplan she already executes monthly. Idempotent by name."""
+    env = book.list_scheduled_transactions(compact=False, limit=250)
+    rows = next((v for v in env.values() if isinstance(v, list)), [])
+    existing = {row.get("name") for row in rows}
+    plans = [
+        ("Miete Studio", "Dauerauftrag Miete Studio Schwabing", [
+            {"account": BANKKONTO, "amount": "-1190.00"},
+            {"account": MIETE, "amount": "1190.00"},
+        ], "monthly", "2025-01-01"),
+        ("Krankenkasse", "Techniker Krankenkasse Beitrag", [
+            {"account": BANKKONTO, "amount": "-812.40"},
+            {"account": KRANKENKASSE, "amount": "812.40"},
+        ], "monthly", "2025-01-01"),
+        # The ETF split needs a quantity (IWDA.AS ≠ EUR). A template's
+        # unit count is nominal — the realized buys reprice monthly —
+        # so ~€1,200 at a recent close is the honest placeholder.
+        ("ETF Sparplan", "MSCI World ETF Sparplan (comdirect)", [
+            {"account": BANKKONTO, "amount": "-1200.00"},
+            {"account": ETF, "amount": "1200.00", "quantity": "13.1378"},
+        ], "monthly", "2025-01-06"),
+    ]
+    created = 0
+    for name, desc, splits, freq, start in plans:
+        if name in existing:
+            continue
+        book.create_scheduled_transaction(
+            name=name, description=desc, splits=splits,
+            start_date=start, frequency=freq, enabled=True,
+        )
+        created += 1
+    return created
+
+
+def ensure_budget(book: GnuCashBook) -> bool:
+    """Feature parity (bookkeeper review §4): a modest business budget
+    so all three books exercise the budget surface. Idempotent."""
+    env = book.list_budgets(compact=False)
+    rows = next((v for v in env.values() if isinstance(v, list)), [])
+    if any(row.get("name") == "Budget 2025" for row in rows):
+        return False
+    book.create_budget(name="Budget 2025", year=YEAR, num_periods=12,
+                       period_type="monthly",
+                       description="Studio-Budget Sabine Brenner")
+    monthly = [
+        (MIETE, "1190"),
+        (KRANKENKASSE, "812"),
+        ("Aufwendungen 2/4:verschiedene Kosten:4930 Bürobedarf", "120"),
+        ("Aufwendungen 2/4:verschiedene Kosten:4922 Internet", "60"),
+        ("Aufwendungen 2/4:Werbe-/Reisekosten:4670 Reisekosten Unternehmer",
+         "250"),
+    ]
+    for acct, amt in monthly:
+        book.set_budget_amount(budget_name="Budget 2025", account=acct,
+                               amount=amt, period="all")
+    return True
+
+
+def continue_business(book: GnuCashBook, through: date,
+                      since: date) -> dict:
+    """Sabine's business module is fixed-2025 VAT fixtures except one
+    THROUGH-relative open invoice (the A/R demo surface). Re-anchor it
+    after the settlement pass ages its predecessor — skipped while the
+    predecessor is still outstanding."""
+    ensure_schedules(book)
+    ensure_budget(book)
+    env = book.get_outstanding_invoices(compact=False, limit=250)
+    open_names = {doc.get("owner_name") for doc in env.get("invoices", [])}
+    if "Verlag Bergblick GmbH" in open_names:
+        return {"invoices": 0}
+    # ~10 days before the horizon: with Net 14 terms the invoice reads
+    # as a CURRENT receivable, not already-overdue on first open.
+    recent = through - timedelta(days=10)
+    if recent <= since:
+        return {"invoices": 0}
+    cust_env = book.list_customers(compact=False, limit=250)
+    rows = next((v for v in cust_env.values() if isinstance(v, list)), [])
+    verlag = next(row for row in rows
+                  if row.get("name") == "Verlag Bergblick GmbH")
+    inv = book.create_invoice(customer_id=verlag["id"],
+                              date_opened=recent.isoformat(),
+                              currency="EUR", term="Net 14")
+    book.add_invoice_entry(invoice_id=inv["id"], account=REV19,
+                           description=f"Editorial-Design — Ausgabe "
+                                       f"{recent.strftime('%m/%Y')}",
+                           quantity="1", price="3800", taxtable="USt 19%")
+    book.post_invoice(invoice_id=inv["id"], post_account=AR,
+                      post_date=recent.isoformat(), owner_type="customer")
+    return {"invoices": 1}
+
+
+def continue_investments(out_path: Path, through: date,
+                         since: date) -> int:
+    global THROUGH
+    THROUGH = through
+    return run_investments(out_path, since=since)
+
+
+def advance_schedules(out_path: Path, through: date) -> dict:
+    from continuation import advance_sx
+    return advance_sx(out_path, through)
+
+
+POLICY = PersonaPolicy(
+    key="sabine", currency="EUR",
+    checking=BANKKONTO,                # the thin flow account
+    savings=POSTBANK,                  # the accumulating parking account
+    buffer=D("8000"),                  # corridor midpoint (DRIFT)
+    cards=(),
+    savings_share=D("1"),              # surplus parks in Postbank whole
+    invest_months=(3, 6, 9, 12),
+    savings_target=D("10000"),         # Postbank skims to the ETF above this
+    rebalance_tranche=D("2000"),       # modest — steady state suffices
+    max_monthly_sweep=D("6000"),
+    min_sweep=D("100"),
+    invest=continuation_invest,
+    ensure_rate=ensure_rate,
+    book_repairs=ausgleich_repair,
+    # Loans + VAT clearing: no statement to reconcile against (§1).
+    no_reconcile=(HYPOTHEK, KFZ_FIN, UST19, UST7),
+    desc_sweep="Übertrag auf Postbank (Monatsüberschuss)",
+    desc_repair_sweep="Übertrag auf Postbank — angesammelter Überschuss",
+    desc_topup="Umbuchung von Postbank (Kontodeckung)",
+)
+
+
+# ── Driver ──────────────────────────────────────────────────────
+
 def build(out_path: Path) -> None:
     # Sabine runs a German-locale system, so the server names auto-created
     # accounts in German (Tier-D): the FX gain/loss leaf becomes
@@ -802,6 +1069,10 @@ def build(out_path: Path) -> None:
     print(f"  {run_investments(out_path)} Sparplan buys")
     print("\nPhase 7: business (VAT invoicing + USD cross-currency)")
     print(f"  {run_business(book)}")
+    print("\nPhase 7c: schedules + budget (parity — bookkeeper review §4)")
+    from continuation import advance_sx
+    print(f"  {ensure_schedules(book)} schedules, "
+          f"budget={ensure_budget(book)}, cursors={advance_sx(out_path, THROUGH)}")
     print("\nPhase 8: edge — localized Ausgleichskonto")
     run_edge(out_path)
     verify(out_path)
