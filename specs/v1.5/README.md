@@ -87,13 +87,47 @@ The rest of this section remains unscheduled.
   except auto-fill (shipped 1.4.1) and typed-schema ergonomics.
   Multi-currency math on the write path → explicit code review +
   full loop per `feedback_bookkeeper_validates_base_cases`.
-- **Two-tools question** — once `cur` lands and bakes, revisit
-  deprecating the `create_transaction` tool (batch would cover
-  everything; remaining argument is typed-schema vs TSV
-  ergonomics). Ruled 2026-07-16: legitimate conversation AFTER
-  `cur`, never a same-release deletion — deprecation notice first,
-  removal a release later.
+- **Two-tools question — RESOLVED 2026-08-27, notice shipped.**
+  `create_transaction` is deprecated on full capability parity
+  (qty/cur/memo/notes/action columns, auto-fill, dry-run,
+  duplicates all batch-native); the docstring redirects with a
+  one-row-batch example and `create_transactions` is the canonical
+  entry tool. Removal rides v1.5.0.
 
+- **Tool-surface consolidation queue** (ordered by the maintainer,
+  2026-08-29 — the un-blooming, begun at 111 tools):
+  1. **Update pair — notice shipped 2026-08-29** on
+     `feat/update-batch-clear`: the updates TSV gained the opt-in
+     `clear` column (parity first), `update_transaction` carries
+     the deprecation banner, `update_transactions` is canonical.
+  2. **Business consolidation — v1.5.0, implementation begun
+     2026-08-29** on `feat/business-consolidation` per
+     BUSINESS_CONSOLIDATION_SPEC.md (strict annotation-fidelity
+     variant, amended: no legacy module, straight removal).
+  3. **Removals** — both deprecated singulars exit in v1.5.0
+     alongside the consolidation, backed by debug-log call counts.
+  Standing rule: new MCP tools require explicit maintainer
+  sign-off — additions to TOOL_MODULES are a stop-and-ask, in any
+  mode. The bloat's historical author was autonomous sessions
+  adding locally-reasonable tools; the gate is the fix.
+
+- **`enter_statement` — one-shot statement entry** — a complete
+  statement (opening/closing balances + lines) enters, claims
+  matches, and reconciles in one atomic open/save; dry-run is a
+  full rehearsal including the balance tie. Collapses the current
+  four-step workflow around the one irreducible step (the LLM/user
+  judgment pass), which its classification table is designed to
+  serve. Design complete — five questions ruled 2026-08-11; two
+  dry-run response rulings (summary header + the clearance
+  principle, `create_transactions` inheritance) added 2026-08-21;
+  three duplicate-review rulings (`review_required` status,
+  self-contained candidate comparisons, stateless disposition
+  acknowledgment protocol) added 2026-08-24 — the last gated on a
+  bookkeeper ruling for its `force` tightening and sequenced
+  after the batch signal hoist.
+  **Retargeted to v1.4.4** as the bulk-ops line's headliner; it
+  leaves this list when the 1.4.4 release ships it.
+  _Spec: [ENTER_STATEMENT_SPEC.md](ENTER_STATEMENT_SPEC.md)._
 - **Custom period alignment (`periods` parameter)** — the three
   breakdown reports (`spending_by_category`, `income_by_source`,
   `cash_flow`) accept an explicit list of caller-supplied boundary
@@ -119,10 +153,14 @@ The rest of this section remains unscheduled.
   Closes the dashboard's stale-price warning loop. First live
   network call in the server → own sprint for failure handling.
   ~500–700 LOC. _Spec: [PRICE_UPDATE_SPEC.md](../v1.4/features/PRICE_UPDATE_SPEC.md)._
-- **i18n output localization (Tier D)** — render reports, errors,
-  and audit lines in the book's locale; number-format policy
-  (decimal separator per locale). The largest remaining i18n
-  lift. _Spec: [I18N_ACCOUNT_RESOLUTION_SPEC.md](../v1.4/i18n/I18N_ACCOUNT_RESOLUTION_SPEC.md) Tier D / §9._
+- **i18n output localization (Tier D)** — render reports, warnings,
+  and audit lines in the book's locale. Full inventory swept
+  2026-07-19; targets GnuCash's 61 po-catalog languages; errors and
+  wire enums declared out of scope (LLM translates); number
+  formatting recommended non-localized. Four open questions await
+  ruling. _Spec: [I18N_OUTPUT_SPEC.md](I18N_OUTPUT_SPEC.md)
+  (supersedes the Tier D / §9 stub in
+  [I18N_ACCOUNT_RESOLUTION_SPEC.md](../v1.4/i18n/I18N_ACCOUNT_RESOLUTION_SPEC.md))._
 - **Taxtable default cascade + `tax_override`** — customer/vendor
   default taxtable with an explicit override gate; ~80 LOC, the
   posting-math seam already accepts inherited taxtables. _Spec:

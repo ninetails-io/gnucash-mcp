@@ -311,6 +311,40 @@ class InvestmentsMixin:
         )
         return "created"
 
+    @staticmethod
+    def _same_date_outranker(
+        book, comm, resolved_currency, price_date, source,
+    ) -> str | None:
+        """Source of a same-date row that beats ``source`` in the
+        tie-break (``_price_source_rank`` — the bookkeeper's ruling: manual
+        quote > other user:* > feed), or None when the written row
+        is the effective rate for its date.
+
+        An operator who just wrote a price and can't see it winning
+        has been misled by silence — both ``create_price`` and
+        ``create_prices`` surface this so single and batch entry
+        can't diverge on it. Only a strictly higher rank reports;
+        an equal-rank guid tie is arbitrary-but-stable and naming a
+        "winner" there would imply an ordering that isn't semantic.
+        """
+        from gnucash_mcp.book._currency import _price_source_rank
+        own_rank = _price_source_rank(source)
+        best = None
+        for p in book.session.query(Price).filter_by(
+            commodity_guid=comm.guid,
+            currency_guid=resolved_currency.guid,
+        ).all():
+            if _to_date(p.date) != price_date or p.source == source:
+                continue
+            if not _is_market_price(p):
+                continue
+            rank = _price_source_rank(p.source)
+            if rank > own_rank and (
+                best is None or rank > _price_source_rank(best)
+            ):
+                best = p.source
+        return best
+
     def _resolve_price_commodity(self, book, mnemonic: str,
                                  namespace: str | None):
         """Resolve a batch price row's commodity.
@@ -366,6 +400,9 @@ class InvestmentsMixin:
 
         Returns ``{"results": TSV}`` — columns
         ``ref, status, commodity, date, value, currency, reason``.
+        ``reason`` also notes when a same-date row from a
+        higher-ranked source outranks the written row as the
+        effective rate.
         """
         if on_error not in ("abort", "skip"):
             raise ValueError("on_error must be 'abort' or 'skip'")
@@ -488,6 +525,18 @@ class InvestmentsMixin:
                     "value": row["value"],
                     "currency": row["currency"].mnemonic,
                 }
+                # Same-date tie loss surfaces in the reason column
+                # — dry run projects it identically (the outranker
+                # ignores the not-yet-written row either way).
+                outranked_by = self._same_date_outranker(
+                    book, row["comm"], row["currency"],
+                    row["date"], row["source"],
+                )
+                if outranked_by:
+                    by_ref[row["ref"]]["reason"] = (
+                        f"outranked by {outranked_by!r} for this "
+                        f"date (manual sources win same-date ties)"
+                    )
 
             if wrote:
                 book.save()
@@ -536,7 +585,9 @@ class InvestmentsMixin:
         Returns:
             Dict echoing the RESOLVED currency mnemonic, plus
             status "updated" (same commodity/currency/date/source
-            existed) or "created".
+            existed) or "created". A ``note`` key appears when a
+            same-date row from a higher-ranked source outranks the
+            written row as the effective rate.
 
         Raises:
             ValueError: If commodity not found or invalid currency.
@@ -581,6 +632,15 @@ class InvestmentsMixin:
                 "type": price_type,
                 "status": "updated" if existing else "created",
             }
+            outranked_by = self._same_date_outranker(
+                book, comm, resolved_currency, price_date, source,
+            )
+            if outranked_by:
+                result["note"] = (
+                    f"recorded, but a {outranked_by!r} price for "
+                    f"this date outranks it as the effective rate "
+                    f"(manual sources win same-date ties)"
+                )
 
             return result
 

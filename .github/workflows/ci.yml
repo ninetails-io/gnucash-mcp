@@ -1,0 +1,68 @@
+# First CI for gnucash-mcp. Two jobs:
+#
+#   test    — the full pytest suite against the LOCKED dependency set,
+#             on the oldest supported Python (3.10 — the GDATE
+#             date.fromisoformat class of bug only bites there) and a
+#             current one. `uv sync --locked` fails if uv.lock is out
+#             of date with pyproject.toml, which is exactly the
+#             stale-lockfile mistake v1.4.1 shipped with.
+#
+#   bundle  — validates manifest.json and packs the MCPB via the same
+#             script humans run (scripts/build_bundle.sh), then
+#             uploads the .mcpb as a build artifact: every PR gets a
+#             downloadable bundle from the Actions run page.
+#
+# Triggers: every PR, and pushes to the two long-lived branches.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+      # --extra dev: pytest lives in [project.optional-dependencies],
+      # and uv installs extras only when asked (first CI run failed
+      # with "Failed to spawn: pytest" — the local venv had the extra
+      # from an old sync, the clean runner didn't).
+      - name: Install dependencies (locked)
+        run: uv sync --locked --extra dev --python ${{ matrix.python }}
+      - name: Run test suite
+        run: uv run --locked --extra dev --python ${{ matrix.python }} pytest -q
+
+  bundle:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Generate current demo books (offline, committed cache)
+        # The same updater a clone user runs: frozen prefix +
+        # deterministic continuation through the build date, priced
+        # from the committed rates cache — no network. Workspace-only
+        # mutation; the bundle whitelist (.mcpbignore) picks the
+        # books up from samples/. Every bundle build is thereby a
+        # regression test of the updater itself. ~30s.
+        run: uv run --locked --extra dev python scripts/synthetic_book/rebuild_all.py --continue-only
+      - name: Build the MCPB bundle
+        run: bash scripts/build_bundle.sh
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gnucash-mcp-bundle
+          path: dist/*.mcpb
+          if-no-files-found: error

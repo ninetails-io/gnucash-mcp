@@ -21,7 +21,14 @@ from decimal import Decimal, InvalidOperation
 import piecash
 
 from gnucash_mcp.logging_config import DEBUG_LOGGER_NAME
-from gnucash_mcp._format import _paginate
+from gnucash_mcp._format import (
+    _candidate_comparison_tsv,
+    _dry_run_summary,
+    _format_number,
+    _paginate,
+    _split_match_verdict,
+    _tsv_cell,
+)
 
 _debug_logger = logging.getLogger(DEBUG_LOGGER_NAME)
 
@@ -29,6 +36,7 @@ from gnucash_mcp.book._base import (
     _slot_bool,
     _account_to_compact_line,
     _account_to_dict,
+    _commodity_quantum,
     _guid_prefix_map,
     _is_market_price,
     _is_unreconciled,
@@ -109,6 +117,30 @@ class _SummaryData:
     income_total: int = 0
     expense_active: int = 0
     expense_total: int = 0
+
+
+# Shared correspondence thresholds — the ONE definition both
+# matchers (the duplicate screen in _collect_create_signals and the
+# statement candidate scan in enter_statement) read, so the A/D
+# signal semantics can't drift between the two surfaces. The
+# ADMISSION rules deliberately differ (documented at each site):
+# the book-wide duplicate screen demands >=2 signals; the
+# account-scoped statement scan admits the amount signal alone,
+# because its narrow universe makes an amount match meaningful —
+# and the spec's own monthly-rent case carries only that signal.
+_MATCH_AMOUNT_TOLERANCE = Decimal("1.00")
+_MATCH_DATE_TIGHT_DAYS = 2
+
+# Statement classification: desc + amount matching at roughly a
+# month's remove is the RECURRING-PAYMENT signature (last month's
+# rent), not same-event correspondence — such candidates ship as
+# evidence but never drive MATCH/AMBIGUOUS (bookkeeper T6, the
+# third specimen of the near-match family). Three weeks: beyond
+# realistic clearing drift, comfortably inside monthly cadence.
+# Biweekly patterns (14d paychecks) stay below it deliberately —
+# a slow check clearing two weeks late is still a plausible match,
+# and judgment rules those with the evidence in hand.
+_RECURRENCE_MIN_DAYS = 21
 
 
 def _post_date_as_date(transaction) -> date | None:
@@ -334,6 +366,7 @@ class CoreMixin:
             has_yc = False
             any_splits = False
             unreconciled_count = 0
+            unreconciled_value = Decimal("0")
             oldest_unreconciled_date = None
             balance = Decimal("0")
             for s in account.splits:
@@ -355,6 +388,7 @@ class CoreMixin:
                         latest_y_date = pd
                 if _is_unreconciled(s):
                     unreconciled_count += 1
+                    unreconciled_value += s.quantity
                     pd = s.transaction.post_date
                     # Null post_date (an old-book artifact) still
                     # counts as backlog; it just can't anchor the
@@ -395,6 +429,8 @@ class CoreMixin:
                         "status": f"through {latest_y_date.isoformat()}",
                         "days_behind": days_behind,
                         "unreconciled_count": unreconciled_count,
+                        "unreconciled_value": str(unreconciled_value),
+                        "commodity": account.commodity.mnemonic,
                         "latest_y_date": latest_y_date.isoformat(),
                         "oldest_unreconciled_date":
                             oldest_unreconciled_date.isoformat(),
@@ -616,8 +652,10 @@ class CoreMixin:
 
     def _overdue_scheduled_warnings(
         self, book: piecash.Book, today: date,
-    ) -> list[str]:
-        """Overdue-scheduled warning strings, most overdue first.
+    ) -> list[dict]:
+        """Overdue-scheduled entries, most overdue first — each
+        ``{days, name, msg}``; ``len()`` still feeds the Scheduled
+        line's overdue count.
 
         Requires SchedulingMixin's helpers (_next_occurrence,
         RECURRENCE_TO_FREQUENCY). When that module isn't loaded,
@@ -666,13 +704,19 @@ class CoreMixin:
                         days_overdue = (today - next_occ).days
                         overdue_entries.append((
                             days_overdue,
+                            sx.name,
                             f"Overdue scheduled: {sx.name} "
                             f"due {next_occ.isoformat()}",
                         ))
                 except Exception:
                     continue
-            overdue_entries.sort(reverse=True)
-            return [msg for _, msg in overdue_entries]
+            overdue_entries.sort(
+                key=lambda e: e[0], reverse=True,
+            )
+            return [
+                {"days": d, "name": n, "msg": m}
+                for d, n, m in overdue_entries
+            ]
         except Exception:
             return []
 
@@ -681,7 +725,8 @@ class CoreMixin:
         book: piecash.Book,
         transactions: list,
         accounts: list,
-        overdue_scheduled: list[str] | None = None,
+        overdue_scheduled: list[dict] | None = None,
+        last_entry_days_behind: int | None = None,
     ) -> list[str]:
         """Collect warnings for the consolidated Warnings section.
 
@@ -971,7 +1016,7 @@ class CoreMixin:
 
             # (sort_key, message) — no-price entries sort to the
             # top as most stale.
-            stale_entries: list[tuple[int, str]] = []
+            stale_entries: list[tuple[int, str, str]] = []
             for commodity in book.commodities:
                 if commodity == default_currency:
                     continue
@@ -981,17 +1026,33 @@ class CoreMixin:
                 if latest is None:
                     stale_entries.append((
                         10**9,  # arbitrary large sort key — top
+                        commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} no price on file",
                     ))
                 elif latest < cutoff:
                     days_old = (today - latest).days
                     stale_entries.append((
                         days_old,
+                        commodity.mnemonic,
                         f"Stale price: {commodity.mnemonic} "
                         f"last updated {days_old} days ago",
                     ))
-            stale_entries.sort(reverse=True)
-            stale_prices = [msg for _, msg in stale_entries]
+            stale_entries.sort(key=lambda e: e[0], reverse=True)
+            stale_prices = self._rollup_warnings(
+                [m for _, _, m in stale_entries],
+                names=[n for _, n, m in stale_entries],
+                oldest_days=(
+                    None if not stale_entries
+                    or stale_entries[0][0] >= 10**9
+                    else stale_entries[0][0]
+                ),
+                noun="commodities",
+                aggregate_prefix="Stale prices",
+                no_data_count=sum(
+                    1 for d, _, _ in stale_entries if d >= 10**9
+                ),
+                escape_hatch="get_prices / create_prices to refresh",
+            )
         except Exception:
             # Per spec: skip failed checks, emit the rest.
             pass
@@ -1034,14 +1095,94 @@ class CoreMixin:
             except Exception:
                 pass
 
+        # Overdue-scheduled rollup: small lists stay itemized;
+        # beyond the threshold, one aggregate line carries count,
+        # oldest, leading names, and the escape hatch. Framed as
+        # homework, not verdict — an overdue schedule means "not
+        # entered", which may be unentered activity rather than a
+        # missed payment.
+        overdue_sched_lines = self._rollup_warnings(
+            [e["msg"] for e in overdue_scheduled],
+            names=[e["name"] for e in overdue_scheduled],
+            oldest_days=(
+                overdue_scheduled[0]["days"]
+                if overdue_scheduled else None
+            ),
+            noun="transactions",
+            aggregate_prefix="Overdue scheduled",
+            escape_hatch=(
+                "list_scheduled_transactions for all; verify "
+                "entered vs missed"
+            ),
+        )
+
+        # Staleness linkage: when the book itself is far behind,
+        # time-based warnings describe the gap, not events — say so
+        # FIRST, where it frames everything below it.
+        staleness_note: list[str] = []
+        if (
+            last_entry_days_behind is not None
+            and last_entry_days_behind > self._LAST_ENTRY_WARN_DAYS
+            and (overdue_scheduled or overdue_invoices)
+        ):
+            staleness_note.append(
+                f"Book is {last_entry_days_behind} days behind — "
+                f"time-based warnings below may reflect unentered "
+                f"activity, not missed events"
+            )
+
         return (
-            integrity
+            staleness_note
+            + integrity
             + backup_health
             + low_cash
             + overdue_invoices
-            + overdue_scheduled
+            + overdue_sched_lines
             + stale_prices
         )
+
+    # Itemize-vs-aggregate threshold for the Warnings rollups: at or
+    # below this, per-item lines carry more signal than a summary;
+    # above it, the list is noise burying the other warnings.
+    _WARNING_ROLLUP_THRESHOLD = 3
+
+    @classmethod
+    def _rollup_warnings(
+        cls,
+        messages: list[str],
+        *,
+        names: list[str],
+        oldest_days: int | None,
+        noun: str,
+        aggregate_prefix: str,
+        escape_hatch: str,
+        no_data_count: int = 0,
+    ) -> list[str]:
+        """Collapse a per-item warning list into one aggregate line
+        past the threshold (chokepoint shared by the scheduled and
+        stale-price rollups — the two collapse rules can't drift).
+
+        The aggregate keeps the decision signal (count, oldest age,
+        leading names) and points at the tool that lists the rest;
+        per the clearance principle it assigns homework, never a
+        verdict.
+        """
+        if len(messages) <= cls._WARNING_ROLLUP_THRESHOLD:
+            return list(messages)
+        shown = ", ".join(names[:3])
+        more = len(names) - min(3, len(names))
+        if more > 0:
+            shown += f", +{more} more"
+        qualifiers = []
+        if oldest_days is not None:
+            qualifiers.append(f"oldest {oldest_days} days")
+        if no_data_count:
+            qualifiers.append(f"{no_data_count} with no price on file")
+        qual = f", {'; '.join(qualifiers)}" if qualifiers else ""
+        return [
+            f"{aggregate_prefix}: {len(messages)} {noun}"
+            f"{qual} ({shown}) — {escape_hatch}"
+        ]
 
     def _budget_headline(
         self,
@@ -1593,9 +1734,21 @@ class CoreMixin:
                 lag_inner = self._format_reconciliation_lag(
                     entry["days_behind"], with_parens=False,
                 )
+                # Materiality: the net unreconciled amount sits
+                # beside the split count — a 174-split backlog
+                # netting to 40 units is a different chore than
+                # one netting to 12,000 (from the outside-model
+                # dashboard review, 2026-08-21).
+                value_part = ""
+                if "unreconciled_value" in entry:
+                    amt = Decimal(entry["unreconciled_value"])
+                    value_part = (
+                        f" / {entry['commodity']} "
+                        f"{_format_number(abs(amt))} net"
+                    )
                 out.append(
-                    f"  {leaf}: {n} split{plural} unreconciled "
-                    f"({lag_inner}, oldest: {oldest}) ⚠"
+                    f"  {leaf}: {n} split{plural}{value_part} "
+                    f"unreconciled ({lag_inner}, oldest: {oldest}) ⚠"
                 )
             else:
                 out.append(
@@ -2309,9 +2462,14 @@ class CoreMixin:
             overdue_sched = self._overdue_scheduled_warnings(
                 book, date.today(),
             )
+            days_behind_for_warnings = (
+                (date.today() - last_date).days
+                if last_date is not None else None
+            )
             warnings = self._collect_warnings(
                 book, transactions, accounts,
                 overdue_scheduled=overdue_sched,
+                last_entry_days_behind=days_behind_for_warnings,
             )
             if warnings:
                 lines.append("Warnings:")
@@ -2690,6 +2848,101 @@ class CoreMixin:
         )
         return categorization if categorization else all_names
 
+    def _proposal_category_primary(
+        self, book, splits: list[dict],
+    ) -> Decimal | None:
+        """Signed max-abs value among the proposal's category
+        (non-funding) legs — the direction anchor for the duplicate
+        amount signal (R3 P5). None when any ref fails to resolve
+        or no category leg exists (transfers) — the signal then
+        falls back to magnitude comparison."""
+        legs = []
+        for sp in splits:
+            acct = self._resolve_account(book, sp["account"])
+            if acct is None:
+                return None
+            if acct.type not in self._FUNDING_ACCOUNT_TYPES:
+                try:
+                    legs.append(_to_decimal(sp["amount"]))
+                except (InvalidOperation, ValueError):
+                    return None
+        if not legs:
+            return None
+        return max(legs, key=abs)
+
+    def _signal_sweep(
+        self, book: piecash.Book,
+    ) -> list[tuple["piecash.Transaction", str]]:
+        """The full-table traversal every signal collection shares:
+        sort ``book.transactions`` recent-first and drop the rows
+        that can never be signal sources. Returns ``(transaction,
+        lowercased_description)`` pairs.
+
+        Batch surfaces (``create_transactions``, ``enter_statement``)
+        call ``_collect_create_signals`` once or twice PER ROW; the
+        sweep is the per-call cost that dominates on large books
+        (the debug log's p95 7s tail). Compute it once per book
+        session and pass it to every ``_collect_create_signals``
+        call whose screening happens against the same pre-write
+        table state.
+
+        **Capture before any of the batch's transactions are
+        committed** — a sweep taken after a write would let the
+        just-created rows shadow themselves as duplicates; a sweep
+        taken before stays honestly pre-write for every row screened
+        against it. The list holds live ORM objects: never let it
+        outlive the ``open()`` session that built it.
+
+        Three argument-independent filters live here so they run
+        once, not once per call:
+
+        - **Template recipes, not events.** GnuCash persists each
+          SX's split template as a real Transaction row whose splits
+          post under ``book.root_template``. A user entering a
+          mortgage payment for the first time would otherwise always
+          see the Mortgage template as a "duplicate" candidate via
+          description + date match, even with a stale template
+          amount that kills the A signal. Filtering at the sweep
+          boundary blocks leakage into every bucket downstream:
+          auto-fill, stability, duplicates, and recent-matches.
+        - **Voided transactions are not signal sources**: the void-
+          and-re-enter workflow makes the voided txn the most recent
+          match, and auto-fill would clone its zeroed splits into a
+          silent $0 transaction.
+        - **Undated rows** can't anchor cadence or duplicate-window
+          math.
+        """
+        from sqlalchemy.orm import selectinload
+
+        from piecash.core.transaction import Transaction
+
+        template_guids = self._template_account_guids(book)
+        # Bulk-load every transaction WITH its splits collection in
+        # two indexed queries — the voided-source filter below reads
+        # ``txn.splits`` for every row, and the lazy per-transaction
+        # collection load was one SELECT each: O(book transactions)
+        # round-trips per sweep, on exactly the large books this
+        # hoist exists for (release-review finding 8, second half).
+        # The swept list keeps the surviving rows (and their loaded
+        # splits) strongly referenced for the session — the identity
+        # map alone holds them weakly.
+        loaded = (
+            book.session.query(Transaction)
+            .options(selectinload(Transaction.splits))
+            .all()
+        )
+        swept = [
+            (txn, txn.description.lower())
+            for txn in loaded
+            if txn.post_date is not None
+            and not self._is_template_transaction(txn, template_guids)
+            and not any(_is_voided(s) for s in txn.splits)
+        ]
+        # One sort, descending — recent-first lets the capped
+        # buckets in the collector short-circuit.
+        swept.sort(key=lambda pair: pair[0].post_date, reverse=True)
+        return swept
+
     def _collect_create_signals(
         self,
         book: piecash.Book,
@@ -2697,11 +2950,13 @@ class CoreMixin:
         trans_date: date,
         proposed_amounts: list[Decimal],
         *,
+        proposed_category_primary: Decimal | None = None,
         want_auto_fill: bool,
         want_stability: bool,
         want_duplicates: bool,
         want_recent: bool,
         trans_currency: str | None = None,
+        sweep: list[tuple["piecash.Transaction", str]] | None = None,
         duplicate_window_days: int = 30,
         stability_days: int = 90,
         stability_limit: int = 5,
@@ -2731,6 +2986,10 @@ class CoreMixin:
                 amount, date; emit HIGH/MEDIUM candidates.
             want_recent: Keep top N matches for the post-write
                 split-consistency warning.
+            sweep: A precomputed ``_signal_sweep(book)`` — pass it
+                when calling per-row in a batch so the table
+                traversal amortizes to one; ``None`` computes a
+                fresh sweep (single-call sites).
 
         Returns:
             A ``_CreateSignals`` bundle; untracked signals keep
@@ -2752,22 +3011,17 @@ class CoreMixin:
             else {}
         )
 
-        # Template-account GUID set — used to skip scheduled-transaction
-        # template transactions. GnuCash persists each SX's split
-        # template as a real Transaction row whose splits post to
-        # accounts under book.root_template. Those are recipes, not
-        # events — a user entering a mortgage payment for the first
-        # time would otherwise always see the Mortgage template as a
-        # "duplicate" candidate via description + date match, even
-        # with a stale template amount that kills the A signal.
-        # Filtering at the iteration boundary blocks leakage into
-        # every bucket the collector fills: auto-fill, stability,
-        # duplicates, and recent-matches.
-        template_guids = self._template_account_guids(book)
-
         # Proposed primary = headline amount (max abs split value)
         # for the duplicate amount-signal; zero when the caller
-        # passed [] (that branch never runs then).
+        # passed [] (that branch never runs then). When BOTH sides
+        # have a category anchor (proposed_category_primary + the
+        # candidate's), the signal compares SIGNED category
+        # primaries instead — a +104 refund is not a -104
+        # payment's twin, and the direction lives in the category
+        # legs because a balanced transaction always carries both
+        # signs (bookkeeper R3 P5, blocker-class). Magnitude
+        # comparison remains the fallback for transfer-shaped
+        # rows with no category leg.
         proposed_primary = max(proposed_amounts) if proposed_amounts else Decimal("0")
 
         # Local accumulators — each bucket is independent. We finalize
@@ -2777,38 +3031,17 @@ class CoreMixin:
         recent_matches: list = []  # list[piecash.Transaction]
         duplicates: list[dict] = []
 
-        # One sort, one iteration, descending — recent-first lets
-        # the capped buckets short-circuit. Null post_date rows sort
-        # oldest and are skipped (every bucket does date math).
-        sorted_txns = sorted(
-            book.transactions,
-            key=lambda t: t.post_date or date.min,
-            reverse=True,
-        )
+        # The sorted, pre-filtered traversal — shared across a
+        # batch's calls when the caller passes it in (see
+        # _signal_sweep for the filters and the pre-write caveat).
+        if sweep is None:
+            sweep = self._signal_sweep(book)
 
-        for txn in sorted_txns:
-            # Template recipes, not events — see the note above.
-            if self._is_template_transaction(txn, template_guids):
-                continue
-
-            # Voided transactions are not signal sources: the void-
-            # and-re-enter workflow makes the voided txn the most
-            # recent match, and auto-fill would clone its zeroed
-            # splits into a silent $0 transaction. Duplicates /
-            # stability skip them too.
-            if any(_is_voided(s) for s in txn.splits):
-                continue
-
-            # Undated rows can't anchor cadence or duplicate-window
-            # math.
-            if txn.post_date is None:
-                continue
-
+        for txn, txn_desc_lower in sweep:
             # Empty descriptions carry no signal: "" substring-matches
             # everything, so an empty-description transaction would
             # desc-match every proposal and auto-fill could clone an
             # unrelated transaction instead of raising "no match".
-            txn_desc_lower = txn.description.lower()
             desc_match = (
                 bool(desc_lower.strip())
                 and bool(txn_desc_lower.strip())
@@ -2861,6 +3094,15 @@ class CoreMixin:
                 # kills the noise without losing real duplicates
                 # (paycheck-vs-paycheck still matches on gross).
                 primary_amount = max(abs(s.value) for s in txn.splits)
+                cand_cat_values = [
+                    s.value for s in txn.splits
+                    if s.account.type
+                    not in CoreMixin._FUNDING_ACCOUNT_TYPES
+                ]
+                cand_cat_primary = (
+                    max(cand_cat_values, key=abs)
+                    if cand_cat_values else None
+                )
                 # Amounts only compare within the same currency
                 # frame: 188 HKD and 188 CNY are not the same money,
                 # and the cross-frame version of a true duplicate
@@ -2874,14 +3116,31 @@ class CoreMixin:
                     trans_currency is None
                     or txn.currency.mnemonic == trans_currency
                 )
-                amount_match = same_frame and (
-                    abs(proposed_primary - primary_amount) <= Decimal("1.00")
-                )
+                if (
+                    same_frame
+                    and proposed_category_primary is not None
+                    and cand_cat_primary is not None
+                ):
+                    amount_match = (
+                        abs(
+                            proposed_category_primary
+                            - cand_cat_primary
+                        )
+                        <= _MATCH_AMOUNT_TOLERANCE
+                    )
+                else:
+                    amount_match = same_frame and (
+                        abs(proposed_primary - primary_amount)
+                        <= _MATCH_AMOUNT_TOLERANCE
+                    )
 
                 # Signal 3: date within ±2 days of trans_date (tighter
                 # than the window filter — window is for "worth
                 # considering at all").
-                date_match = abs((txn.post_date - trans_date).days) <= 2
+                date_match = (
+                    abs((txn.post_date - trans_date).days)
+                    <= _MATCH_DATE_TIGHT_DAYS
+                )
 
                 signals = sum([desc_match, amount_match, date_match])
                 if signals >= 2:
@@ -2891,12 +3150,60 @@ class CoreMixin:
                         + ("A" if amount_match else "-")
                         + ("D" if date_match else "-")
                     )
+                    # Category (non-funding) legs, for the ruling-9
+                    # self-contained comparison; all legs when
+                    # filtering leaves nothing (transfers), same
+                    # fallback as _extract_account_pattern.
+                    # SIGNED legs: a refund's inverted categories
+                    # must not read exact against the purchase's
+                    # (R3 P5).
+                    cat_legs = [
+                        (s.account.fullname, str(s.value))
+                        for s in txn.splits
+                        if s.account.type
+                        not in CoreMixin._FUNDING_ACCOUNT_TYPES
+                    ] or [
+                        (s.account.fullname, str(s.value))
+                        for s in txn.splits
+                    ]
+                    # Most-anchored split state: a reconciled
+                    # candidate is definitely entered AND tied —
+                    # decisive for the duplicate call (bookkeeper
+                    # T7: the shared table's state column must not
+                    # sit empty on the batch surface).
+                    states = {s.reconcile_state for s in txn.splits}
+                    txn_state = (
+                        "y" if "y" in states
+                        else "c" if "c" in states
+                        else "f" if "f" in states else "n"
+                    )
+                    primary_signed = (
+                        cand_cat_primary
+                        if cand_cat_primary is not None
+                        else max(
+                            (s.value for s in txn.splits), key=abs,
+                        )
+                    )
                     duplicates.append({
                         "confidence": confidence,
                         "guid": txn_prefixes[txn.guid],
+                        "state": txn_state,
+                        # The frame predicate the amount signal
+                        # actually used — comparability is
+                        # candidate-vs-PROPOSAL currency, not
+                        # candidate-vs-book-default (review
+                        # finding: 100 EUR vs 100 USD rendered as
+                        # a perfect twin). currency_code is always
+                        # present so the cur label can name the
+                        # frame either way.
+                        "same_frame": same_frame,
+                        "currency_code": txn.currency.mnemonic,
                         "date": txn.post_date.isoformat(),
                         "description": txn.description,
+                        "notes": txn.notes or "",
+                        "categories": cat_legs,
                         "amount": str(primary_amount),
+                        "primary_signed": str(primary_signed),
                         # Labeling non-default candidates lets the
                         # caller interpret a cross-currency MEDIUM
                         # (desc+date) without a follow-up read —
@@ -3160,6 +3467,12 @@ class CoreMixin:
         """
         # Dry runs don't need a writable session; all other paths do.
         readonly = dry_run
+        # Defaults resolve loudly, explicit inputs echo nothing: when
+        # the caller omitted the date, the response says which day
+        # "today" resolved to — server, client, and book can sit in
+        # different time zones (a UTC-hosted deployment is a day
+        # ahead of a Pacific book every evening).
+        date_defaulted = trans_date is None
         if trans_date is None:
             trans_date = date.today()
 
@@ -3173,6 +3486,12 @@ class CoreMixin:
             # pass 2 — a single scan.
             auto_filled_from = None
             auto_fill_warnings: list[dict] = []
+            # Splitless means TWO collector calls (auto-fill
+            # preflight + duplicate scan) — precompute the sweep so
+            # the table traversal happens once. Explicit splits make
+            # one call; let it sweep for itself so error paths
+            # before pass 2 stay cheap.
+            sweep = self._signal_sweep(book) if not splits else None
             if not splits:
                 preflight = self._collect_create_signals(
                     book,
@@ -3183,6 +3502,7 @@ class CoreMixin:
                     want_stability=True,
                     want_duplicates=False,
                     want_recent=False,
+                    sweep=sweep,
                 )
                 if preflight.auto_fill is None:
                     raise ValueError(
@@ -3218,11 +3538,15 @@ class CoreMixin:
                 description,
                 trans_date,
                 proposed_amounts,
+                proposed_category_primary=(
+                    self._proposal_category_primary(book, splits)
+                ),
                 want_auto_fill=False,
                 want_stability=False,
                 want_duplicates=check_duplicates,
                 want_recent=True,
                 trans_currency=frame_code,
+                sweep=sweep,
             )
             duplicates = signals.duplicates
 
@@ -3349,6 +3673,8 @@ class CoreMixin:
                 transaction.guid, (t.guid for t in book.transactions)
             )
             result = {"guid": short_guid, "status": "created"}
+            if date_defaulted:
+                result["date"] = trans_date.isoformat()
             if warnings:
                 result["warnings"] = warnings
             if duplicates:
@@ -3414,6 +3740,20 @@ class CoreMixin:
         with self.open(readonly=readonly) as book:
             default_currency = self._require_default_currency(book)
 
+            # One table sweep for the whole batch — phase 1's
+            # auto-fill preflights and phase 2's per-row duplicate
+            # screens all read the same pre-write table state
+            # (writes don't start until phase 3), so sharing the
+            # sweep is behavior-identical and turns O(rows) table
+            # traversals into one. Lazy: an all-explicit batch that
+            # aborts in phase 1 never pays for it.
+            _sweep_memo: list = []
+
+            def _sweep():
+                if not _sweep_memo:
+                    _sweep_memo.append(self._signal_sweep(book))
+                return _sweep_memo[0]
+
             # --- Phase 1: structural validation (every row) ---
             prepared = []
             for txn in transactions:
@@ -3456,6 +3796,7 @@ class CoreMixin:
                             proposed_amounts=[],
                             want_auto_fill=True, want_stability=True,
                             want_duplicates=False, want_recent=False,
+                            sweep=_sweep(),
                         )
                         if preflight.auto_fill is None:
                             raise ValueError(
@@ -3503,29 +3844,77 @@ class CoreMixin:
             # --- Phase 2: duplicate screen (against existing book) ---
             accepted = []
             for p in prepared:
+                p_cat_values = [
+                    v["value"] for v in p["validated"]
+                    if v["account"].type
+                    not in self._FUNDING_ACCOUNT_TYPES
+                ]
+                p_cat_primary = (
+                    max(p_cat_values, key=abs)
+                    if p_cat_values else None
+                )
                 signals = self._collect_create_signals(
                     book, p["description"], p["trans_date"],
                     p["proposed_amounts"],
+                    proposed_category_primary=p_cat_primary,
                     want_auto_fill=False, want_stability=False,
                     want_duplicates=True, want_recent=False,
                     trans_currency=p["currency"].mnemonic,
+                    sweep=_sweep(),
                 )
                 dups = signals.duplicates
-                for d in dups:
-                    dup_rows.append((p["ref"], d))
+                if dups:
+                    # Proposal-side context for the ruling-9
+                    # comparison rows — computed once per row.
+                    p_cats = [
+                        (v["account"].fullname, str(v["value"]))
+                        for v in p["validated"]
+                        if v["account"].type
+                        not in self._FUNDING_ACCOUNT_TYPES
+                    ] or [
+                        (v["account"].fullname, str(v["value"]))
+                        for v in p["validated"]
+                    ]
+                    proposal = {
+                        "desc": p["description"],
+                        "date": p["trans_date"],
+                        # SIGNED primary (max-abs split's value) —
+                        # the comparison table reads sign as
+                        # direction on both surfaces, so a +50
+                        # deposit and a -50 payment never render
+                        # as a perfect twin (review finding).
+                        "amount": (
+                            p_cat_primary
+                            if p_cat_primary is not None
+                            else max(
+                                (v["value"] for v in p["validated"]),
+                                key=abs,
+                            )
+                            if p["validated"] else Decimal("0")
+                        ),
+                        "cats": p_cats,
+                    }
+                    for d in dups:
+                        dup_rows.append((p["ref"], d, proposal))
+                # Duplicates arrive HIGH-first, so [0] is the max —
+                # the results-table shortcut that saves the
+                # two-table join for the common decision.
+                max_conf = dups[0]["confidence"] if dups else ""
                 if signals.has_high_duplicate and not force:
                     by_ref[p["ref"]] = {
                         "ref": p["ref"], "status": "rejected",
-                        "reason": "duplicate_detected", "dup_count": len(dups),
+                        "reason": "duplicate_detected",
+                        "dup_count": len(dups),
+                        "max_confidence": max_conf,
                     }
                 else:
-                    accepted.append((p, len(dups)))
+                    accepted.append((p, len(dups), max_conf))
 
             # Cross-commodity implied-rate sanity per accepted row
             # (non-blocking) — surfaced as a side table keyed by ref,
             # so a decimal slip in a bulk import is caught too.
             warn_rows: list = []
-            for p, _dc in accepted:
+            for p, _dc, _mc in accepted:
                 for w in p["auto_fill_warnings"]:
                     warn_rows.append((p["ref"], w["message"]))
                 for w in self._fx_sanity_warnings(
@@ -3548,18 +3937,98 @@ class CoreMixin:
 
             # --- Phase 3: build all accepted rows, one save ---
             if dry_run:
-                for p, dup_count in accepted:
+                # Ruling 8: a projected-action label must not
+                # masquerade as clearance. would_create stays only
+                # on candidate-free rows (there it is an honest,
+                # verified clearance); any row with >=1 candidate
+                # reports review_required. HIGH blocks stay
+                # rejected + reason.
+                for p, dup_count, max_conf in accepted:
                     by_ref[p["ref"]] = {
-                        "ref": p["ref"], "status": "would_create",
+                        "ref": p["ref"],
+                        "status": (
+                            "review_required" if dup_count
+                            else "would_create"
+                        ),
                         "dup_count": dup_count,
+                        "max_confidence": max_conf,
                         **_fill_marker(p),
                     }
-                return self._batch_envelope(
+                envelope = self._batch_envelope(
                     transactions, by_ref, dup_rows, warn_rows,
                 )
+                # Ruling 7 upgrades: shared rehearsal header (counts
+                # + homework, never a clearance) and the projected
+                # per-account effects footer — the rehearsal-
+                # completeness principle, minus the tie (batches
+                # assert no closing balance).
+                n_review = sum(
+                    1 for r in by_ref.values()
+                    if r["status"] == "review_required"
+                )
+                n_would = len(accepted) - n_review
+                n_rejected = len(transactions) - len(accepted)
+                with_cands = sum(
+                    1 for r in by_ref.values() if r.get("dup_count")
+                )
+                if n_review:
+                    homework = (
+                        f"{n_review} rows are review_required — "
+                        f"rule each against the duplicates table "
+                        f"before committing."
+                    )
+                elif with_cands:
+                    homework = (
+                        f"{with_cands} rows have duplicate "
+                        f"candidates — review the duplicates table "
+                        f"before committing."
+                    )
+                else:
+                    homework = "No duplicate candidates."
+                summary = _dry_run_summary(
+                    len(transactions), "rows",
+                    [("would_create", n_would),
+                     ("review_required", n_review),
+                     ("rejected", n_rejected)],
+                    homework,
+                )
+                effects: dict[str, list] = {}
+                for p, _dc, _mc in accepted:
+                    if _dc:
+                        # review_required rows are homework, not a
+                        # settled projection — including them would
+                        # let the footer masquerade as clearance
+                        # (review finding; worst under force).
+                        continue
+                    for v in p["validated"]:
+                        key = v["account"].fullname
+                        entry = effects.setdefault(
+                            key,
+                            [Decimal("0"),
+                             v["account"].commodity.mnemonic],
+                        )
+                        entry[0] += v["quantity"]
+                effects_tsv = ""
+                if effects:
+                    # Deltas are in each account's OWN commodity —
+                    # the commodity column keeps a mixed batch
+                    # legible under one heading.
+                    out = ["account\tdelta\tcommodity"]
+                    for name in sorted(effects):
+                        delta, mnemonic = effects[name]
+                        out.append(
+                            f"{_tsv_cell(name)}\t{delta}\t"
+                            f"{mnemonic}"
+                        )
+                    effects_tsv = "\n".join(out)
+                return {
+                    "summary": summary,
+                    **envelope,
+                    "effects": effects_tsv,
+                }
 
             built = []
-            for p, dup_count in accepted:
+            for p, dup_count, _max_conf in accepted:
                 piecash_splits = [
                     piecash.Split(
                         account=v["account"], value=v["value"],
@@ -3575,7 +4044,7 @@ class CoreMixin:
                     post_date=p["trans_date"],
                     splits=piecash_splits,
                 )
-                built.append((p, txn_obj, dup_count))
+                built.append((p, txn_obj, dup_count, _max_conf))
 
             # Single flush for the whole batch — per the "don't flush
             # mid-build" rule, every Transaction is fully constructed
@@ -3583,11 +4052,12 @@ class CoreMixin:
             book.save()
 
             all_guids = [t.guid for t in book.transactions]
-            for p, txn_obj, dup_count in built:
+            for p, txn_obj, dup_count, max_conf in built:
                 by_ref[p["ref"]] = {
                     "ref": p["ref"], "status": "created",
                     "txn_guid": _unique_prefix(txn_obj.guid, all_guids),
                     "dup_count": dup_count,
+                    "max_confidence": max_conf,
                     **_fill_marker(p),
                 }
 
@@ -3617,41 +4087,1140 @@ class CoreMixin:
             return ""
         lines = ["ref\tmessage"]
         for ref, message in warn_rows:
-            lines.append(f"{ref}\t{message}")
+            lines.append(f"{_tsv_cell(ref)}\t{_tsv_cell(message)}")
         return "\n".join(lines)
 
     @staticmethod
     def _batch_results_to_tsv(rows: list[dict]) -> str:
         """RESULTS table: header + one row per input transaction.
-        Blank cells for fields a given status doesn't carry; ``dup_count``
-        of 0 renders as "0", absent renders blank."""
-        header = "ref\tstatus\ttxn_guid\tdup_count\treason"
+        Blank cells for fields a given status doesn't carry;
+        ``dup_count`` of 0 renders as "0", absent renders blank.
+        ``max_confidence`` (HIGH/MEDIUM/blank) is the row's top
+        duplicate candidate — the shortcut that saves the two-table
+        join for the common keep/drop decision; the duplicates
+        table remains for the real one."""
+        header = (
+            "ref\tstatus\ttxn_guid\tdup_count\tmax_confidence\treason"
+        )
         lines = [header]
         for r in rows:
             dup = r["dup_count"] if "dup_count" in r else ""
             lines.append(
                 f"{r['ref']}\t{r['status']}\t{r.get('txn_guid', '')}\t"
-                f"{dup}\t{r.get('reason', '')}"
+                f"{dup}\t{r.get('max_confidence', '')}\t"
+                f"{r.get('reason', '')}"
             )
         return "\n".join(lines)
 
     @staticmethod
-    def _batch_duplicates_to_tsv(dup_rows: list) -> str:
-        """DUPLICATES table: single-entry's column order with ``ref``
-        prepended as the FK. Empty string when no row has a match."""
-        if not dup_rows:
-            return ""
-        lines = [
-            "ref\tconfidence\tguid\tdate\tamount\tcur\t"
-            "description\tsignals"
-        ]
-        for ref, d in dup_rows:
-            lines.append(
-                f"{ref}\t{d['confidence']}\t{d['guid']}\t{d['date']}\t"
-                f"{d['amount']}\t{d.get('currency', '')}\t"
-                f"{d['description']}\t{d['signals']}"
+    def _cats_str(cats: list[tuple[str, str]]) -> str:
+        """Render category legs as ``account=amount`` pipe-joined.
+        The mini-grammar's own separators are escaped inside
+        account names so an account containing ``|`` or ``=``
+        can't corrupt the cell or flip split_match's reading."""
+        def esc(a: str) -> str:
+            return (
+                a.replace("\\", "\\\\")
+                .replace("=", "\\=")
+                .replace("|", "\\|")
             )
-        return "\n".join(lines)
+        return "|".join(f"{esc(a)}={v}" for a, v in sorted(cats))
+
+    @staticmethod
+    def _batch_duplicates_to_tsv(dup_rows: list) -> str:
+        """DUPLICATES table in the shared ruling-9 comparison shape:
+        proposed + existing values AND deltas, category legs,
+        split_match — the caller never joins back to its own input.
+        Empty string when no row has a match. ``amt_delta`` renders
+        blank on cross-currency candidates (the ``cur`` column
+        labels them): 188 HKD − 188 CNY is not a number."""
+        rows = []
+        for ref, d, prop in dup_rows:
+            date_old = date.fromisoformat(d["date"])
+            cross_frame = not d.get("same_frame", True)
+            rows.append({
+                "ref": ref,
+                "candidate_guid": d["guid"],
+                "confidence": d["confidence"],
+                "state": d.get("state", ""),
+                "date_new": prop["date"].isoformat(),
+                "date_old": d["date"],
+                "date_delta_days": (date_old - prop["date"]).days,
+                "amt_new": str(prop["amount"]),
+                "amt_old": d.get("primary_signed", d["amount"]),
+                "amt_delta": (
+                    "" if cross_frame
+                    else str(
+                        _to_decimal(
+                            d.get("primary_signed", d["amount"])
+                        )
+                        - prop["amount"]
+                    )
+                ),
+                "cur": (
+                    d.get("currency_code", "") if cross_frame
+                    else ""
+                ),
+                "desc_new": prop["desc"],
+                "desc_old": d["description"],
+                "notes_old": d.get("notes", ""),
+                "cat_new": CoreMixin._cats_str(prop["cats"]),
+                "cat_old": CoreMixin._cats_str(
+                    d.get("categories", [])
+                ),
+                "split_match": _split_match_verdict(
+                    prop["cats"], d.get("categories", []),
+                ),
+                "signals": d["signals"],
+            })
+        return _candidate_comparison_tsv(rows)
+
+    # ── Statement entry ────────────────────────────────────────────
+
+    # Statement-native sign transform, keyed by GNCAccountType (never
+    # by name — i18n invariant). Asset-class statements print amounts
+    # in the split convention already; liability-class statements
+    # print charges positive and balances as amount-owed, so both
+    # negate. The model transcribes verbatim; the server flips.
+    _STATEMENT_SIGNS = {
+        "BANK": 1, "CASH": 1, "ASSET": 1,
+        "CREDIT": -1, "LIABILITY": -1,
+    }
+
+    def enter_statement(
+        self,
+        account_name: str,
+        statement_date: date,
+        opening_balance: str,
+        closing_balance: str,
+        lines: list[dict],
+        dry_run: bool = True,
+        force_base: bool = False,
+        force_duplicates: bool = False,
+        show_all: bool = False,
+    ) -> dict:
+        """One-shot statement entry: enter, claim, and reconcile a
+        complete bank/card statement in one atomic open/save.
+
+        Spec: specs/v1.5/ENTER_STATEMENT_SPEC.md. Each line dict is
+        ``{ref, date (date), amount (statement-native string),
+        description?, notes?, raw?, match?, splits}``.
+
+        ``dry_run=True`` (the default) classifies every line —
+        NEW / MATCH / OVERLAP / AMBIGUOUS — against the account's
+        existing splits and projects the balance tie; nothing is
+        written. ``dry_run=False`` creates NEW rows, claims ``match``
+        rows, reconciles every statement-touched split at
+        ``statement_date``, and saves once — or refuses wholesale.
+
+        The two force flags are INDEPENDENT safeties (maintainer
+        ruling after the round-two review found one flag coaching
+        itself into the exact scenario its other half guards):
+        ``force_base=True`` clears the opening-balance precondition
+        and downgrades the consequent closing-tie failure to a
+        recorded discrepancy; ``force_duplicates=True`` disables
+        the exact-twin guard on create rows. Forcing the base
+        never silently disables duplicate detection, and vice
+        versa.
+        """
+        if not lines:
+            raise ValueError(
+                "statement has no lines — for a no-activity "
+                "statement, reconcile_account covers the balance "
+                "tie on its own"
+            )
+        refs = [ln["ref"] for ln in lines]
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                "duplicate ref in statement — each line needs a "
+                "unique ref"
+            )
+        opening = _to_decimal(opening_balance)
+        closing = _to_decimal(closing_balance)
+
+        with self.open(readonly=dry_run) as book:
+            default_currency = self._require_default_currency(book)
+            account = self._resolve_account(book, account_name)
+            if not account:
+                raise self._account_not_found_error(book, account_name)
+            sign = self._STATEMENT_SIGNS.get(account.type)
+            if sign is None:
+                raise ValueError(
+                    f"enter_statement needs a balance-carrying "
+                    f"statement account (BANK, CASH, ASSET, CREDIT, "
+                    f"or LIABILITY); '{account.fullname}' is "
+                    f"{account.type}"
+                )
+            if account.commodity != default_currency:
+                raise ValueError(
+                    f"'{account.fullname}' is denominated in "
+                    f"{account.commodity.mnemonic}, not the book "
+                    f"default {default_currency.mnemonic} — "
+                    f"foreign-currency statements are a planned "
+                    f"follow-up; enter this one via "
+                    f"create_transactions + reconcile_account"
+                )
+            quantum = _commodity_quantum(account.commodity)
+
+            amounts: dict[str, Decimal] = {}
+            for ln in lines:
+                try:
+                    amt = _to_decimal(ln["amount"])
+                except (InvalidOperation, ValueError):
+                    raise ValueError(
+                        f"line {ln['ref']}: amount "
+                        f"{ln['amount']!r} is not a decimal"
+                    )
+                # Sub-quantum precision is a transcription error,
+                # not a rounding job — and rounding here would let
+                # the self-check gate and the tie compute different
+                # sums for the same statement.
+                if amt != amt.quantize(quantum):
+                    raise ValueError(
+                        f"line {ln['ref']}: amount {ln['amount']} "
+                        f"carries finer precision than "
+                        f"{account.commodity.mnemonic} — re-check "
+                        f"the transcription"
+                    )
+                amounts[ln["ref"]] = amt
+            for label, bal in (
+                ("opening_balance", opening),
+                ("closing_balance", closing),
+            ):
+                if bal != bal.quantize(quantum):
+                    raise ValueError(
+                        f"{label} {bal} carries finer precision "
+                        f"than {account.commodity.mnemonic} — "
+                        f"re-check the transcription"
+                    )
+
+            # Self-consistency gate — statement-native signs, before
+            # any transform: the statement must not contradict itself.
+            line_sum = sum(amounts.values(), Decimal("0"))
+            if (opening + line_sum).quantize(quantum) != \
+                    closing.quantize(quantum):
+                raise ValueError(
+                    f"statement does not self-check: opening "
+                    f"{opening} + line sum {line_sum} = "
+                    f"{opening + line_sum}, but closing is {closing} "
+                    f"(difference "
+                    f"{closing - (opening + line_sum)}). A missed or "
+                    f"doubled line, or a sign slip — re-check the "
+                    f"transcription before trusting any "
+                    f"classification."
+                )
+
+            # Opening precondition: the base the statement lands on.
+            reconciled_balance = Decimal("0")
+            for s in account.splits:
+                if s.reconcile_state == "y":
+                    reconciled_balance += s.quantity
+            opening_book = (sign * opening).quantize(quantum)
+            opening_gap = (
+                reconciled_balance.quantize(quantum) - opening_book
+            )
+            warn_rows: list[tuple[str, str]] = []
+            if opening_gap != 0:
+                gap_msg = (
+                    f"account's reconciled balance "
+                    f"{reconciled_balance} does not tie to the "
+                    f"statement's opening balance ({opening} as "
+                    f"printed → {opening_book} in book convention); "
+                    f"difference {opening_gap}. A prior statement "
+                    f"may be unentered."
+                )
+                if dry_run:
+                    warn_rows.append(("*", gap_msg))
+                elif not force_base:
+                    raise ValueError(
+                        gap_msg + " Commit refuses on an untied "
+                        "base — enter the prior statement first, "
+                        "or pass force_base=true to land this one "
+                        "anyway (the resulting reconciled state is "
+                        "only as good as the base; duplicate "
+                        "detection stays on)."
+                    )
+
+            split_prefixes = self._split_prefix_map(book)
+
+            # Warm this account's transaction rows in ONE indexed
+            # query before the universe filter touches
+            # s.transaction.post_date per split — the lazy
+            # many-to-one was a SELECT per transaction, making the
+            # headline workflow O(account history) in round-trips on
+            # large books, paid by dry-run and commit alike
+            # (release-review finding 8). Account-scoped on purpose:
+            # _preload_split_graph loads the whole book, which a
+            # single-statement entry never needs. The strong
+            # reference is load-bearing — the identity map holds
+            # rows only weakly (same trap the preload documents).
+            from piecash.core.transaction import (
+                Split as _Split,
+                Transaction as _Txn,
+            )
+            _txn_keepalive = (  # noqa: F841 — keepalive, see above
+                book.session.query(_Txn)
+                .join(_Split, _Split.transaction_guid == _Txn.guid)
+                .filter(_Split.account_guid == account.guid)
+                .distinct()
+                .all()
+            )
+
+            # Candidate universe: this account's splits within the
+            # match window of any line. Ruling 1: window 31 days —
+            # one day wider than the duplicate screen, so a monthly
+            # pattern (June 30 "July rent" vs a July 31 line)
+            # SURFACES for judgment. Candidate noise is the feature.
+            window = timedelta(days=31)
+            lo = min(ln["date"] for ln in lines) - window
+            hi = max(ln["date"] for ln in lines) + window
+            acct_splits = []
+            for s in account.splits:
+                pd = s.transaction.post_date
+                if pd is None or _is_voided(s):
+                    continue
+                if lo <= pd <= hi:
+                    acct_splits.append(s)
+
+            def _book_amount(ln) -> Decimal:
+                return (sign * amounts[ln["ref"]]).quantize(quantum)
+
+            def _candidates_for(ln) -> list[dict]:
+                """DAD-style scoring against the account's own
+                splits. A candidate needs the amount signal alone
+                (the universe is narrow enough that an amount match
+                is meaningful — and the rent case has ONLY that), or
+                desc+date without amount (the fix-the-book-typo
+                case)."""
+                target = _book_amount(ln)
+                probe = (
+                    ln.get("description") or ln.get("raw") or ""
+                ).lower().strip()
+                cands = []
+                for s in acct_splits:
+                    pd = s.transaction.post_date
+                    if abs((pd - ln["date"]).days) > 31:
+                        continue
+                    amount_match = (
+                        abs(s.quantity - target)
+                        <= _MATCH_AMOUNT_TOLERANCE
+                    )
+                    date_match = (
+                        abs((pd - ln["date"]).days)
+                        <= _MATCH_DATE_TIGHT_DAYS
+                    )
+                    tdesc = (
+                        s.transaction.description or ""
+                    ).lower().strip()
+                    desc_match = (
+                        bool(probe) and bool(tdesc)
+                        and (probe in tdesc or tdesc in probe)
+                    )
+                    if not (
+                        amount_match or (desc_match and date_match)
+                    ):
+                        continue
+                    cands.append({
+                        "split": s,
+                        "signals": (
+                            ("D" if desc_match else "-")
+                            + ("A" if amount_match else "-")
+                            + ("D" if date_match else "-")
+                        ),
+                        # Exact = the same event, not the monthly
+                        # pattern: amount to the quantum AND date
+                        # within the tight window. Drives the
+                        # OVERLAP class and the commit guard.
+                        "exact": (
+                            date_match
+                            and s.quantity.quantize(quantum)
+                            == target
+                        ),
+                        # Recurring signature: same name, same
+                        # amount, a month away — evidence for the
+                        # annotation-adaptation case, never a
+                        # class driver.
+                        "recurring": (
+                            desc_match and amount_match
+                            and abs((pd - ln["date"]).days)
+                            >= _RECURRENCE_MIN_DAYS
+                        ),
+                    })
+                return cands
+
+            if dry_run:
+                return self._statement_dry_run(
+                    book, account, lines, amounts, sign, quantum,
+                    _book_amount, _candidates_for, split_prefixes,
+                    reconciled_balance, closing, warn_rows,
+                    show_all, force_duplicates,
+                )
+            return self._statement_commit(
+                book, account, lines, amounts, sign, quantum,
+                statement_date, _book_amount, _candidates_for,
+                split_prefixes, reconciled_balance, closing,
+                force_base, force_duplicates, default_currency,
+            )
+
+    def _statement_prep_create(
+        self, book, account, ln, book_amount, default_currency,
+        sweep_fn=None,
+    ) -> tuple[list[dict], dict | None]:
+        """Validate one would-be-created statement line into resolved
+        splits (bank leg synthesized first, counter legs from the
+        row or a 2-split auto-fill precedent). Returns
+        ``(validated, auto_fill_source | None)``; raises ValueError
+        with the row-level problem. ``sweep_fn``, when given, is a
+        zero-arg memoized ``_signal_sweep`` supplier — splitless
+        lines across one statement then share a single table
+        traversal."""
+        if not (ln.get("description") or ln.get("raw")):
+            raise ValueError(
+                "a created line needs a description (or at least "
+                "a raw cell to fall back on)"
+            )
+        bank: dict = {
+            "account": account.fullname, "amount": str(book_amount),
+        }
+        if ln.get("raw"):
+            bank["memo"] = ln["raw"]
+
+        counters = ln.get("splits") or []
+        src = None
+        if not counters:
+            probe = ln.get("description") or ln.get("raw") or ""
+            sig = self._collect_create_signals(
+                book, probe, ln["date"], [],
+                want_auto_fill=True, want_stability=False,
+                want_duplicates=False, want_recent=False,
+                sweep=sweep_fn() if sweep_fn is not None else None,
+            )
+            if sig.auto_fill is None:
+                raise ValueError(
+                    "no matching transaction to auto-fill from — "
+                    "supply explicit counter-splits"
+                )
+            filled, src = sig.auto_fill
+            if len(filled) != 2:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} has "
+                    f"{len(filled)} splits — statement auto-fill "
+                    f"only adapts 2-split precedents to the line "
+                    f"amount; supply explicit counter-splits"
+                )
+            # The precedent must have a leg ON the statement account
+            # — that's what makes "the other leg is the counter"
+            # well-defined. A description match paid from a
+            # DIFFERENT account would otherwise pick an arbitrary
+            # leg (split iteration order) and could fabricate an
+            # inter-bank transfer instead of the expense (review
+            # finding).
+            on_account = [
+                f for f in filled
+                if f["account"] == account.fullname
+            ]
+            if len(on_account) != 1:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} doesn't "
+                    f"touch this statement account — supply "
+                    f"explicit counter-splits"
+                )
+            counter = next(
+                f for f in filled
+                if f["account"] != account.fullname
+            )
+            if "quantity" in counter:
+                raise ValueError(
+                    f"auto-fill precedent {src['guid']} has a "
+                    f"cross-commodity leg — supply explicit "
+                    f"counter-splits"
+                )
+            counters = [{
+                "account": counter["account"],
+                "amount": str(-book_amount),
+                **(
+                    {"memo": counter["memo"]}
+                    if counter.get("memo") else {}
+                ),
+            }]
+
+        validated = self._validate_transaction_splits(
+            book, [bank] + counters, default_currency,
+        )
+        for v in validated:
+            if v["account"].placeholder:
+                raise self._placeholder_error(v["account"])
+        # The statement account's leg is SYNTHESIZED from the line
+        # amount; a counter-split resolving back to it would move
+        # the account by more than the printed line while the tie
+        # — an identity over the inputs — still reports success,
+        # and the stray unreconciled split breaks NEXT month's
+        # opening gate (review finding).
+        for v in validated[1:]:
+            if v["account"].guid == account.guid:
+                raise ValueError(
+                    f"counter-splits must not name the statement "
+                    f"account ('{account.fullname}') — its leg is "
+                    f"synthesized from the line amount"
+                )
+        return validated, src
+
+    def _statement_resolve_claim(
+        self, book, account, ln, book_amount, quantum,
+    ):
+        """Resolve and vet one ``match`` cell. Returns
+        ``(split, "claim" | "overlap")`` — overlap means the split
+        is already reconciled and the row is an idempotent no-op.
+        Raises ValueError on any claim that would lie."""
+        if ln.get("splits"):
+            raise ValueError(
+                "a match row claims an existing split — it cannot "
+                "also carry counter-splits"
+            )
+        s = self._find_split(book, ln["match"])
+        if s is None:
+            raise ValueError(f"match split not found: {ln['match']}")
+        if s.account.guid != account.guid:
+            raise ValueError(
+                f"match split {ln['match']} is on "
+                f"'{s.account.fullname}', not the statement account"
+            )
+        if _is_voided(s):
+            raise ValueError(
+                f"match split {ln['match']} is voided — voided "
+                f"splits cannot be claimed; unvoid_transaction "
+                f"first"
+            )
+        # Exactness has no reconciled-split exemption: a wrong-GUID
+        # paste naming a reconciled split of a different amount must
+        # diagnose at the row, not silently no-op and surface as a
+        # generic tie discrepancy (review finding).
+        if s.quantity.quantize(quantum) != book_amount:
+            raise ValueError(
+                f"match split {ln['match']} has amount "
+                f"{s.quantity}, but the line says {ln['amount']} "
+                f"as printed ({book_amount} in book convention) — "
+                f"wrong split, or fix the book entry first "
+                f"(update_transactions), then claim it"
+            )
+        if s.reconcile_state == "y":
+            return s, "overlap"
+        return s, "claim"
+
+    def _statement_dry_run(
+        self, book, account, lines, amounts, sign, quantum,
+        _book_amount, _candidates_for, split_prefixes,
+        reconciled_balance, closing, warn_rows, show_all,
+        force_duplicates,
+    ) -> dict:
+        """The rehearsal: run the SAME disposition resolution commit
+        runs (the chokepoint), classify every line as evidence, and
+        project the balance tie from the resolved dispositions —
+        never from the classification (the adversarial round's
+        root-cause finding: an approximated projection diverged
+        from the landing in both directions)."""
+        default_currency = self._require_default_currency(book)
+        phase_a = self._statement_dispositions(
+            book, account, lines, _book_amount, _candidates_for,
+            quantum, default_currency, force_duplicates,
+            split_prefixes,
+        )
+        by_ref = phase_a["by_ref"]
+        for ref, msg in phase_a["errors"]:
+            warn_rows.append((ref, msg))
+        n_refuse = len(phase_a["errors"]) + len(phase_a["guards"])
+
+        counts = {"NEW": 0, "MATCH": 0, "OVERLAP": 0, "AMBIGUOUS": 0}
+        line_rows: list[tuple] = []
+        cand_rows: list[dict] = []
+        projected = reconciled_balance.quantize(quantum)
+
+        for ln in lines:
+            cands = _candidates_for(ln)
+            unrec = [
+                c for c in cands if _is_unreconciled(c["split"])
+            ]
+            rec = [
+                c for c in cands
+                if c["split"].reconcile_state == "y"
+            ]
+            # MATCH/AMBIGUOUS demand adjudication, so the class is
+            # gated on MEDIUM+ correspondence (>=2 signals) that
+            # is NOT the recurring-payment signature. Weak and
+            # recurring candidates still SURFACE as evidence —
+            # ruling 1's superset — but classify NEW: three weak
+            # lookalikes must not adopt a genuinely new line, and
+            # last month's rent is a precedent, not a twin
+            # (bookkeeper findings, maiden flight + T6).
+            strong = [
+                c for c in unrec
+                if sum(1 for ch in c["signals"] if ch != "-") >= 2
+                and not c["recurring"]
+            ]
+            if strong:
+                cls = "MATCH" if len(strong) == 1 else "AMBIGUOUS"
+                listed = unrec + rec
+            elif any(c["exact"] for c in rec):
+                # OVERLAP means THE SAME EVENT already landed and
+                # tied — exact amount, tight date; fuzzier
+                # reconciled candidates are evidence for a NEW
+                # line, not an overlap.
+                cls = "OVERLAP"
+                listed = rec
+            else:
+                cls = "NEW"
+                # Weak (LOW) and reconciled fuzzy candidates stay
+                # listed: the spec's annotation-adaptation case
+                # needs the prior instance's annotation shipped as
+                # evidence even when it doesn't drive the class.
+                listed = unrec + rec
+
+            # Note, class overrides, and projection all come from
+            # the RESOLVED DISPOSITION — what commit will actually
+            # do with this row — not from the evidence class.
+            d = by_ref[ln["ref"]]
+            note = ""
+            proposal_cats = None
+            if d["kind"] == "claim":
+                cls = "MATCH"
+                note = (
+                    f"will claim "
+                    f"{split_prefixes[d['split'].guid]}"
+                )
+                projected += _book_amount(ln)
+            elif d["kind"] == "overlap":
+                cls = "OVERLAP"
+                note = "match names a reconciled split — no-op"
+            elif d["kind"] == "guard":
+                # The guard's coaching verbatim — the same text the
+                # commit rejection would carry.
+                note = d["message"]
+                if not d["twin_reconciled"]:
+                    # Resolution (claim, or forced create) lands
+                    # the amount either way; a reconciled twin
+                    # resolves to a no-op.
+                    projected += _book_amount(ln)
+            elif d["kind"] == "create":
+                validated = d["validated"]
+                proposal_cats = [
+                    (v["account"].fullname, str(v["value"]))
+                    for v in validated
+                    if v["account"].guid != account.guid
+                ]
+                if cls == "NEW" and not ln.get("splits"):
+                    counter_names = ", ".join(
+                        v["account"].fullname
+                        for v in validated[1:]
+                    )
+                    note = (
+                        f"would create {_book_amount(ln)} → "
+                        f"{counter_names}"
+                    )
+                    if d["src"]:
+                        note += (
+                            f" (auto_filled_from:"
+                            f"{d['src']['guid']})"
+                        )
+                projected += _book_amount(ln)
+            else:  # error — assume the operator fixes the row and
+                # it lands; the caveat counts it either way.
+                projected += _book_amount(ln)
+
+            counts[cls] += 1
+
+            # Best-evidence-only display (bookkeeper ruling,
+            # 2026-08-24): a line with MEDIUM/HIGH candidates
+            # suppresses its LOW amount-coincidences — redundant
+            # next to the real evidence, and dense-recurrence
+            # cards make the token weight real (19 LOWs on one
+            # $4.99 line). A line whose ONLY evidence is LOW keeps
+            # it: ruling 1's rent case is load-bearing. The
+            # suppression leaves a breadcrumb in the cands column;
+            # show_all=true is the escape hatch.
+            kept = listed
+            n_suppressed = 0
+            if not show_all:
+                strong_listed = [
+                    c for c in listed
+                    if sum(1 for ch in c["signals"] if ch != "-")
+                    >= 2
+                ]
+                if strong_listed and len(strong_listed) < len(listed):
+                    n_suppressed = len(listed) - len(strong_listed)
+                    kept = strong_listed
+            cands_cell = str(len(kept))
+            if n_suppressed:
+                cands_cell += f" (+{n_suppressed} LOW suppressed)"
+
+            for c in kept:
+                s = c["split"]
+                txn = s.transaction
+                cat_old = [
+                    (s2.account.fullname, str(s2.value))
+                    for s2 in txn.splits
+                    if s2.account.guid != account.guid
+                ]
+                risk = sum(1 for ch in c["signals"] if ch != "-")
+                cand_rows.append({
+                    "ref": ln["ref"],
+                    "candidate_guid": split_prefixes[s.guid],
+                    "confidence": {
+                        3: "HIGH", 2: "MEDIUM", 1: "LOW",
+                    }.get(risk, ""),
+                    "state": s.reconcile_state,
+                    "date_new": ln["date"].isoformat(),
+                    "date_old": txn.post_date.isoformat(),
+                    "date_delta_days": (
+                        txn.post_date - ln["date"]
+                    ).days,
+                    "amt_new": str(_book_amount(ln)),
+                    "amt_old": str(s.quantity),
+                    "amt_delta": str(
+                        s.quantity - _book_amount(ln)
+                    ),
+                    "desc_new": (
+                        ln.get("description") or ln.get("raw") or ""
+                    ),
+                    "desc_old": txn.description or "",
+                    "notes_old": txn.notes or "",
+                    "memo_old": s.memo or "",
+                    "cat_new": (
+                        self._cats_str(proposal_cats)
+                        if proposal_cats is not None else ""
+                    ),
+                    "cat_old": self._cats_str(cat_old),
+                    "split_match": _split_match_verdict(
+                        proposal_cats, cat_old,
+                    ),
+                    "signals": c["signals"],
+                })
+            line_rows.append((ln["ref"], cls, cands_cell, note))
+
+        # Summary header via the shared rehearsal renderer — counts
+        # are facts and may headline; clearance verdicts over
+        # unadjudicated rows may not (the clearance principle,
+        # spec §4).
+        n_judge = counts["MATCH"] + counts["AMBIGUOUS"]
+        if n_judge:
+            homework = (
+                f"{n_judge} rows need adjudication — rule each "
+                f"MATCH/AMBIGUOUS against the candidates table "
+                f"before committing."
+            )
+        elif cand_rows:
+            # Verified-empty phrasing must not contradict the
+            # visible table (bookkeeper copy quibble + round-two
+            # R6: a recurring candidate labels MEDIUM in the
+            # confidence column, so "no MEDIUM+ candidates" argued
+            # with its own table). State what is true: no row
+            # needs adjudication; the listed rows are evidence.
+            homework = (
+                "No rows need adjudication — the listed candidates "
+                "are evidence only (recurring patterns or "
+                "already-reconciled)."
+            )
+        else:
+            homework = "No existing-split candidates on any line."
+        header = _dry_run_summary(
+            len(lines), "lines",
+            [(c, counts[c]) for c in
+             ("NEW", "MATCH", "OVERLAP", "AMBIGUOUS")],
+            homework,
+        )
+
+        closing_book = (sign * closing).quantize(quantum)
+        projected = projected.quantize(quantum)
+        if projected == closing_book:
+            tie = (
+                f"Projected reconciled balance after commit: "
+                f"{projected} — ties to the statement closing "
+                f"({closing} as printed)."
+            )
+        else:
+            tie = (
+                f"Projected reconciled balance after commit: "
+                f"{projected} vs statement closing {closing_book} "
+                f"({closing} as printed) — DISCREPANCY "
+                f"{closing_book - projected}."
+            )
+        if n_refuse:
+            # Counts the rows the SAME payload would refuse at
+            # commit — resolved dispositions, not a warning-count
+            # proxy (the old proxy was wrong in both directions:
+            # guard hits raised no warning, and under force the
+            # opening-gap warning implied a refusal that wouldn't
+            # happen). Facts, not clearance.
+            tie += (
+                f" {n_refuse} row(s) this payload would refuse at "
+                f"commit — resolve the notes/warnings first."
+            )
+
+        lines_tsv = ["ref\tclass\tcands\tnote"]
+        for r in line_rows:
+            lines_tsv.append(
+                f"{_tsv_cell(r[0])}\t{r[1]}\t{r[2]}\t"
+                f"{_tsv_cell(r[3])}"
+            )
+
+        return {
+            "summary": header,
+            "lines": "\n".join(lines_tsv),
+            "candidates": _candidate_comparison_tsv(cand_rows),
+            "warnings": self._batch_warnings_to_tsv(warn_rows),
+            "tie": tie,
+        }
+
+    def _statement_dispositions(
+        self, book, account, lines, _book_amount, _candidates_for,
+        quantum, default_currency, force_duplicates, split_prefixes,
+    ) -> dict:
+        """Phase A — THE disposition chokepoint both modes run.
+
+        The adversarial round found the rehearsal approximating this
+        procedure and drifting from it in five distinct ways; the
+        fix is structural: one resolver, two consumers, divergence
+        impossible by construction. Claims resolve first (the
+        guard's exemption set), then each create row runs the twin
+        guard BEFORE counter-split/auto-fill prep (bookkeeper
+        signoff, carried item). ``force_duplicates`` disables the
+        guard here — for BOTH modes, so a forced rehearsal
+        rehearses the forced landing.
+
+        Returns ``{"by_ref": {ref: {"kind": claim|overlap|create|
+        guard|error, ...}}, "claims": [(ln, split)], "skipped":
+        [(ln, split)], "prepared": [(ln, validated, src)],
+        "errors": [(ref, msg)], "guards": [(ref, msg,
+        twin_reconciled)]}``. Pure read — no mutation on any path.
+        """
+        by_ref: dict[str, dict] = {}
+        prepared: list[tuple] = []
+        claims: list[tuple] = []
+        skipped: list[tuple] = []
+        errors: list[tuple[str, str]] = []
+        guards: list[tuple[str, str, bool]] = []
+        claimed_guids: set[str] = set()
+        overlap_guids: set[str] = set()
+
+        # Shared table sweep for the statement's splitless create
+        # rows — dispositions are a pure read (no mutation on any
+        # path), so every auto-fill preflight screens the same
+        # pre-write table state. Lazy: all-claims and all-explicit
+        # statements never pay for it.
+        _sweep_memo: list = []
+
+        def _sweep():
+            if not _sweep_memo:
+                _sweep_memo.append(self._signal_sweep(book))
+            return _sweep_memo[0]
+
+        create_rows = []
+        for ln in lines:
+            if not ln.get("match"):
+                create_rows.append(ln)
+                continue
+            try:
+                s, kind = self._statement_resolve_claim(
+                    book, account, ln, _book_amount(ln), quantum,
+                )
+                if s.guid in claimed_guids or (
+                    kind == "overlap" and s.guid in overlap_guids
+                ):
+                    # One split, one row — reconciled no-ops
+                    # included: two lines both no-opping one split
+                    # would report two handled lines for one
+                    # (review finding).
+                    raise ValueError(
+                        "split already used by another row in "
+                        "this statement"
+                    )
+                if kind == "overlap":
+                    overlap_guids.add(s.guid)
+                    skipped.append((ln, s))
+                    by_ref[ln["ref"]] = {"kind": "overlap", "split": s}
+                else:
+                    claimed_guids.add(s.guid)
+                    claims.append((ln, s))
+                    by_ref[ln["ref"]] = {"kind": "claim", "split": s}
+            except ValueError as e:
+                errors.append((ln["ref"], str(e)))
+                by_ref[ln["ref"]] = {"kind": "error", "message": str(e)}
+
+        def _twin_guard(ln) -> tuple[str, bool] | None:
+            """Statement-duplicate guard: a created line that
+            exactly matches an unclaimed split on this account
+            would double-enter. Unreconciled twin: the tie would
+            still hold (only the new split reconciles) — silent.
+            Reconciled twin: already landed via a prior statement.
+            Splits claimed OR no-op'd by other rows in this
+            statement are exempt — their lines are accounted for,
+            so an exact-matching create is a genuine second
+            charge."""
+            for c in _candidates_for(ln):
+                s = c["split"]
+                if (
+                    s.guid in claimed_guids
+                    or s.guid in overlap_guids
+                    or not c["exact"]
+                ):
+                    continue
+                if _is_unreconciled(s):
+                    return (
+                        f"unreconciled split "
+                        f"{split_prefixes[s.guid]} on this account "
+                        f"matches this line exactly (amount + "
+                        f"date) and no row claims it — claim it "
+                        f"with match={split_prefixes[s.guid]}, or "
+                        f"force_duplicates=true to create "
+                        f"anyway"
+                    ), False
+                return (
+                    f"reconciled split {split_prefixes[s.guid]} "
+                    f"matches this line exactly — it looks landed "
+                    f"by a prior statement; keep the line as a "
+                    f"match row (match={split_prefixes[s.guid]}, "
+                    f"a no-op skip), or force_duplicates=true "
+                    f"to create anyway"
+                ), True
+            return None
+
+        for ln in create_rows:
+            if not force_duplicates:
+                hit = _twin_guard(ln)
+                if hit is not None:
+                    msg, twin_reconciled = hit
+                    guards.append((ln["ref"], msg, twin_reconciled))
+                    by_ref[ln["ref"]] = {
+                        "kind": "guard", "message": msg,
+                        "twin_reconciled": twin_reconciled,
+                    }
+                    continue
+            try:
+                validated, src = self._statement_prep_create(
+                    book, account, ln, _book_amount(ln),
+                    default_currency, sweep_fn=_sweep,
+                )
+                prepared.append((ln, validated, src))
+                by_ref[ln["ref"]] = {
+                    "kind": "create", "validated": validated,
+                    "src": src,
+                }
+            except ValueError as e:
+                errors.append((ln["ref"], str(e)))
+                by_ref[ln["ref"]] = {"kind": "error", "message": str(e)}
+
+        return {
+            "by_ref": by_ref, "claims": claims, "skipped": skipped,
+            "prepared": prepared, "errors": errors, "guards": guards,
+        }
+
+    def _statement_commit(
+        self, book, account, lines, amounts, sign, quantum,
+        statement_date, _book_amount, _candidates_for,
+        split_prefixes, reconciled_balance, closing, force_base,
+        force_duplicates, default_currency,
+    ) -> dict:
+        """The landing: resolve dispositions (the shared chokepoint),
+        check the tie, then — and only then — mutate and save once."""
+        phase_a = self._statement_dispositions(
+            book, account, lines, _book_amount, _candidates_for,
+            quantum, default_currency, force_duplicates,
+            split_prefixes,
+        )
+        prepared = phase_a["prepared"]
+        claims = phase_a["claims"]
+        skipped = phase_a["skipped"]
+        # Guard hits are row errors at commit time.
+        errors = phase_a["errors"] + [
+            (ref, msg) for ref, msg, _rec in phase_a["guards"]
+        ]
+
+        if errors:
+            # The row's error rides the note column INLINE — the
+            # results table is the primary read, and a rejection
+            # whose coaching ("claim it with match=…, or force")
+            # lives elsewhere strands the operator at exactly the
+            # moment they need the next move (bookkeeper T5b).
+            error_by_ref = {}
+            for ref, msg in errors:
+                error_by_ref.setdefault(ref, msg)
+            rows = []
+            for ln in lines:
+                msg = error_by_ref.get(ln["ref"], "")
+                status = "rejected" if msg else "statement_aborted"
+                rows.append(
+                    f"{_tsv_cell(ln['ref'])}\t{status}\t\t"
+                    f"{_tsv_cell(msg)}"
+                )
+            return {
+                "summary": (
+                    f"Statement REJECTED — {len(error_by_ref)} row "
+                    f"error(s); nothing was written."
+                ),
+                "results": "ref\tstatus\tguid\tnote\n"
+                + "\n".join(rows),
+            }
+
+        # The tie, BEFORE any mutation. Claim amounts equal line
+        # amounts by the exactness rule, so both dispositions
+        # contribute the transformed line amount.
+        new_reconciled = reconciled_balance
+        for ln, _s in claims:
+            new_reconciled += _book_amount(ln)
+        for ln, _v, _src in prepared:
+            new_reconciled += _book_amount(ln)
+        new_reconciled = new_reconciled.quantize(quantum)
+        closing_book = (sign * closing).quantize(quantum)
+        n_touched = len(prepared) + len(claims)
+        cur = account.commodity.mnemonic
+        if new_reconciled == closing_book:
+            tie = (
+                f"Reconciled: {n_touched} splits @ "
+                f"{statement_date.isoformat()}; closing balance "
+                f"{cur} {new_reconciled} ({closing} as printed) — "
+                f"tied."
+            )
+        elif force_base:
+            # Only a forced base can produce a discrepancy — the
+            # self-check and opening gates make the unforced tie
+            # an identity, and forced duplicates still contribute
+            # their own line amounts.
+            tie = (
+                f"DISCREPANCY {closing_book - new_reconciled}: "
+                f"reconciled balance {new_reconciled} vs statement "
+                f"closing {closing_book} ({closing} as printed) — "
+                f"landed under force_base"
+            )
+        else:
+            raise ValueError(
+                f"balance tie failed: the reconciled balance would "
+                f"be {new_reconciled}, but the statement closes at "
+                f"{closing_book} ({closing} as printed); difference "
+                f"{closing_book - new_reconciled}. Nothing was "
+                f"written."
+            )
+
+        # Audit before-state: the claimed splits' prior annotations
+        # and states, for the ENTER formatter's diffs.
+        self._stage_audit_before({
+            "account": account.fullname,
+            "claims": [
+                {
+                    "guid": s.guid,
+                    "state": s.reconcile_state,
+                    "memo": s.memo or "",
+                    "notes": s.transaction.notes or "",
+                    "description": s.transaction.description or "",
+                    "date": (
+                        s.transaction.post_date.isoformat()
+                        if s.transaction.post_date else ""
+                    ),
+                }
+                for _ln, s in claims
+            ],
+        })
+
+        # Mutate: claims first (annotations + state), then builds.
+        rec_dt = datetime.combine(
+            statement_date, datetime.min.time()
+        )
+        for ln, s in claims:
+            if ln.get("raw"):
+                s.memo = ln["raw"]
+            if ln.get("notes"):
+                s.transaction.notes = ln["notes"]
+            s.reconcile_state = "y"
+            s.reconcile_date = rec_dt
+
+        built = []
+        for ln, validated, src in prepared:
+            piecash_splits = [
+                piecash.Split(
+                    account=v["account"], value=v["value"],
+                    quantity=v["quantity"], memo=v["memo"] or "",
+                    action=v["action"] or "",
+                )
+                for v in validated
+            ]
+            txn_obj = piecash.Transaction(
+                currency=default_currency,
+                description=(
+                    ln.get("description") or ln.get("raw") or ""
+                ),
+                notes=ln.get("notes") or None,
+                post_date=ln["date"],
+                splits=piecash_splits,
+            )
+            # The bank leg is validated[0] by construction; it is
+            # part of the statement, so it lands reconciled.
+            piecash_splits[0].reconcile_state = "y"
+            piecash_splits[0].reconcile_date = rec_dt
+            built.append((ln, txn_obj, src))
+
+        book.save()
+
+        # Post-write verification (round-two finding: the pre-save
+        # tie is an arithmetic identity over the operator's own
+        # inputs). Read the reconciled balance BACK from the saved
+        # splits; a mismatch means the write did not land as
+        # computed and must surface loudly, never as a clean
+        # summary. Same doctrine as _verify_write for raw SQL.
+        readback = Decimal("0")
+        for s in account.splits:
+            if s.reconcile_state == "y":
+                readback += s.quantity
+        if readback.quantize(quantum) != new_reconciled:
+            raise ValueError(
+                f"post-write verification failed: the account's "
+                f"reconciled balance reads {readback}, expected "
+                f"{new_reconciled}. The statement WAS saved — "
+                f"inspect the account before retrying."
+            )
+
+        all_guids = [t.guid for t in book.transactions]
+        rows = ["ref\tstatus\tguid\tnote"]
+        by_ref: dict[str, str] = {}
+        for ln, txn_obj, src in built:
+            note = (
+                f"auto_filled_from:{src['guid']}" if src else ""
+            )
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tcreated\t"
+                f"{_unique_prefix(txn_obj.guid, all_guids)}\t{note}"
+            )
+        for ln, s in claims:
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tclaimed\t{split_prefixes[s.guid]}\t"
+            )
+        for ln, s in skipped:
+            by_ref[ln["ref"]] = (
+                f"{ln['ref']}\tskipped_duplicate\t"
+                f"{split_prefixes[s.guid]}\talready reconciled"
+            )
+        for ln in lines:
+            rows.append(by_ref[ln["ref"]])
+
+        return {
+            "summary": (
+                f"Statement entered on {account.fullname} through "
+                f"{statement_date.isoformat()}: {len(built)} "
+                f"created, {len(claims)} claimed, {len(skipped)} "
+                f"skipped (already reconciled)."
+                + (
+                    " LANDED UNDER FORCE ("
+                    + ", ".join(
+                        n for n, on in (
+                            ("base", force_base),
+                            ("duplicates", force_duplicates),
+                        ) if on
+                    )
+                    + ") — the named guard(s) were bypassed."
+                    if (force_base or force_duplicates) else ""
+                )
+            ),
+            "results": "\n".join(rows),
+            "new_reconciled_balance": str(new_reconciled),
+            "tie": tie,
+        }
 
     def search_transactions(
         self,
@@ -4199,7 +5768,7 @@ class CoreMixin:
           orphans the invoice's posted-state metadata, after which
           the invoice refuses both delete ("posted") and re-post
           ("already posted") — SQL surgery is the only escape.
-          unpost_invoice clears the metadata properly.
+          unpost_document clears the metadata properly.
         - Refuses reconciled splits unless ``force``.
         """
         from sqlalchemy import text
@@ -4210,7 +5779,7 @@ class CoreMixin:
         if posting_for:
             raise ValueError(
                 f"Transaction is the posting record for invoice "
-                f"{posting_for[0]}. Use unpost_invoice first."
+                f"{posting_for[0]}. Use unpost_document first."
             )
 
         reconciled = [
@@ -4562,10 +6131,10 @@ class CoreMixin:
 
         Each entry: ``{guid, description (optional), notes
         (optional), date (optional, datetime.date)}`` — absent keys
-        leave the field unchanged (the TSV's empty cells). Clearing
-        a field is deliberately single-tool territory
-        (``update_transaction`` with ``notes=""``) so a sparse batch
-        can never mass-erase.
+        leave the field unchanged (the TSV's empty cells), while an
+        explicit ``""`` clears (produced only by the TSV ``clear``
+        column — an opt-in per-row declaration, so a sparse batch
+        still can never mass-erase by accident).
 
         ``on_error="abort"`` (default) sinks the batch on any bad
         row; ``"skip"`` keeps the good rows. ``force`` allows date

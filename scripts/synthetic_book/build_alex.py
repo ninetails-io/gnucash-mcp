@@ -255,7 +255,7 @@ def add_prices(out_path: Path) -> int:
     reflects the most recent real close instead of forward-filling the
     1st-of-month value to the end of the horizon.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -287,10 +287,10 @@ def add_prices(out_path: Path) -> int:
         # at the present edge of the book — the actual most-recent close,
         # not the 1st-of-month value carried over.
         for sym, _full, _ns, _frac in SECURITIES:
-            asof = min(THROUGH, MD.latest_security_date(sym))
+            asof = THROUGH  # §5: closing point AT the horizon (value forward-fills)
             _add(sym, asof, MD.security(sym, asof).quantize(_security_quant(sym)))
         for foreign in FOREIGN_CURRENCIES:
-            asof = min(THROUGH, MD.latest_fx_date(foreign, "USD"))
+            asof = THROUGH
             _add(foreign, asof, MD.fx(foreign, "USD", asof).quantize(D("0.0001")))
 
         book.save()
@@ -306,7 +306,7 @@ def add_event_prices(out_path: Path, events: list[tuple[str, date]]) -> int:
     date so cross-currency posts/pays find a fresh rate and lot-gain
     calculations have an on-date market price.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -452,7 +452,7 @@ ACCOUNTS = [
 
 def create_accounts(out_path: Path) -> int:
     """Create the full chart of accounts directly via piecash."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         comm_by_key = {}
@@ -494,6 +494,10 @@ def set_account_slots(book: GnuCashBook) -> None:
     book.set_account_slot(AMEX, "statement_close_day", "22")
     book.set_account_slot(MORTGAGE, "apr", "6.25")
     book.set_account_slot(AUTO_LOAN, "apr", "5.49")
+    # Loans opt out of the reconciliation surface — no statement
+    # exists to reconcile against (bookkeeper review §1).
+    book.set_account_slot(MORTGAGE, "no_reconcile", "true")
+    book.set_account_slot(AUTO_LOAN, "no_reconcile", "true")
 
 
 # ── Phase 3: Opening balances + investment lots ─────────────────
@@ -524,7 +528,7 @@ OPENING_LOTS = [
 
 def opening_balances(out_path: Path) -> None:
     """Post opening balances (one balanced transaction) + investment lots."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     try:
         usd = book.default_currency
         acct = {a.fullname: a for a in book.accounts}
@@ -578,7 +582,7 @@ def write_bulk(out_path: Path, txns: list[dict]) -> int:
     (account_path, value, quantity) when the account commodity differs
     from the transaction currency. ``currency`` defaults to USD.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     count = 0
     try:
         usd = book.default_currency
@@ -1505,14 +1509,19 @@ def gen_savings_sweep(through: date) -> list[dict]:
     return txns
 
 
-def run_vtsax_sweep(out_path: Path, through: date) -> dict:
+def run_vtsax_sweep(out_path: Path, through: date,
+                    since: date | None = None) -> dict:
     """Quarterly surplus sweep from Checking into VTSAX (fractional shares).
 
     A separate lot per sweep, cost = USD swept, shares at the real VTSAX
     close on the sweep date. Mirrors the DCA path so lot/gain tooling
     sees consistent data.
+
+    Prefix-only: continuation retires the fixed-amount sweep — the
+    policy layer (``continuation.PersonaPolicy``) derives sweeps from
+    actual surplus instead. ``since`` guards the full-rebuild path.
     """
-    book = piecash.open_book(str(out_path), readonly=False)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     counts = {"txns": 0, "lots": 0}
     try:
         usd = book.default_currency
@@ -1525,6 +1534,8 @@ def run_vtsax_sweep(out_path: Path, through: date) -> dict:
                 continue
             when = _clamp_day(yr, m, 20)
             if when < date(YEAR, 2, 1) or when > through:
+                continue
+            if since is not None and when <= since:
                 continue
             price = MD.security("VTSAX", when).quantize(_security_quant("VTSAX"))
             shares = _shares_from_usd(QUARTERLY_VTSAX_SWEEP, price, frac)
@@ -1648,60 +1659,98 @@ def business_event_price_dates(through: date) -> list[tuple[str, date]]:
     return out
 
 
-def run_business(book: GnuCashBook, through: date) -> dict:
+def _party_by_name(book: GnuCashBook, name: str) -> dict:
+    """Find an existing customer/vendor row by exact name (continuation
+    mode — entities live in the frozen prefix and are never recreated)."""
+    for lister in (book.list_customers, book.list_vendors):
+        env = lister(compact=False, limit=250)
+        rows = next((v for v in env.values() if isinstance(v, list)), [])
+        for row in rows:
+            if row.get("name") == name:
+                return row
+    raise SystemExit(f"continuation: party {name!r} not found in book")
+
+
+def run_business(book: GnuCashBook, through: date,
+                 since: date | None = None) -> dict:
     """Create billterms, customers, vendors, invoices, bills, and jobs.
 
     A realistic slice of invoices is left POSTED-BUT-UNPAID so the book
     shows outstanding receivables in both USD and EUR A/R; the rest are
     paid (Berlin's settled EUR invoices still book realized FX gain/loss).
     Three jobs group project invoices across customers.
+
+    ``since`` (continuation mode): entities and jobs already exist in
+    the frozen prefix — look them up instead of creating; emit only
+    documents opened AFTER ``since``. The ``through``-relative "recent
+    open" extras are re-anchored each continuation but skipped while
+    their predecessor is still outstanding (a quarterly client doesn't
+    invoice monthly just because the updater runs monthly).
     """
     counts = {"customers": 0, "vendors": 0, "invoices": 0, "bills": 0,
               "terms": 0, "employees": 0, "jobs": 0, "open_invoices": 0}
 
-    book.create_billterm(name="Net 15", due_days=15,
-                         description="Payment due within 15 days")
-    book.create_billterm(name="Net 30", due_days=30,
-                         description="Payment due within 30 days")
-    book.create_billterm(name="2/10 Net 30", due_days=30, discount_days=10,
-                         discount_percent="2",
-                         description="2% discount if paid in 10 days, else net 30")
-    counts["terms"] = 3
+    open_owner_names: set[str] = set()
+    if since is None:
+        book.create_billterm(name="Net 15", due_days=15,
+                             description="Payment due within 15 days")
+        book.create_billterm(name="Net 30", due_days=30,
+                             description="Payment due within 30 days")
+        book.create_billterm(name="2/10 Net 30", due_days=30,
+                             discount_days=10, discount_percent="2",
+                             description="2% discount if paid in 10 days, else net 30")
+        counts["terms"] = 3
 
-    # Customers. Notes are natural client descriptors — nothing that names a
-    # test scenario (no "EUR-denominated", "FX case", currency tags, etc.).
-    emerald = book.create_customer(
-        name="Emerald Analytics", currency="USD",
-        notes="Seattle analytics firm; monthly data-engineering retainer.")
-    sound_transit = book.create_customer(
-        name="Sound Transit Data Team", currency="USD",
-        notes="Regional transit agency; project-based engagements.")
-    berlin = book.create_customer(
-        name="Berlin Digital GmbH", currency="EUR",
-        notes="Digital agency in Berlin; recurring engagements.")
-    nord = book.create_customer(
-        name="Nord Analytique", currency="CAD",
-        notes="Montréal data consultancy.")
-    counts["customers"] = 4
+        # Customers. Notes are natural client descriptors — nothing that
+        # names a test scenario (no "EUR-denominated", "FX case",
+        # currency tags, etc.).
+        emerald = book.create_customer(
+            name="Emerald Analytics", currency="USD",
+            notes="Seattle analytics firm; monthly data-engineering retainer.")
+        sound_transit = book.create_customer(
+            name="Sound Transit Data Team", currency="USD",
+            notes="Regional transit agency; project-based engagements.")
+        berlin = book.create_customer(
+            name="Berlin Digital GmbH", currency="EUR",
+            notes="Digital agency in Berlin; recurring engagements.")
+        nord = book.create_customer(
+            name="Nord Analytique", currency="CAD",
+            notes="Montréal data consultancy.")
+        counts["customers"] = 4
 
-    # Vendors.
-    jetbrains = book.create_vendor(
-        name="JetBrains", currency="USD", notes="Developer IDE and tooling.")
-    bookkeeper = book.create_vendor(
-        name="BookkeepingCo", currency="USD",
-        notes="Outsourced bookkeeping firm.")
-    counts["vendors"] = 2
+        # Vendors.
+        jetbrains = book.create_vendor(
+            name="JetBrains", currency="USD",
+            notes="Developer IDE and tooling.")
+        bookkeeper = book.create_vendor(
+            name="BookkeepingCo", currency="USD",
+            notes="Outsourced bookkeeping firm.")
+        counts["vendors"] = 2
 
-    # Employee.
-    book.create_employee(name="Sam Rivera", currency="USD")
-    counts["employees"] = 1
+        # Employee.
+        book.create_employee(name="Sam Rivera", currency="USD")
+        counts["employees"] = 1
+    else:
+        emerald = _party_by_name(book, "Emerald Analytics")
+        sound_transit = _party_by_name(book, "Sound Transit Data Team")
+        berlin = _party_by_name(book, "Berlin Digital GmbH")
+        nord = _party_by_name(book, "Nord Analytique")
+        jetbrains = _party_by_name(book, "JetBrains")
+        bookkeeper = _party_by_name(book, "BookkeepingCo")
+        env = book.get_outstanding_invoices(compact=False, limit=250)
+        open_owner_names = {
+            doc.get("owner_name") for doc in env.get("invoices", [])
+        }
 
     def run_invoice(customer_id, date_open, date_pay, amount, description,
                     currency, post_account, paid=True, job_id=None):
         """Create + post an invoice; pay it only when ``paid`` is True.
 
-        Returns the invoice id. ``date_open`` / ``date_pay`` are dates.
+        Returns the invoice id (None when skipped by ``since``).
+        ``date_open`` / ``date_pay`` are dates.
         """
+        if since is not None and date_open <= since:
+            return None
         cross = currency != "USD"
         inv = book.create_invoice(
             customer_id=customer_id, date_opened=date_open.isoformat(),
@@ -1785,6 +1834,8 @@ def run_business(book: GnuCashBook, through: date) -> dict:
     # horizon). Its post date is added to the event-price dates so the
     # cross-currency post finds a real EUR/USD rate.
     berlin_open_date = _berlin_recent_open_date(through)
+    if berlin_open_date is not None and "Berlin Digital GmbH" in open_owner_names:
+        berlin_open_date = None  # predecessor still outstanding — don't stack
     if berlin_open_date is not None:
         run_invoice(
             berlin["id"], berlin_open_date,
@@ -1822,7 +1873,17 @@ def run_business(book: GnuCashBook, through: date) -> dict:
         (sound_transit["id"], "Sound Transit Realtime Feed", "ST-RT",
          [("7200.00", False)], 12),
     ]
+    existing_jobs: set[str] = set()
+    if since is not None:
+        env = book.list_jobs(compact=False, limit=250)
+        rows = next((v for v in env.values() if isinstance(v, list)), [])
+        existing_jobs = {row.get("name") for row in rows}
     for owner_id, jname, jref, milestones, anchor_days in jobs_specs:
+        if jname in existing_jobs:
+            # Prefix narrative: the job and its milestones exist; the
+            # settlement pass ages its open milestones. Re-anchoring
+            # would duplicate the project under a new date window.
+            continue
         last_open = through - timedelta(days=anchor_days)
         first_open = last_open - timedelta(days=30 * (len(milestones) - 1))
         if first_open < date(YEAR, 1, 1):
@@ -1846,6 +1907,8 @@ def run_business(book: GnuCashBook, through: date) -> dict:
     # Vendor bills.
     def run_bill(vendor_id, date_open, date_pay, amount, description,
                  expense_account, payment_account=CHECKING, paid=True):
+        if since is not None and date_open <= since:
+            return None
         bill = book.create_bill(
             vendor_id=vendor_id, date_opened=date_open.isoformat(),
             term="Net 30",
@@ -1891,13 +1954,15 @@ def run_business(book: GnuCashBook, through: date) -> dict:
     # Re-dated outstanding bill: a recent BookkeepingCo bill left UNPAID
     # so Accounts Payable shows a current outstanding balance (rather than
     # a stale/corrupt-looking one). Opened ~10 days before ``through``.
+    # Continuation: skipped while the previous one is still outstanding.
     recent_open = through - timedelta(days=10)
-    run_bill(
-        bookkeeper["id"], recent_open, recent_open + timedelta(days=30),
-        "450.00",
-        f"Quarterly bookkeeping review - {recent_open.strftime('%B %Y')}",
-        EXP_ACCOUNTING, paid=False,
-    )
+    if "BookkeepingCo" not in open_owner_names:
+        run_bill(
+            bookkeeper["id"], recent_open, recent_open + timedelta(days=30),
+            "450.00",
+            f"Quarterly bookkeeping review - {recent_open.strftime('%B %Y')}",
+            EXP_ACCOUNTING, paid=False,
+        )
 
     return counts
 
@@ -1976,11 +2041,15 @@ def _shares_from_usd(usd: Decimal, price: Decimal, fraction: int) -> Decimal:
     return (usd / price).quantize(places)
 
 
-def run_investments(out_path: Path, through: date) -> dict:
+def run_investments(out_path: Path, through: date,
+                    since: date | None = None) -> dict:
     """Monthly DCA, quarterly trades, reinvested dividends, plus recent
     whole-share stock buys — continuing through ``through``. Direct
-    piecash."""
-    book = piecash.open_book(str(out_path), readonly=False)
+    piecash. ``since`` (continuation mode): skip every event dated on
+    or before it — those trades and lots already exist in the frozen
+    prefix, and re-running them would double-create."""
+    cut = since or date(YEAR, 1, 1) - timedelta(days=1)
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     counts = {"txns": 0, "lots": 0}
     try:
         usd = book.default_currency
@@ -2000,7 +2069,7 @@ def run_investments(out_path: Path, through: date) -> dict:
         dca = [("VTSAX", D("500.00")), ("VBTLX", D("200.00"))]
         for yr, m in _month_iter(date(YEAR, 1, 1), through):
             d = date(yr, m, 1)
-            if d > through:
+            if d > through or d <= cut:
                 continue
             for sym, amt in dca:
                 price = MD.security(sym, d).quantize(_security_quant(sym))
@@ -2029,7 +2098,7 @@ def run_investments(out_path: Path, through: date) -> dict:
             if m not in (2, 5, 8, 11):
                 continue
             d = date(yr, m, 10)
-            if d > through:
+            if d > through or d <= cut:
                 continue
             for sym, n_shares in stock_dca:
                 price = MD.security(sym, d).quantize(_security_quant(sym))
@@ -2055,6 +2124,8 @@ def run_investments(out_path: Path, through: date) -> dict:
         # Quarterly trades at real prices.
         for m, day, action, sym, shares in QUARTERLY_TRADES:
             d = date(YEAR, m, day)
+            if d <= cut:
+                continue
             price = MD.security(sym, d).quantize(_security_quant(sym))
             inv_acct = acct[ACCT_BY_SYMBOL[sym]]
             usd_amt = (shares * price).quantize(D("0.01"))
@@ -2106,7 +2177,7 @@ def run_investments(out_path: Path, through: date) -> dict:
         for yr in range(YEAR, through.year + 1):
             for m, day, sym, amt in DIVIDENDS_PLAN:
                 d = date(yr, m, day)
-                if d > through:
+                if d > through or d <= cut:
                     continue
                 inv_acct = acct[ACCT_BY_SYMBOL[sym]]
                 if sym in ("AAPL", "MSFT"):
@@ -2427,96 +2498,14 @@ def run_reconciliation(book: GnuCashBook) -> None:
 
 # ── Scheduled-transaction state (stay ENABLED, realistic timing) ─
 
-# Schedules we deliberately leave OVERDUE (last_occur pushed two periods
-# back so the dashboard surfaces an overdue-scheduled warning) — by name.
-#
-# Only the Estimated Tax Payment stays overdue: it's a believable
-# real-world lapse (a freelancer can genuinely miss a quarterly IRS
-# deadline) and the bookkeeper keeps it as a demo of the overdue-warning
-# surface. The Auto Loan Payment is NOT overdue — missing a car payment
-# hits credit after 30 days, which would be unrealistic; its recurring
-# instantiation is posted current (the monthly amortization in
-# ``gen_recurring`` runs through ``through``) and its SX cursor advances
-# to the latest occurrence below.
-OVERDUE_SX = {"Estimated Tax Payment"}
-
-
 def set_schedule_state(out_path: Path, through: date) -> dict:
-    """Leave SX templates ENABLED with realistic ``last_occur`` timing.
-
-    Most schedules get ``last_occur`` set to their most recent occurrence
-    on/before ``through`` so their next occurrence is upcoming (the
-    dashboard's "due soon" line, and a working
-    ``create_transaction_from_scheduled`` target). A couple in
-    ``OVERDUE_SX`` are pushed two periods back so they read as overdue —
-    driving the overdue-schedule warning.
-
-    We set ``last_occur`` directly via piecash because the public
-    ``update_scheduled_transaction`` tool intentionally doesn't expose it
-    (it's GnuCash desktop's "Since Last Run" cursor, not user-editable).
-    """
-    from dateutil.relativedelta import relativedelta
-
-    period = {
-        "weekly": timedelta(days=7),
-        "biweekly": timedelta(days=14),
-        "monthly": relativedelta(months=1),
-        "quarterly": relativedelta(months=3),
-        "yearly": relativedelta(years=1),
-    }
-    info = {"enabled": 0, "upcoming": 0, "overdue": 0}
-
-    book = piecash.open_book(str(out_path), readonly=False)
-    try:
-        for sx in book.session.query(piecash.ScheduledTransaction).all():
-            rec = sx.recurrence
-            if rec is None:
-                continue
-            mult = rec.recurrence_mult
-            ptype = rec.recurrence_period_type
-            # Map piecash recurrence to a frequency label.
-            if ptype == "week" and mult == 2:
-                freq = "biweekly"
-            elif ptype == "week":
-                freq = "weekly"
-            elif ptype == "month" and mult == 3:
-                freq = "quarterly"
-            elif ptype == "year":
-                freq = "yearly"
-            else:
-                freq = "monthly"
-
-            start = sx.start_date
-            if hasattr(start, "date"):
-                start = start.date()
-
-            # Walk occurrences forward from start, collecting those on or
-            # before ``through``.
-            step = period[freq]
-            occs = []
-            cur = start
-            while cur <= through and len(occs) < 5000:
-                occs.append(cur)
-                cur = cur + step
-
-            if not occs:
-                last_occ = None
-            elif sx.name in OVERDUE_SX and len(occs) >= 2:
-                # Push last_occur back so the next occurrence falls before
-                # today → the dashboard reads it as overdue.
-                last_occ = occs[-2]
-                info["overdue"] += 1
-            else:
-                last_occ = occs[-1]
-                info["upcoming"] += 1
-
-            sx.enabled = 1
-            sx.last_occur = last_occ
-            info["enabled"] += 1
-        book.save()
-    finally:
-        book.close()
-    return info
+    """Stamp SX cursors via the shared engine rule: everything current,
+    at most ONE schedule overdue and only when it "just came due" (3–7
+    days — bookkeeper review §2). The old always-overdue Estimated Tax
+    hook aged into looking like neglect; the due-soon line is Alex's
+    hook now."""
+    from continuation import advance_sx
+    return advance_sx(out_path, through)
 
 
 # ── Verification ────────────────────────────────────────────────
@@ -2935,6 +2924,127 @@ def verify(out_path: Path, through: date) -> None:
 def relativedelta_safe(months: int = 0):
     from dateutil.relativedelta import relativedelta
     return relativedelta(months=months)
+
+
+# ── Continuation hooks (closed-loop policy layer) ───────────────
+# Persona wiring for scripts/synthetic_book/continue_book.py; policy
+# constants derived from the measured drift in
+# specs/v1.5/DRIFT_ANALYSIS.md.
+
+from continuation import CardPolicy, PersonaPolicy  # noqa: E402
+
+
+def continuation_txns(through: date) -> list[dict]:
+    """The deterministic streams continuation replays (spec §2.2).
+
+    ``gen_savings_sweep`` and ``gen_credit_cards`` are deliberately
+    absent: fixed payments against variable spending are the measured
+    drift disease — the policy layer derives payments and sweeps from
+    the book itself going forward.
+    """
+    return (gen_recurring(through) + gen_daily_weekly(through)
+            + gen_personal_life(through) + gen_contractor_income(through)
+            + gen_volume(through))
+
+
+def continue_business(book: GnuCashBook, through: date,
+                      since: date) -> dict:
+    return run_business(book, through, since=since)
+
+
+def continue_investments(out_path: Path, through: date,
+                         since: date) -> dict:
+    return run_investments(out_path, through, since=since)
+
+
+def advance_schedules(out_path: Path, through: date) -> dict:
+    return set_schedule_state(out_path, through)
+
+
+def extend_prices(out_path: Path, since: date, through: date) -> int:
+    """Price rows for the continued range: 1st-of-month snapshots, a
+    fresh closing point per commodity, and on-date quotes for the new
+    trade/settlement events. ``add_event_prices`` skips anything the
+    book already has, so the prefix's price table is never touched."""
+    syms = [s[0] for s in SECURITIES]
+    events: list[tuple[str, date]] = []
+    for yr, mo in _price_months(through):
+        d = date(yr, mo, 1)
+        if d <= since:
+            continue
+        events += [(sym, d) for sym in syms]
+        events += [(fc, d) for fc in FOREIGN_CURRENCIES]
+    for sym in syms:
+        events.append((sym, through))  # §5: dated at the horizon
+    for fc in FOREIGN_CURRENCIES:
+        events.append((fc, through))
+    for sym, d in (investment_event_price_dates(through)
+                   + business_event_price_dates(through)):
+        if d > since:
+            events.append((sym, d))
+    return add_event_prices(out_path, events)
+
+
+def ensure_rate(out_path: Path, currency: str, when: date) -> None:
+    """Real FX close for a cross-currency settlement date (no-op when
+    a rate for that date is already on file)."""
+    add_event_prices(out_path, [(currency, when)])
+
+
+def continuation_invest(out_path: Path, when: date, amount: Decimal,
+                        source_path: str) -> None:
+    """Policy-layer VTSAX purchase: one lot per purchase at the real
+    close, mirroring the DCA/sweep lot pattern so lot and gain tooling
+    see consistent data. Source is Checking (surplus sweep) or Savings
+    (pile rebalance — RULED 2026-08-31)."""
+    add_event_prices(out_path, [("VTSAX", when)])
+    book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
+    try:
+        usd = book.default_currency
+        acct = {a.fullname: a for a in book.accounts}
+        frac = {s[0]: s[3] for s in SECURITIES}["VTSAX"]
+        price = MD.security("VTSAX", when).quantize(_security_quant("VTSAX"))
+        shares = _shares_from_usd(amount, price, frac)
+        kind = ("savings rebalance" if source_path == SAVINGS
+                else "surplus sweep")
+        lot = piecash.Lot(
+            title=f"VTSAX {kind} {when.isoformat()}", account=acct[VTSAX],
+            notes=f"{kind.capitalize()} — ${amount} @ ${price}", is_closed=0)
+        inv_split = piecash.Split(account=acct[VTSAX], value=amount,
+                                  quantity=shares)
+        cash_split = piecash.Split(account=acct[source_path], value=-amount)
+        piecash.Transaction(
+            currency=usd, description=f"VTSAX purchase — {kind}",
+            post_date=when, splits=[inv_split, cash_split])
+        inv_split.lot = lot
+        book.save()
+    finally:
+        book.close()
+
+
+POLICY = PersonaPolicy(
+    key="alex", currency="USD",
+    checking=CHECKING, savings=SAVINGS,
+    buffer=D("12000"),                 # DRIFT_ANALYSIS: measured floor
+    cards=(
+        CardPolicy(account=CHASE, label="Chase Sapphire", kind="pif",
+                   close_day_default=15),
+        # repair_min below buffer/2: the Amex fossil (~$4k, DRIFT
+        # ANALYSIS) deserves the catch-up narrative when first paid.
+        CardPolicy(account=AMEX, label="Business Amex", kind="pif",
+                   close_day_default=22, repair_min=D("2000")),
+    ),
+    savings_share=D("0.40"),           # surplus: 40% savings / 60% VTSAX
+    invest_months=(3, 6, 9, 12),       # VTSAX share moves quarterly
+    savings_target=D("60000"),         # ~5× buffer; rebalance ends here
+    rebalance_tranche=D("10000"),      # quarterly savings→VTSAX tranche
+    max_monthly_sweep=D("15000"),      # staging cap — paces the repair
+    min_sweep=D("200"),
+    invest=continuation_invest,
+    ensure_rate=ensure_rate,
+    # Loans have no statement to reconcile against (review §1).
+    no_reconcile=(MORTGAGE, AUTO_LOAN),
+)
 
 
 # ── Driver ──────────────────────────────────────────────────────

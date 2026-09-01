@@ -16,6 +16,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable
 
+from gnucash_mcp._env import _env_errors, _parse_env_toggle
+
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
 DEBUG_LOGGER_NAME = "gnucash_mcp.debug"
 
@@ -134,6 +136,32 @@ def reset_write_rate_limiter() -> None:
     _write_limiter_initialized = False
 
 
+# Memo for _redact_enabled: (raw env value, verdict). redact_paths
+# runs on every outgoing error response, so the toggle parse (and
+# any one-time error recording) must not repeat per call.
+_redact_toggle_memo: tuple[str | None, bool] | None = None
+
+
+def _redact_enabled() -> bool:
+    """GNUCASH_REDACT_PATHS through the ``_parse_env_toggle``
+    chokepoint, memoized per raw value. Unparseable values fail
+    CLOSED (redact) — over-redaction is the safe direction for a
+    privacy control — and are recorded in ``_env_errors`` so a
+    main()-run server fails fast at startup like every other
+    toggle."""
+    global _redact_toggle_memo
+    raw = os.environ.get("GNUCASH_REDACT_PATHS")
+    if _redact_toggle_memo is not None and _redact_toggle_memo[0] == raw:
+        return _redact_toggle_memo[1]
+    try:
+        enabled = bool(_parse_env_toggle("GNUCASH_REDACT_PATHS"))
+    except ValueError as exc:
+        _env_errors.append(str(exc))
+        enabled = True  # fail closed: redact on a garbled toggle
+    _redact_toggle_memo = (raw, enabled)
+    return enabled
+
+
 def redact_paths(text: str) -> str:
     """Replace absolute filesystem paths with their basename when
     ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
@@ -145,7 +173,15 @@ def redact_paths(text: str) -> str:
     bit. POSIX and Windows absolute paths match; relative paths
     pass through (they don't leak layout).
     """
-    if os.environ.get("GNUCASH_REDACT_PATHS") != "1":
+    # Full toggle vocabulary via the _parse_env_toggle chokepoint —
+    # =="1" once made the Advanced box's "true" a silent no-op, and
+    # raw vocabulary membership repeated the shape one level up: a
+    # typo'd value ("ture") silently disabled redaction while every
+    # other GNUCASH_* toggle failed loud (release-review finding 7).
+    # A privacy control fails CLOSED: unparseable → redact anyway,
+    # and the recorded _env_error makes main()-run servers exit(2)
+    # at startup like the other toggles.
+    if not _redact_enabled():
         return text
 
     import re
@@ -529,28 +565,6 @@ def _transaction_guid(entry: dict) -> str:
 # ── Transaction handlers ──────────────────────────────────────────
 
 
-def _fmt_transaction_create(entry: dict) -> list[str]:
-    time_part = _extract_time(entry)
-    params = entry.get("params") or {}
-    after = entry.get("after_state") or {}
-    guid = _transaction_guid(entry)
-
-    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
-    desc = after.get("description") or params.get("description", "")
-    date_str = after.get("date") or params.get("transaction_date", "")
-    lines.append(f'{_INDENT}"{desc}" ({date_str})')
-
-    notes = after.get("notes") or params.get("notes") or ""
-    if notes:
-        lines.append(f"{_INDENT}notes: {notes}")
-
-    # after_state preferred; fall back to params (thin-response case)
-    splits = after.get("splits") or params.get("splits") or []
-    if splits:
-        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
-    return lines
-
-
 def _fmt_transaction_create_from_scheduled(entry: dict) -> list[str]:
     """SX instantiation — the response carries ``transaction_guid``
     (not ``guid``), so the generic transaction handler would fall
@@ -645,95 +659,36 @@ def _parse_batch_submission(tsv: str) -> dict:
     return out
 
 
-def _fmt_transaction_create_batch(entry: dict) -> list[str]:
-    """Batch create audits as N individual create blocks — one per
-    committed transaction, each rendered like a single-entry create.
-    Joins the submitted TSV (params) with the results TSV (after_state)
-    by ref. Account refs render as the caller supplied them (the TSV
-    isn't run through the audit ref-normalizer)."""
+# ── Retired-operation renderers ──────────────────────────────────
+# (transaction, CREATE) and (transaction, UPDATE) lost their last
+# declaring tools when the deprecated singulars were removed
+# (v1.4.4, 2026-08-30). The formatters are retained because the
+# audit-decorator test harness uses them as its canonical
+# single-entity vehicles (tests/test_logging.py); the dispatcher
+# contract test exempts them by name as RETIRED_OP_RENDERERS.
+# Filed for 1.5.x: port the harness vehicles to living operations,
+# then delete these.
+def _fmt_transaction_create(entry: dict) -> list[str]:
     time_part = _extract_time(entry)
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
-    submitted = _parse_batch_submission(params.get("transactions") or "")
-    results = _parse_audit_tsv_rows(after.get("results") or "")
-    created = [r for r in results if r.get("status") == "created"]
-    rejected = [r for r in results if r.get("status") == "rejected"]
+    guid = _transaction_guid(entry)
 
-    lines = [
-        f"{time_part}  CREATE TRANSACTIONS (batch)  "
-        f"{len(created)} created, {len(rejected)} rejected"
-    ]
-    for r in created:
-        src = submitted.get(r.get("ref", ""), {})
-        guid = r.get("txn_guid", "")
-        desc = src.get("description", "")
-        date_str = src.get("date", "")
-        when = date_str
-        if src.get("currency"):
-            when = f"{date_str}, {src['currency']}"
-        lines.append(
-            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
-        )
-        if src.get("notes"):
-            lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
-        reason = r.get("reason", "")
-        if reason.startswith("auto_filled_from:"):
-            # Splitless submission — the source guid is the trail to
-            # what actually got booked.
-            source = reason.split(":", 1)[1]
-            lines.append(
-                f"{_INDENT_SPLITS}auto-filled from guid:{source}"
-            )
-        splits = src.get("splits") or []
-        if splits:
-            lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    lines = [f"{time_part}  CREATE TRANSACTION  guid:{guid}"]
+    desc = after.get("description") or params.get("description", "")
+    date_str = after.get("date") or params.get("transaction_date", "")
+    lines.append(f'{_INDENT}"{desc}" ({date_str})')
+
+    notes = after.get("notes") or params.get("notes") or ""
+    if notes:
+        lines.append(f"{_INDENT}notes: {notes}")
+
+    # after_state preferred; fall back to params (thin-response case)
+    splits = after.get("splits") or params.get("splits") or []
+    if splits:
+        lines.append(_format_splits_text(splits, _INDENT_SPLITS))
     return lines
 
-
-def _fmt_transaction_update_batch(entry: dict) -> list[str]:
-    """``update_transactions`` (TSV, per-row values) — old→new per
-    touched field, old values from the staged before-state, new
-    from the submitted TSV re-parsed through the SAME parser the
-    tool used (no display drift)."""
-    from gnucash_mcp._format import _parse_update_tsv
-
-    time_part = _extract_time(entry)
-    params = entry.get("params") or {}
-    before = entry.get("before_state") or {}
-    befores = {
-        (t.get("guid") or ""): t
-        for t in before.get("transactions") or []
-    }
-    try:
-        rows = _parse_update_tsv(params.get("updates") or "")
-    except ValueError:
-        rows = []
-    lines = [
-        f"{time_part}  UPDATE TRANSACTIONS (batch)  {len(rows)} rows"
-    ]
-    for r in rows[:15]:
-        key = r["guid"]
-        old = next(
-            (
-                b for g, b in befores.items()
-                if g.startswith(key) or key.startswith(g[:8])
-            ),
-            {},
-        )
-        parts = [f"guid:{key}"]
-        if "description" in r:
-            old_d = old.get("description", "")
-            parts.append(f'"{old_d}" → "{r["description"]}"')
-        if "notes" in r:
-            old_n = old.get("notes") or "(none)"
-            parts.append(f"Notes: {old_n} → {r['notes']}")
-        if "date" in r:
-            old_dt = old.get("date", "")
-            parts.append(f"Date: {old_dt} → {r['date']}")
-        lines.append(f"{_INDENT}{'  '.join(parts)}")
-    if len(rows) > 15:
-        lines.append(f"{_INDENT}... and {len(rows) - 15} more")
-    return lines
 
 
 def _fmt_transaction_update(entry: dict) -> list[str]:
@@ -817,6 +772,98 @@ def _fmt_transaction_update(entry: dict) -> list[str]:
         lines.append(_format_splits_text(old_splits, _INDENT_SPLITS))
         lines.append(f"{_INDENT}Splits (after):")
         lines.append(_format_splits_text(new_splits, _INDENT_SPLITS))
+    return lines
+
+
+
+def _fmt_transaction_create_batch(entry: dict) -> list[str]:
+    """Batch create audits as N individual create blocks — one per
+    committed transaction, each rendered like a single-entry create.
+    Joins the submitted TSV (params) with the results TSV (after_state)
+    by ref. Account refs render as the caller supplied them (the TSV
+    isn't run through the audit ref-normalizer)."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    submitted = _parse_batch_submission(params.get("transactions") or "")
+    results = _parse_audit_tsv_rows(after.get("results") or "")
+    created = [r for r in results if r.get("status") == "created"]
+    rejected = [r for r in results if r.get("status") == "rejected"]
+
+    lines = [
+        f"{time_part}  CREATE TRANSACTIONS (batch)  "
+        f"{len(created)} created, {len(rejected)} rejected"
+    ]
+    for r in created:
+        src = submitted.get(r.get("ref", ""), {})
+        guid = r.get("txn_guid", "")
+        desc = src.get("description", "")
+        date_str = src.get("date", "")
+        when = date_str
+        if src.get("currency"):
+            when = f"{date_str}, {src['currency']}"
+        lines.append(
+            f'{_INDENT}CREATE  guid:{guid}  "{desc}" ({when})'
+        )
+        if src.get("notes"):
+            lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+        reason = r.get("reason", "")
+        if reason.startswith("auto_filled_from:"):
+            # Splitless submission — the source guid is the trail to
+            # what actually got booked.
+            source = reason.split(":", 1)[1]
+            lines.append(
+                f"{_INDENT_SPLITS}auto-filled from guid:{source}"
+            )
+        splits = src.get("splits") or []
+        if splits:
+            lines.append(_format_splits_text(splits, _INDENT_SPLITS))
+    return lines
+
+
+def _fmt_transaction_update_batch(entry: dict) -> list[str]:
+    """``update_transactions`` (TSV, per-row values) — old→new per
+    touched field, old values from the staged before-state, new
+    from the submitted TSV re-parsed through the SAME parser the
+    tool used (no display drift)."""
+    from gnucash_mcp._format import _parse_update_tsv
+
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    before = entry.get("before_state") or {}
+    befores = {
+        (t.get("guid") or ""): t
+        for t in before.get("transactions") or []
+    }
+    try:
+        rows = _parse_update_tsv(params.get("updates") or "")
+    except ValueError:
+        rows = []
+    lines = [
+        f"{time_part}  UPDATE TRANSACTIONS (batch)  {len(rows)} rows"
+    ]
+    for r in rows[:15]:
+        key = r["guid"]
+        old = next(
+            (
+                b for g, b in befores.items()
+                if g.startswith(key)
+            ),
+            {},
+        )
+        parts = [f"guid:{key}"]
+        if "description" in r:
+            old_d = old.get("description", "")
+            parts.append(f'"{old_d}" → "{r["description"]}"')
+        if "notes" in r:
+            old_n = old.get("notes") or "(none)"
+            parts.append(f"Notes: {old_n} → {r['notes']}")
+        if "date" in r:
+            old_dt = old.get("date", "")
+            parts.append(f"Date: {old_dt} → {r['date']}")
+        lines.append(f"{_INDENT}{'  '.join(parts)}")
+    if len(rows) > 15:
+        lines.append(f"{_INDENT}... and {len(rows) - 15} more")
     return lines
 
 
@@ -1624,6 +1671,31 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
+    # A rehearsal must not read as a booked payment (battery bug 2:
+    # dry runs rendered as PAY INVOICE with blank paid/remaining —
+    # phantom payments to an auditor). Tagged rather than omitted,
+    # matching ENTER STATEMENT (dry run): the record of what was
+    # rehearsed is itself audit-relevant.
+    dry = bool(params.get("dry_run")) or bool(
+        (after or {}).get("dry_run")
+    )
+    if dry:
+        lines = [
+            f"{time_part}  PAY INVOICE (dry run)  "
+            f"id:{params.get('id', '')}"
+        ]
+        if after:
+            lines.append(
+                f"{_INDENT}would pay: {after.get('amount', '')}  "
+                f"remaining after: "
+                f"{after.get('remaining_balance_after', '')}"
+            )
+            lines.append(
+                f"{_INDENT}from: {params.get('payment_account', '')}"
+                f"  nothing booked"
+            )
+        return lines
+
     lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
     if after:
         amount = after.get("amount_paid", "")
@@ -1805,6 +1877,11 @@ def _fmt_credit_note_apply(entry: dict) -> list[str]:
             f"against: {target_id}"
         ),
     ]
+    # Divergence from the stored applies-to link — provenance the
+    # permanent record must carry, not just the live response.
+    note = after.get("note", "")
+    if note:
+        lines.append(f"{_INDENT}{note}")
     # Decimal comparison, not string equality — the response holds
     # quantized strings ("0.00") that "== '0'" would mishandle.
     from decimal import Decimal as _D, InvalidOperation as _IO
@@ -1831,7 +1908,16 @@ def _fmt_credit_note_create(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
     cn_id = after.get("id", "")
-    owner_type = params.get("owner_type", "")
+    # Owner-type label: the consolidated create_document sends
+    # party_type (often omitted — inherited from applies_to), so
+    # derive from which side-dependent id key the response carries.
+    # The retired create_credit_note tool sent owner_type; kept as
+    # a last fallback for replaying old entries.
+    owner_type = params.get("party_type") or (
+        "customer" if after.get("customer_id")
+        else "vendor" if after.get("vendor_id")
+        else params.get("owner_type", "owner")
+    )
     # The owner_id key is side-dependent (customer_id / vendor_id).
     owner_id = (
         after.get("customer_id")
@@ -1871,17 +1957,23 @@ def _fmt_entry_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     desc = after.get("description", params.get("description", ""))
     total = after.get("total", "")
-    # Whichever doc-ID key the tool wrapper used (mutually
-    # exclusive in practice).
+    # The consolidated add_document_entry sends ``id``; the retired
+    # per-type tools sent invoice_id/bill_id/voucher_id/
+    # credit_note_id (kept as fallbacks for replaying old entries).
     inv_id = (
-        params.get("invoice_id", "")
+        params.get("id", "")
+        or params.get("invoice_id", "")
         or params.get("bill_id", "")
         or params.get("voucher_id", "")
         or params.get("credit_note_id", "")
     )
+    # Prefix the document type when the caller named one — a bare
+    # "on: 000014" doesn't say which per-type ID sequence it's from.
+    doc_type = params.get("document_type", "")
+    on_ref = f"{doc_type} {inv_id}".strip()
     lines = [
         f"{time_part}  CREATE ENTRY",
-        f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
+        f'{_INDENT}"{desc}"  total: {total}  on: {on_ref}',
     ]
     action = after.get("action", params.get("action", ""))
     notes = after.get("notes", params.get("notes", ""))
@@ -2051,6 +2143,117 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
     return lines
 
 
+def _fmt_statement_enter(entry: dict) -> list[str]:
+    """``enter_statement`` audits as ONE document event — the
+    statement landing (or rehearsing) as a whole, not N disconnected
+    CREATE lines. Created rows render with their interpreted
+    description; claimed rows render their annotation diffs from the
+    staged before-state (a claim is a write to an existing
+    transaction)."""
+    time_part = _extract_time(entry)
+    params = entry.get("params") or {}
+    after = entry.get("after_state") or {}
+    before = entry.get("before_state") or {}
+
+    account = params.get("account", "")
+    stmt_date = params.get("statement_date", "")
+    opening = params.get("opening_balance", "")
+    closing = params.get("closing_balance", "")
+    dry = params.get("dry_run", True)
+
+    verb = "ENTER STATEMENT (dry run)" if dry else "ENTER STATEMENT"
+    forced = [
+        n for n, k in (("base", "force_base"),
+                       ("duplicates", "force_duplicates"))
+        if params.get(k)
+    ]
+    if forced and not dry:
+        # A forced landing bypassed the base and twin guards — the
+        # permanent record says so even when the tie held (review:
+        # a forced commit's audit entry was byte-identical to a
+        # clean one).
+        verb += f" (FORCED: {', '.join(forced)})"
+    lines = [
+        f"{time_part}  {verb}  {account}  {stmt_date}  "
+        f"opening {opening} → closing {closing}"
+    ]
+    summary = (after.get("summary") or "").replace("\n", " ")
+    if summary:
+        lines.append(f"{_INDENT}{summary}")
+    tie = after.get("tie") or ""
+    if tie and not dry:
+        lines.append(f"{_INDENT}{tie}")
+    if dry:
+        return lines
+
+    # Re-parse the submitted lines through the SAME parser the tool
+    # used (no display drift); tolerate malformed input — the write
+    # path already rejected it.
+    from gnucash_mcp._format import _parse_statement_tsv
+
+    try:
+        submitted = {
+            r["ref"]: r
+            for r in _parse_statement_tsv(params.get("lines") or "")
+        }
+    except ValueError:
+        submitted = {}
+    results = _parse_audit_tsv_rows(after.get("results") or "")
+    befores = {c.get("guid", ""): c for c in before.get("claims") or []}
+
+    for r in results:
+        ref = r.get("ref", "")
+        src = submitted.get(ref, {})
+        status = r.get("status", "")
+        guid = r.get("guid", "")
+        if status == "created":
+            desc = src.get("description") or src.get("raw") or ""
+            lines.append(
+                f'{_INDENT}CREATE  guid:{guid}  "{desc}" '
+                f'({src.get("date", "")}, {src.get("amount", "")})'
+            )
+            if src.get("notes"):
+                lines.append(f"{_INDENT_SPLITS}notes: {src['notes']}")
+            note = r.get("note", "")
+            if note.startswith("auto_filled_from:"):
+                lines.append(
+                    f"{_INDENT_SPLITS}auto-filled from "
+                    f"guid:{note.split(':', 1)[1]}"
+                )
+        elif status == "claimed":
+            old = next(
+                (
+                    b for g, b in befores.items()
+                    if g.startswith(guid)
+                ),
+                {},
+            )
+            desc = old.get("description", "")
+            lines.append(
+                f'{_INDENT}CLAIM  split:{guid}  "{desc}" '
+                f'({old.get("date", "")})  '
+                f'state: {old.get("state", "")} → y'
+            )
+            new_memo = src.get("raw", "")
+            if new_memo and new_memo != old.get("memo", ""):
+                lines.append(
+                    f"{_INDENT_SPLITS}memo: "
+                    f"{old.get('memo', '') or '(empty)'} → {new_memo}"
+                )
+            new_notes = src.get("notes", "")
+            if new_notes and new_notes != old.get("notes", ""):
+                lines.append(
+                    f"{_INDENT_SPLITS}notes: "
+                    f"{old.get('notes', '') or '(empty)'} → "
+                    f"{new_notes}"
+                )
+        elif status == "skipped_duplicate":
+            lines.append(
+                f"{_INDENT}SKIP  split:{guid}  already reconciled"
+            )
+    return lines
+
+
 # ── Dispatch table ────────────────────────────────────────────────
 #
 # Key shape: (entity_type, operation). Both in their canonical forms —
@@ -2058,12 +2261,12 @@ def _fmt_scheduled_transaction_delete(entry: dict) -> list[str]:
 # is one row here plus one handler function above.
 
 _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
-    ("transaction", "CREATE"): _fmt_transaction_create,
     ("transaction", "CREATE_FROM_SCHEDULED"):
         _fmt_transaction_create_from_scheduled,
+    ("transaction", "CREATE"): _fmt_transaction_create,
+    ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "CREATE_BATCH"): _fmt_transaction_create_batch,
     ("transaction", "UPDATE_BATCH"): _fmt_transaction_update_batch,
-    ("transaction", "UPDATE"): _fmt_transaction_update,
     ("transaction", "VOID"): _fmt_transaction_void,
     ("transaction", "UNVOID"): _fmt_transaction_unvoid,
     ("transaction", "DELETE"): _fmt_transaction_delete,
@@ -2073,6 +2276,7 @@ _AUDIT_HANDLERS: dict[str, Callable[[dict], list[str]]] = {
     ("account", "MOVE"): _fmt_account_move,
     ("account", "DELETE"): _fmt_account_delete,
     ("split", "RECONCILE"): _fmt_split_reconcile,
+    ("statement", "ENTER"): _fmt_statement_enter,
     ("split", "SET_STATE"): _fmt_split_set_state,
     ("account_slot", "SET_SLOT"): _fmt_account_slot_set,
     ("account_slot", "DELETE_SLOT"): _fmt_account_slot_delete,
@@ -2240,7 +2444,7 @@ def _escape_audit_value(text: str) -> str:
 # still neutralizes \r, stray C0 controls, and bidi overrides that
 # could survive inside a cell.
 _AUDIT_TSV_KEYS = frozenset({"transactions", "updates", "results",
-                             "prices"})
+                             "prices", "lines"})
 
 _AUDIT_UNSAFE_TSV_RE = re.compile(
     "[\\\\\\x00-\\x08\\x0b-\\x1f\\x7f"  # C0 minus \t \n, + DEL
@@ -2512,15 +2716,20 @@ def audit_log(
                     else:
                         entry["result"] = "success"
                         if classification == "write":
-                            # The lifecycle tools register as
-                            # entity_type="invoice" but accept all
-                            # four document kinds — the response's
-                            # ``type`` field is the truth; swap so
-                            # the log doesn't mis-categorize.
+                            # Polymorphic tools register under one
+                            # entity_type but accept a family — the
+                            # response's ``type`` field is the truth;
+                            # swap so the log doesn't mis-categorize.
+                            # Document family registers "invoice";
+                            # party family registers "customer".
                             if (
                                 entity_type == "invoice"
                                 and result_data.get("type")
                                 in {"bill", "voucher", "credit_note"}
+                            ) or (
+                                entity_type == "customer"
+                                and result_data.get("type")
+                                in {"vendor", "employee"}
                             ):
                                 entry["entity_type"] = (
                                     result_data["type"]
@@ -2583,6 +2792,16 @@ def audit_log(
                 _flush_logger(logger)
                 raise
 
+        # Expose the declared classification/operation on the wrapper.
+        # @wraps copies __dict__ outward through later decorator layers
+        # (safe_tool), so the registration layer can read this off the
+        # function FastMCP stores and derive MCP ToolAnnotations
+        # (readOnlyHint/destructiveHint/idempotentHint) from the same
+        # declaration the audit log trusts — one source, no drift.
+        wrapper.__audit_meta__ = {
+            "classification": classification,
+            "operation": operation,
+        }
         return wrapper
 
     return decorator

@@ -150,19 +150,52 @@ what's in each.
 
 ---
 
-## Quick Start (5 minutes)
+## Quick Start
 
-### 1. Download
+### The one-click way (Claude Desktop)
+
+Download **`gnucash-mcp.mcpb`** from the
+[latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest)
+and double-click it. Claude Desktop installs the server — no
+terminal, no config file, no Python. The installer asks three
+things:
+
+- **Your GnuCash book(s)** — a file picker. Books must be in
+  SQLite format; if yours is the older XML format, do the
+  [one-time conversion](#one-time-conversion-gnucash-file-format)
+  first. Pick several books to switch between them in-chat.
+- **Demo books** — one checkbox serves the three sample books
+  described above, so you can explore on fictional money before
+  (or instead of) connecting your own.
+- **"Do you invoice clients?"** — yes adds the business suite
+  (customer invoices, vendor bills, employee expenses).
+  Everything else — budgets, scheduled transactions, investment
+  tracking — is always on.
+
+That's the entire install. Skip ahead to
+[step 4](#4-try-it) to take it for a spin.
+
+### The manual way (any MCP client, or development)
+
+The path below gives you an updatable git-clone install — for
+Claude Desktop without the bundle, for
+[other AI clients](#other-ai-clients), or for hacking on the
+server itself.
+
+### 1. Download and install
 
 ```bash
 git clone https://github.com/ninetails-io/gnucash-mcp.git
+uv tool install -e ./gnucash-mcp
 ```
 
-That's the whole install — there's no build or install step. The
-client launches the server with `uv run` (next step), which syncs
-dependencies from the lockfile automatically on every start. To
-update later, just `git pull` inside the repo; the next launch
-picks up new code *and* new dependencies with nothing else to do.
+The second command gives you a `gnucash-mcp` command (in
+`~/.local/bin`) with its dependencies in a private environment —
+your other Python projects never see them. The `-e` makes it an
+*updatable* install: the command runs whatever code is in your
+clone, so updating is `git pull` plus a server restart. The one
+exception: if an update changes *dependencies*, run
+`uv tool install -e ./gnucash-mcp --reinstall` once.
 
 > If you don't have `uv`, install it with one line:
 > `curl -LsSf https://astral.sh/uv/install.sh | sh`
@@ -185,21 +218,14 @@ Find your Claude Desktop config:
 - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add this — replace `/path/to/gnucash-mcp` with the repo you just
-cloned, and `GNUCASH_BOOK_PATH` with your book's path:
+Add this — replace `yourname` in both paths:
 
 ```json
 {
   "mcpServers": {
     "gnucash": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/gnucash-mcp",
-        "gnucash-mcp",
-        "--modules=all"
-      ],
+      "command": "/Users/yourname/.local/bin/gnucash-mcp",
+      "args": ["--modules=all"],
       "env": {
         "GNUCASH_BOOK_PATH": "/Users/yourname/gnucash-mcp-scratch/alex.gnucash"
       }
@@ -208,12 +234,13 @@ cloned, and `GNUCASH_BOOK_PATH` with your book's path:
 }
 ```
 
-`uv run --directory` runs the server straight from the clone,
-resyncing dependencies each launch — so a `git pull` is all it
-takes to update. `--modules=all` loads every tool (111 of them)
-so you can poke at anything. Once you know what you actually use,
-narrow it — see [choosing a module set](#choosing-a-module-set)
-below.
+Use the **full path** to the command: GUI apps launch without
+your shell's PATH, so a bare `gnucash-mcp` may not resolve even
+though it works in your terminal. (`uv tool dir --bin` prints
+the right directory if yours differs.) `--modules=all` loads
+every tool (86 of them) so you can poke at anything. Once you
+know what you actually use, narrow it — see
+[choosing a module set](#choosing-a-module-set) below.
 
 Quit Claude Desktop completely (not just close the window —
 quit) and reopen it. Look for the hammer 🔨 icon next to the
@@ -276,13 +303,20 @@ point at your own SQLite-format book. Restart Claude Desktop.
 ### Other AI clients
 
 This is an [MCP](https://modelcontextprotocol.io/) server, so
-it works with any client that speaks MCP. Notes for non–Claude
-Desktop clients:
+it works with any client that speaks MCP. Everywhere below,
+`gnucash-mcp` means the full path from the install step
+(`/Users/yourname/.local/bin/gnucash-mcp`; `uv tool dir --bin`
+prints yours).
 
-- **Claude Code**: `claude mcp add-json gnucash '{"command":"uv","args":["run","--directory","/path/to/gnucash-mcp","gnucash-mcp","--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
+- **Claude Code**: `claude mcp add-json gnucash '{"command":"/Users/yourname/.local/bin/gnucash-mcp","args":["--modules=all"],"env":{"GNUCASH_BOOK_PATH":"/path/to/your/book.gnucash"}}'`
   Add `--scope user` for all projects, `--scope project` for
   this one only.
-- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash uv run --directory /path/to/gnucash-mcp gnucash-mcp --modules=all`
+- **ChatGPT (desktop app / Codex)**: Settings → Connectors →
+  Add MCP server. Name it `gnucash-mcp`, type **STDIO**,
+  "Command to launch" = the full `gnucash-mcp` path, one
+  argument `--modules=all`, and an environment variable
+  `GNUCASH_BOOK_PATH` = your book's path.
+- **Gemini CLI**: `gemini mcp add -e GNUCASH_BOOK_PATH="/path/to/your/book.gnucash" gnucash /Users/yourname/.local/bin/gnucash-mcp --modules=all`
   This writes a project `.gemini/settings.json` with the server
   registered; run `/mcp list` inside Gemini to confirm it shows
   `gnucash - Ready`. (Verified on Linux — if GnuCash never offered
@@ -291,15 +325,18 @@ Desktop clients:
   [@hpuri](https://github.com/hpuri)'s testing in
   [#89](https://github.com/ninetails-io/gnucash-mcp/issues/89) —
   thanks.)
-- **Anything else**: set `GNUCASH_BOOK_PATH` and run `uv run
-  --directory /path/to/gnucash-mcp gnucash-mcp`. Any client that
-  can spawn a command and speak MCP over stdio will work.
+- **Anything else**: set `GNUCASH_BOOK_PATH` and run
+  `gnucash-mcp`. No install at all? `uv run --directory
+  /path/to/gnucash-mcp gnucash-mcp` and
+  `python -m gnucash_mcp` (with the repo on the path) both
+  still work. Any client that can spawn a command and speak
+  MCP over stdio will do.
 
 ---
 
 ## Choosing a module set
 
-`--modules=all` is the easy default — every tool, 107 of them.
+`--modules=all` is the easy default — every tool, 88 of them.
 For day-to-day use you'll probably want less. Pick the role that
 matches how you'll talk to the server. Each role is a *group*
 that expands to the underlying tool modules; you can also pick
@@ -310,8 +347,8 @@ the leaves individually for a finer cut.
 | `core` | Ledger primitives — accounts, transactions, balances, slots, audit log, backups, balance sheet, **reconciliation**. **Always loaded.** | 29 |
 | `bookkeeper` | Run reports, manage budgets, schedule recurring transactions. The personal-finance management cluster. (Reconciliation moved into core — any configuration that handles money needs it.) | 17 |
 | `investor` | Cost-basis tracking + price/commodity management. Tax-lot accounting needs prices to compute gains, so the bundle is the useful unit. | 12 |
-| `freelancer` | Customer invoicing + sales tax, plus billterms (payment terms), jobs (per-project P&L rollups), and credit notes (customer refunds). The full solo-consultant toolkit. | 31 |
-| `business` | Full small-business package — group alias that expands to `freelancer` (invoicing) plus `business_complete` (vendors, employees, bills, vouchers, vendor reports). | 48 |
+| `freelancer` | Party + document management (polymorphic: customers by default; vendors/employees unlock with `business_complete`), sales tax, billterms, jobs, credit notes. The full solo-consultant toolkit. | 26 |
+| `business` | Full small-business package — group alias: `freelancer`'s tools with the vendor/employee sides unlocked, plus vendor reports. | 27 |
 
 Pick one or more, comma-separated:
 
@@ -335,6 +372,20 @@ run `uv run gnucash-mcp --help` from the repo for the full menu.
 
 A non-exhaustive tour. Phrase any of these naturally — the
 assistant translates.
+
+### Entering a whole statement
+
+> "Here's my August checking statement." *(attach the PDF)*
+>
+> Rehearsed 31 lines against your book: 24 new, 6 already
+> entered (claimed), 1 needs a look — here's the comparison.
+> Confirm and I'll land the month: entered, categorized, and
+> reconciled to the closing balance in one step.
+
+One statement, two calls, a tied book. The dry-run classifies
+every line with evidence before anything is written, and the
+commit refuses wholesale rather than land a month that doesn't
+tie.
 
 ### Recording activity
 
@@ -432,9 +483,8 @@ for the rollback procedure.
 > timestamps (filesystem-safe and unambiguous across travel
 > and DST); audit and debug logs use *local-dated* daily
 > files, matching how you'd search for "what happened
-> Tuesday." Near midnight these can differ by a day — the
-> `list_backups` tool always reports both the ISO timestamp
-> and a human age, so prefer it over eyeballing filenames.
+> Tuesday." Near midnight these can differ by a day — keep
+> that in mind when matching a backup to a day's log.
 
 **Reconciled splits are protected.** The server refuses to
 delete or modify reconciled splits without an explicit
@@ -470,6 +520,38 @@ environment variable instead of `--modules=...` in the JSON
 args.
 
 ---
+
+## What's new in v1.4.4
+
+The statement is the call — the bulk-operations line closes with
+its capstone, and rehearsal spreads to every consequential write:
+
+- **`enter_statement`** — a complete bank statement (opening
+  balance, closing balance, every line) enters, claims its
+  matches against transactions already in the book, and
+  reconciles in ONE atomic call. Dry-run first by default: every
+  line classified with side-by-side evidence, and a projected
+  balance tie that guarantees a rehearsal that ties is a commit
+  that will tie. No half-landed months, ever.
+- **Rehearsal everywhere** — `pay_document` gains `dry_run`
+  (proposed splits, FX and discount treatment, projected balance,
+  zero writes), and batch entry's dry-run shows self-contained
+  duplicate comparisons with a `review_required` status that
+  never masquerades as clearance.
+- **One-click install** — the MCPB bundle: download, double-click,
+  and Claude Desktop runs the server. Built by the project's first
+  CI on every PR.
+- **A surface that tells the truth about itself** — MCP
+  ToolAnnotations on every tool (read-only says so, destructive
+  says so), strict CLI arguments, a defined status vocabulary,
+  and a debt plan that names every debt it had to leave out.
+- **The un-blooming, completed in one release** — the tool
+  surface peaked at 111 and ships at 86: the business surface
+  consolidated (48 tools → 27, one polymorphic family per verb),
+  and the batch tools are now THE entry/update tools (the
+  singular create/update removed at full capability parity).
+
+**Tests:** 2,100+ passing, parallel by default (full suite < 40s).
 
 ## What's new in v1.4.2
 
@@ -520,7 +602,7 @@ Batch entry grows up, driven by the bookkeeper's daily workflow:
   one call, one save, all-or-nothing.
 - **Every annotation field reachable** — notes + action on
   invoice/bill/voucher/credit-note line items, a payment memo on
-  `pay_invoice`, account notes (shared with GnuCash desktop's
+  `pay_document`, account notes (shared with GnuCash desktop's
   editor), and scheduled transactions that actually keep their
   description.
 - **Find accounts without paging** — `query` on `list_accounts`
@@ -653,16 +735,18 @@ Contributor guide and design notes live in
 
 ```bash
 uv sync --extra dev
-uv run pytest                       # 1,954 tests as of v1.4.2
+uv run pytest                       # 2,100+ tests as of v1.4.4, parallel by default
 uv run ruff check src/ tests/
 uv run black --check src/ tests/
 ```
 
-The `uv run --directory PATH ...` form the Quick Start uses is
-also how you point a client at a specific worktree — swap the
-directory and you're running that checkout, no reinstall. If you
-prefer a `gnucash-mcp` binary on your PATH instead, `uv tool
-install -e ./gnucash-mcp` still works and tracks your source.
+The installed `gnucash-mcp` command tracks your clone live: it
+serves whatever branch the checkout is on, so switching branches
+switches the served code at the next restart — handy for testing,
+worth remembering when you forget you're mid-branch. To run a
+DIFFERENT checkout (a second worktree) without touching the
+install, `uv run --directory PATH gnucash-mcp` still runs any
+directory you point it at.
 
 The server is built on
 [piecash](https://github.com/sdementen/piecash) (Python

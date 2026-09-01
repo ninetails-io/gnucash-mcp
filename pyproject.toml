@@ -1,6 +1,6 @@
 [project]
 name = "gnucash-mcp"
-version = "1.4.2"
+version = "1.4.4"
 description = "MCP server for GnuCash accounting data"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,7 +9,9 @@ authors = [
     { name = "Stephen", email = "stephen@ninetails.io" }
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # <2: mcp 2.0.0 moved/removed mcp.server.fastmcp, and the
+    # strict-kwargs patch reaches into 1.x FastMCP internals.
+    "mcp[cli]>=1.0.0,<2",
     "piecash>=1.2.0",
     "python-dateutil>=2.8.0",
 ]
@@ -39,6 +41,10 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Parallel by default (pytest-xdist): the suite is tmp_path-isolated
+# and proved parallel-safe; ~3x wall-clock. Pass -n0 for serial runs
+# (pdb debugging, single-test timing).
+addopts = "-n auto"
 
 [tool.ruff]
 line-length = 100
@@ -66,3 +72,8 @@ ignore = ["E501"]
 [tool.black]
 line-length = 100
 target-version = ["py310", "py311", "py312", "py313"]
+
+[dependency-groups]
+dev = [
+    "pytest-xdist>=3.8.0",
+]

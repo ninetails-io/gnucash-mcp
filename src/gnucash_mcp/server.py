@@ -12,6 +12,7 @@ from typing import Annotated
 from pydantic import Field
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 # Strict tool-argument validation: reject unknown kwargs at the MCP
 # boundary instead of silently ignoring them.
@@ -31,6 +32,18 @@ ArgModelBase.model_config = {
     "extra": "forbid",
 }
 
+# The advanced-options passthrough (GNUCASH_MCP_ADVANCED) lives in
+# gnucash_mcp/_env.py and is applied at the top of the package
+# __init__ — before this module or any sibling imports — so the
+# seeds below already see its overrides. main() fail-fasts on any
+# recorded _env_errors; harnesses that bypass main() (mcp dev,
+# pytest) still see them on stderr at import.
+from gnucash_mcp._env import (
+    _apply_advanced_env,
+    _env_errors,
+    _parse_env_toggle,
+)
+
 from gnucash_mcp.book import GnuCashBook, build_book_class, extracted_modules
 from gnucash_mcp.logging_config import audit_log, debug_log, setup_logging
 from gnucash_mcp.tools._helpers import _json, safe_tool
@@ -47,6 +60,9 @@ ORIENTATION:
 - Use list_accounts to get exact paths and short GUIDs before writing.
 - Use search_transactions before creating to avoid duplicates.
 - Every transaction has splits that MUST sum to zero.
+STATEMENT ENTRY (the headline workflow):
+- For a COMPLETE bank/card statement, use enter_statement — not create_transactions + reconcile_account. Dry-run (default) classifies every line against the book and projects the balance tie; commit enters, claims, and reconciles atomically against the closing balance.
+- Transcribe amounts and balances EXACTLY as the statement prints them (credit cards included) — the server applies the sign convention. Your judgment pass between dry-run and commit is the one step the server cannot do.
 ACCOUNT REFERENCES:
 - Tools accept full paths ("Expenses:Groceries"), short GUIDs ("%xxxxxxx" form), or full 32-char GUIDs.
 - list_accounts emits short GUIDs at line start: "%xxxxxxx\\tAssets:Savings [BANK]" (x's are a placeholder — copy real GUIDs from list_accounts output). Reuse them — ~80% smaller than paths.
@@ -58,8 +74,9 @@ DOUBLE-ENTRY SIGN CONVENTION:
 - Positive = debit (increases Asset/Expense, decreases Liability/Income/Equity).
 - Negative = credit (reverse).
 - Credit card payment: checking -200, card +200. Income: checking +3000, income -3000.
-INVESTMENT FLOW: create_lot → create_transaction (with quantity/cost) → assign_split_to_lot → create_price → calculate_lot_gain.
+INVESTMENT FLOW: create_lot → create_transactions (a one-row batch with qty/cost columns) → assign_split_to_lot → create_price → calculate_lot_gain.
 SLOTS: get_account_slots / set_account_slot store per-account metadata (APR, credit limit, statement day) as strings.
+OUTPUT: every tool's compact default is complete — verbose=true adds structure (JSON), not information. Compact is cheaper; prefer it unless you need machine-readable fields.
 SAFETY: Reconciled splits are protected (use force=true to override). Prefer void_transaction over delete for audit trail. delete_account is blocked if account has children or transactions.
 """,
 )
@@ -146,9 +163,8 @@ TOOL_MODULES: dict[str, list[str]] = {
     "transactions": [
         "list_transactions",
         "get_transaction",
-        "create_transaction",
         "create_transactions",
-        "update_transaction",
+        "enter_statement",
         "update_transactions",
         "delete_transaction",
         "replace_splits",
@@ -168,11 +184,12 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_audit_log",
     ],
     "backup": [
-        # Manual control surface; the auto-snapshot hook is
-        # always-on regardless.
+        # On-demand snapshot only; the auto-snapshot hook and staged
+        # retention are always-on regardless. The store is APPEND-ONLY
+        # from the model's side by design — no tool lists or deletes
+        # backups (the safety net must survive model mistakes;
+        # list_backups/prune_backups were removed for exactly that).
         "create_backup",
-        "list_backups",
-        "prune_backups",
     ],
     "balance_sheet": [
         # THE canonical report; analytical reports stay in
@@ -240,23 +257,22 @@ TOOL_MODULES: dict[str, list[str]] = {
     # vendor/employee ENTITIES and the workflows that don't make
     # sense without them.
     "freelancer": [
-        "create_customer",
-        "list_customers",
-        "get_customer",
-        "update_customer",
-        "delete_customer",
-        "create_invoice",
-        "add_invoice_entry",
-        "list_invoices",
-        "get_invoice",
-        "post_invoice",
-        "unpost_invoice",
-        "pay_invoice",
-        "delete_invoice",
-        "get_outstanding_invoices",
+        "create_party",
+        "list_parties",
+        "get_party",
+        "update_party",
+        "delete_party",
+        "create_document",
+        "add_document_entry",
+        "list_documents",
+        "get_document",
+        "post_document",
+        "unpost_document",
+        "pay_document",
+        "delete_document",
+        "get_outstanding_documents",
         "create_taxtable",
         "list_taxtables",
-        "get_taxtable",
         "update_taxtable",
         "delete_taxtable",
         # Billterms, jobs, credit notes — placement rule above.
@@ -264,35 +280,15 @@ TOOL_MODULES: dict[str, list[str]] = {
         "list_billterms",
         "create_job",
         "list_jobs",
-        "get_job",
         "update_job",
         "delete_job",
         "get_job_report",
-        "create_credit_note",
-        "add_credit_note_entry",
-        "delete_credit_note",
         "apply_credit_note",
     ],
     # Vendor + employee surface — see the placement rule above.
     "business_complete": [
-        "create_vendor",
-        "list_vendors",
-        "get_vendor",
-        "update_vendor",
-        "delete_vendor",
-        "create_bill",
-        "add_bill_entry",
-        "delete_bill",
-        "create_employee",
-        "list_employees",
-        "get_employee",
-        "update_employee",
-        "delete_employee",
         # Voucher lifecycle (post/unpost/pay) flows through the
         # polymorphic invoice tools with owner_type='employee'.
-        "create_voucher",
-        "add_voucher_entry",
-        "delete_voucher",
         "vendor_spending_report",
     ],
 }
@@ -420,6 +416,20 @@ def is_module_enabled(name: str) -> bool:
     enabled set. Tool wrappers call this to gate per-module behavior.
     """
     return name in _LOADED_MODULES
+
+
+def _module_tool_count(name: str) -> int:
+    """Tool count for a module or group name — display/help only.
+
+    ``"all"`` counts every mapped tool. Group names expand via
+    MODULE_GROUPS; leaf names count their own TOOL_MODULES entry.
+    Inline conditional tools (switch_book) are not included — they
+    exist outside the module partition.
+    """
+    if name == "all":
+        return sum(len(tools) for tools in TOOL_MODULES.values())
+    members = MODULE_GROUPS.get(name, [name])
+    return len({t for m in members for t in TOOL_MODULES.get(m, [])})
 
 
 def _apply_module_filter(modules_str: str | None) -> list[str]:
@@ -555,7 +565,95 @@ def _apply_module_filter(modules_str: str | None) -> list[str]:
         if set(members) <= enabled_modules:
             _LOADED_MODULES.add(group_name)
 
+    _apply_tool_annotations()
+
     return sorted(enabled_modules)
+
+
+# ---------------------------------------------------------------------------
+# MCP ToolAnnotations — derived from the @audit_log declaration each
+# tool already carries, not from a second per-tool table that could
+# drift. classification="read" → readOnlyHint; write operations map
+# through _WRITE_VERB_HINTS. openWorldHint is False across the board:
+# every tool operates on a closed local book, never the network.
+# ---------------------------------------------------------------------------
+
+# operation verb → (destructiveHint, idempotentHint).
+# destructive means "modifies or removes EXISTING book data";
+# purely additive writes (new entities, new transactions) are False.
+# idempotent means "repeating the same call adds nothing further":
+# overwrites and removals converge, additions accumulate.
+_WRITE_VERB_HINTS: dict[str, tuple[bool, bool]] = {
+    "create": (False, False),
+    "create_batch": (False, False),
+    "create_from_scheduled": (False, False),
+    "delete": (True, True),
+    "delete_slot": (True, True),
+    "set_slot": (True, True),
+    "update_batch": (True, True),
+    "update": (True, True),
+    "void": (True, True),
+    "unvoid": (True, True),
+    "unpost": (True, True),        # removes the posting transaction
+    "set_state": (True, True),
+    "replace_splits": (True, True),
+    "reconcile": (True, True),
+    # Statement entry adds transactions but also claims and
+    # reconciles EXISTING splits (annotations + state) — destructive.
+    # Repeating the same commit refuses on the opening precondition
+    # (the base moved), adding nothing further.
+    "enter": (True, True),
+    "post": (False, True),         # additive; re-post errors, adds nothing
+    "pay": (False, False),         # paying twice records two payments
+    "apply": (False, False),
+}
+
+# Inline tools registered without @audit_log. switch_book mutates
+# server state (the active book), not book data.
+_INLINE_TOOL_ANNOTATIONS: dict[str, ToolAnnotations] = {
+    "get_server_config": ToolAnnotations(
+        readOnlyHint=True, openWorldHint=False,
+    ),
+    "switch_book": ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
+}
+
+
+def _derive_tool_annotations(name: str, fn) -> "ToolAnnotations | None":
+    """Annotations for one registered tool, or None if underivable."""
+    if name in _INLINE_TOOL_ANNOTATIONS:
+        return _INLINE_TOOL_ANNOTATIONS[name]
+    meta = getattr(fn, "__audit_meta__", None)
+    if meta is None:
+        return None
+    if meta["classification"] == "read":
+        return ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+    destructive, idempotent = _WRITE_VERB_HINTS.get(
+        meta["operation"] or "", (True, False),  # unknown verb: safest hints
+    )
+    return ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=False,
+    )
+
+
+def _apply_tool_annotations() -> None:
+    """Set ToolAnnotations on every registered tool.
+
+    Runs at the end of _apply_module_filter — the chokepoint every
+    enabled tool passes through — so lazy-loaded and inline tools
+    alike are annotated before any client lists them. Tools without
+    a derivable classification are left as-is; the contract test
+    (TestToolAnnotations) is the loud gate for that.
+    """
+    for name, tool in mcp._tool_manager._tools.items():
+        ann = _derive_tool_annotations(name, tool.fn)
+        if ann is not None:
+            tool.annotations = ann
 
 
 # Runtime server state — populated by main(), read by get_server_config tool
@@ -591,6 +689,139 @@ _book_paths: list[Path] = []
 _current_path: Path | None = None
 _book_registry: dict[str, GnuCashBook] = {}
 _book = None
+# The exact GNUCASH_BOOK_PATH string _book_paths was derived from (or
+# mirrored into). get_book() re-parses the env ONLY when the live value
+# differs from this — re-splitting our own mirror would corrupt any
+# validated path containing os.pathsep and re-stat every book.
+_book_paths_source: str | None = None
+
+# ── Restart safety (Sabine battery ruling 6, 2026-08-31) ──────────
+# A client config reload restarts this process SILENTLY mid-session:
+# the LLM may still believe it is on the book it switched to, while
+# the active book has reset to the first configured entry — the next
+# write lands in the wrong ledger. Process-global state is the
+# detection mechanism on purpose: a fresh process IS the event.
+#
+# - _startup_notice_pending: the first tool result of every process
+#   carries a one-line notice naming the active book.
+# - _writes_armed: None = undetermined; determined at first use.
+#   Single-book configs arm permanently (there is no wrong ledger).
+#   Multi-book configs start DISARMED — mutating tools refuse until
+#   switch_book (including a no-op "Already on" call) confirms the
+#   target. safe_tool consults the gate before @audit_log runs, so
+#   a refused write never consumes rate-limit tokens, never triggers
+#   auto-backup, and never stages audit state.
+_startup_notice_pending: bool = True
+_writes_armed: bool | None = None
+
+
+def _configured_paths() -> list[Path]:
+    """The configured book paths, without mutating the get_book()
+    globals: returns ``_book_paths`` when populated, else parses the
+    env directly. The restart-safety helpers may run before any tool
+    has called get_book(), so they can't rely on the globals being
+    warm. Unset/invalid env → [] (the tool body will surface the
+    real error itself)."""
+    if _book_paths:
+        return _book_paths
+    try:
+        return _parse_book_paths(os.environ.get("GNUCASH_BOOK_PATH"))
+    except Exception:
+        return []
+
+
+def _determine_writes_armed() -> bool:
+    """Resolve (and cache) the disarm state on first use.
+
+    Caches ONLY when the book config is actually visible
+    (release-review finding 6): _configured_paths() returns [] both
+    for an unset env and for a transiently unresolvable path (cloud
+    sync, unmounted volume), and permanently caching armed=True off
+    that blank would disable the multi-book disarm for the process —
+    a wrong-ledger write sailing through minutes later when the
+    mount returns. An empty view arms THIS call (there is nothing to
+    gate against) but leaves the verdict undetermined, so the gate
+    re-asks until the config can be seen. main()-run servers
+    fail-fast on bad paths before serving; this guards the entry
+    points that skip main() (mcp dev, tests, SDK embedding).
+    """
+    global _writes_armed
+    if _writes_armed is None:
+        paths = _configured_paths()
+        if not paths:
+            return True  # fail open for this call, but don't cache
+        _writes_armed = len(paths) < 2
+    return _writes_armed
+
+
+def _write_gate_message() -> str | None:
+    """Refusal text while mutating tools are disarmed, else None.
+
+    Ruling 6 piece 2: with 2+ books configured, a process start
+    disarms every write-classified tool until switch_book confirms
+    which ledger the session means to be in.
+    """
+    if _determine_writes_armed():
+        return None
+    paths = _configured_paths()
+    active = _current_path if _current_path else (
+        paths[0] if paths else None
+    )
+    active_name = active.name if active else "unknown"
+    available = ", ".join(p.name for p in paths)
+    # Addressed to the calling model: the fix is one tool call it
+    # can make itself, so the copy names the call and the retry —
+    # the user should never have to notice this exchange happened.
+    return (
+        f"Write blocked — the server (re)started and the active "
+        f"book reset to {active_name!r}, which may not be the book "
+        f"this session was writing to. Call switch_book with the "
+        f"intended book ({active_name!r} itself is a valid "
+        f"confirmation), then retry this call. Available books: "
+        f"{available}."
+    )
+
+
+def _mutation_book_stamp() -> str | None:
+    """Ruling 6 piece 3: the filename every mutating response should
+    name as the book it wrote to. None on single-book configs — with
+    one ledger there is no ambiguity for the stamp to resolve, and
+    every response byte must earn its keep."""
+    if len(_configured_paths()) < 2:
+        return None
+    return _current_path.name if _current_path else None
+
+
+def _consume_startup_notice() -> str | None:
+    """Ruling 6 piece 1: one-line notice for the first tool result
+    of this process, naming the active book. Returns None after the
+    first call (and when no book is configured at all)."""
+    global _startup_notice_pending
+    if not _startup_notice_pending:
+        return None
+    _startup_notice_pending = False
+    paths = _configured_paths()
+    active = _current_path if _current_path else (
+        paths[0] if paths else None
+    )
+    if active is None:
+        return None
+    if len(paths) >= 2 and not _determine_writes_armed():
+        # Coaching for the calling model, not the user: perform the
+        # confirmation as part of the opening turn so the person
+        # never has to notice it happened.
+        return (
+            f"⚠ Server (re)started — active book reset to "
+            f"{active.name}. Writes are disarmed: before your next "
+            f"write, confirm the intended book with switch_book "
+            f"(confirming {active.name} itself works). Account "
+            f"names and GUIDs from before this notice may belong "
+            f"to a different book."
+        )
+    return (
+        f"ℹ GnuCash MCP server (re)started — active book: "
+        f"{active.name}."
+    )
 
 # Effective logging mode. Seeded from env at import; main() may widen
 # it via the --debug / --noaudit CLI flags. switch_book reads these to
@@ -653,7 +884,28 @@ def _parse_book_paths(value: str | None) -> list[Path]:
             "Invalid GNUCASH_BOOK_PATH: contains only separators, "
             "no paths"
         )
+    return _validate_book_paths(raw)
 
+
+def _validate_book_paths(
+    raw: list[str], *, source: str = "GNUCASH_BOOK_PATH"
+) -> list[Path]:
+    """Resolve and validate a list of book path strings.
+
+    The single chokepoint for inbound book lists — both the
+    GNUCASH_BOOK_PATH env var (via _parse_book_paths) and the --book
+    CLI argument land here, so existence, regular-file, and
+    filename-stem uniqueness rules cannot diverge between the two
+    interfaces. ``source`` names the interface in error messages.
+
+    Empty entries are dropped rather than resolved — an MCPB host
+    expanding an unset multi-file config could hand --book an empty
+    string, and ``Path("").resolve(strict=True)`` would otherwise
+    "find" the working directory.
+    """
+    raw = [p for p in (s.strip() for s in raw) if p]
+    if not raw:
+        raise _BookPathError(f"Invalid {source}: no paths given")
     paths: list[Path] = []
     errors: list[str] = []
     for p in raw:
@@ -692,9 +944,179 @@ def _parse_book_paths(value: str | None) -> list[Path]:
 
     if errors:
         raise _BookPathError(
-            "Invalid GNUCASH_BOOK_PATH:\n" + "\n".join(errors)
+            f"Invalid {source}:\n" + "\n".join(errors)
         )
     return paths
+
+
+def _install_book_list(paths: list[Path], *, activate: bool) -> None:
+    """Install ``paths`` as the active book list.
+
+    The single owner of the book-list invariant triple — the
+    ``_book_paths``/``_current_path`` globals, the GNUCASH_BOOK_PATH
+    env mirror, and (when ``activate``) logging activation. Every
+    composition site (--book args, the env var, demo append, and any
+    future source) must route here rather than hand-sync the triple.
+
+    The mirror exists because get_book() re-reads the env whenever
+    ``_book`` is reset; the mirrored string is also cached in
+    ``_book_paths_source`` so get_book() can tell "the value I
+    mirrored" from a genuinely swapped one — re-splitting our own
+    mirror on os.pathsep would shatter a validated path that happens
+    to contain the separator (a ``Budget: 2026.gnucash`` picked in
+    the bundle's file dialog).
+
+    ``_current_path`` survives when it appears in the new list (demo
+    append behind an active book); otherwise it resets to the first
+    entry and the cached ``_book`` instance is dropped.
+
+    Pass ``activate=True`` when this install is the moment logging
+    should (re-)point at the current book: books arriving via CLI
+    (the import-time logging block never saw them), pure demo mode,
+    or CLI logging flags changing the effective modes.
+    """
+    global _book_paths, _current_path, _book, _book_paths_source
+    _book_paths = list(paths)
+    if _current_path not in _book_paths:
+        _current_path = _book_paths[0]
+        _book = None
+    mirrored = os.pathsep.join(str(p) for p in _book_paths)
+    os.environ["GNUCASH_BOOK_PATH"] = mirrored
+    _book_paths_source = mirrored
+    if activate:
+        _activate_logging(_current_path)
+
+
+def _apply_book_args(book_args: list[str]) -> None:
+    """Install --book CLI paths as the active book list.
+
+    Args win over GNUCASH_BOOK_PATH. Always activates logging: when
+    the books arrive via CLI, the import-time logging block never ran
+    (it reads the env, which was unset or different at import) — and
+    main() folds CLI logging flags into the effective modes before
+    calling here, so the activation sees the final debug/audit state.
+    """
+    _install_book_list(
+        _validate_book_paths(book_args, source="--book"),
+        activate=True,
+    )
+
+
+def _demo_book_paths() -> list[Path]:
+    """Bundled demo books to serve alongside the user's own.
+
+    The MCPB manifest sets GNUCASH_DEMO_DIR to the bundle's samples/
+    directory and maps the "Include demo books" checkbox onto
+    GNUCASH_DEMO_BOOKS. Returns the directory's *.gnucash files in
+    sorted order (Alex first, alphabetically) when the toggle is
+    truthy; [] when the toggle is absent/false or the directory is
+    unset or missing — a broken demo must degrade, never brick the
+    user's real books.
+
+    Raises ValueError on an unparseable toggle value (fail fast,
+    same contract as the GNUCASH_ENABLE_* toggles).
+    """
+    if not _parse_env_toggle("GNUCASH_DEMO_BOOKS"):
+        return []
+    demo_dir = os.environ.get("GNUCASH_DEMO_DIR")
+    if not demo_dir or not demo_dir.strip():
+        return []
+    d = Path(demo_dir).expanduser()
+    if not d.is_dir():
+        print(
+            f"Note: demo books enabled but {d} is not a directory; "
+            "continuing without them.",
+            file=sys.stderr,
+        )
+        return []
+    # A single ".gnucash" only: opening a demo in GnuCash writes
+    # timestamped backups (x.gnucash.20260823120000.gnucash) beside
+    # it, which match the glob and would balloon the roster with
+    # near-identical books and make switch_book prefixes ambiguous.
+    return sorted(
+        p.resolve() for p in d.glob("*.gnucash")
+        if p.is_file() and p.name.count(".gnucash") == 1
+    )
+
+
+def _append_demo_books() -> None:
+    """Append bundled demo books to the active book list.
+
+    Demos always follow the user's own books, so the user's first
+    pick stays the startup default. A demo whose filename stem
+    collides with a configured book is skipped with a stderr note
+    rather than tripping the stem-uniqueness fail-fast — the demo is
+    an optional extra and must not brick startup over a name. When
+    no user books are configured at all, the demos alone become the
+    book list (pure demo mode) and logging activates on the first.
+    List installation (globals, env mirror, activation) is
+    _install_book_list's job.
+    """
+    demos = _demo_book_paths()
+    if not demos:
+        return
+    seen = {p.stem.lower() for p in _book_paths}
+    added: list[Path] = []
+    for p in demos:
+        if p.stem.lower() in seen:
+            print(
+                f"Note: bundled demo book {p.name} skipped — a "
+                "configured book shares its filename.",
+                file=sys.stderr,
+            )
+            continue
+        # Same degrade rule for format: a corrupted or XML demo
+        # (truncated extension update, stray file in the demo dir)
+        # is skipped, never fatal — main()'s fatal format check runs
+        # on USER books only, before demos are appended.
+        if _book_format_error(p) is not None:
+            print(
+                f"Note: bundled demo book {p.name} skipped — not a "
+                "readable SQLite book.",
+                file=sys.stderr,
+            )
+            continue
+        seen.add(p.stem.lower())
+        added.append(p)
+    if not added:
+        return
+    demo_only = not _book_paths
+    _install_book_list(_book_paths + added, activate=demo_only)
+
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _book_format_error(path: Path) -> str | None:
+    """Detect a non-SQLite book at startup; return a message a
+    non-developer can act on, or None when the header looks right.
+
+    The #1 predictable mistake in the bundle's file picker is a book
+    saved in GnuCash's XML format (uncompressed ``<?xml`` or the
+    gzip default) — piecash would otherwise fail on it at first tool
+    call with a DatabaseError a non-developer can't decode.
+    Unreadable files return None: the real open surfaces its own
+    error with the existing error_type contract.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_MAGIC))
+    except OSError:
+        return None
+    if head.startswith(_SQLITE_MAGIC):
+        return None
+    if head.startswith(b"\x1f\x8b") or head.lstrip().startswith(b"<?xml"):
+        return (
+            f"{path.name} is in GnuCash's XML format. Open it in "
+            "GnuCash and use File > Save As with the sqlite3 format, "
+            "then pick the new file."
+        )
+    return (
+        f"{path.name} does not look like a GnuCash book in SQLite "
+        "format (unrecognized file header). In GnuCash, use "
+        "File > Save As with the sqlite3 format, then pick the "
+        "new file."
+    )
 
 
 def _book_for(path: Path) -> GnuCashBook:
@@ -726,11 +1148,17 @@ def get_book():
     forces re-initialization from the environment — the reset point
     tests rely on.
     """
-    global _book, _current_path, _book_paths
+    global _book, _current_path, _book_paths, _book_paths_source
     if _book is None:
         # Re-read the env so a test that swapped GNUCASH_BOOK_PATH and
-        # reset _book picks up the new value.
-        _book_paths = _parse_book_paths(os.environ.get("GNUCASH_BOOK_PATH"))
+        # reset _book picks up the new value — but ONLY when the value
+        # actually differs from the one _book_paths came from.
+        # Re-splitting our own mirror would corrupt a validated path
+        # containing os.pathsep and re-stat every book per reset.
+        env_val = os.environ.get("GNUCASH_BOOK_PATH")
+        if not _book_paths or env_val != _book_paths_source:
+            _book_paths = _parse_book_paths(env_val)
+            _book_paths_source = env_val
         if _current_path not in _book_paths:
             _current_path = _book_paths[0]
         _book = _book_for(_current_path)
@@ -742,15 +1170,17 @@ def _activate_logging(path: Path) -> None:
 
     Used on book switch so each book's writes land in its own
     .mcp/audit trail. setup_logging clears its handlers on every call,
-    so repeated invocations don't stack handlers.
+    so repeated invocations don't stack handlers — and with both
+    modes off it clears WITHOUT reinstalling, which is why this call
+    is unconditional: a --noaudit startup must tear down handlers the
+    import-time block already installed, not skip past them.
     """
-    if _logging_audit or _logging_debug:
-        setup_logging(
-            book_path=str(path),
-            debug=_logging_debug,
-            audit=_logging_audit,
-            get_book=get_book,
-        )
+    setup_logging(
+        book_path=str(path),
+        debug=_logging_debug,
+        audit=_logging_audit,
+        get_book=get_book,
+    )
 
 
 def _book_orientation(book_instance) -> str:
@@ -793,7 +1223,7 @@ def _switch_book_impl(name: str) -> str:
     """Make the book whose filename uniquely prefix-matches ``name``
     the current book. See the switch_book tool docstring.
     """
-    global _book, _current_path
+    global _book, _current_path, _writes_armed
     if not _book_paths:
         # Cold start (direct single-call use): populate the registry.
         get_book()
@@ -838,6 +1268,10 @@ def _switch_book_impl(name: str) -> str:
         logging.getLogger("gnucash_mcp.debug").info(
             f"switch_book: no-op, already on {target.name}"
         )
+        # A no-op switch is still a CONFIRMATION — the session named
+        # the book it means to be in, which is exactly what the
+        # restart disarm (ruling 6) is waiting to hear.
+        _writes_armed = True
         return (
             f"Already on: {target.name}\n"
             f"{_book_orientation(_book)}"
@@ -898,6 +1332,7 @@ def _switch_book_impl(name: str) -> str:
 
     _current_path = target
     _book = new_book
+    _writes_armed = True  # explicit book choice re-arms writes
     _server_state["book_path"] = str(target)
     _server_state["current_book"] = target.name
 
@@ -920,8 +1355,22 @@ def _switch_book_impl(name: str) -> str:
 # Use GNUCASH_MCP_DEBUG=1 env var to enable debug logging
 # Use GNUCASH_MCP_NOAUDIT=1 env var to disable audit logging
 # Logs are stored alongside the book file: {book_path}.mcp/audit/ and {book_path}.mcp/debug/
-_debug_mode = os.environ.get("GNUCASH_MCP_DEBUG") == "1"
-_audit_mode = os.environ.get("GNUCASH_MCP_NOAUDIT") != "1"
+def _seed_toggle(var: str, *, default: bool) -> bool:
+    """Import-time toggle read. Accepts the full toggle vocabulary
+    (so GNUCASH_MCP_DEBUG=true from the Advanced box works, not just
+    =1). Import must not raise, so a garbage value is recorded in
+    _env_errors — main() fail-fasts on it — and the default applies
+    meanwhile."""
+    try:
+        value = _parse_env_toggle(var)
+    except ValueError as exc:
+        _env_errors.append(str(exc))
+        return default
+    return default if value is None else value
+
+
+_debug_mode = _seed_toggle("GNUCASH_MCP_DEBUG", default=False)
+_audit_mode = not _seed_toggle("GNUCASH_MCP_NOAUDIT", default=False)
 _logging_debug = _debug_mode
 _logging_audit = _audit_mode
 # Initial logging points at the first valid book. Best-effort at
@@ -1054,52 +1503,202 @@ def switch_book(
 # ============== Main ==============
 
 
-def main() -> None:
-    """Run the MCP server."""
-    # Handle --help
-    if "--help" in sys.argv or "-h" in sys.argv:
-        print("""GnuCash MCP Server
+class _CliParseError(ValueError):
+    """Unusable command line. The message is the complete user-facing
+    text; main() prints it and exits 2."""
+
+
+def _parse_cli_argv(
+    argv: list[str],
+) -> tuple[list[str], bool, bool, str | None]:
+    """Parse CLI arguments: (book_args, debug, noaudit, modules_value).
+
+    ``--book`` consumes every following token up to the next option
+    (the MCPB manifest expands a multi-file picker to ``--book A B``);
+    it also repeats, and accepts the ``--book=PATH`` form. Unrecognized
+    tokens are fatal: a silently ignored flag means the server runs
+    with the wrong tool surface (``--modules all`` once passed
+    unnoticed and served core-only while looking configured). Same
+    fail-fast principle as the unknown-module-NAME check in
+    _apply_module_filter and ``extra="forbid"`` on tool kwargs.
+    """
+    debug_flag = False
+    noaudit_flag = False
+    modules_value: str | None = None
+    book_args: list[str] = []
+    unknown_args: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--debug":
+            debug_flag = True
+        elif arg == "--noaudit":
+            noaudit_flag = True
+        elif arg.startswith("--modules="):
+            modules_value = arg.split("=", 1)[1]
+        elif arg.startswith("--book="):
+            value = arg.split("=", 1)[1]
+            if value.strip():
+                book_args.append(value)
+        elif arg == "--book":
+            # Empty tokens are consumed but dropped: an MCPB host
+            # expanding an unset multi-file config to --book "" must
+            # fall through to the env var / demo books, not brick
+            # startup. A bare --book with NO following token stays a
+            # loud error — that's a human's CLI typo.
+            j = i + 1
+            while j < len(argv) and not argv[j].startswith("--"):
+                if argv[j].strip():
+                    book_args.append(argv[j])
+                j += 1
+            if j == i + 1:
+                raise _CliParseError(
+                    "--book requires at least one path, e.g. "
+                    "--book /path/to/ledger.gnucash"
+                )
+            i = j
+            continue
+        else:
+            unknown_args.append(arg)
+        i += 1
+    if unknown_args:
+        lines = [f"Unrecognized argument(s): {' '.join(unknown_args)}"]
+        if "--modules" in unknown_args:
+            lines.append(
+                'The module list must be attached with "=", '
+                "e.g. --modules=all or --modules=core,reporting."
+            )
+        lines.append(
+            "Accepted options: --modules=MODULES, --book PATH ..., "
+            "--debug, --noaudit, --help"
+        )
+        raise _CliParseError("\n".join(lines))
+    return book_args, debug_flag, noaudit_flag, modules_value
+
+
+# The MCPB bundle's module interface: each manifest checkbox lands
+# as one of these env vars, rendered "true"/"false" by the host app.
+# Values map to module/group names in TOOL_MODULES / MODULE_GROUPS.
+# GNUCASH_ENABLE_BUSINESS is the only var the CURRENT manifest sets
+# (the one question). GNUCASH_ENABLE_FREELANCER is retired from the
+# manifest but still HONORED: unlike planning/investments, the
+# freelancer surface did NOT join the always-on base, so ignoring a
+# stored freelancer=true would subtract the invoicing tools from an
+# old install (release-review finding 4 — a pre-#163 bundle install
+# that answered freelancer=yes, business=no must keep its surface).
+_ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
+    "GNUCASH_ENABLE_BUSINESS": ("business",),
+    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
+}
+
+# Honored when present in the environment, but deliberately absent
+# from the current manifest's installer UI. The manifest contract
+# test exempts these; everything else in _ENV_MODULE_TOGGLES must
+# appear in manifest.json.
+_RETIRED_ENV_TOGGLES: frozenset[str] = frozenset(
+    {"GNUCASH_ENABLE_FREELANCER"}
+)
+
+# The bundle base: what every install gets before the one question.
+# Planning and investments joined it 2026-08-31 (maintainer ruling:
+# too common a need to gate — even a 401(k) wants the portfolio
+# surface, and budgets/scheduling are too small a set to be worth an
+# installer decision). The retired GNUCASH_ENABLE_PLANNING /
+# _INVESTMENTS variables are ignored if present — their surfaces are
+# in the base, so an old install's stored config cannot subtract.
+_ENV_TOGGLE_BASE = ("reporting", "budgets", "scheduling", "investor")
+
+
+def _modules_from_env_toggles() -> str | None:
+    """Compose a --modules value from the GNUCASH_ENABLE_* booleans.
+
+    Returns None when no toggle variable is present at all, so CLI
+    and GNUCASH_MCP_MODULES users (and the core-only default) are
+    untouched. When a toggle is present, the selection is the bundle
+    base (reporting + planning + investor) plus every enabled
+    toggle's modules — core is force-added downstream by
+    _apply_module_filter, matching the bundle design where the base
+    surface is always on and business is the one question.
+
+    Raises ValueError on an unparseable value: a typo'd toggle must
+    not silently serve the wrong tool surface.
+    """
+    if not any(v in os.environ for v in _ENV_MODULE_TOGGLES):
+        return None
+    selected: list[str] = list(_ENV_TOGGLE_BASE)
+    for var, modules in _ENV_MODULE_TOGGLES.items():
+        if _parse_env_toggle(var):
+            selected.extend(modules)
+    return ",".join(selected)
+
+
+def _build_help_text() -> str:
+    """Render ``--help`` output.
+
+    Tool counts derive from TOOL_MODULES / MODULE_GROUPS at call
+    time so this text cannot drift from the registry (the counts
+    were literals once and went stale: "107 tools" shipped while
+    the server served 110).
+    """
+    core = _module_tool_count("core")
+    bookkeeper = _module_tool_count("bookkeeper")
+    investor = _module_tool_count("investor")
+    freelancer = _module_tool_count("freelancer")
+    business = _module_tool_count("business")
+    total = _module_tool_count("all")
+    n_core = len(MODULE_GROUPS["core"])
+    n_bookkeeper = len(MODULE_GROUPS["bookkeeper"])
+    n_investor = len(MODULE_GROUPS["investor"])
+    n_business = len(MODULE_GROUPS["business"])
+    return f"""GnuCash MCP Server
 
 Usage: gnucash-mcp [OPTIONS]
 
 Options:
+  --book PATH [PATH ...]
+                       GnuCash SQLite book(s) to serve. Overrides
+                       GNUCASH_BOOK_PATH; repeatable, and multiple
+                       paths may follow one flag. Two or more books
+                       add the switch_book tool. Filename stems must
+                       be unique (switch_book matches by name).
   --modules=MODULES    Tool modules to load (comma-separated).
-                       Default: core (30 tools, always-on). Use "all"
-                       for every module (107 tools).
+                       Default: core ({core} tools, always-on). Use "all"
+                       for every module ({total} tools; configuring
+                       multiple books adds switch_book on top).
 
                        Role-based selections (group aliases that
                        expand to underlying modules — start here):
                          core         Ledger primitives + reconciliation.
-                                      Always on regardless. 30 tools.
+                                      Always on regardless. {core} tools.
                          bookkeeper   Reporting + budgets + scheduling.
-                                      17 tools.
+                                      {bookkeeper} tools.
                          investor     tax_lots + portfolio (cost basis
-                                      + prices). 12 tools.
+                                      + prices). {investor} tools.
                          freelancer   Customer invoicing + sales tax,
                                       plus billterms (payment terms),
                                       jobs (per-project P&L), and
                                       credit notes (customer refunds).
                                       The full solo-consultant
-                                      toolkit. 31 tools.
+                                      toolkit. {freelancer} tools.
                          business     Full small-business package:
                                       freelancer (invoicing) +
                                       business_complete (vendors,
                                       employees, bills, vouchers,
-                                      vendor reports). 48 tools.
+                                      vendor reports). {business} tools.
 
                        Leaf modules (pick individually for finer
                        control, or as members of the groups above):
 
-                       Core sub-modules (9): summary, accounts,
+                       Core sub-modules ({n_core}): summary, accounts,
                        transactions, slots, audit, backup,
                        balance_sheet, diagnostic, reconciliation.
 
-                       Bookkeeper members (3): reporting, budgets,
+                       Bookkeeper members ({n_bookkeeper}): reporting, budgets,
                        scheduling.
 
-                       Investor members (2): tax_lots, portfolio.
+                       Investor members ({n_investor}): tax_lots, portfolio.
 
-                       Business members (2): freelancer,
+                       Business members ({n_business}): freelancer,
                        business_complete.
 
                        Example: --modules=freelancer for a solo
@@ -1123,13 +1722,34 @@ Environment variables:
                              (switch_book matches by name).
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
-  GNUCASH_MCP_DEBUG=1        Enable debug logging
-  GNUCASH_MCP_NOAUDIT=1      Disable audit logging
+  GNUCASH_ENABLE_BUSINESS    Boolean (true/false) — the MCPB bundle's one
+                             module question ("Do you invoice clients?").
+                             When set, modules = core + reporting +
+                             budgets + scheduling + investor, plus the
+                             business suite when true. The retired
+                             _PLANNING/_INVESTMENTS toggles are ignored
+                             (their surface is now always on); the
+                             retired _FREELANCER toggle is still honored
+                             (its invoicing surface is NOT in the base,
+                             so old freelancer-only installs keep it).
+                             --modules / GNUCASH_MCP_MODULES win when set.
+  GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
+  GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)
+  GNUCASH_DEMO_BOOKS         true/false — serve the demo books found in
+                             GNUCASH_DEMO_DIR (*.gnucash, sorted) after
+                             the user's own books. The MCPB bundle's
+                             "Include demo books" checkbox; with no other
+                             books configured, the demos serve alone.
+  GNUCASH_MCP_ADVANCED       Shell-style GNUCASH_*=value pairs applied to
+                             the environment before any other setting is
+                             read (quoted values may contain spaces). The
+                             MCPB bundle's "Advanced options" field maps
+                             here; pairs override already-set variables.
   GNUCASH_LOG_DIR            Relocate .mcp storage (audit, debug, backups).
                              Each book gets its own subdirectory:
-                             {GNUCASH_LOG_DIR}/{book}.mcp
-                             Default location: {book_path}.mcp
-  GNUCASH_REDACT_PATHS=1     Collapse absolute paths to basenames in tool
+                             {{GNUCASH_LOG_DIR}}/{{book}}.mcp
+                             Default location: {{book_path}}.mcp
+  GNUCASH_REDACT_PATHS=true  Collapse absolute paths to basenames in tool
                              responses and error messages (safe to share)
   GNUCASH_FX_GUARD_DAYS      Refuse a cross-currency invoice/bill post or pay
                              when the chosen rate is this many days from the
@@ -1145,68 +1765,118 @@ Environment variables:
 
 Logs and backups live under the .mcp directory — beside the book file by
 default, or per-book under GNUCASH_LOG_DIR if set:
-  {book_path}.mcp/audit/YYYY-MM-DD.txt
-  {book_path}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
-  {book_path}.mcp/backups/               (auto + manual snapshots)
-""")
+  {{book_path}}.mcp/audit/YYYY-MM-DD.txt
+  {{book_path}}.mcp/debug/YYYY-MM-DD.log   (when debug enabled)
+  {{book_path}}.mcp/backups/               (auto + manual snapshots)
+"""
+
+
+def main() -> None:
+    """Run the MCP server."""
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(_build_help_text())
         sys.exit(0)
 
-    global _book_paths, _current_path, _logging_debug, _logging_audit
-    global _book_class
+    global _logging_debug, _logging_audit, _book_class
 
-    # GNUCASH_BOOK_PATH: one path or an os.pathsep-separated list. Fail fast
-    # on any invalid/duplicate entry (unset is tolerated — tools error
-    # at call time, matching the prior behavior). ``book_path`` below
-    # is the CURRENT book, used for logging / health / display.
+    # Env-configuration errors surfaced first: advanced-option pairs
+    # and toggle seeds were applied (or rejected) at import, but a
+    # typo'd option must kill startup loudly, not silently run with
+    # the default it meant to change.
+    if _env_errors:
+        print("\n".join(_env_errors), file=sys.stderr)
+        raise SystemExit(2)
+
+    # Parse CLI flags first — --book must win over GNUCASH_BOOK_PATH
+    # below. Fail-fast rationale lives on _parse_cli_argv.
+    try:
+        book_args, debug_flag, noaudit_flag, modules_value = (
+            _parse_cli_argv(sys.argv[1:])
+        )
+    except _CliParseError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
+    del sys.argv[1:]
+
+    # Fold CLI logging flags into the effective modes BEFORE any book
+    # installation can activate logging — activation must see the
+    # final debug/audit state. (Activating first and re-initializing
+    # later left --noaudit's teardown unreachable: the old re-init
+    # guard skipped setup_logging when both modes were off, and
+    # setup_logging is the only handler-clearing path.)
+    if debug_flag or noaudit_flag:
+        _logging_debug = debug_flag or _debug_mode
+        _logging_audit = (not noaudit_flag) and _audit_mode
+
+    # Resolve the book list: --book args win; otherwise
+    # GNUCASH_BOOK_PATH (one path or an os.pathsep-separated list).
+    # Fail fast on any invalid/duplicate entry (neither set is
+    # tolerated — tools error at call time, matching the prior
+    # behavior). ``book_path`` below is the CURRENT book, used for
+    # logging / health / display.
     raw_book_path = os.environ.get("GNUCASH_BOOK_PATH")
-    if raw_book_path and raw_book_path.strip():
+    if book_args or (raw_book_path and raw_book_path.strip()):
         try:
-            _book_paths = _parse_book_paths(raw_book_path)
+            if book_args:
+                _apply_book_args(book_args)
+            else:
+                # Env-configured books: import-time logging already
+                # points at the first one, so re-activate only when
+                # the CLI flags changed the effective modes.
+                _install_book_list(
+                    _parse_book_paths(raw_book_path),
+                    activate=debug_flag or noaudit_flag,
+                )
         except _BookPathError as exc:
             print(str(exc), file=sys.stderr)
-            raise SystemExit(2)
-        _current_path = _book_paths[0]
-        book_path = str(_current_path)
-    else:
-        book_path = None
+            raise SystemExit(2) from None
 
-    # Parse CLI flags
-    debug_flag = "--debug" in sys.argv
-    noaudit_flag = "--noaudit" in sys.argv
-    modules_value = None
+    # Startup format check on the USER's books: an XML-format book
+    # (the #1 predictable file-picker mistake) fails here with a
+    # message a non-developer can act on, instead of a piecash
+    # DatabaseError at first tool call. Runs BEFORE demos append —
+    # demo books get the soft skip inside _append_demo_books instead,
+    # because a broken demo must degrade, never brick the user's
+    # real books.
+    format_errors = [
+        msg for p in _book_paths
+        if (msg := _book_format_error(p)) is not None
+    ]
+    if format_errors:
+        print("\n".join(format_errors), file=sys.stderr)
+        raise SystemExit(2)
 
-    # Parse --key=value flags
-    for arg in sys.argv[:]:
-        if arg.startswith("--modules="):
-            modules_value = arg.split("=", 1)[1]
-            sys.argv.remove(arg)
+    # Bundled demo books (MCPB "Include demo books" checkbox) append
+    # AFTER the user's own, so their first pick stays the startup
+    # default; with no user books configured, the demos alone serve
+    # (pure demo mode).
+    try:
+        _append_demo_books()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from None
 
-    if "--debug" in sys.argv:
-        sys.argv.remove("--debug")
-    if "--noaudit" in sys.argv:
-        sys.argv.remove("--noaudit")
+    book_path = str(_current_path) if _book_paths else None
 
-    # Env var fallback for modules (CLI flag takes precedence)
+    # Module selection precedence: --modules, then GNUCASH_MCP_MODULES,
+    # then the MCPB bundle's GNUCASH_ENABLE_* checkbox toggles.
     if modules_value is None:
         modules_value = os.environ.get("GNUCASH_MCP_MODULES")
+    if modules_value is None:
+        try:
+            modules_value = _modules_from_env_toggles()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from None
 
-    # Re-init logging if CLI flags override env vars. Update the
-    # effective-mode globals so switch_book repoints with the same
-    # debug/audit settings.
-    if debug_flag or noaudit_flag:
-        audit_enabled = not noaudit_flag
-        _logging_debug = debug_flag or _debug_mode
-        _logging_audit = audit_enabled and _audit_mode
-        if book_path and (_logging_audit or _logging_debug):
-            setup_logging(
-                book_path=book_path,
-                debug=_logging_debug,
-                audit=_logging_audit,
-                get_book=get_book,
-            )
-            if _logging_debug:
-                debug_log(f"Server starting via CLI. Book: {book_path}")
-                debug_log(f"Debug logging enabled, audit={'enabled' if _logging_audit else 'disabled'}")
+    # Logging was activated (or torn down) by the book-list install
+    # above with the flag-merged modes; only the breadcrumbs remain.
+    if book_path and _logging_debug:
+        debug_log(f"Server starting via CLI. Book: {book_path}")
+        debug_log(
+            "Debug logging enabled, audit="
+            f"{'enabled' if _logging_audit else 'disabled'}"
+        )
 
     # Validate and apply module filter (also lazy-loads extracted modules)
     _validate_module_groups()
@@ -1259,7 +1929,10 @@ default, or per-book under GNUCASH_LOG_DIR if set:
         "book_path": book_path or "not set",
         "book_paths": [p.name for p in _book_paths],
         "current_book": _current_path.name if _current_path else None,
-        "debug": debug_flag,
+        # Effective mode, not just the CLI flag — debug enabled via
+        # GNUCASH_MCP_DEBUG (or the advanced-options box) must not
+        # display as "Debug mode: false".
+        "debug": _logging_debug,
         "default_currency_ok": currency_ok,
     })
 

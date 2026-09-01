@@ -1,7 +1,7 @@
 # Scheduled Transactions & Lots Specification
 ## GnuCash MCP Server Enhancement
 
-**Author:** Abe Raham Jr.  
+**Author:** the bookkeeper  
 **Date:** 2026-02-07  
 **Status:** Draft  
 **Version:** 1.0 Roadmap  

@@ -376,6 +376,369 @@ def _batch_row_splits(rest: list[str], group: tuple[str, ...]) -> list[dict]:
     return splits
 
 
+# Characters str.splitlines() treats as line breaks but no TSV cell
+# legitimately contains: Unicode LINE/PARAGRAPH SEPARATOR, NEL,
+# vertical tab, form feed. Models and copy/paste occasionally emit
+# them invisibly; splitting on one SHATTERS a row mid-cell, and the
+# resulting structural error truthfully blames the row while being
+# unable to name the invisible byte — a bookkeeper lost a night's
+# bisection to exactly that. Reject them loudly by name instead.
+_EXOTIC_SEPARATORS = {
+    "\u2028": "U+2028 LINE SEPARATOR",
+    "\u2029": "U+2029 PARAGRAPH SEPARATOR",
+    "\x85": "U+0085 NEXT LINE",
+    "\x0b": "U+000B VERTICAL TAB",
+    "\x0c": "U+000C FORM FEED",
+    # The other three str.splitlines boundaries — without them the
+    # shatter class was only HALF-fixed: the byte flowed silently
+    # into a cell and died later as a bare ConversionSyntax naming
+    # no character (review finding). splitlines breaks on exactly
+    # ten characters; \n and \r are the real newlines, these are
+    # the other eight.
+    "\x1c": "U+001C FILE SEPARATOR",
+    "\x1d": "U+001D GROUP SEPARATOR",
+    "\x1e": "U+001E RECORD SEPARATOR",
+}
+
+
+def _tsv_lines(tsv: str, what: str) -> list[str]:
+    """Split a TSV block on REAL newlines only, rejecting the
+    invisible separator characters ``str.splitlines`` would have
+    silently split on. Shared by every TSV parser — one splitting
+    discipline, one diagnosis."""
+    # Normalize BEFORE locating, or a bare-\r file reports every
+    # exotic as "the header" (review finding); and number the same
+    # blank-filtered rows the parse loops number, so this
+    # diagnosis and every other row error agree about a line.
+    text = tsv.replace("\r\n", "\n").replace("\r", "\n")
+    for ch, name in _EXOTIC_SEPARATORS.items():
+        if ch in text:
+            prior = text[: text.index(ch)].split("\n")[:-1]
+            row = sum(1 for ln in prior if ln.strip())
+            where = f"row {row}" if row else "the header"
+            raise ValueError(
+                f"invisible {name} character inside {what} at "
+                f"{where} — a copy/paste or generation artifact "
+                f"that would silently shatter the row; re-emit it "
+                f"with plain newlines and tabs"
+            )
+    return [ln for ln in text.split("\n") if ln.strip()]
+
+
+# Statement-dialect fixed columns (``enter_statement``). The batch
+# grammar's fixed prefix is positional (ref, date, description,
+# [notes], [cur]); a statement header instead declares an
+# ANY-ORDER set of per-line columns after ``ref, date``. ``cur``
+# is deliberately absent — foreign-currency statements are a
+# deferred follow-up (spec ruling 3), so the token stays unknown
+# and rejects loudly rather than parsing and half-working.
+_STATEMENT_FIXED_TOKENS = {
+    "description": "description", "desc": "description",
+    "notes": "notes",
+    "raw": "raw",
+    "match": "match",
+    "amount": "amount", "amt": "amount",
+}
+
+
+def _statement_tsv_layout(header_line: str) -> dict:
+    """Column layout of an ``enter_statement`` lines TSV.
+
+    Same header-is-the-schema contract as ``_batch_tsv_layout``, with
+    the statement dialect's fixed columns: ``ref, date`` first, then
+    any order of ``description``/``desc``, ``notes``, ``raw``,
+    ``match``, ``amount`` (required — the self-consistency gate sums
+    it), then optional split-group columns for the COUNTER-side of
+    created rows (``amt, acct, memo, qty, act`` — the statement
+    account's own leg is synthesized by the server, never a column).
+
+    ``amount``/``amt`` is claimed by the fixed section at most once;
+    a second amount-ish token starts the split groups, so the
+    canonical spelling — fixed ``amount``, group ``amt1`` — and the
+    lazy one both parse. Every token is validated; unknown or typo'd
+    names reject on the format, same as batch.
+
+    Returns ``{"fixed_idx": {name: column}, "fixed": int,
+    "group": tuple[str, ...]}``.
+    """
+    raw_tokens = [t.strip().lower() for t in header_line.split("\t")]
+    while raw_tokens and not raw_tokens[-1]:
+        raw_tokens.pop()
+    tokens = [t.rstrip("0123456789") for t in raw_tokens]
+
+    if len(tokens) < 3 or tokens[0] != "ref" or tokens[1] != "date":
+        raise ValueError(
+            "statement header must start with ref, date — got "
+            f"{', '.join(raw_tokens[:2]) or '(empty header)'}"
+        )
+
+    fixed_idx: dict[str, int] = {}
+    start = 2
+    while start < len(tokens):
+        # Match on the RAW token: a digit-suffixed spelling (amt1)
+        # is always a split-group column, never the per-line fixed
+        # amount — the docstring's "lazy spelling" promise depends
+        # on this (review finding: the digit-stripped token was
+        # getting swallowed as fixed, inverting the group order).
+        name = _STATEMENT_FIXED_TOKENS.get(raw_tokens[start])
+        if name is None or name in fixed_idx:
+            break
+        fixed_idx[name] = start
+        start += 1
+
+    # Validate the remaining tokens BEFORE the presence checks: a
+    # typo'd fixed column ("descrption") must error by NAME, not as
+    # a bogus "missing amount" about a column visibly present
+    # (review finding).
+    canonical: list[str] = []
+    for raw, token in zip(raw_tokens[start:], tokens[start:]):
+        name = _BATCH_SPLIT_TOKENS.get(token)
+        if name is None:
+            raise ValueError(
+                f"unrecognized column {raw!r} in statement header — "
+                f"columns are ref, date, then "
+                f"description/notes/raw/match/amount in any order, "
+                f"then amt, acct, memo, qty counter-split groups "
+                f"(the statement account's own leg is synthesized — "
+                f"never a column)"
+            )
+        canonical.append(name)
+
+    if "amount" not in fixed_idx:
+        raise ValueError(
+            "statement header needs an amount column — every line "
+            "carries the amount the statement prints"
+        )
+    if "description" not in fixed_idx and "raw" not in fixed_idx:
+        raise ValueError(
+            "statement header needs a description or raw column — "
+            "something has to identify each line"
+        )
+
+    layout = {"fixed_idx": fixed_idx, "fixed": start}
+    if not canonical:
+        return layout | {"group": _BATCH_LEGACY_GROUP}
+    group: list[str] = []
+    for name in canonical:
+        if name in group:
+            break
+        group.append(name)
+    if "amount" not in group or "account" not in group:
+        raise ValueError(
+            "counter-split columns must include both an amount and "
+            "an account column (or declare none at all)"
+        )
+    return layout | {"group": tuple(group)}
+
+
+def _parse_statement_tsv(tsv: str) -> list[dict]:
+    """Parse an ``enter_statement`` lines TSV into row dicts.
+
+    Row shape: ``{ref, date (ISO string — the caller converts),
+    amount (string), description?, notes?, raw?, match?, splits}``.
+    Optional fixed cells appear only when non-empty. ``date`` and
+    ``amount`` cells are REQUIRED per row — a statement line without
+    either isn't a transcription, and defaulting a date (as batch
+    does) would silently corrupt the date signal every
+    classification leans on.
+
+    Split cells beyond the fixed columns chunk through
+    ``_batch_row_splits`` — the same group mechanics as batch, so
+    the two grammars can't drift.
+    """
+    lines = _tsv_lines(tsv, "the statement lines TSV")
+    if len(lines) < 2:
+        raise ValueError(
+            "statement lines TSV needs a header row and at least one "
+            "data row"
+        )
+    layout = _statement_tsv_layout(lines[0])
+    fixed_idx = layout["fixed_idx"]
+    fixed = layout["fixed"]
+    out: list[dict] = []
+    for i, ln in enumerate(lines[1:], start=1):
+        fields = ln.split("\t")
+        while fields and not fields[-1].strip():
+            fields.pop()
+        ref = fields[0].strip() if fields else ""
+        if not ref:
+            raise ValueError(f"row {i}: empty ref (each row needs a key)")
+        if len(fields) < 2 or not fields[1].strip():
+            raise ValueError(f"row {i} (ref {ref!r}): missing date")
+        row: dict = {"ref": ref, "date": fields[1].strip()}
+        for name, idx in fixed_idx.items():
+            if len(fields) > idx and fields[idx].strip():
+                row[name] = fields[idx].strip()
+        if "amount" not in row:
+            raise ValueError(
+                f"row {i} (ref {ref!r}): missing amount — transcribe "
+                f"the amount exactly as the statement prints it"
+            )
+        if len(fields) <= fixed:
+            row["splits"] = []
+        elif row.get("match"):
+            # A claim row takes no split cells — say so BEFORE the
+            # group chunker turns the stray cells into a confusing
+            # mid-group miscount (bookkeeper finding, maiden
+            # flight).
+            raise ValueError(
+                f"row {i} (ref {ref!r}): a claim row (match cell "
+                f"set) takes no split cells — end the row at its "
+                f"last fixed column"
+            )
+        else:
+            try:
+                row["splits"] = _batch_row_splits(
+                    fields[fixed:], layout["group"]
+                )
+            except ValueError as e:
+                raise ValueError(f"row {i} (ref {ref!r}): {e}")
+        out.append(row)
+    return out
+
+
+# Ruling 9 (statement spec §10): candidate rows are SELF-CONTAINED
+# comparisons — proposed + existing values AND deltas, category
+# legs, a split_match verdict. The caller never joins back to its
+# own input to reconstruct either side. One column set for both
+# rehearsal surfaces (batch duplicates, statement candidates);
+# cells a surface can't fill render blank.
+_CANDIDATE_COMPARISON_COLUMNS = (
+    "ref", "candidate_guid", "confidence", "state",
+    "date_new", "date_old", "date_delta_days",
+    "amt_new", "amt_old", "amt_delta", "cur",
+    "desc_new", "desc_old", "notes_old", "memo_old",
+    "cat_new", "cat_old", "split_match", "signals",
+)
+
+
+def _tsv_cell(value) -> str:
+    """Escape one response-TSV cell — the OUTPUT mirror of
+    ``_tsv_lines``. Book-sourced free text (notes, memos,
+    descriptions, account names) is routinely multi-line in
+    OFX-imported books; written raw into a TSV it shatters the row
+    into phantom rows exactly like the input-side bug this branch
+    already fixed (review finding: a two-line note became a
+    candidate row for a ref that didn't exist). Structural
+    characters render as visible escapes; the invisible separator
+    exotics render as spaces. ``None`` renders empty — never the
+    string "None"."""
+    if value is None:
+        return ""
+    s = str(value)
+    if not s:
+        return ""
+    s = (
+        s.replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    for ch in _EXOTIC_SEPARATORS:
+        s = s.replace(ch, " ")
+    return s
+
+
+def _candidate_risk(row: dict) -> int:
+    """Correspondence strength = lit signal count."""
+    return sum(1 for ch in str(row.get("signals", "")) if ch != "-")
+
+
+def _candidate_comparison_tsv(rows: list[dict]) -> str:
+    """Render candidate-comparison dicts as the shared TSV, sorted
+    by descending risk, then |amt_delta| and |date_delta| ascending
+    (nearest correspondence first within a tier — bookkeeper
+    ruling), then the stable (ref, candidate_guid) tie-break — the
+    reader's model of the list must not form on the harmless
+    entries. Empty input renders "" (dropped by _strip_noise)."""
+    if not rows:
+        return ""
+
+    def _abs_or_zero(value) -> Decimal:
+        # Blank deltas are WITHHELD comparisons (cross-currency),
+        # not distant ones — sorting them last would demote exactly
+        # the rows that need manual eyes (review finding). They
+        # sort at the head of their risk tier instead. NaN would
+        # escape the constructor guard and blow up inside sorted();
+        # it lands with the blanks.
+        try:
+            d = abs(Decimal(str(value)))
+        except InvalidOperation:
+            return Decimal(0)
+        return Decimal(0) if d.is_nan() else d
+
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            -_candidate_risk(r),
+            _abs_or_zero(r.get("amt_delta", "")),
+            _abs_or_zero(r.get("date_delta_days", "")),
+            str(r.get("ref", "")), str(r.get("candidate_guid", "")),
+        ),
+    )
+    lines = ["\t".join(_CANDIDATE_COMPARISON_COLUMNS)]
+    for r in ordered:
+        lines.append(
+            "\t".join(
+                _tsv_cell(r.get(c)) for c in
+                _CANDIDATE_COMPARISON_COLUMNS
+            )
+        )
+    return "\n".join(lines)
+
+
+def _split_match_verdict(
+    cat_new: list[tuple[str, str]] | None,
+    cat_old: list[tuple[str, str]],
+) -> str:
+    """``exact`` / ``partial`` / ``none`` over the category
+    (non-payment) split sets — the payment account is shared by
+    construction and carries no signal. exact = same accounts and
+    amounts; partial = any account overlap; none = disjoint.
+    Unknown proposal side renders blank."""
+    if cat_new is None:
+        return ""
+
+    def norm(cats):
+        # Amounts compare as numbers — "800.00" IS "800"; the raw
+        # strings come from different layers with different scales.
+        out = set()
+        for a, v in cats:
+            try:
+                out.add((a, Decimal(v)))
+            except InvalidOperation:
+                out.add((a, v))
+        return out
+
+    new_set, old_set = norm(cat_new), norm(cat_old)
+    if new_set == old_set:
+        return "exact"
+    if {a for a, _ in new_set} & {a for a, _ in old_set}:
+        return "partial"
+    return "none"
+
+
+def _dry_run_summary(
+    total: int, noun: str, counts: list[tuple[str, int]],
+    homework: str = "",
+) -> str:
+    """Shared dry-run summary header for the two rehearsal surfaces
+    (``enter_statement`` and ``create_transactions`` dry-runs) —
+    divergence between them is a bug, same as the grammars.
+
+    The clearance principle (statement spec §4): counts are facts
+    and may headline; "safe to commit" / "0 blocking" style verdicts
+    over rows the judgment pass hasn't ruled are banned vocabulary.
+    ``homework`` assigns the work ("K rows need adjudication…") or
+    states a verified empty ("no duplicate candidates") — never a
+    clearance."""
+    parts = ", ".join(f"{n} {label}" for label, n in counts)
+    out = f"Dry run: {total} {noun} — {parts}."
+    if homework:
+        out += f"\n{homework}"
+    return out
+
+
 # ── Numeric formatting ─────────────────────────────────────────────
 
 
@@ -637,14 +1000,25 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     """``update_transactions`` TSV → row dicts.
 
     Header: ``guid`` then any of ``description``, ``notes``,
-    ``date`` (at least one, any order, no repeats); unknown tokens
-    reject by name. An EMPTY cell leaves that field unchanged — the
-    key is simply absent from the row dict. ``date`` stays an ISO
-    string here (the tool layer parses; the audit display reuses
-    this parser and wants text). Shared with the audit formatter so
-    the display parse can't drift from the tool parse.
+    ``date`` (at least one, any order, no repeats), plus an
+    optional ``clear`` column; unknown tokens reject by name. An
+    EMPTY cell leaves that field unchanged — the key is simply
+    absent from the row dict.
+
+    ``clear`` is the explicit opt-in that empty-cell-means-
+    unchanged deliberately forecloses: its cell holds
+    comma-separated field names (``description`` and/or ``notes``)
+    to blank on that row, emitted as ``""`` values (the book layer
+    already treats empty as clear). ``date`` is not clearable —
+    transactions must have one. A row that both sets and clears
+    the same field is contradictory and rejects.
+
+    ``date`` stays an ISO string here (the tool layer parses; the
+    audit display reuses this parser and wants text). Shared with
+    the audit formatter so the display parse can't drift from the
+    tool parse.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the updates TSV")
     if len(lines) < 2:
         raise ValueError(
             "updates TSV needs a header row and at least one data row"
@@ -658,14 +1032,15 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
     if not fields:
         raise ValueError(
             "updates header needs at least one field column "
-            "(description, notes, date)"
+            "(description, notes, date) or a clear column"
         )
     seen: set = set()
     for tok in fields:
-        if tok not in _UPDATE_TSV_FIELDS:
+        if tok != "clear" and tok not in _UPDATE_TSV_FIELDS:
             raise ValueError(
                 f"unrecognized column {tok!r} in updates header — "
-                f"columns are guid, then description, notes, date"
+                f"columns are guid, then description, notes, date, "
+                f"and optionally clear"
             )
         if tok in seen:
             raise ValueError(f"duplicate {tok!r} column in updates header")
@@ -678,8 +1053,31 @@ def _parse_update_tsv(tsv: str) -> list[dict]:
         if not guid:
             raise ValueError(f"row {i}: empty guid")
         row: dict = {"guid": guid}
+        clear_spec = ""
         for j, tok in enumerate(fields, start=1):
-            if j < len(cells) and cells[j].strip():
-                row[tok] = cells[j].strip()
+            cell = cells[j].strip() if j < len(cells) else ""
+            if tok == "clear":
+                clear_spec = cell
+            elif cell:
+                row[tok] = cell
+        for name in (
+            n.strip().lower()
+            for n in clear_spec.split(",") if n.strip()
+        ):
+            if name == "date":
+                raise ValueError(
+                    f"row {i}: 'date' is not clearable — every "
+                    f"transaction needs a posting date"
+                )
+            if name not in ("description", "notes"):
+                raise ValueError(
+                    f"row {i}: unknown field {name!r} in clear cell "
+                    f"— clearable fields are description, notes"
+                )
+            if name in row:
+                raise ValueError(
+                    f"row {i}: sets AND clears {name!r} — pick one"
+                )
+            row[name] = ""
         out.append(row)
     return out

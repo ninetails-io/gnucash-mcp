@@ -5,6 +5,10 @@ Registered only when the 'business' module is enabled via --modules.
 
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
+    DocumentType,
+    PartyType,
+    _gate_document_type,
+    _gate_party_type,
     BusinessAddressInput,
     BusinessNotes,
     BusinessNotesOptional,
@@ -21,230 +25,144 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="create", entity_type="customer")
-    def create_customer(
+    def create_party(
+        party_type: PartyType,
         name: str,
         currency: str | None = None,
         notes: BusinessNotes = "",
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Create a new customer.
+        """Create a customer, vendor, or employee.
+
+        Additive: each call creates a fresh party — names are NOT
+        checked for duplicates, so list_parties first when unsure.
+        Returns the assigned ID (e.g., "000001"), the handle every
+        later call wants. ID counters are PER TYPE: customer 000001
+        and vendor 000001 are different parties, which is why
+        party_type is required everywhere.
 
         Args:
-            name: Customer name (e.g., "Acme Corp").
+            party_type: "customer" (pays you), "vendor" (you pay),
+                or "employee" (expense-voucher workflows).
+            name: Party name (e.g., "Acme Corp", "Jane Smith").
             currency: ISO currency code (e.g., "USD", "EUR").
-                      Defaults to book's default currency.
-            notes: Optional notes (max 4096 characters).
+                Defaults to book's default currency.
+            notes: Optional notes (max 4096 characters). Employees
+                have no notes field — rejected, not ignored.
             address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email. Each sub-field
-                     capped at 1024 characters.
+                addr3, addr4, phone, fax, email. Each sub-field
+                capped at 1024 characters.
         """
+        party_type = _gate_party_type(party_type)
         book = get_book()
-        result = book.create_customer(
-            name=name, currency=currency, notes=notes,
-            address=address.model_dump() if address else None,
-        )
+        addr = address.model_dump() if address else None
+        if party_type == "employee":
+            if notes:
+                raise ValueError(
+                    "Employees have no notes field in GnuCash. "
+                    "Omit notes, or keep employee context elsewhere."
+                )
+            result = book.create_employee(
+                name=name, currency=currency, address=addr,
+            )
+        elif party_type == "vendor":
+            result = book.create_vendor(
+                name=name, currency=currency, notes=notes,
+                address=addr,
+            )
+        else:
+            result = book.create_customer(
+                name=name, currency=currency, notes=notes,
+                address=addr,
+            )
+        result["type"] = party_type
         return _json(result)
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def list_customers(
+    def list_parties(
+        party_type: PartyType | None = None,
         active_only: bool = True,
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> str:
-        """List all customers.
+        """List customers, vendors, and/or employees.
 
-        Leads with a ``Showing X-Y of Z customers`` line, then a compact
-        one-line-per-customer format by default. Page with ``offset``;
-        ``limit=0`` returns the count only. Use verbose=true for full
-        JSON with guid, address, notes, etc.
+        Leads with a ``Showing X-Y of Z`` line per type, then a
+        compact one-line-per-party format by default. Page with
+        ``offset``; ``limit=0`` returns the count only. Use
+        verbose=true for full JSON with guid, address, notes, etc.
 
         Args:
-            active_only: If True, only show active customers. Default True.
-            verbose: If true, return full JSON details for each customer.
-            limit: Page size (default 50, max 250). 0 = count only.
+            party_type: "customer", "vendor", or "employee". Omit
+                for all three (sections in that order).
+            active_only: If True, only show active parties. Default True.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
+            limit: Page size per type (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
+        party_type = _gate_party_type(party_type)
         book = get_book()
-        result = book.list_customers(
-            active_only=active_only, compact=not verbose,
-            limit=limit, offset=offset,
-        )
+        routes = {
+            "customer": book.list_customers,
+            "vendor": book.list_vendors,
+            "employee": book.list_employees,
+        }
+        kinds = [party_type] if party_type else list(routes)
+        results = {
+            k: routes[k](
+                active_only=active_only, compact=not verbose,
+                limit=limit, offset=offset,
+            )
+            for k in kinds
+        }
         if verbose:
-            return _json(result)
-        return result
+            return _json(
+                results[party_type] if party_type
+                else {f"{k}s": v for k, v in results.items()}
+            )
+        if party_type:
+            return results[party_type]
+        return "\n\n".join(
+            f"{k.upper()}S:\n{v}" for k, v in results.items()
+        )
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def get_customer(
+    def get_party(
+        party_type: PartyType,
         id: str,
     ) -> str:
-        """Get details for a specific customer by ID.
+        """Get details for one customer, vendor, or employee by ID.
 
         Args:
-            id: Customer ID (e.g., "000001"). This is the human-readable
+            party_type: "customer", "vendor", or "employee" —
+                required because ID counters collide across types
+                (customer 000001 ≠ vendor 000001).
+            id: Party ID (e.g., "000001"). This is the human-readable
                 ID shown in GnuCash, not the internal GUID.
         """
+        party_type = _gate_party_type(party_type)
         book = get_book()
-        result = book.get_customer(customer_id=id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="vendor")
-    def create_vendor(
-        name: str,
-        currency: str | None = None,
-        notes: BusinessNotes = "",
-        address: BusinessAddressInput | None = None,
-    ) -> str:
-        """Create a new vendor.
-
-        Args:
-            name: Vendor name (e.g., "Office Depot").
-            currency: ISO currency code (e.g., "USD", "EUR").
-                      Defaults to book's default currency.
-            notes: Optional notes (max 4096 characters).
-            address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email. Each sub-field
-                     capped at 1024 characters.
-        """
-        book = get_book()
-        result = book.create_vendor(
-            name=name, currency=currency, notes=notes,
-            address=address.model_dump() if address else None,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def list_vendors(
-        active_only: bool = True,
-        verbose: bool = False,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> str:
-        """List all vendors.
-
-        Leads with a ``Showing X-Y of Z vendors`` line, then a compact
-        one-line-per-vendor format by default. Page with ``offset``;
-        ``limit=0`` returns the count only. Use verbose=true for full
-        JSON with guid, address, notes, etc.
-
-        Args:
-            active_only: If True, only show active vendors. Default True.
-            verbose: If true, return full JSON details for each vendor.
-            limit: Page size (default 50, max 250). 0 = count only.
-            offset: 0-indexed first row to return (default 0).
-        """
-        book = get_book()
-        result = book.list_vendors(
-            active_only=active_only, compact=not verbose,
-            limit=limit, offset=offset,
-        )
-        if verbose:
-            return _json(result)
-        return result
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def get_vendor(
-        id: str,
-    ) -> str:
-        """Get details for a specific vendor by ID.
-
-        Args:
-            id: Vendor ID (e.g., "000001"). This is the human-readable
-                ID shown in GnuCash, not the internal GUID.
-        """
-        book = get_book()
-        result = book.get_vendor(vendor_id=id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="employee")
-    def create_employee(
-        name: str,
-        currency: str | None = None,
-        address: BusinessAddressInput | None = None,
-    ) -> str:
-        """Create a new employee.
-
-        Employee has no ``notes`` field (unlike Customer and Vendor).
-        Address shape is identical.
-
-        Args:
-            name: Employee name (e.g., "Jane Smith").
-            currency: ISO currency code (e.g., "USD", "EUR").
-                      Defaults to book's default currency.
-            address: Optional address with keys: name, addr1, addr2,
-                     addr3, addr4, phone, fax, email. Each sub-field
-                     capped at 1024 characters.
-        """
-        book = get_book()
-        result = book.create_employee(
-            name=name, currency=currency,
-            address=address.model_dump() if address else None,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def list_employees(
-        active_only: bool = True,
-        verbose: bool = False,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> str:
-        """List all employees.
-
-        Leads with a ``Showing X-Y of Z employees`` line, then a compact
-        one-line-per-employee format by default. Page with ``offset``;
-        ``limit=0`` returns the count only. Use verbose=true for full
-        JSON with guid, address, etc.
-
-        Args:
-            active_only: If True, only show active employees. Default True.
-            verbose: If true, return full JSON details for each employee.
-            limit: Page size (default 50, max 250). 0 = count only.
-            offset: 0-indexed first row to return (default 0).
-        """
-        book = get_book()
-        result = book.list_employees(
-            active_only=active_only, compact=not verbose,
-            limit=limit, offset=offset,
-        )
-        if verbose:
-            return _json(result)
-        return result
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def get_employee(
-        id: str,
-    ) -> str:
-        """Get details for a specific employee by ID.
-
-        Args:
-            id: Employee ID (e.g., "000001"). This is the human-readable
-                ID shown in GnuCash, not the internal GUID.
-        """
-        book = get_book()
-        result = book.get_employee(employee_id=id)
+        if party_type == "employee":
+            result = book.get_employee(employee_id=id)
+        elif party_type == "vendor":
+            result = book.get_vendor(vendor_id=id)
+        else:
+            result = book.get_customer(customer_id=id)
         return _json(result)
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="customer")
-    def update_customer(
+    def update_party(
+        party_type: PartyType,
         id: str,
         name: str | None = None,
         currency: str | None = None,
@@ -252,93 +170,79 @@ def register(mcp, get_book) -> None:
         active: bool | None = None,
         address: BusinessAddressInput | None = None,
     ) -> str:
-        """Update an existing customer.
+        """Update a customer's, vendor's, or employee's mutable fields.
 
-        Mutates only the fields supplied; everything else stays.
-        Existing invoices/bills are not retroactively changed —
-        ``currency`` here is the customer's *default* trading
-        currency for future documents.
+        ``None`` = no change on every parameter; pass an empty
+        string to clear ``notes``. Returns a diff-style response
+        with the changed fields only.
 
         Args:
-            id: Customer ID (e.g., "000001").
+            party_type: "customer", "vendor", or "employee" (ID
+                counters collide across types — always required).
+            id: Party ID (e.g., "000001").
             name: New display name.
-            currency: New default ISO currency code (e.g., "EUR").
-            notes: New notes. Pass "" to clear.
-            active: ``false`` to deactivate (archive without
-                deleting); ``true`` to reactivate.
-            address: Partial address dict — keys ``name``,
-                ``addr1``..``addr4``, ``phone``, ``fax``, ``email``.
-                Merges onto the existing address (creating one if
-                absent). To clear a sub-field, pass an empty
-                string explicitly for that key.
+            currency: New ISO currency code (future documents only).
+            notes: New notes; "" clears. Employees have no notes
+                field — rejected, not ignored.
+            active: Set active/inactive (inactive parties hide from
+                default listings but keep their history).
+            address: Full replacement address (see create_party).
         """
+        party_type = _gate_party_type(party_type)
         book = get_book()
-        result = book.update_customer(
-            customer_id=id, name=name, currency=currency,
-            notes=notes, active=active,
-            address=address.model_dump() if address else None,
-        )
+        addr = address.model_dump() if address else None
+        if party_type == "employee":
+            if notes is not None:
+                raise ValueError(
+                    "Employees have no notes field in GnuCash — "
+                    "the notes parameter cannot be updated for "
+                    "party_type='employee'."
+                )
+            result = book.update_employee(
+                employee_id=id, name=name, currency=currency,
+                active=active, address=addr,
+            )
+        elif party_type == "vendor":
+            result = book.update_vendor(
+                vendor_id=id, name=name, currency=currency,
+                notes=notes, active=active, address=addr,
+            )
+        else:
+            result = book.update_customer(
+                customer_id=id, name=name, currency=currency,
+                notes=notes, active=active, address=addr,
+            )
+        result["type"] = party_type
         return _json(result)
 
     @mcp.tool()
     @safe_tool
-    @audit_log(classification="write", operation="update", entity_type="vendor")
-    def update_vendor(
+    @audit_log(classification="write", operation="delete", entity_type="customer")
+    def delete_party(
+        party_type: PartyType,
         id: str,
-        name: str | None = None,
-        currency: str | None = None,
-        notes: BusinessNotesOptional = None,
-        active: bool | None = None,
-        address: BusinessAddressInput | None = None,
     ) -> str:
-        """Update an existing vendor.
+        """Delete a customer, vendor, or employee.
 
-        Same semantics as ``update_customer``.
+        Blocked while the party has documents (invoices, bills,
+        vouchers, credit notes) — the audit trail outranks tidiness.
+        Prefer update_party(active=false) to retire a party while
+        keeping its history.
 
         Args:
-            id: Vendor ID (e.g., "000001").
-            name: New display name.
-            currency: New default ISO currency code.
-            notes: New notes. Pass "" to clear.
-            active: ``false`` to deactivate; ``true`` to reactivate.
-            address: Partial address dict (see ``update_customer``).
+            party_type: "customer", "vendor", or "employee" (ID
+                counters collide across types — always required).
+            id: Party ID (e.g., "000001").
         """
+        party_type = _gate_party_type(party_type)
         book = get_book()
-        result = book.update_vendor(
-            vendor_id=id, name=name, currency=currency,
-            notes=notes, active=active,
-            address=address.model_dump() if address else None,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="update", entity_type="employee")
-    def update_employee(
-        id: str,
-        name: str | None = None,
-        currency: str | None = None,
-        active: bool | None = None,
-        address: BusinessAddressInput | None = None,
-    ) -> str:
-        """Update an existing employee.
-
-        Employee has no ``notes`` column — parameter omitted
-        accordingly. Otherwise identical to ``update_customer``.
-
-        Args:
-            id: Employee ID (e.g., "000001").
-            name: New display name.
-            currency: New default ISO currency code.
-            active: ``false`` to deactivate; ``true`` to reactivate.
-            address: Partial address dict (see ``update_customer``).
-        """
-        book = get_book()
-        result = book.update_employee(
-            employee_id=id, name=name, currency=currency,
-            active=active,
-            address=address.model_dump() if address else None,
-        )
+        if party_type == "employee":
+            result = book.delete_employee(employee_id=id)
+        elif party_type == "vendor":
+            result = book.delete_vendor(vendor_id=id)
+        else:
+            result = book.delete_customer(customer_id=id)
+        result["type"] = party_type
         return _json(result)
 
     @mcp.tool()
@@ -383,7 +287,10 @@ def register(mcp, get_book) -> None:
         JSON with guid, discount details, etc.
 
         Args:
-            verbose: If true, return full JSON details for each billing term.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
@@ -442,47 +349,39 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def list_taxtables(
+        name: str | None = None,
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> str:
-        """List all sales-tax tables.
+        """List all sales-tax tables, or get one by name.
 
         Leads with a ``Showing X-Y of Z taxtables`` line. Compact format
         (default): one line per taxtable with name, entry count, and
         per-entry rate→account routing. Page with ``offset``; ``limit=0``
-        returns the count only. Verbose: full JSON with resolved account
+        returns the count only. Verbose: structured JSON with resolved account
         paths and refcount.
 
         Args:
-            verbose: If true, return full JSON for each taxtable.
+            name: Tax table name for a single-table detail lookup
+                (entries, rates, account routing, refcount). All
+                other parameters are ignored.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
         book = get_book()
+        if name is not None:
+            return _json(book.get_taxtable(name=name))
         result = book.list_taxtables(
             compact=not verbose, limit=limit, offset=offset
         )
         if verbose:
             return _json(result)
         return result
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def get_taxtable(name: str) -> str:
-        """Get full details for one sales-tax table.
-
-        Returns guid, name, refcount (count of Entry rows
-        referencing it — voided invoices still count), and the
-        resolved entry list with account paths.
-
-        Args:
-            name: Taxtable name.
-        """
-        book = get_book()
-        result = book.get_taxtable(name=name)
-        return _json(result)
 
     @mcp.tool()
     @safe_tool
@@ -542,398 +441,241 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="create", entity_type="invoice")
-    def create_invoice(
-        customer_id: str,
-        date_opened: str | None = None,
-        notes: str = "",
-        currency: str | None = None,
-        term: str | None = None,
-        invoice_id: str | None = None,
-        job_id: str | None = None,
-    ) -> str:
-        """Create a customer invoice.
-
-        Args:
-            customer_id: Customer ID (e.g., "000001").
-            date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
-            notes: Optional notes.
-            currency: ISO currency code. Defaults to the customer's
-                currency, falling back to the book's default. Pass
-                explicitly to override.
-            term: Billterm name (e.g., "Net 30"). Optional.
-            invoice_id: Custom invoice number (e.g., "INV-2026-001"). If omitted,
-                auto-generates from the book's invoice counter.
-            job_id: Optional Job ID. When set, groups the invoice
-                under the named job. The job must belong to the
-                same customer and be a customer-job (created
-                with owner_type='customer'). Use ``create_job``
-                first to define the job, then attach invoices
-                to it via this parameter.
-        """
-        book = get_book()
-        result = book.create_invoice(
-            customer_id=customer_id, date_opened=date_opened,
-            notes=notes, currency=currency, term=term,
-            invoice_id=invoice_id, job_id=job_id,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="bill")
-    def create_bill(
-        vendor_id: str,
-        date_opened: str | None = None,
-        notes: str = "",
-        currency: str | None = None,
-        term: str | None = None,
-        bill_id: str | None = None,
-        job_id: str | None = None,
-    ) -> str:
-        """Create a vendor bill.
-
-        Args:
-            vendor_id: Vendor ID (e.g., "000001").
-            date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
-            notes: Optional notes.
-            currency: ISO currency code. Defaults to the vendor's
-                currency, falling back to the book's default. Pass
-                explicitly to override.
-            term: Billterm name (e.g., "Net 30"). Optional.
-            bill_id: Custom bill number (e.g., "BILL-2026-001"). If omitted,
-                auto-generates from the book's bill counter.
-            job_id: Optional Job ID. When set, groups the bill
-                under the named job. The job must belong to the
-                same vendor and be a vendor-job.
-        """
-        book = get_book()
-        result = book.create_bill(
-            vendor_id=vendor_id, date_opened=date_opened,
-            notes=notes, currency=currency, term=term,
-            bill_id=bill_id, job_id=job_id,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="entry")
-    def add_invoice_entry(
-        invoice_id: str,
-        account: str,
-        description: str,
-        quantity: str,
-        price: str,
-        taxtable: str | None = None,
-        tax_included: bool = False,
-        notes: str = "",
-        action: str = "",
-    ) -> str:
-        """Add a line item to a customer invoice.
-
-        The invoice must not be posted yet. Entries represent individual
-        goods or services being billed.
-
-        Args:
-            invoice_id: Invoice ID (e.g., "000001").
-            account: Income account path (e.g., "Income:Sales").
-            description: Line item description.
-            quantity: Quantity as decimal string (e.g., "1", "2.5").
-            price: Unit price as decimal string (e.g., "100.00").
-            taxtable: Optional taxtable name. When given, the line
-                contributes tax components per the taxtable's entries
-                at posting time. Multi-entry taxtables (e.g., GST+PST)
-                produce one tax split per entry.
-            tax_included: If true, ``price`` is the gross (tax-included)
-                value; pretax extracted at posting. If false (default),
-                ``price`` is pre-tax and tax adds on top.
-            notes: Optional per-line notes (max 4096 bytes) — detail
-                that doesn't belong on the printed description line.
-            action: Optional line-type label (GnuCash convention:
-                "Hours", "Material", "Project").
-        """
-        book = get_book()
-        result = book.add_invoice_entry(
-            invoice_id=invoice_id, account=account,
-            description=description, quantity=quantity, price=price,
-            taxtable=taxtable, tax_included=tax_included,
-            notes=notes, action=action,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="entry")
-    def add_bill_entry(
-        bill_id: str,
-        account: str,
-        description: str,
-        quantity: str,
-        price: str,
-        taxtable: str | None = None,
-        tax_included: bool = False,
-        notes: str = "",
-        action: str = "",
-    ) -> str:
-        """Add a line item to a vendor bill.
-
-        The bill must not be posted yet. Entries represent individual
-        goods or services being billed.
-
-        Args:
-            bill_id: Bill ID (e.g., "000001").
-            account: Expense account path (e.g., "Expenses:Office Supplies").
-            description: Line item description.
-            quantity: Quantity as decimal string (e.g., "1", "2.5").
-            price: Unit price as decimal string (e.g., "50.00").
-            taxtable: Optional taxtable name. For vendor bills, the
-                tax component typically routes to an ASSET account
-                (input-tax credit receivable) per the taxtable's
-                entries.
-            tax_included: If true, ``price`` is gross; pretax extracted
-                at posting. If false (default), tax adds on top.
-            notes: Optional per-line notes (max 4096 bytes).
-            action: Optional line-type label (GnuCash convention:
-                "Hours", "Material", "Project").
-        """
-        book = get_book()
-        result = book.add_bill_entry(
-            bill_id=bill_id, account=account,
-            description=description, quantity=quantity, price=price,
-            taxtable=taxtable, tax_included=tax_included,
-            notes=notes, action=action,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="voucher")
-    def create_voucher(
-        employee_id: str,
-        date_opened: str | None = None,
-        notes: str = "",
-        currency: str | None = None,
-        term: str | None = None,
-        voucher_id: str | None = None,
-    ) -> str:
-        """Create an employee expense voucher.
-
-        A voucher is the document an employee submits for
-        reimbursement of out-of-pocket business expenses. It
-        behaves like a vendor bill: post creates the obligation
-        (debit expense accounts, credit A/P), pay settles it from
-        a cash account.
-
-        Args:
-            employee_id: Employee ID (e.g., "000001").
-            date_opened: Date in ISO format (YYYY-MM-DD). Defaults to today.
-            notes: Optional notes.
-            currency: ISO currency code. Defaults to the employee's
-                currency, falling back to the book's default.
-            term: Billterm name (e.g., "Net 30"). Optional —
-                vouchers rarely use payment terms.
-            voucher_id: Custom voucher number. If omitted,
-                auto-generates from the book's voucher counter.
-        """
-        book = get_book()
-        result = book.create_voucher(
-            employee_id=employee_id, date_opened=date_opened,
-            notes=notes, currency=currency, term=term,
-            voucher_id=voucher_id,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="entry")
-    def add_voucher_entry(
-        voucher_id: str,
-        account: str,
-        description: str,
-        quantity: str,
-        price: str,
-        taxtable: str | None = None,
-        tax_included: bool = False,
-        notes: str = "",
-        action: str = "",
-    ) -> str:
-        """Add a line item to an employee expense voucher.
-
-        The voucher must not be posted yet. Each entry is typically
-        a separate expense category (meals, supplies, travel).
-        Account must be EXPENSE or ASSET.
-
-        Args:
-            voucher_id: Voucher ID (e.g., "000001").
-            account: Expense account path (e.g.,
-                "Expenses:Meals & Entertainment").
-            description: Line item description.
-            quantity: Quantity as decimal string (e.g., "1").
-            price: Unit price as decimal string (e.g., "42.50").
-            taxtable: Optional taxtable name. Same semantics as
-                ``add_bill_entry``.
-            tax_included: If true, ``price`` is gross; pretax extracted
-                at posting.
-            notes: Optional per-line notes (max 4096 bytes) — e.g.
-                receipt reference or attendee list.
-            action: Optional line-type label (GnuCash convention:
-                "Hours", "Material", "Project").
-        """
-        book = get_book()
-        result = book.add_voucher_entry(
-            voucher_id=voucher_id, account=account,
-            description=description, quantity=quantity, price=price,
-            taxtable=taxtable, tax_included=tax_included,
-            notes=notes, action=action,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="voucher")
-    def delete_voucher(
-        id: str | None = None,
-        voucher_id: str | None = None,
-    ) -> str:
-        """Delete an unposted employee expense voucher.
-
-        Automatically removes associated entries. Posted vouchers
-        cannot be deleted — unpost first via ``unpost_invoice``,
-        then delete.
-
-        Args:
-            id: Voucher ID (e.g., "000001"). Preferred parameter
-                name — matches get_invoice / post_invoice / etc.
-            voucher_id: Legacy alias for ``id``. Accepted for
-                back-compat; pass exactly one of ``id`` or
-                ``voucher_id``.
-        """
-        resolved_id = _resolve_id_alias(id, voucher_id, "voucher_id")
-        book = get_book()
-        result = book.delete_voucher(voucher_id=resolved_id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="credit_note")
-    def create_credit_note(
+    def create_document(
+        document_type: DocumentType,
         owner_id: str,
-        owner_type: str,
-        applies_to_invoice_id: str | None = None,
+        party_type: PartyType | None = None,
         date_opened: str | None = None,
-        notes: str = "",
+        notes: BusinessNotes = "",
         currency: str | None = None,
         term: str | None = None,
-        credit_note_id: str | None = None,
+        id: str | None = None,
+        job_id: str | None = None,
+        applies_to_id: str | None = None,
     ) -> str:
-        """Create a credit note against a customer invoice or
-        vendor bill.
+        """Create a customer invoice, vendor bill, employee expense
+        voucher, or credit note.
 
-        A credit note reverses part or all of a posted invoice
-        while preserving the original posting in the audit trail.
-        At post time, posting direction reverses: customer credit
-        notes debit Income / credit A/R (reducing receivables);
-        vendor credit notes debit A/P / credit Expense (reducing
-        payables). Settled either by refund (``pay_invoice``) or
-        by netting against an outstanding invoice
-        (``apply_credit_note``).
-
-        Use ``add_credit_note_entry`` to add line items, then
-        ``post_invoice`` to post.
+        The owner side derives from the document type — invoice →
+        customer, bill → vendor, voucher → employee. Credit notes
+        exist on both sides, so they alone require ``party_type``
+        ("customer" or "vendor"). After creating, add line items
+        with add_document_entry, then post_document to put it on
+        the books.
 
         Args:
-            owner_id: Customer or vendor ID (e.g., "000001").
-            owner_type: "customer" or "vendor". Employees are not
-                supported (GnuCash desktop has no UI for employee
-                credit notes; use unpost_invoice + edit on the
-                voucher to amend an employee reimbursement).
-            applies_to_invoice_id: Optional source invoice / bill
-                ID. Must belong to the same owner and use the
-                same currency. Highly recommended for audit
-                trail. Can be omitted for floating credit notes
-                that will be applied later.
-            date_opened: ISO date (YYYY-MM-DD). Defaults to today.
-            notes: Free-text notes (e.g., reason for the credit).
-            currency: ISO currency code. Inherited from source
-                invoice when applies_to_invoice_id is given;
-                otherwise from owner's currency or book default.
-            term: Billterm name. Rarely used for credit notes.
-            credit_note_id: Custom ID. Auto-generated from the
-                shared invoice/bill counter when omitted.
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note".
+            owner_id: The owning party's ID (customer ID for
+                invoices, vendor ID for bills, employee ID for
+                vouchers). ID counters are per type.
+            party_type: Required for credit notes only ("customer"
+                or "vendor" — which side the credit belongs to).
+                Derived from document_type otherwise.
+            date_opened: ISO date. Defaults to today (echoed in the
+                response).
+            notes: Optional notes (max 4096 characters).
+            currency: ISO code. Defaults to the owner's currency,
+                then the book default.
+            term: Billterm name (e.g., "Net 30"). Optional.
+            id: Custom document number; auto-generated when omitted.
+            job_id: Optional Job to group under (invoices and bills;
+                must belong to the same owner).
+            applies_to_id: Credit notes only — the invoice/bill this
+                credit note reverses. The link is PROVENANCE, not a
+                constraint: apply_credit_note can net the credit
+                against any open document from the same owner (its
+                response notes the divergence when the applied
+                target differs from this link).
         """
-        owner_type = _gate_owner_type(owner_type)
+        document_type = _gate_document_type(document_type)
+        # Type-scoped parameters refuse loudly when inapplicable.
+        # These are DECLARED parameters, so extra="forbid" can't
+        # catch them — without this check a supplied value would be
+        # silently dropped by the dispatch below (the silent-kwarg
+        # loss class the forbid work exists to kill).
+        if applies_to_id is not None and document_type != "credit_note":
+            raise ValueError(
+                f"applies_to_id only applies to "
+                f"document_type='credit_note' — a {document_type} "
+                f"cannot link a document it reverses. Omit it, or "
+                f"create a credit_note."
+            )
+        if job_id is not None and document_type not in (
+            "invoice", "bill",
+        ):
+            raise ValueError(
+                f"job_id only applies to invoices and bills — a "
+                f"{document_type} cannot be grouped under a job. "
+                f"Omit job_id."
+            )
         book = get_book()
-        result = book.create_credit_note(
-            owner_id=owner_id,
-            owner_type=owner_type,
-            applies_to_invoice_id=applies_to_invoice_id,
-            date_opened=date_opened,
-            notes=notes,
-            currency=currency,
-            term=term,
-            credit_note_id=credit_note_id,
-        )
+        if document_type == "credit_note":
+            if party_type is None:
+                raise ValueError(
+                    "Credit notes exist on both sides — pass "
+                    "party_type='customer' (reduces a receivable) "
+                    "or party_type='vendor' (reduces a payable)."
+                )
+            party_type = _gate_party_type(party_type)
+            if party_type == "employee":
+                raise ValueError(
+                    "party_type='employee' is not valid for credit "
+                    "notes — use 'customer' or 'vendor'."
+                )
+            result = book.create_credit_note(
+                owner_id=owner_id, owner_type=party_type,
+                applies_to_invoice_id=applies_to_id,
+                date_opened=date_opened, notes=notes,
+                currency=currency, term=term, credit_note_id=id,
+            )
+        elif document_type == "bill":
+            result = book.create_bill(
+                vendor_id=owner_id, date_opened=date_opened,
+                notes=notes, currency=currency, term=term,
+                bill_id=id, job_id=job_id,
+            )
+        elif document_type == "voucher":
+            result = book.create_voucher(
+                employee_id=owner_id, date_opened=date_opened,
+                notes=notes, currency=currency, term=term,
+                voucher_id=id,
+            )
+        else:
+            result = book.create_invoice(
+                customer_id=owner_id, date_opened=date_opened,
+                notes=notes, currency=currency, term=term,
+                invoice_id=id, job_id=job_id,
+            )
+        result["type"] = document_type
         return _json(result)
 
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="create", entity_type="entry")
-    def add_credit_note_entry(
-        credit_note_id: str,
+    def add_document_entry(
+        document_type: DocumentType,
+        id: str,
         account: str,
         description: str,
         quantity: str,
         price: str,
-        owner_type: str | None = None,
+        party_type: PartyType | None = None,
         taxtable: str | None = None,
         tax_included: bool = False,
-        notes: str = "",
+        notes: BusinessNotes = "",
         action: str = "",
     ) -> str:
-        """Add a line item to a credit note.
+        """Add a line item to a customer invoice, vendor bill,
+        employee voucher, or credit note.
 
-        Mirrors ``add_invoice_entry`` / ``add_bill_entry`` but
-        validates the target is in fact a credit note (the slot
-        flag is the gate). Account type rules match the
-        non-credit twin: INCOME for customer credit notes,
-        EXPENSE/ASSET for vendor credit notes. Prices stay
-        positive — the credit-note flag inverts posting direction
-        at post time, not at entry-add time.
+        Only unposted documents accept entries — unpost_document
+        first to amend a posted one. Amounts are decimal strings;
+        the line total is quantity × price (plus tax when a
+        taxtable is attached).
 
         Args:
-            credit_note_id: Credit note ID (e.g., "000032").
-            account: Account path appropriate for the owner type
-                (INCOME for customer, EXPENSE/ASSET for vendor).
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note".
+            id: Document ID (e.g., "000001").
+            account: Income account for invoices / credit notes;
+                expense account for bills and vouchers. Full path,
+                %short GUID, or full GUID.
             description: Line item description.
-            quantity: Quantity as decimal string.
-            price: Unit price as decimal string.
-            owner_type: Optional "customer" or "vendor"
-                disambiguator for ID collisions. Usually omitted.
-            taxtable: Optional taxtable name. Same semantics as
-                ``add_invoice_entry``; the credit-note flag inverts
-                tax-split direction at posting time so a refunded
-                tax-inclusive sale produces a debit to the tax-payable
-                account.
-            tax_included: If true, ``price`` is gross; pretax
-                extracted at posting.
-            notes: Optional per-line notes (max 4096 bytes) — e.g.
-                the reason this line is being credited.
-            action: Optional line-type label (GnuCash convention:
-                "Hours", "Material", "Project").
+            quantity: Quantity as a decimal string (e.g., "3").
+            price: Unit price as a decimal string (e.g., "125.00").
+            party_type: Credit notes only — disambiguates when a
+                customer and vendor credit note share an ID.
+            taxtable: Tax table name to apply. Optional.
+            tax_included: Whether price already includes tax.
+            notes: Optional entry notes.
+            action: Optional entry action label (e.g., "Hours").
         """
-        owner_type = _gate_owner_type(owner_type)
+        document_type = _gate_document_type(document_type)
         book = get_book()
-        result = book.add_credit_note_entry(
-            credit_note_id=credit_note_id,
-            account=account,
-            description=description,
-            quantity=quantity,
-            price=price,
-            owner_type=owner_type,
-            taxtable=taxtable,
-            tax_included=tax_included,
-            notes=notes,
-            action=action,
-        )
+        if document_type == "credit_note":
+            result = book.add_credit_note_entry(
+                credit_note_id=id, account=account,
+                description=description, quantity=quantity,
+                price=price, owner_type=party_type,
+                taxtable=taxtable, tax_included=tax_included,
+                notes=notes, action=action,
+            )
+        elif document_type == "bill":
+            result = book.add_bill_entry(
+                bill_id=id, account=account,
+                description=description, quantity=quantity,
+                price=price, taxtable=taxtable,
+                tax_included=tax_included, notes=notes,
+                action=action,
+            )
+        elif document_type == "voucher":
+            result = book.add_voucher_entry(
+                voucher_id=id, account=account,
+                description=description, quantity=quantity,
+                price=price, taxtable=taxtable,
+                tax_included=tax_included, notes=notes,
+                action=action,
+            )
+        else:
+            result = book.add_invoice_entry(
+                invoice_id=id, account=account,
+                description=description, quantity=quantity,
+                price=price, taxtable=taxtable,
+                tax_included=tax_included, notes=notes,
+                action=action,
+            )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(classification="write", operation="delete", entity_type="invoice")
+    def delete_document(
+        document_type: DocumentType,
+        id: str,
+        party_type: PartyType | None = None,
+    ) -> str:
+        """Delete an UNPOSTED customer invoice, vendor bill,
+        employee voucher, or credit note.
+
+        Posted documents are on the books — unpost_document first
+        (payments block unposting; the audit trail outranks
+        tidiness).
+
+        Args:
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note".
+            id: Document ID (e.g., "000001").
+            party_type: Owner side, credit notes only — pass it when
+                a credit note's ID collides with a document of the
+                same ID on the other side (ID counters are per
+                type).
+        """
+        document_type = _gate_document_type(document_type)
+        # The typed species imply their side; only credit notes
+        # exist on both sides and can collide. Refuse a meaningless
+        # party_type loudly rather than silently ignoring it.
+        if party_type is not None and document_type != "credit_note":
+            raise ValueError(
+                f"party_type only applies to "
+                f"document_type='credit_note' (a "
+                f"{document_type}'s owner side is implied by its "
+                f"type). Omit party_type."
+            )
+        book = get_book()
+        if document_type == "credit_note":
+            result = book.delete_credit_note(
+                credit_note_id=id,
+                owner_type=_gate_owner_type(party_type)
+                if party_type else None,
+            )
+        elif document_type == "bill":
+            result = book.delete_bill(bill_id=id)
+        elif document_type == "voucher":
+            result = book.delete_voucher(voucher_id=id)
+        else:
+            result = book.delete_invoice(invoice_id=id)
+        result["type"] = document_type
         return _json(result)
 
     @mcp.tool()
@@ -955,7 +697,7 @@ def register(mcp, get_book) -> None:
         bookkeeper issues a credit note against an overcharge,
         then nets it against the next invoice from that customer
         (or applies it to an outstanding bill on the vendor side).
-        Use ``pay_invoice`` instead when the credit note will be
+        Use ``pay_document`` instead when the credit note will be
         settled by sending or receiving cash.
 
         Args:
@@ -963,7 +705,10 @@ def register(mcp, get_book) -> None:
                 posted).
             applies_to_invoice_id: The target invoice/bill (must
                 be posted, same owner, same currency, same A/R
-                or A/P post account).
+                or A/P post account). Need not be the document
+                the credit note was created against — that link
+                is provenance, and the response notes the
+                divergence when this target differs from it.
             amount: Decimal-string amount to apply, in the
                 document currency. Defaults to ``min(credit_note_
                 remaining, target_remaining)`` — apply as much
@@ -986,68 +731,59 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="credit_note")
-    def delete_credit_note(
-        id: str | None = None,
-        credit_note_id: str | None = None,
-        owner_type: str | None = None,
-    ) -> str:
-        """Delete an unposted credit note.
-
-        Validates the target is a credit note before deletion.
-        Posted credit notes cannot be deleted — unpost first via
-        ``unpost_invoice``, then delete.
-
-        Args:
-            id: Credit note ID. Preferred parameter name — matches
-                get_invoice / post_invoice / etc.
-            credit_note_id: Legacy alias for ``id``. Accepted for
-                back-compat; pass exactly one of ``id`` or
-                ``credit_note_id``.
-            owner_type: Optional "customer" or "vendor"
-                disambiguator for ID collisions.
-        """
-        resolved_id = _resolve_id_alias(id, credit_note_id, "credit_note_id")
-        owner_type = _gate_owner_type(owner_type)
-        book = get_book()
-        result = book.delete_credit_note(
-            credit_note_id=resolved_id,
-            owner_type=owner_type,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
     @audit_log(classification="read")
-    def list_invoices(
-        owner_type: str | None = None,
+    def list_documents(
+        document_type: DocumentType | None = None,
+        party_type: PartyType | None = None,
         status: str | None = None,
         verbose: bool = False,
         limit: int = 50,
         job_id: str | None = None,
         offset: int = 0,
     ) -> str:
-        """List invoices and/or vendor bills.
+        """List customer invoices, vendor bills, employee vouchers,
+        and credit notes.
 
         Leads with a ``Showing X-Y of Z invoices (date range)`` line,
         then a compact one-line-per-invoice format by default. Page with
         ``offset``; ``limit=0`` returns the count only. Use verbose=true
-        for full JSON with GUIDs, dates, notes, etc.
+        for structured JSON with GUIDs, dates, notes, etc.
+
+        Status vocabulary (shared by every invoice/bill tool):
+        **open** = created and editable, not yet booked to A/R//A/P —
+        not payable. **posted** = booked to A/R//A/P with a lot
+        tracking its balance — payable. **paid** = posted with a zero
+        remaining balance (lot closed). **outstanding** = posted with
+        a remaining balance — the unpaid subset; get it directly from
+        ``get_outstanding_documents`` rather than deriving it here.
+        The ``status`` filter below covers document state
+        (open/posted) only; settlement state lives on the lot.
 
         Args:
-            owner_type: Filter by type: "customer" for invoices,
-                        "vendor" for bills, or omit for all.
             status: Filter by status: "posted" or "open", or omit for all.
-            verbose: If true, return full JSON details.
+            document_type: Filter to one document kind
+                ("invoice", "bill", "voucher", "credit_note").
+                Omit for all.
+            party_type: Filter by owner side ("customer",
+                "vendor"). Omit for all.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             job_id: Filter to invoices grouped under a specific
                 job — useful for the "what's part of this
                 engagement?" listing pattern.
             offset: 0-indexed first row to return (default 0).
         """
+        owner_type = party_type if party_type else {
+            "invoice": "customer", "bill": "vendor",
+            "voucher": "employee",
+        }.get(_gate_document_type(document_type) if document_type else None)
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.list_invoices(
+            doc_type=document_type,
             owner_type=owner_type,
             status=status,
             compact=not verbose,
@@ -1062,22 +798,35 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def get_invoice(
+    def get_document(
         id: str,
-        owner_type: str | None = None,
+        document_type: DocumentType | None = None,
+        party_type: PartyType | None = None,
     ) -> str:
-        """Get full details for an invoice or bill, including line items.
+        """Get full details for a customer invoice, vendor bill,
+        employee voucher, or credit note, including line items.
 
-        Works for both customer invoices and vendor bills. Returns all
-        entries with quantities, prices, and totals.
+        Returns all entries with quantities, prices, and totals;
+        the response's ``type`` field names the document kind.
+
+        Status vocabulary: open = editable, not yet booked; posted =
+        on the books, payable; paid = remaining balance zero. The
+        full definitions live on ``list_documents``; the unpaid list
+        is ``get_outstanding_documents``.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001"). This is the
+            id: Document ID (e.g., "000001"). This is the
                 human-readable ID, not the internal GUID.
-            owner_type: Filter by type: "customer" for invoices,
-                        "vendor" for bills. Useful when an invoice and
-                        bill share the same ID (independent counters).
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide
+                across per-type counters.
+            party_type: Owner side ("customer"/"vendor") — needed
+                only for credit notes, which exist on both sides.
         """
+        owner_type = party_type if party_type else {
+            "invoice": "customer", "bill": "vendor",
+            "voucher": "employee",
+        }.get(_gate_document_type(document_type) if document_type else None)
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.get_invoice(invoice_id=id, owner_type=owner_type)
@@ -1086,16 +835,18 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="post", entity_type="invoice")
-    def post_invoice(
+    def post_document(
         id: str,
         post_account: str,
         post_date: str | None = None,
         due_date: str | None = None,
         description: str | None = None,
-        owner_type: str | None = None,
+        document_type: DocumentType | None = None,
+        party_type: PartyType | None = None,
         force: bool = False,
     ) -> str:
-        """Post a customer invoice or vendor bill.
+        """Post a customer invoice, vendor bill, employee voucher,
+        or credit note to A/R or A/P.
 
         Posting creates a transaction in the A/R or A/P account and makes
         the invoice official. Once posted, entries cannot be added.
@@ -1111,15 +862,21 @@ def register(mcp, get_book) -> None:
         beyond the 90-day staleness cap cannot be forced.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
+            id: Document ID (e.g., "000001").
             post_account: A/R or A/P account path (e.g., "Assets:Accounts Receivable").
             post_date: Date in ISO format (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction. Optional.
-            owner_type: "customer" or "vendor" for disambiguation when IDs collide.
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
             force: Override the stale-FX-rate guard and post with a
                 7–90 day stale rate. Default False.
         """
+        owner_type = party_type if party_type else {
+            "invoice": "customer", "bill": "vendor",
+            "voucher": "employee",
+        }.get(_gate_document_type(document_type) if document_type else None)
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.post_invoice(
@@ -1136,11 +893,14 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="unpost", entity_type="invoice")
-    def unpost_invoice(
+    def unpost_document(
         id: str,
-        owner_type: str | None = None,
+        document_type: DocumentType | None = None,
+        party_type: PartyType | None = None,
     ) -> str:
-        """Reverse a posted invoice or bill.
+        """Reverse a posted customer invoice, vendor bill, employee
+        voucher, or credit note (each keeps its type through the
+        round-trip).
 
         Deletes the posting transaction and lot, and clears the
         invoice's posted-state metadata. The invoice returns to
@@ -1149,10 +909,15 @@ def register(mcp, get_book) -> None:
         then unpost.
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
-            owner_type: "customer" or "vendor" for disambiguation
-                when IDs collide.
+            id: Document ID (e.g., "000001").
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
         """
+        owner_type = party_type if party_type else {
+            "invoice": "customer", "bill": "vendor",
+            "voucher": "employee",
+        }.get(_gate_document_type(document_type) if document_type else None)
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.unpost_invoice(
@@ -1164,23 +929,35 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="write", operation="pay", entity_type="invoice")
-    def pay_invoice(
+    def pay_document(
         id: str,
         payment_account: str,
         amount: str,
         payment_date: str | None = None,
         description: str | None = None,
-        owner_type: str | None = None,
+        document_type: DocumentType | None = None,
+        party_type: PartyType | None = None,
         fx_account: str | None = None,
         apply_discount: bool = False,
         discount_account: str | None = None,
         force: bool = False,
         memo: str = "",
+        dry_run: bool = False,
     ) -> str:
-        """Record a payment against a posted invoice or bill.
+        """Record a payment against a posted customer invoice,
+        vendor bill, employee voucher, or credit note.
 
         Creates a payment transaction from the specified bank/cash account
-        to the invoice's A/R or A/P account. Partial payments are supported.
+        to the document's A/R or A/P account. Partial payments are supported.
+
+        ``dry_run=true`` rehearses the payment without booking it:
+        the full validation, conversion, discount, and FX pipeline
+        runs and the response shows the proposed splits, the
+        remaining balance after, whether the invoice would settle in
+        full, and any account the real call would auto-create. Same
+        inputs, same code path — a rehearsal that succeeds is a
+        payment that will book. Recommended before complex payments
+        (cross-currency, discounts, credit-note refunds).
 
         For cross-currency payments where the rate moved between
         post-date and pay-date, a realized FX gain/loss split is
@@ -1208,12 +985,14 @@ def register(mcp, get_book) -> None:
         bill payments).
 
         Args:
-            id: Invoice or bill ID (e.g., "000001").
+            id: Document ID (e.g., "000001").
             payment_account: Bank or cash account for payment (e.g., "Assets:Checking").
             amount: Payment amount as decimal string (e.g., "500.00").
             payment_date: Payment date (YYYY-MM-DD). Defaults to today.
             description: Description for the payment transaction. Optional.
-            owner_type: "customer" or "vendor" for disambiguation.
+            document_type: "invoice", "bill", "voucher", or
+                "credit_note" — disambiguates when IDs collide.
+            party_type: Owner side, credit notes only.
             fx_account: Optional INCOME or EXPENSE account to receive
                 realized FX gain/loss (cross-currency payments only).
                 Accepts a full path, %short GUID, or full 32-char GUID.
@@ -1236,7 +1015,20 @@ def register(mcp, get_book) -> None:
                 check number or wire reference). ``description``
                 names the whole transaction; ``memo`` annotates the
                 cash movement.
+            dry_run: When True, rehearse without writing — returns
+                the proposed splits and projected outcome instead of
+                booking. Default False.
+
+        Returns:
+            ``status`` is ``"paid"`` when the document settles to
+            zero, ``"partial"`` when a balance remains, and
+            ``"would_pay"`` on dry runs — plus the amount paid,
+            remaining balance, and transaction reference.
         """
+        owner_type = party_type if party_type else {
+            "invoice": "customer", "bill": "vendor",
+            "voucher": "employee",
+        }.get(_gate_document_type(document_type) if document_type else None)
         owner_type = _gate_owner_type(owner_type)
         book = get_book()
         result = book.pay_invoice(
@@ -1251,114 +1043,9 @@ def register(mcp, get_book) -> None:
             discount_account=discount_account,
             force=force,
             memo=memo,
+            dry_run=dry_run,
         )
         return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="invoice")
-    def delete_invoice(
-        id: str | None = None,
-        invoice_id: str | None = None,
-    ) -> str:
-        """Delete an unposted customer invoice.
-
-        Automatically removes associated entries (line items). Posted invoices
-        cannot be deleted — void them or issue a credit note instead.
-
-        Args:
-            id: Invoice ID (e.g., "000001" or "INV-2026-001").
-                Preferred parameter name — matches get_invoice /
-                post_invoice / etc.
-            invoice_id: Legacy alias for ``id``. Accepted for
-                back-compat; pass exactly one of ``id`` or
-                ``invoice_id``.
-        """
-        resolved_id = _resolve_id_alias(id, invoice_id, "invoice_id")
-        book = get_book()
-        result = book.delete_invoice(invoice_id=resolved_id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="bill")
-    def delete_bill(
-        id: str | None = None,
-        bill_id: str | None = None,
-    ) -> str:
-        """Delete an unposted vendor bill.
-
-        Automatically removes associated entries (line items). Posted bills
-        cannot be deleted — void them or issue a credit note instead.
-
-        Args:
-            id: Bill ID (e.g., "000001" or "BILL-2026-001").
-                Preferred parameter name — matches get_invoice /
-                post_invoice / etc.
-            bill_id: Legacy alias for ``id``. Accepted for
-                back-compat; pass exactly one of ``id`` or
-                ``bill_id``.
-        """
-        resolved_id = _resolve_id_alias(id, bill_id, "bill_id")
-        book = get_book()
-        result = book.delete_bill(bill_id=resolved_id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="customer")
-    def delete_customer(customer_id: str) -> str:
-        """Delete a customer with no invoices.
-
-        Customers with any invoices (posted or unposted) cannot be deleted.
-        Delete the invoices first, then delete the customer.
-
-        Args:
-            customer_id: Customer ID (e.g., "000001").
-        """
-        book = get_book()
-        result = book.delete_customer(customer_id=customer_id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="vendor")
-    def delete_vendor(vendor_id: str) -> str:
-        """Delete a vendor with no bills.
-
-        Vendors with any bills (posted or unposted) cannot be deleted.
-        Delete the bills first, then delete the vendor.
-
-        Args:
-            vendor_id: Vendor ID (e.g., "000001").
-        """
-        book = get_book()
-        result = book.delete_vendor(vendor_id=vendor_id)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="delete", entity_type="employee")
-    def delete_employee(employee_id: str) -> str:
-        """Delete an employee.
-
-        Employees in the 1.3.0 release have no associated documents;
-        the delete proceeds unconditionally after slot cleanup.
-
-        Args:
-            employee_id: Employee ID (e.g., "000001").
-        """
-        book = get_book()
-        result = book.delete_employee(employee_id=employee_id)
-        return _json(result)
-
-    # ── Job CRUD tools ───────────────────────────────────────
-    #
-    # Jobs are project-level grouping over invoices/bills for a
-    # single customer or vendor. The financial lifecycle stays
-    # on the linked invoices; the job itself only has
-    # ``active``/``inactive`` state. See create_invoice and
-    # create_bill for how to link a new invoice to a job.
 
     @mcp.tool()
     @safe_tool
@@ -1400,6 +1087,7 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def list_jobs(
+        id: str | None = None,
         owner_type: str | None = None,
         owner_id: str | None = None,
         active_only: bool = True,
@@ -1412,19 +1100,29 @@ def register(mcp, get_book) -> None:
         Leads with a ``Showing X-Y of Z jobs`` line; page with
         ``offset``, or pass ``limit=0`` for the count only.
 
+        Pass ``id`` for one job's full details (name, owner,
+        active state, linked invoice/bill IDs) — the exact-lookup
+        mode that replaced ``get_job``.
+
         Args:
+            id: Job ID for a single-job detail lookup (e.g.,
+                "000001"). All other filters are ignored.
             owner_type: Filter by "customer" or "vendor". Omit
                 for all.
             owner_id: Filter by specific customer or vendor ID
                 (requires owner_type).
             active_only: If True (default), exclude inactive jobs.
-            verbose: If True, return full JSON dicts; otherwise
-                compact tab-separated rows.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = _gate_owner_type(owner_type)
         book = get_book()
+        if id is not None:
+            return _json(book.get_job(job_id=id))
+        owner_type = _gate_owner_type(owner_type)
         result = book.list_jobs(
             owner_type=owner_type,
             owner_id=owner_id,
@@ -1441,22 +1139,6 @@ def register(mcp, get_book) -> None:
         if verbose:
             return _json(result)
         return result
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def get_job(job_id: str) -> str:
-        """Get a job's details by ID.
-
-        Returns name, owner, active state, plus a count + IDs
-        list of every invoice/bill linked to the job.
-
-        Args:
-            job_id: Job ID (e.g., "000001").
-        """
-        book = get_book()
-        result = book.get_job(job_id=job_id)
-        return _json(result)
 
     @mcp.tool()
     @safe_tool
@@ -1537,15 +1219,21 @@ def register(mcp, get_book) -> None:
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
-    def get_outstanding_invoices(
-        owner_type: str | None = None,
+    def get_outstanding_documents(
+        party_type: PartyType | None = None,
         customer_id: str | None = None,
         vendor_id: str | None = None,
         verbose: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> str:
-        """Get all posted invoices/bills with outstanding balances.
+        """Get all posted customer invoices, vendor bills, employee
+        vouchers, and credit notes with outstanding balances.
+
+        This is the authoritative unpaid list: outstanding = posted
+        with a remaining balance > 0. One call answers "what is
+        actually unpaid?" — no need to combine ``list_documents`` and
+        ``get_document`` (full status vocabulary on ``list_documents``).
 
         Leads with a ``Showing X-Y of Z invoices (date range)`` line,
         then a compact one-line-per-doc format by default with action
@@ -1554,19 +1242,22 @@ def register(mcp, get_book) -> None:
         items at the top. Page with ``offset``; ``limit=0`` returns the
         count only.
 
-        Use verbose=true for full JSON with ``original_amount`` /
+        Use verbose=true for structured JSON with ``original_amount`` /
         ``amount_paid`` / ``amount_due`` breakdown — the shape
-        ``pay_invoice`` workflows expect.
+        ``pay_document`` workflows expect.
 
         Args:
-            owner_type: Filter by "customer" or "vendor". Omit for all.
+            party_type: Filter by "customer" or "vendor". Omit for all.
             customer_id: Filter by specific customer ID.
             vendor_id: Filter by specific vendor ID.
-            verbose: If true, return full JSON details.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
         """
-        owner_type = _gate_owner_type(owner_type)
+        owner_type = _gate_owner_type(party_type)
         # When Business isn't loaded, vendor_id is also a vendor-only
         # surface — reject it the same way an explicit
         # owner_type='vendor' is rejected. _gate_owner_type already
@@ -1613,13 +1304,16 @@ def register(mcp, get_book) -> None:
         and outstanding amounts per vendor.
 
         Returns a compact aligned text table by default. Use verbose=true
-        for the full structured dict (programmatic consumers).
+        for the structured dict (programmatic consumers).
 
         Args:
             start_date: Start of period (YYYY-MM-DD).
             end_date: End of period (YYYY-MM-DD).
             vendor_id: Optional filter to a specific vendor.
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             group_by: Optional "month", "quarter", or "year" — split the
                 range into sub-period columns of total billed per vendor
                 and return a multi-period TSV table. Overrides verbose.

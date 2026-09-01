@@ -15,12 +15,13 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import piecash
 
 from gnucash_mcp.book._base import (
+    _commodity_quantum,
     _slot_value_str,
     _to_decimal,
     _unique_prefix,
@@ -40,18 +41,22 @@ from gnucash_mcp._format import (
 debug_logger = logging.getLogger("gnucash_mcp.debug")
 
 
-def _commodity_quantum(commodity) -> Decimal:
-    """Smallest representable unit of a commodity, as a Decimal quantum.
+class _PlannedAccount:
+    """Stand-in for an account a rehearsal WOULD create.
 
-    Derived from ``commodity.fraction`` (piecash stores 100 for USD,
-    1 for JPY, 1000 for BHD, 10000 for shares). A hardcoded
-    ``Decimal("0.01")`` would silently corrupt non-2-decimal
-    currencies — half-yen amounts on JPY, lost mils on BHD/KWD.
+    The FX/discount resolvers auto-create their canonical account on
+    first use; a ``pay_invoice`` dry run must not (no piecash objects
+    during dry_run — the batch precedent). Carries exactly what the
+    rehearsal path reads; ``planned`` lets the response mark it.
     """
-    fraction = getattr(commodity, "fraction", 100)
-    if fraction <= 1:
-        return Decimal(1)
-    return Decimal(1) / Decimal(fraction)
+
+    placeholder = False
+    planned = True
+
+    def __init__(self, fullname: str, commodity, type: str):
+        self.fullname = fullname
+        self.commodity = commodity
+        self.type = type
 
 
 def _safe_invoice_date(inv, attr: str):
@@ -418,12 +423,20 @@ class BusinessMixin:
             account.guid = uuid.uuid4().hex
         book.root_account[slot_key] = account.guid
 
-    def _get_or_create_fx_account(self, book, fx_account: str | None = None):
+    def _get_or_create_fx_account(
+        self, book, fx_account: str | None = None,
+        dry_run: bool = False,
+    ):
         """Find or lazily create the FX-gain/loss account.
 
         Returns ``(account, notice)``; ``notice`` is ``None`` except
         when the fuzzy match found multiple candidates and fell back
         to the canonical default.
+
+        ``dry_run=True`` resolves without side effects: no account
+        construction (a would-be create returns a
+        ``_PlannedAccount``) and no designation-slot writes (the
+        self-heal happens on the real run instead).
 
         Resolution order:
 
@@ -548,7 +561,7 @@ class BusinessMixin:
             # book's machinery generates is the resolver re-finding
             # its own account — designate it so the next call hits
             # Layer 0 and the healed slot survives renames.
-            if only.name.lower() in own_fx_leaves:
+            if only.name.lower() in own_fx_leaves and not dry_run:
                 self._store_designated_account(
                     book, self._FX_ACCOUNT_SLOT_KEY, only
                 )
@@ -593,10 +606,35 @@ class BusinessMixin:
         ):
             # Lock in the designation so the next call hits Layer 0
             # directly — even on a book that already had this account.
-            self._store_designated_account(
-                book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
-            )
+            if not dry_run:
+                self._store_designated_account(
+                    book, self._FX_ACCOUNT_SLOT_KEY, fx_acct
+                )
             return fx_acct, _ambiguity_notice(fx_acct.fullname)
+
+        # Past this point the resolver CREATES — same fail-safe rule
+        # as the discount resolver (ruling 4(b)), with one deliberate
+        # difference: a DETERMINED foreign locale still creates,
+        # because every vote-determinable locale ships an fx_gain_loss
+        # translation (§6.3) and gets its own-language leaf. The hole
+        # is the UNDETERMINED chart (DATEV/SKR03 numbered top-levels
+        # infer None) — there the English fallback leaf would land in
+        # a non-English ledger and be permanently designated. None
+        # means undetermined, not English: require the affirmative
+        # read before creating in English.
+        locale = self._infer_book_locale(book)
+        if locale is None and not self._book_reads_english(book):
+            raise ValueError(
+                f"No realized FX gain/loss account is designated on "
+                f"this book, and auto-creating the English default "
+                f"({self.FX_GAIN_LOSS_PATH!r}) is unsafe: the chart "
+                f"does not affirmatively read as English (locale "
+                f"undetermined — numbered or custom top-level "
+                f"account names). Pass fx_account with the account "
+                f"that should absorb realized FX gain/loss (a "
+                f"non-placeholder INCOME or EXPENSE account "
+                f"denominated in the book default currency)."
+            )
 
         # Resolve the parent by TYPE, not the English name "Income".
         # On a localized book the income root is "Erträge"/"Ingresos"/…,
@@ -607,7 +645,8 @@ class BusinessMixin:
         income, parent_notice = self._top_level_account_of_type(
             book, "INCOME"
         )
-        if income is None:
+        income_fullname = income.fullname if income is not None else "Income"
+        if income is None and not dry_run:
             income = piecash.Account(
                 name="Income",
                 type="INCOME",
@@ -631,7 +670,7 @@ class BusinessMixin:
         # identically — a permanently wedged cross-currency pay path.
         existing = next(
             (c for c in income.children if c.name == fx_leaf), None
-        )
+        ) if income is not None else None
         if existing is not None:
             if (
                 existing.type in {"INCOME", "EXPENSE"}
@@ -639,9 +678,10 @@ class BusinessMixin:
                 and not existing.placeholder
                 and existing.guid not in template_guids
             ):
-                self._store_designated_account(
-                    book, self._FX_ACCOUNT_SLOT_KEY, existing
-                )
+                if not dry_run:
+                    self._store_designated_account(
+                        book, self._FX_ACCOUNT_SLOT_KEY, existing
+                    )
                 adopted_notice = _ambiguity_notice(existing.fullname)
                 return existing, (
                     adopted_notice if adopted_notice is not None
@@ -658,6 +698,15 @@ class BusinessMixin:
                 f"{default_currency.mnemonic}). Pass fx_account "
                 f"explicitly to choose a different account."
             )
+
+        # Rehearsal: report the planned account instead of creating.
+        if dry_run:
+            planned = _PlannedAccount(
+                f"{income_fullname}:{fx_leaf}",
+                default_currency, "INCOME",
+            )
+            notice = _ambiguity_notice(planned.fullname)
+            return planned, notice if notice is not None else parent_notice
 
         # Construct — piecash.Account auto-adds to the session via the
         # parent linkage. Don't flush here: the caller is still building
@@ -685,13 +734,16 @@ class BusinessMixin:
     def _get_or_create_discount_account(
         self, book, owner_type_is_bill: bool,
         discount_account: str | None = None,
+        dry_run: bool = False,
     ):
         """Find or lazily create the early-payment-discount account.
 
         Direct parallel to ``_get_or_create_fx_account`` — same
         four-layer resolution (stored designation > explicit > fuzzy
-        match > canonical default with auto-create) and the same
-        ``(account, notice)`` return shape. The Layer-0 slot is
+        match > canonical default with auto-create), the same
+        ``(account, notice)`` return shape, and the same
+        ``dry_run`` contract (no creates, no slot writes; a would-be
+        create returns a ``_PlannedAccount``). The Layer-0 slot is
         per-side, so the sales and purchase designations are
         independent.
 
@@ -798,8 +850,44 @@ class BusinessMixin:
             and disc_acct.type in {"INCOME", "EXPENSE"}
             and not disc_acct.placeholder
         ):
-            self._store_designated_account(book, slot_key, disc_acct)
+            if not dry_run:
+                self._store_designated_account(book, slot_key, disc_acct)
             return disc_acct, _ambiguity_notice(disc_acct.fullname)
+
+        # Battery ruling 4(b): past this point the resolver CREATES.
+        # On a non-English book, silently creating the English
+        # default misstates the ledger twice over — an English leaf
+        # in a localized chart, and (on the sales side) an EXPENSE
+        # account where the textbook treatment is contra-revenue.
+        # The gate requires an AFFIRMATIVE English read (the
+        # bookkeeper's Sabine repro, 2026-09-01): a DATEV-numbered German chart infers
+        # locale None, and None means undetermined, not English — so
+        # provably-foreign and can't-tell both refuse; only a chart
+        # that matches the English structural names creates. Existing
+        # accounts remain adoptable through the explicit/slot/fuzzy/
+        # canonical layers above. Ruling 4(a) — resolve the default
+        # by ROLE — is the destination that lifts this refusal.
+        locale = self._infer_book_locale(book)
+        if locale != "en" and not (
+            locale is None and self._book_reads_english(book)
+        ):
+            chart_reads = (
+                f"reads as locale {locale!r}"
+                if locale is not None
+                else "does not affirmatively read as English "
+                     "(locale undetermined — numbered or custom "
+                     "top-level account names)"
+            )
+            raise ValueError(
+                f"No {side_label} account is designated on this "
+                f"book, and auto-creating the English default "
+                f"({canonical_path!r}) could misstate a localized "
+                f"ledger: the chart {chart_reads}. Pass "
+                f"discount_account with the account that should "
+                f"absorb the discount (path, %short GUID, or full "
+                f"32-char GUID of a non-placeholder INCOME or "
+                f"EXPENSE account)."
+            )
 
         # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
         # name "Income"/"Expenses" — locale-robust and rename-proof.
@@ -809,7 +897,11 @@ class BusinessMixin:
             book, canonical_type
         )
         default_currency = self._require_default_currency(book)
-        if parent is None:
+        parent_fullname = (
+            parent.fullname if parent is not None
+            else canonical_parent_path
+        )
+        if parent is None and not dry_run:
             parent = piecash.Account(
                 name=canonical_parent_path,
                 type=canonical_type,
@@ -837,14 +929,17 @@ class BusinessMixin:
         # ship.
         existing = next(
             (c for c in parent.children if c.name == leaf_name), None
-        )
+        ) if parent is not None else None
         if existing is not None:
             if (
                 existing.type in {"INCOME", "EXPENSE"}
                 and not existing.placeholder
                 and existing.guid not in template_guids
             ):
-                self._store_designated_account(book, slot_key, existing)
+                if not dry_run:
+                    self._store_designated_account(
+                        book, slot_key, existing
+                    )
                 adopted_notice = _ambiguity_notice(existing.fullname)
                 return existing, (
                     adopted_notice if adopted_notice is not None
@@ -858,6 +953,17 @@ class BusinessMixin:
                 f"INCOME or EXPENSE account. Pass discount_account "
                 f"explicitly to choose a different account."
             )
+        # Rehearsal: report the planned account instead of creating.
+        if dry_run:
+            planned = _PlannedAccount(
+                f"{parent_fullname}:{leaf_name}",
+                default_currency, canonical_type,
+            )
+            notice = _ambiguity_notice(planned.fullname)
+            return planned, (
+                notice if notice is not None else parent_notice
+            )
+
         disc_acct = piecash.Account(
             name=leaf_name,
             type=canonical_type,
@@ -865,7 +971,7 @@ class BusinessMixin:
             commodity=default_currency,
             description=(
                 f"Early-payment discounts {'taken on supplier bills' if owner_type_is_bill else 'given to customers'}, "
-                f"booked when pay_invoice is called with "
+                f"booked when pay_document is called with "
                 f"apply_discount=True and the term + window + amount "
                 f"validation passes. Auto-created on first use."
             ),
@@ -1001,8 +1107,14 @@ class BusinessMixin:
         discount_amount: Decimal = Decimal("0"),
         discount_quantity: Decimal | None = None,
         discount_commodity=None,
+        dry_run: bool = False,
     ) -> dict | None:
         """Compute the realized FX gain/loss for a cross-currency payment.
+
+        ``dry_run=True`` computes identically but constructs no Split
+        (``"split"`` is None) and resolves the FX account without
+        side effects; ``"quantity"`` / ``"memo"`` carry what the
+        split would hold, for rehearsal rendering.
 
         When ``pay_invoice`` settles a foreign-currency invoice and
         the rate moved between post-date and pay-date, the amount
@@ -1149,7 +1261,7 @@ class BusinessMixin:
             return None
 
         fx_acct, fx_notice = self._get_or_create_fx_account(
-            book, fx_account=fx_account,
+            book, fx_account=fx_account, dry_run=dry_run,
         )
 
         # Customer (is_bill=False): received more → gain → credit
@@ -1161,21 +1273,28 @@ class BusinessMixin:
             (is_bill and fx_diff_default > 0)
             or (not is_bill and fx_diff_default < 0)
         )
-        split = piecash.Split(
-            account=fx_acct,
-            value=Decimal("0"),
-            quantity=quantity_sign * fx_diff_default,
-            memo=(
-                f"FX {'loss' if is_loss else 'gain'} on invoice "
-                f"{inv.id}: post-rate {rate_at_post:.4f}, pay-rate "
-                f"{exchange_rate}"
-            ),
+        fx_quantity = quantity_sign * fx_diff_default
+        fx_memo = (
+            f"FX {'loss' if is_loss else 'gain'} on invoice "
+            f"{inv.id}: post-rate {rate_at_post:.4f}, pay-rate "
+            f"{exchange_rate}"
         )
+        split = None
+        if not dry_run:
+            split = piecash.Split(
+                account=fx_acct,
+                value=Decimal("0"),
+                quantity=fx_quantity,
+                memo=fx_memo,
+                action="Payment",
+            )
         return {
             "split": split,
             "fx_diff_default": fx_diff_default,
             "fx_acct": fx_acct,
             "fx_notice": fx_notice,
+            "quantity": fx_quantity,
+            "memo": fx_memo,
         }
 
     @staticmethod
@@ -1624,6 +1743,10 @@ class BusinessMixin:
         # ``applies_to`` further requires the link to be set —
         # floating credit notes are unusual but valid.
         if BusinessMixin._get_is_credit_note(invoice):
+            # ``type`` must agree with the delete/unpost responses,
+            # which already report credit notes as their own type —
+            # owner_type alone can't see the slot.
+            result["type"] = "credit_note"
             result["is_credit_note"] = True
             if applies_to:
                 result["applies_to"] = applies_to
@@ -4084,7 +4207,7 @@ class BusinessMixin:
             # surface the same constraint on lookup.
             raise ValueError(
                 "Credit notes are not supported for employees. "
-                "Use unpost_invoice + edit on the original voucher "
+                "Use unpost_document + edit on the original voucher "
                 "to amend an employee reimbursement."
             )
         inv = self._find_invoice(
@@ -4098,26 +4221,15 @@ class BusinessMixin:
             # Regular invoice/bill/voucher with this ID: name the
             # right tool so the LLM course-corrects in one hop.
             # Three-way — a binary branch would misname voucher tools.
-            _ENTRY_TOOLS = {
-                2: "add_invoice_entry",
-                4: "add_bill_entry",
-                5: "add_voucher_entry",
+            _DOC_TYPES = {
+                2: "invoice", 4: "bill", 5: "voucher",
             }
-            _DELETE_TOOLS = {
-                2: "delete_invoice",
-                4: "delete_bill",
-                5: "delete_voucher",
-            }
-            entry_tool = _ENTRY_TOOLS.get(
-                inv.owner_type, "add_invoice_entry",
-            )
-            delete_tool = _DELETE_TOOLS.get(
-                inv.owner_type, "delete_invoice",
-            )
+            doc_type = _DOC_TYPES.get(inv.owner_type, "invoice")
             raise ValueError(
                 f"{self._doc_label_for(inv.owner_type)} "
                 f"{credit_note_id} is not a credit note. Use "
-                f"{entry_tool} / {delete_tool} for the regular "
+                f"add_document_entry / delete_document with "
+                f"document_type='{doc_type}' for the regular "
                 f"document, or check the ID."
             )
         return inv
@@ -4153,7 +4265,7 @@ class BusinessMixin:
 
         **Employees excluded**: GnuCash desktop has no UI for
         employee credit notes; creating them here would produce
-        documents the desktop can't view. Use ``unpost_invoice`` +
+        documents the desktop can't view. Use ``unpost_document`` +
         edit instead.
 
         Args:
@@ -4178,7 +4290,7 @@ class BusinessMixin:
                 "GnuCash desktop has no UI for employee credit "
                 "notes; supporting them at the MCP layer would "
                 "create documents desktop users can't view or "
-                "edit. Use unpost_invoice + edit on the original "
+                "edit. Use unpost_document + edit on the original "
                 "voucher to amend an employee reimbursement."
             )
         if int_owner_type not in (2, 4):
@@ -4218,7 +4330,12 @@ class BusinessMixin:
                         f"dangling owner reference — can't verify "
                         f"it belongs to {owner_id}."
                     )
-                if source_owner.id != owner_id:
+                # Compare effective type AND id — ids alone are
+                # per-type sequences, so customer 000005 vs vendor
+                # 000005 would false-pass an id-only check.
+                if (self._effective_owner_type(book, source)
+                        != int_owner_type
+                        or source_owner.id != owner_id):
                     raise ValueError(
                         f"Source "
                         f"{self._doc_label_for(int_owner_type).lower()} "
@@ -4343,7 +4460,7 @@ class BusinessMixin:
 
         Validates the target IS a credit note, then delegates to
         ``_delete_invoice_or_bill``. Posted credit notes must be
-        unposted first via ``unpost_invoice``.
+        unposted first via ``unpost_document``.
 
         Raises:
             ValueError: not found, not a credit note, or posted.
@@ -4368,7 +4485,7 @@ class BusinessMixin:
         2: {  # customer invoice
             "label": "Invoice",
             "id_param": "invoice_id",
-            "twin_method": "add_bill_entry",
+            "twin_method": "add_document_entry with document_type='bill'",
             "twin_label": "vendor bill",
             "allowed_types": frozenset({"INCOME"}),
             "type_error_msg": (
@@ -4381,7 +4498,7 @@ class BusinessMixin:
         4: {  # vendor bill
             "label": "Bill",
             "id_param": "bill_id",
-            "twin_method": "add_invoice_entry",
+            "twin_method": "add_document_entry with document_type='invoice'",
             "twin_label": "customer invoice",
             "allowed_types": frozenset({"EXPENSE", "ASSET"}),
             "type_error_msg": (
@@ -4399,7 +4516,7 @@ class BusinessMixin:
             # row distinguishes them.
             "label": "Voucher",
             "id_param": "voucher_id",
-            "twin_method": "add_invoice_entry",
+            "twin_method": "add_document_entry with document_type='invoice'",
             "twin_label": "customer invoice",
             "allowed_types": frozenset({"EXPENSE", "ASSET"}),
             "type_error_msg": (
@@ -4548,10 +4665,26 @@ class BusinessMixin:
                     b_taxable=0, b_taxincluded=0, b_taxtable=None,
                 )
 
+            # Entry date follows the DOCUMENT's opened date, not the
+            # wall clock — GnuCash desktop's default, and what a
+            # backdated invoice's lines should carry. Anchored at
+            # GnuCash's neutral time (10:59) as an explicit-UTC
+            # datetime so piecash's _DateTime local→UTC conversion
+            # is a no-op: a naive local timestamp here stored as
+            # next-day UTC for evening-western users (battery bug 4
+            # — every entry dated tomorrow) and prior-day for
+            # eastern ones. date_entered stays a true "when was
+            # this typed" timestamp.
+            opened_dt = _safe_invoice_date(inv, "date_opened")
+            entry_date = datetime.combine(
+                opened_dt.date() if opened_dt else date.today(),
+                time(10, 59),
+                tzinfo=timezone.utc,
+            )
             book.session.execute(
                 Entry.__table__.insert().values(
                     guid=entry_guid,
-                    date=datetime.now(),
+                    date=entry_date,
                     date_entered=datetime.now(),
                     description=description,
                     action=action,
@@ -4726,6 +4859,7 @@ class BusinessMixin:
         limit: int | None = None,
         job_id: str | None = None,
         offset: int = 0,
+        doc_type: str | None = None,
     ) -> dict | str:
         """List invoices and/or bills.
 
@@ -4777,17 +4911,38 @@ class BusinessMixin:
 
             invoices = query.order_by(Invoice.date_opened.desc()).all()
 
+            # Document-kind filter (consolidated surface): resolved
+            # per row — credit notes are a slot flag, not a column,
+            # and vouchers are the employee owner side.
+            if doc_type is not None:
+                def _kind(inv) -> str:
+                    eot = self._effective_owner_type(book, inv)
+                    if self._get_is_credit_note(inv):
+                        return "credit_note"
+                    if eot == 5:
+                        return "voucher"
+                    return "bill" if eot == 4 else "invoice"
+                invoices = [i for i in invoices if _kind(i) == doc_type]
+
             if status == "posted":
                 invoices = [i for i in invoices if _is_invoice_posted(i)]
             elif status == "open":
                 invoices = [i for i in invoices if not _is_invoice_posted(i)]
 
             total = len(invoices)
+            # The indicator noun follows the doc_type filter — a
+            # voucher listing saying "0 of 0 invoices" reads as the
+            # wrong tool answering (bookkeeper-pass finding,
+            # 2026-08-30). Unfiltered listings span all four kinds,
+            # so the generic noun is the honest one there.
+            entity_noun = (
+                f"{doc_type}s" if doc_type is not None else "documents"
+            )
             page, indicator = _paginate(
                 invoices,
                 offset=offset,
                 limit=limit,
-                entity_name="invoices",
+                entity_name=entity_noun,
                 date_key=lambda i: i.date_opened,
             )
             invoices = page
@@ -5146,7 +5301,8 @@ class BusinessMixin:
             post_date: ISO date (YYYY-MM-DD). Defaults to today.
             due_date: Payment due date (YYYY-MM-DD). Optional.
             description: Description for the posting transaction.
-            owner_type: 'customer' or 'vendor' for disambiguation.
+            owner_type: 'customer', 'vendor', or 'employee' (vouchers)
+                for disambiguation.
 
         Returns:
             Dict with invoice details, total, transaction_guid, lot_guid.
@@ -5174,6 +5330,7 @@ class BusinessMixin:
             # owner_type, infer it from the post account's type:
             # RECEIVABLE → customer invoice, PAYABLE → vendor bill
             # (the same predicate the later validation uses).
+            inferred = False
             if ot is None:
                 pa = self._resolve_account(book, post_account)
                 if pa is not None:
@@ -5181,11 +5338,21 @@ class BusinessMixin:
                         ot = 2
                     elif pa.type == "PAYABLE":
                         ot = 4
+                        inferred = True
 
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
+            if not inv and inferred:
+                # PAYABLE inference can't distinguish vendor bills
+                # from employee vouchers — both post to A/P. Retry
+                # the voucher side before declaring not-found (an
+                # EXPLICIT owner_type never falls through here).
+                inv = self._find_invoice(book, invoice_id, owner_type=5)
             if not inv:
                 raise ValueError(
-                    f"Document not found: {invoice_id}"
+                    f"Document not found: {invoice_id}. If the ID "
+                    f"is shared across document types, pass "
+                    f"owner_type ('customer', 'vendor', or "
+                    f"'employee' for vouchers) explicitly."
                 )
 
             # ``_is_invoice_posted`` treats None/"" as not-posted —
@@ -5208,6 +5375,29 @@ class BusinessMixin:
                 raise ValueError(
                     f"Post account must be {expected_type}, "
                     f"got {post_acct.type}"
+                )
+
+            # Battery ruling 1 (sunset shipped v1.5.0): a receivable
+            # held in a different commodity than its document freezes
+            # the balance at post-date FX and drifts from the
+            # document's true value every day after. This was a
+            # warning through v1.4.4; desktop GnuCash refuses the
+            # pairing outright, and so do we now. Historical
+            # mismatched postings from the warning era still exist in
+            # real books — downstream guards (apply_credit_note,
+            # pay_invoice FX settlement) keep handling those.
+            if inv.currency_guid != post_acct.commodity.guid:
+                side = "A/P" if is_bill else "A/R"
+                raise ValueError(
+                    f"Cannot post a {inv.currency.mnemonic} document "
+                    f"to {post_acct.commodity.mnemonic}-denominated "
+                    f"{post_acct.fullname!r}: the "
+                    f"{side} balance would freeze at post-date FX "
+                    f"and drift from the document's true value. "
+                    f"Correct practice is one {side} account per "
+                    f"document currency — post to (or create) a "
+                    f"{inv.currency.mnemonic}-denominated "
+                    f"{side} account instead."
                 )
 
             totals = self._get_invoice_entries_and_total(book, inv)
@@ -5280,12 +5470,21 @@ class BusinessMixin:
                 ar_ap_value = -grand_total
             else:
                 ar_ap_value = grand_total
+            # Desktop vocabulary on EVERY leg ("Invoice" / "Credit
+            # Note"), not just A/R: a leg left with action="" gets
+            # auto-stamped "Buy"/"Sell" by piecash when its account
+            # commodity differs from the transaction currency —
+            # brokerage vocabulary on a client bill. Forward-only:
+            # existing transactions are never rewritten to conform.
+            doc_action = (
+                "Credit Note" if is_credit_note else "Invoice"
+            )
             ar_ap_split = piecash.Split(
                 account=post_acct,
                 value=ar_ap_value,
                 quantity=_qty_for_split(post_acct, ar_ap_value),
                 memo="",
-                action="Invoice",
+                action=doc_action,
                 reconcile_date=datetime(1970, 1, 1),
             )
             piecash_splits.append(ar_ap_split)
@@ -5310,6 +5509,7 @@ class BusinessMixin:
                         value=split_value,
                         quantity=_qty_for_split(entry_acct, split_value),
                         memo="",
+                        action=doc_action,
                     )
                 )
 
@@ -5386,7 +5586,6 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
-
         return result
 
     def unpost_invoice(
@@ -5394,7 +5593,8 @@ class BusinessMixin:
         invoice_id: str,
         owner_type: str | None = None,
     ) -> dict:
-        """Unpost a previously-posted invoice or bill.
+        """Unpost a previously-posted document (invoice, bill,
+        voucher, or credit note).
 
         Reverses ``post_invoice``: deletes the posting transaction
         and lot, clears the posted-state metadata. The document
@@ -5500,6 +5700,7 @@ class BusinessMixin:
             is_credit_note = self._get_is_credit_note(inv)
             inv_id_snapshot = inv.id
             owner_type_snapshot = inv.owner_type
+            inv_guid_snapshot = inv.guid
 
             # The transaction delete cascades its splits; the lot is
             # empty now that the posted-state pointers are cleared.
@@ -5507,6 +5708,38 @@ class BusinessMixin:
                 book.session.delete(txn)
             if lot is not None:
                 book.session.delete(lot)
+
+            if is_credit_note:
+                # Deleting the posting transaction sweeps the
+                # invoice's OWN slots along with the txn's: the
+                # txn carries a ``gncInvoice`` GUID slot, and
+                # piecash's overlapping slot-hierarchy relationship
+                # treats every slot on the referenced invoice as
+                # that slot's child frame, cascading them away.
+                # Restore the identity flag or this document comes
+                # back from unpost as a plain invoice.
+                # Core-table insert + the _verify_* chokepoint —
+                # the same idiom as the applies-to slot writes
+                # above. This site once used text() DML with a
+                # hand-rolled COUNT check, which the
+                # TestWriteVerificationCoverage scanner could not
+                # see (release-review finding 10).
+                from piecash.kvp import KVP_Type, Slot
+                book.flush()
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=inv_guid_snapshot,
+                        name="credit-note",
+                        slot_type=KVP_Type.KVP_TYPE_GINT64,
+                        int64_val=1,
+                    )
+                )
+                _verify_composite_write(
+                    book.session, Slot.__table__,
+                    {"obj_guid": inv_guid_snapshot,
+                     "name": "credit-note"},
+                    "credit-note flag restore",
+                )
 
             book.save()
 
@@ -5535,11 +5768,22 @@ class BusinessMixin:
         discount_account: str | None = None,
         force: bool = False,
         memo: str = "",
+        dry_run: bool = False,
     ) -> dict:
         """Record a payment against a posted invoice or bill.
 
         Creates a payment transaction and assigns the A/R or A/P
         split to the invoice's lot. Partial payments are supported.
+
+        ``dry_run=True`` is a full rehearsal: every validation,
+        conversion, discount precondition, and FX computation runs
+        identically (readonly session, nothing persists, no piecash
+        objects constructed), returning the proposed splits,
+        remaining balance after, and any FX/discount treatment. An
+        account the real run would auto-create (FX gain/loss,
+        discounts) is reported under ``would_create_accounts``
+        rather than created. A dry run that succeeds is a payment
+        that will book — same inputs, same code path.
 
         ``memo`` lands on the bank-account split (check number, wire
         reference). The A/R//A/P split keeps its ``action="Payment"``
@@ -5564,8 +5808,10 @@ class BusinessMixin:
         (resolution mirrors ``fx_account``).
 
         Returns:
-            Payment details and remaining balance; plus
-            ``exchange_rate`` / ``payment_account_amount`` /
+            Payment details and remaining balance. ``status`` is
+            ``"paid"`` when the lot settles to zero, ``"partial"``
+            when a balance remains (``"would_pay"`` on dry runs).
+            Plus ``exchange_rate`` / ``payment_account_amount`` /
             ``fx_realized`` on cross-currency, and a ``discount``
             block when a discount was booked.
 
@@ -5587,7 +5833,7 @@ class BusinessMixin:
             else date.today()
         )
 
-        with self.open(readonly=False) as book:
+        with self.open(readonly=dry_run) as book:
             inv = self._find_invoice(book, invoice_id, owner_type=ot)
             if not inv:
                 raise ValueError(
@@ -5739,7 +5985,8 @@ class BusinessMixin:
                     f"{invoice_id}. Pay at most the outstanding "
                     f"balance. To record a genuine overpayment, pay "
                     f"the outstanding balance and book the excess as "
-                    f"a credit note (create_credit_note) so it shows "
+                    f"a credit note (create_document with "
+                    f"document_type='credit_note') so it shows "
                     f"as credit owed to the counterparty rather than "
                     f"a phantom receivable."
                 )
@@ -5750,9 +5997,12 @@ class BusinessMixin:
             # all invariants and books the discount split, or
             # rejects.
             discount_split: piecash.Split | None = None
+            discount_booked = False
             discount_acct = None
             discount_notice = None
             discount_amount_invoice_ccy = Decimal("0")
+            disc_quantity: Decimal | None = None
+            disc_value_sign = 1
             if apply_discount:
                 if is_credit_note:
                     raise ValueError(
@@ -5772,8 +6022,8 @@ class BusinessMixin:
                             f"apply_discount=True on invoice "
                             f"{invoice_id} which has no billterm "
                             f"linked. Set terms at invoice creation "
-                            f"(via create_invoice or create_bill's "
-                            f"``term`` parameter), repost, then retry."
+                            f"(via create_document's ``term`` "
+                            f"parameter), repost, then retry."
                         )
                     raise ValueError(
                         f"apply_discount=True on invoice "
@@ -5855,6 +6105,7 @@ class BusinessMixin:
                         book,
                         owner_type_is_bill=effective_is_bill,
                         discount_account=discount_account,
+                        dry_run=dry_run,
                     )
                 )
                 disc_quantity, _disc_rate = _convert(
@@ -5863,12 +6114,15 @@ class BusinessMixin:
                 # Customer payment: discount is EXPENSE (debit), +value
                 # Vendor bill payment: discount is INCOME (credit), -value
                 disc_value_sign = -1 if effective_is_bill else 1
-                discount_split = piecash.Split(
-                    account=discount_acct,
-                    value=disc_value_sign * expected,
-                    quantity=disc_value_sign * disc_quantity,
-                    memo="Early-payment discount",
-                )
+                discount_booked = True
+                if not dry_run:
+                    discount_split = piecash.Split(
+                        account=discount_acct,
+                        value=disc_value_sign * expected,
+                        quantity=disc_value_sign * disc_quantity,
+                        memo="Early-payment discount",
+                        action="Payment",
+                    )
                 discount_amount_invoice_ccy = expected
 
                 # With a discount the A/R side absorbs the FULL
@@ -5908,38 +6162,35 @@ class BusinessMixin:
                         / remaining_before_pay
                     ).quantize(_commodity_quantum(post_acct.commodity))
 
-            if effective_is_bill:
-                # Pay vendor bill (or refund customer credit note):
-                # debit A/P, credit bank.
-                ar_ap_split = piecash.Split(
-                    account=post_acct,
-                    value=full_settle_amount,
-                    quantity=full_settle_post_qty,
-                    memo="",
-                    action="Payment",
-                )
-                bank_split = piecash.Split(
-                    account=pay_acct,
-                    value=-payment_amount,
-                    quantity=-pay_quantity,
-                    memo=memo,
-                )
-            else:
-                # Receive customer payment (or refund-in from a
-                # vendor credit note): credit A/R, debit bank.
-                ar_ap_split = piecash.Split(
-                    account=post_acct,
-                    value=-full_settle_amount,
-                    quantity=-full_settle_post_qty,
-                    memo="",
-                    action="Payment",
-                )
-                bank_split = piecash.Split(
-                    account=pay_acct,
-                    value=payment_amount,
-                    quantity=pay_quantity,
-                    memo=memo,
-                )
+            # Sign-factored split data: a bill payment (or customer
+            # credit-note refund) debits A/P and credits bank; the
+            # customer receipt is the exact mirror. ONE set of
+            # values feeds both the rehearsal's proposed-splits
+            # table and the real Split construction below — the
+            # rehearsal cannot diverge from the booking.
+            sgn = 1 if effective_is_bill else -1
+            proposed: list[dict] = [
+                {
+                    "account": post_acct.fullname,
+                    "value": sgn * full_settle_amount,
+                    "quantity": sgn * full_settle_post_qty,
+                    "memo": "",
+                    "action": "Payment",
+                },
+                {
+                    "account": pay_acct.fullname,
+                    "value": -sgn * payment_amount,
+                    "quantity": -sgn * pay_quantity,
+                    "memo": memo,
+                },
+            ]
+            if discount_booked:
+                proposed.append({
+                    "account": discount_acct.fullname,
+                    "value": disc_value_sign * discount_amount_invoice_ccy,
+                    "quantity": disc_value_sign * disc_quantity,
+                    "memo": "Early-payment discount",
+                })
 
             # Realized FX gain/loss on post→pay rate drift, factored
             # into _compute_fx_gain_loss (the four sign quadrants
@@ -5947,9 +6198,6 @@ class BusinessMixin:
             # transaction currency, non-zero quantity in the FX
             # account's commodity (book default). One account both
             # directions; sign decides gain vs loss.
-            splits = [ar_ap_split, bank_split]
-            if discount_split is not None:
-                splits.append(discount_split)
             fx_result: dict | None = None
             default_currency = self._require_default_currency(book)
             if exchange_rate is not None:
@@ -5969,18 +6217,143 @@ class BusinessMixin:
                     default_currency=default_currency,
                     discount_amount=discount_amount_invoice_ccy,
                     discount_quantity=(
-                        discount_split.quantity * (
-                            -1 if effective_is_bill else 1
-                        )
-                        if discount_split is not None else None
+                        disc_quantity if discount_booked else None
                     ),
                     discount_commodity=(
                         discount_acct.commodity
                         if discount_acct is not None else None
                     ),
+                    dry_run=dry_run,
                 )
                 if fx_result is not None:
-                    splits.append(fx_result["split"])
+                    proposed.append({
+                        "account": fx_result["fx_acct"].fullname,
+                        "value": Decimal("0"),
+                        "quantity": fx_result["quantity"],
+                        "memo": fx_result["memo"],
+                    })
+
+            # Shared result tail — identical blocks on the rehearsal
+            # and the booked response, built from the same locals.
+            def _attach_extras(result: dict) -> None:
+                if exchange_rate is not None:
+                    result["exchange_rate"] = str(exchange_rate)
+                    result["payment_account_amount"] = str(pay_quantity)
+                    result["invoice_currency"] = inv.currency.mnemonic
+                    result["payment_account_currency"] = (
+                        pay_acct.commodity.mnemonic
+                    )
+                    if fx_result is not None:
+                        fx_diff_default = fx_result["fx_diff_default"]
+                        # Label follows effective_is_bill (the
+                        # direction the split was booked with) —
+                        # keyed on is_bill, an FX loss on a customer
+                        # credit-note refund would be labeled "gain".
+                        direction = (
+                            "loss"
+                            if (effective_is_bill and fx_diff_default > 0)
+                            or (
+                                not effective_is_bill
+                                and fx_diff_default < 0
+                            )
+                            else "gain"
+                        )
+                        result["fx_realized"] = {
+                            # In the book default — the FX account's
+                            # commodity.
+                            "amount": str(
+                                abs(fx_diff_default).quantize(
+                                    _commodity_quantum(default_currency)
+                                )
+                            ),
+                            "currency": default_currency.mnemonic,
+                            "direction": direction,
+                            "account": fx_result["fx_acct"].fullname,
+                        }
+                        if fx_result["fx_notice"] is not None:
+                            result["fx_notice"] = fx_result["fx_notice"]
+                if discount_booked:
+                    # ``account`` is the canonical path — the resolver
+                    # may have picked an account the caller didn't pass.
+                    result["discount"] = {
+                        "amount": str(discount_amount_invoice_ccy),
+                        "currency": inv.currency.mnemonic,
+                        "account": discount_acct.fullname,
+                    }
+                    if discount_notice is not None:
+                        result["discount_notice"] = discount_notice
+                # Surface the worst-aged forced FX override (if any).
+                if fx_stale_overrides:
+                    result["fx_stale"] = max(
+                        fx_stale_overrides, key=lambda m: m["age_days"]
+                    )
+
+            doc_type = (
+                "credit_note"
+                if is_credit_note
+                else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                    inv.owner_type, "invoice"
+                )
+            )
+
+            # ── Rehearsal exit: everything above ran; nothing books.
+            # Projected remaining derives from the same directional
+            # balance the overpayment guard used (invoice currency,
+            # positive = still owed).
+            if dry_run:
+                remaining_after = (
+                    remaining_before_pay - full_settle_amount
+                )
+                result = {
+                    "dry_run": True,
+                    "id": inv.id,
+                    "type": doc_type,
+                    "status": "would_pay",
+                    "amount": str(payment_amount),
+                    "remaining_balance_after": str(remaining_after),
+                    "would_close_lot": remaining_after == Decimal(0),
+                    "payment_account": pay_acct.fullname,
+                    "payment_date": str(parsed_date),
+                    "proposed_splits": [
+                        {
+                            k: (str(v) if isinstance(v, Decimal) else v)
+                            for k, v in row.items()
+                        }
+                        for row in proposed
+                    ],
+                }
+                would_create = sorted(
+                    a.fullname
+                    for a in (
+                        discount_acct,
+                        fx_result["fx_acct"] if fx_result else None,
+                    )
+                    if a is not None and getattr(a, "planned", False)
+                )
+                if would_create:
+                    result["would_create_accounts"] = would_create
+                _attach_extras(result)
+                return result
+
+            ar_ap_split = piecash.Split(
+                account=post_acct,
+                value=proposed[0]["value"],
+                quantity=proposed[0]["quantity"],
+                memo="",
+                action="Payment",
+            )
+            bank_split = piecash.Split(
+                account=pay_acct,
+                value=proposed[1]["value"],
+                quantity=proposed[1]["quantity"],
+                memo=memo,
+                action="Payment",
+            )
+            splits = [ar_ap_split, bank_split]
+            if discount_split is not None:
+                splits.append(discount_split)
+            if fx_result is not None:
+                splits.append(fx_result["split"])
 
             txn = piecash.Transaction(
                 currency=inv.currency,
@@ -6012,14 +6385,13 @@ class BusinessMixin:
 
             result = {
                 "id": inv.id,
-                "type": (
-                    "credit_note"
-                    if is_credit_note
-                    else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        inv.owner_type, "invoice"
-                    )
+                "type": doc_type,
+                # "paid" only when the lot is settled — a partial
+                # payment reporting "paid" invites the caller to
+                # stop collecting with a balance still open.
+                "status": (
+                    "partial" if remaining_directional > 0 else "paid"
                 ),
-                "status": "paid",
                 "amount_paid": str(payment_amount),
                 "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
@@ -6032,51 +6404,7 @@ class BusinessMixin:
                 "payment_account": pay_acct.fullname,
                 "payment_date": str(parsed_date),
             }
-            if exchange_rate is not None:
-                result["exchange_rate"] = str(exchange_rate)
-                result["payment_account_amount"] = str(pay_quantity)
-                result["invoice_currency"] = inv.currency.mnemonic
-                result["payment_account_currency"] = pay_acct.commodity.mnemonic
-                if fx_result is not None:
-                    fx_diff_default = fx_result["fx_diff_default"]
-                    # Label follows effective_is_bill (the direction
-                    # the split was booked with) — keyed on is_bill,
-                    # an FX loss on a customer credit-note refund
-                    # would be labeled "gain".
-                    direction = (
-                        "loss" if (effective_is_bill and fx_diff_default > 0)
-                        or (not effective_is_bill and fx_diff_default < 0)
-                        else "gain"
-                    )
-                    result["fx_realized"] = {
-                        # In the book default — the FX account's
-                        # commodity.
-                        "amount": str(
-                            abs(fx_diff_default).quantize(
-                                _commodity_quantum(default_currency)
-                            )
-                        ),
-                        "currency": default_currency.mnemonic,
-                        "direction": direction,
-                        "account": fx_result["fx_acct"].fullname,
-                    }
-                    if fx_result["fx_notice"] is not None:
-                        result["fx_notice"] = fx_result["fx_notice"]
-            if discount_split is not None:
-                # ``account`` is the canonical path — the resolver
-                # may have picked an account the caller didn't pass.
-                result["discount"] = {
-                    "amount": str(discount_amount_invoice_ccy),
-                    "currency": inv.currency.mnemonic,
-                    "account": discount_acct.fullname,
-                }
-                if discount_notice is not None:
-                    result["discount_notice"] = discount_notice
-            # Surface the worst-aged forced FX override (if any).
-            if fx_stale_overrides:
-                result["fx_stale"] = max(
-                    fx_stale_overrides, key=lambda m: m["age_days"]
-                )
+            _attach_extras(result)
 
         return result
 
@@ -6162,19 +6490,42 @@ class BusinessMixin:
                     f"posted — post it before applying credits."
                 )
 
-            # Same owner check.
-            if cn.owner_guid != target.owner_guid:
+            # Same owner check — on the EFFECTIVE counterparty, not
+            # the raw owner row. A job-attached invoice's owner_guid
+            # points at the Job, so a raw comparison refuses a
+            # legitimate netting while the error text (built from
+            # the job-chasing helper) names the same customer on
+            # both sides.
+            cn_eff_ot, cn_job = self._resolve_owner_type_and_job(
+                book, cn,
+            )
+            cn_eff_guid = cn_job.owner_guid if cn_job else cn.owner_guid
+            t_eff_ot, t_job = self._resolve_owner_type_and_job(
+                book, target,
+            )
+            t_eff_guid = t_job.owner_guid if t_job else target.owner_guid
+            if (cn_eff_ot, cn_eff_guid) != (t_eff_ot, t_eff_guid):
                 cn_owner = self._find_invoice_owner_by_guid(
-                    book, cn.owner_type, cn.owner_guid,
+                    book, cn_eff_ot, cn_eff_guid,
                 )
                 target_owner = self._find_invoice_owner_by_guid(
-                    book, target.owner_type, target.owner_guid,
+                    book, t_eff_ot, t_eff_guid,
                 )
+                # Owner IDs are per-type sequences: customer 000005
+                # and vendor 000005 are different entities with the
+                # same ID string. Without the type words this error
+                # can read "belongs to '000005' but target belongs
+                # to '000005'" — a contradiction.
+                _kind = {2: "customer", 4: "vendor", 5: "employee"}
                 raise ValueError(
                     f"Credit note belongs to "
-                    f"{cn_owner.id if cn_owner else '?'!r} but "
-                    f"target belongs to "
-                    f"{target_owner.id if target_owner else '?'!r}. "
+                    f"{_kind.get(cn_eff_ot, 'owner')} "
+                    f"{(cn_owner.id if cn_owner else '?')!r}"
+                    f"{f' ({cn_owner.name})' if cn_owner else ''} "
+                    f"but target belongs to "
+                    f"{_kind.get(t_eff_ot, 'owner')} "
+                    f"{(target_owner.id if target_owner else '?')!r}"
+                    f"{f' ({target_owner.name})' if target_owner else ''}. "
                     f"Credit notes can only net against documents "
                     f"from the same customer/vendor."
                 )
@@ -6203,10 +6554,10 @@ class BusinessMixin:
 
             # The netting transaction is in the post account's
             # commodity, so the document currency must match it.
-            # Well-formed books keep per-currency A/R accounts; the
-            # case caught here is a EUR invoice deliberately posted
-            # to USD A/R (post_invoice allows that via FX rates) —
-            # reject rather than write wrong split values.
+            # post_invoice refuses this pairing since v1.5.0
+            # (battery ruling 1), but books that posted under the
+            # warning-era permissiveness still carry mismatched
+            # lots — this guard is what protects them, so it stays.
             if cn.currency_guid != post_acct.commodity.guid:
                 raise ValueError(
                     f"Cross-currency apply not supported: credit "
@@ -6289,7 +6640,7 @@ class BusinessMixin:
 
             # Customer side: +apply on the CN lot (settles toward
             # zero), −apply on the target lot. Vendor side symmetric.
-            is_bill_side = self._is_bill_side(cn.owner_type)
+            is_bill_side = self._is_bill_side(cn_eff_ot)
             if is_bill_side:
                 cn_split_value = -apply_amount
                 target_split_value = apply_amount
@@ -6355,7 +6706,7 @@ class BusinessMixin:
 
             # Quantize response amounts to the post-account
             # commodity — "$100.00", not "$100".
-            return {
+            result = {
                 "credit_note_id": credit_note_id,
                 "applies_to_invoice_id": applies_to_invoice_id,
                 "amount_applied": str(apply_amount.quantize(quantum)),
@@ -6373,6 +6724,18 @@ class BusinessMixin:
                 "apply_date": str(parsed_date),
                 "status": "applied",
             }
+            # The stored applies-to link is provenance, not a
+            # constraint — netting against whatever's open next is
+            # the normal flow. When the applied target diverges
+            # from the link, say so in the moment (and in the
+            # audit log) rather than leaving it discoverable later.
+            linked = self._resolve_applies_to(book, cn)
+            if linked and linked["id"] != target.id:
+                result["note"] = (
+                    f"applied to {target.id} (credit note "
+                    f"references {linked['id']})"
+                )
+            return result
 
     # ── Delete paths ──────────────────────────────────────────────
 
@@ -6414,7 +6777,7 @@ class BusinessMixin:
         """Delete an unposted employee expense voucher.
 
         Automatically removes associated entries. Posted vouchers
-        cannot be deleted — unpost first via ``unpost_invoice``,
+        cannot be deleted — unpost first via ``unpost_document``,
         then delete.
 
         Args:
@@ -6457,7 +6820,9 @@ class BusinessMixin:
             if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Cannot delete posted {type_label.lower()} '{doc_id}'. "
-                    f"Void it or issue a credit note instead."
+                    f"Unpost it first (unpost_document), or issue a "
+                    f"credit note (create_document with "
+                    f"document_type='credit_note') to reverse it."
                 )
 
             inv_guid = inv.guid
@@ -7241,12 +7606,20 @@ class BusinessMixin:
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
-                # type stays the owner-type tag; is_credit_note lets
-                # the formatter distinguish.
+                # type agrees with get_document / delete / unpost:
+                # credit notes are their own type everywhere
+                # (battery bug 6 — verbose mode here was the one
+                # surface still tagging them by owner type). The
+                # redundant is_credit_note key stays for callers
+                # already keyed on it. No due_date either — credit
+                # is available, not owed by a date.
                 row = {
                     "id": inv.id,
-                    "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        effective_ot, "invoice"
+                    "type": (
+                        "credit_note" if is_credit_note
+                        else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                            effective_ot, "invoice"
+                        )
                     ),
                     "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
@@ -7255,10 +7628,12 @@ class BusinessMixin:
                         str(posted_dt.date()) if posted_dt else None
                     ),
                     "due_date": (
-                        str(due_date) if due_date is not None else None
+                        str(due_date)
+                        if due_date is not None and not is_credit_note
+                        else None
                     ),
                     "days_past_due": days_past_due,
-                    "no_terms": no_terms,
+                    "no_terms": False if is_credit_note else no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(amount_due),
@@ -7277,7 +7652,7 @@ class BusinessMixin:
                 results,
                 offset=offset,
                 limit=limit,
-                entity_name="invoices",
+                entity_name="documents",
                 date_key=lambda r: r["date_posted"],
             )
             if compact:

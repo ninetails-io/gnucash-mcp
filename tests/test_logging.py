@@ -1066,6 +1066,146 @@ class TestAuditEntityTypeBillSwap:
         assert "PAY INVOICE" not in rendered
 
 
+class TestPayDryRunAuditRendering:
+    """``pay_document(dry_run=true)`` must not read as a booked
+    payment (battery bug 2: dry runs rendered as ``PAY INVOICE``
+    with blank paid/remaining/txn fields — phantom payments to an
+    auditor). Tagged ``(dry run)``, matching the ENTER STATEMENT
+    precedent."""
+
+    _DRY_ENTRY = {
+        "classification": "write",
+        "entity_type": "invoice",
+        "operation": "pay",
+        "timestamp": "2026-08-31T18:00:00",
+        "params": {
+            "id": "000013",
+            "payment_account": "Assets:Checking",
+            "dry_run": True,
+        },
+        "after_state": {
+            "dry_run": True,
+            "type": "invoice",
+            "status": "would_pay",
+            "amount": "200.00",
+            "remaining_balance_after": "300.00",
+            "would_close_lot": False,
+            "payment_account": "Assets:Checking",
+            "payment_date": "2026-08-31",
+        },
+    }
+
+    def test_dry_run_tagged_and_no_phantom_fields(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        rendered = _format_audit_entry_text(self._DRY_ENTRY)
+        assert "PAY INVOICE (dry run)" in rendered
+        assert "would pay: 200.00" in rendered
+        assert "remaining after: 300.00" in rendered
+        assert "nothing booked" in rendered
+        # The booked-payment shape must not appear.
+        assert "paid: " not in rendered
+        assert "txn:" not in rendered
+
+    def test_dry_run_bill_keeps_tag_through_label_swap(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            **self._DRY_ENTRY,
+            "entity_type": "bill",
+            "after_state": {
+                **self._DRY_ENTRY["after_state"], "type": "bill",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY BILL (dry run)" in rendered
+
+    def test_real_payment_rendering_unchanged(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "invoice",
+            "operation": "pay",
+            "timestamp": "2026-08-31T18:00:00",
+            "params": {
+                "id": "000013",
+                "payment_account": "Assets:Checking",
+            },
+            "after_state": {
+                "type": "invoice", "amount_paid": "500.00",
+                "remaining_balance": "0.00",
+                "transaction_guid": "abc12345",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "PAY INVOICE  id:000013" in rendered
+        assert "(dry run)" not in rendered
+        assert "paid: 500.00" in rendered
+
+
+class TestConsolidatedParamNamesInFormatters:
+    """The business consolidation renamed tool params (``id``,
+    ``party_type``, ``document_type``); the entry/credit-note CREATE
+    formatters still hunted the retired names and rendered blanks
+    (battery bug 5: ``on:`` with no document ID, ``: 000004`` with
+    no owner-type label)."""
+
+    def test_entry_create_reads_consolidated_id(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-08-31T18:00:00",
+            "params": {
+                "document_type": "invoice",
+                "id": "000014",
+                "description": "Beratung August",
+            },
+            "after_state": {
+                "description": "Beratung August",
+                "total": "800.00",
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "on: invoice 000014" in rendered
+
+    def test_entry_create_still_reads_retired_keys(self):
+        """Old per-type keys keep rendering — replayed history must
+        not go blank."""
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "entry",
+            "operation": "create",
+            "timestamp": "2026-08-31T18:00:00",
+            "params": {"bill_id": "000002", "description": "Paper"},
+            "after_state": {"description": "Paper", "total": "50.00"},
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "on: 000002" in rendered
+
+    def test_credit_note_create_derives_owner_label(self):
+        from gnucash_mcp.logging_config import _format_audit_entry_text
+        entry = {
+            "classification": "write",
+            "entity_type": "credit_note",
+            "operation": "create",
+            "timestamp": "2026-08-31T18:00:00",
+            # party_type omitted — inherited from applies_to, the
+            # common consolidated-call shape.
+            "params": {
+                "document_type": "credit_note",
+                "owner_id": "000004",
+            },
+            "after_state": {
+                "id": "000015",
+                "customer_id": "000004",
+                "is_credit_note": True,
+            },
+        }
+        rendered = _format_audit_entry_text(entry)
+        assert "customer: 000004" in rendered
+
+
 class TestAuditBeforeStateLeak:
     """Defense-in-depth: a previous call's staged before-state must
     never leak into the next call's audit entry, regardless of how
@@ -1877,6 +2017,26 @@ class TestRedactPaths:
         text = "Path: /Users/alice/secret.gnucash"
         assert self._rp(text) == text
 
+    def test_unparseable_value_fails_closed(self, monkeypatch):
+        """Release-review finding 7: a typo'd toggle must not
+        silently disable a privacy control. The toggle now parses
+        through the _parse_env_toggle chokepoint; unparseable
+        values fail CLOSED (redaction ON) and record an _env_error
+        so main()-run servers exit loudly at startup."""
+        from gnucash_mcp import _env as env_mod
+        monkeypatch.setenv("GNUCASH_REDACT_PATHS", "ture")
+        before = len(env_mod._env_errors)
+        text = "Path: /Users/alice/secret.gnucash"
+        result = self._rp(text)
+        assert "/Users/alice" not in result  # fail closed: redacted
+        assert "secret.gnucash" in result
+        assert len(env_mod._env_errors) == before + 1
+        assert "GNUCASH_REDACT_PATHS" in env_mod._env_errors[-1]
+        # Memoized: a second call must not re-record the error.
+        self._rp(text)
+        assert len(env_mod._env_errors) == before + 1
+        env_mod._env_errors.pop()  # leave global state clean
+
     def test_posix_path_redacted(self, monkeypatch):
         monkeypatch.setenv("GNUCASH_REDACT_PATHS", "1")
         text = "GnuCash book not found: /Users/stephen/Books/alex.gnucash"
@@ -1940,6 +2100,23 @@ class TestWriteRateLimiter:
     """Stage 6 — write rate-limiting at the audit_log decorator.
     Token bucket; disabled by default; opt-in via
     GNUCASH_WRITE_RATE_LIMIT env var."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_limiter_state(self):
+        """Reset the limiter cache around every test in this class.
+
+        The limiter is cached process-globally behind an
+        initialized flag, so monkeypatch's env teardown alone
+        leaves a drained bucket live — and any write-classified
+        tool that runs later in the same process gets rate-limited
+        into an error envelope instead of executing. Under xdist
+        that poisons whichever tests land after this class on the
+        same worker.
+        """
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        reset_write_rate_limiter()
+        yield
+        reset_write_rate_limiter()
 
     def _setup_decorated_tool(self):
         """Build a minimal write-classified tool decorated by

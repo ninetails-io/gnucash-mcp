@@ -117,25 +117,162 @@ class TestLocalizedHelperAccounts:
             acct2, _ = gb._get_or_create_fx_account(b)
             assert acct2.fullname == "Erträge:Realisierter Gewinn/Verlust"
 
-    def test_discount_accounts_autocreate_under_localized_parents(
+    def test_discount_autocreate_refused_on_localized_book(
         self, localized_book
     ):
+        """Battery ruling 4(b): with no designation and no explicit
+        ``discount_account``, the resolver REFUSES on a non-English
+        book instead of auto-creating the English default (an
+        English leaf in a localized chart, wrong-sided on the sales
+        side). The hint names the fix. Both sides refuse; the
+        dry-run rehearsal refuses identically."""
         gb = GnuCashBook(str(localized_book))
         with gb.open(readonly=False) as b:
-            # Sales discount → EXPENSE side → German expense root.
-            sales, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=False
-            )
-            assert sales.type == "EXPENSE"
-            assert sales.parent.fullname == "Aufwand"
+            for is_bill in (False, True):
+                with pytest.raises(
+                    ValueError, match="discount_account"
+                ) as exc:
+                    gb._get_or_create_discount_account(
+                        b, owner_type_is_bill=is_bill
+                    )
+                assert "'de'" in str(exc.value)
+            with pytest.raises(ValueError, match="discount_account"):
+                gb._get_or_create_discount_account(
+                    b, owner_type_is_bill=False, dry_run=True
+                )
 
-            # Purchase discount → INCOME side → German income root.
-            purchase, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=True
+    def test_discount_autocreate_refused_on_undetermined_chart(
+        self, tmp_path
+    ):
+        """The bookkeeper's Sabine repro (live loop, 2026-09-01): a DATEV/SKR03
+        chart's numbered top-levels ("Aufwendungen 2/4") match no
+        locale's exact structural words, so ``_infer_book_locale``
+        returns None — and the 4(b) gate originally read None as
+        English and auto-created "Sales Discounts" into the German
+        book. The gate now requires an AFFIRMATIVE English read:
+        undetermined refuses too."""
+        book_path = tmp_path / "datev.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="EUR", overwrite=True,
+        )
+        root = book.root_account
+        eur = book.default_currency
+        for name, atype in (
+            ("Anlage- u. Kapitalkonten 0", "ASSET"),
+            ("Finanz- u. Privatkonten 1", "LIABILITY"),
+            ("Erlöse u. Erträge 2/8", "INCOME"),
+            ("Aufwendungen 2/4", "EXPENSE"),
+            ("Kapital 9", "EQUITY"),
+        ):
+            piecash.Account(
+                name=name, type=atype, parent=root,
+                commodity=eur, placeholder=True,
             )
-            assert purchase.type == "INCOME"
-            assert purchase.parent.fullname == "Erträge"
-            b.save()
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=False) as b:
+            # The inference miss is real and documented…
+            assert gb._infer_book_locale(b) is None
+            assert gb._book_reads_english(b) is False
+            # …and the gate no longer treats it as English.
+            with pytest.raises(
+                ValueError, match="discount_account"
+            ) as exc:
+                gb._get_or_create_discount_account(
+                    b, owner_type_is_bill=False
+                )
+            assert "undetermined" in str(exc.value)
+
+    def test_fx_autocreate_refused_on_undetermined_chart(
+        self, tmp_path
+    ):
+        """Release-review finding 1: the fail-safe create gate must
+        cover BOTH sibling resolvers. On a locale-undetermined chart
+        the FX resolver used to fall back to creating (and
+        permanently designating) the English 'Foreign Exchange
+        Gain/Loss' leaf; it now refuses with the fx_account hint.
+        Determined-foreign locales still create (localized leaf —
+        covered by test_fx_account_autocreates_under_localized_income)."""
+        book_path = tmp_path / "datev-fx.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="EUR", overwrite=True,
+        )
+        root = book.root_account
+        eur = book.default_currency
+        for name, atype in (
+            ("Anlage- u. Kapitalkonten 0", "ASSET"),
+            ("Erlöse u. Erträge 2/8", "INCOME"),
+            ("Aufwendungen 2/4", "EXPENSE"),
+        ):
+            piecash.Account(
+                name=name, type=atype, parent=root,
+                commodity=eur, placeholder=True,
+            )
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=False) as b:
+            assert gb._infer_book_locale(b) is None
+            with pytest.raises(ValueError, match="fx_account") as exc:
+                gb._get_or_create_fx_account(b)
+            assert "undetermined" in str(exc.value)
+            with pytest.raises(ValueError, match="fx_account"):
+                gb._get_or_create_fx_account(b, dry_run=True)
+            # Nothing was designated by the refused attempts.
+            assert gb._resolve_designated_account(
+                b, gb._FX_ACCOUNT_SLOT_KEY
+            ) is None
+
+    def test_book_reads_english_affirmative_on_english_chart(
+        self, tmp_path
+    ):
+        """The other half of the fail-safe gate: a standard English
+        chart passes the affirmative check, so English books keep
+        their auto-create default."""
+        book_path = tmp_path / "english.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        for name, atype in (
+            ("Assets", "ASSET"),
+            ("Income", "INCOME"),
+            ("Expenses", "EXPENSE"),
+        ):
+            piecash.Account(
+                name=name, type=atype, parent=root,
+                commodity=usd, placeholder=True,
+            )
+        book.save()
+        book.close()
+        gb = GnuCashBook(str(book_path))
+        with gb.open() as b:
+            assert gb._book_reads_english(b) is True
+            assert gb._infer_book_locale(b) is None  # not a vote row
+
+    def test_discount_explicit_account_works_on_localized_book(
+        self, localized_book
+    ):
+        """The refusal's own hint must work: an explicit
+        ``discount_account`` resolves on the localized book with no
+        create and no locale objection."""
+        gb = GnuCashBook(str(localized_book))
+        with gb.open(readonly=False) as b:
+            sales, notice = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=False,
+                discount_account="Aufwand:Bürobedarf",
+            )
+            assert sales.fullname == "Aufwand:Bürobedarf"
+            assert notice is None
+            purchase, _ = gb._get_or_create_discount_account(
+                b, owner_type_is_bill=True,
+                discount_account="Erträge:Umsatzerlöse",
+            )
+            assert purchase.fullname == "Erträge:Umsatzerlöse"
 
 
 class TestFxAccountCollisionSafety:
@@ -432,14 +569,19 @@ class TestDesignatedAccountSlotLayer0:
 
     def test_discount_sides_use_independent_slots(self, localized_book):
         # Sales (EXPENSE) and purchase (INCOME) designations are stored
-        # under separate slot keys and resolve independently.
+        # under separate slot keys and resolve independently. Stored
+        # directly — ruling 4(b) closed the auto-create path on
+        # localized books, and the explicit-arg layer deliberately
+        # does not designate.
         gb = GnuCashBook(str(localized_book))
         with gb.open(readonly=False) as b:
-            sales, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=False
+            sales = gb._find_account(b, "Aufwand:Bürobedarf")
+            purchase = gb._find_account(b, "Erträge:Umsatzerlöse")
+            gb._store_designated_account(
+                b, gb._SALES_DISCOUNT_SLOT_KEY, sales
             )
-            purchase, _ = gb._get_or_create_discount_account(
-                b, owner_type_is_bill=True
+            gb._store_designated_account(
+                b, gb._PURCHASE_DISCOUNT_SLOT_KEY, purchase
             )
             b.save()
             sales_guid, purchase_guid = sales.guid, purchase.guid
@@ -933,16 +1075,32 @@ class TestSKR03Chart:
             exp, _ = gb._top_level_account_of_type(b, "EXPENSE")
             assert exp.fullname == "Aufwendungen 2/4"
 
-    def test_fx_account_lands_under_skr03_income_root(self, tmp_path):
+    def test_fx_autocreate_refuses_on_skr03_chart(self, tmp_path):
+        """Flipped by the release-review fail-safe gate: SKR03's
+        numbered top-levels defeat the locale vote (None =
+        undetermined, not English), so the resolver now REFUSES to
+        create the English leaf here instead of planting
+        'Foreign Exchange Gain/Loss' in a German chart. The
+        explicit-account path — the refusal's own hint — must
+        still work and designate."""
         path = tmp_path / "skr03fx.gnucash"
         self._skr03_book(path)
         gb = GnuCashBook(str(path))
         with gb.open(readonly=False) as b:
-            acct, _ = gb._get_or_create_fx_account(b)
-            assert acct.type == "INCOME"
-            assert acct.parent.fullname == "Erlöse u. Erträge 2/8"
-            assert (
-                acct.fullname
-                == "Erlöse u. Erträge 2/8:Foreign Exchange Gain/Loss"
+            with pytest.raises(ValueError, match="fx_account"):
+                gb._get_or_create_fx_account(b)
+            # The hint works: an explicit default-currency income
+            # leaf resolves, with no locale objection.
+            income_root = gb._top_level_account_of_type(
+                b, "INCOME"
+            )[0]
+            leaf = piecash.Account(
+                name="8600 Kursgewinne", type="INCOME",
+                parent=income_root, commodity=b.default_currency,
             )
+            b.flush()
+            acct, _ = gb._get_or_create_fx_account(
+                b, fx_account=leaf.fullname
+            )
+            assert acct.fullname.endswith("8600 Kursgewinne")
             b.save()

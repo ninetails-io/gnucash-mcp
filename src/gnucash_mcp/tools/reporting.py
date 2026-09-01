@@ -22,13 +22,18 @@ def register(mcp, get_book) -> None:
         """Get spending breakdown by expense category for a period.
 
         Returns a compact aligned text table by default. Use verbose=true
-        for the full structured dict (programmatic consumers, plotting).
+        for the structured dict (programmatic consumers, plotting).
 
         Args:
-            start_date: Start of period (YYYY-MM-DD)
-            end_date: End of period (YYYY-MM-DD)
+            start_date: Start of period (YYYY-MM-DD), inclusive. No
+                calendar snapping — for calendar-month figures pass
+                full month boundaries (e.g. 2026-05-01 to 2026-07-31).
+            end_date: End of period (YYYY-MM-DD), inclusive.
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             group_by: Optional "month", "quarter", or "year" — split the
                 range into sub-period columns and return a multi-period
                 TSV table (category rows, one column per period plus
@@ -61,13 +66,16 @@ def register(mcp, get_book) -> None:
         """Get income breakdown by source for a period.
 
         Returns a compact aligned text table by default. Use verbose=true
-        for the full structured dict.
+        for the structured dict.
 
         Args:
             start_date: Start of period (YYYY-MM-DD)
             end_date: End of period (YYYY-MM-DD)
             depth: Hierarchy depth for grouping (1 = top-level categories, 2 = subcategories)
-            verbose: If true, return the structured dict.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             group_by: Optional "month", "quarter", or "year" — split the
                 range into sub-period columns and return a multi-period
                 TSV table (source rows, one column per period plus Total
@@ -126,9 +134,18 @@ def register(mcp, get_book) -> None:
         start_date: str | None = None,
         interval: str | None = None,
     ) -> str:
-        """Calculate net worth (assets minus liabilities).
+        """Calculate net worth (assets minus liabilities), as one
+        value or a trajectory.
 
-        Can calculate a single point-in-time value or a time series.
+        Read-only. Valuation is as-of: each date values holdings at
+        the latest market rate on or before it, in the book's default
+        currency; voided transactions are excluded. end_date alone
+        gives one number; add start_date + interval for a series
+        (one value per interval step from start_date, end_date
+        always included as the last row). For the full A = L + E statement
+        with per-account detail, use balance_sheet; this tool is the
+        headline number and its trend. The dashboard's trajectory
+        section is this same calculation.
 
         Args:
             end_date: Calculate net worth as of this date (YYYY-MM-DD)
@@ -205,9 +222,20 @@ def register(mcp, get_book) -> None:
         Auto-discovers CREDIT/LIABILITY accounts that have an 'apr' slot set.
         Set APRs via set_account_slot (e.g., set_account_slot("Liabilities:Visa", "apr", "23.49")).
 
+        Assumptions the schedule is computed under: interest
+        compounds monthly at apr/12 on the running balance; one
+        payment per debt per month starting this month; extra budget
+        beyond the minimums goes to the highest-APR debt first
+        (avalanche); balances are as of today in the book default
+        currency; amounts round to 0.01. Debts the plan cannot
+        include are CONFESSED in ⚠ lines, never silently dropped:
+        foreign-currency debts with no FX rate, loans with no
+        minimum_payment/loan_term_months to estimate a payment from,
+        and balance-carrying debts with no 'apr' slot.
+
         Returns a compact text summary by default — kill order with
         balances/APRs/payoff months, YETI line, totals, debt-free date.
-        Use verbose=true for the full structured dict (per-account
+        Use verbose=true for the structured dict (per-account
         ``interest_paid`` / ``credit_limit`` / ``minimum_payment``,
         plus the structured ``yeti`` block) suitable for programmatic
         consumers.
@@ -219,8 +247,10 @@ def register(mcp, get_book) -> None:
         Args:
             monthly_budget: Total monthly amount available for all debt payments combined
             additional_purchase: Dollar amount to calculate YETI for (default "1.00")
-            verbose: If true, return the full structured dict instead
-                     of the compact text summary.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.debt_payoff_plan(

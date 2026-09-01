@@ -561,6 +561,270 @@ class TestBatchCreate:
             gc.create_transactions([_txn(1, "x", "1")], on_error="bad")
 
 
+class TestBatchDryRunUpgrades:
+    """Ruling 7 (statement spec §9): the batch dry-run inherits the
+    rehearsal surface — summary header (counts + homework, never a
+    clearance), max_confidence results column, per-account effects
+    footer."""
+
+    def test_summary_counts_and_homework(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20)),
+             _txn(2, "Fresh Thing", "10.00")],
+            dry_run=True,
+        )
+        assert "Dry run: 2 rows — " in env["summary"]
+        assert "1 would_create, 0 review_required, 1 rejected" in \
+            env["summary"]
+        assert "duplicate candidates" in env["summary"]
+        # The clearance principle: no verdict vocabulary.
+        assert "safe" not in env["summary"].lower()
+        assert "blocking" not in env["summary"].lower()
+
+    def test_summary_verified_empty(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions(
+            [_txn(1, "Fresh Thing", "10.00")], dry_run=True,
+        )
+        assert "No duplicate candidates." in env["summary"]
+
+    def test_max_confidence_column(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20)),
+             _txn(2, "Fresh Thing", "10.00")],
+            dry_run=True,
+        )
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["1"]["max_confidence"] == "HIGH"
+        assert rows["2"]["max_confidence"] == ""
+
+    def test_max_confidence_on_commit_rows_too(self, test_book):
+        """One results shape across modes — the column isn't
+        dry-run-only."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20))],
+            force=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "created"
+        assert rows[0]["max_confidence"] == "HIGH"
+
+    def test_effects_footer(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions(
+            [_txn(1, "A", "10.00"), _txn(2, "B", "5.50")],
+            dry_run=True,
+        )
+        effects = {
+            f[0]: f[1] for f in
+            (ln.split("\t") for ln in
+             env["effects"].splitlines()[1:])
+        }
+        assert effects["Assets:Checking"] == "-15.50"
+        assert effects["Expenses:Groceries"] == "15.50"
+
+    def test_commit_has_no_summary_or_effects(self, test_book):
+        gc = GnuCashBook(str(test_book))
+        env = gc.create_transactions([_txn(1, "A", "10.00")])
+        assert "summary" not in env
+        assert "effects" not in env
+
+    def test_review_required_status(self, test_book):
+        """Ruling 8: a non-blocking (MEDIUM) candidate turns
+        would_create into review_required — a projected-action
+        label must not masquerade as clearance."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        # Same description + date, amount off by > $1: desc+date
+        # MEDIUM, non-blocking.
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1700", d=date(2026, 5, 21))],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "review_required"
+        assert rows[0]["max_confidence"] == "MEDIUM"
+        assert "1 rows are review_required" in env["summary"]
+
+    def test_duplicates_table_is_self_contained(self, test_book):
+        """Ruling 9: the candidate row carries proposed + existing
+        values, deltas, category legs, and a split_match verdict —
+        no join back to the caller's input."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1700", d=date(2026, 5, 21))],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["desc_new"] == "Rent"
+        assert row["desc_old"] == "Rent"
+        assert row["date_delta_days"] == "-1"
+        # Amounts anchor to the SIGNED CATEGORY primary (R3 P5):
+        # the expense leg, +1700 vs +1800.
+        assert row["amt_new"] == "1700"
+        assert row["amt_old"] == "1800"
+        assert row["amt_delta"] == "100"
+        assert row["cat_new"] == "Expenses:Groceries=1700"
+        assert row["cat_old"] == "Expenses:Groceries=1800"
+        assert row["split_match"] == "partial"
+        # T7 (statement round): the shared table's state column is
+        # populated on the batch surface too — most-anchored split
+        # state of the candidate transaction.
+        assert row["state"] == "n"
+
+    def test_cross_frame_blanks_delta_and_names_currency(
+        self, multi_currency_book
+    ):
+        """Round-two renderer finding: comparability is
+        candidate-vs-PROPOSAL currency. A default-currency proposal
+        against an EUR candidate must blank amt_delta and name EUR
+        in cur — 100 EUR vs 100 USD is not a twin."""
+        gc = GnuCashBook(str(multi_currency_book))
+        gc.create_transaction(
+            description="Consulting Invoice",
+            currency="EUR",
+            splits=[
+                {"account": "Assets:Euro Savings",
+                 "amount": "-100.00"},
+                {"account": "Expenses:Groceries",
+                 "amount": "100.00", "quantity": "108.00"},
+            ],
+            trans_date=date(2026, 5, 21),
+            check_duplicates=False,
+        )
+        env = gc.create_transactions(
+            [_txn(1, "Consulting Invoice", "100.00")],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["cur"] == "EUR"
+        assert row["amt_delta"] == ""
+
+    def test_refund_is_not_the_payments_twin(self, test_book):
+        """R3 P5 (blocker-class): signed amounts must live in the
+        SCORER, not just the display. A +104 refund was HIGH-
+        blocked as a duplicate of the -104 payment, with
+        split_match 'exact' on inverted legs. The direction anchor
+        is the signed CATEGORY primary — a balanced transaction
+        always carries both signs, so the funding leg can't carry
+        the signal."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transaction(
+            description="Amazon",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-104.00"},
+                {"account": "Expenses:Groceries",
+                 "amount": "104.00"},
+            ],
+            trans_date=date(2026, 5, 20),
+        )
+        env = gc.create_transactions(
+            [{
+                "ref": "1", "date": date(2026, 5, 21),
+                "description": "Amazon Refund",
+                "splits": [
+                    {"account": "Assets:Checking",
+                     "amount": "104.00"},
+                    {"account": "Expenses:Groceries",
+                     "amount": "-104.00"},
+                ],
+            }],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        # Surfaced for review (desc+date), never HIGH-blocked.
+        assert rows[0]["status"] == "review_required"
+        assert rows[0]["max_confidence"] == "MEDIUM"
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert "A" not in row["signals"]
+        assert Decimal(row["amt_new"]) == Decimal("-104")
+        assert Decimal(row["amt_old"]) == Decimal("104")
+        assert Decimal(row["amt_delta"]) == Decimal("208")
+        assert row["split_match"] == "partial"
+
+    def test_transfer_duplicates_still_match_on_magnitude(
+        self, test_book
+    ):
+        """The fallback: transfer-shaped rows (no category leg)
+        keep magnitude comparison, so a true transfer duplicate
+        still blocks."""
+        gc = GnuCashBook(str(test_book))
+        gc.create_transaction(
+            description="Card Payment",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-500.00"},
+                {"account": "Equity:Opening Balance",
+                 "amount": "500.00"},
+            ],
+            trans_date=date(2026, 5, 20),
+        )
+        env = gc.create_transactions(
+            [{
+                "ref": "1", "date": date(2026, 5, 20),
+                "description": "Card Payment",
+                "splits": [
+                    {"account": "Assets:Checking",
+                     "amount": "-500.00"},
+                    {"account": "Equity:Opening Balance",
+                     "amount": "500.00"},
+                ],
+            }],
+            dry_run=True,
+        )
+        rows = _parse(env["results"])
+        assert rows[0]["status"] == "rejected"
+        assert rows[0]["max_confidence"] == "HIGH"
+
+    def test_reconciled_candidate_shows_state_y(self, test_book):
+        """The bookkeeper's fourth verification probe: a reconciled
+        duplicate candidate reads y — entered AND tied, decisive."""
+        import piecash as pc
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        b = pc.open_book(str(test_book), readonly=False,
+                         do_backup=False)
+        for txn in b.transactions:
+            if txn.description == "Rent":
+                for s in txn.splits:
+                    if s.account.name == "Checking":
+                        s.reconcile_state = "y"
+        b.save()
+        b.close()
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1800", d=date(2026, 5, 20))],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["state"] == "y"
+
+    def test_split_match_none_on_distinct_categories(
+        self, test_book
+    ):
+        """The Chewy/fuel case: MEDIUM on date+amount, decisively
+        distinct on category."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        env = gc.create_transactions(
+            [_txn(1, "Rent", "1799.50", d=date(2026, 5, 21),
+                  acct_to="Income:Salary")],
+            dry_run=True,
+        )
+        lines = env["duplicates"].splitlines()
+        row = dict(zip(lines[0].split("\t"), lines[1].split("\t")))
+        assert row["split_match"] == "none"
+
+
 class TestBatchCurColumn:
     """The ``cur`` column sets a ROW's transaction currency.
 
@@ -797,3 +1061,57 @@ class TestSplitActionColumn:
             if s["account"] == "Assets:Checking"
         )
         assert chk["action"] == "Wire"
+
+
+class TestSignalSweepAmortization:
+    """The table sweep (sort + filter of every transaction) is the
+    collector's dominant cost on large books; each surface must pay
+    it at most ONCE per call, however many rows it screens — the
+    debug log's create_transactions p95 tail was O(rows) sweeps.
+    Counts real invocations via a wrapping monkeypatch: a new call
+    site that forgets to share the sweep fails here, not in a
+    profiler six months later.
+    """
+
+    @pytest.fixture
+    def sweep_calls(self, monkeypatch):
+        from gnucash_mcp.book.core import CoreMixin
+        calls = {"n": 0}
+        orig = CoreMixin._signal_sweep
+
+        def counting(self, book):
+            calls["n"] += 1
+            return orig(self, book)
+
+        monkeypatch.setattr(CoreMixin, "_signal_sweep", counting)
+        return calls
+
+    def test_batch_sweeps_once(self, test_book, sweep_calls):
+        """Mixed batch — a splitless auto-fill row (phase-1
+        preflight) plus explicit rows (phase-2 screens): one sweep
+        covers all of them."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        sweep_calls["n"] = 0
+        env = gc.create_transactions([
+            {"ref": "1", "date": date(2026, 6, 21),
+             "description": "Rent", "splits": []},
+            _txn(2, "Groceries B", "25.00"),
+            _txn(3, "Groceries C", "30.00"),
+        ])
+        rows = {r["ref"]: r for r in _parse(env["results"])}
+        assert rows["2"]["status"] == "created"
+        assert rows["3"]["status"] == "created"
+        assert sweep_calls["n"] == 1
+
+    def test_single_splitless_sweeps_once(self, test_book, sweep_calls):
+        """Splitless create makes TWO collector calls (auto-fill
+        preflight + duplicate scan); they share one sweep."""
+        gc = GnuCashBook(str(test_book))
+        _seed_rent(gc)
+        sweep_calls["n"] = 0
+        result = gc.create_transaction(
+            description="Rent", trans_date=date(2026, 6, 21),
+        )
+        assert result["status"] in ("created", "rejected")
+        assert sweep_calls["n"] == 1

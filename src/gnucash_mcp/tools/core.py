@@ -11,7 +11,9 @@ from datetime import date
 from gnucash_mcp._format import (
     _batch_row_splits,
     _batch_tsv_layout,
+    _parse_statement_tsv,
     _parse_update_tsv,
+    _tsv_lines,
 )
 from gnucash_mcp.logging_config import audit_log
 from gnucash_mcp.tools._helpers import (
@@ -39,7 +41,7 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
     missing header, too-few columns, or a split count that doesn't
     match the declared shape.
     """
-    lines = [ln for ln in tsv.splitlines() if ln.strip()]
+    lines = _tsv_lines(tsv, "the transactions TSV")
     if len(lines) < 2:
         raise ValueError(
             "transactions TSV needs a header row and at least one data row"
@@ -65,8 +67,8 @@ def _parse_transactions_tsv(tsv: str) -> list[dict]:
         if len(fields) <= fixed:
             # No split cells at all: an auto-fill request — the book
             # layer reproduces the most recent matching-description
-            # transaction (create_transaction's omitted-splits
-            # contract), or rejects the row when nothing matches.
+            # transaction (the omitted-splits contract), or rejects
+            # the row when nothing matches.
             splits: list[dict] = []
         else:
             try:
@@ -145,7 +147,10 @@ def register(mcp, get_book) -> None:
 
         Args:
             root: Filter to a subtree (e.g., "Expenses" for expense accounts only).
-            verbose: If true, return full JSON details for each account.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
             query: Case-insensitive substring filter on account
@@ -164,7 +169,14 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="read")
     def get_account(name: str) -> str:
-        """Get details for a specific account by name.
+        """Get details for one account: type, commodity, description,
+        placeholder flag, GUID, and hierarchy position.
+
+        Read-only. Returns ``{"error": "Account not found: ..."}``
+        when the ref matches nothing — nothing raises. Use
+        list_accounts to discover refs in bulk, get_balance when you
+        only need a number, get_account_slots for custom metadata
+        (APR, credit_limit, ...).
 
         Args:
             name: Account ref: full path (e.g. 'Assets:Bank:Checking'), %short GUID, or full 32-char GUID
@@ -243,7 +255,10 @@ def register(mcp, get_book) -> None:
             end_date: End date in ISO format (YYYY-MM-DD)
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         start = _parse_iso_date(start_date)
@@ -274,85 +289,6 @@ def register(mcp, get_book) -> None:
 
     @mcp.tool()
     @safe_tool
-    @audit_log(classification="write", operation="create", entity_type="transaction")
-    def create_transaction(
-        description: str,
-        splits: list[SplitInput] | None = None,
-        transaction_date: str | None = None,
-        currency: str | None = None,
-        notes: str | None = None,
-        check_duplicates: bool = True,
-        force_create: bool = False,
-        dry_run: bool = False,
-    ) -> str:
-        """Create a new transaction with splits. Splits must balance to zero.
-
-        Each split: ``account`` (full path, required), ``amount``
-        (required, in transaction currency), ``quantity`` (required
-        when account commodity differs from transaction currency),
-        ``memo`` (optional), ``action`` (optional). ``amount`` and
-        ``quantity`` are decimal strings (e.g. "94.87") — never raw
-        JSON numbers, which would lose precision on non-dyadic
-        decimals.
-
-        FIELD TARGETING — the annotation fields, one job each, in
-        GnuCash-register visibility order:
-
-        - ``description``: the clean name ("Chevron 0090706
-          Portland"). Always visible.
-        - ``notes``: what the purchase WAS, when the description
-          alone doesn't say ("Fuel, road trip to Portland").
-          Visible in the register's double-line view — this is the
-          annotation humans read. Interpret; don't transcribe.
-        - split ``memo`` (bank/card leg): the RAW statement line as
-          provenance ("Withdrawal ACH TRAVELERS TYPE: PER INSUR…").
-          Visible only in expanded split view — evidence, not
-          narrative.
-        - split ``action``: the typed KIND of movement, one word.
-          Matters most on investment legs, where desktop convention
-          (and the Advanced Portfolio report) expects "Buy" /
-          "Sell" / "Dividend"; bank legs may use "Wire" / "ATM" /
-          "Interest". Skip it for ordinary spending.
-
-        When duplicate detection surfaces candidates (either rejecting
-        the write with ``status: "rejected"`` or returning alongside a
-        successful create), ``duplicates`` in the response is a
-        newline-separated TSV string, not a list of dicts. Columns::
-
-            confidence<TAB>guid<TAB>date<TAB>amount<TAB>cur<TAB>description<TAB>signals
-
-        Confidence is ``HIGH`` (all three signals match) or ``MEDIUM``
-        (two of three). Signals is a three-char code: position 0
-        description, position 1 amount (±$1 tolerance), position 2
-        date (±2 days); ``D``/``A``/``D`` for match, ``-`` for miss.
-
-        Args:
-            description: Transaction description.
-            splits: List of split dicts (see above). Omit to auto-fill
-                from the most recent matching-description transaction.
-            transaction_date: ISO date (YYYY-MM-DD). Defaults to today.
-            currency: ISO currency code. Defaults to book's default.
-            notes: What the purchase was (see FIELD TARGETING above).
-            check_duplicates: Run duplicate detection. Default True.
-            force_create: Create even if HIGH-confidence duplicates found.
-            dry_run: Validate + dupe check only; don't write.
-        """
-        book = get_book()
-        trans_date = _parse_iso_date(transaction_date)
-        result = book.create_transaction(
-            description=description,
-            splits=_splits_to_dicts(splits),
-            trans_date=trans_date,
-            currency=currency,
-            notes=notes,
-            check_duplicates=check_duplicates,
-            force_create=force_create,
-            dry_run=dry_run,
-        )
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
     @audit_log(
         classification="write", operation="create_batch",
         entity_type="transaction",
@@ -363,7 +299,10 @@ def register(mcp, get_book) -> None:
         dry_run: bool = False,
         on_error: str = "abort",
     ) -> str:
-        """Create MANY transactions in one atomic command (bulk entry).
+        """Create transactions in one atomic command (bulk entry) —
+        the canonical entry tool for one transaction or many. A
+        single transaction is a one-row batch (the former
+        ``create_transaction`` tool was removed; this replaces it).
 
         INPUT — ``transactions`` is a TSV block: a header row, then one
         row per transaction. The HEADER DECLARES THE LAYOUT. Base form:
@@ -442,8 +381,7 @@ def register(mcp, get_book) -> None:
         AUTO-FILL — a row with NO split cells at all (ends right
         after ``description``/``notes``) reproduces the most recent
         transaction with the same description — splits, memos, and
-        quantities included — exactly like calling
-        ``create_transaction`` without ``splits``::
+        quantities included::
 
             1<TAB>2026-07-01<TAB>Rent
             2<TAB>2026-07-01<TAB>Netflix
@@ -465,9 +403,9 @@ def register(mcp, get_book) -> None:
           STRINGS (never raw JSON numbers). Each transaction needs
           >=2 splits balancing to zero in the default currency. Rows
           may differ in width (2 splits vs 3).
-        - The transaction currency is always the book default — for
-          a transaction denominated in another currency, use
-          ``create_transaction`` with its ``currency`` parameter.
+        - The transaction currency is the book default unless the
+          row declares one via the ``cur`` column (see
+          PER-TRANSACTION CURRENCY above).
 
         BEHAVIOR — one book-open, one atomic save:
         - A STRUCTURAL error (unbalanced, unknown account, bad pairs)
@@ -475,18 +413,43 @@ def register(mcp, get_book) -> None:
           ``on_error="skip"`` to write the good rows and reject only the
           bad ones.
         - A duplicate rejects ONLY its row; ``force=True`` overrides all
-          blocking duplicates (as in ``create_transaction``).
+          blocking duplicates.
           ``dry_run=True`` validates + screens without writing.
 
         OUTPUT — a JSON envelope of two TSV tables joined by ``ref``:
         - ``results`` (always): ``ref, status, txn_guid, dup_count,
-          reason``. status is ``created`` | ``rejected`` |
-          ``would_create`` (dry_run); reason is a code like
+          max_confidence, reason``. status is ``created`` |
+          ``rejected`` | ``would_create`` (dry_run, candidate-free
+          rows only) | ``review_required`` (dry_run rows with >=1
+          duplicate candidate — rule each against the duplicates
+          table before committing); reason is a code like
           ``duplicate_detected`` or the validation message.
-        - ``duplicates`` (only when matches exist): ``ref, confidence,
-          guid, date, amount, description, signals`` — the columns
-          ``create_transaction`` emits, keyed back to the offending
-          ``ref``. Σ(dup_count) equals the duplicates row count.
+          ``max_confidence`` (HIGH/MEDIUM/blank) is the row's top
+          duplicate candidate — enough for the common keep/drop
+          call without the join.
+        - ``duplicates`` (only when matches exist): SELF-CONTAINED
+          comparison rows, sorted strongest-correspondence first —
+          ``ref, candidate_guid, confidence, state, date_new,
+          date_old, date_delta_days, amt_new, amt_old, amt_delta,
+          cur, desc_new, desc_old, notes_old, memo_old, cat_new,
+          cat_old, split_match, signals``. ``_new`` = your proposed
+          row, ``_old`` = the existing transaction; ``cat_*`` are
+          the category (non-payment) legs as
+          ``account=amount|...``; ``split_match``
+          (exact/partial/none) compares them — MEDIUM on
+          date+amount but ``none`` on category is usually a
+          distinct purchase. Amounts are SIGNED (direction
+          matters: a deposit is not a payment's twin).
+          ``amt_delta`` is blank on cross-currency candidates
+          (``cur`` names the candidate's currency exactly when
+          the frames differ); ``memo_old`` and ``state`` blanks
+          mean this surface can't fill them. Never re-read your
+          own input — both sides are in the row.
+          Σ(dup_count) equals the duplicates row count.
+        - Dry runs additionally lead with ``summary`` (would-create/
+          review-required/rejected counts + the homework line)
+          and close with ``effects`` — the projected per-account
+          balance deltas of the rows that would land.
 
         Args:
             transactions: The TSV block described above.
@@ -498,6 +461,162 @@ def register(mcp, get_book) -> None:
         parsed = _parse_transactions_tsv(transactions)
         result = book.create_transactions(
             parsed, force=force, dry_run=dry_run, on_error=on_error,
+        )
+        return _json(result)
+
+    @mcp.tool()
+    @safe_tool
+    @audit_log(
+        classification="write", operation="enter",
+        entity_type="statement",
+    )
+    def enter_statement(
+        account: str,
+        statement_date: str,
+        opening_balance: str,
+        closing_balance: str,
+        lines: str,
+        dry_run: bool = True,
+        force_base: bool = False,
+        force_duplicates: bool = False,
+        show_all: bool = False,
+    ) -> str:
+        """Enter a COMPLETE bank/card statement in one atomic call:
+        create the new lines, claim the ones already in the book,
+        and reconcile everything against the closing balance — all
+        in one save, or nothing at all.
+
+        THE WORKFLOW (two calls around your judgment):
+
+        1. ``dry_run=true`` (the DEFAULT) — transcribe the statement
+           and get back a classification of every line: NEW (not in
+           the book), MATCH (an existing unreconciled split
+           corresponds), OVERLAP (already reconciled), AMBIGUOUS
+           (several candidates). MATCH/AMBIGUOUS rows come with the
+           candidate's full annotation (date, amount, description,
+           notes, memo, short GUID) so you can adjudicate each one.
+        2. Rule every MATCH/AMBIGUOUS row yourself, adapt
+           annotations, confirm with the user.
+        3. ``dry_run=false`` — NEW rows now carry interpreted
+           description/notes and counter-splits; MATCH rows carry
+           ``match=<split guid>`` claims. The server enters, claims,
+           reconciles every statement-touched split at
+           ``statement_date``, and saves once.
+
+        TRANSCRIBE, DON'T INTERPRET (dry-run): amounts and balances
+        go in EXACTLY as the statement prints them — for credit
+        cards too (charges positive, balance as amount owed). The
+        server applies the sign convention from the account's type;
+        you never flip a sign. The gate
+        ``opening + sum(lines) == closing`` must hold or the call
+        rejects: transcribe every line.
+
+        INPUT — ``lines`` is a TSV block. Header: ``ref, date``
+        first, then any order of ``description``, ``notes``,
+        ``raw``, ``match``, ``amount`` (required), then optional
+        ``amt, acct, memo, qty`` counter-split groups (batch
+        grammar). The statement account's own leg is SYNTHESIZED —
+        never a column. Dry-run typically needs only::
+
+            ref<TAB>date<TAB>raw<TAB>amount
+            1<TAB>2026-07-03<TAB>POS DEBIT WHOLEFDS #123<TAB>-87.12
+
+        - ``raw`` = the verbatim statement line; it lands on the
+          bank leg's memo (provenance). ``description``/``notes``
+          are your interpretation (commit).
+        - ``match`` = the split GUID this line claims instead of
+          creating (from the dry-run candidates table). Claim rows
+          may also carry ``raw`` (updates the claimed split's memo)
+          and ``notes`` (updates the transaction's notes), and END
+          at their last fixed column — they take no split cells.
+          The claimed amount must equal the line amount exactly —
+          fix the book first if they disagree.
+        - A commit row with no counter-splits auto-fills from the
+          most recent same-description 2-split transaction, adapted
+          to the line amount (marked ``auto_filled_from:<guid>``).
+          The precedent must have exactly one leg on the statement
+          account and no cross-commodity leg — anything else
+          rejects with "supply explicit counter-splits". Explicit
+          counter-splits must not name the statement account (its
+          leg is synthesized).
+
+        SAFETY: the account's reconciled balance must tie to
+        ``opening_balance`` (a prior unentered statement blocks
+        commit), every created-vs-existing exact overlap must be
+        explicitly claimed or forced, and the projected closing tie
+        is verified BEFORE anything is written. The two force
+        flags are INDEPENDENT: ``force_base=true`` lands onto an
+        untied opening base (the consequent tie discrepancy is
+        recorded, and duplicate detection STAYS ON);
+        ``force_duplicates=true`` creates past exact twins you
+        have adjudicated as distinct. Neither bypasses the
+        statement's own self-check. After the save, the reconciled
+        balance is read back and verified against the tie.
+
+        OUTPUT (dry-run): ``summary`` (class counts), ``lines``
+        (ref, class, cands, note — the note is the resolved
+        disposition: the guard's refusal coaching verbatim, the
+        auto-fill prediction, or "will claim …"), ``candidates`` —
+        SELF-CONTAINED comparison rows sorted
+        strongest-correspondence first (``ref, candidate_guid,
+        confidence, state, date_new/old + delta, amt_new/old +
+        delta, cur, desc_new/old, notes_old, memo_old, cat_new/old,
+        split_match, signals``; ``_new`` = the statement line in
+        book convention, ``_old`` = the existing split — never
+        re-read your own input; ``cur`` is structurally blank on
+        this surface), plus ``warnings`` (only when present;
+        ``candidates`` likewise) and ``tie`` — the projected
+        reconciled balance vs the closing, with a count of rows
+        this exact payload would refuse at commit. The dry-run
+        rehearses the SAME disposition procedure commit runs —
+        force included. The tie is the only verdict;
+        MATCH/AMBIGUOUS rows are yours to rule.
+        OUTPUT (commit): ``results`` (``ref, status, guid, note``;
+        status is created | claimed | skipped_duplicate, or on a
+        refused statement rejected | statement_aborted — the note
+        column carries the row's coaching and
+        ``auto_filled_from:<guid>`` markers), plus, on success
+        only, the new reconciled balance and the tie (a refusal
+        returns just ``summary`` + ``results``).
+
+        Args:
+            account: Statement account ref (path, %short, or GUID).
+                BANK/CASH/ASSET/CREDIT/LIABILITY only.
+            statement_date: The statement's closing date
+                (YYYY-MM-DD); every touched split reconciles at it.
+            opening_balance: Opening balance, exactly as printed.
+            closing_balance: Closing balance, exactly as printed.
+            lines: The TSV block described above.
+            dry_run: DEFAULT TRUE — the rehearsal is the workflow.
+            force_base: Land onto an untied opening base; the tie
+                discrepancy is recorded, twin detection stays on.
+            force_duplicates: Create past exact unclaimed twins
+                (you adjudicated them as distinct charges).
+            show_all: Dry-run only. Lines with MEDIUM/HIGH
+                candidates suppress their LOW amount-coincidences
+                (the cands column notes "+N LOW suppressed");
+                show_all=true lists everything.
+        """
+        book = get_book()
+        stmt_date = _parse_iso_date(statement_date)
+        if stmt_date is None:
+            raise ValueError(
+                f"statement_date {statement_date!r} is not a valid "
+                f"YYYY-MM-DD date"
+            )
+        parsed = _parse_statement_tsv(lines)
+        for row in parsed:
+            d = _parse_iso_date(row["date"])
+            if d is None:
+                raise ValueError(
+                    f"line {row['ref']}: date {row['date']!r} is "
+                    f"not a valid YYYY-MM-DD date"
+                )
+            row["date"] = d
+        result = book.enter_statement(
+            account, stmt_date, opening_balance, closing_balance,
+            parsed, dry_run=dry_run, force_base=force_base,
+            force_duplicates=force_duplicates, show_all=show_all,
         )
         return _json(result)
 
@@ -525,7 +644,10 @@ def register(mcp, get_book) -> None:
             field: Field to search: 'description', 'memo', 'notes', or 'amount'
             limit: Page size (default 50, max 250). 0 = count only.
             offset: 0-indexed first row to return (default 0).
-            verbose: If true, return full JSON details for each transaction.
+            verbose: If false (default), compact text output — optimized
+                for reading and token efficiency. If true, structured
+                JSON, for when you need machine-readable fields rather
+                than a report.
         """
         book = get_book()
         result = book.search_transactions(
@@ -620,7 +742,17 @@ def register(mcp, get_book) -> None:
     @safe_tool
     @audit_log(classification="write", operation="update", entity_type="account")
     def move_account(name: str, new_parent: str) -> str:
-        """Move an account to a new parent in the hierarchy.
+        """Move an account — children and balances ride along — under
+        a new parent in the hierarchy.
+
+        No transaction data changes: only the account's position
+        (and therefore every descendant's full path) is rewritten.
+        Errors, changing nothing, if either ref matches no account,
+        if the move would create a cycle (new parent is the account
+        itself or one of its descendants), or if the new parent
+        already has a child of the same name. %short GUIDs survive
+        the move; saved full paths do not. Use update_account to
+        rename in place instead of moving.
 
         Args:
             name: Account ref to move (full path e.g. "Expenses:Old:Account", %short GUID, or full 32-char GUID)
@@ -656,7 +788,7 @@ def register(mcp, get_book) -> None:
 
         Safeguards prevent deletion if a transaction has reconciled
         splits (force=true overrides) or is an invoice's posting
-        record (unpost_invoice first).
+        record (unpost_document first).
 
         Pass a LIST of GUIDs to delete several in one book open /
         one save. The batch is all-or-nothing: every guid is
@@ -675,53 +807,6 @@ def register(mcp, get_book) -> None:
             result = book.delete_transactions(guid, force=force)
         else:
             result = book.delete_transaction(guid, force=force)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="write", operation="update", entity_type="transaction")
-    def update_transaction(
-        guid: TransactionGuid | list[TransactionGuid],
-        description: str | None = None,
-        transaction_date: str | None = None,
-        splits: list[SplitInput] | None = None,
-        notes: str | None = None,
-        force: bool = False,
-    ) -> str:
-        """Update an existing transaction — or broadcast to several.
-
-        Pass a LIST of GUIDs to apply the SAME supplied values to
-        every listed transaction in one book open / one save
-        (all-or-nothing) — the batch-annotation case: one note
-        across 35 related entries, one call. ``splits`` stays
-        single-transaction. For per-row DIFFERENT values, use
-        ``update_transactions``.
-
-        Args:
-            guid: Transaction GUID (32-character hex string, or 8+ char prefix), or a list of them
-            description: New transaction description (optional)
-            transaction_date: New date in ISO format YYYY-MM-DD (optional)
-            splits: List of split updates with 'account' and 'amount' (optional).
-                    Must match existing splits by account name and balance to zero.
-                    For cross-currency splits, include 'quantity' (amount in account's commodity).
-                    Include 'memo' to set that split's memo (omit to leave it unchanged).
-                    ``amount``/``quantity`` are decimal strings (e.g. "94.87").
-            notes: New transaction notes (optional). Pass empty string to clear.
-            force: Allow modifying transactions with reconciled splits —
-                required for split changes AND for moving the date of a
-                transaction with reconciled splits (a date move shifts
-                it out of its reconciled statement period).
-        """
-        book = get_book()
-        trans_date = _parse_iso_date(transaction_date)
-        result = book.update_transaction(
-            guid=guid,
-            description=description,
-            trans_date=trans_date,
-            splits=_splits_to_dicts(splits),
-            notes=notes,
-            force=force,
-        )
         return _json(result)
 
     @mcp.tool()
@@ -745,19 +830,28 @@ def register(mcp, get_book) -> None:
             56926ac2<TAB>PayPal Credit Payment<TAB>Resolved — card payment
             7f0fc117<TAB><TAB>Netflix subscription, $22.10/mo
 
-        An EMPTY cell leaves that field UNCHANGED — this batch can
-        annotate but never clear (clearing is ``update_transaction``
-        with ``notes=""``, deliberately single-transaction). Splits
-        and memos are not updatable here (``replace_splits``).
+        An EMPTY cell leaves that field UNCHANGED. To blank a field,
+        opt in with a ``clear`` column: its cell names the fields to
+        clear on that row (``notes`` or ``description,notes``) —
+        explicit per row, so a sparse batch can never mass-erase by
+        accident. ``date`` is not clearable; a row that sets and
+        clears the same field rejects. Splits and memos are not
+        updatable here (``replace_splits``)::
+
+            guid<TAB>notes<TAB>clear
+            56926ac2<TAB>Verified subscription<TAB>
+            7f0fc117<TAB><TAB>notes
 
         One book open, one save; ``on_error="abort"`` (default)
         sinks the batch on any bad row, ``"skip"`` keeps good rows.
         Date moves on transactions with reconciled splits are
         rejected per row unless ``force=true`` (they shift the
         transaction out of its reconciled statement period).
-        Returns a results TSV keyed by your input guids. For the
-        SAME value across many transactions, ``update_transaction``
-        with a guid list is cheaper than repeating rows.
+        Returns a results TSV keyed by your input guids. This is
+        the canonical update tool for one transaction or many (the
+        former ``update_transaction`` tool was removed; this
+        replaces it — same value across many transactions = the
+        same cells repeated per row).
         """
         book = get_book()
         rows = _parse_update_tsv(updates)

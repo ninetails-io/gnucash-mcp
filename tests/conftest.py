@@ -10,6 +10,20 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 
+@pytest.fixture(autouse=True)
+def _quiet_restart_guards():
+    """Neutralize the ruling-6 restart guards for the suite.
+
+    The startup notice fires once per process and the multi-book
+    write disarm trips on fresh state — both would make test
+    outcomes depend on execution order. Tests that exercise the
+    guards re-arm these globals explicitly in their own bodies."""
+    import gnucash_mcp.server as _server
+    _server._startup_notice_pending = False
+    _server._writes_armed = True
+    yield
+
+
 @pytest.fixture
 def test_book(tmp_path: Path) -> Path:
     """Create a temporary GnuCash book with sample data.
@@ -1386,3 +1400,17 @@ def pathological_book(tmp_path: Path) -> PathologicalBook:
         usd_invoice_id=usd_invoice_id,
         eur_invoice_id=eur_invoice_id,
     )
+
+
+# Pristine inline-tool snapshot, captured at conftest import — before
+# any test on this xdist worker has run _apply_module_filter. Inline
+# tools (switch_book, get_server_config) register at server import
+# ONLY; a single-book "all" filter run by an earlier test on the same
+# worker pops switch_book permanently, breaking later multi-book
+# tests by scheduling accident. Tests that need the pristine inline
+# set restore from here.
+import gnucash_mcp.server as _srv_for_snapshot
+PRISTINE_INLINE_TOOLS = {
+    name: tool
+    for name, tool in _srv_for_snapshot.mcp._tool_manager._tools.items()
+}

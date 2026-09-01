@@ -3313,7 +3313,7 @@ class TestGetBookSummaryReconciliationSplitCount:
             f"got summary:\n{result}"
         )
         # Count appears in the line.
-        assert "splits unreconciled" in recon_line
+        assert "unreconciled" in recon_line and "net" in recon_line
         assert "oldest:" in recon_line
         # Warning marker still fires.
         assert "⚠" in recon_line
@@ -5096,7 +5096,7 @@ class TestTemplateTransactionsExcluded:
     descriptions and cadence match), training them to ignore the
     duplicate warning.
 
-    Regression for Abe's 2026-04-23 filing, which surfaced $2,485
+    Regression for the bookkeeper's 2026-04-23 filing, which surfaced $2,485
     mortgage-template MEDIUM matches against $2,850 real-world
     payments on Alex's book.
     """
@@ -5221,7 +5221,7 @@ class TestTemplateTransactionsExcluded:
 
 class TestDuplicatesTsvShape:
     """The ``duplicates`` response field is a newline-separated TSV
-    string, not a list of dicts. Abe's bookkeeper thread parses it
+    string, not a list of dicts. the bookkeeper's thread parses it
     column-wise to decide whether to retry with ``force_create=True``
     or back off — compact shape matters because a rejection often
     fires mid-conversation and the full JSON form was blowing
@@ -10910,9 +10910,12 @@ class TestMultiCurrencyDashboardHelpers:
                 name="Liabilities", type="LIABILITY", parent=bk.root_account,
                 commodity=usd, placeholder=True,
             )
+            # EUR A/P: the post account must match the bill currency
+            # (battery ruling 1); the report-time conversion under
+            # test happens on the bill's grand_total, not here.
             ap = piecash.Account(
                 name="Accounts Payable", type="PAYABLE",
-                parent=liabilities, commodity=usd,
+                parent=liabilities, commodity=eur,
             )
             expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
             office_eur = piecash.Account(
@@ -13111,3 +13114,170 @@ class TestSplitGraphPreload:
                 f"{len(statements)} SQL statements — the preload's "
                 f"strong reference has been lost"
             )
+
+
+class TestDefaultedDateEcho:
+    """Defaults resolve loudly, explicit inputs echo nothing: a
+    create_transaction that let the date default to today learns
+    which day 'today' resolved to; an explicit date echoes nothing
+    (the caller already has it)."""
+
+    def test_defaulted_date_is_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Defaulted date",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+        )
+        assert result["date"] == date.today().isoformat()
+
+    def test_explicit_date_is_not_echoed(self, test_book: Path):
+        gc_book = GnuCashBook(str(test_book))
+        result = gc_book.create_transaction(
+            description="Explicit date",
+            splits=[
+                {"account": "Expenses:Groceries", "amount": "10.00"},
+                {"account": "Assets:Checking", "amount": "-10.00"},
+            ],
+            trans_date=date(2024, 2, 1),
+        )
+        assert "date" not in result
+
+
+class TestUpdateClearColumn:
+    """The TSV ``clear`` column — the explicit opt-in that
+    empty-cell-means-unchanged deliberately forecloses. Parser
+    produces ``""`` values; the book layer already treats empty as
+    clear (notes → None, verified by _verify_transaction_state's
+    None↔"" normalization)."""
+
+    def _one(self, gc):
+        return gc.create_transaction(
+            description="Netflix via PayPal",
+            notes="investigate this",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-22.10"},
+                {"account": "Expenses:Groceries", "amount": "22.10"},
+            ],
+        )["guid"]
+
+    def test_parser_clear_emits_empty_values(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        rows = _parse_update_tsv(
+            "guid\tnotes\tclear\n"
+            "aaaa1111\tkeep me\t\n"
+            "bbbb2222\t\tnotes\n"
+            "cccc3333\t\tdescription, notes\n"
+        )
+        assert "notes" not in rows[0] or rows[0]["notes"] == "keep me"
+        assert rows[1]["notes"] == ""
+        assert rows[2]["description"] == ""
+        assert rows[2]["notes"] == ""
+
+    def test_parser_clear_only_header_is_valid(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        rows = _parse_update_tsv(
+            "guid\tclear\naaaa1111\tnotes\n"
+        )
+        assert rows[0]["notes"] == ""
+
+    def test_parser_set_and_clear_conflict_rejects(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="sets AND clears"):
+            _parse_update_tsv(
+                "guid\tnotes\tclear\naaaa1111\tnew note\tnotes\n"
+            )
+
+    def test_parser_date_not_clearable(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="not clearable"):
+            _parse_update_tsv(
+                "guid\tclear\naaaa1111\tdate\n"
+            )
+
+    def test_parser_unknown_clear_field_rejects_by_name(self):
+        from gnucash_mcp._format import _parse_update_tsv
+        with pytest.raises(ValueError, match="'memo'"):
+            _parse_update_tsv(
+                "guid\tclear\naaaa1111\tmemo\n"
+            )
+
+    def test_clear_flows_through_to_the_book(self, test_book: Path):
+        gc = GnuCashBook(str(test_book))
+        guid = self._one(gc)
+        env = gc.update_transactions([{"guid": guid, "notes": ""}])
+        rows = _parse_results_tsv(env["results"])
+        assert rows[0]["status"] == "updated"
+        assert not gc.get_transaction(guid).get("notes")
+
+
+class TestDashboardTriageRollups:
+    """The 2026-08-21 outside-model dashboard review's adopted
+    findings: warning rollups past the threshold, itemization at or
+    below it, reconciliation materiality, and the staleness-linkage
+    framing line. Counts must agree with the Scheduled line by
+    construction (shared list)."""
+
+    def test_rollup_helper_itemizes_small_lists(self):
+        msgs = ["a", "b", "c"]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=["A", "B", "C"], oldest_days=9,
+            noun="transactions", aggregate_prefix="Overdue scheduled",
+            escape_hatch="hatch",
+        )
+        assert out == msgs
+
+    def test_rollup_helper_aggregates_large_lists(self):
+        msgs = [f"m{i}" for i in range(14)]
+        names = [f"Name{i}" for i in range(14)]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=names, oldest_days=36,
+            noun="transactions", aggregate_prefix="Overdue scheduled",
+            escape_hatch="list_scheduled_transactions for all",
+        )
+        assert len(out) == 1
+        line = out[0]
+        assert "14 transactions" in line
+        assert "oldest 36 days" in line
+        assert "Name0, Name1, Name2, +11 more" in line
+        assert "list_scheduled_transactions" in line
+        # Clearance principle: homework, never a verdict.
+        assert "safe" not in line.lower()
+
+    def test_rollup_no_price_qualifier(self):
+        msgs = [f"m{i}" for i in range(5)]
+        out = GnuCashBook._rollup_warnings(
+            msgs, names=list("ABCDE"), oldest_days=40,
+            noun="commodities", aggregate_prefix="Stale prices",
+            escape_hatch="refresh", no_data_count=2,
+        )
+        assert "2 with no price on file" in out[0]
+
+    def test_staleness_note_frames_time_warnings(self, test_book: Path):
+        """A book far behind gets the linkage line FIRST, and only
+        when time-based warnings exist to frame."""
+        gc = GnuCashBook(str(test_book))
+        # Create an old scheduled transaction so an overdue warning
+        # exists, and no recent entries so the book reads behind.
+        gc.create_transaction(
+            description="Anchor",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-1.00"},
+                {"account": "Expenses:Groceries", "amount": "1.00"},
+            ],
+            trans_date=date(2024, 1, 15),
+        )
+        gc.create_scheduled_transaction(
+            name="Old Rent", description="Rent",
+            frequency="monthly", start_date="2024-02-01",
+            splits=[
+                {"account": "Assets:Checking", "amount": "-100"},
+                {"account": "Expenses:Groceries", "amount": "100"},
+            ],
+        )
+        summary = gc.get_book_summary()
+        w = [l for l in summary.splitlines() if "days behind — " in l]
+        assert w, summary
+        assert "unentered activity" in w[0]

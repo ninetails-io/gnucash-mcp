@@ -198,7 +198,13 @@ module contributes zero tools to the MCP surface.
     catalog translation of "Income" is **"Ertrag"**. So a "look up the
     localized word and match it" fix is unsafe for template-created
     accounts. `_infer_book_locale` therefore *votes* across several
-    top-level type accounts rather than trusting any one.
+    top-level type accounts rather than trusting any one. And its
+    **None means undetermined, not English** — a numbered chart
+    (SKR03/DATEV "Aufwendungen 2/4") matches no locale's words at
+    all. Cosmetic callers (leaf naming) may fall back to English on
+    None; anything that CREATES accounts must require
+    `_book_reads_english`'s affirmative match instead (ruling 4(b);
+    the bookkeeper's Sabine live-loop repro, 2026-09-01).
   - **Designated accounts self-heal via a KVP slot.** The FX and
     discount resolvers store the resolved account's GUID on the root
     account (`gnc-mcp/fx-gain-loss-acct`, etc.) on first use, then
@@ -291,6 +297,11 @@ existed.
   `book.session.add(acct)` — redundant. And `book.accounts` fullname
   lookups won't find the new account until after flush; in tests,
   keep Python references to the objects you construct.
+- **Lot constructor is OPEN** — `Lot(title=..., account=...,
+  notes=..., is_closed=0)` works directly, unlike the blocked
+  business-object constructors (see "Where the business module
+  differs"). `title`/`notes` are `pure_slot_property` — slot-stored,
+  transparently accessed.
 - **Splits**: `value` is in transaction currency, `quantity` in
   account commodity. Same-currency transactions have
   `value == quantity`. Cross-currency: value on all splits must sum
@@ -335,6 +346,8 @@ existed.
   `DetachedInstanceError`.
 - **`create_transaction()` returns a dict** with `guid` key, not a
   GUID string. `trans_date` expects a `date` object, not a string.
+- **`_split_to_dict()` uses the `"value"` key** for the
+  transaction-currency amount — not `"amount"`.
 - **Attribute names vs column names**: ORM attributes sometimes
   differ from table columns. `Split.transaction_guid` (column is
   `tx_guid`); `Account.type` (column is `account_type`). `dir(Split)`
@@ -415,6 +428,14 @@ accounts of different commodities:
   `_account_conversion_factors(book, as_of)`. Pick by report kind,
   not convenience — see the flow-vs-stock invariant above.
 - Skip `type='transaction'` prices (auto-defaults).
+- A commodity priced only through a pivot currency values via a
+  one-hop chain (provenance notes the path, e.g. `via USD`) — and
+  the chain legs obey the same market-price filter as direct
+  lookups; a `type='transaction'` rate inside the chain leaks
+  fee-laden implied rates into valuations. Both halves of this
+  rule come from Abdulla Alhosani's
+  ([@alhosani-abdulla](https://github.com/alhosani-abdulla))
+  report in issue #94.
 - Fall back to `split.value` when no market rate is on file —
   that's the transaction-currency amount, which equals cost basis
   for default-currency-denominated investment purchases and degrades
@@ -460,6 +481,18 @@ Three layers:
   zh_CN chart, multi-currency stress), and Sabine Brenner
   (EUR-default, German SKR03 chart — the i18n bug-class oracle).
 
+**Migrating tests across a behavior break.** When a change closes a
+creation path (e.g. the v1.5.0 currency-mismatch post refusal),
+migrate the affected tests by SUBJECT, not mechanically: tests
+whose subject survives the break re-route through the
+correct-practice path (the FX-staleness and tax-conversion tests
+moved to per-currency A/R); tests whose subject IS the
+now-uncreatable historical state engineer that state byte-faithfully
+via raw SQL (post through the still-open door, then flip the rows
+to what warning-era books actually hold). The state outlives the
+door that made it — real books carry it forever, so the guards that
+protect it need tests that can still construct it.
+
 Run with `uv run pytest`. Per-phase synthetic-book rebuild:
 `uv run python scripts/synthetic_book/phase_<N>.py` in order. Each
 phase backs up the book before running.
@@ -489,6 +522,35 @@ For live verification against a personal GnuCash book, ensure
   the PR conversation tab clean. `--dry-run` previews; `--all`
   resolves regardless of author for the rare case a human
   reviewer leaves threads open after agreeing in chat.
+
+### Git safety (added 2026-08-29, paid for twice that same day)
+
+This working tree is dirty BY DESIGN — sample-book drift is never
+staged, and CLAUDE.md may carry uncommitted additions between doc
+commits. The M flags become wallpaper, which is exactly when a
+history operation destroys real work. Rules:
+
+- **Never run `reset --hard`, `restore`, or `checkout` over
+  modified paths without `git stash push` first** (or a verified
+  clean `git status`). No exceptions for "routine" surgery — the
+  two incidents were both routine.
+- **Prefer constructions that never need a reset.** To move a
+  commit between branches: create the new branch at the commit
+  FIRST (`git branch new <sha>`), or `cherry-pick` onto a branch
+  made from the right base — then remove it from the source with
+  the tree stashed. To undo a commit, prefer `revert`.
+- **Commit your own work the moment it exists.** Uncommitted work
+  is the only kind a reset can kill. Docs drafts, spec edits,
+  scratch analyses — commit them to the branch they belong to
+  immediately; reword later with the tree clean.
+- **Recovery, when prevention fails:** `git fsck --unreachable`
+  lists staged-then-lost blobs (`git cat-file blob <sha>` recovers
+  them); session transcripts may hold diff output naming blob
+  hashes; macOS local APFS snapshots
+  (`tmutil listlocalsnapshots /`) live on the internal disk and
+  survive a dead backup target.
+- **Verify pushes with `git ls-remote`**, never a piped push (the
+  pipeline's exit code is the pipe's, not push's).
 
 ### Staging
 
@@ -534,16 +596,33 @@ For live verification against a personal GnuCash book, ensure
    capture-rig-invalidating event. For before/after report
    verification, capture against the committed books at HEAD (or
    generate locally and capture both sides same-machine).
+   **The market-data cache IS refreshed per release** (standing as
+   of v1.4.4): `uv run python scripts/synthetic_book/market_data.py
+   --refresh --through <release date>` and commit the updated
+   `market_data_cache.json` — CI's demo-book continuation and every
+   clone-side `continue_book.py` run read it, and a stale cache
+   caps how current the living demo books can be.
 4. Tester/bookkeeper signoff on develop.
-5. **Version bump LAST** — one commit: `pyproject.toml`,
+5. **Satisfy Dependabot** — Dependabot scans only the default
+   branch, so open alerts persist until a release lands; clearing
+   them mid-cycle is invisible, clearing them here makes the
+   release ship with a clean scan. Check
+   `gh api repos/ninetails-io/gnucash-mcp/dependabot/alerts?state=open`,
+   upgrade flagged packages in the lockfile
+   (`uv lock --upgrade-package <name>`), and run the test suite
+   against the refreshed lock. Most alerts here are transitive
+   and unexploitable (stdio server, no network surface) — fix
+   them anyway; the badge on a financial tool's repo costs more
+   than the bump.
+6. **Version bump LAST** — one commit: `pyproject.toml`,
    `__init__.py`, and a fresh `uv lock` staging `uv.lock`. The
    lockfile records the project's own version; a bump without the
    re-lock ships a lockfile that contradicts the release (v1.4.1
    did; it breaks `uv sync --locked`/`--frozen` consumers such as
    CI and bundle builds). Version numbering and timing are the
    maintainer's call.
-6. Release PR `develop` → `main`; merge on the maintainer's go.
-7. Annotated tag, push verified with `git ls-remote` (never trust
+7. Release PR `develop` → `main`; merge on the maintainer's go.
+8. Annotated tag, push verified with `git ls-remote` (never trust
    a piped push).
 
 ---
