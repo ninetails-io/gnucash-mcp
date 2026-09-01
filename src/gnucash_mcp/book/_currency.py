@@ -133,18 +133,23 @@ def _to_date(dt: date | datetime) -> date:
 # The two sources a deliberate manual quote arrives under:
 # ``user:price`` from create_price, ``user:price-editor`` from
 # GnuCash's editor. An EXPLICIT allowlist — ``user:market-data`` is
-# deliberately feed-ranked despite the prefix.
+# deliberately feed-ranked despite the prefix, so it needs its own
+# explicit demotion below the generic ``user:*`` tier.
 _MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
+_FEED_PRICE_SOURCES = frozenset({"user:market-data"})
 
 
 def _price_source_rank(source: str | None) -> int:
     """Three-tier source rank for same-date ties: 2 = known manual
     quote, 1 = other ``user:*`` (an explicit operator act, but one
     that shouldn't silently override a deliberate manual edit),
-    0 = feeds and everything else."""
+    0 = feeds and everything else — including ``user:market-data``,
+    which is feed-ranked by name despite the prefix."""
     source = source or ""
     if source in _MANUAL_PRICE_SOURCES:
         return 2
+    if source in _FEED_PRICE_SOURCES:
+        return 0
     if source.startswith("user:"):
         return 1
     return 0
