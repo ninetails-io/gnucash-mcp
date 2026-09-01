@@ -53,10 +53,17 @@ on GitHub — that number belongs to a registry-side rebuild.)
 **One-click install (#153).**
 
 - The MCPB bundle: download, double-click, and Claude Desktop runs
-  the server — book file picker, persona checkboxes, demo books
-  behind one checkbox. Built and attached by the project's first CI
-  (locked tests on Python 3.10 and 3.13, bundle artifact on every
-  PR); validated end-to-end through a real Desktop install.
+  the server — book file picker, demo books behind one checkbox.
+  Built and attached by the project's first CI (locked tests on
+  Python 3.10 and 3.13, bundle artifact on every PR); validated
+  end-to-end through a real Desktop install.
+- The installer asks ONE module question: "Do you invoice
+  clients?" Budgets, scheduled transactions, and investment
+  tracking proved too common a need to gate behind checkboxes —
+  they're always on now (even a 401(k) wants the portfolio
+  surface). The business suite is the only genuinely optional
+  branch, and the Advanced field remains the full `--modules`
+  escape hatch.
 
 **A surface that tells the truth about itself.**
 
@@ -109,6 +116,12 @@ replacement needs no deprecation grace period. Two moves:
   can never mass-erase by accident) to close the last gap first.
   `create_transactions` and `update_transactions` are canonical
   for one transaction or many.
+- **The backup store is append-only from the model's side**:
+  `list_backups` and `prune_backups` removed (88 → 86). The safety
+  net exists to survive model mistakes; no tool may enumerate or
+  shrink it. Automatic staged retention keeps running internally,
+  `create_backup` stays, and reviewing or deleting backups is the
+  human's filesystem operation.
 
 Validated by a live bookkeeper-style pass on the sample books:
 full invoice, bill (partial pay), credit-note (apply), and

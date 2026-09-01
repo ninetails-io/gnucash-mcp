@@ -15,10 +15,13 @@ Follow these steps with a text editor or terminal, not via Claude.
 
 You'll need:
 - Your backup file — typically at
-  `{book_path}.mcp/backups/{book}-{timestamp}-{stage}.gnucash`. Use
-  the `list_backups` MCP tool (before anything goes wrong) to see
-  what's available. Once you're in a recovery situation, you can
-  look at that directory directly via Finder / `ls`.
+  `{book_path}.mcp/backups/{book}-{timestamp}-{stage}.gnucash`.
+  Look at that directory directly via Finder / `ls` — filenames
+  carry a UTC timestamp and the retention stage. (There is
+  deliberately no MCP tool that lists or deletes backups: the
+  store is append-only from the model's side, so the safety net
+  can't be enumerated or shrunk by a confused or manipulated
+  session.)
 - Your live book path — typically from the `GNUCASH_BOOK_PATH`
   environment variable in your MCP client config. Example:
   `/Users/stephen/Finances/books.gnucash`.

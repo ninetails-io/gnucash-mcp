@@ -184,11 +184,12 @@ TOOL_MODULES: dict[str, list[str]] = {
         "get_audit_log",
     ],
     "backup": [
-        # Manual control surface; the auto-snapshot hook is
-        # always-on regardless.
+        # On-demand snapshot only; the auto-snapshot hook and staged
+        # retention are always-on regardless. The store is APPEND-ONLY
+        # from the model's side by design — no tool lists or deletes
+        # backups (the safety net must survive model mistakes;
+        # list_backups/prune_backups were removed for exactly that).
         "create_backup",
-        "list_backups",
-        "prune_backups",
     ],
     "balance_sheet": [
         # THE canonical report; analytical reports stay in
@@ -1447,11 +1448,17 @@ def _parse_cli_argv(
 # host app. Values map to module/group names in TOOL_MODULES /
 # MODULE_GROUPS ("planning" spans two leaf modules).
 _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
-    "GNUCASH_ENABLE_PLANNING": ("budgets", "scheduling"),
-    "GNUCASH_ENABLE_INVESTMENTS": ("investor",),
-    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
     "GNUCASH_ENABLE_BUSINESS": ("business",),
 }
+
+# The bundle base: what every install gets before the one question.
+# Planning and investments joined it 2026-08-31 (maintainer ruling:
+# too common a need to gate — even a 401(k) wants the portfolio
+# surface, and budgets/scheduling are too small a set to be worth an
+# installer decision). The retired GNUCASH_ENABLE_PLANNING /
+# _INVESTMENTS / _FREELANCER variables are ignored if present — an
+# old install's stored config must not subtract from the new base.
+_ENV_TOGGLE_BASE = ("reporting", "budgets", "scheduling", "investor")
 
 
 def _modules_from_env_toggles() -> str | None:
@@ -1459,17 +1466,18 @@ def _modules_from_env_toggles() -> str | None:
 
     Returns None when no toggle variable is present at all, so CLI
     and GNUCASH_MCP_MODULES users (and the core-only default) are
-    untouched. When any toggle is present, the selection is
-    ``reporting`` plus every enabled toggle's modules — core is
-    force-added downstream by _apply_module_filter, matching the
-    bundle design where core + reporting are always on.
+    untouched. When a toggle is present, the selection is the bundle
+    base (reporting + planning + investor) plus every enabled
+    toggle's modules — core is force-added downstream by
+    _apply_module_filter, matching the bundle design where the base
+    surface is always on and business is the one question.
 
     Raises ValueError on an unparseable value: a typo'd toggle must
     not silently serve the wrong tool surface.
     """
     if not any(v in os.environ for v in _ENV_MODULE_TOGGLES):
         return None
-    selected: list[str] = ["reporting"]
+    selected: list[str] = list(_ENV_TOGGLE_BASE)
     for var, modules in _ENV_MODULE_TOGGLES.items():
         if _parse_env_toggle(var):
             selected.extend(modules)
@@ -1566,12 +1574,13 @@ Environment variables:
                              (switch_book matches by name).
   GNUCASH_MCP_MODULES        Tool modules to load — same values as
                              --modules (e.g. "bookkeeper" or "core,reporting")
-  GNUCASH_ENABLE_PLANNING    Boolean module toggles (true/false) — the
-  GNUCASH_ENABLE_INVESTMENTS interface the MCPB bundle's checkboxes use.
-  GNUCASH_ENABLE_FREELANCER  When any is set, modules = core + reporting
-  GNUCASH_ENABLE_BUSINESS    plus each enabled toggle's modules (planning
-                             = budgets + scheduling; investments =
-                             investor; business supersedes freelancer).
+  GNUCASH_ENABLE_BUSINESS    Boolean (true/false) — the MCPB bundle's one
+                             module question ("Do you invoice clients?").
+                             When set, modules = core + reporting +
+                             budgets + scheduling + investor, plus the
+                             business suite when true. The retired
+                             _PLANNING/_INVESTMENTS/_FREELANCER toggles
+                             are ignored (that surface is now always on).
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
   GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)

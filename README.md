@@ -453,9 +453,8 @@ for the rollback procedure.
 > timestamps (filesystem-safe and unambiguous across travel
 > and DST); audit and debug logs use *local-dated* daily
 > files, matching how you'd search for "what happened
-> Tuesday." Near midnight these can differ by a day — the
-> `list_backups` tool always reports both the ISO timestamp
-> and a human age, so prefer it over eyeballing filenames.
+> Tuesday." Near midnight these can differ by a day — keep
+> that in mind when matching a backup to a day's log.
 
 **Reconciled splits are protected.** The server refuses to
 delete or modify reconciled splits without an explicit
