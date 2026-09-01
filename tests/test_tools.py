@@ -1332,6 +1332,37 @@ class TestConsolidatedBusinessSurface:
         ))
         assert result["status"] == "deleted"
 
+    def test_create_document_refuses_inapplicable_params(
+        self, setup_book_env,
+    ):
+        """Release-review finding 3: applies_to_id and job_id are
+        declared for every document_type but only some branches
+        forward them — a supplied-but-inapplicable value must
+        refuse loudly, never silently evaporate."""
+        c = json.loads(server_module.create_party(
+            party_type="customer", name="Scoped Params LLC",
+        ))
+        e = json.loads(server_module.create_party(
+            party_type="employee", name="Casey Scoped",
+        ))
+        err = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+            applies_to_id="000001",
+        ))
+        assert err["error_type"] == "validation_error"
+        assert "credit_note" in err["error"]
+        err = json.loads(server_module.create_document(
+            document_type="voucher", owner_id=e["id"],
+            job_id="000001",
+        ))
+        assert err["error_type"] == "validation_error"
+        assert "job" in err["error"]
+        # The applicable combinations still work.
+        ok = json.loads(server_module.create_document(
+            document_type="invoice", owner_id=c["id"],
+        ))
+        assert ok.get("error") is None, ok
+
     def test_delete_document_credit_note_id_collision(
         self, setup_book_env,
     ):

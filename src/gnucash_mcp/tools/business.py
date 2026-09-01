@@ -489,6 +489,26 @@ def register(mcp, get_book) -> None:
                 target differs from this link).
         """
         document_type = _gate_document_type(document_type)
+        # Type-scoped parameters refuse loudly when inapplicable.
+        # These are DECLARED parameters, so extra="forbid" can't
+        # catch them — without this check a supplied value would be
+        # silently dropped by the dispatch below (the silent-kwarg
+        # loss class the forbid work exists to kill).
+        if applies_to_id is not None and document_type != "credit_note":
+            raise ValueError(
+                f"applies_to_id only applies to "
+                f"document_type='credit_note' — a {document_type} "
+                f"cannot link a document it reverses. Omit it, or "
+                f"create a credit_note."
+            )
+        if job_id is not None and document_type not in (
+            "invoice", "bill",
+        ):
+            raise ValueError(
+                f"job_id only applies to invoices and bills — a "
+                f"{document_type} cannot be grouped under a job. "
+                f"Omit job_id."
+            )
         book = get_book()
         if document_type == "credit_note":
             if party_type is None:
