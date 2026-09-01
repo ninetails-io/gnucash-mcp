@@ -612,6 +612,30 @@ class BusinessMixin:
                 )
             return fx_acct, _ambiguity_notice(fx_acct.fullname)
 
+        # Past this point the resolver CREATES — same fail-safe rule
+        # as the discount resolver (ruling 4(b)), with one deliberate
+        # difference: a DETERMINED foreign locale still creates,
+        # because every vote-determinable locale ships an fx_gain_loss
+        # translation (§6.3) and gets its own-language leaf. The hole
+        # is the UNDETERMINED chart (DATEV/SKR03 numbered top-levels
+        # infer None) — there the English fallback leaf would land in
+        # a non-English ledger and be permanently designated. None
+        # means undetermined, not English: require the affirmative
+        # read before creating in English.
+        locale = self._infer_book_locale(book)
+        if locale is None and not self._book_reads_english(book):
+            raise ValueError(
+                f"No realized FX gain/loss account is designated on "
+                f"this book, and auto-creating the English default "
+                f"({self.FX_GAIN_LOSS_PATH!r}) is unsafe: the chart "
+                f"does not affirmatively read as English (locale "
+                f"undetermined — numbered or custom top-level "
+                f"account names). Pass fx_account with the account "
+                f"that should absorb realized FX gain/loss (a "
+                f"non-placeholder INCOME or EXPENSE account "
+                f"denominated in the book default currency)."
+            )
+
         # Resolve the parent by TYPE, not the English name "Income".
         # On a localized book the income root is "Erträge"/"Ingresos"/…,
         # so _find_account(book, "Income") returns None and the old
