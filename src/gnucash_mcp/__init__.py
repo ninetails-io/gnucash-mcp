@@ -12,5 +12,5 @@ _apply_advanced_env()
 from gnucash_mcp.book import GnuCashLockError
 from gnucash_mcp.server import main
 
-__version__ = "1.4.2"
+__version__ = "1.4.4"
 __all__ = ["main", "GnuCashLockError"]
