@@ -117,6 +117,13 @@ def _verify(book: _Book, path: Path, through: date) -> None:
                 f"{path.name}: latest activity {latest} is more than "
                 f"45 days before {through} — timeline didn't extend?"
             )
+        if latest > through:
+            raise SystemExit(
+                f"{path.name}: latest activity {latest} is AFTER "
+                f"{through} — a generator leaked future-dated "
+                f"transactions (month-iterating stream missing its "
+                f"through-clamp?)"
+            )
         print(f"   ok: {count} txns, {cur}, latest activity {latest}")
     finally:
         gc_book.close()

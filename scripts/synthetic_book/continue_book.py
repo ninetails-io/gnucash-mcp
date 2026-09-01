@@ -84,7 +84,14 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
     n = mod.extend_prices(book_path, cutoff, through)
     print(f"   prices: {n} new rows")
 
-    txns = [t for t in mod.continuation_txns(through) if t["date"] > cutoff]
+    # Clamp BOTH ends: > cutoff (the frozen prefix) and <= through.
+    # The upper clamp is load-bearing — a month-iterating generator
+    # emits the whole month once it's touched, so a through early in
+    # a month would otherwise write future-dated transactions (CI
+    # caught this the first time a run crossed UTC midnight: Sabine
+    # grew a September of activity on September 1st).
+    txns = [t for t in mod.continuation_txns(through)
+            if cutoff < t["date"] <= through]
     n = mod.write_bulk(book_path, txns)
     print(f"   streams: {n} transactions")
 

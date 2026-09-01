@@ -347,7 +347,8 @@ def run_investments(out_path: Path, since: date | None = None) -> int:
         etf, bank = acct[ETF], acct[BANKKONTO]
         cost = D("1200.00")
         for first in iter_months():
-            if day_in(first, 6) <= cut:
+            buy_day = day_in(first, 6)
+            if buy_day <= cut or buy_day > THROUGH:
                 continue
             price = etf_price(first)
             units = (cost / price).quantize(D("0.0001"), ROUND_HALF_UP)
@@ -722,6 +723,11 @@ def run_edge(out_path: Path) -> None:
 
 
 def write_bulk(out_path: Path, txns: list[dict]) -> int:
+    # Sabine's generators iterate MONTHS and emit each month whole, so
+    # this is the module's clamp: nothing dated past THROUGH may land
+    # (a through early in a month would otherwise write the rest of
+    # that month as future-dated activity).
+    txns = [t for t in txns if t["date"] <= THROUGH]
     book = piecash.open_book(str(out_path), readonly=False, do_backup=False)
     n = 0
     try:
