@@ -1,7 +1,7 @@
 # 1.2.1 Patch Spec: Three Bug Fixes
 
 **Priority:** Ship with 1.2.1 release
-**Source:** Abe (bookkeeper audit) + Cowork (field report §2.4, §3.1, §2.6)
+**Source:** the bookkeeper's audit + Cowork (field report §2.4, §3.1, §2.6)
 **Test against:** Both alex.chen-morales.gnucash and lin.wei.gnucash
 
 ---

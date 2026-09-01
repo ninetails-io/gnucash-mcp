@@ -5096,7 +5096,7 @@ class TestTemplateTransactionsExcluded:
     descriptions and cadence match), training them to ignore the
     duplicate warning.
 
-    Regression for Abe's 2026-04-23 filing, which surfaced $2,485
+    Regression for the bookkeeper's 2026-04-23 filing, which surfaced $2,485
     mortgage-template MEDIUM matches against $2,850 real-world
     payments on Alex's book.
     """
@@ -5221,7 +5221,7 @@ class TestTemplateTransactionsExcluded:
 
 class TestDuplicatesTsvShape:
     """The ``duplicates`` response field is a newline-separated TSV
-    string, not a list of dicts. Abe's bookkeeper thread parses it
+    string, not a list of dicts. the bookkeeper's thread parses it
     column-wise to decide whether to retry with ``force_create=True``
     or back off — compact shape matters because a rejection often
     fires mid-conversation and the full JSON form was blowing

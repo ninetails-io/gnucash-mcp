@@ -128,6 +128,6 @@ list_accounts()  # Should show new account
 
 ---
 
-*Spec written by Abe Raham, The Accountant*
+*Spec written by the bookkeeper*
 *For: Claude Code*
 *Date: 2026-01-30*

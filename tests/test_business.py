@@ -10627,7 +10627,7 @@ class TestPhase4DVendorSpendingCompact:
         )
         assert "vendors" in result
         assert "totals" in result
-        # ``period`` was the input echo Abe flagged for removal — it
+        # ``period`` was the input echo the bookkeeper flagged for removal — it
         # duplicated the dates the caller already had.
         assert "period" not in result
 

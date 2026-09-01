@@ -112,7 +112,7 @@ count error and corrected it.
 2. Wire-surface capture before/after (scratchpad JSON diff — the
    pattern used for the annotations branch): new surface counts
    verified, legacy module verified absent by default.
-3. Bookkeeper (Abe) round on the new names — he is ONE persona
+3. Bookkeeper round on the new names — he is ONE persona
    (books + testing + specs); test plan into specs/v1.5/testing/.
 4. Cross-model battery COLD against consolidated names (reuse
    testing/CROSS_MODEL_BATTERY_2026_08_05.md structure; foreign

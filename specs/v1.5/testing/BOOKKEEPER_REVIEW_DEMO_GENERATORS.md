@@ -8,7 +8,7 @@ Sabine's summary now opens with `⚠ Stale price: IWDA.AS last updated 31 days a
 
 **Ask:** date each commodity's final generated price at generation date (or generation-date minus 0–2 days) so a fresh bundle opens warning-free, and the stale-price warning appears only when a book has genuinely aged — at which point it's a *feature* (it hands the first conversation "want me to fetch fresh quotes?" as a hook).
 
-Reviewer: Abe VI (household bookkeeper), via `get_book_summary` on all three regenerated books.
+Reviewer: the household bookkeeper, via `get_book_summary` on all three regenerated books.
 Verdict: **ship-worthy after item 1.** Items 2–3 are nits; 4 is optional parity.
 
 The books are three financial cultures, not one book translated — keep that. Data range rolling to today is exactly right.
@@ -58,7 +58,7 @@ Sabine carries no scheduled transactions and no budget; Alex and Lin Wei have bo
 
 ## Signoff (2026-08-31, same day)
 
-All four items addressed and re-verified on the live books. Abe VI:
+All four items addressed and re-verified on the live books. The bookkeeper:
 "Balance sheets, trajectories, and the cultural texture all held
 steady through the fixes — surgical changes, nothing sanded off. The
 demo fleet is ship-ready. Three well-kept households, each with a
