@@ -1560,12 +1560,19 @@ def _parse_cli_argv(
     return book_args, debug_flag, noaudit_flag, modules_value
 
 
-# The MCPB bundle's only module interface: each manifest checkbox
-# lands as one of these env vars, rendered "true"/"false" by the
-# host app. Values map to module/group names in TOOL_MODULES /
-# MODULE_GROUPS ("planning" spans two leaf modules).
+# The MCPB bundle's module interface: each manifest checkbox lands
+# as one of these env vars, rendered "true"/"false" by the host app.
+# Values map to module/group names in TOOL_MODULES / MODULE_GROUPS.
+# GNUCASH_ENABLE_BUSINESS is the only var the CURRENT manifest sets
+# (the one question). GNUCASH_ENABLE_FREELANCER is retired from the
+# manifest but still HONORED: unlike planning/investments, the
+# freelancer surface did NOT join the always-on base, so ignoring a
+# stored freelancer=true would subtract the invoicing tools from an
+# old install (release-review finding 4 — a pre-#163 bundle install
+# that answered freelancer=yes, business=no must keep its surface).
 _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
     "GNUCASH_ENABLE_BUSINESS": ("business",),
+    "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
 }
 
 # The bundle base: what every install gets before the one question.
@@ -1573,8 +1580,8 @@ _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
 # too common a need to gate — even a 401(k) wants the portfolio
 # surface, and budgets/scheduling are too small a set to be worth an
 # installer decision). The retired GNUCASH_ENABLE_PLANNING /
-# _INVESTMENTS / _FREELANCER variables are ignored if present — an
-# old install's stored config must not subtract from the new base.
+# _INVESTMENTS variables are ignored if present — their surfaces are
+# in the base, so an old install's stored config cannot subtract.
 _ENV_TOGGLE_BASE = ("reporting", "budgets", "scheduling", "investor")
 
 
@@ -1696,8 +1703,11 @@ Environment variables:
                              When set, modules = core + reporting +
                              budgets + scheduling + investor, plus the
                              business suite when true. The retired
-                             _PLANNING/_INVESTMENTS/_FREELANCER toggles
-                             are ignored (that surface is now always on).
+                             _PLANNING/_INVESTMENTS toggles are ignored
+                             (their surface is now always on); the
+                             retired _FREELANCER toggle is still honored
+                             (its invoicing surface is NOT in the base,
+                             so old freelancer-only installs keep it).
                              --modules / GNUCASH_MCP_MODULES win when set.
   GNUCASH_MCP_DEBUG=true     Enable debug logging (true/1/yes/on)
   GNUCASH_MCP_NOAUDIT=true   Disable audit logging (true/1/yes/on)
