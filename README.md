@@ -150,7 +150,37 @@ what's in each.
 
 ---
 
-## Quick Start (5 minutes)
+## Quick Start
+
+### The one-click way (Claude Desktop)
+
+Download **`gnucash-mcp.mcpb`** from the
+[latest release](https://github.com/ninetails-io/gnucash-mcp/releases/latest)
+and double-click it. Claude Desktop installs the server — no
+terminal, no config file, no Python. The installer asks three
+things:
+
+- **Your GnuCash book(s)** — a file picker. Books must be in
+  SQLite format; if yours is the older XML format, do the
+  [one-time conversion](#one-time-conversion-gnucash-file-format)
+  first. Pick several books to switch between them in-chat.
+- **Demo books** — one checkbox serves the three sample books
+  described above, so you can explore on fictional money before
+  (or instead of) connecting your own.
+- **"Do you invoice clients?"** — yes adds the business suite
+  (customer invoices, vendor bills, employee expenses).
+  Everything else — budgets, scheduled transactions, investment
+  tracking — is always on.
+
+That's the entire install. Skip ahead to
+[step 4](#4-try-it) to take it for a spin.
+
+### The manual way (any MCP client, or development)
+
+The path below gives you an updatable git-clone install — for
+Claude Desktop without the bundle, for
+[other AI clients](#other-ai-clients), or for hacking on the
+server itself.
 
 ### 1. Download and install
 
@@ -208,7 +238,7 @@ Use the **full path** to the command: GUI apps launch without
 your shell's PATH, so a bare `gnucash-mcp` may not resolve even
 though it works in your terminal. (`uv tool dir --bin` prints
 the right directory if yours differs.) `--modules=all` loads
-every tool (111 of them) so you can poke at anything. Once you
+every tool (86 of them) so you can poke at anything. Once you
 know what you actually use, narrow it — see
 [choosing a module set](#choosing-a-module-set) below.
 
@@ -503,7 +533,7 @@ its capstone, and rehearsal spreads to every consequential write:
   line classified with side-by-side evidence, and a projected
   balance tie that guarantees a rehearsal that ties is a commit
   that will tie. No half-landed months, ever.
-- **Rehearsal everywhere** — `pay_invoice` gains `dry_run`
+- **Rehearsal everywhere** — `pay_document` gains `dry_run`
   (proposed splits, FX and discount treatment, projected balance,
   zero writes), and batch entry's dry-run shows self-contained
   duplicate comparisons with a `review_required` status that
@@ -516,7 +546,7 @@ its capstone, and rehearsal spreads to every consequential write:
   says so), strict CLI arguments, a defined status vocabulary,
   and a debt plan that names every debt it had to leave out.
 - **The un-blooming, completed in one release** — the tool
-  surface peaked at 111 and ships at 88: the business surface
+  surface peaked at 111 and ships at 86: the business surface
   consolidated (48 tools → 27, one polymorphic family per verb),
   and the batch tools are now THE entry/update tools (the
   singular create/update removed at full capability parity).
@@ -572,7 +602,7 @@ Batch entry grows up, driven by the bookkeeper's daily workflow:
   one call, one save, all-or-nothing.
 - **Every annotation field reachable** — notes + action on
   invoice/bill/voucher/credit-note line items, a payment memo on
-  `pay_invoice`, account notes (shared with GnuCash desktop's
+  `pay_document`, account notes (shared with GnuCash desktop's
   editor), and scheduled transactions that actually keep their
   description.
 - **Find accounts without paging** — `query` on `list_accounts`
