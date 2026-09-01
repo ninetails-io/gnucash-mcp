@@ -118,6 +118,9 @@ HSBC_CARD = "负债:信用卡:汇丰港币信用卡"
 MORTGAGE = "负债:贷款:房屋贷款"
 AUTO_LOAN = "负债:贷款:汽车贷款"
 AP = "负债:应付账款"
+# USD payables subledger — same per-currency pattern as AR_USD/AR_EUR.
+# Created lazily by run_business (the frozen prefix predates it).
+AP_USD = "负债:应付账款（美元）"
 
 OPENING = "所有者权益:期初余额"
 
@@ -1945,22 +1948,41 @@ def run_business(book: GnuCashBook, since: date | None = None) -> dict:
                  f"{date(YEAR, m, 1).strftime('%Y年%m月')} 工位租赁",
                  EXP_COWORKING, "CNY")
 
-    # JetBrains US$249 — the foreign-currency PAYABLE regression case (M2).
-    # RE-DATED to a recent month (the 1st of THROUGH's month, which carries a
-    # USD/CNY monthly snapshot) and left OUTSTANDING (pay=False) so it reads
-    # as a current payable, not apparent corruption. Posted to the CNY-only
-    # ``Liabilities:Accounts Payable``: the USD bill currency drives the A/P
-    # split — its VALUE is USD (txn currency), its QUANTITY the CNY equivalent
-    # at the real USD/CNY rate on the post date. vendor_spending_report
-    # converts off the bill currency regardless of the A/P account commodity,
-    # so M2 coverage holds without a USD-denominated A/P account.
+    # JetBrains US$249 — the foreign-currency PAYABLE case (M2).
+    # RE-DATED to a recent month (the 1st of THROUGH's month, which
+    # carries a USD/CNY monthly snapshot) and left OUTSTANDING
+    # (pay=False) so it reads as a current payable, not apparent
+    # corruption. Posted to the USD A/P subledger: post_invoice
+    # refuses a document/post-account commodity mismatch since
+    # v1.5.0 (battery ruling 1 — per-currency payables are correct
+    # practice, and the demo models it). Reports convert the USD
+    # balance at report time, so M2's foreign-currency-payable
+    # coverage holds; any warning-era mismatched postings in the
+    # frozen prefix remain as old-book coverage.
     jetbrains_post = recent_open
     jetbrains_bill_id = None
     if "JetBrains" not in open_owner_names:
+        # Lazy-create the subledger: the frozen prefix predates it,
+        # and a fresh full build needs it too.
+        try:
+            existing = book.get_account(AP_USD)
+        except Exception:
+            existing = None
+        if not existing:
+            try:
+                book.create_account(
+                    name=AP_USD.split(":")[-1],
+                    account_type="PAYABLE",
+                    parent="负债",
+                    commodity="USD",
+                )
+            except ValueError as e:
+                if "already exists" not in str(e).lower():
+                    raise
         jetbrains_bill_id = run_bill(
             jetbrains["id"], jetbrains_post, jetbrains_post, "249",
             "JetBrains All Products Pack (annual subscription)",
-            EXP_SOFTWARE, "USD", pay=False, post_account=AP,
+            EXP_SOFTWARE, "USD", pay=False, post_account=AP_USD,
         )
 
     counts["jetbrains_bill_id"] = jetbrains_bill_id
