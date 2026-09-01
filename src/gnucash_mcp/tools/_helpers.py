@@ -223,8 +223,8 @@ def _splits_to_dicts(
     contract — so ``"quantity" in split`` and ``split.get("memo", "")``
     keep behaving the way they did when splits arrived as loose dicts.
 
-    ``None`` passes through unchanged (auto-fill path in
-    ``create_transaction``).
+    ``None`` passes through unchanged (the auto-fill path's
+    omitted-splits contract).
     """
     if splits is None:
         return None

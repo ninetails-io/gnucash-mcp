@@ -4560,7 +4560,7 @@ class CoreMixin:
                 f"{s.quantity}, but the line says {ln['amount']} "
                 f"as printed ({book_amount} in book convention) — "
                 f"wrong split, or fix the book entry first "
-                f"(update_transaction), then claim it"
+                f"(update_transactions), then claim it"
             )
         if s.reconcile_state == "y":
             return s, "overlap"

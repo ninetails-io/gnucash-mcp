@@ -387,8 +387,9 @@ def register(mcp, get_book) -> None:
         Additive: the lot starts open with no splits attached, and
         nothing else in the book changes. A lot groups one purchase
         with its later sales so cost basis and capital gain compute
-        per purchase. The full flow: create_lot → create_transaction
-        (the buy) → assign_split_to_lot → calculate_lot_gain; the
+        per purchase. The full flow: create_lot →
+        create_transactions (the buy, a one-row batch) →
+        assign_split_to_lot → calculate_lot_gain; the
         lot auto-closes when its assigned splits net to zero shares.
         Errors if the account ref matches nothing. Skip this tool
         when you only want a valuation — get_book_summary and
@@ -478,7 +479,8 @@ def register(mcp, get_book) -> None:
 
         Workflow:
             1. create_lot("Assets:VTSAX", "VTSAX Jan 2026")
-            2. create_transaction(...buy 10 shares...)
+            2. create_transactions(...one-row batch buying 10
+               shares, qty column on the investment leg...)
             3. assign_split_to_lot(investment_split_guid, lot_guid)
         """
         book = get_book()
