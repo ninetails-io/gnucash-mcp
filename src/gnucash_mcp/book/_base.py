@@ -1464,8 +1464,14 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             and self._split_prefix_cache[0] == mtime_ns
         ):
             return self._split_prefix_cache[1]
+        # One indexed query for the guid column — the relationship
+        # walk (book.transactions → t.splits) lazy-loaded one splits
+        # collection PER TRANSACTION on every cold cache, i.e. after
+        # every book write (release-review finding 8's third head).
+        from piecash.core.transaction import Split
+
         prefix_map = _guid_prefix_map(
-            s.guid for t in book.transactions for s in t.splits
+            guid for (guid,) in book.session.query(Split.guid)
         )
         self._split_prefix_cache = (mtime_ns, prefix_map)
         return prefix_map
