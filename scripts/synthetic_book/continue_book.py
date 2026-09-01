@@ -80,6 +80,7 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
         print(f"   schedules: {sx}")
         return 0
     print(f"── Continuing {persona}: ({cutoff} → {through}] at {book_path}")
+    prefix_rows = continuation.prefix_txn_count(book_path, cutoff)
 
     n = mod.extend_prices(book_path, cutoff, through)
     print(f"   prices: {n} new rows")
@@ -127,6 +128,17 @@ def continue_persona(persona: str, book_path: Path, through: date) -> int:
                                               through)
     for w in warnings:
         print(f"   WARN: {w}")
+
+    # The core continuation invariant, checked independently of the
+    # passes that must uphold it: the frozen prefix's row count may
+    # never change. Fails the run (and CI) loudly, not a WARN.
+    after_rows = continuation.prefix_txn_count(book_path, cutoff)
+    if after_rows != prefix_rows:
+        raise SystemExit(
+            f"{persona}: PREFIX VIOLATION — transactions at-or-before "
+            f"cutoff {cutoff} went {prefix_rows} → {after_rows}; a "
+            f"continuation pass wrote into the frozen prefix.")
+
     print(f"── {persona} current through {through}.")
     return 0
 

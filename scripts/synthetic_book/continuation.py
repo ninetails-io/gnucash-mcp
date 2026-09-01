@@ -155,6 +155,27 @@ def find_cutoff(book_path: Path) -> date:
     return min(cutoff, date.today())
 
 
+def prefix_txn_count(book_path: Path, cutoff: date) -> int:
+    """Row count of the frozen prefix: transactions dated at-or-before
+    the cutoff. Snapshotted before the continuation passes and
+    re-checked after — nothing at or before the cutoff is ever
+    written, and every pass dates its own writes, so the invariant
+    deserves a checker that isn't the passes themselves
+    (release-review finding 9: the interest write once slipped a
+    pre-cutoff date past a pay_date-only guard, and
+    verify_invariants replicated the same boundary blindness)."""
+    con = sqlite3.connect(str(book_path))
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM transactions "
+            "WHERE date(post_date) <= ?",
+            (cutoff.isoformat(),),
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0])
+
+
 # ── Book-state readers (dogfooding the server's own reporting) ──
 
 def _balance(book: GnuCashBook, account: str, as_of: date) -> D:
@@ -220,9 +241,20 @@ def _pay_card(book: GnuCashBook, policy: PersonaPolicy, card: CardPolicy,
         if card.accrue_interest and apr is not None and owed > 0:
             interest = (owed * apr / D("100") / D("12")).quantize(D("0.01"))
             if interest > 0:
+                # The cycle guard above checks only pay_date, so a
+                # cycle that CLOSED at-or-before the cutoff but pays
+                # after it reaches here — deliberately (the hanging
+                # statement is _card_closes' whole point). Its
+                # interest must still never be dated into the frozen
+                # prefix (nothing at or before the cutoff is ever
+                # written — release-review finding 9): clamp to the
+                # first mutable day. Deterministic across re-runs —
+                # the clamp only fires on the run that first extends
+                # past the hanging cycle.
+                interest_date = max(close, cutoff + timedelta(days=1))
                 book.create_transaction(
                     description=policy.desc_interest.format(label=card.label),
-                    trans_date=close,
+                    trans_date=interest_date,
                     splits=[
                         {"account": card.account, "amount": str(-interest)},
                         {"account": card.interest_account,
