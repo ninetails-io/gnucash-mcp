@@ -1,18 +1,22 @@
-"""Backup tools: manual snapshot creation, listing, and retention.
+"""Backup tools: on-demand snapshot creation.
 
 Always registered — `_apply_module_filter` forces 'backup' into the
 enabled set the same way it forces 'core'. Automatic backups happen
-regardless (via `@audit_log`'s `_maybe_auto_backup` hook); these
-tools give users the option to snapshot on demand, review what's on
-disk, and prune manually.
+regardless (via `@audit_log`'s `_maybe_auto_backup` hook), with
+staged retention pruning them internally; this tool gives users the
+option to snapshot on demand.
 
-Restore is deliberately NOT a tool — it's a documented filesystem
-procedure performed with the server stopped. See
+The backup store is deliberately APPEND-ONLY from the model's side:
+the safety net exists to survive model mistakes, so no tool may
+enumerate or delete it. Listing and manual pruning are filesystem
+operations the user performs directly (the ``.mcp/backups``
+directory beside the book), and restore is a documented procedure
+performed with the server stopped — see
 ``docs/RESTORE_FROM_BACKUP.md``.
 """
 
 from gnucash_mcp.logging_config import audit_log
-from gnucash_mcp.tools._helpers import _json, _paginate, safe_tool
+from gnucash_mcp.tools._helpers import _json, safe_tool
 
 
 def register(mcp, get_book) -> None:
@@ -23,11 +27,11 @@ def register(mcp, get_book) -> None:
         get_book: Callable returning the shared GnuCashBook instance.
     """
 
-    # Classified as read-w.r.t.-the-book: these tools touch disk but
-    # never mutate the GnuCash file. Read classification also prevents
-    # the backup tools from triggering the auto-backup hook on
-    # themselves (which the process-level flag would short-circuit
-    # anyway, but the cleaner contract is "the book didn't change").
+    # Classified as read-w.r.t.-the-book: this tool touches disk but
+    # never mutates the GnuCash file. Read classification also prevents
+    # it from triggering the auto-backup hook on itself (which the
+    # process-level flag would short-circuit anyway, but the cleaner
+    # contract is "the book didn't change").
     @mcp.tool()
     @safe_tool
     @audit_log(classification="read")
@@ -41,9 +45,10 @@ def register(mcp, get_book) -> None:
         backup and raises.
 
         Manual backups are kept indefinitely — automatic retention
-        (session / weekly / monthly stages) does not touch them. Use
-        ``prune_backups(stage="manual")`` if you want to clean them
-        up explicitly.
+        (session / weekly / monthly stages) does not touch them. To
+        review or remove backups, the user works with the files
+        directly in the backup directory; no tool can list or delete
+        them.
 
         The response includes a ``restore_hint`` describing the
         filesystem command to restore from this backup. Restore is a
@@ -58,78 +63,4 @@ def register(mcp, get_book) -> None:
         """
         book = get_book()
         result = book.create_backup(stage="manual", label=label)
-        return _json(result)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def list_backups(limit: int = 50, offset: int = 0) -> str:
-        """List all available backups, newest first.
-
-        Leads with a ``Showing X-Y of Z backups (date range)`` line,
-        then a compact tab-separated table with one row per backup:
-        ``stage``, ``timestamp`` (ISO UTC), ``age``, ``size`` (MB),
-        and ``label`` (if any). Stages are ``session`` / ``weekly`` /
-        ``monthly`` (automatic retention tiers) and ``manual`` (user-
-        invoked, unlimited retention). Page with ``offset``; ``limit=0``
-        returns the count only.
-
-        Args:
-            limit: Page size (default 50, max 250). 0 = count only.
-            offset: 0-indexed first row to return (default 0).
-        """
-        book = get_book()
-        entries = book.list_backups()
-        page, indicator = _paginate(
-            entries, offset=offset, limit=limit,
-            entity_name="backups", date_key=lambda e: e["timestamp"],
-        )
-        if not page:
-            return indicator
-
-        # Indicator + header + rows. TSV is compact and the LLM can
-        # parse it without a schema reminder.
-        lines = [indicator, "stage\ttimestamp\tage\tsize_mb\tlabel"]
-        for e in page:
-            size_mb = f"{e['size_bytes'] / (1024 * 1024):.1f}"
-            label = e.get("label") or ""
-            lines.append(
-                f"{e['stage']}\t{e['timestamp']}\t{e['age']}\t"
-                f"{size_mb}\t{label}"
-            )
-        return "\n".join(lines)
-
-    @mcp.tool()
-    @safe_tool
-    @audit_log(classification="read")
-    def prune_backups(
-        keep_last_n: int,
-        stage: str | None = None,
-        dry_run: bool = True,
-    ) -> str:
-        """Remove older backups, keeping the most recent N per stage.
-
-        Default is ``dry_run=True`` — the response shows what WOULD
-        be deleted without touching disk, so the caller can confirm
-        before committing. Pass ``dry_run=False`` to actually delete.
-
-        When ``stage`` is None (default), only auto-retention stages
-        (session / weekly / monthly) are pruned. Manual backups are
-        never auto-pruned; target them explicitly with
-        ``stage="manual"``.
-
-        Args:
-            keep_last_n: Number of backups to retain per affected
-                stage. Must be >= 0.
-            stage: If set, only prune within this stage. One of
-                ``session``, ``weekly``, ``monthly``, ``manual``.
-            dry_run: When True (default), report only. When False,
-                delete.
-        """
-        book = get_book()
-        result = book.prune_backups(
-            keep_last_n=keep_last_n,
-            stage=stage,
-            dry_run=dry_run,
-        )
         return _json(result)

@@ -84,23 +84,25 @@ class TestToolModulesMapping:
                 seen.add(tool)
 
     def test_core_group_resolves_to_31_tools(self):
-        """The ``core`` group expands to 33 tools across its nine
-        sub-modules (summary 1 + accounts 7 + transactions 12 + slots
-        3 + audit 1 + backup 3 + balance_sheet 1 + diagnostic 1 +
-        reconciliation 4). Reconciliation joined core in v1.3.1
-        per the bookkeeper-driven principle that any configuration
-        which handles money must include reconciliation.
+        """The ``core`` group expands across its nine sub-modules
+        (summary 1 + accounts 7 + transactions 12 + slots 3 + audit 1
+        + backup 1 + balance_sheet 1 + diagnostic 1 + reconciliation
+        4). Reconciliation joined core in v1.3.1 per the bookkeeper-
+        driven principle that any configuration which handles money
+        must include reconciliation; backup shrank to create-only in
+        v1.4.4 (the store is append-only from the model's side).
         """
-        assert len(_core_tool_names()) == 31
+        assert len(_core_tool_names()) == 29
 
     def test_total_tool_count(self):
         """Total tools across all sub-modules should be 111 —
         88 post-module-restructure + 3 voucher tools +
         4 credit-note tools + 5 job CRUD tools +
         1 get_job_report + 5 taxtable CRUD tools added in v1.3 +
-        1 enter_statement added in v1.4.4."""
+        1 enter_statement added in v1.4.4, minus list_backups +
+        prune_backups (removed v1.4.4 — append-only backup store)."""
         total = sum(len(tools) for tools in TOOL_MODULES.values())
-        assert total == 88
+        assert total == 86
 
     def test_expected_modules_exist(self):
         """All expected leaf-module names should be present.
@@ -266,7 +268,7 @@ class TestApplyModuleFilter:
     def test_all_keeps_everything(self):
         """--modules=all should keep all 88 tools (the consolidated business surface: 5 parties + 9 documents + 6 reference + 5 jobs + 2 reports, alongside the unchanged modules)."""
         _apply_module_filter("all")
-        assert len(self._tool_names()) == 88
+        assert len(self._tool_names()) == 86
 
     def test_none_defaults_to_core_only(self):
         """No --modules flag defaults to the ``core`` group, which
@@ -298,12 +300,12 @@ class TestApplyModuleFilter:
         """Specifying every module individually should equal 'all'."""
         all_names = ",".join(TOOL_MODULES.keys())
         _apply_module_filter(all_names)
-        assert len(self._tool_names()) == 88
+        assert len(self._tool_names()) == 86
 
     def test_all_in_list_keeps_everything(self):
         """'all' mixed with other modules should keep all 111 tools."""
         _apply_module_filter("scheduling,reconciliation,all")
-        assert len(self._tool_names()) == 88
+        assert len(self._tool_names()) == 86
 
     def test_unknown_module_fails_fast(self, capsys):
         """Unknown module names fail-fast at startup with SystemExit.
@@ -1136,17 +1138,17 @@ class TestMultiBook:
         alex, _ = two_books
         srv._book_paths = [alex.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 88
+        assert len(mcp._tool_manager._tools) == 86
 
     def test_tool_count_multi_book(self, two_books):
-        """The lone runtime delta from single-book: switch_book (112).
+        """The lone runtime delta from single-book: switch_book (87).
         Each filter call relies on switch_book being registered at
         import; the production flow filters once at startup."""
         import gnucash_mcp.server as srv
         alex, beast = two_books
         srv._book_paths = [alex.resolve(), beast.resolve()]
         _apply_module_filter("all")
-        assert len(mcp._tool_manager._tools) == 89
+        assert len(mcp._tool_manager._tools) == 87
 
     # ── switch_book matching ───────────────────────────────────────
 
@@ -1771,31 +1773,37 @@ class TestEnvModuleToggles:
         from gnucash_mcp.server import _modules_from_env_toggles
         assert _modules_from_env_toggles() is None
 
-    def test_planning_only(self, monkeypatch):
+    def test_business_false_still_gets_base(self, monkeypatch):
+        """The one-question install: business off still serves the
+        full base — reporting + planning + investor (always-on per
+        the 2026-08-31 ruling; too common a need to gate)."""
         from gnucash_mcp.server import _modules_from_env_toggles
-        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "true")
-        assert _modules_from_env_toggles() == "reporting,budgets,scheduling"
+        monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
+        assert (_modules_from_env_toggles()
+                == "reporting,budgets,scheduling,investor")
 
-    def test_all_false_still_gets_reporting(self, monkeypatch):
-        from gnucash_mcp.server import (
-            _ENV_MODULE_TOGGLES, _modules_from_env_toggles,
-        )
-        for var in _ENV_MODULE_TOGGLES:
-            monkeypatch.setenv(var, "false")
-        assert _modules_from_env_toggles() == "reporting"
-
-    def test_mcpb_style_selection(self, monkeypatch):
+    def test_business_true_adds_the_suite(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles
-        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "false")
-        monkeypatch.setenv("GNUCASH_ENABLE_INVESTMENTS", "true")
-        monkeypatch.setenv("GNUCASH_ENABLE_FREELANCER", "false")
         monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "true")
-        assert _modules_from_env_toggles() == "reporting,investor,business"
+        assert (_modules_from_env_toggles()
+                == "reporting,budgets,scheduling,investor,business")
+
+    def test_retired_toggles_are_ignored(self, monkeypatch):
+        """An old install's stored config (pre-unification manifest)
+        may still export the retired toggles; they must neither
+        trigger composition alone nor subtract from the base."""
+        from gnucash_mcp.server import _modules_from_env_toggles
+        monkeypatch.setenv("GNUCASH_ENABLE_INVESTMENTS", "false")
+        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "false")
+        assert _modules_from_env_toggles() is None
+        monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "false")
+        assert (_modules_from_env_toggles()
+                == "reporting,budgets,scheduling,investor")
 
     def test_invalid_value_fails_fast(self, monkeypatch):
         from gnucash_mcp.server import _modules_from_env_toggles
-        monkeypatch.setenv("GNUCASH_ENABLE_PLANNING", "ture")
-        with pytest.raises(ValueError, match="GNUCASH_ENABLE_PLANNING"):
+        monkeypatch.setenv("GNUCASH_ENABLE_BUSINESS", "ture")
+        with pytest.raises(ValueError, match="GNUCASH_ENABLE_BUSINESS"):
             _modules_from_env_toggles()
 
     def test_toggle_targets_exist_in_registry(self):
@@ -1803,9 +1811,10 @@ class TestEnvModuleToggles:
         ``reporting``) must be a real module or group name, so a
         module rename cannot silently strand the bundle's checkboxes
         on an unknown-module startup error."""
-        from gnucash_mcp.server import _ENV_MODULE_TOGGLES
+        from gnucash_mcp.server import _ENV_MODULE_TOGGLES, _ENV_TOGGLE_BASE
         valid = set(TOOL_MODULES) | set(MODULE_GROUPS)
-        assert "reporting" in valid
+        for name in _ENV_TOGGLE_BASE:
+            assert name in valid, name
         for modules in _ENV_MODULE_TOGGLES.values():
             for name in modules:
                 assert name in valid, name
