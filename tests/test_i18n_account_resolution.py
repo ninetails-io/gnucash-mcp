@@ -141,6 +141,78 @@ class TestLocalizedHelperAccounts:
                     b, owner_type_is_bill=False, dry_run=True
                 )
 
+    def test_discount_autocreate_refused_on_undetermined_chart(
+        self, tmp_path
+    ):
+        """The bookkeeper's Sabine repro (live loop, 2026-09-01): a DATEV/SKR03
+        chart's numbered top-levels ("Aufwendungen 2/4") match no
+        locale's exact structural words, so ``_infer_book_locale``
+        returns None — and the 4(b) gate originally read None as
+        English and auto-created "Sales Discounts" into the German
+        book. The gate now requires an AFFIRMATIVE English read:
+        undetermined refuses too."""
+        book_path = tmp_path / "datev.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="EUR", overwrite=True,
+        )
+        root = book.root_account
+        eur = book.default_currency
+        for name, atype in (
+            ("Anlage- u. Kapitalkonten 0", "ASSET"),
+            ("Finanz- u. Privatkonten 1", "LIABILITY"),
+            ("Erlöse u. Erträge 2/8", "INCOME"),
+            ("Aufwendungen 2/4", "EXPENSE"),
+            ("Kapital 9", "EQUITY"),
+        ):
+            piecash.Account(
+                name=name, type=atype, parent=root,
+                commodity=eur, placeholder=True,
+            )
+        book.save()
+        book.close()
+
+        gb = GnuCashBook(str(book_path))
+        with gb.open(readonly=False) as b:
+            # The inference miss is real and documented…
+            assert gb._infer_book_locale(b) is None
+            assert gb._book_reads_english(b) is False
+            # …and the gate no longer treats it as English.
+            with pytest.raises(
+                ValueError, match="discount_account"
+            ) as exc:
+                gb._get_or_create_discount_account(
+                    b, owner_type_is_bill=False
+                )
+            assert "undetermined" in str(exc.value)
+
+    def test_book_reads_english_affirmative_on_english_chart(
+        self, tmp_path
+    ):
+        """The other half of the fail-safe gate: a standard English
+        chart passes the affirmative check, so English books keep
+        their auto-create default."""
+        book_path = tmp_path / "english.gnucash"
+        book = piecash.create_book(
+            str(book_path), currency="USD", overwrite=True,
+        )
+        root = book.root_account
+        usd = book.default_currency
+        for name, atype in (
+            ("Assets", "ASSET"),
+            ("Income", "INCOME"),
+            ("Expenses", "EXPENSE"),
+        ):
+            piecash.Account(
+                name=name, type=atype, parent=root,
+                commodity=usd, placeholder=True,
+            )
+        book.save()
+        book.close()
+        gb = GnuCashBook(str(book_path))
+        with gb.open() as b:
+            assert gb._book_reads_english(b) is True
+            assert gb._infer_book_locale(b) is None  # not a vote row
+
     def test_discount_explicit_account_works_on_localized_book(
         self, localized_book
     ):

@@ -198,7 +198,13 @@ module contributes zero tools to the MCP surface.
     catalog translation of "Income" is **"Ertrag"**. So a "look up the
     localized word and match it" fix is unsafe for template-created
     accounts. `_infer_book_locale` therefore *votes* across several
-    top-level type accounts rather than trusting any one.
+    top-level type accounts rather than trusting any one. And its
+    **None means undetermined, not English** — a numbered chart
+    (SKR03/DATEV "Aufwendungen 2/4") matches no locale's words at
+    all. Cosmetic callers (leaf naming) may fall back to English on
+    None; anything that CREATES accounts must require
+    `_book_reads_english`'s affirmative match instead (ruling 4(b);
+    the bookkeeper's Sabine live-loop repro, 2026-09-01).
   - **Designated accounts self-heal via a KVP slot.** The FX and
     discount resolvers store the resolved account's GUID on the root
     account (`gnc-mcp/fx-gain-loss-acct`, etc.) on first use, then

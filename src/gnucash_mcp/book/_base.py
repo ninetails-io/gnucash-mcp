@@ -1254,33 +1254,25 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
         },
     }
 
-    def _infer_book_locale(self, book: piecash.Book) -> str | None:
-        """Infer the book's locale (a normalized 2-letter language
-        code) for naming auto-created accounts. Decided source of
-        truth (§6.3):
+    # English structural names, for the AFFIRMATIVE check below.
+    # Deliberately not a row in _STRUCTURAL_TYPE_NAMES: the locale
+    # vote's None already means "no locale proven", and English must
+    # stay distinguishable from undetermined for fail-safe gates.
+    _ENGLISH_TYPE_NAMES = {
+        "ASSET": "Assets",
+        "LIABILITY": "Liabilities",
+        "INCOME": "Income",
+        "EXPENSE": "Expenses",
+        "EQUITY": "Equity",
+    }
 
-        1. ``GNUCASH_LOCALE`` env override, reduced to its language
-           code (``de_DE.UTF-8`` → ``de``).
-        2. else **vote**: match the book's top-level type accounts
-           against the gettext structural-word catalog; the language
-           with the most matches wins (>= 2, so a single coincidental
-           hit doesn't drive inference).
-        3. else ``None`` → English leaf names.
-
-        Voting (not a single-account lookup) sidesteps the two-
-        translation-sources trap: a German book's top-level income is
-        the template word "Erträge", which does NOT equal the gettext
-        "Ertrag" — but Assets/Expenses/Equity ("Aktiva"/"Aufwand"/
-        "Eigenkapital") match exactly, so German still resolves. A
-        numbered chart like SKR03 matches too few to trigger and
-        correctly falls back to English.
-        """
-        import os
-        override = os.environ.get("GNUCASH_LOCALE")
-        if override:
-            code = override.strip().split(".")[0].split("_")[0].lower()
-            return code or None
-
+    def _top_level_type_names(
+        self, book: piecash.Book
+    ) -> dict[str, list[str]]:
+        """Top-level (root-child) account names grouped by
+        GNCAccountType, normalized (strip + lower), template accounts
+        excluded. Shared traversal for the locale vote and the
+        affirmative-English check."""
         root = book.root_account
         template_guids = self._template_account_guids(book)
         names_by_type: dict[str, list[str]] = {}
@@ -1292,6 +1284,66 @@ class BaseGnuCashBook(CurrencyMixin, QueryMixin):
             names_by_type.setdefault(acct.type, []).append(
                 acct.name.strip().lower()
             )
+        return names_by_type
+
+    def _book_reads_english(self, book: piecash.Book) -> bool:
+        """True when the chart's top-level type accounts affirmatively
+        match the English structural names (>= 2 exact matches — the
+        same threshold as the locale vote).
+
+        Exists for fail-safe creation gates (battery ruling 4(b);
+        the bookkeeper's Sabine repro, 2026-09-01): ``_infer_book_locale``
+        returning None means UNDETERMINED, not English. A DATEV/SKR03
+        chart's numbered top-levels ("Aufwendungen 2/4") match no
+        locale's exact words, so a gate that reads that None as
+        English auto-creates English accounts into a German book.
+        Cosmetic naming may keep treating None as English; anything
+        that CREATES must require this affirmative check instead.
+        (The GNUCASH_LOCALE override is not consulted here — when it
+        is set, ``_infer_book_locale`` returns non-None and gates
+        never reach the undetermined branch.)
+        """
+        names_by_type = self._top_level_type_names(book)
+        score = sum(
+            1
+            for atype, word in self._ENGLISH_TYPE_NAMES.items()
+            if any(
+                n == word.lower() for n in names_by_type.get(atype, ())
+            )
+        )
+        return score >= 2
+
+    def _infer_book_locale(self, book: piecash.Book) -> str | None:
+        """Infer the book's locale (a normalized 2-letter language
+        code) for naming auto-created accounts. Decided source of
+        truth (§6.3):
+
+        1. ``GNUCASH_LOCALE`` env override, reduced to its language
+           code (``de_DE.UTF-8`` → ``de``).
+        2. else **vote**: match the book's top-level type accounts
+           against the gettext structural-word catalog; the language
+           with the most matches wins (>= 2, so a single coincidental
+           hit doesn't drive inference).
+        3. else ``None`` → UNDETERMINED. Cosmetic callers (leaf
+           naming) fall back to English; creation gates must not —
+           they require ``_book_reads_english`` instead, because a
+           numbered chart (SKR03/DATEV "Aufwendungen 2/4") matches
+           too few words to trigger ANY locale while being plainly
+           non-English.
+
+        Voting (not a single-account lookup) sidesteps the two-
+        translation-sources trap: a German book's top-level income is
+        the template word "Erträge", which does NOT equal the gettext
+        "Ertrag" — but Assets/Expenses/Equity ("Aktiva"/"Aufwand"/
+        "Eigenkapital") match exactly, so German still resolves.
+        """
+        import os
+        override = os.environ.get("GNUCASH_LOCALE")
+        if override:
+            code = override.strip().split(".")[0].split("_")[0].lower()
+            return code or None
+
+        names_by_type = self._top_level_type_names(book)
         if not names_by_type:
             return None
 

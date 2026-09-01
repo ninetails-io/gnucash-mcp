@@ -831,25 +831,38 @@ class BusinessMixin:
             return disc_acct, _ambiguity_notice(disc_acct.fullname)
 
         # Battery ruling 4(b): past this point the resolver CREATES.
-        # On a non-English-locale book, silently creating the English
+        # On a non-English book, silently creating the English
         # default misstates the ledger twice over — an English leaf
         # in a localized chart, and (on the sales side) an EXPENSE
         # account where the textbook treatment is contra-revenue.
-        # Refuse with the fix in hand; existing accounts remain
-        # adoptable through the explicit/slot/fuzzy/canonical layers
-        # above. Ruling 4(a) — resolve the default by ROLE — is the
-        # destination that lifts this refusal.
+        # The gate requires an AFFIRMATIVE English read (the
+        # bookkeeper's Sabine repro, 2026-09-01): a DATEV-numbered German chart infers
+        # locale None, and None means undetermined, not English — so
+        # provably-foreign and can't-tell both refuse; only a chart
+        # that matches the English structural names creates. Existing
+        # accounts remain adoptable through the explicit/slot/fuzzy/
+        # canonical layers above. Ruling 4(a) — resolve the default
+        # by ROLE — is the destination that lifts this refusal.
         locale = self._infer_book_locale(book)
-        if locale is not None and locale != "en":
+        if locale != "en" and not (
+            locale is None and self._book_reads_english(book)
+        ):
+            chart_reads = (
+                f"reads as locale {locale!r}"
+                if locale is not None
+                else "does not affirmatively read as English "
+                     "(locale undetermined — numbered or custom "
+                     "top-level account names)"
+            )
             raise ValueError(
                 f"No {side_label} account is designated on this "
                 f"book, and auto-creating the English default "
-                f"({canonical_path!r}) on a book whose chart reads "
-                f"as locale {locale!r} would misstate the ledger. "
-                f"Pass discount_account with the account that "
-                f"should absorb the discount (path, %short GUID, "
-                f"or full 32-char GUID of a non-placeholder INCOME "
-                f"or EXPENSE account)."
+                f"({canonical_path!r}) could misstate a localized "
+                f"ledger: the chart {chart_reads}. Pass "
+                f"discount_account with the account that should "
+                f"absorb the discount (path, %short GUID, or full "
+                f"32-char GUID of a non-placeholder INCOME or "
+                f"EXPENSE account)."
             )
 
         # Resolve the parent by TYPE (INCOME/EXPENSE), not the English
