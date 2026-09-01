@@ -482,7 +482,11 @@ def register(mcp, get_book) -> None:
             job_id: Optional Job to group under (invoices and bills;
                 must belong to the same owner).
             applies_to_id: Credit notes only — the invoice/bill this
-                credit note reverses (linked for apply_credit_note).
+                credit note reverses. The link is PROVENANCE, not a
+                constraint: apply_credit_note can net the credit
+                against any open document from the same owner (its
+                response notes the divergence when the applied
+                target differs from this link).
         """
         document_type = _gate_document_type(document_type)
         book = get_book()
@@ -654,7 +658,7 @@ def register(mcp, get_book) -> None:
         bookkeeper issues a credit note against an overcharge,
         then nets it against the next invoice from that customer
         (or applies it to an outstanding bill on the vendor side).
-        Use ``pay_invoice`` instead when the credit note will be
+        Use ``pay_document`` instead when the credit note will be
         settled by sending or receiving cash.
 
         Args:
@@ -662,7 +666,10 @@ def register(mcp, get_book) -> None:
                 posted).
             applies_to_invoice_id: The target invoice/bill (must
                 be posted, same owner, same currency, same A/R
-                or A/P post account).
+                or A/P post account). Need not be the document
+                the credit note was created against — that link
+                is provenance, and the response notes the
+                divergence when this target differs from it.
             amount: Decimal-string amount to apply, in the
                 document currency. Defaults to ``min(credit_note_
                 remaining, target_remaining)`` — apply as much
@@ -972,6 +979,12 @@ def register(mcp, get_book) -> None:
             dry_run: When True, rehearse without writing — returns
                 the proposed splits and projected outcome instead of
                 booking. Default False.
+
+        Returns:
+            ``status`` is ``"paid"`` when the document settles to
+            zero, ``"partial"`` when a balance remains, and
+            ``"would_pay"`` on dry runs — plus the amount paid,
+            remaining balance, and transaction reference.
         """
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",

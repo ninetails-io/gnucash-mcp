@@ -393,14 +393,16 @@ def _resolve_id_alias(
     legacy: str | None,
     legacy_name: str,
 ) -> str:
-    """Resolve the ``id`` / ``<entity>_id`` parameter pair on
-    delete_invoice / delete_bill / delete_voucher / delete_credit_note.
+    """Resolve the ``id`` / ``<entity>_id`` parameter pair on the
+    document delete path (now ``delete_document``; before the
+    business consolidation, delete_invoice / delete_bill /
+    delete_voucher / delete_credit_note).
 
-    The standard parameter across the invoice tool surface
-    (get_invoice, post_invoice, unpost_invoice, pay_invoice) is
-    ``id``. The delete tools historically used ``<entity>_id``.
-    To converge without breaking older callers, both names are
-    accepted on the delete tools — but exactly one must be set.
+    The standard parameter across the document tool surface
+    (get_document, post_document, unpost_document, pay_document)
+    is ``id``. The retired delete tools used ``<entity>_id``. To
+    converge without breaking older callers, both names are
+    accepted on the delete path — but exactly one must be set.
 
     - Both omitted → ``ValueError`` (caller forgot the ID)
     - Both provided → ``ValueError`` (ambiguous; pick one)

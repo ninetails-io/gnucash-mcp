@@ -183,6 +183,39 @@ tie check is the fleet itself.
   bundle ships demo books current as of the day it was built, and
   every build regression-tests the updater.
 
+**The Sabine battery (#165).** A full business-module test battery
+run against the German sample book closed out the release — six
+bugs fixed, and four design rulings shipped:
+
+- A credit note now nets against a job-grouped invoice from the
+  same customer (the owner check compared a Job's GUID against a
+  Customer's and refused, while naming the same owner on both
+  sides of the error).
+- Payment dry runs render as `PAY INVOICE (dry run)` in the audit
+  log instead of masquerading as booked payments with blank
+  fields; partial payments report `partial`, not `paid`.
+- Invoice line items carry the document's own date — entries no
+  longer date themselves tomorrow (or yesterday) depending on the
+  operator's timezone.
+- Credit notes are `type: "credit_note"` on every surface, with no
+  due date — credit available isn't money owed by a date.
+- Posting a document into an A/R or A/P account of a different
+  commodity warns loudly, naming the valuation freeze and the
+  per-currency-subledger fix.
+- Price sources rank in three tiers (manual quote > other user
+  sources > feeds), and recording a price that loses its date's
+  tie now says so instead of silently not being the rate.
+- Business transactions speak desktop's language — `Invoice`,
+  `Credit Note`, `Payment` on every leg — instead of picking up
+  brokerage `Buy`/`Sell` stamps on cross-currency postings
+  (forward-only; existing transactions are untouched).
+- Applying a credit note to a different document than the one it
+  references is allowed and now says so: "applied to 000014
+  (credit note references 000013)" — in the response and in the
+  permanent record.
+- Every error message and docstring that still named a
+  pre-consolidation tool now names the consolidated surface.
+
 **Under the hood.**
 
 - Batch entry runs one signal sweep per batch instead of up to two
