@@ -1591,6 +1591,14 @@ _ENV_MODULE_TOGGLES: dict[str, tuple[str, ...]] = {
     "GNUCASH_ENABLE_FREELANCER": ("freelancer",),
 }
 
+# Honored when present in the environment, but deliberately absent
+# from the current manifest's installer UI. The manifest contract
+# test exempts these; everything else in _ENV_MODULE_TOGGLES must
+# appear in manifest.json.
+_RETIRED_ENV_TOGGLES: frozenset[str] = frozenset(
+    {"GNUCASH_ENABLE_FREELANCER"}
+)
+
 # The bundle base: what every install gets before the one question.
 # Planning and investments joined it 2026-08-31 (maintainer ruling:
 # too common a need to gate — even a 401(k) wants the portfolio

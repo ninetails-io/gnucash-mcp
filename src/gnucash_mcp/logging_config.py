@@ -16,7 +16,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable
 
-from gnucash_mcp._env import _TOGGLE_TRUE
+from gnucash_mcp._env import _env_errors, _parse_env_toggle
 
 AUDIT_LOGGER_NAME = "gnucash_mcp.audit"
 DEBUG_LOGGER_NAME = "gnucash_mcp.debug"
@@ -136,6 +136,32 @@ def reset_write_rate_limiter() -> None:
     _write_limiter_initialized = False
 
 
+# Memo for _redact_enabled: (raw env value, verdict). redact_paths
+# runs on every outgoing error response, so the toggle parse (and
+# any one-time error recording) must not repeat per call.
+_redact_toggle_memo: tuple[str | None, bool] | None = None
+
+
+def _redact_enabled() -> bool:
+    """GNUCASH_REDACT_PATHS through the ``_parse_env_toggle``
+    chokepoint, memoized per raw value. Unparseable values fail
+    CLOSED (redact) — over-redaction is the safe direction for a
+    privacy control — and are recorded in ``_env_errors`` so a
+    main()-run server fails fast at startup like every other
+    toggle."""
+    global _redact_toggle_memo
+    raw = os.environ.get("GNUCASH_REDACT_PATHS")
+    if _redact_toggle_memo is not None and _redact_toggle_memo[0] == raw:
+        return _redact_toggle_memo[1]
+    try:
+        enabled = bool(_parse_env_toggle("GNUCASH_REDACT_PATHS"))
+    except ValueError as exc:
+        _env_errors.append(str(exc))
+        enabled = True  # fail closed: redact on a garbled toggle
+    _redact_toggle_memo = (raw, enabled)
+    return enabled
+
+
 def redact_paths(text: str) -> str:
     """Replace absolute filesystem paths with their basename when
     ``GNUCASH_REDACT_PATHS=1`` is set; pass-through otherwise.
@@ -147,9 +173,15 @@ def redact_paths(text: str) -> str:
     bit. POSIX and Windows absolute paths match; relative paths
     pass through (they don't leak layout).
     """
-    # Full toggle vocabulary, not just "1" — the MCPB Advanced box
-    # renders booleans as "true", and =="1" made that a silent no-op.
-    if os.environ.get("GNUCASH_REDACT_PATHS", "").strip().lower() not in _TOGGLE_TRUE:
+    # Full toggle vocabulary via the _parse_env_toggle chokepoint —
+    # =="1" once made the Advanced box's "true" a silent no-op, and
+    # raw vocabulary membership repeated the shape one level up: a
+    # typo'd value ("ture") silently disabled redaction while every
+    # other GNUCASH_* toggle failed loud (release-review finding 7).
+    # A privacy control fails CLOSED: unparseable → redact anyway,
+    # and the recorded _env_error makes main()-run servers exit(2)
+    # at startup like the other toggles.
+    if not _redact_enabled():
         return text
 
     import re
