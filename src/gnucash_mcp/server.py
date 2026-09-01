@@ -695,6 +695,111 @@ _book = None
 # validated path containing os.pathsep and re-stat every book.
 _book_paths_source: str | None = None
 
+# ── Restart safety (Sabine battery ruling 6, 2026-08-31) ──────────
+# A client config reload restarts this process SILENTLY mid-session:
+# the LLM may still believe it is on the book it switched to, while
+# the active book has reset to the first configured entry — the next
+# write lands in the wrong ledger. Process-global state is the
+# detection mechanism on purpose: a fresh process IS the event.
+#
+# - _startup_notice_pending: the first tool result of every process
+#   carries a one-line notice naming the active book.
+# - _writes_armed: None = undetermined; determined at first use.
+#   Single-book configs arm permanently (there is no wrong ledger).
+#   Multi-book configs start DISARMED — mutating tools refuse until
+#   switch_book (including a no-op "Already on" call) confirms the
+#   target. safe_tool consults the gate before @audit_log runs, so
+#   a refused write never consumes rate-limit tokens, never triggers
+#   auto-backup, and never stages audit state.
+_startup_notice_pending: bool = True
+_writes_armed: bool | None = None
+
+
+def _configured_paths() -> list[Path]:
+    """The configured book paths, without mutating the get_book()
+    globals: returns ``_book_paths`` when populated, else parses the
+    env directly. The restart-safety helpers may run before any tool
+    has called get_book(), so they can't rely on the globals being
+    warm. Unset/invalid env → [] (the tool body will surface the
+    real error itself)."""
+    if _book_paths:
+        return _book_paths
+    try:
+        return _parse_book_paths(os.environ.get("GNUCASH_BOOK_PATH"))
+    except Exception:
+        return []
+
+
+def _determine_writes_armed() -> bool:
+    """Resolve (and cache) the disarm state on first use."""
+    global _writes_armed
+    if _writes_armed is None:
+        _writes_armed = len(_configured_paths()) < 2
+    return _writes_armed
+
+
+def _write_gate_message() -> str | None:
+    """Refusal text while mutating tools are disarmed, else None.
+
+    Ruling 6 piece 2: with 2+ books configured, a process start
+    disarms every write-classified tool until switch_book confirms
+    which ledger the session means to be in.
+    """
+    if _determine_writes_armed():
+        return None
+    paths = _configured_paths()
+    active = _current_path if _current_path else (
+        paths[0] if paths else None
+    )
+    active_name = active.name if active else "unknown"
+    available = ", ".join(p.name for p in paths)
+    return (
+        f"Mutating tools are disarmed: the server (re)started with "
+        f"{len(paths)} books configured, so the active book reset "
+        f"to {active_name!r} (the first configured) — which may not "
+        f"be the book this session was working in. Confirm the "
+        f"target with switch_book before writing (a switch_book "
+        f"call to the current book counts as confirmation). "
+        f"Available books: {available}."
+    )
+
+
+def _mutation_book_stamp() -> str | None:
+    """Ruling 6 piece 3: the filename every mutating response should
+    name as the book it wrote to. None on single-book configs — with
+    one ledger there is no ambiguity for the stamp to resolve, and
+    every response byte must earn its keep."""
+    if len(_configured_paths()) < 2:
+        return None
+    return _current_path.name if _current_path else None
+
+
+def _consume_startup_notice() -> str | None:
+    """Ruling 6 piece 1: one-line notice for the first tool result
+    of this process, naming the active book. Returns None after the
+    first call (and when no book is configured at all)."""
+    global _startup_notice_pending
+    if not _startup_notice_pending:
+        return None
+    _startup_notice_pending = False
+    paths = _configured_paths()
+    active = _current_path if _current_path else (
+        paths[0] if paths else None
+    )
+    if active is None:
+        return None
+    if len(paths) >= 2 and not _determine_writes_armed():
+        return (
+            f"⚠ GnuCash MCP server (re)started — active book: "
+            f"{active.name}. Any earlier in-session book switch was "
+            f"reset. Mutating tools are disarmed until switch_book "
+            f"confirms the target book."
+        )
+    return (
+        f"ℹ GnuCash MCP server (re)started — active book: "
+        f"{active.name}."
+    )
+
 # Effective logging mode. Seeded from env at import; main() may widen
 # it via the --debug / --noaudit CLI flags. switch_book reads these to
 # re-point logging at the newly-active book.
@@ -1095,7 +1200,7 @@ def _switch_book_impl(name: str) -> str:
     """Make the book whose filename uniquely prefix-matches ``name``
     the current book. See the switch_book tool docstring.
     """
-    global _book, _current_path
+    global _book, _current_path, _writes_armed
     if not _book_paths:
         # Cold start (direct single-call use): populate the registry.
         get_book()
@@ -1140,6 +1245,10 @@ def _switch_book_impl(name: str) -> str:
         logging.getLogger("gnucash_mcp.debug").info(
             f"switch_book: no-op, already on {target.name}"
         )
+        # A no-op switch is still a CONFIRMATION — the session named
+        # the book it means to be in, which is exactly what the
+        # restart disarm (ruling 6) is waiting to hear.
+        _writes_armed = True
         return (
             f"Already on: {target.name}\n"
             f"{_book_orientation(_book)}"
@@ -1200,6 +1309,7 @@ def _switch_book_impl(name: str) -> str:
 
     _current_path = target
     _book = new_book
+    _writes_armed = True  # explicit book choice re-arms writes
     _server_state["book_path"] = str(target)
     _server_state["current_book"] = target.name
 
