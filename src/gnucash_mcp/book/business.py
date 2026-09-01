@@ -5340,6 +5340,29 @@ class BusinessMixin:
                     f"got {post_acct.type}"
                 )
 
+            # Battery ruling 1 (sunset shipped v1.5.0): a receivable
+            # held in a different commodity than its document freezes
+            # the balance at post-date FX and drifts from the
+            # document's true value every day after. This was a
+            # warning through v1.4.4; desktop GnuCash refuses the
+            # pairing outright, and so do we now. Historical
+            # mismatched postings from the warning era still exist in
+            # real books — downstream guards (apply_credit_note,
+            # pay_invoice FX settlement) keep handling those.
+            if inv.currency_guid != post_acct.commodity.guid:
+                side = "A/P" if is_bill else "A/R"
+                raise ValueError(
+                    f"Cannot post a {inv.currency.mnemonic} document "
+                    f"to {post_acct.commodity.mnemonic}-denominated "
+                    f"{post_acct.fullname!r}: the "
+                    f"{side} balance would freeze at post-date FX "
+                    f"and drift from the document's true value. "
+                    f"Correct practice is one {side} account per "
+                    f"document currency — post to (or create) a "
+                    f"{inv.currency.mnemonic}-denominated "
+                    f"{side} account instead."
+                )
+
             totals = self._get_invoice_entries_and_total(book, inv)
             acct_totals = totals["acct_totals"]
             grand_total = totals["grand_total"]
@@ -5526,27 +5549,6 @@ class BusinessMixin:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
                 )
-            # A receivable held in a different commodity than its
-            # document freezes the A/R balance at post-date FX and
-            # drifts from the document's true value every day after
-            # — per-currency A/R//A/P subledgers are correct
-            # practice (desktop refuses this pairing outright).
-            # Allowed for now with a loud warning; ruled to become
-            # a refusal once no sample book depends on it.
-            if inv.currency_guid != post_acct.commodity.guid:
-                result["warning"] = (
-                    f"{inv.currency.mnemonic} document posted to "
-                    f"{post_acct.commodity.mnemonic}-denominated "
-                    f"'{post_acct.fullname}'. apply_credit_note "
-                    f"will refuse cross-commodity netting against "
-                    f"this posting; payments still settle via FX. "
-                    f"Correct practice is a per-currency "
-                    f"{'A/P' if effective_is_bill else 'A/R'} "
-                    f"account per document currency "
-                    f"(e.g. one denominated in "
-                    f"{inv.currency.mnemonic})."
-                )
-
         return result
 
     def unpost_invoice(
@@ -6508,10 +6510,10 @@ class BusinessMixin:
 
             # The netting transaction is in the post account's
             # commodity, so the document currency must match it.
-            # Well-formed books keep per-currency A/R accounts; the
-            # case caught here is a EUR invoice deliberately posted
-            # to USD A/R (post_invoice allows that via FX rates) —
-            # reject rather than write wrong split values.
+            # post_invoice refuses this pairing since v1.5.0
+            # (battery ruling 1), but books that posted under the
+            # warning-era permissiveness still carry mismatched
+            # lots — this guard is what protects them, so it stays.
             if cn.currency_guid != post_acct.commodity.guid:
                 raise ValueError(
                     f"Cross-currency apply not supported: credit "

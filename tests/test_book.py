@@ -10910,9 +10910,12 @@ class TestMultiCurrencyDashboardHelpers:
                 name="Liabilities", type="LIABILITY", parent=bk.root_account,
                 commodity=usd, placeholder=True,
             )
+            # EUR A/P: the post account must match the bill currency
+            # (battery ruling 1); the report-time conversion under
+            # test happens on the bill's grand_total, not here.
             ap = piecash.Account(
                 name="Accounts Payable", type="PAYABLE",
-                parent=liabilities, commodity=usd,
+                parent=liabilities, commodity=eur,
             )
             expenses = next(a for a in bk.accounts if a.fullname == "Expenses")
             office_eur = piecash.Account(
