@@ -1639,6 +1639,31 @@ def _fmt_invoice_pay(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state")
 
+    # A rehearsal must not read as a booked payment (battery bug 2:
+    # dry runs rendered as PAY INVOICE with blank paid/remaining —
+    # phantom payments to an auditor). Tagged rather than omitted,
+    # matching ENTER STATEMENT (dry run): the record of what was
+    # rehearsed is itself audit-relevant.
+    dry = bool(params.get("dry_run")) or bool(
+        (after or {}).get("dry_run")
+    )
+    if dry:
+        lines = [
+            f"{time_part}  PAY INVOICE (dry run)  "
+            f"id:{params.get('id', '')}"
+        ]
+        if after:
+            lines.append(
+                f"{_INDENT}would pay: {after.get('amount', '')}  "
+                f"remaining after: "
+                f"{after.get('remaining_balance_after', '')}"
+            )
+            lines.append(
+                f"{_INDENT}from: {params.get('payment_account', '')}"
+                f"  nothing booked"
+            )
+        return lines
+
     lines = [f"{time_part}  PAY INVOICE  id:{params.get('id', '')}"]
     if after:
         amount = after.get("amount_paid", "")
@@ -1846,7 +1871,16 @@ def _fmt_credit_note_create(entry: dict) -> list[str]:
     params = entry.get("params") or {}
     after = entry.get("after_state") or {}
     cn_id = after.get("id", "")
-    owner_type = params.get("owner_type", "")
+    # Owner-type label: the consolidated create_document sends
+    # party_type (often omitted — inherited from applies_to), so
+    # derive from which side-dependent id key the response carries.
+    # The retired create_credit_note tool sent owner_type; kept as
+    # a last fallback for replaying old entries.
+    owner_type = params.get("party_type") or (
+        "customer" if after.get("customer_id")
+        else "vendor" if after.get("vendor_id")
+        else params.get("owner_type", "owner")
+    )
     # The owner_id key is side-dependent (customer_id / vendor_id).
     owner_id = (
         after.get("customer_id")
@@ -1886,17 +1920,23 @@ def _fmt_entry_create(entry: dict) -> list[str]:
     after = entry.get("after_state") or {}
     desc = after.get("description", params.get("description", ""))
     total = after.get("total", "")
-    # Whichever doc-ID key the tool wrapper used (mutually
-    # exclusive in practice).
+    # The consolidated add_document_entry sends ``id``; the retired
+    # per-type tools sent invoice_id/bill_id/voucher_id/
+    # credit_note_id (kept as fallbacks for replaying old entries).
     inv_id = (
-        params.get("invoice_id", "")
+        params.get("id", "")
+        or params.get("invoice_id", "")
         or params.get("bill_id", "")
         or params.get("voucher_id", "")
         or params.get("credit_note_id", "")
     )
+    # Prefix the document type when the caller named one — a bare
+    # "on: 000014" doesn't say which per-type ID sequence it's from.
+    doc_type = params.get("document_type", "")
+    on_ref = f"{doc_type} {inv_id}".strip()
     lines = [
         f"{time_part}  CREATE ENTRY",
-        f'{_INDENT}"{desc}"  total: {total}  on: {inv_id}',
+        f'{_INDENT}"{desc}"  total: {total}  on: {on_ref}',
     ]
     action = after.get("action", params.get("action", ""))
     notes = after.get("notes", params.get("notes", ""))
