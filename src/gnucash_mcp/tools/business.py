@@ -613,6 +613,7 @@ def register(mcp, get_book) -> None:
     def delete_document(
         document_type: DocumentType,
         id: str,
+        party_type: PartyType | None = None,
     ) -> str:
         """Delete an UNPOSTED customer invoice, vendor bill,
         employee voucher, or credit note.
@@ -625,11 +626,29 @@ def register(mcp, get_book) -> None:
             document_type: "invoice", "bill", "voucher", or
                 "credit_note".
             id: Document ID (e.g., "000001").
+            party_type: Owner side, credit notes only — pass it when
+                a credit note's ID collides with a document of the
+                same ID on the other side (ID counters are per
+                type).
         """
         document_type = _gate_document_type(document_type)
+        # The typed species imply their side; only credit notes
+        # exist on both sides and can collide. Refuse a meaningless
+        # party_type loudly rather than silently ignoring it.
+        if party_type is not None and document_type != "credit_note":
+            raise ValueError(
+                f"party_type only applies to "
+                f"document_type='credit_note' (a "
+                f"{document_type}'s owner side is implied by its "
+                f"type). Omit party_type."
+            )
         book = get_book()
         if document_type == "credit_note":
-            result = book.delete_credit_note(credit_note_id=id)
+            result = book.delete_credit_note(
+                credit_note_id=id,
+                owner_type=_gate_owner_type(party_type)
+                if party_type else None,
+            )
         elif document_type == "bill":
             result = book.delete_bill(bill_id=id)
         elif document_type == "voucher":
