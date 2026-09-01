@@ -35,9 +35,6 @@
         "${user_config.books}"
       ],
       "env": {
-        "GNUCASH_ENABLE_PLANNING": "${user_config.planning}",
-        "GNUCASH_ENABLE_INVESTMENTS": "${user_config.investments}",
-        "GNUCASH_ENABLE_FREELANCER": "${user_config.freelancer}",
         "GNUCASH_ENABLE_BUSINESS": "${user_config.business}",
         "GNUCASH_DEMO_BOOKS": "${user_config.demo_books}",
         "GNUCASH_DEMO_DIR": "${__dirname}/samples",
@@ -54,29 +51,11 @@
       "title": "Your GnuCash book(s)",
       "description": "Pick one or more .gnucash files saved in SQLite format. Pick several to switch between them in-chat. (Books in GnuCash's older XML format need a one-time File > Save As with the sqlite3 format first.)"
     },
-    "planning": {
-      "type": "boolean",
-      "default": true,
-      "title": "Budgets & scheduled transactions",
-      "description": "Set budgets, track pacing, and manage recurring transactions"
-    },
-    "investments": {
-      "type": "boolean",
-      "default": false,
-      "title": "Investment tracking",
-      "description": "Lots, cost basis, capital gains, and price updates"
-    },
-    "freelancer": {
-      "type": "boolean",
-      "default": false,
-      "title": "Client invoicing",
-      "description": "Send invoices to clients and record their payments"
-    },
     "business": {
       "type": "boolean",
       "default": false,
-      "title": "Full business suite",
-      "description": "Everything in Client invoicing, plus vendors, bills, and employee expenses"
+      "title": "Do you invoice clients?",
+      "description": "Adds the business suite: client invoices and payments, plus vendors, bills, and employee expenses. Everything else — budgets, scheduled transactions, and investment tracking — is always included."
     },
     "demo_books": {
       "type": "boolean",

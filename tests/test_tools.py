@@ -1144,7 +1144,6 @@ _PAGINATED_TOOLS = [
     ("get_prices", {"commodity": "USD", "namespace": "CURRENCY"}, "prices"),
     ("list_lots", {"account": "Assets:Checking"}, "lots"),
     ("list_budgets", {}, "budgets"),
-    ("list_backups", {}, None),
     ("get_audit_log", {}, None),
     ("get_reconciliation_status", {}, None),
 ]
