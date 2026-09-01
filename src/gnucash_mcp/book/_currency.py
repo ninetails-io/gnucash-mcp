@@ -130,22 +130,40 @@ def _to_date(dt: date | datetime) -> date:
     return dt
 
 
+# The two sources a deliberate manual quote arrives under:
+# ``user:price`` from create_price, ``user:price-editor`` from
+# GnuCash's editor. An EXPLICIT allowlist — ``user:market-data`` is
+# deliberately feed-ranked despite the prefix.
+_MANUAL_PRICE_SOURCES = frozenset({"user:price", "user:price-editor"})
+
+
+def _price_source_rank(source: str | None) -> int:
+    """Three-tier source rank for same-date ties: 2 = known manual
+    quote, 1 = other ``user:*`` (an explicit operator act, but one
+    that shouldn't silently override a deliberate manual edit),
+    0 = feeds and everything else."""
+    source = source or ""
+    if source in _MANUAL_PRICE_SOURCES:
+        return 2
+    if source.startswith("user:"):
+        return 1
+    return 0
+
+
 def _price_tie_rank(price) -> tuple:
     """Deterministic tie-break key for prices sharing a date
     (bookkeeper finding F3 — the winner used to be an accident of
     query/iteration order, so posting math and month-close valuation
     could flip between runs on books carrying same-date duplicates).
 
-    Higher tuple wins. Rule: a deliberate manual quote
-    (``user:price`` from create_price, ``user:price-editor`` from
-    GnuCash's editor) outranks feed/import sources
-    (``user:market-data``, ``Finance::Quote``, anything else); the
-    guid breaks residual ties — arbitrary but STABLE, which is the
-    property that matters.
+    Higher tuple wins. Rank via ``_price_source_rank`` (manual
+    quote > other user:* > feed); the guid breaks residual ties —
+    arbitrary but STABLE, which is the property that matters.
+    ``create_price``/``create_prices`` report when a written row
+    loses this tie, so any rank order stays visible to the operator.
     """
     source = getattr(price, "source", None) or ""
-    manual = 1 if source in ("user:price", "user:price-editor") else 0
-    return (manual, price.guid or "")
+    return (_price_source_rank(source), price.guid or "")
 
 
 def _is_market_price(price) -> bool:

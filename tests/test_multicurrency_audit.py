@@ -417,6 +417,72 @@ class TestSameDatePriceTieBreak:
             rates = gc._rates_as_of(book, d)
             assert rates[eur.guid] == Decimal("1.10")
 
+    def test_unknown_user_source_ranks_between_manual_and_feed(
+        self, multi_currency_book,
+    ):
+        """Abe's three-tier ruling: an unrecognized ``user:*``
+        source (an explicit operator act) outranks feeds but does
+        NOT silently override a deliberate manual quote."""
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.30", price_date=d,
+                        source="user:market-data")
+        gc.create_price("EUR", "CURRENCY", "1.20", price_date=d,
+                        source="user:test-fx")
+        with gc.open(readonly=True) as book:
+            eur = book.commodities(mnemonic="EUR")
+            usd = book.default_currency
+            assert gc._find_exchange_rate(book, eur, usd, d) == \
+                Decimal("1.20")
+        # A known-manual quote still beats the custom user source.
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+                        source="user:price")
+        with gc.open(readonly=True) as book:
+            eur = book.commodities(mnemonic="EUR")
+            usd = book.default_currency
+            assert gc._find_exchange_rate(book, eur, usd, d) == \
+                Decimal("1.10")
+
+    def test_create_price_notes_when_outranked(
+        self, multi_currency_book,
+    ):
+        """An operator who just wrote a price and can't see it
+        winning has been misled by silence — the losing write says
+        so; the winning write carries no note."""
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        winner = gc.create_price(
+            "EUR", "CURRENCY", "1.10", price_date=d,
+            source="user:price",
+        )
+        assert "note" not in winner
+        loser = gc.create_price(
+            "EUR", "CURRENCY", "1.30", price_date=d,
+            source="user:market-data",
+        )
+        assert "outranks it as the effective rate" in loser["note"]
+        assert "user:price" in loser["note"]
+
+    def test_create_prices_batch_notes_outranked_in_reason(
+        self, multi_currency_book,
+    ):
+        """Batch entry reports the same tie loss in the reason
+        column — single and batch can't diverge (chokepoint)."""
+        from datetime import date
+        gc = GnuCashBook(str(multi_currency_book))
+        d = date(2026, 3, 31)
+        gc.create_price("EUR", "CURRENCY", "1.10", price_date=d,
+                        source="user:price")
+        out = gc.create_prices([{
+            "ref": "1", "commodity": "EUR", "date": d,
+            "value": "1.30", "source": "user:market-data",
+        }])["results"]
+        row = out.splitlines()[1]
+        assert "created" in row
+        assert "outranked by 'user:price'" in row
+
 
 class TestPriceLookupMemo:
     """_find_prices memoizes each (commodity_guid, currency_guid)
