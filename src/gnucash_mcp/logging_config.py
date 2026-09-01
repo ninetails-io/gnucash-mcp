@@ -1845,6 +1845,11 @@ def _fmt_credit_note_apply(entry: dict) -> list[str]:
             f"against: {target_id}"
         ),
     ]
+    # Divergence from the stored applies-to link — provenance the
+    # permanent record must carry, not just the live response.
+    note = after.get("note", "")
+    if note:
+        lines.append(f"{_INDENT}{note}")
     # Decimal comparison, not string equality — the response holds
     # quantized strings ("0.00") that "== '0'" would mishandle.
     from decimal import Decimal as _D, InvalidOperation as _IO

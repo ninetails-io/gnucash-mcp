@@ -482,7 +482,11 @@ def register(mcp, get_book) -> None:
             job_id: Optional Job to group under (invoices and bills;
                 must belong to the same owner).
             applies_to_id: Credit notes only — the invoice/bill this
-                credit note reverses (linked for apply_credit_note).
+                credit note reverses. The link is PROVENANCE, not a
+                constraint: apply_credit_note can net the credit
+                against any open document from the same owner (its
+                response notes the divergence when the applied
+                target differs from this link).
         """
         document_type = _gate_document_type(document_type)
         book = get_book()
@@ -662,7 +666,10 @@ def register(mcp, get_book) -> None:
                 posted).
             applies_to_invoice_id: The target invoice/bill (must
                 be posted, same owner, same currency, same A/R
-                or A/P post account).
+                or A/P post account). Need not be the document
+                the credit note was created against — that link
+                is provenance, and the response notes the
+                divergence when this target differs from it.
             amount: Decimal-string amount to apply, in the
                 document currency. Defaults to ``min(credit_note_
                 remaining, target_remaining)`` — apply as much

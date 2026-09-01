@@ -1227,6 +1227,7 @@ class BusinessMixin:
                 value=Decimal("0"),
                 quantity=fx_quantity,
                 memo=fx_memo,
+                action="Payment",
             )
         return {
             "split": split,
@@ -5387,12 +5388,21 @@ class BusinessMixin:
                 ar_ap_value = -grand_total
             else:
                 ar_ap_value = grand_total
+            # Desktop vocabulary on EVERY leg ("Invoice" / "Credit
+            # Note"), not just A/R: a leg left with action="" gets
+            # auto-stamped "Buy"/"Sell" by piecash when its account
+            # commodity differs from the transaction currency —
+            # brokerage vocabulary on a client bill. Forward-only:
+            # existing transactions are never rewritten to conform.
+            doc_action = (
+                "Credit Note" if is_credit_note else "Invoice"
+            )
             ar_ap_split = piecash.Split(
                 account=post_acct,
                 value=ar_ap_value,
                 quantity=_qty_for_split(post_acct, ar_ap_value),
                 memo="",
-                action="Invoice",
+                action=doc_action,
                 reconcile_date=datetime(1970, 1, 1),
             )
             piecash_splits.append(ar_ap_split)
@@ -5417,6 +5427,7 @@ class BusinessMixin:
                         value=split_value,
                         quantity=_qty_for_split(entry_acct, split_value),
                         memo="",
+                        action=doc_action,
                     )
                 )
 
@@ -5492,6 +5503,26 @@ class BusinessMixin:
             if fx_stale_overrides:
                 result["fx_stale"] = max(
                     fx_stale_overrides, key=lambda m: m["age_days"]
+                )
+            # A receivable held in a different commodity than its
+            # document freezes the A/R balance at post-date FX and
+            # drifts from the document's true value every day after
+            # — per-currency A/R//A/P subledgers are correct
+            # practice (desktop refuses this pairing outright).
+            # Allowed for now with a loud warning; ruled to become
+            # a refusal once no sample book depends on it.
+            if inv.currency_guid != post_acct.commodity.guid:
+                result["warning"] = (
+                    f"{inv.currency.mnemonic} document posted to "
+                    f"{post_acct.commodity.mnemonic}-denominated "
+                    f"'{post_acct.fullname}'. apply_credit_note "
+                    f"will refuse cross-commodity netting against "
+                    f"this posting; payments still settle via FX. "
+                    f"Correct practice is a per-currency "
+                    f"{'A/P' if effective_is_bill else 'A/R'} "
+                    f"account per document currency "
+                    f"(e.g. one denominated in "
+                    f"{inv.currency.mnemonic})."
                 )
 
         return result
@@ -6022,6 +6053,7 @@ class BusinessMixin:
                         value=disc_value_sign * expected,
                         quantity=disc_value_sign * disc_quantity,
                         memo="Early-payment discount",
+                        action="Payment",
                     )
                 discount_amount_invoice_ccy = expected
 
@@ -6247,6 +6279,7 @@ class BusinessMixin:
                 value=proposed[1]["value"],
                 quantity=proposed[1]["quantity"],
                 memo=memo,
+                action="Payment",
             )
             splits = [ar_ap_split, bank_split]
             if discount_split is not None:
@@ -6605,7 +6638,7 @@ class BusinessMixin:
 
             # Quantize response amounts to the post-account
             # commodity — "$100.00", not "$100".
-            return {
+            result = {
                 "credit_note_id": credit_note_id,
                 "applies_to_invoice_id": applies_to_invoice_id,
                 "amount_applied": str(apply_amount.quantize(quantum)),
@@ -6623,6 +6656,18 @@ class BusinessMixin:
                 "apply_date": str(parsed_date),
                 "status": "applied",
             }
+            # The stored applies-to link is provenance, not a
+            # constraint — netting against whatever's open next is
+            # the normal flow. When the applied target diverges
+            # from the link, say so in the moment (and in the
+            # audit log) rather than leaving it discoverable later.
+            linked = self._resolve_applies_to(book, cn)
+            if linked and linked["id"] != target.id:
+                result["note"] = (
+                    f"applied to {target.id} (credit note "
+                    f"references {linked['id']})"
+                )
+            return result
 
     # ── Delete paths ──────────────────────────────────────────────
 

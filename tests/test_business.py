@@ -5528,6 +5528,57 @@ class TestApplyCreditNote:
                 applies_to_invoice_id=beta_inv["id"],
             )
 
+    def test_apply_divergence_from_link_is_echoed(
+        self, business_book,
+    ):
+        """Battery design ruling 5: applies_to is provenance, not a
+        constraint — but applying to a DIFFERENT document than the
+        one the credit note was created against must say so in the
+        response. Applying to the linked document stays note-free."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        for _ in range(2):
+            inv = gb.create_invoice(customer_id="000001")
+            gb.add_invoice_entry(
+                invoice_id=inv["id"], account="Income:Sales",
+                description="x", quantity="1", price="500",
+            )
+            gb.post_invoice(
+                invoice_id=inv["id"],
+                post_account="Assets:Accounts Receivable",
+                owner_type="customer",
+            )
+        # Credit note linked to 000001, applied against 000002.
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+            applies_to_invoice_id="000001",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        diverged = gb.apply_credit_note(
+            credit_note_id=cn["id"],
+            applies_to_invoice_id="000002",
+            amount="60",
+        )
+        assert diverged["status"] == "applied"
+        assert diverged["note"] == (
+            "applied to 000002 (credit note references 000001)"
+        )
+        # Applying the remainder to the LINKED document: no note.
+        aligned = gb.apply_credit_note(
+            credit_note_id=cn["id"],
+            applies_to_invoice_id="000001",
+        )
+        assert aligned["status"] == "applied"
+        assert "note" not in aligned
+
     def test_apply_against_job_attached_invoice(self, business_book):
         """A job-attached invoice nets against a direct credit note
         from the same customer (battery bug 1: the raw owner_guid
@@ -8858,6 +8909,104 @@ class TestPayInvoice:
                 payment_date="2026-03-20",
                 fx_account="Income:Typo Account That Does Not Exist",
             )
+
+    def test_no_brokerage_vocabulary_on_cross_currency_legs(
+        self, business_book,
+    ):
+        """Battery design ruling 3: piecash auto-stamps
+        action="Buy"/"Sell" on any cross-commodity split left with
+        an empty action — brokerage vocabulary on a client bill.
+        Every leg of a posting carries "Invoice" and every leg of a
+        payment (bank, FX gain) carries "Payment", desktop's own
+        words."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        self._add_eur_ar_and_price(gb, "2026-03-20", "1.12")
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="EUR services", quantity="1",
+            price="4500.00",
+        )
+        posted = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+        paid = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="4500.00",
+            payment_date="2026-03-20",
+        )
+        post_txn = gb.get_transaction(posted["transaction_guid"])
+        assert {s["action"] for s in post_txn["splits"]} == \
+            {"Invoice"}
+        pay_txn = gb.get_transaction(paid["transaction_guid"])
+        # A/R + bank + realized-FX legs — all "Payment".
+        assert len(pay_txn["splits"]) == 3
+        assert {s["action"] for s in pay_txn["splits"]} == \
+            {"Payment"}
+
+    def test_cross_commodity_post_warns(self, business_book):
+        """Battery design ruling 1: posting a EUR document into the
+        USD A/R is allowed (Sabine's book has only one A/R) but
+        must warn loudly — the balance freezes at post-date FX, and
+        apply_credit_note will refuse netting against it. Matched
+        commodities post silently."""
+        gb = GnuCashBook(str(business_book))
+        self._add_eur_ar_and_price(gb, "2026-03-10", "1.10")
+        gb.create_customer(name="Berlin Digital", currency="EUR")
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(
+            invoice_id="000001", account="Income:Consulting",
+            description="x", quantity="1", price="1000.00",
+        )
+        mismatched = gb.post_invoice(
+            invoice_id="000001",
+            post_account="Assets:Accounts Receivable",  # USD
+            post_date="2026-03-10",
+        )
+        assert "warning" in mismatched
+        assert "apply_credit_note" in mismatched["warning"]
+        assert "per-currency" in mismatched["warning"]
+        # Matched pairing stays silent.
+        gb.create_invoice(customer_id="000001", currency="EUR",
+                          date_opened="2026-03-10")
+        gb.add_invoice_entry(
+            invoice_id="000002", account="Income:Consulting",
+            description="x", quantity="1", price="1000.00",
+        )
+        matched = gb.post_invoice(
+            invoice_id="000002",
+            post_account="Assets:Accounts Receivable EUR",
+            post_date="2026-03-10",
+        )
+        assert "warning" not in matched
+
+    def test_credit_note_posting_stamps_credit_note_action(
+        self, business_book,
+    ):
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Kulanz", quantity="1", price="100.00",
+        )
+        posted = gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        txn = gb.get_transaction(posted["transaction_guid"])
+        assert {s["action"] for s in txn["splits"]} == \
+            {"Credit Note"}
 
 
 # ============== Overpayment guard + direction (C2/A4) ==============
