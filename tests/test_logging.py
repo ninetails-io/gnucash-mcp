@@ -1941,6 +1941,23 @@ class TestWriteRateLimiter:
     Token bucket; disabled by default; opt-in via
     GNUCASH_WRITE_RATE_LIMIT env var."""
 
+    @pytest.fixture(autouse=True)
+    def _fresh_limiter_state(self):
+        """Reset the limiter cache around every test in this class.
+
+        The limiter is cached process-globally behind an
+        initialized flag, so monkeypatch's env teardown alone
+        leaves a drained bucket live — and any write-classified
+        tool that runs later in the same process gets rate-limited
+        into an error envelope instead of executing. Under xdist
+        that poisons whichever tests land after this class on the
+        same worker.
+        """
+        from gnucash_mcp.logging_config import reset_write_rate_limiter
+        reset_write_rate_limiter()
+        yield
+        reset_write_rate_limiter()
+
     def _setup_decorated_tool(self):
         """Build a minimal write-classified tool decorated by
         audit_log. Returns the wrapped function."""
