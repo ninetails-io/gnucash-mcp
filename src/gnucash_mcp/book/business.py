@@ -15,7 +15,7 @@ in the ORM). All raw inserts are paired with `_verify_write` /
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import piecash
@@ -912,7 +912,7 @@ class BusinessMixin:
             commodity=default_currency,
             description=(
                 f"Early-payment discounts {'taken on supplier bills' if owner_type_is_bill else 'given to customers'}, "
-                f"booked when pay_invoice is called with "
+                f"booked when pay_document is called with "
                 f"apply_discount=True and the term + window + amount "
                 f"validation passes. Auto-created on first use."
             ),
@@ -4147,7 +4147,7 @@ class BusinessMixin:
             # surface the same constraint on lookup.
             raise ValueError(
                 "Credit notes are not supported for employees. "
-                "Use unpost_invoice + edit on the original voucher "
+                "Use unpost_document + edit on the original voucher "
                 "to amend an employee reimbursement."
             )
         inv = self._find_invoice(
@@ -4161,26 +4161,15 @@ class BusinessMixin:
             # Regular invoice/bill/voucher with this ID: name the
             # right tool so the LLM course-corrects in one hop.
             # Three-way — a binary branch would misname voucher tools.
-            _ENTRY_TOOLS = {
-                2: "add_invoice_entry",
-                4: "add_bill_entry",
-                5: "add_voucher_entry",
+            _DOC_TYPES = {
+                2: "invoice", 4: "bill", 5: "voucher",
             }
-            _DELETE_TOOLS = {
-                2: "delete_invoice",
-                4: "delete_bill",
-                5: "delete_voucher",
-            }
-            entry_tool = _ENTRY_TOOLS.get(
-                inv.owner_type, "add_invoice_entry",
-            )
-            delete_tool = _DELETE_TOOLS.get(
-                inv.owner_type, "delete_invoice",
-            )
+            doc_type = _DOC_TYPES.get(inv.owner_type, "invoice")
             raise ValueError(
                 f"{self._doc_label_for(inv.owner_type)} "
                 f"{credit_note_id} is not a credit note. Use "
-                f"{entry_tool} / {delete_tool} for the regular "
+                f"add_document_entry / delete_document with "
+                f"document_type='{doc_type}' for the regular "
                 f"document, or check the ID."
             )
         return inv
@@ -4216,7 +4205,7 @@ class BusinessMixin:
 
         **Employees excluded**: GnuCash desktop has no UI for
         employee credit notes; creating them here would produce
-        documents the desktop can't view. Use ``unpost_invoice`` +
+        documents the desktop can't view. Use ``unpost_document`` +
         edit instead.
 
         Args:
@@ -4241,7 +4230,7 @@ class BusinessMixin:
                 "GnuCash desktop has no UI for employee credit "
                 "notes; supporting them at the MCP layer would "
                 "create documents desktop users can't view or "
-                "edit. Use unpost_invoice + edit on the original "
+                "edit. Use unpost_document + edit on the original "
                 "voucher to amend an employee reimbursement."
             )
         if int_owner_type not in (2, 4):
@@ -4411,7 +4400,7 @@ class BusinessMixin:
 
         Validates the target IS a credit note, then delegates to
         ``_delete_invoice_or_bill``. Posted credit notes must be
-        unposted first via ``unpost_invoice``.
+        unposted first via ``unpost_document``.
 
         Raises:
             ValueError: not found, not a credit note, or posted.
@@ -4436,7 +4425,7 @@ class BusinessMixin:
         2: {  # customer invoice
             "label": "Invoice",
             "id_param": "invoice_id",
-            "twin_method": "add_bill_entry",
+            "twin_method": "add_document_entry with document_type='bill'",
             "twin_label": "vendor bill",
             "allowed_types": frozenset({"INCOME"}),
             "type_error_msg": (
@@ -4449,7 +4438,7 @@ class BusinessMixin:
         4: {  # vendor bill
             "label": "Bill",
             "id_param": "bill_id",
-            "twin_method": "add_invoice_entry",
+            "twin_method": "add_document_entry with document_type='invoice'",
             "twin_label": "customer invoice",
             "allowed_types": frozenset({"EXPENSE", "ASSET"}),
             "type_error_msg": (
@@ -4467,7 +4456,7 @@ class BusinessMixin:
             # row distinguishes them.
             "label": "Voucher",
             "id_param": "voucher_id",
-            "twin_method": "add_invoice_entry",
+            "twin_method": "add_document_entry with document_type='invoice'",
             "twin_label": "customer invoice",
             "allowed_types": frozenset({"EXPENSE", "ASSET"}),
             "type_error_msg": (
@@ -4616,10 +4605,26 @@ class BusinessMixin:
                     b_taxable=0, b_taxincluded=0, b_taxtable=None,
                 )
 
+            # Entry date follows the DOCUMENT's opened date, not the
+            # wall clock — GnuCash desktop's default, and what a
+            # backdated invoice's lines should carry. Anchored at
+            # GnuCash's neutral time (10:59) as an explicit-UTC
+            # datetime so piecash's _DateTime local→UTC conversion
+            # is a no-op: a naive local timestamp here stored as
+            # next-day UTC for evening-western users (battery bug 4
+            # — every entry dated tomorrow) and prior-day for
+            # eastern ones. date_entered stays a true "when was
+            # this typed" timestamp.
+            opened_dt = _safe_invoice_date(inv, "date_opened")
+            entry_date = datetime.combine(
+                opened_dt.date() if opened_dt else date.today(),
+                time(10, 59),
+                tzinfo=timezone.utc,
+            )
             book.session.execute(
                 Entry.__table__.insert().values(
                     guid=entry_guid,
-                    date=datetime.now(),
+                    date=entry_date,
                     date_entered=datetime.now(),
                     description=description,
                     action=action,
@@ -5704,8 +5709,10 @@ class BusinessMixin:
         (resolution mirrors ``fx_account``).
 
         Returns:
-            Payment details and remaining balance; plus
-            ``exchange_rate`` / ``payment_account_amount`` /
+            Payment details and remaining balance. ``status`` is
+            ``"paid"`` when the lot settles to zero, ``"partial"``
+            when a balance remains (``"would_pay"`` on dry runs).
+            Plus ``exchange_rate`` / ``payment_account_amount`` /
             ``fx_realized`` on cross-currency, and a ``discount``
             block when a discount was booked.
 
@@ -5879,7 +5886,8 @@ class BusinessMixin:
                     f"{invoice_id}. Pay at most the outstanding "
                     f"balance. To record a genuine overpayment, pay "
                     f"the outstanding balance and book the excess as "
-                    f"a credit note (create_credit_note) so it shows "
+                    f"a credit note (create_document with "
+                    f"document_type='credit_note') so it shows "
                     f"as credit owed to the counterparty rather than "
                     f"a phantom receivable."
                 )
@@ -5915,8 +5923,8 @@ class BusinessMixin:
                             f"apply_discount=True on invoice "
                             f"{invoice_id} which has no billterm "
                             f"linked. Set terms at invoice creation "
-                            f"(via create_invoice or create_bill's "
-                            f"``term`` parameter), repost, then retry."
+                            f"(via create_document's ``term`` "
+                            f"parameter), repost, then retry."
                         )
                     raise ValueError(
                         f"apply_discount=True on invoice "
@@ -6277,7 +6285,12 @@ class BusinessMixin:
             result = {
                 "id": inv.id,
                 "type": doc_type,
-                "status": "paid",
+                # "paid" only when the lot is settled — a partial
+                # payment reporting "paid" invites the caller to
+                # stop collecting with a balance still open.
+                "status": (
+                    "partial" if remaining_directional > 0 else "paid"
+                ),
                 "amount_paid": str(payment_amount),
                 "remaining_balance": str(remaining_directional),
                 # Transaction GUID emitted as a short prefix —
@@ -6376,13 +6389,26 @@ class BusinessMixin:
                     f"posted — post it before applying credits."
                 )
 
-            # Same owner check.
-            if cn.owner_guid != target.owner_guid:
+            # Same owner check — on the EFFECTIVE counterparty, not
+            # the raw owner row. A job-attached invoice's owner_guid
+            # points at the Job, so a raw comparison refuses a
+            # legitimate netting while the error text (built from
+            # the job-chasing helper) names the same customer on
+            # both sides.
+            cn_eff_ot, cn_job = self._resolve_owner_type_and_job(
+                book, cn,
+            )
+            cn_eff_guid = cn_job.owner_guid if cn_job else cn.owner_guid
+            t_eff_ot, t_job = self._resolve_owner_type_and_job(
+                book, target,
+            )
+            t_eff_guid = t_job.owner_guid if t_job else target.owner_guid
+            if (cn_eff_ot, cn_eff_guid) != (t_eff_ot, t_eff_guid):
                 cn_owner = self._find_invoice_owner_by_guid(
-                    book, cn.owner_type, cn.owner_guid,
+                    book, cn_eff_ot, cn_eff_guid,
                 )
                 target_owner = self._find_invoice_owner_by_guid(
-                    book, target.owner_type, target.owner_guid,
+                    book, t_eff_ot, t_eff_guid,
                 )
                 # Owner IDs are per-type sequences: customer 000005
                 # and vendor 000005 are different entities with the
@@ -6392,11 +6418,11 @@ class BusinessMixin:
                 _kind = {2: "customer", 4: "vendor", 5: "employee"}
                 raise ValueError(
                     f"Credit note belongs to "
-                    f"{_kind.get(cn.owner_type, 'owner')} "
+                    f"{_kind.get(cn_eff_ot, 'owner')} "
                     f"{(cn_owner.id if cn_owner else '?')!r}"
                     f"{f' ({cn_owner.name})' if cn_owner else ''} "
                     f"but target belongs to "
-                    f"{_kind.get(target.owner_type, 'owner')} "
+                    f"{_kind.get(t_eff_ot, 'owner')} "
                     f"{(target_owner.id if target_owner else '?')!r}"
                     f"{f' ({target_owner.name})' if target_owner else ''}. "
                     f"Credit notes can only net against documents "
@@ -6513,7 +6539,7 @@ class BusinessMixin:
 
             # Customer side: +apply on the CN lot (settles toward
             # zero), −apply on the target lot. Vendor side symmetric.
-            is_bill_side = self._is_bill_side(cn.owner_type)
+            is_bill_side = self._is_bill_side(cn_eff_ot)
             if is_bill_side:
                 cn_split_value = -apply_amount
                 target_split_value = apply_amount
@@ -6638,7 +6664,7 @@ class BusinessMixin:
         """Delete an unposted employee expense voucher.
 
         Automatically removes associated entries. Posted vouchers
-        cannot be deleted — unpost first via ``unpost_invoice``,
+        cannot be deleted — unpost first via ``unpost_document``,
         then delete.
 
         Args:
@@ -6681,7 +6707,9 @@ class BusinessMixin:
             if _is_invoice_posted(inv):
                 raise ValueError(
                     f"Cannot delete posted {type_label.lower()} '{doc_id}'. "
-                    f"Void it or issue a credit note instead."
+                    f"Unpost it first (unpost_document), or issue a "
+                    f"credit note (create_document with "
+                    f"document_type='credit_note') to reverse it."
                 )
 
             inv_guid = inv.guid
@@ -7465,12 +7493,20 @@ class BusinessMixin:
                 currency = (
                     inv.currency.mnemonic if inv.currency else None
                 )
-                # type stays the owner-type tag; is_credit_note lets
-                # the formatter distinguish.
+                # type agrees with get_document / delete / unpost:
+                # credit notes are their own type everywhere
+                # (battery bug 6 — verbose mode here was the one
+                # surface still tagging them by owner type). The
+                # redundant is_credit_note key stays for callers
+                # already keyed on it. No due_date either — credit
+                # is available, not owed by a date.
                 row = {
                     "id": inv.id,
-                    "type": self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
-                        effective_ot, "invoice"
+                    "type": (
+                        "credit_note" if is_credit_note
+                        else self._OWNER_TYPE_TO_RESPONSE_TYPE.get(
+                            effective_ot, "invoice"
+                        )
                     ),
                     "is_credit_note": is_credit_note,
                     "owner_name": owner_name,
@@ -7479,10 +7515,12 @@ class BusinessMixin:
                         str(posted_dt.date()) if posted_dt else None
                     ),
                     "due_date": (
-                        str(due_date) if due_date is not None else None
+                        str(due_date)
+                        if due_date is not None and not is_credit_note
+                        else None
                     ),
                     "days_past_due": days_past_due,
-                    "no_terms": no_terms,
+                    "no_terms": False if is_credit_note else no_terms,
                     "original_amount": str(grand_total),
                     "amount_paid": str(amount_paid),
                     "amount_due": str(amount_due),

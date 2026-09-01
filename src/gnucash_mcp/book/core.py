@@ -5727,7 +5727,7 @@ class CoreMixin:
           orphans the invoice's posted-state metadata, after which
           the invoice refuses both delete ("posted") and re-post
           ("already posted") — SQL surgery is the only escape.
-          unpost_invoice clears the metadata properly.
+          unpost_document clears the metadata properly.
         - Refuses reconciled splits unless ``force``.
         """
         from sqlalchemy import text
@@ -5738,7 +5738,7 @@ class CoreMixin:
         if posting_for:
             raise ValueError(
                 f"Transaction is the posting record for invoice "
-                f"{posting_for[0]}. Use unpost_invoice first."
+                f"{posting_for[0]}. Use unpost_document first."
             )
 
         reconciled = [

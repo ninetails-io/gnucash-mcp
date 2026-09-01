@@ -654,7 +654,7 @@ def register(mcp, get_book) -> None:
         bookkeeper issues a credit note against an overcharge,
         then nets it against the next invoice from that customer
         (or applies it to an outstanding bill on the vendor side).
-        Use ``pay_invoice`` instead when the credit note will be
+        Use ``pay_document`` instead when the credit note will be
         settled by sending or receiving cash.
 
         Args:
@@ -972,6 +972,12 @@ def register(mcp, get_book) -> None:
             dry_run: When True, rehearse without writing — returns
                 the proposed splits and projected outcome instead of
                 booking. Default False.
+
+        Returns:
+            ``status`` is ``"paid"`` when the document settles to
+            zero, ``"partial"`` when a balance remains, and
+            ``"would_pay"`` on dry runs — plus the amount paid,
+            remaining balance, and transaction reference.
         """
         owner_type = party_type if party_type else {
             "invoice": "customer", "bill": "vendor",

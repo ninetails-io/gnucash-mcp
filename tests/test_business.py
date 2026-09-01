@@ -5047,7 +5047,7 @@ class TestAddCreditNoteEntry:
         gb.create_customer(name="Acme Co")
         gb.create_invoice(customer_id="000001")  # regular invoice
         with pytest.raises(
-            ValueError, match="not a credit note.*add_invoice_entry",
+            ValueError, match="not a credit note.*document_type='invoice'",
         ):
             gb.add_credit_note_entry(
                 credit_note_id="000001",
@@ -5123,7 +5123,7 @@ class TestDeleteCreditNote:
         gb.create_customer(name="Acme Co")
         gb.create_invoice(customer_id="000001")
         with pytest.raises(
-            ValueError, match="not a credit note.*delete_invoice",
+            ValueError, match="not a credit note.*document_type='invoice'",
         ):
             gb.delete_credit_note(credit_note_id="000001")
 
@@ -5528,6 +5528,94 @@ class TestApplyCreditNote:
                 applies_to_invoice_id=beta_inv["id"],
             )
 
+    def test_apply_against_job_attached_invoice(self, business_book):
+        """A job-attached invoice nets against a direct credit note
+        from the same customer (battery bug 1: the raw owner_guid
+        comparison saw Job GUID vs Customer GUID and refused, with
+        an error naming the same customer on both sides)."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        job = gb.create_job(
+            owner_id="000001", owner_type="customer",
+            name="Relaunch Website",
+        )
+        inv = gb.create_invoice(
+            customer_id="000001", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=inv["id"], account="Income:Sales",
+            description="Milestone 1", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="Goodwill credit", quantity="1", price="100",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        result = gb.apply_credit_note(
+            credit_note_id=cn["id"],
+            applies_to_invoice_id=inv["id"],
+        )
+        assert result["status"] == "applied"
+        assert result["amount_applied"] == "100.00"
+        assert Decimal(result["target_remaining"]) == Decimal("400")
+
+    def test_apply_job_invoice_cross_owner_still_rejected(
+        self, business_book,
+    ):
+        """The job chase must not weaken the cross-owner guard: a
+        job-attached invoice from customer B still refuses customer
+        A's credit note."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Co")
+        gb.create_customer(name="Beta Inc")
+        job = gb.create_job(
+            owner_id="000002", owner_type="customer",
+            name="Beta Project",
+        )
+        beta_inv = gb.create_invoice(
+            customer_id="000002", job_id=job["id"],
+        )
+        gb.add_invoice_entry(
+            invoice_id=beta_inv["id"], account="Income:Sales",
+            description="x", quantity="1", price="500",
+        )
+        gb.post_invoice(
+            invoice_id=beta_inv["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        cn = gb.create_credit_note(
+            owner_id="000001", owner_type="customer",
+        )
+        gb.add_credit_note_entry(
+            credit_note_id=cn["id"], account="Income:Sales",
+            description="x", quantity="1", price="50",
+        )
+        gb.post_invoice(
+            invoice_id=cn["id"],
+            post_account="Assets:Accounts Receivable",
+            owner_type="customer",
+        )
+        with pytest.raises(
+            ValueError, match="same customer/vendor",
+        ):
+            gb.apply_credit_note(
+                credit_note_id=cn["id"],
+                applies_to_invoice_id=beta_inv["id"],
+            )
+
 
 class TestCreditNotePr87ReviewFollowups:
     """Tests for the five Copilot PR #87 review findings.
@@ -5555,7 +5643,8 @@ class TestCreditNotePr87ReviewFollowups:
         # ID. _resolve_credit_note finds it, sees it's NOT a
         # credit note, and emits the suggestion message.
         with pytest.raises(
-            ValueError, match="add_voucher_entry / delete_voucher",
+            ValueError, match="add_document_entry / delete_document with "
+            "document_type='voucher'",
         ):
             gb.add_credit_note_entry(
                 credit_note_id="000001",
@@ -5810,6 +5899,14 @@ class TestCreditNoteDisplayPolish:
         rows = gb.get_outstanding_invoices(compact=False)["invoices"]
         cn_row = next(r for r in rows if r["id"] == cn["id"])
         assert cn_row["is_credit_note"] is True
+        # Battery bug 6: verbose mode was the one surface still
+        # reporting credit notes as type "invoice" (compact and
+        # get_document both say "credit_note") — and it assigned a
+        # due_date to money nobody owes by a date.
+        assert cn_row["type"] == "credit_note"
+        assert cn_row["due_date"] is None
+        assert cn_row["days_past_due"] is None
+        assert cn_row["no_terms"] is False
 
     def test_dashboard_ar_nets_credit_notes_against_invoices(
         self, business_book,
@@ -6001,6 +6098,53 @@ class TestAddInvoiceEntry:
         # id-key name) — that's the dedup contract.
         assert set(inv_result.keys()) - {"invoice_id"} == \
             set(bill_result.keys()) - {"bill_id"}
+
+    def test_entry_date_follows_document_date_opened(
+        self, business_book,
+    ):
+        """Entry dates carry the DOCUMENT's opened date, not the
+        wall clock (battery bug 4: ``datetime.now()`` stored via
+        piecash's local→UTC conversion dated every evening-Pacific
+        entry tomorrow). Backdate the invoice; the entry must match
+        it regardless of when or where the test runs."""
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(
+            customer_id="000001", date_opened="2026-08-15",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="Backdated line",
+            quantity="1", price="100.00",
+        )
+        fetched = gb.get_invoice("000001")
+        assert fetched["entries"][0]["date"] == "2026-08-15"
+
+    def test_entry_date_stored_at_neutral_time(self, business_book):
+        """The raw stored value sits at GnuCash's neutral 10:59 —
+        timezone-proof for the raw-SQL display path (which
+        truncates the stored string) in every real-world zone."""
+        import sqlite3
+
+        gb = GnuCashBook(str(business_book))
+        gb.create_customer(name="Acme Corp")
+        gb.create_invoice(
+            customer_id="000001", date_opened="2026-08-15",
+        )
+        gb.add_invoice_entry(
+            invoice_id="000001",
+            account="Income:Sales",
+            description="x", quantity="1", price="1.00",
+        )
+        conn = sqlite3.connect(str(business_book))
+        try:
+            raw = conn.execute(
+                "SELECT date FROM entries"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert raw == "2026-08-15 10:59:00"
 
     def test_rejects_non_income_account(self, business_book):
         """Invoice entries must post to INCOME accounts. Pre-fix any
@@ -7242,7 +7386,7 @@ class TestUnpostInvoice:
         msg = str(exc_info.value)
         assert "posting record" in msg
         assert posted["id"] in msg
-        assert "unpost_invoice" in msg
+        assert "unpost_document" in msg
 
     def test_delete_transaction_works_for_non_posting_records(
         self, business_book,
@@ -7324,6 +7468,28 @@ class TestPayInvoice:
             amount="200",
         )
         assert Decimal(result["remaining_balance"]) == Decimal("300")
+        # Battery bug 3: a partial payment must not report "paid" —
+        # 300 is still owed.
+        assert result["status"] == "partial"
+
+    def test_full_payment_status_paid(self, business_book):
+        """The settling payment — partial first, then the rest —
+        reports "paid" only on the call that zeroes the lot."""
+        gb = GnuCashBook(str(business_book))
+        self._post_invoice(gb, "500.00")
+        first = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="200",
+        )
+        assert first["status"] == "partial"
+        second = gb.pay_invoice(
+            invoice_id="000001",
+            payment_account="Assets:Checking",
+            amount="300",
+        )
+        assert second["status"] == "paid"
+        assert Decimal(second["remaining_balance"]) == Decimal("0")
 
     def test_memo_lands_on_bank_split_only(self, business_book):
         """User memo annotates the cash movement; the A/R//A/P split

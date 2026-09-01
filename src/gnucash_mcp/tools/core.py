@@ -789,7 +789,7 @@ def register(mcp, get_book) -> None:
 
         Safeguards prevent deletion if a transaction has reconciled
         splits (force=true overrides) or is an invoice's posting
-        record (unpost_invoice first).
+        record (unpost_document first).
 
         Pass a LIST of GUIDs to delete several in one book open /
         one save. The batch is all-or-nothing: every guid is
