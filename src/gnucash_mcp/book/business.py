@@ -5718,21 +5718,28 @@ class BusinessMixin:
                 # that slot's child frame, cascading them away.
                 # Restore the identity flag or this document comes
                 # back from unpost as a plain invoice.
-                from sqlalchemy import text
+                # Core-table insert + the _verify_* chokepoint —
+                # the same idiom as the applies-to slot writes
+                # above. This site once used text() DML with a
+                # hand-rolled COUNT check, which the
+                # TestWriteVerificationCoverage scanner could not
+                # see (release-review finding 10).
+                from piecash.kvp import KVP_Type, Slot
                 book.flush()
-                book.session.execute(text(
-                    "INSERT INTO slots (obj_guid, name, slot_type, "
-                    "int64_val) VALUES (:g, 'credit-note', 1, 1)"
-                ), {"g": inv_guid_snapshot})
-                restored = book.session.execute(text(
-                    "SELECT COUNT(*) FROM slots WHERE obj_guid = :g "
-                    "AND name = 'credit-note'"
-                ), {"g": inv_guid_snapshot}).scalar()
-                if restored != 1:
-                    raise RuntimeError(
-                        f"credit-note flag restore failed for "
-                        f"{inv_id_snapshot} (rows: {restored})"
+                book.session.execute(
+                    Slot.__table__.insert().values(
+                        obj_guid=inv_guid_snapshot,
+                        name="credit-note",
+                        slot_type=KVP_Type.KVP_TYPE_GINT64,
+                        int64_val=1,
                     )
+                )
+                _verify_composite_write(
+                    book.session, Slot.__table__,
+                    {"obj_guid": inv_guid_snapshot,
+                     "name": "credit-note"},
+                    "credit-note flag restore",
+                )
 
             book.save()
 

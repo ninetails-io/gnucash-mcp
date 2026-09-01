@@ -494,21 +494,50 @@ class TestWriteVerificationCoverage:
     # a real gap.
     _VERIFY_WINDOW = 40
 
+    # text()-form DML sites exempt from the paired-verify rule, each
+    # with its reason — exact (file, table, OP) rows, so any NEW
+    # text() DML site fails the test until it verifies or earns an
+    # entry here. Mirrors the RETIRED_OP_RENDERERS exemption style.
+    _TEXT_DML_EXEMPT: dict[tuple[str, str, str], str] = {
+        ("business.py", "invoices", "UPDATE"): (
+            "best-effort self-heal of piecash's date_posted='' "
+            "hazard — zero matched rows is a healthy outcome, so a "
+            "read-back verify is meaningless, and failure must "
+            "never break the lookup it precedes"
+        ),
+    }
+
     def _scan_dml_sites(self) -> list[tuple[Path, int, str, str]]:
         """Yield ``(path, line, table, op)`` for every raw-SQL DML
-        site in ``book/*.py``."""
+        site in ``book/*.py`` — both the ``X.__table__.op()`` form
+        and ``text()``-string DML (matched on the SQL literal line;
+        release-review finding 10: a text() INSERT once shipped with
+        a hand-rolled COUNT check this scanner could not see)."""
         import re
         dml = re.compile(
             r"(\w+)\.__table__\.(insert|delete|update)\(\)"
+        )
+        text_dml = re.compile(
+            r"""["'](?:(INSERT) INTO (\w+)"""
+            r"""|(UPDATE) (\w+) SET"""
+            r"""|(DELETE) FROM (\w+))"""
         )
         out: list[tuple[Path, int, str, str]] = []
         for py_file in sorted(_BOOK_DIR.glob("*.py")):
             lines = py_file.read_text().splitlines()
             for i, line in enumerate(lines, 1):
                 m = dml.search(line)
-                if not m:
+                if m:
+                    out.append((py_file, i, m.group(1), m.group(2)))
                     continue
-                out.append((py_file, i, m.group(1), m.group(2)))
+                t = text_dml.search(line)
+                if t:
+                    op, table = [g for g in t.groups() if g][:2]
+                    if self._TEXT_DML_EXEMPT.get(
+                        (py_file.name, table, op)
+                    ):
+                        continue
+                    out.append((py_file, i, table, op))
         return out
 
     def test_every_raw_sql_dml_site_has_paired_verify(self):
